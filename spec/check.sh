@@ -10,7 +10,7 @@ meta="$(mktemp -d)"; trap 'rm -rf "$meta"' EXIT
 fail=0
 for cfg in MC_*.cfg; do
   name="${cfg%.cfg}"
-  out="$(java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers 1 -deadlock \
+  out="$(java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers 1 -deadlock -noGenerateSpecTE \
          -metadir "$meta/$name" -config "$cfg" MC_OzakiCRT.tla 2>&1)"
   inv="$(sed -n 's/^INVARIANTS //p' "$cfg")"
   case "$name" in
