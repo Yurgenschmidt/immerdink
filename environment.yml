@@ -1,0 +1,17 @@
+# Dedicated env for immerdink (not created yet):
+#   mamba env create -f environment.yml
+name: immerdink
+channels: [conda-forge]
+dependencies:
+  - python=3.14
+  - numpy
+  - pytest
+  - cmake
+  - ninja
+  - cxx-compiler
+  - cuda-version=13.4
+  - cuda-nvcc
+  - cuda-cudart-dev
+  - libcublas-dev        # baseline: native DGEMM
+  - cutensor             # baseline: native FP64 contraction
+  - openjdk=25           # TLC without depending on the VS Code extension
