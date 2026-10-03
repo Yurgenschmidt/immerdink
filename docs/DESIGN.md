@@ -315,10 +315,11 @@ Rules **[spec: Pipeline Fused, MParts; pos_fused_*, neg_fused_*]**:
   after the previous group's GEMMs retire, as before (`neg_fused_all_groups`).
 - Exactly the §4a workspace and the same bits in every region (σ, flags, vec, RA, RB, W) as
   the unfused sequence; `α = 0` / `k = 0` calls run K0 + the β kernel as before.
-- Why k̂ ≤ 512: a tile of 4096 FP64 holds `th = 4096/tk` whole rows (tk = pow2 ≥ k̂), and a
-  row's `tk/16` converting threads are lanes of one warp, so K1's reductions are warp
-  shuffles. The point is fewer, fuller launches for small problems (docs/NOTES-A1.md):
-  K1 and the packs no longer read the operands separately and K0's launch disappears.
+- Why k̂ ≤ 512: a tile of 4096 (or, for small operands, 1024) FP64 holds `th` whole rows
+  (tk = pow2 ≥ k̂, `th·tk` = the tile), so a block owns its rows; their per-row K1
+  reductions are warp shuffles plus, for rows spread over 2–4 warps, a shared-memory
+  combine. The point is fewer, fuller launches for small problems (docs/NOTES-A1.md): K1 and
+  the packs no longer read the operands separately and K0's launch disappears.
 
 **[v1.4] Moduli parts.** A pack launch (K2/K3 and KF) with fewer tiles than about two per
 SM splits the group's slots over `gridDim.y` block rows: part y of a row writes the slots

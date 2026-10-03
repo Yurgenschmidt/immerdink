@@ -188,18 +188,24 @@ __device__ __forceinline__ double round_scaled(const uint32_t (&x)[L], bool neg,
     if (L > 1) lo |= static_cast<uint64_t>(x[L > 1 ? 1 : 0]) << 32;
     t = lo << (64 - bl);
   } else {
-    const int s = bl - 64, ws = s / 32, bs = s % 32;
-    uint32_t w0 = 0, w1 = 0, w2 = 0;
+    // t = floor(mag / 2^s) (< 2^64 since mag < 2^bl), sticky = (mag mod 2^s != 0), limb by
+    // limb with runtime shift amounts only: selecting x[s / 32 + j] was compiled into a
+    // dynamically indexed copy of x in local memory (K5's hottest loads).
+    const int s = bl - 64;
+    t = 0;
 #pragma unroll
     for (int i = 0; i < L; ++i) {
-      if (i == ws) w0 = x[i];
-      if (i == ws + 1) w1 = x[i];
-      if (i == ws + 2) w2 = x[i];
-      if (i < ws && x[i] != 0) sticky = true;
+      const int r = 32 * i - s;  // bit position of limb i relative to bit s
+      const uint64_t v = x[i];
+      if (r >= 0) {
+        if (r < 64) t |= v << r;
+      } else if (r > -32) {
+        t |= v >> -r;
+        if ((v & ((uint64_t{1} << -r) - 1)) != 0) sticky = true;
+      } else if (v != 0) {
+        sticky = true;
+      }
     }
-    if (bs != 0 && (w0 & ((1u << bs) - 1)) != 0) sticky = true;
-    const uint64_t lo = static_cast<uint64_t>(w0) | (static_cast<uint64_t>(w1) << 32);
-    t = (lo >> bs) | (bs != 0 ? static_cast<uint64_t>(w2) << (64 - bs) : 0);
   }
   const int lsb = bl - 64 + e;                  // exponent of t's lsb
   const int q = max(bl - 1 + e - 52, -1074);    // exponent of the result's lsb

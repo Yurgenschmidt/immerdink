@@ -783,9 +783,12 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
   __shared__ int64_t s_out[kRowsMax];
   __shared__ bool s_valid[kRowsMax];
   __shared__ int64_t s_vk[kTileKMax];
+  __shared__ int s_wg[kThreads / 32];
+  __shared__ unsigned s_wf[kThreads / 32];
+  __shared__ u128 s_ws[kThreads / 32];
   const int tid = threadIdx.x;
   const int lg_tk = a.lg_tk, tk = 1 << lg_tk, lg_th = kLgTE - lg_tk, th = 1 << lg_th;
-  const int pitch = tk + tk / kVec + 1, G = tk / E;  // G lanes per row, G | 32
+  const int pitch = tk + tk / kVec + 1, G = tk / E;  // G lanes per row: G | 32 or 32 | G
   const int s_lo = int(blockIdx.y) * a.gsize / int(gridDim.y);
   const int s_hi = (int(blockIdx.y) + 1) * a.gsize / int(gridDim.y);
   const int64_t total = a.tiles[0] + a.tiles[1];
@@ -834,9 +837,19 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
       if (non_finite(bits[e])) fl = 1;
       else if (finite_nonzero(bits[e])) gmax = max(gmax, ilogb_bits(bits[e]));
     }
-    for (int o = G / 2; o > 0; o /= 2) {
+    // Reduce over the row's lanes: within the warp (Gw = min(G, 32) lanes), then, for rows
+    // wider than a warp (G = 64, 128: E = 4 with tk = 256, 512), over the row's warps in
+    // shared memory, combined by every thread in the same order (max, or, exact u128 sum).
+    const int Gw = G < 32 ? G : 32, warp = tid / 32, lane = tid & 31;
+    for (int o = Gw / 2; o > 0; o /= 2) {
       gmax = max(gmax, __shfl_xor_sync(0xffffffffu, gmax, o));
       fl |= __shfl_xor_sync(0xffffffffu, fl, o);
+    }
+    const int w0 = (dl * G) / 32, nw = G / 32;  // the row's warps (G > 32)
+    if (G > 32) {
+      if (lane == 0) s_wg[warp] = gmax, s_wf[warp] = fl;
+      __syncthreads();
+      for (int w = w0; w < w0 + nw; ++w) gmax = max(gmax, s_wg[w]), fl |= s_wf[w];
     }
     u128 S = 0;
     if (gmax != INT_MIN) {
@@ -844,12 +857,19 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
       for (int e = 0; e < E; ++e)
         if (finite_nonzero(bits[e])) S += square_term(bits[e], gmax);
     }
-    for (int o = G / 2; o > 0; o /= 2) S += shfl_xor_u128(S, o);
-    // sigma by the row's first lane (the 256-bit compare once per row), then broadcast.
+    for (int o = Gw / 2; o > 0; o /= 2) S += shfl_xor_u128(S, o);
+    if (G > 32) {
+      if (lane == 0) s_ws[warp] = S;
+      __syncthreads();
+      S = 0;
+      for (int w = w0; w < w0 + nw; ++w) S += s_ws[w];
+    }
+    // sigma by the first lane of the row's piece in this warp (the 256-bit compare once per
+    // row and warp), then broadcast within the warp.
     int sigma = 0;
-    if ((tid & (G - 1)) == 0 && gmax != INT_MIN)
+    if ((lane & (Gw - 1)) == 0 && gmax != INT_MIN)
       sigma = largest_u(S, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
-    sigma = __shfl_sync(0xffffffffu, sigma, (tid & 31) & ~(G - 1));
+    sigma = __shfl_sync(0xffffffffu, sigma, lane & ~(Gw - 1));
     const bool valid = s_valid[dl];
     // 4. part 0 stores sigma and the flag (range certified, cert_shift_range)
     if (valid && blockIdx.y == 0 && (tid & (G - 1)) == 0) {
@@ -881,8 +901,11 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
     for (int64_t q = gt; q < a.d.start[9]; q += gs) a.d.out[q] = k0_entry(a.d, q);
 }
 
-// KF with E = 4 when one row fits 32 lanes of 4 (tk <= 128) and the E = 16 grid would have
-// fewer than 2 blocks per SM even with every modulus of the group in its own block row.
+// KF with E = 4 when the E = 16 grid would have fewer than kKfSmallBlocksPerSm blocks per SM
+// even with every modulus of the group in its own block row (4x the blocks, a 4x shorter
+// chain per thread; its 14 KB of shared memory allow more blocks per SM, so its moduli split
+// targets 4 blocks per SM).
+constexpr int64_t kKfSmallBlocksPerSm = 16;
 template <int Cap>
 imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void* ws,
                        int64_t* vec_out, cudaStream_t stream) {
@@ -917,7 +940,7 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   int64_t tiles = tiles_for(12);
   // (k5_one_elem_per_sm() == 0, test hook only: no small-problem variants anywhere.)
   const bool small =
-      lg_tk <= 7 && tiles * a.gsize < 2 * int64_t{p.sms} && k5_one_elem_per_sm() != 0;
+      tiles * a.gsize < kKfSmallBlocksPerSm * int64_t{p.sms} && k5_one_elem_per_sm() != 0;
   if (small) {
     tiles = tiles_for(10);
     kf_scale_pack<Cap, 4><<<dim3(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms)),

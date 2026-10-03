@@ -33,8 +33,8 @@ IMD_HOST_INTERNAL imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t
 inline bool emulates(const ExecPlan& e) { return e.path == Path::kGemm && e.k >= 2; }
 
 // v1.4 (DESIGN §4 "KF"): the fused scale-and-pack launch is used iff the emulated GEMM runs
-// and one pack tile row covers all of k_hat (k_hat <= kFusedKHatMax, so a row's 16-element
-// pieces lie in one warp). A pure function of the lowering: deterministic at plan time.
+// and one pack tile row covers all of k_hat (k_hat <= kFusedKHatMax: a block owns whole
+// rows). A pure function of the lowering: deterministic at plan time.
 constexpr int64_t kFusedKHatMax = 512;
 inline bool fused_path(const ExecPlan& e) { return emulates(e) && e.k_hat <= kFusedKHatMax; }
 
