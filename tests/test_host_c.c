@@ -28,11 +28,12 @@ int main(void) {
   const int64_t eC[3] = {17, 33, 3}, sC[3] = {99, 3, 1};
   const int32_t lA[3] = {1, 3, 4}, lB[3] = {3, 2, 4}, lC[3] = {1, 2, 4};
   const imd_tensor_t A = {3, eA, sA, lA}, B = {3, eB, sB, lB}, C = {3, eC, sC, lC};
-  const imd_options_t opt = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE};
-  const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT};
+  const imd_options_t opt = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+  const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT, IMD_K4_TUNE_OFF};
 
   CHECK(imd_host_api_version() == IMD_HOST_API_VERSION);
-  CHECK(sizeof(imd_lowering_t) == 152 && IMD_HOST_API_VERSION >= 2);
+  CHECK(sizeof(imd_lowering_t) == 168 && IMD_HOST_API_VERSION >= 3);
+  CHECK(sizeof(imd_options_t) == 24);
 
   size_t bytes = 0;
   CHECK(imd_workspace_size(&A, &B, &C, &opt, &bytes) == IMD_STATUS_SUCCESS);
@@ -92,6 +93,45 @@ int main(void) {
    * padding rows (n_hat > n) each, 5 K4 launches and K5: 1 + 4 * 3 + 5 + 1 = 19. */
   CHECK(lw.fused == 1 && lw.reserved == 0 && lw.kernel_launches == 19);
 
+  /* v3: sm_count 0 -> the reference 128 SMs; a configuration of the table; the autotuning
+   * scratch of group 1 (g = 2, b = 3): RA 2*3*17*16 = 1632, RB 2*3*48*16 = 4608, W
+   * 2*3*17*48 = 4896, each 256-aligned: 1792 + 4608 + 5120. */
+  CHECK(lw.sm_count == 128);
+  CHECK(lw.k4_config >= 0 && lw.k4_config < IMD_K4_CONFIG_COUNT);
+  CHECK(lw.k4_tune_bytes == 11520);
+  {
+    imd_lowering_t l2;
+    memset(&l2, 0, sizeof l2);
+    l2.struct_size = sizeof l2;
+    l2.sm_count = 46; /* an input: the rule for another device */
+    CHECK(imd_lowering(&A, &B, &C, &opt, &l2) == IMD_STATUS_SUCCESS);
+    CHECK(l2.sm_count == 46 && l2.k4_config >= 0 && l2.k4_config < IMD_K4_CONFIG_COUNT);
+    CHECK(l2.m == 17 && l2.k4_tune_bytes == 11520);
+    l2.sm_count = -1; /* invalid input: nothing written */
+    l2.m = -7;
+    CHECK(imd_lowering(&A, &B, &C, &opt, &l2) == IMD_STATUS_INVALID_VALUE);
+    CHECK(l2.m == -7);
+    /* k4_tune is validated like every option; ON changes no host query. */
+    const imd_options_t tune = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_ON};
+    const imd_options_t badt = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, 2};
+    size_t b2 = 0;
+    CHECK(imd_workspace_size(&A, &B, &C, &tune, &b2) == IMD_STATUS_SUCCESS && b2 == 30720);
+    CHECK(imd_workspace_size(&A, &B, &C, &badt, &b2) == IMD_STATUS_INVALID_VALUE);
+    memset(&l2, 0, sizeof l2);
+    l2.struct_size = sizeof l2;
+    CHECK(imd_lowering(&A, &B, &C, &tune, &l2) == IMD_STATUS_SUCCESS);
+    CHECK(l2.k4_config == lw.k4_config && l2.k4_tune_bytes == 11520 && l2.plan_host_bytes == host);
+  }
+
+  /* A version-2 caller (struct_size 152) gets the v2 fields; the v3 tail is untouched. */
+  lw.sm_count = -5;
+  lw.k4_config = -5;
+  lw.k4_tune_bytes = 5;
+  lw.struct_size = 152;
+  CHECK(imd_lowering(&A, &B, &C, &opt, &lw) == IMD_STATUS_SUCCESS);
+  CHECK(lw.m == 17 && lw.kernel_launches == 19 && lw.sm_count == -5 && lw.k4_config == -5 &&
+        lw.k4_tune_bytes == 5);
+
   /* A version-1 caller (struct_size 136) gets the v1 fields; the v2 tail is untouched. */
   lw.fused = -5;
   lw.kernel_launches = -5;
@@ -114,8 +154,8 @@ int main(void) {
     const int64_t ec[2] = {4, 16}, sc[2] = {16, 1};
     const int32_t la[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
     const imd_tensor_t a = {2, ea, sa, la}, b = {2, eb, sb, lb}, c = {2, ec, sc, lc};
-    const imd_options_t rn = {2, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE};
-    const imd_options_t tr = {2, 0, IMD_TRUNC, IMD_EMULATE, IMD_VEC_GENERATE};
+    const imd_options_t rn = {2, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    const imd_options_t tr = {2, 0, IMD_TRUNC, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
     CHECK(imd_workspace_size(&a, &b, &c, &rn, &bytes) == IMD_STATUS_SUCCESS);
     CHECK(imd_plan_bytes(&a, &b, &c, &rn, &dev, &host) == IMD_STATUS_NOT_SUPPORTED);
     CHECK(imd_plan_bytes(&a, &b, &c, &tr, &dev, &host) == IMD_STATUS_SUCCESS);
@@ -126,6 +166,8 @@ int main(void) {
     CHECK(lw.workspace_bytes == bytes && lw.plan_host_bytes == 0);
     /* k_hat > 512: unfused, K0 + 2 K1 + 2 packs + 1 K4 + K5 (n_hat = n: no zero rows). */
     CHECK(lw.fused == 0 && lw.kernel_launches == 7);
+    /* v3 fields are valid with lowered = 1, as k_chunks: 259200 + 1036800 + 128, aligned. */
+    CHECK(lw.k4_tune_bytes == 259328 + 1036800 + 256 && lw.sm_count == 128);
   }
 
   /* Illegal descriptors: the §5 status, lowered = 0. */

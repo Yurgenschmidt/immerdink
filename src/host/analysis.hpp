@@ -9,6 +9,7 @@
 #include "export.hpp"
 #include "immerdink/immerdink_host.h"
 #include "index_map.hpp"
+#include "k4_config.hpp"
 #include "k4_launches.hpp"
 #include "plan_data.hpp"
 #include "workspace.hpp"

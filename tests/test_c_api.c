@@ -25,7 +25,7 @@ static imd_status_t plan_n2(imd_handle_t h, int64_t k, int32_t rounding) {
   const int64_t ec[2] = {4, 16}, sc[2] = {16, 1};
   const int32_t la[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
   const imd_tensor_t A = {2, ea, sa, la}, B = {2, eb, sb, lb}, C = {2, ec, sc, lc};
-  const imd_options_t o = {2, 0, rounding, IMD_EMULATE, IMD_VEC_GENERATE};
+  const imd_options_t o = {2, 0, rounding, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
   imd_plan_t plan = NULL;
   const imd_status_t st = imd_plan_create(h, &A, &B, &C, &o, &plan);
   imd_plan_destroy(plan);
@@ -39,7 +39,7 @@ int main(void) {
   const int64_t eC[3] = {17, 33, 3}, sC[3] = {99, 3, 1};
   const int32_t lA[3] = {1, 3, 4}, lB[3] = {3, 2, 4}, lC[3] = {1, 2, 4};
   const imd_tensor_t A = {3, eA, sA, lA}, B = {3, eB, sB, lB}, C = {3, eC, sC, lC};
-  const imd_options_t opt = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE};
+  const imd_options_t opt = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
   size_t bytes = 0;
 
   expect("workspace_size", imd_workspace_size(&A, &B, &C, &opt, &bytes), IMD_STATUS_SUCCESS);
@@ -54,8 +54,8 @@ int main(void) {
   {
     /* DESIGN v1.2 vec_mode: RESIDENT drops the vec region (30720 - 1024 = 29696, params.py
      * cert_workspace) and the plan owns exactly 8 (34 + 66 + 10 + 9) = 952 device bytes. */
-    const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT};
-    const imd_options_t bad = {9, 2, IMD_RN, IMD_EMULATE, 2};
+    const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT, IMD_K4_TUNE_OFF};
+    const imd_options_t bad = {9, 2, IMD_RN, IMD_EMULATE, 2, IMD_K4_TUNE_OFF};
     size_t dev = 1;
     imd_plan_t pr = NULL;
     expect("workspace_size resident", imd_workspace_size(&A, &B, &C, &res, &bytes),

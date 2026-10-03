@@ -53,7 +53,7 @@ void run(const char* name, std::vector<int64_t> eA, std::vector<int32_t> lA, std
   const imd_tensor_t A{int32_t(eA.size()), eA.data(), sA.data(), lA.data()};
   const imd_tensor_t B{int32_t(eB.size()), eB.data(), sB.data(), lB.data()};
   const imd_tensor_t C{int32_t(eC.size()), eC.data(), sC.data(), lC.data()};
-  const imd_options_t o{N, g, IMD_RN, IMD_EMULATE, vec};
+  const imd_options_t o{N, g, IMD_RN, IMD_EMULATE, vec, IMD_K4_TUNE_OFF};
   const int64_t nA = count(eA), nB = count(eB), nC = count(eC);
   const auto a = values(nA, 1), b = values(nB, 2), c0 = values(nC, 3);
   size_t wsb = 0;

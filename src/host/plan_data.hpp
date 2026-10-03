@@ -54,6 +54,10 @@ struct ExecPlan {
   // v1.4 (DESIGN §4 "KF"): K0 (generate mode), K1 and group 1's K2/K3 run as one fused
   // launch. Chosen at plan time from the lowering (analysis.hpp fused_path).
   bool fused = false;
+  // v1.5 (DESIGN §4 "K4 configurations"): the K4 configuration (IMD_K4_*) the plan runs:
+  // k4_select for the device's SM count, or the fastest one timed with k4_tune. Set by
+  // libimmerdink at plan creation (plan_data leaves IMD_K4_128x256).
+  int32_t k4_config = IMD_K4_128x256;
 
   // §5 step 10 scatter vectors (§4a vec order, vec_count entries), from vec_desc: generated
   // by K0 into ws.vec per call (IMD_VEC_GENERATE), or built once at plan creation into

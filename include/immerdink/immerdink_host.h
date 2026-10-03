@@ -27,7 +27,9 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 2  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4) */
+#define IMD_HOST_API_VERSION 3  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+                                   3: K4 configurations, imd_options_t.k4_tune,
+                                      imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5) */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -52,6 +54,17 @@ enum { IMD_EMULATE = 0, IMD_DIRECT = 1 };
  *                     outlive the GPU work of its calls. */
 enum { IMD_VEC_GENERATE = 0, IMD_VEC_RESIDENT = 1 };
 
+/* K4 tile configurations (DESIGN v1.5 §4): threadblock tile M x N (x 64), all bit-identical.
+ * A plan takes the one chosen by the plan-time rule (imd_lowering_t k4_config), or, with
+ * k4_tune = IMD_K4_TUNE_ON, the fastest one timed at plan creation. */
+enum { IMD_K4_128x256 = 0, IMD_K4_128x128 = 1, IMD_K4_64x128 = 2, IMD_K4_64x64 = 3,
+       IMD_K4_CONFIG_COUNT = 4 };
+/* imd_options_t.k4_tune (v1.5): plan-time autotuning of the K4 configuration. OFF (default):
+ * the rule. ON: imd_plan_create times every configuration once on the plan's device (group
+ * 1's K4 launches on temporary device memory of imd_lowering_t k4_tune_bytes, freed before
+ * it returns) and keeps the fastest; with k4_tune_bytes = 0 it keeps the rule's choice. */
+enum { IMD_K4_TUNE_OFF = 0, IMD_K4_TUNE_ON = 1 };
+
 /* A strided FP64 tensor view. extent, stride (in elements, any sign) and label each have
  * `rank` entries; the pointers may be NULL when rank = 0. Labels are arbitrary int32 ids;
  * equal ids across A, B and C denote the same index (§5). */
@@ -68,6 +81,7 @@ typedef struct {
   int32_t rounding;      /* IMD_RN (default) | IMD_TRUNC     */
   int32_t mode;          /* IMD_EMULATE | IMD_DIRECT         */
   int32_t vec_mode;      /* IMD_VEC_GENERATE (0) | IMD_VEC_RESIDENT (v1.2) */
+  int32_t k4_tune;       /* IMD_K4_TUNE_OFF (0) | IMD_K4_TUNE_ON (v1.5)     */
 } imd_options_t;
 
 /* The host query API's version: IMD_HOST_API_VERSION of the library actually loaded. */
@@ -156,11 +170,23 @@ typedef struct {
   int32_t reserved;        /* 0                                                       */
   int64_t kernel_launches; /* kernel launches of one imd_contract with alpha != 0 (an
                               alpha = 0 call launches K0 (generate mode) + 1)          */
+  /* Version 3 (168 bytes; §4, §6a v1.5). Valid when lowered = 1, like k_chunks. */
+  int32_t sm_count;        /* IN as well as out: the SM count of the target device for the
+                              K4 rule; 0 = 128 (the RTX 4090 it was fitted on). Out: the
+                              count used                                                */
+  int32_t k4_config;       /* IMD_K4_*: the plan-time rule's K4 configuration for sm_count
+                              SMs (IMD_K4_128x256 when no emulated GEMM runs); a plan with
+                              k4_tune = IMD_K4_TUNE_ON may run another one               */
+  uint64_t k4_tune_bytes;  /* device bytes imd_plan_create allocates temporarily to time the
+                              K4 configurations if k4_tune = IMD_K4_TUNE_ON (whatever this
+                              call's option); 0: no tuning would run (no emulated GEMM, or
+                              more than 256 MiB: the rule's choice is kept)               */
 } imd_lowering_t;
 
 /* Fills *out and returns the plan-time status (as imd_plan_bytes). INVALID_VALUE without
  * writing anything if out is NULL or out->struct_size < 136 (the version-1 size). With
- * lowered = 0 only struct_size, status and lowered are meaningful; the others are 0. */
+ * lowered = 0 only struct_size, status and lowered are meaningful; the others are 0.
+ * out->sm_count is read (as an input) only when out->struct_size >= 168. */
 IMD_API imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
                                   const imd_tensor_t* C, const imd_options_t* options,
                                   imd_lowering_t* out);

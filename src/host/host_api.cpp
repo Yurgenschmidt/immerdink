@@ -18,8 +18,11 @@ using imd::detail::ExecPlan;
 // The version-1 size of imd_lowering_t (§6a): fields are only ever appended.
 constexpr uint32_t kLoweringV1Size = 136;
 constexpr uint32_t kLoweringV2Size = 152;  // + fused, reserved, kernel_launches (v1.4)
+constexpr uint32_t kLoweringV3Size = 168;  // + sm_count, k4_config, k4_tune_bytes (v1.5)
 static_assert(offsetof(imd_lowering_t, fused) == kLoweringV1Size, "imd_lowering_t v1 layout changed");
-static_assert(sizeof(imd_lowering_t) == kLoweringV2Size, "imd_lowering_t v2 layout changed");
+static_assert(offsetof(imd_lowering_t, sm_count) == kLoweringV2Size, "imd_lowering_t v2 layout changed");
+static_assert(sizeof(imd_lowering_t) == kLoweringV3Size, "imd_lowering_t v3 layout changed");
+static_assert(sizeof(imd_options_t) == 24, "imd_options_t layout changed");
 static_assert(sizeof(imd_region_t) == 16, "imd_region_t layout changed");
 
 // Runs f() and maps a host allocation failure to ALLOC_FAILED (the queries allocate only
@@ -103,6 +106,10 @@ imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B, const im
   imd_lowering_t r;
   std::memset(&r, 0, sizeof r);
   r.struct_size = out->struct_size;
+  // v3: sm_count is an input (0 or a version-1/2 caller: the reference device).
+  const int32_t sms_in = out->struct_size >= kLoweringV3Size ? out->sm_count : 0;
+  if (sms_in < 0) return IMD_STATUS_INVALID_VALUE;
+  const int32_t sms = sms_in > 0 ? sms_in : imd::detail::kK4ReferenceSms;
   r.status = guarded([&] {
     Analysis an;
     if (const imd_status_t st = imd::detail::analyze(A, B, C, options, &an);
@@ -137,6 +144,11 @@ imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B, const im
     r.fused = fused ? 1 : 0;
     r.kernel_launches = imd::detail::plan_launches(e, fused, an.options.vec_mode == IMD_VEC_RESIDENT,
                                                    r.gemm_launches);
+    // v1.5: the K4 configuration of the plan-time rule (api.cpp uses the same function with
+    // the device's SM count) and the autotuning scratch bytes.
+    r.sm_count = sms;
+    r.k4_config = imd::detail::k4_select(e, sms);
+    r.k4_tune_bytes = imd::detail::k4_tune_bytes(e);
     if (plan_st != IMD_STATUS_SUCCESS) return plan_st;
     r.plan_device_bytes = e.device_bytes;
     r.plan_host_bytes = imd::detail::plan_host_bytes(*A, *B, *C, an, e);

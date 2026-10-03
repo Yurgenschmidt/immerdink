@@ -29,7 +29,7 @@ from dataclasses import dataclass
 __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "workspace_size",
            "workspace_layout", "plan_bytes", "lowering", "g_tradeoff", "REGIONS", "STATUS"]
 
-API_VERSION = 2  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+API_VERSION = 3  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
 
 STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT_WORKSPACE",
           "MISALIGNED", "CUDA_ERROR", "ALLOC_FAILED"]
@@ -38,6 +38,7 @@ DISPATCH = ["NOOP", "EMULATE", "DIRECT", "SCALE"]
 _ROUNDING = {"RN": 0, "TRUNC": 1}
 _MODE = {"EMULATE": 0, "DIRECT": 1}
 _VEC = {"GENERATE": 0, "RESIDENT": 1}
+K4_CONFIGS = ["128x256", "128x128", "64x128", "64x64"]  # IMD_K4_* tiles (DESIGN v1.5 §4)
 
 
 class ImmerdinkError(RuntimeError):
@@ -58,7 +59,8 @@ class _Tensor(C.Structure):
 
 class _Options(C.Structure):
     _fields_ = [("num_moduli", C.c_int32), ("residue_group", C.c_int32),
-                ("rounding", C.c_int32), ("mode", C.c_int32), ("vec_mode", C.c_int32)]
+                ("rounding", C.c_int32), ("mode", C.c_int32), ("vec_mode", C.c_int32),
+                ("k4_tune", C.c_int32)]
 
 
 class _Region(C.Structure):
@@ -74,10 +76,12 @@ class _Lowering(C.Structure):
                 ("k_chunks", C.c_int64), ("gemm_launches", C.c_int64),
                 ("kappa", C.c_uint64), ("workspace_bytes", C.c_uint64),
                 ("plan_device_bytes", C.c_uint64), ("plan_host_bytes", C.c_uint64),
-                ("fused", C.c_int32), ("reserved", C.c_int32), ("kernel_launches", C.c_int64)]
+                ("fused", C.c_int32), ("reserved", C.c_int32), ("kernel_launches", C.c_int64),
+                ("sm_count", C.c_int32), ("k4_config", C.c_int32), ("k4_tune_bytes", C.c_uint64)]
 
 
-assert C.sizeof(_Lowering) == 152  # version 2 (DESIGN §6a v1.4)
+assert C.sizeof(_Lowering) == 168  # version 3 (DESIGN §6a v1.5)
+assert C.sizeof(_Options) == 24
 
 
 # ------------------------------------------------------------------------------------------
@@ -295,15 +299,20 @@ class Lowering:
     fused: bool            # v2: the fused launch KF (K0 + K1 + group 1's packs)
     reserved: int
     kernel_launches: int   # v2: kernel launches of one imd_contract with alpha != 0
+    sm_count: int          # v3: the SM count the K4 rule was evaluated for
+    k4_config: int         # v3: IMD_K4_* of the plan-time rule (tile: K4_CONFIGS[k4_config])
+    k4_tune_bytes: int     # v3: temporary device bytes of a k4_tune plan creation (0: none)
 
 
 def lowering(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",
-             vec_mode="GENERATE", lib=None):
+             vec_mode="GENERATE", sm_count=0, lib=None):
     """imd_lowering: the lowering summary. Never raises for a plan-time status: check
-    .status ("SUCCESS", "NOT_SUPPORTED", ...) and .lowered."""
+    .status ("SUCCESS", "NOT_SUPPORTED", ...) and .lowered. sm_count: the target device's
+    SMs for the K4 configuration rule (0: the 128 of the RTX 4090)."""
     h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib)
     r = _Lowering()
     r.struct_size = C.sizeof(_Lowering)
+    r.sm_count = int(sm_count)
     st = h.lib.imd_lowering(*call.args(), C.byref(r))
     vals = {f: getattr(r, f) for f, _ in _Lowering._fields_ if f != "struct_size"}
     vals.update(status=STATUS[st], lowered=bool(r.lowered), swapped=bool(r.swapped), fused=bool(r.fused),

@@ -60,7 +60,7 @@ struct Problem {
   imd_tensor_t A() const { return {int32_t(eA.size()), eA.data(), sA.data(), lA.data()}; }
   imd_tensor_t B() const { return {int32_t(eB.size()), eB.data(), sB.data(), lB.data()}; }
   imd_tensor_t C() const { return {int32_t(eC.size()), eC.data(), sC.data(), lC.data()}; }
-  imd_options_t opt(int vec) const { return {N, g, IMD_RN, IMD_EMULATE, vec}; }
+  imd_options_t opt(int vec) const { return {N, g, IMD_RN, IMD_EMULATE, vec, IMD_K4_TUNE_OFF}; }
 };
 
 std::vector<int64_t> dense(const std::vector<int64_t>& e) {
