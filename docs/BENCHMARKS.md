@@ -586,3 +586,19 @@ N = 8 went from 0.34–0.52× GEMMul8 to 0.92–0.96× (s128–s512), s_df / s_p
 within noise (after/before 0.89–1.03). K5 at N = 8 is at 91–96 % of its bound (was
 61–64 %), K1 on r_bigk at 67–69 % (was 55 %). nsys breakdowns, tables and the remaining
 floor: [NOTES-A1.md](NOTES-A1.md).
+
+## A3: shape-dependent K4 tiles, K1 long rows, KF for k̂ ≤ 1024 (2026-10-03)
+
+Four K4 configurations (128×256, 128×128, 64×128, 64×64) chosen per plan by a fitted rule
+(DESIGN v1.5 §4), K1's long-row grid kept within the L2 (r_mm), and the fused launch KF
+extended to k̂ ≤ 1024. Before = dev `fa77ec0`, after = `d3c9a78`, interleaved per case by
+`bench/run_ab.sh` with GEMMul8 run first in both processes (the GPU's boost clock settles per
+process; same-process GEMMul8 ratios are the robust metric):
+`bench/results/a3-{before-fa77ec0,after-d3c9a78}.jsonl`. At N = 8: s128 0.87 → 1.06×
+GEMMul8, s256 0.82 → 1.00×, s512 0.85 → 1.11×, s_cc8 0.85 → 1.03×, sq1024 0.94 → 1.04×,
+r_mm 0.81 → 0.96× (1.09× at N = 14), t_ikl / t_batch 8–10 % faster; r_skinny 0.94× and r_bigk
+0.97× unchanged (K4 at its bound there); large shapes within noise. The optional `k4_tune`
+plan option (`bench/sweep_a3_tune.txt`, `a3-tune-ae2ac92.jsonl`) costs 1–24 ms of plan
+creation and up to 256 MiB of temporary device memory for no measurable gain over the
+rule. Per-configuration K4 times on 84 cases (`a3-configs-{nsys,phases}.jsonl`), the rule
+fit, ncu analysis and tables: [NOTES-A3.md](NOTES-A3.md).
