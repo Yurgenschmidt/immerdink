@@ -12,11 +12,13 @@
 (*          per residue group G (g moduli, ⌈N/g⌉ groups):                  *)
 (*            K2 pack A  -> RA[slot][λ][ī][k̂]   (K padded with 0)          *)
 (*            K3 pack B  -> RB[slot][λ][ĵ][k̂]   (rows n..n̂ zero)           *)
-(*            K4 gemm    per K-chunk c and per gridDim.z launch part:      *)
-(*                       epilogue store-mod (c = 0) / add-mod (c > 0)      *)
-(*                       into the u8 planes W_l[λ][ī][n̂]                    *)
+(*            K4 gemm    per K-chunk c, per gridDim.z launch part and per  *)
+(*                       gridDim.y launch part (n̂ split into pieces of     *)
+(*                       MaxY N-tiles): epilogue store-mod (c = 0) /       *)
+(*                       add-mod (c > 0) into the u8 planes W_l[λ][ī][n̂]   *)
 (*          K5 crt    per (λ,ī,j̄): flagged ? native dot : CRT; α/β; C     *)
-(*        launch limits (gridDim.z split), C must not alias A or B, two    *)
+(*        launch limits (gridDim.z and gridDim.y splits), C must not alias *)
+(*        A or B, two                                                      *)
 (*        streams without events are a hazard                              *)
 (*   §3.7 read rules: β = 0 => C not read; α = 0 or k = 0 => A, B not read *)
 (*        (C <- β·C); flagged elements take the native path               *)
@@ -34,7 +36,11 @@
 (*   ra/rb    0 = junk, l = residue of modulus l, Zero = zero padding      *)
 (*            (modulus-independent: a zero is a zero for every p_l)        *)
 (*   w        set of K POSITIONS h ∈ [0, k̂) whose products are folded     *)
-(*            into the u8 plane; {-1} = junk / meaningless (columns ≥ n)   *)
+(*            into the u8 plane; {-1} = never written in this call. Kept   *)
+(*            for every column j < n̂: for j ≥ n the VALUE is meaningless   *)
+(*            (K5 never reads it) but the tag still records which GEMM     *)
+(*            writes reached the cell, so the n̂ split is checked to write  *)
+(*            every column exactly once per chunk.                         *)
 (*   cval     "orig" until K5 writes: "crt" / "native" / "zero" / "betaC"  *)
 (* Tagging W with positions (not chunk indices) makes the K-chunking       *)
 (* itself checked: a dropped, overlapping or gapped chunk, or store-mod on *)
@@ -97,6 +103,8 @@ CONSTANTS
     g,                   \* moduli per residue group (1..N)
     ChunkLen,            \* K_c' (real 131056); K-chunk length in k̂ elements
     MaxZ,                \* CUTLASS gridDim.z limit (real 65535)
+    TileN,               \* CUTLASS threadblock N (real TB::kN, 128 / 256)
+    MaxY,                \* CUTLASS gridDim.y limit in N tiles (real 65535)
     AlignWS,             \* workspace region alignment (real 256 bytes)
     AlignK, AlignN,      \* k̂ = ⌈k⌉_AlignK, n̂ = ⌈n⌉_AlignN (real 16, 16)
     WsBytes,             \* ws_bytes passed to imd_contract
@@ -126,6 +134,11 @@ Bugs == {"none",
          "rbStrideN",     \* RB (slot, λ) block stride uses n rows, not n̂
          "raSizedN",      \* RA sized for N moduli instead of g
          "fullWsK0",      \* k = 0 still allocates every region
+         "noYSplit",      \* n̂ not split: one launch with every N tile
+         "ySplitOverlap", \* off by one: a y part covers [j0, j0 + YLen]
+                          \* (inclusive end), so neighbours share a column
+         "ySplitFloor",   \* off by one: floor(n̂ / YLen) y parts, the short
+                          \* tail piece is never launched
          "kEmptyEmulate", \* a K-empty contraction is dispatched to the
                           \* emulated path (mode EMULATE) while the
                           \* workspace is sized for DIRECT (align(vec))
@@ -190,6 +203,24 @@ NZ(gi)        == GrpSize(gi) * b
 NParts(gi)    == IF Bug = "noSplit" THEN 1 ELSE CeilDiv(NZ(gi), MaxZ)
 PartZ(gi, p)  == IF Bug = "noSplit" THEN 0..(NZ(gi) - 1)
                  ELSE {z \in 0..(NZ(gi) - 1) : p * MaxZ <= z /\ z < (p + 1) * MaxZ}
+
+\* N-tile launches (§4 launch limits, "the N-tile count must be <= 65535
+\* (gridDim.y), so n̂ is split across launches if needed"): the GEMM's N
+\* extent n̂ is tiled by TileN; one launch has at most MaxY N tiles, i.e.
+\* covers YLen = MaxY·TileN columns starting at j0 = q·YLen, the last one
+\* shorter, with a partial last tile (CUTLASS predicates the columns past
+\* nc). This is src/gemm_k4.cu k4_group (n_per_launch = max_n_tiles·kN,
+\* nc = min(n_per_launch, n̂ - j0)); the loop nest is chunk, z part, y part.
+YLen          == MaxY * TileN
+NYParts       == CASE Bug = "noYSplit"    -> 1
+                   [] Bug = "ySplitFloor" -> NHat \div YLen
+                   [] OTHER               -> CeilDiv(NHat, YLen)
+YStart(q)     == IF Bug = "noYSplit" THEN 0 ELSE q * YLen
+YCols(q)      == IF Bug = "noYSplit" THEN NHs
+                 ELSE {j \in NHs : YStart(q) <= j
+                                  /\ j < YStart(q) + YLen + (IF Bug = "ySplitOverlap" THEN 1 ELSE 0)}
+GridY(q)      == CeilDiv(Cardinality(YCols(q)), TileN)     \* gridDim.y of y part q
+TileCols(q, y) == {j \in YCols(q) : (j - YStart(q)) \div TileN = y}
 
 -----------------------------------------------------------------------------
 (* §4a workspace layout *)
@@ -313,15 +344,17 @@ Regs(S) == {x[1] : x \in S}
 (* Host program (§4): a constant kernel sequence; which one runs depends   *)
 (* only on host-side facts (mode, k, and whether α = 0).                   *)
 
-Kr(kd, gi, c, p) == [kind |-> kd, gi |-> gi, c |-> c, p |-> p]
+KrQ(kd, gi, c, p, q) == [kind |-> kd, gi |-> gi, c |-> c, p |-> p, q |-> q]
+Kr(kd, gi, c, p)     == KrQ(kd, gi, c, p, 0)
 KVec    == Kr("vec", 0, 0, 0)
 KScale  == Kr("scale", 0, 0, 0)
 KCrt    == Kr("crt", 0, 0, 0)
 KDirect == Kr("direct", 0, 0, 0)
 
-\* For chunk c, for part p: one batched GEMM launch.
-GemmSeq(gi) == [i \in 1..(NCh * NParts(gi)) |->
-                  Kr("gemm", gi, (i - 1) \div NParts(gi), (i - 1) % NParts(gi))]
+\* For chunk c, for z part p, for y part q: one batched GEMM launch.
+GemmSeq(gi) == LET P == NParts(gi)  Q == NYParts IN
+               [i \in 1..(NCh * P * Q) |->
+                  KrQ("gemm", gi, (i - 1) \div (P * Q), ((i - 1) \div Q) % P, (i - 1) % Q)]
 RECURSIVE GroupsFrom(_)
 GroupsFrom(gi) == IF gi > NG THEN <<>>
                   ELSE <<Kr("packA", gi, 0, 0), Kr("packB", gi, 0, 0)>>
@@ -369,7 +402,8 @@ CTAsOf(kr) ==
                                \cup {<<"b", x[1], x[2]>> : x \in ColsB}
       [] kr.kind = "packA"  -> RowsA                    \* one A row each
       [] kr.kind = "packB"  -> Bs \X NHs                \* one (padded) B column each
-      [] kr.kind = "gemm"   -> PartZ(kr.gi, kr.p) \X Ms \* (batch z, row tile ī)
+      [] kr.kind = "gemm"   -> PartZ(kr.gi, kr.p) \X Ms \X (0..(GridY(kr.q) - 1))
+                                                        \* (batch z, row ī, N tile y)
       [] kr.kind \in {"crt", "direct"} -> Elems         \* one C element each
 CTATbl == [a \in BOOLEAN |-> [i \in DOMAIN Prog[a] |-> CTAsOf(Prog[a][i])]]
 
@@ -379,7 +413,7 @@ CTATbl == [a \in BOOLEAN |-> [i \in DOMAIN Prog[a] |-> CTAsOf(Prog[a][i])]]
 WellFormed ==
     /\ \A x \in {b, m, n, k} : x \in Nat
     /\ N \in Nat /\ N >= 1 /\ g \in 1..N
-    /\ ChunkLen >= 1 /\ MaxZ >= 1
+    /\ ChunkLen >= 1 /\ MaxZ >= 1 /\ TileN >= 1 /\ MaxY >= 1
     /\ AlignWS >= 1 /\ AlignK >= 1 /\ AlignN >= 1
     /\ WsBytes \in Nat
     /\ {Direct, KEmpty, TwoStreams, UseEvents, EnforcePreconditions} \subseteq BOOLEAN
@@ -393,6 +427,7 @@ Preconditions ==
     /\ ChunkLen % AlignK = 0                   \* §3.5: K_c' multiple of 16
     /\ AlignWS % 8 = 0                         \* regions naturally aligned (int64)
     /\ AlignWS % AlignK = 0 /\ AlignWS % AlignN = 0  \* 256 % 16 = 0
+    /\ TileN % AlignN = 0                      \* N tile: a multiple of 16
 \* Design rules (removing one is what the Bug-models do; Harmless deviations
 \* are allowed in positive models).
 DesignRules == (Bug = "none" \/ Bug \in Harmless) /\ (TwoStreams => UseEvents)
@@ -425,7 +460,7 @@ vars    == <<pc, done, retired, alpha0, beta0, flagA, flagB, aDirty, bDirty,
 inputs  == <<alpha0, beta0, flagA, flagB>>
 
 Zero     == -1                            \* ra/rb tag of zero padding
-ErrKinds == {"stale", "plane", "reuse", "oob", "readC", "readAB", "clobber"}
+ErrKinds == {"stale", "plane", "dup", "reuse", "oob", "readC", "readAB", "clobber"}
 CTags    == {"orig", "zero", "betaC", "native", "crt"}
 
 Init ==
@@ -526,34 +561,40 @@ PackBStep(gi, t) ==
                     ELSE {}))
     /\ UNCHANGED <<vecV, sfA, sfB, ra, w, cw, cval, aDirty, bDirty>>
 
-\* K4: chunk c of the int8 GEMM for batch z = s·b + λ (modulus l), row tile
-\* ī, all n̂ columns; epilogue store-mod (c = 0) or add-mod (c > 0).
+\* K4: chunk c of the int8 GEMM for batch z = s·b + λ (modulus l), row ī,
+\* the columns of N tile y of y part kr.q; epilogue store-mod (c = 0) or
+\* add-mod (c > 0).
 \*   stale  a real product reads a non-residue / wrong-modulus operand, a
 \*          K-padding product has no zero operand, or add-mod reads a junk W
-\*   plane  add-mod folds a K position that the plane already holds
+\*   plane  add-mod folds a K position that the plane already holds (j < n)
+\*   dup    a W cell (any column j < n̂) written twice for the same chunk:
+\*          store-mod over a written cell, or add-mod re-folding positions
 \* W columns j ≥ n are computed (and stored, AccessesSafe) but never read
-\* by K5; their tag is "meaningless" ({-1}).
+\* by K5; their tag records the writes only.
 GemmStep(kr, t) ==
     LET z == t[1]  i == t[2]  s == z \div b  lam == z % b
         l == ModOf(kr.gi, s)  c == kr.c  hs == Chunk(c)
+        Js == TileCols(kr.q, t[3])
         add == c > 0 /\ Bug # "storeMod"
         A(h)    == ra[<<s, lam, i, h>>]
         B(j, h) == rb[<<s, lam, j, h>>]
-        badIn == \E j \in Ns, h \in hs :
+        badIn == \E j \in Js \cap Ns, h \in hs :
                    IF h < k THEN A(h) # l \/ B(j, h) # l
                    ELSE A(h) # Zero /\ B(j, h) # Zero
-        badW  == add /\ \E j \in Ns : -1 \in w[<<l, lam, i, j>>]
-        dbl   == add /\ \E j \in Ns : w[<<l, lam, i, j>>] \cap hs # {}
+        badW  == add /\ \E j \in Js \cap Ns : -1 \in w[<<l, lam, i, j>>]
+        dbl   == add /\ \E j \in Js \cap Ns : w[<<l, lam, i, j>>] \cap hs # {}
+        dup   == \E j \in Js : IF add THEN w[<<l, lam, i, j>>] \cap hs # {}
+                               ELSE w[<<l, lam, i, j>>] # {-1}
     IN
     /\ w' = [x \in WDom |->
-               IF x[1] = l /\ x[2] = lam /\ x[3] = i
-               THEN (IF x[4] >= n THEN {-1}
-                     ELSE IF add THEN w[x] \cup hs ELSE hs)
+               IF x[1] = l /\ x[2] = lam /\ x[3] = i /\ x[4] \in Js
+               THEN (IF add THEN w[x] \cup hs ELSE hs)
                ELSE w[x]]
     /\ Access({AccRA(s, lam, i, h) : h \in hs}
-              \cup {AccRB(s, lam, j, h) : j \in NHs, h \in hs}
-              \cup {AccW(l, lam, i, j) : j \in NHs},
-              Stale(badIn \/ badW) \cup (IF dbl THEN {"plane"} ELSE {}))
+              \cup {AccRB(s, lam, j, h) : j \in Js, h \in hs}
+              \cup {AccW(l, lam, i, j) : j \in Js},
+              Stale(badIn \/ badW) \cup (IF dbl THEN {"plane"} ELSE {})
+              \cup (IF dup THEN {"dup"} ELSE {}))
     /\ UNCHANGED <<vecV, sfA, sfB, ra, rb, cw, cval, aDirty, bDirty>>
 
 \* K5 (and the DIRECT kernel) for C element e = (λ, ī, j̄). Writing C[e]
@@ -673,6 +714,17 @@ ReuseAfterRetire == "reuse" \notin err
 \* add-mod; no position twice, none missing).
 PlanesFinalAtCRT == "plane" \notin err
 
+\* §4 launch limits, the n̂ split: no GEMM launch writes a W cell (any
+\* column j < n̂, incl. the padding columns) that an earlier launch of the
+\* same K-chunk already wrote (the y parts and the N tiles inside each
+\* launch are disjoint) ...
+PlanesWrittenOnce == "dup" \notin err
+\* ... and together they cover it: after a complete emulated run every
+\* cell of every plane (every column of [0, n̂)) has folded exactly the
+\* K positions [0, k̂).
+PlanesCoverAtEnd ==
+    (AllDone /\ FullWs /\ ~alpha0) => \A x \in WDom : w[x] = KHs
+
 \* §4 Exactly once.
 FinalAtMostOnce       == \A e \in Elems : cw[e] <= 1
 FinalExactlyOnceAtEnd == AllDone => \A e \in Elems : cw[e] = 1
@@ -681,7 +733,10 @@ Termination           == <>AllDone
 \* §3.1/§3.7: flagged elements take the native path, unflagged the CRT path;
 \* α = 0 or k = 0 gives β·C (or 0). Per-element refinement of the abstract
 \* contraction: the written value is Expected(e), a function of the inputs
-\* only (not of g, chunking, launch split, stream, or interleaving).
+\* only (not of g, chunking, the z or y launch splits, the N tile size,
+\* stream, or interleaving). With PlanesFinalAtCRT (every plane read by K5
+\* has folded exactly [0, k̂)) this is "the result is independent of the
+\* split": the models with and without the n̂ split agree element-wise.
 CorrectPath == \A e \in Elems : cw[e] >= 1 => cval[e] = Expected(e)
 
 \* §3.7 read rules.
@@ -744,6 +799,10 @@ GemmAligned ==
            /\ AddrRA(s, lam, 0, c * ChunkLen) % AlignK = 0
            /\ AddrRB(s, lam, 0, c * ChunkLen) % AlignK = 0
            /\ AddrW(ModOf(gi, s), lam, 0, 0) % AlignN = 0
+           \* the y part's B and W pointers (column j0 = YStart(q))
+           /\ \A q \in 0..(NYParts - 1) :
+                /\ AddrRB(s, lam, YStart(q), c * ChunkLen) % AlignK = 0
+                /\ AddrW(ModOf(gi, s), lam, 0, YStart(q)) % AlignN = 0
 
 \* §4 DIRECT path / §4a: "K-empty -> DIRECT is documented dispatch by
 \* descriptor". The DIRECT kernel is launched iff the output is non-empty
@@ -768,4 +827,17 @@ LaunchGridOK ==
         /\ UNION {PartZ(gi, p) : p \in 0..(NParts(gi) - 1)} = 0..(NZ(gi) - 1)
         /\ \A p1, p2 \in 0..(NParts(gi) - 1) :
               p1 # p2 => PartZ(gi, p1) \cap PartZ(gi, p2) = {}
+
+\* §4 launch limits, gridDim.y: n̂ is split into y parts, each a launch of
+\* GridY(q) ∈ 1..MaxY N tiles; the y parts partition [0, n̂) (no gap, no
+\* overlap) and so do the N tiles inside each part, each tile non-empty and
+\* at most TileN wide. Constant-level.
+LaunchGridYOK ==
+    FullWs =>
+      /\ \A q \in 0..(NYParts - 1) :
+           /\ GridY(q) \in 1..MaxY
+           /\ UNION {TileCols(q, y) : y \in 0..(GridY(q) - 1)} = YCols(q)
+           /\ \A y \in 0..(GridY(q) - 1) : Cardinality(TileCols(q, y)) \in 1..TileN
+      /\ UNION {YCols(q) : q \in 0..(NYParts - 1)} = NHs
+      /\ \A q1, q2 \in 0..(NYParts - 1) : q1 # q2 => YCols(q1) \cap YCols(q2) = {}
 =============================================================================
