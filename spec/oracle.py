@@ -54,6 +54,7 @@ import math
 import os
 import struct
 import sys
+from collections.abc import Mapping
 from fractions import Fraction
 
 # ---------------------------------------------------------------------------------------
@@ -652,6 +653,32 @@ def _radix_vec(modes, X):
     return v
 
 
+class LazyVecs(Mapping):
+    """The nine scatter vectors of a GemmView, each built by _radix_vec on first access
+    and cached (lower(..., build_vec=False)). Holds only the fused modes, O(rank), so a
+    status / lowering-only use of a legal 2^31-row descriptor costs no vector memory.
+    The vectors, once built, are the same lists the eager lowering builds."""
+
+    def __init__(self, modes, where):
+        self._modes, self._where, self._cache = modes, where, {}
+
+    def __getitem__(self, name):
+        if name not in self._cache:
+            X, g = self._where[name]                   # KeyError for an unknown name
+            self._cache[name] = _radix_vec(self._modes[g], X)
+        return self._cache[name]
+
+    def __iter__(self):
+        return iter(self._where)
+
+    def __len__(self):
+        return len(self._where)
+
+    def built(self):
+        """Names of the vectors materialized so far."""
+        return set(self._cache)
+
+
 class GemmView:
     """Result of lower(): the b x (m x n x k) GEMM view and its scatter vectors.
 
@@ -674,9 +701,15 @@ class GemmView:
         return self.b == 0 or self.m == 0 or self.n == 0
 
 
-def lower(A: Desc, B: Desc, C: Desc, mode=EMULATE) -> GemmView:
+def lower(A: Desc, B: Desc, C: Desc, mode=EMULATE, build_vec=True) -> GemmView:
     """DESIGN §5 lowering with the legality rows 1-5 in precedence order (rows 6-7 are
-    execute-time). Raises InvalidValue / NotSupported."""
+    execute-time). Raises InvalidValue / NotSupported.
+
+    build_vec=True (default) builds the nine scatter vectors eagerly as lists (2m + 2n +
+    2k + 3b entries; tens of GB for a legal 2^31-row descriptor). build_vec=False
+    makes v.vec a LazyVecs: every status, dimension, order and fusion result is the same,
+    lowering costs O(rank) time and memory, and a vector is built (identically) only when
+    it is read."""
     T = {"A": A, "B": B, "C": C}
     for d in T.values():
         if any(e < 0 for e in d.extent):
@@ -762,10 +795,14 @@ def lower(A: Desc, B: Desc, C: Desc, mode=EMULATE) -> GemmView:
     v.vec = {}
     if not v.empty_output():
         modes = {g: [(tuple(ls), e, st) for ls, e, st in v.fused[g]] for g in "IJKL"}
-        for name, X, g in (("A_row", "A", "I"), ("A_k", "A", "K"), ("A_bat", "A", "L"),
-                           ("B_k", "B", "K"), ("B_col", "B", "J"), ("B_bat", "B", "L"),
-                           ("C_row", "C", "I"), ("C_col", "C", "J"), ("C_bat", "C", "L")):
-            v.vec[name] = _radix_vec(modes[g], X)
+        where = {"A_row": ("A", "I"), "A_k": ("A", "K"), "A_bat": ("A", "L"),
+                 "B_k": ("B", "K"), "B_col": ("B", "J"), "B_bat": ("B", "L"),
+                 "C_row": ("C", "I"), "C_col": ("C", "J"), "C_bat": ("C", "L")}
+        if build_vec:
+            for name, (X, g) in where.items():
+                v.vec[name] = _radix_vec(modes[g], X)
+        else:
+            v.vec = LazyVecs(modes, where)
     return v
 
 
