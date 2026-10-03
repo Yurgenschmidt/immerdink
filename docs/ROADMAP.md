@@ -1,4 +1,4 @@
-# immerdink roadmap (draft for review, 2026-10-03)
+# immerdink roadmap (priorities set by Eric, 2026-10-03)
 
 Where v1 stands, what comes next, and what each item addresses. **Proposed** ordering;
 Eric reorders/approves before anything starts. Sizes: S ≈ a day of agent work, M ≈ a
@@ -81,13 +81,17 @@ streams, multi-GPU orchestration, a workspace-budget option (g + the host query 
 instead), a native-FP64 TBLIS path (cuTENSOR wins there), the K1 two-launch split
 (measured slower; kept in the spec only), the pinned-host K0 copy.
 
-## Proposed order
+## Priorities (Eric, 2026-10-03)
 
-1. **A1** small-problem overhead (biggest current loss, matters for many-plans use)
-2. **B3** CPU-only CI (cheap; protects everything after)
-3. **A2** K4 overlap (with ncu)
-4. **B1** Python bindings
-5. **C1** adaptive precision (design session first: variant choice)
-6. **B2** performance model (after A settles)
-7. **D1** packed-operand reuse → **A3** tile selection → **D2** complex
-8. Long-term: **D3** packed symmetry, **E1** Hopper/Blackwell, **D4** fused, **F2** paper
+Focus: **straight performance and capabilities.** Software-engineering items are parked
+until the repo matures.
+
+1. **Now:** A1 small-problem overhead, A2 K4 overlap, A4 leftovers; then A3 tile selection.
+2. **Next:** D1 packed-operand reuse, D4 fused variants.
+3. **Then:** D3 packed symmetric contractions, once performance is clean (high interest,
+   not to be rushed).
+4. **Medium:** B2 performance model (designed to be called directly from ehrenfest, so
+   ehrenfest needs no model of its own), B1 Python bindings.
+5. **After Ozaki-II is polished:** C1 adaptive precision.
+6. **Parked:** B3 CI, B4 packaging, F1 test gaps, F2 paper track, D2 complex, E1
+   Hopper/Blackwell (needs hardware).
