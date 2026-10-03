@@ -165,21 +165,23 @@ inline int pack_tile_lg_rows(bool along_rows, int64_t D) {
 // K1 over the pack's row tiles (NOTES-M2M3 #5), used when the pack reads along rows (the
 // operand's smallest-|stride| mode is a row / batch mode, so reading one row along k-bar
 // would be strided). A block takes th rows rho = lo + radix * d, d in [d0, d0 + th), over
-// all of k-bar; thread tid always works on row dl = tid mod th, so a warp reads th rows
-// side by side (coalesced along the pivot) and 32 / th consecutive k-bar. Same two passes
+// all of k-bar (the pack's row enumeration; th = 8 here, see the launch); thread tid always
+// works on row dl = tid mod th, so a warp reads th rows side by side (coalesced along the
+// pivot) and 32 / th consecutive k-bar. Same two passes
 // and the same exact integers as k1_scale: gamma (and the flag) per row, then S per row;
 // the per-thread partial results are combined in shared memory (max, or, u128 sum: exact
 // and order-independent).
-__global__ void __launch_bounds__(kThreads) k1_tiled(ScaleArgs a, int64_t radix, int lg_th) {
-  __shared__ int s_max[kThreads];
-  __shared__ int s_flag[kThreads];
-  __shared__ u128 s_sum[kThreads];
+template <int T>
+__global__ void __launch_bounds__(T) k1_tiled(ScaleArgs a, int64_t radix, int lg_th) {
+  __shared__ int s_max[T];
+  __shared__ int s_flag[T];
+  __shared__ u128 s_sum[T];
   __shared__ int64_t s_base[kTileRowsMax];
   __shared__ bool s_valid[kTileRowsMax];
   __shared__ int s_gamma[kTileRowsMax];
   __shared__ int s_rflag[kTileRowsMax];
   const int tid = threadIdx.x, th = 1 << lg_th, dl = tid & (th - 1);
-  const int h_first = tid >> lg_th, h_step = kThreads >> lg_th, per_row = kThreads >> lg_th;
+  const int h_first = tid >> lg_th, h_step = T >> lg_th, per_row = T >> lg_th;
   const int64_t rows = a.op.rows, D = a.b * rows / radix, n_d = (D + th - 1) >> lg_th;
   const int64_t tiles = radix * n_d;
   for (int64_t t = blockIdx.x; t < tiles; t += gridDim.x) {
@@ -626,10 +628,15 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
     const int64_t rows = p.b * sa.op.rows;
     if (p.pack_along_rows[x]) {  // rows are read side by side: tiles as in the pack
       const int64_t radix = p.pack_radix[x], D = rows / radix;
-      const int lg_th = pack_tile_lg_rows(true, D);
+      // 8 rows side by side (64-byte segments, whole sectors) keep the per-block re-read
+      // footprint small, so more rows fit in L2 for the second pass.
+      const int lg_th = 3;
       const int64_t tiles = radix * ((D + (int64_t{1} << lg_th) - 1) >> lg_th);
-      k1_tiled<<<k1_blocks(tiles, 8.0 * double(p.k) * double(int64_t{1} << lg_th)), kThreads, 0,
-                 stream>>>(sa, radix, lg_th);
+      const unsigned blocks = k1_blocks(tiles, 8.0 * double(p.k) * double(int64_t{1} << lg_th));
+      if (int64_t{blocks} < 2 * int64_t{sm_count()})
+        k1_tiled<1024><<<blocks, 1024, 0, stream>>>(sa, radix, lg_th);
+      else
+        k1_tiled<kThreads><<<blocks, kThreads, 0, stream>>>(sa, radix, lg_th);
     } else {
       const unsigned blocks = k1_blocks(rows, 8.0 * double(p.k));
       if (int64_t{blocks} < 2 * int64_t{sm_count()})
