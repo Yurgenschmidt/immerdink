@@ -79,6 +79,12 @@ if(Python3_FOUND)
   add_test(NAME python_harness
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/harness.py"
                    --lib "$<TARGET_FILE:immerdink>")
+  # DESIGN §3.8 bound on CC-shaped fixtures with stressing data (docs/ACCURACY.md), small
+  # extents; exit 1 on any element whose error exceeds the bound.
+  add_test(NAME accuracy_bound_quick
+           COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/contractions.py"
+                   --lib "$<TARGET_FILE:immerdink>" --quick --rows 16)
+  set_tests_properties(accuracy_bound_quick PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files

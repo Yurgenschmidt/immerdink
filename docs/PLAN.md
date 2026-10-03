@@ -161,10 +161,19 @@ available on sm_89.
 - Permuted tensor contractions within 15% of the matrix-case throughput at equal m, n, k.
 - Each phase reported as a % of its MEMORY_MODEL §5 lower bound.
 
-## M5 — Real-workload check (optional)
+## M5 — Real-workload check (optional) ✅ (done 2026-10-03)
 
 - Run a few real contractions (CC_NOTES fixtures) and one small end-to-end calculation
   against FP64, as a sanity check of the accuracy model.
+- Status: [ACCURACY.md](ACCURACY.md), scripts in `bench/accuracy/`.
+  - 4 CC-shaped fixtures × 5 stressing distributions × N = 8…20 × {RN, TRUNC}, with
+    **no §3.8 bound violation**.
+  - Max observed/bound is 0.2 while emulation error dominates, and 0.99 once the final
+    rounding dominates (N ≥ 16).
+  - A Jacobi iteration shows no error accumulation, and from N = 14 on it matches FP64.
+  - Recommended N: 14 for FP64-comparable normwise accuracy, 16 for the guarantee. Add
+    ≈ log₁₀(‖a‖‖b‖/|x|)/1.15 moduli for an elementwise target.
+  - ctest `accuracy_bound_quick` guards the bound.
 
 ## Later (designed-for, not scheduled)
 

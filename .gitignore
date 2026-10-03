@@ -12,3 +12,4 @@ proofs/.lake/
 build/
 .claude/
 bench/_deps/
+bench/accuracy/__pycache__/
