@@ -61,22 +61,40 @@ struct VisitorModP {
   Params const* params_ptr = nullptr;
 
   struct Callbacks : cutlass::epilogue::threadblock::EmptyCallbacks {
-    int l;  // modulus index of this CTA's batch
+    // Modulus p_l of this CTA's batch and its §3.5 constants, read from the __constant__
+    // table once per CTA. (A2: reading them inside the element loop re-issued two indexed
+    // LDCs and the p = 256 branch per element, ~12 instructions per element instead of 4.)
+    uint32_t p, bias;
+    uint64_t magic;
 
-    CUTLASS_DEVICE explicit Callbacks(int l_) : l(l_) {}
+    CUTLASS_DEVICE explicit Callbacks(int l)
+        : p(imd::device::c_tables.moduli[l]),
+          bias(imd::device::c_tables.epi_bias[l]),
+          magic(imd::device::c_tables.epi_magic[l]) {}
 
-    // frg_prev: zero inputs (store-mod) or the stored u8 residues (add-mod).
+    // frg_prev: zero inputs (store-mod) or the stored u8 residues (add-mod). Both branches
+    // compute imd::device::mod_p_epilogue; p is CTA-uniform, so the p = 256 test is one
+    // uniform branch per fragment.
     template <class ElementAccumulator, int FragmentSize, class... Prev>
     CUTLASS_DEVICE cutlass::Array<uint8_t, FragmentSize> visit(
         int, int, int, int, cutlass::Array<ElementAccumulator, FragmentSize> const& frg_acc,
         Prev const&... frg_prev) {
       static_assert(sizeof...(Prev) <= 1, "VisitorModP takes at most one child (the old W)");
       cutlass::Array<uint8_t, FragmentSize> out;
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < FragmentSize; ++i) {
-        int32_t v = static_cast<int32_t>(frg_acc[i]);
-        ((v += static_cast<int32_t>(frg_prev[i])), ...);  // W + acc stays in int32 (cert_kc)
-        out[i] = static_cast<uint8_t>(imd::device::mod_p(v, l));
+      if (p == 256u) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < FragmentSize; ++i) {
+          int32_t v = static_cast<int32_t>(frg_acc[i]);
+          ((v += static_cast<int32_t>(frg_prev[i])), ...);  // W + acc stays in int32 (cert_kc)
+          out[i] = static_cast<uint8_t>(static_cast<uint32_t>(v) & 255u);
+        }
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < FragmentSize; ++i) {
+          int32_t v = static_cast<int32_t>(frg_acc[i]);
+          ((v += static_cast<int32_t>(frg_prev[i])), ...);
+          out[i] = static_cast<uint8_t>(imd::device::mod_p_barrett(v, p, bias, magic));
+        }
       }
       return out;
     }

@@ -23,14 +23,34 @@ IMD_HD uint64_t umulhi64(uint64_t a, uint64_t b) {
 #endif
 }
 
+// umulhi64(a, n) for a 32-bit n, from 32-bit words (A2): with a = ah 2^32 + al,
+// floor(a n / 2^64) = floor((ah n + floor(al n / 2^32)) / 2^32), because dropping the
+// fraction al n / 2^32 - floor(..) < 1 from the integer ah n 2^32 + al n cannot cross a
+// multiple of 2^64; ah n + floor(al n / 2^32) < 2^64. Same value as umulhi64(a, n) (so
+// cert_barrett's proof applies unchanged); on the device one IMAD.HI.U32 + one
+// IMAD.WIDE.U32 instead of the generic 64 x 64 high product (5 instructions).
+IMD_HD uint32_t umulhi64_u32(uint64_t a, uint32_t n) {
+  const auto al = static_cast<uint32_t>(a), ah = static_cast<uint32_t>(a >> 32);
+#if defined(__CUDA_ARCH__)
+  const uint32_t t = __umulhi(al, n);
+#else
+  const auto t = static_cast<uint32_t>((uint64_t{al} * n) >> 32);
+#endif
+  return static_cast<uint32_t>((uint64_t{ah} * n + t) >> 32);
+}
+
+// §3.5 epilogue for p != 256: n = v + bias in [0, 2^32), q = umulhi64(magic, n) = n div p,
+// v mod p = n - p q (all u32 words), exact for v in [epi_vmin, epi_vmax] (cert_barrett).
+IMD_HD uint32_t mod_p_barrett(int32_t v, uint32_t p, uint32_t bias, uint64_t magic) {
+  const uint32_t n = static_cast<uint32_t>(v) + bias;
+  return n - p * umulhi64_u32(magic, n);
+}
+
 // §3.5 epilogue: the non-negative residue v mod p for v in the certified reachable range
-// [epi_vmin, epi_vmax]. p = 256: two's-complement mask; otherwise n = v + bias in [0, 2^32),
-// q = umulhi64(magic, n) = n div p, v mod p = n - p q (all u32 / u64 words).
+// [epi_vmin, epi_vmax]. p = 256: two's-complement mask; otherwise mod_p_barrett.
 IMD_HD uint32_t mod_p_epilogue(int32_t v, uint32_t p, uint32_t bias, uint64_t magic) {
   if (p == 256u) return static_cast<uint32_t>(v) & 255u;
-  const uint32_t n = static_cast<uint32_t>(v) + bias;
-  const auto q = static_cast<uint32_t>(umulhi64(magic, n));
-  return n - p * q;
+  return mod_p_barrett(v, p, bias, magic);
 }
 
 // §3.6: n mod p for n in [0, 2^16) (n = q_l W_l), same magic, bias 0.
