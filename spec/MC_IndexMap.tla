@@ -76,6 +76,26 @@
 (*               lowering to I with stride 0 in A is exact); it is a v1    *)
 (*               policy.                                                   *)
 (*                                                                         *)
+(*  pos_swap     role swap (§5 step 8): 3 labels, ranks <= 2, extents      *)
+(*               {1,2,3}, C strides {-1,0,1,2,3}: swapped / unswapped,     *)
+(*               fastest mode in L, the extent > 1 filter ON its boundary  *)
+(*               (an extent-1 I mode of stride 0), swap at extent 3        *)
+(*               (m, n = 3, 2 -> 2, 3, nh = 4). Every claim of the module  *)
+(*               also runs on the swapped lowering in every model above.   *)
+(*  pos_swap_order  4 labels, extent 2, operand strides with zeros: the    *)
+(*               orders on the POST-swap roles (K's big operand at m = n), *)
+(*               position from the caller's label order (full K ties).     *)
+(*  pos_limit_n  GemmMax = 3 (real 2^31 - 1), PadQ = 2, extents {0,2,3},   *)
+(*               EMULATE and DIRECT: m = 3 ON the boundary; n = 3 <=       *)
+(*               GemmMax but nh = 4 rejected; the post-swap nh decides;    *)
+(*               DIRECT, an empty output, k = 0 and K-empty are exempt.   *)
+(*  pos_limit_m  GemmMax = 2: m = 2 ON, m = 3 rejected (EMULATE only).     *)
+(*  pos_contract_ws     imd_contract, AlignWS = 16: workspace placed       *)
+(*               touching / one byte into C, A, B, ws_bytes = size - 1,   *)
+(*               size, size + 8 (slack overlapping A is fine), both modes. *)
+(*  pos_contract_order  null x misalignment x ws placement x ws_bytes:    *)
+(*               every pair of §6 checks firing together.                  *)
+(*                                                                         *)
 (* NEGATIVE models (must fail as their "\* EXPECT:" says):                 *)
 (*  neg_cstride  Drop "CStride": a C with |s_t| = span (one below the      *)
 (*               boundary) is accepted and written twice.                  *)
@@ -90,6 +110,26 @@
 (*  neg_alias    Drop "Aliasing": C shares an element with A.             *)
 (*  neg_rule_sufficient_only  StrideRuleNecessary fails: the rule rejects  *)
 (*               an injective C (e = (2,2,2), s = (2,3,4)), as DESIGN says.*)
+(*  neg_noswap / neg_swap_filter   SwapMakesJFastest: no swap / the swap   *)
+(*               decided over all C modes (swape1 is swapped).            *)
+(*  neg_swap_late_ws / neg_swap_late_limit   swap after sizing: a region   *)
+(*               overruns (WorkspaceFits) / a GEMM with nh > GemmMax is    *)
+(*               launched (GemmDimsFit).                                   *)
+(*  neg_order_pre_swap  orders before the swap: CanonicalOrderSorted.     *)
+(*  neg_pos_swapped     position from the swapped descriptor:              *)
+(*               CanonicalOrderExact.                                      *)
+(*  neg_limit_drop / neg_limit_n   GemmDimsFit: no limit / n checked, not  *)
+(*               nh.  neg_limit_direct / _empty / _k   LimitScope: limit   *)
+(*               applied in DIRECT / to an empty output / with k < 2.      *)
+(*  neg_null, neg_ws_alias, neg_ws_range, neg_misaligned,                  *)
+(*  neg_insufficient   one §6 check dropped (ws_range: [ws, ws + ws_bytes)*)
+(*               instead of [ws, ws + workspace_size)): NoNullDeref,      *)
+(*               WsNoAlias, AliasingSound, AlignedAccess, WsSufficient.    *)
+(*  neg_order_*  the §6 checks reordered (null/empty, empty last,          *)
+(*               MISALIGNED before ALIASING, INSUFFICIENT before           *)
+(*               MISALIGNED): StatusCorrect. These orders are POLICY (no  *)
+(*               semantic invariant depends on them); the models show the  *)
+(*               enumerated space distinguishes every adjacent pair.       *)
 (***************************************************************************)
 EXTENDS IndexMap
 
@@ -110,6 +150,9 @@ CAl       == -3..4
 \* Swap models: C strides with 0 (an extent-1 mode may have it), signs,
 \* and 3 (dense at extent 3).
 SwS(r)    == [1..r -> {-1, 0, 1, 2, 3}]
+\* Swap -> order model: operand strides with zeros (full K-key ties) and
+\* both mode orders.
+Ord2(r)   == IF r = 2 THEN {<<1, 0>>, <<0, 1>>, <<1, 2>>, <<2, 1>>} ELSE [1..r -> {0, 1}]
 \* Contract models: A at elements {0,1} (bytes [0,16)), B at {2,3} ([16,32)),
 \* C at 1 (aliases A), 4 (touches B) or 5.
 BC145     == {1, 4, 5}
@@ -339,7 +382,18 @@ Cov == [
                  T(100, <<1, 3>>, <<1, 2>>, <<0, 1>>)),
   \* swap at extent 3: user m = 3, n = 2 become m = 2, n = 3, nh = 4.
   swap3    |-> D(T(0, <<1, 2>>, <<3, 2>>, <<1, 2>>), T(0, <<2, 3>>, <<2, 2>>, <<1, 2>>),
-                 T(100, <<1, 3>>, <<3, 2>>, <<1, 3>>))
+                 T(100, <<1, 3>>, <<3, 2>>, <<1, 3>>)),
+  \* order after the swap, m = n = 2: K = {2 (A-only, stride 2 in A),
+  \* 4 (B-only, stride 2 in B)}. Post-swap big = A' = the caller's B, so
+  \* K = <<2, 4>> (label 2 has stride 0 there); ordering BEFORE the swap
+  \* (big = the caller's A) gives <<4, 2>>.
+  ordK     |-> D(T(0, <<1, 2>>, <<2, 2>>, <<1, 2>>), T(0, <<3, 4>>, <<2, 2>>, <<1, 2>>),
+                 T(100, <<1, 3>>, <<2, 2>>, <<1, 2>>)),
+  \* full tie in K (strides 0 in both operands): position decides, from the
+  \* CALLER's A.l ++ B.l ++ C.l: <<2, 4>>; the swapped descriptor's
+  \* B.l ++ A.l ++ C.l would give <<4, 2>>.
+  ordPos   |-> D(T(0, <<1, 2>>, <<2, 2>>, <<1, 0>>), T(0, <<3, 4>>, <<2, 2>>, <<1, 0>>),
+                 T(100, <<1, 3>>, <<2, 2>>, <<1, 2>>))
 ]
 
 (* Coverage with execute arguments and an EXPECTED status (rejections     *)
@@ -379,10 +433,10 @@ CovX == [
   limdir   |-> <<DLn3, XDirect, "SUCCESS">>,
   limswap  |-> <<DLswap, XDef, "INVALID_VALUE">>,
   limempty |-> <<DLempty, XDef, "SUCCESS">>,
-  \* DESIGN-literal row 5 (EMULATE mode, non-empty output): these two run
-  \* no GEMM (K-empty -> DIRECT; k = 0 -> beta*C) yet are rejected.
-  limkempty |-> <<DLkempty, XDef, "INVALID_VALUE">>,
-  limk0    |-> <<DLk0, XDef, "INVALID_VALUE">>,
+  \* k < 2 runs no GEMM (K-empty -> DIRECT; k = 0 -> beta*C): not limited
+  \* (the k >= 2 boundary of row 5).
+  limkempty |-> <<DLkempty, XDef, "SUCCESS">>,
+  limk0    |-> <<DLk0, XDef, "SUCCESS">>,
   \* --- GEMM limits, GemmMax = 2 ---
   limm2    |-> <<DLm2, XDef, "SUCCESS">>,
   limm3rej |-> <<DLm3, XDef, "INVALID_VALUE">>,
@@ -430,6 +484,13 @@ ASSUME Drop = "none" =>
              /\ UDims(Cov.swap3).m = 3 /\ UDims(Cov.swap3).n = 2
 \* SwapFilter's witness: it swaps swape1 (the extent-1 I mode, stride 0).
 ASSUME Drop = "SwapFilter" => LowerTop(Cov.swape1, "EMULATE").swap
+\* Swap -> order pins (both descriptors are swapped).
+ASSUME Drop = "none" =>
+         /\ LowerTop(Cov.ordK, "EMULATE").swap /\ LowerTop(Cov.ordPos, "EMULATE").swap
+         /\ LowerTop(Cov.ordK, "EMULATE").ord["K"] = <<2, 4>>
+         /\ LowerTop(Cov.ordPos, "EMULATE").ord["K"] = <<2, 4>>
+ASSUME Drop = "OrderPreSwap" => LowerTop(Cov.ordK, "EMULATE").ord["K"] = <<4, 2>>
+ASSUME Drop = "PosSwapped"   => LowerTop(Cov.ordPos, "EMULATE").ord["K"] = <<4, 2>>
 
 \* Pins on coverage descriptors (design models only):
 \*  - fusion HAPPENS when on its boundary (a lowering that never fuses is

@@ -29,8 +29,9 @@
 (*           (NOT_SUPPORTED), 3 C-only label with extent > 1              *)
 (*           (NOT_SUPPORTED), 4 the sorted-|stride| rule on a non-empty C  *)
 (*           (INVALID_VALUE), 5 the CUTLASS GemmCoord limit m, nh <=       *)
-(*           GemmMax in EMULATE mode with a non-empty output, on the       *)
-(*           POST-swap m and nh (INVALID_VALUE); then execute time         *)
+(*           GemmMax when the emulated GEMM runs (EMULATE, non-empty       *)
+(*           output, k >= 2), on the POST-swap m and nh (INVALID_VALUE);   *)
+(*           then execute time                                             *)
 (*           (imd_contract, DESIGN §6 order): null pointer                 *)
 (*           (INVALID_VALUE), empty output (SUCCESS, nothing touched),     *)
 (*           ALIASING (C vs A/B byte hulls; workspace [ws, ws +            *)
@@ -40,7 +41,9 @@
 (*           smallest-|stride| one carries an I label, the operand roles   *)
 (*           are swapped (Cᵀ = BᵀAᵀ: the descriptors A and B exchange      *)
 (*           places, so I and J exchange) BEFORE everything that uses m,  *)
-(*           n: the §4a sizing, the GEMM limits, the lowering.             *)
+(*           n: the §4a sizing, the GEMM limits, the lowering, and the     *)
+(*           canonical orders (post-swap roles; the position tie-break     *)
+(*           uses the CALLER's label order A.l ++ B.l ++ C.l).             *)
 (*  lower    on the (possibly swapped) descriptor: step 2 diagonal merge   *)
 (*           (strides of a repeated label summed: MS below), step 4        *)
 (*           extent-1 labels dropped, step 5/6 classification by           *)
@@ -74,7 +77,8 @@
 (*  LayoutBijective, DecodeBijective, FusionPreservesAddresses,            *)
 (*  OperandIndependence, NoCAliasing, StrideRuleImpliesInjective,          *)
 (*  StatusCorrect (incl. the full plan + contract precedence chain),       *)
-(*  CanonicalOrderSorted, OrderIndependent (expensive; small models only), *)
+(*  CanonicalOrderSorted, CanonicalOrderExact (the full key, post-swap     *)
+(*  roles, caller's position), OrderIndependent (expensive; small models), *)
 (*  the role swap: SwapWellDefined, SwapMakesJFastest (and every claim     *)
 (*  above holds on the swapped lowering), the sizing and dispatch:         *)
 (*  DispatchByDescriptor, WorkspaceFits, WorkspaceExact, GemmDimsFit,      *)
@@ -132,6 +136,12 @@
 (*  "GemmLimitN"      row 5     checks n instead of nh = ceil_Q(n)         *)
 (*  "GemmLimitDirect" row 5     also applied in DIRECT mode                *)
 (*  "GemmLimitEmpty"  row 5     also applied to an empty output            *)
+(*  "GemmLimitK"      row 5     also applied when k < 2 (no GEMM runs)     *)
+(*  "OrderPreSwap" §5 step 8    canonical orders computed BEFORE the swap  *)
+(*                              (K's "big" on the caller's roles; differs  *)
+(*                              only when m = n)                           *)
+(*  "PosSwapped"   §5 step 8    position tie-break from the swapped        *)
+(*                              descriptor (B.l ++ A.l ++ C.l)             *)
 (*  "Null"       §6 1           null pointers not rejected                 *)
 (*  "WsAlias"    §5 row 6       workspace vs A/B/C test dropped            *)
 (*  "WsRangeBytes" row 6        workspace range [ws, ws + ws_bytes)        *)
@@ -324,8 +334,13 @@ Decode(o, ext, size) ==
            [l \in {o[j] : j \in 1..n} |->
               LET j == CHOOSE j \in 1..n : o[j] = l IN (q \div pre[j]) % ext[l]]]
 
-\* d is the descriptor the lowering works on (already swapped if sw).
-Lower(d, mode, sw) ==
+\* d is the descriptor the lowering works on (already swapped if sw); od is
+\* the CALLER's descriptor. DESIGN §5 step 8 (as implemented in M1): the
+\* swap comes first, the canonical orders are computed on the post-swap
+\* roles (so K's "big" operand compares the post-swap m, n), and the
+\* final tie-break "position" is taken from the caller's original label
+\* order od.A.l \o od.B.l \o od.C.l.
+Lower(d, mode, sw, od) ==
     LET labs == AllLab(d)
         ext  == [l \in labs |-> Ext(d, l)]
         ms   == [X \in Tens, l \in labs |-> MS(d, X, l)]
@@ -335,11 +350,18 @@ Lower(d, mode, sw) ==
         sz   == [g \in Grps |-> ProdOver(grp[g], ext)]
         m == sz["I"]  n == sz["J"]  k == sz["K"]  b == sz["L"]
         kh == CeilQ(k)  nh == CeilQ(n)
-        big == IF m >= n THEN "A" ELSE "B"                        \* step 8
+        \* step 8. Drop "OrderPreSwap": the order is computed BEFORE the
+        \* swap, i.e. "big" is decided on the caller's roles (the caller's
+        \* A = role B after a swap); this differs only when m = n.
+        big == IF Drop = "OrderPreSwap" /\ sw
+               THEN (IF n >= m THEN "B" ELSE "A")
+               ELSE (IF m >= n THEN "A" ELSE "B")
         oth == IF big = "A" THEN "B" ELSE "A"
+        \* Drop "PosSwapped": position taken from the swapped descriptor.
+        posd == IF Drop = "PosSwapped" THEN d ELSE od
         key == [g \in Grps |-> [l \in grp[g] |->
                   LET a == Abs(ms["A", l])  bb == Abs(ms["B", l])
-                      c == Abs(ms["C", l])  f == FirstPos(d, l)
+                      c == Abs(ms["C", l])  f == FirstPos(posd, l)
                   IN  CASE g = "I" -> <<c, a, 0, f>>
                         [] g = "J" -> <<c, bb, 0, f>>
                         [] g = "L" -> <<c, a, bb, f>>
@@ -465,7 +487,7 @@ LD(d)        == IF DoSwap(d) THEN Sw(d) ELSE d
 PDims(d)     == UDims(LD(d))                         \* post-swap (DESIGN)
 SDims(d)     == IF Drop = "SwapLate" THEN UDims(d) ELSE PDims(d)  \* what sizing uses
 
-LowerTop(d, mode) == Lower(LD(d), mode, DoSwap(d))
+LowerTop(d, mode) == Lower(LD(d), mode, DoSwap(d), d)
 
 \* Dispatch by descriptor (§4 DIRECT path, §4a): a pure function of the
 \* GEMM dimensions and the mode.
@@ -499,9 +521,13 @@ WsSizeU(u, mode) ==
 WsSizeImpl(d, mode)   == WsSizeU(SDims(d), mode)   \* imd_workspace_size as built
 WsSizeDesign(d, mode) == WsSizeU(PDims(d), mode)   \* DESIGN §4a
 
-\* §5 row 5, the CUTLASS GemmCoord limit (scaled: GemmMax).
+\* §5 row 5, the CUTLASS GemmCoord limit (scaled: GemmMax). It applies
+\* exactly when the emulated GEMM runs: EMULATE mode, a non-empty output
+\* and k >= 2 (k = 0: C <- beta*C; k = 1: K-empty, dispatched to DIRECT),
+\* the same condition as the RN acceptance rule (orchestrator, M1).
 LimitApplies(d, x) == /\ x.mode = "EMULATE" \/ Drop = "GemmLimitDirect"
                       /\ ~EmptyOut(d) \/ Drop = "GemmLimitEmpty"
+                      /\ UDims(d).k >= 2 \/ Drop = "GemmLimitK"
 LimitExceeded(d)   == LET u == SDims(d) IN
                       \/ u.m > GemmMax
                       \/ (IF Drop = "GemmLimitN" THEN u.n ELSE CeilQ(u.n)) > GemmMax
@@ -773,7 +799,7 @@ Reasons(d, x) ==
        <<"RepeatC",   RepeatedC(d),                              "NOT_SUPPORTED">>,
        <<"COnly",     COnlyBig(d),                               "NOT_SUPPORTED">>,
        <<"CStride",   ~Empty(d, "C") /\ ~StrideRule(d, "C"),     "INVALID_VALUE">>,
-       <<"GemmLimit", x.mode = "EMULATE" /\ ~EmptyOut(d)
+       <<"GemmLimit", x.mode = "EMULATE" /\ ~EmptyOut(d) /\ u.k >= 2
                       /\ (u.m > GemmMax \/ CeilQ(u.n) > GemmMax), "INVALID_VALUE">>,
        <<"Null",      x.nul # {},                                "INVALID_VALUE">>,
        <<"-",         EmptyOut(d),                               "SUCCESS">>,
@@ -811,14 +837,39 @@ StatusCorrect ==
 \* C's merged |stride| (so CRT scatter writes coalesce); within K it is
 \* non-decreasing in the LARGER operand's |stride| (A if m >= n, else B, in
 \* GEMM roles; stride 0 for a label the operand lacks). Ties are broken by a
-\* fixed key (see Lower) that DESIGN does not prescribe, so only the DESIGN
-\* key is checked. The "larger operand" is recomputed here from m, n.
+\* fixed key (see CanonicalOrderExact). The "larger operand" is recomputed
+\* here from the post-swap m, n.
 CanonicalOrderSorted ==
     ok => LET bigX == IF low.m >= low.n THEN "A" ELSE "B"
               keyT(g) == IF g = "K" THEN bigX ELSE "C"
           IN  \A g \in Grps : \A t \in 1..(Len(low.ord[g]) - 1) :
                 Abs(MS(low.d, keyT(g), low.ord[g][t]))
                   <= Abs(MS(low.d, keyT(g), low.ord[g][t + 1]))
+
+\* DESIGN §5 step 8 in full (orchestrator clarification, as built in M1):
+\* the swap comes FIRST; then I by (|s_C|, |s_A|, position), J by (|s_C|,
+\* |s_B|, position), L by (|s_C|, |s_A|, |s_B|, position) and K by (|s_big|,
+\* |s_other|, position), big = A if m >= n else B, all in the POST-swap
+\* roles (low.d, low.m, low.n), and position = first occurrence in the
+\* CALLER's A.labels ++ B.labels ++ C.labels (desc). Lexicographic keys;
+\* every group's order is exactly the sorted one. Written independently of
+\* Lower's key table.
+CanonicalOrderExact ==
+    ok => LET d == low.d
+              bigX == IF low.m >= low.n THEN "A" ELSE "B"
+              othX == IF bigX = "A" THEN "B" ELSE "A"
+              cat == desc.A.l \o desc.B.l \o desc.C.l
+              pos(l) == CHOOSE p \in 1..Len(cat) : cat[p] = l /\ \A q \in 1..(p - 1) : cat[q] # l
+              s(X, l) == Abs(MS(d, X, l))
+              kk(g, l) == CASE g = "I" -> <<s("C", l), s("A", l), pos(l)>>
+                            [] g = "J" -> <<s("C", l), s("B", l), pos(l)>>
+                            [] g = "L" -> <<s("C", l), s("A", l), s("B", l), pos(l)>>
+                            [] g = "K" -> <<s(bigX, l), s(othX, l), pos(l)>>
+              lt(u, v) == \E t \in DOMAIN u : u[t] < v[t] /\ \A r \in 1..(t - 1) : u[r] = v[r]
+          IN  \A g \in Grps :
+                /\ {low.ord[g][t] : t \in DOMAIN low.ord[g]} = low.grp[g]
+                /\ \A t \in 1..(Len(low.ord[g]) - 1) :
+                      lt(kk(g, low.ord[g][t]), kk(g, low.ord[g][t + 1]))
 
 \* DESIGN §1.1 / r_layout §4.1: the result does not depend on the group
 \* orders (canonical orders are a performance choice only). Every
@@ -913,10 +964,11 @@ WorkspaceExact ==
 GemmDimsFit ==
     ok /\ low.kind = "GEMM" => low.m <= GemmMax /\ low.nh <= GemmMax
 
-\* §5 row 5 scope: a DIRECT-mode call and an empty output are never
-\* rejected because of the GEMM limits.
+\* §5 row 5 scope: a call that runs no CUTLASS GEMM (DIRECT mode, an empty
+\* output, k = 0, or K-empty with k = 1) is never rejected because of the
+\* GEMM limits.
 LimitScope ==
-    (xa.mode = "DIRECT" \/ EmptyOut(desc)) =>
+    (xa.mode = "DIRECT" \/ EmptyOut(desc) \/ PDims(desc).k < 2) =>
         st = StatusX(desc, xa, {Drop, "GemmLimit"})
 
 -----------------------------------------------------------------------------
@@ -963,7 +1015,7 @@ ASSUME Drop \in {"none", "Extents", "RepeatC", "COnly", "CStride", "Aliasing",
                  "GemmLimit", "GemmLimitN", "GemmLimitDirect", "GemmLimitEmpty",
                  "Null", "WsAlias", "WsRangeBytes", "Misaligned", "Insufficient",
                  "OrderNullEmpty", "OrderEmptyLast", "OrderAlignFirst",
-                 "OrderInsuffFirst"}
+                 "OrderInsuffFirst", "OrderPreSwap", "PosSwapped", "GemmLimitK"}
 ASSUME GemmMax >= 1 /\ AlignWS >= 8 /\ AlignWS % 8 = 0
 ASSUME \A x \in Execs :
           /\ x.mode \in {"EMULATE", "DIRECT"}
