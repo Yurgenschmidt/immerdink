@@ -1162,6 +1162,71 @@ def sigma_extremes():
     return hi, hi_rn, lo
 
 
+def test_lazy_lower():
+    """lower(..., build_vec=False): same results as the eager lowering, vectors built only
+    on access and identical; a legal 2^31-row descriptor lowers in O(rank) time and memory
+    (NOTES-M2M3 issue 8: the eager lists needed tens of GB)."""
+    import tracemalloc
+    rng = random.Random(83)
+    fields = ("m", "n", "k", "b", "swapped", "order", "fused", "stride", "first", "ext")
+    compared = 0
+    for _ in range(300):
+        A, B, C = rand_desc_triple(rng)
+        for mode in (o.EMULATE, o.DIRECT):
+            try:
+                ve = o.lower(A, B, C, mode)
+            except (o.InvalidValue, o.NotSupported) as ex:
+                try:
+                    o.lower(A, B, C, mode, build_vec=False)
+                except type(ex) as ex2:
+                    assert str(ex2) == str(ex)
+                else:
+                    raise AssertionError("lazy lowering accepted a rejected descriptor")
+                continue
+            vl = o.lower(A, B, C, mode, build_vec=False)
+            for f in fields:
+                assert getattr(vl, f) == getattr(ve, f), f
+            if not ve.empty_output():
+                assert isinstance(vl.vec, o.LazyVecs) and not vl.vec.built()
+                assert list(vl.vec) == list(ve.vec) == list(o.GemmView.VEC_ORDER)
+                assert vl.vec["C_col"] == ve.vec["C_col"] and vl.vec.built() == {"C_col"}
+                assert vl.vec_region() == ve.vec_region() and dict(vl.vec) == ve.vec
+                compared += 1
+            else:
+                assert vl.vec == ve.vec == {}
+    assert compared > 100, compared
+
+    # Legal huge descriptors: 'ik,kj->ij' with m = 2^31 - 1 (EMULATE, ON the GemmCoord
+    # limit) and m = 2^31 (DIRECT; EMULATE rejects it at row 5), n = 3, k = 4.
+    i, j, kk = 1, 2, 3
+    budget_bytes, budget_s = 4 * 2**20, 2.0
+    for m, mode in ((2**31 - 1, o.EMULATE), (2**31, o.DIRECT), (2**31, o.EMULATE)):
+        A = o.Desc([m, 4], [4, 1], [i, kk])
+        B = o.Desc([4, 3], [1, 4], [kk, j])
+        C = o.Desc([m, 3], [3, 1], [i, j])
+        tracemalloc.start()
+        t1 = time.perf_counter()
+        try:
+            v = o.lower(A, B, C, mode, build_vec=False)
+            st = "SUCCESS"
+        except o.InvalidValue:
+            v, st = None, "INVALID_VALUE"
+        dt = time.perf_counter() - t1
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        want = "INVALID_VALUE" if (mode == o.EMULATE and m > o.GEMM_DIM_MAX) else "SUCCESS"
+        assert st == want, (m, mode, st)
+        assert peak <= budget_bytes and dt <= budget_s, (m, mode, peak, dt)
+        if v is not None:
+            assert (v.m, v.n, v.k, v.b, v.swapped) == (m, 3, 4, 1, False)
+            assert not v.vec.built() and len(v.vec) == 9
+            # small vectors are still available, built on access only
+            assert v.vec["C_col"] == [0, 1, 2] and v.vec["A_k"] == [0, 1, 2, 3]
+            assert v.vec.built() == {"C_col", "A_k"}
+        RESULTS.setdefault("lazy_lower", []).append(
+            f"m={m} {mode}: {st}, peak {peak / 1024:.1f} KiB, {dt * 1e3:.2f} ms")
+
+
 def main():
     t0 = time.time()
     for name, fn in (("primitives+negatives", test_primitives),
@@ -1169,7 +1234,8 @@ def main():
                      ("determinism (3)", test_determinism), ("non-finite (4)", test_nonfinite),
                      ("edges (5)", test_edges), ("adversarial (A)", test_adversarial),
                      ("stats (6)", test_stats),
-                     ("dgemm-like (7)", test_dgemm_like), ("tensor front end (8)", test_tensor)):
+                     ("dgemm-like (7)", test_dgemm_like), ("tensor front end (8)", test_tensor),
+                     ("lazy lowering (9)", test_lazy_lower)):
         t1 = time.time()
         fn()
         print(f"PASS  {name:24s} {time.time() - t1:7.1f}s", flush=True)
@@ -1192,6 +1258,9 @@ def main():
     print(RESULTS["adversarial"])
     print(RESULTS["stats"])
     print(RESULTS["dgemm_like"])
+    print("lazy lowering (build_vec=False):")
+    for line in RESULTS["lazy_lower"]:
+        print("  " + line)
     print(f"\nALL PASS in {time.time() - t0:.1f}s")
 
 
