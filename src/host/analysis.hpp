@@ -39,13 +39,24 @@ inline bool emulates(const ExecPlan& e) { return e.path == Path::kGemm && e.k >=
 constexpr int64_t kFusedKHatMax = 1024;  // 512 until A3 (DESIGN v1.5)
 inline bool fused_path(const ExecPlan& e) { return emulates(e) && e.k_hat <= kFusedKHatMax; }
 
+// v1.6 (DESIGN §4 "KL"): the operands scaled and packed (group 1) by the fused large launch
+// KL, as a bit mask (bit 0: the GEMM's A, bit 1: its B, post-swap): every operand of a plan
+// with the emulated GEMM that does not take KF. A pure function of the lowering.
+constexpr int32_t kFusedLargeA = 1, kFusedLargeB = 2;
+inline int32_t fused_large(const ExecPlan& e) {
+  if (!emulates(e) || fused_path(e)) return 0;
+  return kFusedLargeA | kFusedLargeB;
+}
+
 // Kernel launches of one imd_contract with alpha != 0 (DESIGN §4, §6a kernel_launches):
-// NOOP 0; DIRECT / SCALE: K0 (generate mode) + 1; EMULATE: fused ? KF : K0 (generate) + 2 K1,
-// then per residue group not packed by KF two packs (+ one launch zeroing the B rows
-// n..n_hat-1 if n_hat > n), the K4 launches, and K5. `fused` and `resident` are the plan's
-// choices (fused_path, vec_mode = IMD_VEC_RESIDENT); `k4_launches` is plan_k4_counts.
-IMD_HOST_INTERNAL int64_t plan_launches(const ExecPlan& e, bool fused, bool resident,
-                                        int64_t k4_launches);
+// NOOP 0; DIRECT / SCALE: K0 (generate mode) + 1; EMULATE: fused ? KF : K0 (generate) + one
+// scale launch per operand (K1 of it, or v1.6 KL), then per residue group two packs (+ one
+// launch zeroing the B rows n..n_hat-1 if n_hat > n), except group 1's packs of KF (both
+// operands) or of the KL operands (KL_B zeroes those rows itself), the K4 launches, and K5.
+// `fused`, `fused_large` and `resident` are the plan's choices (fused_path, fused_large,
+// vec_mode = IMD_VEC_RESIDENT); `k4_launches` is plan_k4_counts.
+IMD_HOST_INTERNAL int64_t plan_launches(const ExecPlan& e, bool fused, int32_t fused_large,
+                                        bool resident, int64_t k4_launches);
 
 // kappa = ceil(sqrt(k)) exactly (k >= 1; 0 for k = 0), DESIGN §3.2.
 IMD_HOST_INTERNAL uint64_t ceil_sqrt_u64(uint64_t k);

@@ -111,7 +111,9 @@ class Library:
         return None if self.shim is None else self.shim.imd_shim_launch_count()
 
     def set_fused(self, mode=-1):
-        """v1.4 fused path for plans created afterwards: -1 plan-time rule, 0 never."""
+        """Fused launches of plans created afterwards (src/test_hooks.cpp): -1 the plan-time
+        rules (v1.4 KF, v1.6 KL), 0 none, 2 KL for both operands of every emulated plan,
+        3 as 2 with 64-row KL tiles (several chunks per row)."""
         assert self.lib.imd_test_set_fused(mode) == 0
 
     def set_k5_one_elem(self, per_sm=-1):
@@ -134,6 +136,10 @@ class Library:
         """(fused, kernel launches per imd_contract with alpha != 0) of a real plan."""
         v = self.plan_sizes(plan)
         return bool(v[32]), v[33]
+
+    def plan_fused_large(self, plan):
+        """The operands a real plan scales and packs with KL (bit 0: A, bit 1: B; v1.6)."""
+        return self.plan_sizes(plan)[37]
 
     def plan_k4(self, plan):
         """(K4 configuration the plan runs, that of its K4 parameters, its SM count); the

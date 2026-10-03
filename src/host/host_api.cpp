@@ -19,9 +19,11 @@ using imd::detail::ExecPlan;
 constexpr uint32_t kLoweringV1Size = 136;
 constexpr uint32_t kLoweringV2Size = 152;  // + fused, reserved, kernel_launches (v1.4)
 constexpr uint32_t kLoweringV3Size = 168;  // + sm_count, k4_config, k4_tune_bytes (v1.5)
+constexpr uint32_t kLoweringV4Size = 176;  // + fused_large, reserved4 (v1.6)
 static_assert(offsetof(imd_lowering_t, fused) == kLoweringV1Size, "imd_lowering_t v1 layout changed");
 static_assert(offsetof(imd_lowering_t, sm_count) == kLoweringV2Size, "imd_lowering_t v2 layout changed");
-static_assert(sizeof(imd_lowering_t) == kLoweringV3Size, "imd_lowering_t v3 layout changed");
+static_assert(offsetof(imd_lowering_t, fused_large) == kLoweringV3Size, "imd_lowering_t v3 layout changed");
+static_assert(sizeof(imd_lowering_t) == kLoweringV4Size, "imd_lowering_t v4 layout changed");
 static_assert(sizeof(imd_options_t) == 24, "imd_options_t layout changed");
 static_assert(sizeof(imd_region_t) == 16, "imd_region_t layout changed");
 
@@ -139,10 +141,13 @@ imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B, const im
       r.k_chunks = kc.k_chunks;
       r.gemm_launches = kc.launches;
     }
-    // v1.4: the fused launch and the kernel launches per call (contract.cu runs exactly these).
+    // v1.4: the fused launch and the kernel launches per call (contract.cu runs exactly these);
+    // v1.6: the operands of the fused large launch KL (plan_data set e.fused_large).
     const bool fused = imd::detail::fused_path(e);
     r.fused = fused ? 1 : 0;
-    r.kernel_launches = imd::detail::plan_launches(e, fused, an.options.vec_mode == IMD_VEC_RESIDENT,
+    r.fused_large = imd::detail::fused_large(e);
+    r.kernel_launches = imd::detail::plan_launches(e, fused, r.fused_large,
+                                                   an.options.vec_mode == IMD_VEC_RESIDENT,
                                                    r.gemm_launches);
     // v1.5: the K4 configuration of the plan-time rule (api.cpp uses the same function with
     // the device's SM count) and the autotuning scratch bytes.

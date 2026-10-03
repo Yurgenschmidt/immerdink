@@ -2,8 +2,9 @@
 // captured into a CUDA graph on the caller's stream in cudaStreamCaptureModeGlobal (which
 // makes any allocation or synchronization during capture, in any thread, an error), the
 // graph is replayed twice, and each replay's C is bit-identical to an uncaptured call.
-// Shapes: a matrix with three residue groups, a batched tensor, and an alpha = 0 call
-// (beta-only K5), so K0 / K1 / K2-K4 / K5 and the beta-only path are all captured.
+// Shapes: a matrix with three residue groups, a long-k matrix (v1.6 KL), a batched tensor,
+// and an alpha = 0 call (beta-only K5), so K0 / K1 / KL / K2-K4 / K5 and the beta-only path
+// are all captured.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -116,6 +117,10 @@ int main() {
   for (int vec : {IMD_VEC_GENERATE, IMD_VEC_RESIDENT}) {
     run("matrix 300x200x700 N=14 g=5", {300, 700}, {1, 3}, {700, 200}, {3, 2}, {300, 200}, {1, 2},
         14, 5, 1.0, vec, h);
+    // v1.6 KL for both operands (k_hat = 5008 > 1024): A along k (two chunks), B along rows
+    // (8-row tiles, ten chunks: re-read chunks), RB rows 40..47 zeroed by KL_B; g = 3.
+    run("matrix 200x40x5000 N=8 g=3 (KL)", {200, 5000}, {1, 3}, {5000, 40}, {3, 2}, {200, 40},
+        {1, 2}, 8, 3, 1.0, vec, h);
     run("batched lik,lkj->ilj N=9", {4, 64, 200}, {4, 1, 3}, {4, 200, 48}, {4, 3, 2}, {64, 4, 48},
         {1, 4, 2}, 9, 0, -1.5, vec, h);
     run("alpha = 0 (beta-only K5)", {300, 700}, {1, 3}, {700, 200}, {3, 2}, {300, 200}, {1, 2}, 14,

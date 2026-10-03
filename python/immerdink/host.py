@@ -29,7 +29,7 @@ from dataclasses import dataclass
 __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "workspace_size",
            "workspace_layout", "plan_bytes", "lowering", "g_tradeoff", "REGIONS", "STATUS"]
 
-API_VERSION = 3  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+API_VERSION = 4  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
 
 STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT_WORKSPACE",
           "MISALIGNED", "CUDA_ERROR", "ALLOC_FAILED"]
@@ -77,10 +77,11 @@ class _Lowering(C.Structure):
                 ("kappa", C.c_uint64), ("workspace_bytes", C.c_uint64),
                 ("plan_device_bytes", C.c_uint64), ("plan_host_bytes", C.c_uint64),
                 ("fused", C.c_int32), ("reserved", C.c_int32), ("kernel_launches", C.c_int64),
-                ("sm_count", C.c_int32), ("k4_config", C.c_int32), ("k4_tune_bytes", C.c_uint64)]
+                ("sm_count", C.c_int32), ("k4_config", C.c_int32), ("k4_tune_bytes", C.c_uint64),
+                ("fused_large", C.c_int32), ("reserved4", C.c_int32)]
 
 
-assert C.sizeof(_Lowering) == 168  # version 3 (DESIGN §6a v1.5)
+assert C.sizeof(_Lowering) == 176  # version 4 (DESIGN §6a v1.6)
 assert C.sizeof(_Options) == 24
 
 
@@ -302,6 +303,8 @@ class Lowering:
     sm_count: int          # v3: the SM count the K4 rule was evaluated for
     k4_config: int         # v3: IMD_K4_* of the plan-time rule (tile: K4_CONFIGS[k4_config])
     k4_tune_bytes: int     # v3: temporary device bytes of a k4_tune plan creation (0: none)
+    fused_large: int       # v4: bit 0 / bit 1: the GEMM's A / B scaled + packed by KL
+    reserved4: int
 
 
 def lowering(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",
