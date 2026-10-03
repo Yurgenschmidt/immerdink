@@ -420,6 +420,15 @@ __device__ __forceinline__ void store_out(const OutArgs& a, int64_t off, double 
   a.C[off] = a.beta == 0.0 ? E : __fma_rn(a.beta, a.C[off], E);  // C not read when beta = 0
 }
 
+// Largest N whose CRT word has L limbs (DESIGN §2 L_w), checked against the table.
+constexpr int k5_max_n(int L) { return L == 1 ? 3 : L == 2 ? 7 : L == 3 ? 12 : L == 4 ? 16 : 20; }
+constexpr bool k5_max_n_ok() {
+  for (int N = imd::constants::kNMin; N <= imd::constants::kNMax; ++N)
+    if (N > k5_max_n(imd::constants::kTables.L32[N])) return false;
+  return true;
+}
+static_assert(k5_max_n_ok(), "k5_max_n must cover every N of its limb count");
+
 // K5 core: the D values of the 4 consecutive j-bar j0..j0+3 of row (lambda, i); j0 is a
 // multiple of 4, so each plane's 4 bytes are one aligned u32 load (n_hat is a multiple of
 // 16). Elements with j >= n are not computed (D[e] unspecified).
@@ -433,10 +442,19 @@ __device__ __forceinline__ void k5_quad(const OutArgs& a, int64_t lam, int64_t i
   for (int e = 0; e < 4; ++e)
 #pragma unroll
     for (int w = 0; w < L; ++w) x[e][w] = 0;
-  for (int l = 0; l < a.N; ++l) {
-    const uint32_t wv = __ldg(reinterpret_cast<const uint32_t*>(W + l * plane));
+  // All N plane loads are issued before the CRT chain (N <= kMaxN for this L), so their
+  // latencies overlap instead of serializing with the arithmetic.
+  constexpr int kMaxN = k5_max_n(L);
+  uint32_t wv[kMaxN];
 #pragma unroll
-    for (int e = 0; e < 4; ++e) crt_step<L>(x[e], (wv >> (8 * e)) & 255u, l, a.N);
+  for (int l = 0; l < kMaxN; ++l)
+    wv[l] = l < a.N ? __ldg(reinterpret_cast<const uint32_t*>(W + l * plane)) : 0u;
+#pragma unroll
+  for (int l = 0; l < kMaxN; ++l) {
+    if (l < a.N) {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) crt_step<L>(x[e], (wv[l] >> (8 * e)) & 255u, l, a.N);
+    }
   }
   const bool fa = a.fA[row] != 0;
   const int sa = a.sA[row];
