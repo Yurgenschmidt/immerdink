@@ -70,6 +70,53 @@ class Library:
                   "imd_contract"):
             getattr(self.lib, f).restype = C.c_int
         self._handle = None
+        # Test-only hooks (src/test_hooks.cpp); absent from a library built without them.
+        self.has_test_hooks = hasattr(self.lib, "imd_test_set_limits")
+        if self.has_test_hooks:
+            self.lib.imd_test_set_limits.argtypes = [C.c_int64] * 3
+            self.lib.imd_test_set_limits.restype = C.c_int
+            self.lib.imd_test_lowering.argtypes = [C.POINTER(Tensor)] * 3 + \
+                [C.POINTER(C.c_int64), C.c_int64, C.POINTER(C.c_int64)]
+            self.lib.imd_test_lowering.restype = C.c_int
+        self.shim = None
+
+    def load_alloc_shim(self, path):
+        """The LD_PRELOAD allocation counter (tests/alloc_shim.c); must already be preloaded
+        so that it interposes the library's CUDA runtime calls."""
+        self.shim = C.CDLL(path)
+        self.shim.imd_shim_alloc_count.restype = C.c_int64
+
+    def alloc_count(self):
+        """CUDA runtime allocations (device, host, managed, async) seen so far, or None."""
+        return None if self.shim is None else self.shim.imd_shim_alloc_count()
+
+    def set_limits(self, k_chunk=0, max_batch=0, max_n_tiles=0):
+        """Override K4's launch limits (0 = production value); see src/test_hooks.cpp."""
+        assert self.lib.imd_test_set_limits(k_chunk, max_batch, max_n_tiles) == 0
+
+    def lowering(self, A, B, Cc):
+        """(status, dict) of the library's §5 lowering (src/test_hooks.cpp layout)."""
+        cnt = C.c_int64(0)
+        st = self.lib.imd_test_lowering(C.byref(A), C.byref(B), C.byref(Cc), None, 0, C.byref(cnt))
+        if st != 0:
+            return STATUS[st], None
+        buf = (C.c_int64 * cnt.value)()
+        st = self.lib.imd_test_lowering(C.byref(A), C.byref(B), C.byref(Cc), buf, cnt.value,
+                                        C.byref(cnt))
+        v = list(buf)
+        out = {"swapped": bool(v[0]), "m": v[1], "n": v[2], "k": v[3], "b": v[4],
+               "order": {}, "fused": {}}
+        p = 5
+        for g in "IJKL":
+            nl = v[p]
+            out["order"][g] = v[p + 1:p + 1 + nl]
+            p += 1 + nl
+            nm = v[p]
+            p += 1
+            out["fused"][g] = [tuple(v[p + 4 * t:p + 4 * t + 4]) for t in range(nm)]
+            p += 4 * nm
+        out["pivot"] = [(bool(v[p]), v[p + 1]), (bool(v[p + 2]), v[p + 3])]
+        return STATUS[st], out
 
     def handle(self):
         if self._handle is None:
@@ -87,8 +134,18 @@ class Library:
         assert name == "IMD_STATUS_" + STATUS[st], name
         return STATUS[st], out.value
 
+    MAX_PLAN_HOST = 64 << 20   # test guard: pinned scatter-vector bytes per plan
+
     def plan_create(self, A, B, Cc, N, g=0, rounding=RN, mode=EMULATE):
-        """(status, plan handle or None)."""
+        """(status, plan handle or None). Test guard: a plan whose pinned scatter vectors
+        (8 (2m + 2n + 2k + 3b) bytes) exceed MAX_PLAN_HOST is never created (a descriptor
+        that imd_workspace_size rejects fails plan creation before any allocation)."""
+        if self.has_test_hooks and self.workspace_size(A, B, Cc, N, g, rounding, mode)[0] == \
+                "SUCCESS":
+            st, lw = self.lowering(A, B, Cc)
+            if st == "SUCCESS":
+                vec = 8 * (2 * (lw["m"] + lw["n"] + lw["k"]) + 3 * lw["b"])
+                assert vec <= self.MAX_PLAN_HOST, f"plan would pin {vec} bytes (test guard)"
         plan = C.c_void_p()
         st = self.lib.imd_plan_create(self.handle(), C.byref(A), C.byref(B), C.byref(Cc),
                                       C.byref(Options(N, g, rounding, mode)), C.byref(plan))
@@ -114,6 +171,7 @@ class Cuda:
         self.rt.cudaMemset.argtypes = [C.c_void_p, C.c_int, C.c_size_t]
         self.rt.cudaGetErrorString.argtypes = [C.c_int]
         self.rt.cudaGetErrorString.restype = C.c_char_p
+        self.rt.cudaMemGetInfo.argtypes = [C.POINTER(C.c_size_t), C.POINTER(C.c_size_t)]
 
     def check(self, err, what):
         if err != 0:
@@ -133,8 +191,22 @@ class Cuda:
     def download(self, arr, p):
         self.check(self.rt.cudaMemcpy(arr.ctypes.data, p, arr.nbytes, self.D2H), "cudaMemcpy D2H")
 
+    def upload_raw(self, addr, arr):
+        """Host array -> device address (an int, e.g. an offset into an allocation)."""
+        self.check(self.rt.cudaMemcpy(C.c_void_p(addr), arr.ctypes.data, arr.nbytes, self.H2D),
+                   "cudaMemcpy H2D")
+
+    def download_raw(self, arr, addr):
+        self.check(self.rt.cudaMemcpy(arr.ctypes.data, C.c_void_p(addr), arr.nbytes, self.D2H),
+                   "cudaMemcpy D2H")
+
     def memset(self, p, value, nbytes):
         self.check(self.rt.cudaMemset(p, value, nbytes), "cudaMemset")
+
+    def mem_info(self):
+        free, total = C.c_size_t(0), C.c_size_t(0)
+        self.check(self.rt.cudaMemGetInfo(C.byref(free), C.byref(total)), "cudaMemGetInfo")
+        return free.value, total.value
 
     def sync(self):
         self.check(self.rt.cudaDeviceSynchronize(), "cudaDeviceSynchronize (kernel error)")

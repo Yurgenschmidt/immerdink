@@ -33,14 +33,34 @@ target_include_directories(test_mod_exhaustive PRIVATE "${PROJECT_SOURCE_DIR}/sr
 target_link_libraries(test_mod_exhaustive PRIVATE imd_constants imd_warnings Threads::Threads)
 add_test(NAME mod_exhaustive_cpu COMMAND test_mod_exhaustive)
 
+# LD_PRELOAD counter of CUDA runtime allocations: imd_contract must allocate nothing (M3).
+add_library(imd_alloc_shim SHARED alloc_shim.c)
+target_include_directories(imd_alloc_shim PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(imd_alloc_shim PRIVATE ${CMAKE_DL_LIBS})
+target_compile_definitions(imd_alloc_shim PRIVATE
+  IMD_CUDART_SONAME="libcudart.so.${CUDAToolkit_VERSION_MAJOR}")
+
 if(Python3_FOUND)
-  # imd_contract on the GPU vs spec/oracle.py, bit for bit (tests/test_contract.py).
+  # imd_contract on the GPU vs spec/oracle.py, bit for bit (tests/test_contract.py), with
+  # the allocation shim preloaded; tensor front end and robustness (tests/test_frontend.py).
+  # contract_highrank (operand ranks 6-12) has hard size guards; run it alone with
+  # `tools/test.sh -R contract_highrank`, or skip it with `-E contract_highrank`.
+  set(shim "$<TARGET_FILE:imd_alloc_shim>")
   foreach(suite api stages e2e tensor bigk replay)
     add_test(NAME contract_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
-                     --lib "$<TARGET_FILE:immerdink>" --suite ${suite} -v)
-    set_tests_properties(contract_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+                     --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+    set_tests_properties(contract_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                         ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
+  foreach(suite lowering legality random fixtures robust highrank)
+    add_test(NAME contract_${suite}
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_frontend.py"
+                     --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+    set_tests_properties(contract_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                         ENVIRONMENT "LD_PRELOAD=${shim}")
+  endforeach()
+  set_tests_properties(contract_highrank PROPERTIES TIMEOUT 300)
 
   # imd_workspace_size and the C++ lowering vs spec/params.py on generated descriptors.
   set(vectors "${CMAKE_CURRENT_BINARY_DIR}/workspace_vectors.txt")
