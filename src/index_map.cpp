@@ -1,6 +1,7 @@
 #include "index_map.hpp"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -146,10 +147,10 @@ imd_status_t lower(const imd_tensor_t& A, const imd_tensor_t& B, const imd_tenso
   r.k = size[static_cast<int>(LabelClass::K)];
   r.b = size[static_cast<int>(LabelClass::L)];
 
-  // Step 8 (coalescing part only): if C's smallest-|stride| label is in I, swap the
-  // operand roles so that j-bar runs along C's fastest axis. On a non-empty C that passed
-  // row 4 the smallest |stride| among modes with extent > 1 is unique.
-  // TODO(M2): canonical I/J/K/L orders (step 8) and fusion (step 9).
+  // Step 8 (coalescing): if C's smallest-|stride| label is in I, swap the operand roles so
+  // that j-bar runs along C's fastest axis. On a non-empty C that passed row 4 the smallest
+  // |stride| among modes with extent > 1 is unique. The canonical orders are computed in
+  // the post-swap frame by build_scatter_vectors.
   if (!c_empty) {
     std::optional<int32_t> fastest;
     for (int32_t d = 0; d < C.rank; ++d) {
@@ -173,16 +174,83 @@ imd_status_t lower(const imd_tensor_t& A, const imd_tensor_t& B, const imd_tenso
     }
   }
 
-  // Row 5 (rest): lowered operand sizes fit int64; GemmCoord is int (m, n_hat <= 2^31-1).
+  // Row 5 (rest): lowered operand sizes fit int64. The GemmCoord part is gemm_dims_ok.
   int64_t t0 = 0, t1 = 0;
   if (!mul_i64(r.b, r.m, &t0) || !mul_i64(t0, r.k, &t1)) return IMD_STATUS_INVALID_VALUE;
   if (!mul_i64(r.b, r.n, &t0) || !mul_i64(t0, r.k, &t1)) return IMD_STATUS_INVALID_VALUE;
   if (!mul_i64(r.b, r.m, &t0) || !mul_i64(t0, r.n, &t1)) return IMD_STATUS_INVALID_VALUE;
-  if (r.m > kInt32Max || r.n > kInt32Max - 15) return IMD_STATUS_INVALID_VALUE;  // n_hat
+  // The vec entry count 2m + 2k + 2n + 3b fits int64 whenever the §4a vec byte size
+  // (8x that, overflow-checked in uint64 by workspace_layout) does.
 
   r.labels = std::move(labels);
   *out = std::move(r);
   return IMD_STATUS_SUCCESS;
+}
+
+bool gemm_dims_ok(const Lowered& lw) { return lw.m <= kInt32Max && lw.n <= kInt32Max - 15; }
+
+int64_t scatter_vector_count(const Lowered& lw) {
+  return 2 * lw.m + 2 * lw.k + 2 * lw.n + 3 * lw.b;
+}
+
+namespace {
+
+// One canonical group: labels in canonical order (first fastest).
+std::vector<const LabelInfo*> canonical_order(const Lowered& lw, LabelClass cls) {
+  std::vector<const LabelInfo*> g;
+  for (const LabelInfo& li : lw.labels)
+    if (li.cls == cls && li.extent != 1) g.push_back(&li);
+  const int big = lw.m >= lw.n ? kA : kB, oth = big == kA ? kB : kA;
+  auto key = [&](const LabelInfo* l) -> std::array<uint64_t, 4> {
+    const uint64_t a = abs_u64(l->stride[kA]), b = abs_u64(l->stride[kB]),
+                   c = abs_u64(l->stride[kC]), pos = static_cast<uint64_t>(l->first_pos);
+    switch (cls) {
+      case LabelClass::I: return {c, a, pos, 0};
+      case LabelClass::J: return {c, b, pos, 0};
+      case LabelClass::L: return {c, a, b, pos};
+      case LabelClass::K: return {abs_u64(l->stride[big]), abs_u64(l->stride[oth]), pos, 0};
+    }
+    return {};
+  };
+  std::sort(g.begin(), g.end(), [&](const LabelInfo* x, const LabelInfo* y) { return key(x) < key(y); });
+  return g;
+}
+
+// Mixed-radix scatter vector of tensor X over the group's canonical order (first fastest),
+// by an odometer: no intermediate leaves the tensor's span (row 5), so int64 is exact.
+int64_t* radix_vec(const std::vector<const LabelInfo*>& order, int X, int64_t size, int64_t* out) {
+  std::vector<int64_t> digit(order.size(), 0);
+  int64_t cur = 0;
+  for (int64_t q = 0; q < size; ++q) {
+    out[q] = cur;
+    for (size_t t = 0; t < order.size(); ++t) {
+      const int64_t e = order[t]->extent, s = order[t]->stride[X];
+      if (digit[t] + 1 < e) {
+        ++digit[t];
+        cur += s;
+        break;
+      }
+      cur -= s * (e - 1);
+      digit[t] = 0;
+    }
+  }
+  return out + size;
+}
+
+}  // namespace
+
+void build_scatter_vectors(const Lowered& lw, int64_t* out) {
+  const auto I = canonical_order(lw, LabelClass::I), J = canonical_order(lw, LabelClass::J),
+             K = canonical_order(lw, LabelClass::K), L = canonical_order(lw, LabelClass::L);
+  out = radix_vec(I, kA, lw.m, out);
+  out = radix_vec(K, kA, lw.k, out);
+  out = radix_vec(L, kA, lw.b, out);
+  out = radix_vec(K, kB, lw.k, out);
+  out = radix_vec(J, kB, lw.n, out);
+  out = radix_vec(L, kB, lw.b, out);
+  out = radix_vec(I, kC, lw.m, out);
+  out = radix_vec(J, kC, lw.n, out);
+  radix_vec(L, kC, lw.b, out);
 }
 
 }  // namespace imd::detail

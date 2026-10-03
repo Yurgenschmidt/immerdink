@@ -99,8 +99,6 @@ def lower(A, B, C):
         m, n = n, m
     if max(b * m * k, b * k * n, b * m * n) > INT64_MAX:
         raise Bad(INVALID)                                  # row 5: operand sizes
-    if m > INT32_MAX or params.align_up(n, 16) > INT32_MAX:
-        raise Bad(INVALID)                                  # row 5: GemmCoord is int
     return m, n, k, b, swapped
 
 
@@ -115,6 +113,9 @@ def expect(A, B, C, N, g, rnd, mode):
         m, n, k, b, sw = lower(A, B, C)
     except Bad as e:
         return e.status, None, None, None
+    # row 5, GemmCoord is int: EMULATE mode with a non-empty output only (DESIGN v1.1)
+    if mode == EMULATE and b * m * n != 0 and (m > INT32_MAX or params.align_up(n, 16) > INT32_MAX):
+        return INVALID, None, None, None
     try:
         ws = params.workspace_size(m, n, k, b, N, g, MODE_NAME[mode])
     except OverflowError:
@@ -270,6 +271,10 @@ def tensors():
     add("row5_m_int32_ok", *matrix(big, 2, 2, 1), want=(OK, big, 2, 2, 1, False))
     add("row5_nhat_int32", *matrix(2, 2**31 - 15, 2, 1), want=(INVALID,))
     add("row5_nhat_int32_ok", *matrix(2, 2**31 - 16, 2, 1), want=(OK, 2, 2**31 - 16, 2, 1, False))
+    add("row5_nhat_int32_direct", *matrix(2, 2**31 - 15, 2, 1), mode=DIRECT,
+        want=(OK, 2, 2**31 - 15, 2, 1, False))
+    add("row5_m_int32_direct", *matrix(2**31, 1, 2, 1), mode=DIRECT, want=(OK, 1, 2**31, 2, 1, True))
+    add("row5_m_int32_empty", *matrix(2**31, 0, 2, 1), want=(OK, 2**31, 0, 2, 1, False))
     add("row5_workspace_u64", *matrix(big, 2**31 - 16, 2, 1), N=20, want=(INVALID,))
     add("row5_workspace_u64_direct", *matrix(big, 2**31 - 16, 2, 1), N=20, mode=DIRECT,
         want=(OK, big, 2**31 - 16, 2, 1, False))
