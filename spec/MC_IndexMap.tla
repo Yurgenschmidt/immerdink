@@ -90,6 +90,16 @@
 (*               GemmMax but nh = 4 rejected; the post-swap nh decides;    *)
 (*               DIRECT, an empty output, k = 0 and K-empty are exempt.   *)
 (*  pos_limit_m  GemmMax = 2: m = 2 ON, m = 3 rejected (EMULATE only).     *)
+(*  pos_kappa    §3.2 accuracy policy kappa = ceil(sqrt(k)) >= T ->        *)
+(*               NOT_SUPPORTED, symbolic T in {1,2,3} (real T(N) >= 180),  *)
+(*               extents {0,2,3}, GemmMax = 100 (out of the way). Execs:   *)
+(*               EMULATE+RN at T = 1, 2, 3; DIRECT+RN and EMULATE+TRUNC at *)
+(*               T = 1 (every k >= 2 has kappa >= T there, so the scope    *)
+(*               exemptions are exercised maximally). kappa = T - 1        *)
+(*               accepted (k = 4, T = 3) and kappa = T rejected (k = 6,    *)
+(*               T = 3; k = 2, T = 2: the k >= 2 boundary); exempt ON each *)
+(*               scope boundary: DIRECT, TRUNC, an empty output, K-empty   *)
+(*               k = 1 at T = 1 (kappa = T), k = 0.                        *)
 (*  pos_contract_ws     imd_contract, AlignWS = 16: workspace placed       *)
 (*               touching / one byte into C, A, B, ws_bytes = size - 1,   *)
 (*               size, size + 8 (slack overlapping A is fine), both modes. *)
@@ -123,6 +133,12 @@
 (*  neg_limit_drop / neg_limit_n   GemmDimsFit: no limit / n checked, not  *)
 (*               nh.  neg_limit_direct / _empty / _k   LimitScope: limit   *)
 (*               applied in DIRECT / to an empty output / with k < 2.      *)
+(*  neg_kappa_drop  Drop "Kappa": an RN GEMM with kappa >= T is accepted:  *)
+(*               KappaAccepted.                                            *)
+(*  neg_kappa_direct / _empty / _k / _trunc   KappaScope: the policy also  *)
+(*               applied in DIRECT / to an empty output / with k < 2 (K-   *)
+(*               empty k = 1 at T = 1) / with TRUNC. Each scope condition  *)
+(*               is necessary.                                             *)
 (*  neg_null, neg_ws_alias, neg_ws_range, neg_misaligned,                  *)
 (*  neg_insufficient   one §6 check dropped (ws_range: [ws, ws + ws_bytes)*)
 (*               instead of [ws, ws + workspace_size)): NoNullDeref,      *)
@@ -179,7 +195,7 @@ MisC4     == [Mis0 EXCEPT !["C"] = 4]
 WsPlaces  == {<<"far", "after", 0>>, <<"C", "after", 0>>, <<"C", "after", -1>>,
               <<"C", "before", 0>>, <<"C", "before", 1>>, <<"A", "after", 0>>,
               <<"A", "before", 0>>, <<"A", "before", 1>>, <<"B", "after", -1>>}
-Ex(md, nl, ms, wp, dw) == [mode |-> md, nul |-> nl, a0 |-> FALSE, mis |-> ms, wsp |-> wp, dws |-> dw]
+Ex(md, nl, ms, wp, dw) == [XDef EXCEPT !.mode = md, !.nul = nl, !.mis = ms, !.wsp = wp, !.dws = dw]
 ExA0(md, nl, ms, wp, dw) == [Ex(md, nl, ms, wp, dw) EXCEPT !.a0 = TRUE]
 \* ws placement x insufficient/exact/larger ws_bytes x both modes.
 ExWs      == {Ex(md, {}, Mis0, wp, dw) : md \in {"EMULATE", "DIRECT"},
@@ -192,6 +208,10 @@ ExOrder   == {Ex("EMULATE", nl, ms, wp, dw) :
                 dw \in {-1, 0}}
              \cup {ExA0("EMULATE", nl, Mis0, <<"far", "after", 0>>, 0) :
                     nl \in {{}, {"A"}, {"B"}, {"A", "B"}, {"ws"}}}
+\* §3.2 kappa policy: mode x rounding (rn) x symbolic T (tn).
+ExK(md, r, t) == [XDef EXCEPT !.mode = md, !.rn = r, !.tn = t]
+ExKappa   == {ExK("EMULATE", TRUE, t) : t \in 1..3}
+             \cup {ExK("DIRECT", TRUE, 1), ExK("EMULATE", FALSE, 1)}
 
 -----------------------------------------------------------------------------
 (* Boundary sentinels (constant-level; TLC evaluates them as ASSUMEs).     *)
@@ -429,6 +449,15 @@ DLk0   == D(LA(2, 0), LB(0, 3), LC(2, 3, <<3, 1>>))
 \* pos_limit_m (GemmMax = 2): m = 2 ON the boundary.
 DLm2   == D(LA(2, 2), LB(2, 2), LC(2, 2, <<2, 1>>))
 
+\* §3.2 kappa policy (pos_kappa). Dot products C = sum A B (m = n = 1):
+\* one K label of extent e (k = e) or two of extents e1, e2 (k = e1*e2).
+DK1(e)       == D(T(0, <<1>>, <<e>>, <<1>>), T(0, <<1>>, <<e>>, <<1>>), Scalar(100))
+DK2(e1, e2)  == D(T(0, <<1, 2>>, <<e1, e2>>, <<1, 2>>), T(0, <<1, 2>>, <<e1, e2>>, <<1, 2>>),
+                  Scalar(100))
+\* empty output (m = 0) with k = 3 (kappa = 2).
+DKempty      == D(T(0, <<1, 2>>, <<0, 3>>, <<1, 2>>), T(0, <<2>>, <<3>>, <<1>>),
+                  T(100, <<1>>, <<0>>, <<1>>))
+
 \* Contract models: A = [0,2) elements, B = [2,4), C a scalar.
 DDot(c)  == D(T(0, <<1>>, <<2>>, <<1>>), T(2, <<1>>, <<2>>, <<1>>), Scalar(c))
 \* empty output (m = 0); k = 0 (SCALE).
@@ -451,6 +480,19 @@ CovX == [
   limm2    |-> <<DLm2, XDef, "SUCCESS">>,
   limm3rej |-> <<DLm3, XDef, "INVALID_VALUE">>,
   limm3dir |-> <<DLm3, XDirect, "SUCCESS">>,
+  \* --- §3.2 kappa >= T policy (pos_kappa, GemmMax = 100) ---
+  \* kappa = T - 1 accepted, kappa = T rejected (k = 4: kappa 2; k = 6: 3).
+  kapk4t3  |-> <<DK2(2, 2), ExK("EMULATE", TRUE, 3), "SUCCESS">>,
+  kapk6t3  |-> <<DK2(2, 3), ExK("EMULATE", TRUE, 3), "NOT_SUPPORTED">>,
+  \* the smallest k that runs a GEMM (k = 2, kappa = 2 = T) is rejected.
+  kapk2t2  |-> <<DK1(2), ExK("EMULATE", TRUE, 2), "NOT_SUPPORTED">>,
+  \* exempt, each ON its scope boundary with kappa >= T:
+  kapdir   |-> <<DK2(2, 3), ExK("DIRECT", TRUE, 1), "SUCCESS">>,
+  kaptrunc |-> <<DK2(2, 3), ExK("EMULATE", FALSE, 1), "SUCCESS">>,
+  kapempty |-> <<DKempty, ExK("EMULATE", TRUE, 2), "SUCCESS">>,
+  \* K-empty (k = 1, kappa = 1 = T at T = 1): DIRECT by descriptor.
+  kapk1t1  |-> <<DLkempty, ExK("EMULATE", TRUE, 1), "SUCCESS">>,
+  kapk0t1  |-> <<DLk0, ExK("EMULATE", TRUE, 1), "SUCCESS">>,
   \* --- workspace placement / size (pos_contract_ws, AlignWS = 16) ---
   ctouchB  |-> <<DDot(4), XDef, "SUCCESS">>,                    \* C [32,40) touches B
   caliasA  |-> <<DDot(1), XDef, "ALIASING">>,

@@ -31,6 +31,10 @@
 (*           (INVALID_VALUE), 5 the CUTLASS GemmCoord limit m, nh <=       *)
 (*           GemmMax when the emulated GEMM runs (EMULATE, non-empty       *)
 (*           output, k >= 2), on the POST-swap m and nh (INVALID_VALUE);   *)
+(*           then the §3.2 RN accuracy policy: kappa = ceil(sqrt(k)) >= T  *)
+(*           -> NOT_SUPPORTED, only when the emulated GEMM runs (EMULATE,  *)
+(*           non-empty output, k >= 2) with rounding RN (T = T(N) is an    *)
+(*           option of the call, the Execs field tn);                      *)
 (*           then execute time                                             *)
 (*           (imd_contract, DESIGN §6 order): null pointer             *)
 (*           (INVALID_VALUE; C always, A/B only when alpha # 0 and k # 0,  *)
@@ -84,7 +88,8 @@
 (*  the role swap: SwapWellDefined, SwapMakesJFastest (and every claim     *)
 (*  above holds on the swapped lowering), the sizing and dispatch:         *)
 (*  DispatchByDescriptor, WorkspaceFits, WorkspaceExact, GemmDimsFit,      *)
-(*  LimitScope, and the execute-time checks: NoNullDeref, WsNoAlias,       *)
+(*  LimitScope, the accuracy policy: KappaAccepted, KappaScope, and the   *)
+(*  execute-time checks: NoNullDeref, WsNoAlias,                           *)
 (*  AliasingSound, AlignedAccess, WsSufficient; and                        *)
 (*  StrideRuleNecessary (FALSE by design: a negative model shows the rule  *)
 (*  is only sufficient).                                                   *)
@@ -139,6 +144,12 @@
 (*  "GemmLimitDirect" row 5     also applied in DIRECT mode                *)
 (*  "GemmLimitEmpty"  row 5     also applied to an empty output            *)
 (*  "GemmLimitK"      row 5     also applied when k < 2 (no GEMM runs)     *)
+(*  "Kappa"      §3.2/§6        the kappa >= T policy not applied          *)
+(*  "KappaDirect"     §3.2      also applied in DIRECT mode                *)
+(*  "KappaEmpty"      §3.2      also applied to an empty output            *)
+(*  "KappaK"          §3.2      also applied when k < 2 (k = 1: K-empty -> *)
+(*                              DIRECT; needs T <= 1, see KappaScope)      *)
+(*  "KappaTrunc"      §3.2      also applied with rounding TRUNC           *)
 (*  "OrderPreSwap" §5 step 8    canonical orders computed BEFORE the swap  *)
 (*                              (K's "big" on the caller's roles; differs  *)
 (*                              only when m = n)                           *)
@@ -539,6 +550,20 @@ LimitExceeded(d)   == LET u == SDims(d) IN
                       \/ u.m > GemmMax
                       \/ (IF Drop = "GemmLimitN" THEN u.n ELSE CeilQ(u.n)) > GemmMax
 
+\* §3.2 "RN acceptance", accuracy policy: plan time rejects kappa >= T,
+\* kappa = ceil(sqrt(k)) exact (NOT_SUPPORTED, "N too small for this k"),
+\* only in EMULATE with a non-empty output and k >= 2 (the emulated GEMM
+\* runs), only for rounding RN, independent of alpha. T = T(N) comes with
+\* the call's options (x.tn); x.rn = rounding RN. As built (src/api.cpp
+\* imd_plan_create) it is checked after every §5 plan-time row, so it is
+\* the last plan-time status. imd_workspace_size never applies it (§6).
+CeilSqrt(x)  == CHOOSE c \in 0..x : c * c >= x /\ (c = 0 \/ (c - 1) * (c - 1) < x)
+KappaApplies(d, x) == /\ x.mode = "EMULATE" \/ Drop = "KappaDirect"
+                      /\ ~EmptyOut(d) \/ Drop = "KappaEmpty"
+                      /\ PDims(d).k >= 2 \/ Drop = "KappaK"
+                      /\ x.rn \/ Drop = "KappaTrunc"
+KappaTooBig(d, x)  == CeilSqrt(PDims(d).k) >= x.tn
+
 -----------------------------------------------------------------------------
 (* Execute-time arguments (imd_contract) and checks (DESIGN §5 rows 6-7,  *)
 (* §6). Addresses are in BYTES: element a of tensor X occupies            *)
@@ -547,6 +572,9 @@ LimitExceeded(d)   == LET u == SDims(d) IN
 (*   [mode |-> "EMULATE" | "DIRECT",                                       *)
 (*    nul  |-> subset of {"A", "B", "C", "ws"}: null pointers,             *)
 (*    a0   |-> alpha = 0 (only the §6 null rule depends on it here),       *)
+(*    rn   |-> rounding = RN (the §3.2 kappa policy applies to RN only),   *)
+(*    tn   |-> T = T(N) of the chosen N (real: T(2) = 180 and up; the      *)
+(*             models use a small symbolic T so kappa >= T is reachable),  *)
 (*    mis  |-> [Tens -> 0..7],                                             *)
 (*    wsp  |-> <<anchor, side, delta>>: where ws is placed. anchor "far":  *)
 (*             FarWs; else ws = (byte hull end of anchor) + delta (side    *)
@@ -554,8 +582,8 @@ LimitExceeded(d)   == LET u == SDims(d) IN
 (*             so delta = 0 TOUCHES the anchor and +-1 overlaps one byte,  *)
 (*    dws  |-> ws_bytes - workspace_size].                                 *)
 
-XDef  == [mode |-> "EMULATE", nul |-> {}, a0 |-> FALSE, mis |-> [X \in Tens |-> 0],
-          wsp |-> <<"far", "after", 0>>, dws |-> 0]
+XDef  == [mode |-> "EMULATE", nul |-> {}, a0 |-> FALSE, rn |-> TRUE, tn |-> 180,
+          mis |-> [X \in Tens |-> 0], wsp |-> <<"far", "after", 0>>, dws |-> 0]
 FarWs == 1024 * AlignWS
 
 \* Byte hull of X: [8*lo + mis, 8*hi + mis) from the element interval.
@@ -600,6 +628,8 @@ StatusX(d, x, off) ==
                                                                     THEN "INVALID_VALUE"
           ELSE IF on("GemmLimit") /\ LimitApplies(d, x) /\ LimitExceeded(d)
                                                                     THEN "INVALID_VALUE"
+          ELSE IF on("Kappa") /\ KappaApplies(d, x) /\ KappaTooBig(d, x)
+                                                                    THEN "NOT_SUPPORTED"
           ELSE "SUCCESS"
         wsr == IF Drop = "WsRangeBytes" THEN <<WsAddr(d, x), WsAddr(d, x) + WsBytesArg(d, x)>>
                ELSE WsRange(d, x)
@@ -812,6 +842,13 @@ StrideRuleNecessary ==
 \* condition here is the DESIGN one (post-swap m and nh, the byte range
 \* [ws, ws + workspace_size)), so a model whose implementation deviates is
 \* caught by StatusCorrect even when no semantic invariant notices.
+\* DESIGN §3.2 / §6, written independently of KappaApplies: the policy
+\* rejects iff the emulated GEMM would run with RN and ceil(sqrt(k)) >= T,
+\* in closed form: ceil(sqrt(k)) >= T <=> (T - 1)^2 < k (for T >= 1).
+KappaReject(d, x) ==
+    LET k == PDims(d).k IN
+    /\ x.mode = "EMULATE" /\ ~EmptyOut(d) /\ k >= 2 /\ x.rn
+    /\ (x.tn - 1) * (x.tn - 1) < k
 Reasons(d, x) ==
     LET u == PDims(d) IN
     << <<"Extents",   ~ExtentsConsistent(d),                     "INVALID_VALUE">>,
@@ -820,6 +857,7 @@ Reasons(d, x) ==
        <<"CStride",   ~Empty(d, "C") /\ ~StrideRule(d, "C"),     "INVALID_VALUE">>,
        <<"GemmLimit", x.mode = "EMULATE" /\ ~EmptyOut(d) /\ u.k >= 2
                       /\ (u.m > GemmMax \/ CeilQ(u.n) > GemmMax), "INVALID_VALUE">>,
+       <<"Kappa",     KappaReject(d, x),                         "NOT_SUPPORTED">>,
        <<"Null",      NullBad(d, x, WsSizeDesign(d, x.mode)),    "INVALID_VALUE">>,
        <<"-",         EmptyOut(d),                               "SUCCESS">>,
        <<"Aliasing",  CAliasB(d, x),                             "ALIASING">>,
@@ -845,7 +883,8 @@ StatusCorrect ==
                "MISALIGNED", "INSUFFICIENT_WORKSPACE"}
     /\ st = ExpectedStatus(desc, xa)
     /\ ~ExtentsConsistent(desc) => st = "INVALID_VALUE"
-    /\ st = "NOT_SUPPORTED" => ExtentsConsistent(desc) /\ Unsupported(desc)
+    /\ st = "NOT_SUPPORTED" => ExtentsConsistent(desc)
+                               /\ (Unsupported(desc) \/ KappaReject(desc, xa))
     /\ ok => /\ ExtentsConsistent(desc)
              /\ ~Unsupported(desc)
              /\ Injective(desc, "C")
@@ -990,6 +1029,23 @@ LimitScope ==
     (xa.mode = "DIRECT" \/ EmptyOut(desc) \/ PDims(desc).k < 2) =>
         st = StatusX(desc, xa, {Drop, "GemmLimit"})
 
+\* §3.2 accuracy policy: every accepted call that runs the emulated GEMM
+\* with RN has kappa = ceil(sqrt(k)) < T (so 2T - kappa > T and the RN
+\* shift rule is far from its soundness edge kappa = 2T).
+KappaAccepted ==
+    ok /\ low.kind = "GEMM" /\ xa.rn => CeilSqrt(low.k) < xa.tn
+
+\* §3.2 / §6 scope of the policy: a call that runs no emulated GEMM
+\* (DIRECT mode, an empty output, k = 0, K-empty with k = 1) or uses
+\* TRUNC is never rejected because of it, whatever k and T are. Each
+\* disjunct is necessary (neg_kappa_direct / _empty / _k / _trunc). The
+\* k < 2 disjunct matters only when T <= 1 (kappa(1) = 1): at every real
+\* N, T >= 180, so there it is implied by kappa < T; the model uses T = 1
+\* to show the clause is still the right one (no GEMM runs at k = 1).
+KappaScope ==
+    (xa.mode = "DIRECT" \/ EmptyOut(desc) \/ PDims(desc).k < 2 \/ ~xa.rn) =>
+        st = StatusX(desc, xa, {Drop, "Kappa"})
+
 -----------------------------------------------------------------------------
 (* imd_contract execute-time checks (DESIGN §5 rows 6-7, §6).             *)
 
@@ -1038,11 +1094,13 @@ ASSUME Drop \in {"none", "Extents", "RepeatC", "COnly", "CStride", "Aliasing",
                  "Null", "WsAlias", "WsRangeBytes", "Misaligned", "Insufficient",
                  "OrderNullEmpty", "OrderEmptyLast", "OrderAlignFirst",
                  "OrderInsuffFirst", "OrderPreSwap", "PosSwapped", "GemmLimitK",
-                 "NullStrict", "NullWsLax"}
+                 "NullStrict", "NullWsLax", "Kappa", "KappaDirect", "KappaEmpty",
+                 "KappaK", "KappaTrunc"}
 ASSUME GemmMax >= 1 /\ AlignWS >= 8 /\ AlignWS % 8 = 0
 ASSUME \A x \in Execs :
           /\ x.mode \in {"EMULATE", "DIRECT"}
           /\ x.nul \subseteq {"A", "B", "C", "ws"} /\ x.a0 \in BOOLEAN
+          /\ x.rn \in BOOLEAN /\ x.tn \in Nat /\ x.tn >= 1
           /\ x.mis \in [Tens -> 0..7]
           /\ x.wsp[1] \in Tens \cup {"far"} /\ x.wsp[2] \in {"after", "before"}
           /\ x.dws \in Int
