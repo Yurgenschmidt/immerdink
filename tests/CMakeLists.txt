@@ -23,6 +23,11 @@ if(Python3_FOUND)
   add_dependencies(test_workspace workspace_vectors)
   add_test(NAME workspace_vs_params COMMAND test_workspace "${vectors}")
 
+  # The Python wrapper (python/immerdink/host.py) over libimmerdink_host vs the C ABI and
+  # vs spec/params.py and spec/oracle.py (lowering summary, sizes, g sweep). CPU only.
+  add_test(NAME host_python
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_host.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" --suite host -v)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
@@ -122,6 +127,16 @@ if(Python3_FOUND)
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
   set_tests_properties(contract_highrank PROPERTIES TIMEOUT 300)
+
+  # libimmerdink's real plans vs libimmerdink_host's queries (DESIGN §6a): the plan's GEMM
+  # view, workspace layout, device bytes, K4 parameter sets and launches, and host payload
+  # (src/test_hooks.cpp imd_test_plan_sizes) equal imd_lowering / imd_plan_bytes /
+  # imd_workspace_layout on random descriptors, every vec_mode and g = 1..N.
+  add_test(NAME host_vs_plan
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_host.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" --lib "$<TARGET_FILE:immerdink>"
+                   --suite plan -v)
+  set_tests_properties(host_vs_plan PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
 
   add_test(NAME python_harness
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/harness.py"
