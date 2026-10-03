@@ -188,12 +188,14 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
     t_gpu = 0.0
     # v1.4: each vec mode with the plan-time fused-path rule (fmode -1) and, with the test
     # hooks, with the fused path disabled (fmode 0): every run bit-exact, all C identical.
-    fmodes = (-1, 0) if lib.has_test_hooks else (-1,)
+    # fmode 1: the plan-time rule, but without the small-problem launch variants (K5 one
+    # element per thread, KF four values per thread).
+    fmodes = (-1, 0, 1) if lib.has_test_hooks else (-1,)
     runs = [(vec, pvec, fm) for vec, pvec in ((hz.VEC_GENERATE, params.VEC_GENERATE),
                                              (hz.VEC_RESIDENT, params.VEC_RESIDENT))
             for fm in fmodes]
     for vec, pvec, fmode in runs:
-        vname = f"{name} [{pvec}{'' if fmode < 0 else ', unfused'}]"
+        vname = f"{name} [{pvec}{ {-1: '', 0: ', unfused', 1: ', large launches'}[fmode]}]"
         st, ws_bytes = lib.workspace_size(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec)
         if st != "SUCCESS":
             raise Fail(f"{vname}: imd_workspace_size {st}")
@@ -205,7 +207,7 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
             raise Fail(f"{vname}: workspace {ws_bytes} > {MAX_WORKSPACE} (test guard)")
         allocs0 = lib.alloc_count()
         if lib.has_test_hooks:
-            lib.set_fused(fmode)
+            lib.set_fused(0 if fmode == 0 else -1)
         try:
             st, plan = lib.plan_create(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec)
         finally:
@@ -248,7 +250,7 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
             launches0 = lib.launch_count()
             t0 = time.time()
             if lib.has_test_hooks:   # the unfused runs also take K5's 4-per-thread mapping
-                lib.set_k5_one_elem(0 if fmode == 0 else -1)
+                lib.set_k5_one_elem(0 if fmode >= 0 else -1)
             try:
                 st = lib.contract(plan, alpha, pA, pB, beta, pC, pW, ws_bytes)
             finally:

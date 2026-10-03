@@ -40,6 +40,19 @@ unsigned blocks_for(int64_t work, int per_block = kThreads) {
   return static_cast<unsigned>(std::max<int64_t>(1, std::min(b, kMaxBlocks)));
 }
 
+// q = a / b, r = a % b for a >= 0, b > 0: 32-bit division when both fit (the common case;
+// a 64-bit division is a ~70-instruction subroutine, a 32-bit one ~20 instructions).
+__device__ __forceinline__ void divmod(int64_t a, int64_t b, int64_t* q, int64_t* r) {
+  if (((static_cast<uint64_t>(a) | static_cast<uint64_t>(b)) >> 32) == 0) {
+    const uint32_t q32 = static_cast<uint32_t>(a) / static_cast<uint32_t>(b);
+    *q = q32;
+    *r = a - int64_t{q32} * b;
+  } else {
+    *q = a / b;
+    *r = a - *q * b;
+  }
+}
+
 // A strided operand seen as `rows` vectors of length k per batch:
 // element (lambda, r, h) at X[v_bat[lambda] + v_row[r] + v_k[h]].
 struct Operand {
@@ -280,14 +293,16 @@ struct PackArgs {
 // The residue of |a'| = mu 2^eps is ((mu mod p) (2^eps mod p)) mod p; mu mod p by byte
 // weights and dp4a (device/modp.hpp mod_p_bytes), the rare eps > 0 factor by the pow2_mod
 // table, then the sign and SMod. Same congruence class as §3.4 `residue`, so the same int8.
-struct PackEmitter {
-  uint32_t lo[kVec], hi[kVec];  // mu = hi 2^32 + lo < 2^54
-  int eps[kVec];
+template <int E>  // E consecutive k-bar of one row: 16 (one uint4 per modulus) or 4 (one u32)
+struct PackEmitterT {
+  static_assert(E == 16 || E == 4, "16 or 4 values per emitter");
+  uint32_t lo[E], hi[E];  // mu = hi 2^32 + lo < 2^54
+  int eps[E];
   uint32_t neg = 0, has_eps = 0;  // bit e: a'_e < 0 / eps_e > 0
 
   __device__ __forceinline__ void load(const uint64_t* bits, int sigma, bool trunc) {
 #pragma unroll
-    for (int e = 0; e < kVec; ++e) {
+    for (int e = 0; e < E; ++e) {
       uint64_t mu;
       quantize(bits[e], sigma, trunc, &mu, &eps[e]);  // non-finite / zero -> mu = 0, eps = 0
       lo[e] = static_cast<uint32_t>(mu);
@@ -296,13 +311,15 @@ struct PackEmitter {
       has_eps |= static_cast<uint32_t>(eps[e] != 0) << e;
     }
   }
-  __device__ __forceinline__ uint4 emit(int l) const {
+  // The E int8 residues for modulus l, as E / 4 little-endian u32 words.
+  __device__ __forceinline__ void emit(int l, uint32_t (&w)[E / 4]) const {
     const uint32_t p = c_tables.moduli[l], half = (p + 1) / 2;
     const uint64_t magic = c_tables.epi_magic[l];
     const uint32_t wlo = imd::device::c_byte_weights.lo[l], whi = imd::device::c_byte_weights.hi[l];
-    uint32_t w[4] = {0, 0, 0, 0};
 #pragma unroll
-    for (int e = 0; e < kVec; ++e) {
+    for (int q = 0; q < E / 4; ++q) w[q] = 0;
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
       uint32_t r = imd::device::mod_p_bytes(lo[e], hi[e], wlo, whi, p, magic);
       if ((has_eps >> e) & 1u)
         r = imd::device::mod_p_small(r * c_tables.pow2_mod[l][eps[e]], p, magic);
@@ -310,9 +327,18 @@ struct PackEmitter {
       const uint32_t s = r >= half ? r - p : r;  // SMod as an int8 bit pattern (low byte)
       w[e / 4] |= (s & 255u) << (8 * (e % 4));
     }
-    return make_uint4(w[0], w[1], w[2], w[3]);
+  }
+  // Store the residues for modulus l at dst (aligned to E bytes).
+  __device__ __forceinline__ void store(int l, int8_t* dst) const {
+    uint32_t w[E / 4];
+    emit(l, w);
+    if constexpr (E == 16)
+      *reinterpret_cast<uint4*>(dst) = make_uint4(w[0], w[1], w[2], w[3]);
+    else
+      *reinterpret_cast<uint32_t*>(dst) = w[0];
   }
 };
+using PackEmitter = PackEmitterT<16>;
 
 __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
   __shared__ uint64_t tile[kTileSmem];
@@ -373,7 +399,7 @@ __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
       const int s_lo = int(blockIdx.y) * a.gsize / int(gridDim.y);
       const int s_hi = (int(blockIdx.y) + 1) * a.gsize / int(gridDim.y);
       for (int s = s_lo; s < s_hi; ++s)
-        *reinterpret_cast<uint4*>(dst + s * plane) = em.emit(a.g0 + s);
+        em.store(a.g0 + s, dst + s * plane);
     }
     __syncthreads();  // shared arrays are reused by the next tile
   }
@@ -519,8 +545,9 @@ __global__ void __launch_bounds__(kThreads) k5_crt(OutArgs a) {
 #pragma unroll
     for (int e = 0; e < E; ++e) D[e] = 0.0;
     if (live) {
-      jg = idx % ng;
-      const int64_t t = idx / ng, i = t % a.m, lam = t / a.m;
+      int64_t t, i, lam;
+      divmod(idx, ng, &t, &jg);
+      divmod(t, a.m, &lam, &i);
       k5_elems<L, E>(a, lam, i, E * jg, D);
       cbase = a.c_bat[lam] + a.c_row[i];
     }
@@ -651,9 +678,10 @@ template <int Cap>
 __device__ __forceinline__ int64_t k0_offset(const K0Args<Cap>& a, int c, int x, int64_t r) {
   int64_t off = 0;
   for (int t = a.first[c]; t < a.first[c] + a.count[c]; ++t) {
-    const int64_t e = a.extent[t];
-    off += a.stride[t][x] * (r % e);
-    r /= e;
+    int64_t q, d;
+    divmod(r, a.extent[t], &q, &d);
+    off += a.stride[t][x] * d;
+    r = q;
   }
   return off;
 }
@@ -706,24 +734,24 @@ T* region(void* ws, const ExecPlan& p, Region r) {
 
 // ---- KF: K0 + K1 + group 1's K2 / K3 in one launch (DESIGN v1.4 §4) ----------------------
 //
-// Chosen at plan time when k_hat <= 512 (analysis.hpp fused_path): then one pack tile of
-// th = 4096 / tk rows by tk = pow2 >= k_hat columns (tk >= 16) holds whole rows, and the
-// tk / 16 threads that convert one row (16 k-bar each) are consecutive lanes of one warp.
-// A block (tile t, part y):
+// Chosen at plan time when k_hat <= 512 (analysis.hpp fused_path). A block of 256 threads
+// takes a tile of th rows by tk = pow2 >= k_hat columns (tk >= 16), th tk = 256 E: whole rows.
+// Each thread converts E consecutive k-bar of one row (E = 16, or E = 4 for small operands
+// with tk <= 128: 4x the blocks and a 4x shorter chain per thread), so a row's tk / E <= 32
+// threads are consecutive lanes of one warp. A block (tile t, part y):
 //   1. row bases v_bat[lambda] + v_row[r] and v_k[h] computed from the descriptor (kernel
 //      argument), never read from the vec region (which this launch writes);
 //   2. the tile read into shared memory as in k23_pack (coalesced along the pivot);
-//   3. per row, the §3.1/§3.2 K1 integers over its tk / 16 lanes by warp shuffles: the flag
-//      (or), gamma (max ilogb), S (exact u128 sum of the same terms, order-independent), then
-//      sigma = largest_u(S) - gamma, exactly K1's value; zero rows sigma = 0;
+//   3. per row, the §3.1/§3.2 K1 integers over its lanes by warp shuffles: the flag (or),
+//      gamma (max ilogb), S (exact u128 sum of the same terms, order-independent), then
+//      sigma = largest_u(S) - gamma (by the row's first lane), exactly K1's value; zero
+//      rows sigma = 0;
 //   4. part 0 stores sigma and the flag (sA / fA, sB / fB) for the later kernels;
 //   5. §3.3/§3.4 residues of the slots [y gsize / ny, (y + 1) gsize / ny) of group 1, as K2/K3.
 // Blocks of part 0 then zero the B rows n..n_hat-1 of group 1 and (generate mode) write the
 // vec region, grid-strided: the later packs and K5 read them after this launch retires.
 // Every part recomputes sigma from the tile (identical integers), so no block reads another
 // block's output (spec: Pipeline neg_fused_shared_sigma, neg_fused_reads_vec).
-constexpr int kFusedRowsMax = kTileElems / 16;  // th for tk = 16
-constexpr int kFusedSmem = kTileElems + kTileElems / kVec + kFusedRowsMax;
 
 template <int Cap>
 struct FusedArgs {
@@ -746,16 +774,18 @@ __device__ __forceinline__ u128 shfl_xor_u128(u128 v, int d) {
   return (static_cast<u128>(hi) << 64) | lo;
 }
 
-template <int Cap>
+template <int Cap, int E>
 __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant__ FusedArgs<Cap> a) {
-  __shared__ uint64_t tile[kFusedSmem];
-  __shared__ int64_t s_base[kFusedRowsMax];
-  __shared__ int64_t s_out[kFusedRowsMax];
-  __shared__ bool s_valid[kFusedRowsMax];
+  constexpr int kLgE = E == 16 ? 4 : 2, kTE = kThreads * E, kLgTE = 8 + kLgE;
+  constexpr int kRowsMax = kTE / 16;  // th for tk = 16
+  __shared__ uint64_t tile[kTE + kTE / kVec + kRowsMax];
+  __shared__ int64_t s_base[kRowsMax];
+  __shared__ int64_t s_out[kRowsMax];
+  __shared__ bool s_valid[kRowsMax];
   __shared__ int64_t s_vk[kTileKMax];
   const int tid = threadIdx.x;
-  const int lg_tk = a.lg_tk, tk = 1 << lg_tk, lg_th = 12 - lg_tk, th = 1 << lg_th;
-  const int pitch = tk + tk / kVec + 1, G = tk / kVec;  // G lanes per row, G | 32
+  const int lg_tk = a.lg_tk, tk = 1 << lg_tk, lg_th = kLgTE - lg_tk, th = 1 << lg_th;
+  const int pitch = tk + tk / kVec + 1, G = tk / E;  // G lanes per row, G | 32
   const int s_lo = int(blockIdx.y) * a.gsize / int(gridDim.y);
   const int s_hi = (int(blockIdx.y) + 1) * a.gsize / int(gridDim.y);
   const int64_t total = a.tiles[0] + a.tiles[1];
@@ -770,7 +800,9 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
       const bool valid = d < D;
       s_valid[tid] = valid;
       if (valid) {
-        const int64_t rho = lo + radix * d, lam = rho / rows, r = rho % rows;
+        const int64_t rho = lo + radix * d;
+        int64_t lam, r;
+        divmod(rho, rows, &lam, &r);
         s_base[tid] = k0_offset(a.d, 3, x, lam) + k0_offset(a.d, x, x, r);
         s_out[tid] = (lam * a.rows_pad[x] + r) * a.k_hat;
       }
@@ -781,7 +813,7 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
     const double* X = a.X[x];
     const bool along = a.along_rows[x] != 0;
 #pragma unroll 4
-    for (int it = 0; it < kTileElems / kThreads; ++it) {
+    for (int it = 0; it < E; ++it) {
       const int q = tid + it * kThreads;
       const int dl = along ? (q & (th - 1)) : (q >> lg_tk);
       const int hl = along ? (q >> lg_th) : (q & (tk - 1));
@@ -790,15 +822,15 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
     }
     __syncthreads();
     // 3. K1 per row over its G lanes
-    const int dl = tid >> (lg_tk - 4), hl = (tid & (G - 1)) * kVec;
-    uint64_t bits[kVec];
-    const uint64_t* src = tile + dl * pitch + hl + hl / kVec;
+    const int dl = tid >> (lg_tk - kLgE), hl = (tid & (G - 1)) * E;
+    uint64_t bits[E];
+    const uint64_t* src = tile + dl * pitch + hl + hl / kVec;  // E <= 16: no pad inside
 #pragma unroll
-    for (int e = 0; e < kVec; ++e) bits[e] = src[e];
+    for (int e = 0; e < E; ++e) bits[e] = src[e];
     int gmax = INT_MIN;
     unsigned fl = 0;
 #pragma unroll
-    for (int e = 0; e < kVec; ++e) {
+    for (int e = 0; e < E; ++e) {
       if (non_finite(bits[e])) fl = 1;
       else if (finite_nonzero(bits[e])) gmax = max(gmax, ilogb_bits(bits[e]));
     }
@@ -809,11 +841,15 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
     u128 S = 0;
     if (gmax != INT_MIN) {
 #pragma unroll
-      for (int e = 0; e < kVec; ++e)
+      for (int e = 0; e < E; ++e)
         if (finite_nonzero(bits[e])) S += square_term(bits[e], gmax);
     }
     for (int o = G / 2; o > 0; o /= 2) S += shfl_xor_u128(S, o);
-    const int sigma = gmax == INT_MIN ? 0 : largest_u(S, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
+    // sigma by the row's first lane (the 256-bit compare once per row), then broadcast.
+    int sigma = 0;
+    if ((tid & (G - 1)) == 0 && gmax != INT_MIN)
+      sigma = largest_u(S, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
+    sigma = __shfl_sync(0xffffffffu, sigma, (tid & 31) & ~(G - 1));
     const bool valid = s_valid[dl];
     // 4. part 0 stores sigma and the flag (range certified, cert_shift_range)
     if (valid && blockIdx.y == 0 && (tid & (G - 1)) == 0) {
@@ -823,12 +859,11 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
     }
     // 5. residues of this part's slots (K padding h in [k, k_hat) is zero in the tile)
     if (valid && hl < a.k_hat) {
-      PackEmitter em;
+      PackEmitterT<E> em;
       em.load(bits, sigma, a.trunc != 0);
       const int64_t plane = a.b * a.rows_pad[x] * a.k_hat;
       int8_t* dst = a.R[x] + s_out[dl] + hl;
-      for (int s = s_lo; s < s_hi; ++s)
-        *reinterpret_cast<uint4*>(dst + s * plane) = em.emit(s);  // group 1: modulus = slot
+      for (int s = s_lo; s < s_hi; ++s) em.store(s, dst + s * plane);  // group 1: modulus = slot
     }
     __syncthreads();  // shared arrays are reused by the next tile
   }
@@ -846,6 +881,8 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
     for (int64_t q = gt; q < a.d.start[9]; q += gs) a.d.out[q] = k0_entry(a.d, q);
 }
 
+// KF with E = 4 when one row fits 32 lanes of 4 (tk <= 128) and the E = 16 grid would have
+// fewer than 2 blocks per SM even with every modulus of the group in its own block row.
 template <int Cap>
 imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void* ws,
                        int64_t* vec_out, cudaStream_t stream) {
@@ -859,22 +896,36 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   int lg_tk = 4;
   while ((int64_t{1} << lg_tk) < p.k_hat) ++lg_tk;  // k_hat <= 512: lg_tk <= 9
   a.lg_tk = lg_tk;
-  const int64_t th = int64_t{1} << (12 - lg_tk);
-  for (int x = 0; x < 2; ++x) {
-    a.rows[x] = x == 0 ? p.m : p.n;
-    a.rows_pad[x] = x == 0 ? p.m : p.n_hat;
-    a.radix[x] = p.pack_radix[x];
-    a.along_rows[x] = p.pack_along_rows[x] ? 1 : 0;
-    const int64_t D = p.b * a.rows[x] / a.radix[x];
-    a.tiles[x] = a.radix[x] * ((D + th - 1) / th);
-  }
   a.gsize = std::min(p.g, p.N);
   a.trunc = p.trunc ? 1 : 0;
   for (int w = 0; w < 4; ++w) a.rhs[w] = p.rhs[w];
   a.rhs_bits = p.rhs_bits, a.lhs_shift = p.lhs_shift;
-  const int64_t tiles = a.tiles[0] + a.tiles[1];
-  kf_scale_pack<Cap><<<dim3(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms)), kThreads, 0,
-                       stream>>>(a);
+  const auto tiles_for = [&](int lg_te) {
+    const int64_t th = int64_t{1} << (lg_te - lg_tk);
+    int64_t total = 0;
+    for (int x = 0; x < 2; ++x) {
+      a.rows[x] = x == 0 ? p.m : p.n;
+      a.rows_pad[x] = x == 0 ? p.m : p.n_hat;
+      a.radix[x] = p.pack_radix[x];
+      a.along_rows[x] = p.pack_along_rows[x] ? 1 : 0;
+      const int64_t D = p.b * a.rows[x] / a.radix[x];
+      a.tiles[x] = a.radix[x] * ((D + th - 1) / th);
+      total += a.tiles[x];
+    }
+    return total;
+  };
+  int64_t tiles = tiles_for(12);
+  // (k5_one_elem_per_sm() == 0, test hook only: no small-problem variants anywhere.)
+  const bool small =
+      lg_tk <= 7 && tiles * a.gsize < 2 * int64_t{p.sms} && k5_one_elem_per_sm() != 0;
+  if (small) {
+    tiles = tiles_for(10);
+    kf_scale_pack<Cap, 4><<<dim3(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms)),
+                            kThreads, 0, stream>>>(a);
+  } else {
+    kf_scale_pack<Cap, 16><<<dim3(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms)),
+                             kThreads, 0, stream>>>(a);
+  }
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
 

@@ -17,8 +17,9 @@
 //   imd_test_set_k5_one_elem(per_sm)
 //       K5 (j-bar fastest) takes one element per thread while b m n <= per_sm x SMs, else
 //       4 per thread with warp-transposed stores. per_sm -1 restores the production value;
-//       0 always uses 4 per thread. Applies to later imd_contract calls; results must not
-//       change. Returns 0, or 1 for a negative value other than -1.
+//       0 always uses 4 per thread and also disables KF's 4-values-per-thread variant (no
+//       small-problem launch variant anywhere). Applies to later imd_contract calls; results
+//       must not change. Returns 0, or 1 for a negative value other than -1.
 //
 //   imd_test_plan_vec(plan, dev, count)
 //       The plan's resident scatter vectors (IMD_VEC_RESIDENT, DESIGN v1.2): *dev = their

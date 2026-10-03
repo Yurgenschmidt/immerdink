@@ -87,12 +87,17 @@ __device__ __forceinline__ bool shl256(const U256& x, int s, U256* out) {
   }
   if (s < 0 || bl + s > 256) return false;
   const int ws = s / 64, bs = s % 64;
+  // Word shift by selection over the 4 possible ws (static indices only: a dynamic x.w[i - ws]
+  // would put the words in local memory, which is costly when every thread of a warp runs it).
+#pragma unroll
   for (int i = 3; i >= 0; --i) {
-    const int src = i - ws;
     uint64_t v = 0;
-    if (src >= 0) {
-      v = x.w[src] << bs;
-      if (bs != 0 && src >= 1) v |= x.w[src - 1] >> (64 - bs);
+#pragma unroll
+    for (int j = 0; j <= 3; ++j) {
+      if (j == ws && i - j >= 0) {
+        v = x.w[i - j] << bs;
+        if (bs != 0 && i - j >= 1) v |= x.w[i - j - 1] >> (64 - bs);
+      }
     }
     out->w[i] = v;
   }
