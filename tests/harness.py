@@ -83,6 +83,13 @@ class Library:
             self.lib.imd_test_plan_vec.argtypes = [C.c_void_p, C.POINTER(C.c_void_p),
                                                    C.POINTER(C.c_int64)]
             self.lib.imd_test_plan_vec.restype = C.c_int
+            self.lib.imd_test_set_fused.argtypes = [C.c_int]
+            self.lib.imd_test_set_fused.restype = C.c_int
+            self.lib.imd_test_set_k5_one_elem.argtypes = [C.c_int64]
+            self.lib.imd_test_set_k5_one_elem.restype = C.c_int
+            self.lib.imd_test_plan_sizes.argtypes = [C.c_void_p, C.POINTER(C.c_int64), C.c_int64,
+                                                     C.POINTER(C.c_int64)]
+            self.lib.imd_test_plan_sizes.restype = C.c_int
         self.shim = None
 
     def load_alloc_shim(self, path):
@@ -90,10 +97,30 @@ class Library:
         so that it interposes the library's CUDA runtime calls."""
         self.shim = C.CDLL(path)
         self.shim.imd_shim_alloc_count.restype = C.c_int64
+        self.shim.imd_shim_launch_count.restype = C.c_int64
 
     def alloc_count(self):
         """CUDA runtime allocations (device, host, managed, async) seen so far, or None."""
         return None if self.shim is None else self.shim.imd_shim_alloc_count()
+
+    def launch_count(self):
+        """Kernel launches (cudaLaunchKernel) seen so far, or None without the shim."""
+        return None if self.shim is None else self.shim.imd_shim_launch_count()
+
+    def set_fused(self, mode=-1):
+        """v1.4 fused path for plans created afterwards: -1 plan-time rule, 0 never."""
+        assert self.lib.imd_test_set_fused(mode) == 0
+
+    def set_k5_one_elem(self, per_sm=-1):
+        """K5 one element per thread while b m n <= per_sm x SMs (-1 production, 0 never)."""
+        assert self.lib.imd_test_set_k5_one_elem(per_sm) == 0
+
+    def plan_kernels(self, plan):
+        """(fused, kernel launches per imd_contract with alpha != 0) of a real plan."""
+        cnt = C.c_int64(0)
+        buf = (C.c_int64 * 64)()
+        assert self.lib.imd_test_plan_sizes(plan, buf, 64, C.byref(cnt)) == 0
+        return bool(buf[cnt.value - 2]), buf[cnt.value - 1]
 
     def set_limits(self, k_chunk=0, max_batch=0, max_n_tiles=0):
         """Override K4's launch limits (0 = production value); see src/test_hooks.cpp."""

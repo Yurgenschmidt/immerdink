@@ -167,10 +167,15 @@ __device__ __forceinline__ int8_t residue(uint64_t mu, bool neg, int eps, int l)
 // mag: L little-endian u32 limbs.
 template <int L>
 __device__ __forceinline__ double round_scaled(const uint32_t (&x)[L], bool neg, int e) {
-  int top = L - 1;
-  while (top >= 0 && x[top] == 0) --top;
+  // The top nonzero limb, by a fully unrolled scan (static indices only: a dynamic x[top]
+  // would put the limbs in local memory).
+  int top = -1;
+  uint32_t xt = 0;
+#pragma unroll
+  for (int w = 0; w < L; ++w)
+    if (x[w] != 0) top = w, xt = x[w];
   if (top < 0) return 0.0;
-  const int bl = top * 32 + (32 - __clz(static_cast<int>(x[top])));
+  const int bl = top * 32 + (32 - __clz(static_cast<int>(xt)));
   uint64_t t;  // the top 64 bits of mag (exact when bl <= 64), lsb weight 2^(bl - 64 + e)
   bool sticky = false;
   if (bl <= 64) {

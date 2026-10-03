@@ -1,4 +1,4 @@
-// LD_PRELOAD allocation counter for the "imd_contract allocates nothing" test (DESIGN §6,
+// LD_PRELOAD allocation (and kernel launch) counter for the "imd_contract allocates nothing" test (DESIGN §6,
 // PLAN M3). Interposes the CUDA runtime's allocation entry points, counts every call and
 // forwards it to the real libcudart (dlsym RTLD_NEXT). tests/test_frontend.py reads the
 // count before and after imd_contract. Test-only; never linked into the library.
@@ -14,8 +14,14 @@
 #endif
 
 static int64_t g_count = 0;
+static int64_t g_launches = 0;
 
 int64_t imd_shim_alloc_count(void) { return __atomic_load_n(&g_count, __ATOMIC_SEQ_CST); }
+
+// Kernel launches (DESIGN v1.4 §6a kernel_launches). nvcc (CUDA 13) compiles <<<>>> into a
+// call of the runtime's __cudaLaunchKernel(cudaKernel_t, ...) (_ptsz with per-thread default
+// streams); the public cudaLaunchKernel / cudaLaunchKernelExC are counted too.
+int64_t imd_shim_launch_count(void) { return __atomic_load_n(&g_launches, __ATOMIC_SEQ_CST); }
 
 // tests/test_contract.py proves interposition by observing the one cudaMalloc of an
 // IMD_VEC_RESIDENT imd_plan_create (DESIGN v1.2) in the count.
@@ -47,3 +53,25 @@ FORWARD(cudaMallocPitch, (void** p, size_t* pitch, size_t w, size_t h), (p, pitc
 FORWARD(cudaMallocAsync, (void** p, size_t n, cudaStream_t s), (p, n, s))
 FORWARD(cudaMallocFromPoolAsync, (void** p, size_t n, cudaMemPool_t m, cudaStream_t s),
         (p, n, m, s))
+
+#define FORWARD_LAUNCH(name, params, args)               \
+  cudaError_t name params {                              \
+    typedef cudaError_t(*fn_t) params;                   \
+    static fn_t real = NULL;                             \
+    if (real == NULL) real = (fn_t)real_symbol(#name);   \
+    __atomic_add_fetch(&g_launches, 1, __ATOMIC_SEQ_CST); \
+    return real == NULL ? cudaErrorUnknown : real args;   \
+  }
+
+FORWARD_LAUNCH(cudaLaunchKernel,
+               (const void* f, dim3 grid, dim3 block, void** args, size_t smem, cudaStream_t s),
+               (f, grid, block, args, smem, s))
+FORWARD_LAUNCH(cudaLaunchKernelExC, (const cudaLaunchConfig_t* c, const void* f, void** args),
+               (c, f, args))
+// The compiler-generated launch entry points (crt/device_functions.h).
+FORWARD_LAUNCH(__cudaLaunchKernel,
+               (cudaKernel_t k, dim3 grid, dim3 block, void** args, size_t smem, cudaStream_t s),
+               (k, grid, block, args, smem, s))
+FORWARD_LAUNCH(__cudaLaunchKernel_ptsz,
+               (cudaKernel_t k, dim3 grid, dim3 block, void** args, size_t smem, cudaStream_t s),
+               (k, grid, block, args, smem, s))

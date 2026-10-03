@@ -186,8 +186,14 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
     pmode = params.DIRECT if mode == o.DIRECT else params.EMULATE
     results = {}
     t_gpu = 0.0
-    for vec, pvec in ((hz.VEC_GENERATE, params.VEC_GENERATE), (hz.VEC_RESIDENT, params.VEC_RESIDENT)):
-        vname = f"{name} [{pvec}]"
+    # v1.4: each vec mode with the plan-time fused-path rule (fmode -1) and, with the test
+    # hooks, with the fused path disabled (fmode 0): every run bit-exact, all C identical.
+    fmodes = (-1, 0) if lib.has_test_hooks else (-1,)
+    runs = [(vec, pvec, fm) for vec, pvec in ((hz.VEC_GENERATE, params.VEC_GENERATE),
+                                             (hz.VEC_RESIDENT, params.VEC_RESIDENT))
+            for fm in fmodes]
+    for vec, pvec, fmode in runs:
+        vname = f"{name} [{pvec}{'' if fmode < 0 else ', unfused'}]"
         st, ws_bytes = lib.workspace_size(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec)
         if st != "SUCCESS":
             raise Fail(f"{vname}: imd_workspace_size {st}")
@@ -198,7 +204,13 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
         if ws_bytes > MAX_WORKSPACE:
             raise Fail(f"{vname}: workspace {ws_bytes} > {MAX_WORKSPACE} (test guard)")
         allocs0 = lib.alloc_count()
-        st, plan = lib.plan_create(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec)
+        if lib.has_test_hooks:
+            lib.set_fused(fmode)
+        try:
+            st, plan = lib.plan_create(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec)
+        finally:
+            if lib.has_test_hooks:
+                lib.set_fused(-1)
         if st != "SUCCESS":
             raise Fail(f"{vname}: imd_plan_create {st}")
         # CUDA allocations of plan creation (shim): one device allocation for resident
@@ -233,10 +245,29 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
             pC = (dC.value or 0) + 8 * baseC
             pW = dW.value + GUARD
             allocs = lib.alloc_count()
+            launches0 = lib.launch_count()
             t0 = time.time()
-            st = lib.contract(plan, alpha, pA, pB, beta, pC, pW, ws_bytes)
+            if lib.has_test_hooks:   # the unfused runs also take K5's 4-per-thread mapping
+                lib.set_k5_one_elem(0 if fmode == 0 else -1)
+            try:
+                st = lib.contract(plan, alpha, pA, pB, beta, pC, pW, ws_bytes)
+            finally:
+                if lib.has_test_hooks:
+                    lib.set_k5_one_elem(-1)
             if st != "SUCCESS":
                 raise Fail(f"{vname}: imd_contract {st}")
+            # v1.4: the kernel launches of the call are what the plan (and libimmerdink_host's
+            # imd_lowering kernel_launches, tests/test_host.py) says.
+            if launches0 is not None and lib.has_test_hooks:
+                fused, kl = lib.plan_kernels(plan)
+                if fmode == 0 and fused:
+                    raise Fail(f"{vname}: the fused path was not disabled")
+                if alpha == 0.0 and not view.empty_output():
+                    kl = (0 if pvec == params.VEC_RESIDENT else 1) + 1   # K0 + beta kernel
+                if lib.launch_count() - launches0 != kl:
+                    raise Fail(f"{vname}: imd_contract launched {lib.launch_count() - launches0} "
+                               f"kernels, the plan says {kl}")
+                STATS["fused"] = STATS.get("fused", 0) + (1 if fused else 0)
             cuda.sync()
             t_gpu += time.time() - t0
             if allocs is not None and lib.alloc_count() != allocs:
@@ -262,11 +293,11 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
             raise Fail(f"{vname}: {len(bad)}/{got.size} C elements differ; first at {i}: "
                        f"gpu {got[i]!r} ({got.view(np.uint64)[i]:#018x}) oracle {want[i]!r} "
                        f"({want.view(np.uint64)[i]:#018x})")
-        results[pvec] = got
-    if not np.array_equal(results[params.VEC_GENERATE].view(np.uint64),
-                          results[params.VEC_RESIDENT].view(np.uint64)):
-        raise Fail(f"{name}: C differs between vec modes GENERATE and RESIDENT")
-    got = results[params.VEC_GENERATE]
+        results[(pvec, fmode)] = got
+    got = results[(params.VEC_GENERATE, -1)]
+    for key, other in results.items():
+        if not np.array_equal(got.view(np.uint64), other.view(np.uint64)):
+            raise Fail(f"{name}: C differs between runs {(params.VEC_GENERATE, -1)} and {key}")
     STATS["cases"] += 1
     STATS["elements"] += got.size
     STATS["kinds"][kind] = STATS["kinds"].get(kind, 0) + 1
@@ -613,7 +644,8 @@ def main():
         return 1
     print(f"{STATS['cases']} contractions bit-exact vs spec/oracle.py "
           f"({STATS['elements']} C elements; dispatch {STATS['kinds']}; "
-          f"{STATS['stage_bytes']} workspace bytes stage-checked) in {time.time() - t0:.1f}s")
+          f"{STATS['stage_bytes']} workspace bytes stage-checked; {STATS.get('fused', 0)} runs "
+          f"on the fused path) in {time.time() - t0:.1f}s")
     return 0
 
 
