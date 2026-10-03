@@ -158,6 +158,17 @@ available on sm_89.
   - **Ozaki-II with per-call N**. Changing N changes the scaling, so operands must be
     re-packed;
   - a data-driven **auto / bounded-auto N** policy on top of either.
+- **Packed symmetric tensor contractions** (generic permutational symmetry). Wanted by
+  Eric (2026-10-03), long-term; motivating case: the particle–particle ladder (PPL) in
+  DF-CCSD. Operands and/or output are stored packed over permutational symmetry groups
+  (e.g. `a≤b`, `i<j`, with ± signs for antisymmetry). Contract them without unpacking: the
+  TBLIS pack reads the packed layout and expands it on the fly (scatter vectors plus a
+  per-element sign/zero mask), and the CRT/scatter writes only the unique output block.
+  The idea extends naturally: the Ozaki pack already touches every element once, so the
+  unpacking costs no extra pass. To our knowledge no such generic kernels exist even
+  without Ozaki. Design questions for later: the symmetry descriptor in the API (groups,
+  sign), whether to skip redundant output blocks in the GEMM tiling or only in the scatter,
+  and IndexMap/TLA+ extensions for packed legality and injectivity. Not before M4.
 - Accurate-mode scaling.
 - Python package (nanobind).
 - Hopper/Blackwell back ends.
