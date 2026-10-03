@@ -22,6 +22,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/default_gemm_universal_with_visitor.h"
 #include "immerdink/detail/constants.hpp"
+#include "host/analysis.hpp"  // kK4*Bytes: libimmerdink_host's plan host bytes
 #include "kernels/mod_epilogue.cuh"  // also brings in the Sm80 EVT visitors
 #include "plan.hpp"
 #include "profile.hpp"
@@ -39,6 +40,7 @@ namespace c = imd::constants;
 #  define IMD_K4_WM 64
 #  define IMD_K4_WN 64
 #  define IMD_K4_STAGES 3
+#  define IMD_K4_DEFAULT_TILE 1
 #endif
 using TB = cutlass::gemm::GemmShape<IMD_K4_TM, IMD_K4_TN, 64>;
 using Warp = cutlass::gemm::GemmShape<IMD_K4_WM, IMD_K4_WN, 64>;
@@ -78,18 +80,20 @@ using GemmFor = cutlass::gemm::device::GemmUniversalAdapter<
 using GemmStore = GemmFor<EVTStore>;
 using GemmAdd = GemmFor<EVTAdd>;
 
-constexpr int64_t kMaxBatch = 65535;   // gridDim.z
-constexpr int64_t kMaxNTiles = 65535;  // gridDim.y (identity swizzle: N tiles)
+// The launch structure (K-chunks, batch split, n-hat split) is libimmerdink_host's
+// (host/k4_launches.hpp), so the host queries count exactly these launches. Its tile width
+// width is this kernel's (a benchmark-only tile override passes its own to k4_grid; the
+// host queries then differ only in the n-hat split, i.e. for n_hat > 65535 x tile N).
+#ifdef IMD_K4_DEFAULT_TILE
+static_assert(TB::kN == kK4TileN, "host/k4_launches.hpp kK4TileN != K4 tile N");
+#endif
 
-LaunchLimits g_limits = {c::kKcPrime, kMaxBatch, kMaxNTiles};
+LaunchLimits g_limits = production_launch_limits();
 
-// One K4 launch of a call: K-chunk [k0, k0 + kc), batches [z0, z0 + zc) of the group,
-// columns [j0, j0 + nc) of n_hat. Its CUTLASS parameters depend only on the shape key
-// (kc, zc, nc; store-mod for chunk 0, add-mod after); the pointers and the epilogue's
-// modulus offsets are set per call.
-struct Launch {
-  int64_t k0, kc, z0, zc, j0, nc;
-};
+// One K4 launch of a call (host/k4_launches.hpp K4Launch). Its CUTLASS parameters depend
+// only on the shape key (kc, zc, nc; store-mod for chunk 0, add-mod after); the pointers and
+// the epilogue's modulus offsets are set per call.
+using Launch = K4Launch;
 struct ShapeKey {
   int64_t kc, zc, nc;
   bool operator<(const ShapeKey& o) const {
@@ -105,24 +109,24 @@ constexpr int kAddSmem = int(sizeof(typename GemmAdd::GemmKernel::SharedStorage)
 // Everything imd_contract needs to launch K4, fixed at plan creation (DESIGN v1.2 §6).
 struct K4Plan {
   int64_t m = 0, n_hat = 0, k_hat = 0, b = 0;
-  int64_t chunk = 0, max_batch = 0, n_per_launch = 0;  // the launch limits at creation
+  K4Grid grid;  // n_hat, k_hat, b and the launch limits at creation
   std::map<ShapeKey, typename GemmStore::GemmKernel::Params> store;  // chunk 0
   std::map<ShapeKey, typename GemmAdd::GemmKernel::Params> add;      // chunks > 0
 
   // The launches of one group of gsize moduli, in order: K-chunk, batch part, n-hat part.
   template <class F>
   void for_each_launch(int gsize, F&& f) const {
-    const int64_t batches = int64_t{gsize} * b;
-    for (int64_t k0 = 0; k0 < k_hat; k0 += chunk) {  // K-chunks (§3.5), 16-aligned
-      const int64_t kc = std::min<int64_t>(chunk, k_hat - k0);
-      for (int64_t z0 = 0; z0 < batches; z0 += max_batch) {  // batch-count split (§4)
-        const int64_t zc = std::min(max_batch, batches - z0);
-        for (int64_t j0 = 0; j0 < n_hat; j0 += n_per_launch)  // n-hat split (gridDim.y)
-          f(Launch{k0, kc, z0, zc, j0, std::min(n_per_launch, n_hat - j0)});
-      }
-    }
+    k4_for_each_launch(grid, gsize, f);
   }
 };
+
+// libimmerdink_host's plan_host_bytes counts the K4Plan and its map entries with these
+// sizes (host/analysis.hpp); a CUTLASS or K4Plan change must update them there.
+static_assert(sizeof(K4Plan) == kK4PlanBytes, "update kK4PlanBytes in src/host/analysis.hpp");
+static_assert(sizeof(decltype(K4Plan::store)::value_type) == kK4StoreEntryBytes,
+              "update kK4StoreEntryBytes in src/host/analysis.hpp");
+static_assert(sizeof(decltype(K4Plan::add)::value_type) == kK4AddEntryBytes,
+              "update kK4AddEntryBytes in src/host/analysis.hpp");
 
 namespace {
 
@@ -188,13 +192,12 @@ bool launch(typename Gemm::GemmKernel::Params params, typename Gemm::Arguments c
 }  // namespace
 
 LaunchLimits& launch_limits() { return g_limits; }
-LaunchLimits default_launch_limits() { return {c::kKcPrime, kMaxBatch, kMaxNTiles}; }
+LaunchLimits default_launch_limits() { return production_launch_limits(); }
 
 imd_status_t k4_prepare(const ExecPlan& p, std::shared_ptr<const K4Plan>* out) {
   auto k = std::make_shared<K4Plan>();
   k->m = p.m, k->n_hat = p.n_hat, k->k_hat = p.k_hat, k->b = p.b;
-  k->chunk = g_limits.k_chunk, k->max_batch = g_limits.max_batch;
-  k->n_per_launch = g_limits.max_n_tiles * TB::kN;
+  k->grid = k4_grid(p.n_hat, p.k_hat, p.b, g_limits, TB::kN);
   int occ_store = 0, occ_add = 0;
   if (kernel_setup<GemmStore>(kStoreSmem, &occ_store) != cudaSuccess ||
       kernel_setup<GemmAdd>(kAddSmem, &occ_add) != cudaSuccess) {
@@ -219,6 +222,16 @@ imd_status_t k4_prepare(const ExecPlan& p, std::shared_ptr<const K4Plan>* out) {
   if (!ok) return IMD_STATUS_NOT_SUPPORTED;
   *out = std::move(k);
   return IMD_STATUS_SUCCESS;
+}
+
+K4Footprint k4_footprint(const K4Plan& k, int N, int g) {
+  K4Footprint f;
+  f.store_shapes = static_cast<int64_t>(k.store.size());
+  f.add_shapes = static_cast<int64_t>(k.add.size());
+  for (int g0 = 0; g0 < N; g0 += g) k.for_each_launch(std::min(g, N - g0), [&](const Launch&) { ++f.launches; });
+  f.bytes = sizeof(K4Plan) + k.store.size() * sizeof(decltype(k.store)::value_type) +
+            k.add.size() * sizeof(decltype(k.add)::value_type);
+  return f;
 }
 
 imd_status_t k4_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,

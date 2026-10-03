@@ -1,5 +1,8 @@
-// imd_workspace_size (and the C++ lowering behind it) against spec/params.py:
-// reads the vectors written by tests/gen_workspace_vectors.py.
+// libimmerdink_host (DESIGN §6a) against spec/params.py: imd_workspace_size,
+// imd_workspace_layout (the §4a table), imd_plan_bytes (plan device bytes), imd_lowering
+// and the C++ lowering behind them, on the vectors written by tests/gen_workspace_vectors.py
+// (legality cases, grids, random descriptors, and a sweep of g = 1..N in every vec_mode).
+// Links libimmerdink_host only: no CUDA.
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -8,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include "immerdink/immerdink.h"
+#include "immerdink/immerdink_host.h"
 #include "index_map.hpp"
 #include "workspace.hpp"
 
@@ -35,6 +38,7 @@ struct Case {
   uint64_t bytes = 0;
   int64_t m = 0, n = 0, k = 0, b = 0;
   int swapped = 0;
+  int64_t plan_device = -1;  // params.plan_device_bytes; -1: not in the file
   std::vector<Region> regions;
 };
 
@@ -70,6 +74,8 @@ bool read_case(std::istream& in, Case* c) {
     } else if (tok == "expect") {
       in >> c->status;
       if (c->status == "SUCCESS") in >> c->bytes >> c->m >> c->n >> c->k >> c->b >> c->swapped;
+    } else if (tok == "plandev") {
+      in >> c->plan_device;
     } else if (tok == "region") {
       Region r;
       in >> r.name >> r.start >> r.end;
@@ -84,12 +90,16 @@ bool read_case(std::istream& in, Case* c) {
 }
 
 int failures = 0;
+int plan_checked = 0;
 
 template <class... Args>
 void fail(const Case& c, const char* fmt, Args... args) {
   if (++failures <= 25) {
     std::fprintf(stderr, "FAIL %s: ", c.name.c_str());
-    std::fprintf(stderr, fmt, args...);
+    if constexpr (sizeof...(args) == 0)
+      std::fputs(fmt, stderr);
+    else
+      std::fprintf(stderr, fmt, args...);
     std::fprintf(stderr, "\n");
   }
 }
@@ -127,13 +137,51 @@ void check(const Case& c) {
     same = got[i].name == c.regions[i].name && got[i].start == c.regions[i].start &&
            got[i].end == c.regions[i].end;
   if (!same) fail(c, "region offsets differ from params.region_offsets");
+
+  // The public §4a table (imd_workspace_layout) is the same layout.
+  imd_region_t reg[IMD_REGION_COUNT];
+  int32_t nreg = 0;
+  size_t total = 0;
+  if (imd_workspace_layout(&A, &B, &C, &c.opts, reg, IMD_REGION_COUNT, &nreg, &total) !=
+      IMD_STATUS_SUCCESS)
+    return fail(c, "imd_workspace_layout failed");
+  std::vector<Region> pub;
+  for (int r = 0; r < IMD_REGION_COUNT; ++r)
+    if (reg[r].bytes != 0)
+      pub.push_back({imd_region_name(r), reg[r].offset, reg[r].offset + reg[r].bytes});
+  same = total == c.bytes && nreg == IMD_REGION_COUNT && pub.size() == c.regions.size();
+  for (size_t i = 0; same && i < pub.size(); ++i)
+    same = pub[i].name == c.regions[i].name && pub[i].start == c.regions[i].start &&
+           pub[i].end == c.regions[i].end;
+  if (!same) fail(c, "imd_workspace_layout differs from params.region_offsets");
+
+  // imd_lowering: the GEMM view and the workspace bytes; plan device bytes (when the plan
+  // would be created) vs params.plan_device_bytes.
+  imd_lowering_t s{};
+  s.struct_size = sizeof s;
+  const imd_status_t pst = imd_lowering(&A, &B, &C, &c.opts, &s);
+  if (s.lowered != 1 || s.m != c.m || s.n != c.n || s.k != c.k || s.b != c.b ||
+      s.swapped != c.swapped || s.workspace_bytes != c.bytes || s.status != pst)
+    return fail(c, "imd_lowering summary differs");
+  if (pst != IMD_STATUS_SUCCESS && pst != IMD_STATUS_NOT_SUPPORTED)
+    return fail(c, "imd_lowering status %s", imd_status_string(pst));
+  size_t dev = 0;
+  const imd_status_t bst = imd_plan_bytes(&A, &B, &C, &c.opts, &dev, nullptr);
+  if (bst != pst) return fail(c, "imd_plan_bytes status differs from imd_lowering");
+  if (pst == IMD_STATUS_SUCCESS) {
+    ++plan_checked;
+    if (c.plan_device >= 0 && dev != static_cast<uint64_t>(c.plan_device))
+      fail(c, "plan device bytes %llu, expected %lld", (unsigned long long)dev,
+           (long long)c.plan_device);
+    if (s.plan_device_bytes != dev) fail(c, "imd_lowering plan_device_bytes differs");
+  }
 }
 
 // Argument checks that the vector file cannot express (null pointers).
 void check_null_arguments() {
-  const int64_t e[2] = {3, 4}, s[2] = {4, 1};
+  const int64_t e[2] = {3, 4}, eb[2] = {4, 4}, s[2] = {4, 1};
   const int32_t li[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
-  const imd_tensor_t A{2, e, s, li}, B{2, e + 1, s, lb}, C{2, e, s, lc};
+  const imd_tensor_t A{2, e, s, li}, B{2, eb, s, lb}, C{2, e, s, lc};
   const imd_options_t o{9, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE};
   size_t bytes = 0;
   Case c;
@@ -175,6 +223,6 @@ int main(int argc, char** argv) {
   check_null_arguments();
   std::printf("%d cases (", n);
   for (const auto& [s, cnt] : by_status) std::printf(" %s=%d", s.c_str(), cnt);
-  std::printf(" ), %d failures\n", failures);
+  std::printf(" ), %d plan sizes checked, %d failures\n", plan_checked, failures);
   return failures == 0 && n > 0 ? 0 : 1;
 }

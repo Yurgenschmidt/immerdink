@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <optional>
 
+#include "export.hpp"
+
 namespace imd::detail {
 
 enum class Region : int { sA, sB, fA, fB, vec, RA, RB, W, count };
@@ -29,6 +31,6 @@ struct WorkspaceLayout {
 //   DIRECT, k = 0, k = 1       -> vec only (k = 1 after lowering means K is empty)
 //   otherwise                  -> sA sB fA fB vec RA RB W at cumulative 256-aligned offsets
 //   vec_resident               -> the same without vec (DIRECT, k = 0, k = 1: no regions)
-std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s);
+IMD_HOST_INTERNAL std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s);
 
 }  // namespace imd::detail

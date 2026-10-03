@@ -25,9 +25,17 @@ find_path(CUTENSOR_INCLUDE cutensor.h HINTS "${CUDAToolkit_INCLUDE_DIRS}"
           "${CUDAToolkit_LIBRARY_ROOT}/include" "$ENV{CONDA_PREFIX}/include" REQUIRED)
 
 if(IMMERDINK_LIBRARY)
+  # libimmerdink needs libimmerdink_host (DESIGN §6a: imd_workspace_size, imd_status_string),
+  # built next to it.
+  get_filename_component(_imd_dir "${IMMERDINK_LIBRARY}" DIRECTORY)
+  add_library(immerdink_host SHARED IMPORTED)
+  set_target_properties(immerdink_host PROPERTIES
+    IMPORTED_LOCATION "${_imd_dir}/libimmerdink_host.so"
+    INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/../include")
   add_library(immerdink SHARED IMPORTED)
   set_target_properties(immerdink PROPERTIES IMPORTED_LOCATION "${IMMERDINK_LIBRARY}"
-    INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+    INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    INTERFACE_LINK_LIBRARIES immerdink_host)
 else()
   set(IMMERDINK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(IMMERDINK_PROFILE ON CACHE BOOL "" FORCE)  # per-phase timing (src/profile_hooks.h)

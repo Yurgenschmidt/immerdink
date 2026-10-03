@@ -14,6 +14,7 @@ Format: whitespace-separated tokens, one record per case:
     tensor A rank e_1..e_r s_1..s_r l_1..l_r      (likewise B, C)
     expect STATUS                                 (when STATUS != SUCCESS)
     expect SUCCESS bytes m n k b swapped
+    plandev BYTES                                 (params.plan_device_bytes, on SUCCESS)
     region NAME start end                         (zero or more, §4a order)
     end
 """
@@ -308,6 +309,32 @@ def tensors():
         want=(OK, 5, 6, 7, 2, False))
 
 
+def g_sweep(count, seed=20261003):
+    """DESIGN §6a: random descriptors, each for every g in 1..N and both vec modes (the
+    workspace / speed knob of the host query API), EMULATE and DIRECT."""
+    rng = random.Random(seed)
+    ext_choices = [1, 2, 3, 5, 16, 17, 33]
+    for t in range(count):
+        nlab = rng.randint(1, 6)
+        labs = list(range(20, 20 + nlab))
+        ext = {l: rng.choice(ext_choices) for l in labs}
+        mem = {l: rng.choice(("AB", "AC", "BC", "ABC", "A", "B", "ABC")) for l in labs}
+        tens = []
+        for X in "ABC":
+            lab = [l for l in labs if X in mem[l]]
+            rng.shuffle(lab)
+            e = [ext[l] for l in lab]
+            order = list(range(len(e)))
+            rng.shuffle(order)
+            tens.append((e, dense(e, order, [rng.choice((1, -1)) for _ in e]), lab))
+        N = rng.randint(2, 20)
+        mode = rng.choice((EMULATE, EMULATE, DIRECT))
+        for g in range(1, N + 1):
+            for vec in (VEC_GENERATE, VEC_RESIDENT):
+                add(f"gsweep_{t}_g{g}_vec{vec}", *tens, N=N, g=g, rnd=rng.choice((RN, TRUNC)),
+                    mode=mode, vec=vec)
+
+
 def random_cases(count, seed=20261002):
     rng = random.Random(seed)
     ext_choices = [0, 1, 1, 2, 3, 3, 5, 17]
@@ -350,6 +377,7 @@ def write(path):
         if status == OK:
             m, n, k, b, sw = mnkb
             out.append(f"expect {status} {ws} {m} {n} {k} {b} {int(sw)}")
+            out.append(f"plandev {params.plan_device_bytes(m, n, k, b, VEC_NAME[vec])}")
             for rn, start, end in regs:
                 out.append(f"region {rn} {start} {end}")
         else:
@@ -371,4 +399,5 @@ if __name__ == "__main__":
     grid()
     tensors()
     random_cases(3000)
+    g_sweep(150)
     write(sys.argv[1])

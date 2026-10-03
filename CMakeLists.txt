@@ -4,7 +4,15 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 89)  # RTX 4090 (sm_89) first: DESIGN §4
 endif()
 
-project(immerdink VERSION 0.0.0 LANGUAGES C CXX CUDA)
+# IMMERDINK_HOST_ONLY: build only libimmerdink_host (DESIGN §6a: lowering, legality and the
+# memory model as a CUDA-free C ABI) and its CPU tests. Needs no CUDA toolkit, no nvcc and no
+# CUTLASS; tests/check_host_cuda_free.sh builds the repository this way with nvcc off PATH.
+option(IMMERDINK_HOST_ONLY "Build only the CUDA-free libimmerdink_host" OFF)
+
+project(immerdink VERSION 0.0.0 LANGUAGES C CXX)
+if(NOT IMMERDINK_HOST_ONLY)
+  enable_language(CUDA)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -27,7 +35,9 @@ option(IMMERDINK_PROFILE "Benchmark-only per-phase event timing hooks (src/profi
 set(IMMERDINK_CUTLASS_DIR "${PROJECT_SOURCE_DIR}/third_party/cutlass"
     CACHE PATH "CUTLASS v4.8.0 source tree (default: the git submodule)")
 
-find_package(CUDAToolkit REQUIRED)
+if(NOT IMMERDINK_HOST_ONLY)
+  find_package(CUDAToolkit REQUIRED)
+endif()
 find_package(Python3 COMPONENTS Interpreter)
 
 # --- Warnings ---------------------------------------------------------------------------
@@ -62,6 +72,29 @@ else()
 endif()
 target_include_directories(imd_constants INTERFACE "${PROJECT_SOURCE_DIR}/include")
 
+# --- libimmerdink_host (CUDA-free; DESIGN §6a) ------------------------------------------
+# The single implementation of argument checks, lowering, legality (§5, §3.2 RN acceptance)
+# and the memory model (§4a, plan bytes), behind the C ABI of
+# include/immerdink/immerdink_host.h (imd_workspace_size, imd_workspace_layout,
+# imd_plan_bytes, imd_lowering, ...). Plain C++17: no CUDA headers, no CUDA libraries.
+# libimmerdink links it and sizes its plans with it. Its internal C++ entry points
+# (IMD_HOST_INTERNAL, src/host/export.hpp) are exported for libimmerdink and the tests only.
+add_library(immerdink_host SHARED
+  src/host/index_map.cpp src/host/workspace.cpp src/host/analysis.cpp src/host/host_api.cpp)
+target_include_directories(immerdink_host PUBLIC
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
+target_link_libraries(immerdink_host PRIVATE imd_constants imd_warnings)
+set_target_properties(immerdink_host PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+                                                CXX_EXTENSIONS OFF
+                                                CXX_VISIBILITY_PRESET hidden
+                                                VISIBILITY_INLINES_HIDDEN ON)
+# Internal headers (src/, src/host/) for libimmerdink and the unit tests.
+add_library(imd_host_internal INTERFACE)
+target_include_directories(imd_host_internal INTERFACE
+  "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/src/host")
+target_link_libraries(imd_host_internal INTERFACE immerdink_host imd_constants)
+
+if(NOT IMMERDINK_HOST_ONLY)
 # --- CUTLASS (header-only, CUDA translation units only) ----------------------------------
 if(NOT EXISTS "${IMMERDINK_CUTLASS_DIR}/include/cutlass/cutlass.h")
   message(FATAL_ERROR
@@ -75,13 +108,6 @@ target_compile_options(imd_cutlass INTERFACE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -diag-suppress=20012>)
 
 # --- Library -----------------------------------------------------------------------------
-# imd_core: internal C++ (IndexMap lowering, workspace layout), also linked by unit tests.
-add_library(imd_core OBJECT src/index_map.cpp src/workspace.cpp)
-target_include_directories(imd_core PUBLIC "${PROJECT_SOURCE_DIR}/src")
-target_link_libraries(imd_core PUBLIC imd_constants CUDA::cudart PRIVATE imd_warnings)
-set_target_properties(imd_core PROPERTIES CXX_VISIBILITY_PRESET hidden
-                                          VISIBILITY_INLINES_HIDDEN ON)
-
 # The library: C ABI (api.cpp), K0-K5 + DIRECT kernels (contract.cu), K4 CUTLASS GEMM
 # (gemm_k4.cu).
 # Test-only hooks (src/test_hooks.cpp: launch-limit override, lowering dump) are built only
@@ -97,10 +123,15 @@ if(IMMERDINK_PROFILE)
 endif()
 target_include_directories(immerdink PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
-target_link_libraries(immerdink PUBLIC CUDA::cudart PRIVATE imd_core imd_cutlass imd_warnings)
+# PUBLIC immerdink_host: the CUDA-free half of the ABI (imd_workspace_size, imd_status_string,
+# the host queries) lives there; libimmerdink has it as a DT_NEEDED dependency.
+target_link_libraries(immerdink PUBLIC immerdink_host CUDA::cudart
+                                PRIVATE imd_host_internal imd_cutlass imd_warnings)
 set_target_properties(immerdink PROPERTIES CXX_VISIBILITY_PRESET hidden
                                            CUDA_VISIBILITY_PRESET hidden
                                            VISIBILITY_INLINES_HIDDEN ON)
+
+endif()  # NOT IMMERDINK_HOST_ONLY
 
 # --- Tests -------------------------------------------------------------------------------
 if(IMMERDINK_BUILD_TESTS)

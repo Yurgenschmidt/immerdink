@@ -14,7 +14,8 @@
 #include <cstdint>
 #include <vector>
 
-#include "immerdink/immerdink.h"
+#include "export.hpp"
+#include "immerdink/immerdink_host.h"
 
 namespace imd::detail {
 
@@ -60,22 +61,22 @@ struct Lowered {
 // Fusion (§5 step 9): consecutive modes g, g' of a group merge iff s_X(g') = s_X(g) e(g)
 // for every tensor X carrying the group (I: A, C; J: B, C; K: A, B; L: A, B, C), stride-0
 // carriers included.
-imd_status_t lower(const imd_tensor_t& A, const imd_tensor_t& B, const imd_tensor_t& C,
-                   Lowered* out);
+IMD_HOST_INTERNAL imd_status_t lower(const imd_tensor_t& A, const imd_tensor_t& B,
+                                     const imd_tensor_t& C, Lowered* out);
 
 // §5 row 5, GemmCoord part: m <= 2^31-1 and n_hat <= 2^31-1. DESIGN applies it in EMULATE
 // mode with a non-empty output and k >= 2 only (when the emulated GEMM runs).
-bool gemm_dims_ok(const Lowered& lw);
+IMD_HOST_INTERNAL bool gemm_dims_ok(const Lowered& lw);
 
 // Number of int64 entries of the §4a vec region: 2m + 2k + 2n + 3b.
-int64_t scatter_vector_count(const Lowered& lw);
+IMD_HOST_INTERNAL int64_t scatter_vector_count(const Lowered& lw);
 
 // §5 step 10 (scatter vectors) for a non-empty output. Writes the §4a vec region contents
 // to out[0, scatter_vector_count): A: row (m), k (k), batch (b); B: k (k), col (n), batch
 // (b); C: row (m), col (n), batch (b). Entry q of a group's vector is
 // sum_t s_X(mode_t) * digit_t(q) over the group's fused modes (first fastest), in the
 // post-swap frame.
-void build_scatter_vectors(const Lowered& lw, int64_t* out);
+IMD_HOST_INTERNAL void build_scatter_vectors(const Lowered& lw, int64_t* out);
 
 // Gather tiling of the K2/K3 pack for operand X (0 = post-swap A, 1 = post-swap B). The
 // pack enumerates the operand's rows as rho = r + rows * lambda (a mixed radix over the
@@ -88,11 +89,11 @@ struct PackPivot {
   bool along_rows = false;
   int64_t radix = 1;
 };
-PackPivot pack_pivot(const Lowered& lw, int X);
+IMD_HOST_INTERNAL PackPivot pack_pivot(const Lowered& lw, int X);
 
 // K5 thread mapping (NOTES-M2M3 #4): true iff C's smallest-|stride| mode is a batch (L)
 // mode rather than a J mode (after the §5 step 8 swap it is never in I). Canonical orders
 // put each group's smallest |s_C| first, so the first fused modes are compared.
-bool k5_batch_fastest(const Lowered& lw);
+IMD_HOST_INTERNAL bool k5_batch_fastest(const Lowered& lw);
 
 }  // namespace imd::detail

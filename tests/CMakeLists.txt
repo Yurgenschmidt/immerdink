@@ -1,5 +1,52 @@
 # Correctness tests (pass/fail; run ungated, see tools/run_quiet.sh). No timing here.
 
+# --- libimmerdink_host (CUDA-free; DESIGN §6a): also built with IMMERDINK_HOST_ONLY -------
+# The host query ABI from C, linked against libimmerdink_host alone (also proves that
+# immerdink_host.h is valid C11 without any CUDA header).
+add_executable(test_host_c test_host_c.c)
+target_link_libraries(test_host_c PRIVATE immerdink_host imd_warnings)
+add_test(NAME host_c_api COMMAND test_host_c)
+
+if(Python3_FOUND)
+  # The host library and its C++ lowering vs spec/params.py on generated descriptors: the
+  # workspace vectors (legality, layouts, plan device bytes), every vec_mode and g = 1..N.
+  set(vectors "${CMAKE_CURRENT_BINARY_DIR}/workspace_vectors.txt")
+  add_custom_command(
+    OUTPUT "${vectors}"
+    COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/gen_workspace_vectors.py" "${vectors}"
+    DEPENDS gen_workspace_vectors.py "${PROJECT_SOURCE_DIR}/spec/params.py"
+    COMMENT "Generating workspace test vectors from spec/params.py"
+    VERBATIM)
+  add_custom_target(workspace_vectors ALL DEPENDS "${vectors}")
+  add_executable(test_workspace test_workspace.cpp)
+  target_link_libraries(test_workspace PRIVATE imd_host_internal imd_warnings)
+  add_dependencies(test_workspace workspace_vectors)
+  add_test(NAME workspace_vs_params COMMAND test_workspace "${vectors}")
+
+  add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
+  add_test(NAME constants_header_current
+           COMMAND "${CMAKE_COMMAND}" -E compare_files
+                   "${IMD_GENERATED_INCLUDE}/immerdink/detail/constants.hpp"
+                   "${PROJECT_SOURCE_DIR}/${IMD_CONSTANTS_HEADER}")
+endif()
+
+# libimmerdink_host has no CUDA dependency or symbol (readelf / ldd / nm); in the full build
+# also: the repository configures, builds and passes its host tests with IMMERDINK_HOST_ONLY
+# and no nvcc on PATH (a nested build in tests/host_only).
+if(IMMERDINK_HOST_ONLY)
+  add_test(NAME host_cuda_free
+           COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/check_host_cuda_free.sh"
+                   "$<TARGET_FILE:immerdink_host>")
+  return()
+endif()
+add_test(NAME host_cuda_free
+         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/check_host_cuda_free.sh"
+                 "$<TARGET_FILE:immerdink_host>" --standalone "${PROJECT_SOURCE_DIR}"
+                 "${CMAKE_CURRENT_BINARY_DIR}/host_only" "${CMAKE_CXX_COMPILER}"
+                 "${Python3_EXECUTABLE}" "${CMAKE_COMMAND}")
+set_tests_properties(host_cuda_free PROPERTIES TIMEOUT 600)
+
+# --- libimmerdink (CUDA) -------------------------------------------------------------------
 # C ABI from C (also proves the public header is valid C11).
 add_executable(test_c_api test_c_api.c)
 target_link_libraries(test_c_api PRIVATE immerdink imd_warnings)
@@ -76,20 +123,6 @@ if(Python3_FOUND)
   endforeach()
   set_tests_properties(contract_highrank PROPERTIES TIMEOUT 300)
 
-  # imd_workspace_size and the C++ lowering vs spec/params.py on generated descriptors.
-  set(vectors "${CMAKE_CURRENT_BINARY_DIR}/workspace_vectors.txt")
-  add_custom_command(
-    OUTPUT "${vectors}"
-    COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/gen_workspace_vectors.py" "${vectors}"
-    DEPENDS gen_workspace_vectors.py "${PROJECT_SOURCE_DIR}/spec/params.py"
-    COMMENT "Generating workspace test vectors from spec/params.py"
-    VERBATIM)
-  add_custom_target(workspace_vectors ALL DEPENDS "${vectors}")
-  add_executable(test_workspace test_workspace.cpp)
-  target_link_libraries(test_workspace PRIVATE immerdink imd_core imd_warnings)
-  add_dependencies(test_workspace workspace_vectors)
-  add_test(NAME workspace_vs_params COMMAND test_workspace "${vectors}")
-
   add_test(NAME python_harness
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/harness.py"
                    --lib "$<TARGET_FILE:immerdink>")
@@ -99,11 +132,6 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/contractions.py"
                    --lib "$<TARGET_FILE:immerdink>" --quick --rows 16)
   set_tests_properties(accuracy_bound_quick PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
-  add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
-  add_test(NAME constants_header_current
-           COMMAND "${CMAKE_COMMAND}" -E compare_files
-                   "${IMD_GENERATED_INCLUDE}/immerdink/detail/constants.hpp"
-                   "${PROJECT_SOURCE_DIR}/${IMD_CONSTANTS_HEADER}")
 endif()
 
 # GPU tests share one device; run them one at a time.

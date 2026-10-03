@@ -19,12 +19,21 @@
 //       n_labels, labels..., n_modes, (extent, s_A, s_B, s_C) per fused mode; then the pack
 //       pivots of the GEMM's A and B: along_rows, radix. Returns the lowering status;
 //       *count = number of int64s (written only if <= cap).
+//
+//   imd_test_plan_sizes(plan, out, cap, count)
+//       What a real plan actually holds and uses, for comparison with libimmerdink_host's
+//       queries (DESIGN §6a; tests/test_host.py): path, swapped, m, n, k, b, n_hat, k_hat,
+//       N, g; workspace total; 8 x (offset, bytes) of its §4a layout; the plan device bytes
+//       it allocated (0 for a generate plan); the K4 parameter sets (store, add) and the
+//       K4 launches of one call; and its host payload, counted from the live containers:
+//       sizeof(imd_plan_st) + descriptor copies + lowering tables + K0 descriptor + K4Plan
+//       with its map entries. Returns 0, or 1 for a null argument; *count as above.
 #include <cstdint>
 #include <vector>
 
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink.h"
-#include "index_map.hpp"
+#include "host/index_map.hpp"
 #include "plan.hpp"
 
 extern "C" {
@@ -80,6 +89,39 @@ IMD_API imd_status_t imd_test_lowering(const imd_tensor_t* A, const imd_tensor_t
   } catch (...) {
     return IMD_STATUS_ALLOC_FAILED;
   }
+}
+
+IMD_API int imd_test_plan_sizes(imd_plan_t plan, int64_t* out, int64_t cap, int64_t* count) {
+  if (plan == nullptr || count == nullptr) return 1;
+  const imd::detail::ExecPlan& e = plan->exec;
+  std::vector<int64_t> v = {static_cast<int64_t>(e.path), e.swapped ? 1 : 0, e.m, e.n, e.k, e.b,
+                            e.n_hat, e.k_hat, e.N, e.g, static_cast<int64_t>(e.layout.total)};
+  for (size_t r = 0; r < e.layout.offset.size(); ++r) {
+    v.push_back(static_cast<int64_t>(e.layout.offset[r]));
+    v.push_back(static_cast<int64_t>(e.layout.bytes[r]));
+  }
+  v.push_back(e.vec_resident ? static_cast<int64_t>(e.device_bytes) : 0);
+  imd::detail::K4Footprint k4;
+  if (e.k4) k4 = imd::detail::k4_footprint(*e.k4, e.N, e.g);
+  v.push_back(k4.store_shapes);
+  v.push_back(k4.add_shapes);
+  v.push_back(k4.launches);
+  // The host payload, from the live plan (each container's size() times its element size).
+  uint64_t host = sizeof(imd_plan_st);
+  for (const imd::detail::TensorCopy* t : {&plan->A, &plan->B, &plan->C})
+    host += t->extent.size() * sizeof(int64_t) + t->stride.size() * sizeof(int64_t) +
+            t->label.size() * sizeof(int32_t);
+  const imd::detail::Lowered& lw = plan->lowered;
+  host += lw.labels.size() * sizeof(imd::detail::LabelInfo);
+  for (int g = 0; g < 4; ++g)
+    host += lw.order[g].size() * sizeof(int32_t) + lw.fused[g].size() * sizeof(imd::detail::FusedMode);
+  host += e.vec_desc.modes.size() * sizeof(imd::detail::VecMode);
+  host += k4.bytes;
+  v.push_back(static_cast<int64_t>(host));
+  *count = static_cast<int64_t>(v.size());
+  if (out != nullptr && *count <= cap)
+    for (size_t i = 0; i < v.size(); ++i) out[i] = v[i];
+  return 0;
 }
 
 }  // extern "C"
