@@ -9,7 +9,7 @@
 #   IMMERDINK_LIBRARY      link this prebuilt libimmerdink.so instead of building one
 #   GEMMUL8_DIR            GEMMul8 built by tools/get_gemmul8.sh (default bench/_deps/GEMMul8)
 # The build is CPU-heavy: it runs under nice and takes the machine-wide benchmark lock,
-# so it never overlaps a gated timing run.
+# so it never overlaps a gated timing run; it runs inside tools/memcap.sh with at most 4 jobs.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
@@ -30,5 +30,5 @@ cfg=(-S "$here" -B "$build" -G Ninja
 exec 9>"${TLC_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/immerdink-tlc.lock}"
 flock 9
 cmake "${cfg[@]}"
-nice -n 19 cmake --build "$build" --target imd_bench -j "${JOBS:-8}"
+nice -n 19 "$root/tools/memcap.sh" cmake --build "$build" --target imd_bench -j "$(( ${JOBS:-4} < 4 ? ${JOBS:-4} : 4 ))"
 echo "built: $build/imd_bench"

@@ -8,7 +8,8 @@
 #   IMMERDINK_ENV  conda env (default ~/miniforge3/envs/immerdink)
 #   GEMMUL8_DIR    checkout directory (default <repo>/bench/_deps/GEMMul8, git-ignored)
 #   GPU_ARCH       default 89
-#   JOBS           parallel compile jobs (default 8; the build runs under nice -n 19)
+#   JOBS           parallel compile jobs (default 4, max sensible; runs under nice -n 19
+#                  inside tools/memcap.sh, the shared immerdink memory budget)
 # The compile is CPU-heavy, so it takes the machine-wide benchmark lock (the one
 # tools/run_bench.sh uses): it never overlaps a gated timing run.
 set -euo pipefail
@@ -43,7 +44,7 @@ export PATH="$env_dir/bin:$PATH"
 libs="-L$env_dir/lib -L/usr/lib/x86_64-linux-gnu -lcublas -lcudart -lcublasLt -lcuda -lnvidia-ml -ldl"
 exec 9>"${TLC_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/immerdink-tlc.lock}"
 flock 9
-nice -n 19 make -C "$dir" -j"${JOBS:-8}" BACKEND=cuda CUDA_PATH="$env_dir" GPU_ARCH="$arch" \
+nice -n 19 "$here/memcap.sh" make -C "$dir" -j"$(( ${JOBS:-4} < 4 ? ${JOBS:-4} : 4 ))" BACKEND=cuda CUDA_PATH="$env_dir" GPU_ARCH="$arch" \
   OPS=gemm OZ2_BACKENDS=INT8 PROFILE=off LIBS="$libs" CXX="$env_dir/bin/g++"
 flock -u 9
 ls -l "$dir/lib/"

@@ -23,12 +23,14 @@
 // permutes A and B in, runs the GEMM and permutes C out (cuTENSOR permutations).
 //
 // Accuracy: for --samples output elements (all of them if C is smaller), the reference
-// is a double-double (Dot2) dot product on the host. Reported: max |c - r| / |r| and the
+// is a double-double (Dot2) dot product computed on the device; the host holds only the
+// samples (no operand copies), so host RSS is small for every shape. Reported: max |c - r| / |r| and the
 // normwise max |c - r| / (||a_i||_2 ||b_j||_2) of DESIGN §3.8.
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cutensor.h>
+#include <sys/resource.h>
 #include <immerdink/immerdink.h>
 
 #ifdef IMD_BENCH_GEMMUL8
@@ -258,23 +260,66 @@ Case parse_case(const std::string& name, const std::string& spec, const std::str
   return c;
 }
 
-// ------------------------------------------------------------------------ host reference ---
+// ---------------------------------------------------------------------- device reference ---
 // Dot2 (Ogita-Rump-Oishi): the result is as accurate as if computed in twice the working
-// precision, then rounded; far below the FP64-level errors being measured.
+// precision, then rounded; far below the FP64-level errors being measured. Computed on the
+// device for the sampled outputs only (one thread per sample), so the host never holds an
+// operand: host memory stays O(samples) for every shape. Intrinsics keep nvcc from fusing
+// the error-free transformations into FMAs.
 struct DD {
   double hi = 0, lo = 0;
-  void add_prod(double a, double b) {
-    double p = a * b, pe = std::fma(a, b, -p);
-    double s = hi + p, bb = s - hi, se = (hi - (s - bb)) + (p - bb);
+  __device__ void add_prod(double a, double b) {
+    double p = __dmul_rn(a, b), pe = __fma_rn(a, b, -p);
+    double s = __dadd_rn(hi, p), bb = __dsub_rn(s, hi);
+    double se = __dadd_rn(__dsub_rn(hi, __dsub_rn(s, bb)), __dsub_rn(p, bb));
     hi = s;
-    lo += pe + se;
+    lo = __dadd_rn(lo, __dadd_rn(pe, se));
   }
-  void normalize() {  // TwoSum(hi, lo): hi = fl(hi + lo), lo = the exact remainder
-    double s = hi + lo, bb = s - hi;
-    lo = (hi - (s - bb)) + (lo - bb);
+  __device__ void normalize() {  // TwoSum(hi, lo): hi = fl(hi + lo), lo = the exact remainder
+    double s = __dadd_rn(hi, lo), bb = __dsub_rn(s, hi);
+    lo = __dadd_rn(__dsub_rn(hi, __dsub_rn(s, bb)), __dsub_rn(lo, bb));
     hi = s;
   }
 };
+
+constexpr int kMaxKModes = 8;
+struct KIter {  // mixed-radix iteration over the contracted labels
+  int nd = 0;
+  int64_t ext[kMaxKModes], sa[kMaxKModes], sb[kMaxKModes];
+  int64_t k = 1;
+};
+
+// out[s] = {hi, lo, ||a_i||_2 ||b_j||_2} of sample s, whose A/B base offsets are offA/offB.
+__global__ void k_reference(const double* A, const double* B, const int64_t* offA,
+                            const int64_t* offB, size_t ns, KIter it, double* out) {
+  size_t s = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+  if (s >= ns) return;
+  int64_t oa = offA[s], ob = offB[s], ctr[kMaxKModes] = {};
+  DD acc;
+  double na = 0, nb = 0;
+  for (int64_t t = 0; t < it.k; ++t) {
+    double a = A[oa], b = B[ob];
+    acc.add_prod(a, b);
+    na += a * a;
+    nb += b * b;
+    for (int d = it.nd - 1; d >= 0; --d) {  // increment the K counter
+      oa += it.sa[d];
+      ob += it.sb[d];
+      if (++ctr[d] < it.ext[d]) break;
+      oa -= it.sa[d] * it.ext[d];
+      ob -= it.sb[d] * it.ext[d];
+      ctr[d] = 0;
+    }
+  }
+  acc.normalize();
+  out[3 * s] = acc.hi;
+  out[3 * s + 1] = acc.lo;
+  out[3 * s + 2] = sqrt(na) * sqrt(nb);
+}
+__global__ void k_gather(const double* C, const size_t* idx, size_t ns, double* out) {
+  size_t s = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+  if (s < ns) out[s] = C[idx[s]];
+}
 
 struct Accuracy {
   double max_rel = 0, max_norm = 0;
@@ -283,14 +328,15 @@ struct Accuracy {
 
 // Sampled reference: the C linear indices to check, the reference as a double-double
 // (hi + lo, so errors are measured against the exact value, not a rounded one) and
-// ||a_i||_2 ||b_j||_2.
+// ||a_i||_2 ||b_j||_2. idx also lives on the device (dIdx) for the gather.
 struct Reference {
   std::vector<size_t> idx;
   std::vector<double> hi, lo, nrm;
+  DevBuf dIdx, dGot;
 };
 
-Reference make_reference(const Case& c, const std::vector<double>& hA, const std::vector<double>& hB,
-                         long long samples, uint64_t seed) {
+Reference make_reference(const Case& c, const double* dA, const double* dB, long long samples,
+                         uint64_t seed, cudaStream_t st) {
   Reference R;
   size_t total = c.C.size;
   if (size_t(samples) >= total) {
@@ -298,56 +344,67 @@ Reference make_reference(const Case& c, const std::vector<double>& hA, const std
   } else {
     for (long long s = 0; s < samples; ++s) R.idx.push_back(splitmix64(seed + 7919 * s) % total);
   }
-  // K iteration: mixed radix over c.K, with A and B strides per K label.
-  std::vector<int64_t> kext, kA, kB;
+  KIter it;
+  it.k = c.k;
+  if (c.K.size() > size_t(kMaxKModes)) throw Failure("too many contracted labels");
   for (char x : c.K) {
-    kext.push_back(c.ext.at(x));
-    kA.push_back(c.A.stride[c.A.labels.find(x)]);
-    kB.push_back(c.B.stride[c.B.labels.find(x)]);
+    it.ext[it.nd] = c.ext.at(x);
+    it.sa[it.nd] = c.A.stride[c.A.labels.find(x)];
+    it.sb[it.nd] = c.B.stride[c.B.labels.find(x)];
+    ++it.nd;
   }
-  for (size_t li : R.idx) {
-    int64_t offA = 0, offB = 0;
-    size_t rem = li;
+  size_t ns = R.idx.size();
+  std::vector<int64_t> offA(ns), offB(ns);
+  for (size_t s = 0; s < ns; ++s) {
+    size_t rem = R.idx[s];
+    int64_t oa = 0, ob = 0;
     for (int d = int(c.C.labels.size()) - 1; d >= 0; --d) {
       int64_t v = int64_t(rem % size_t(c.C.extent[d]));
       rem /= size_t(c.C.extent[d]);
       char x = c.C.labels[d];
       auto pa = c.A.labels.find(x), pb = c.B.labels.find(x);
-      if (pa != std::string::npos) offA += v * c.A.stride[pa];
-      if (pb != std::string::npos) offB += v * c.B.stride[pb];
+      if (pa != std::string::npos) oa += v * c.A.stride[pa];
+      if (pb != std::string::npos) ob += v * c.B.stride[pb];
     }
-    DD acc;
-    double na = 0, nb = 0;
-    std::vector<int64_t> ctr(kext.size(), 0);
-    int64_t oa = offA, ob = offB;
-    for (int64_t t = 0; t < c.k; ++t) {
-      double a = hA[size_t(oa)], bv = hB[size_t(ob)];
-      acc.add_prod(a, bv);
-      na += a * a;
-      nb += bv * bv;
-      for (int d = int(kext.size()) - 1; d >= 0; --d) {  // increment the K counter
-        oa += kA[d];
-        ob += kB[d];
-        if (++ctr[d] < kext[d]) break;
-        oa -= kA[d] * kext[d];
-        ob -= kB[d] * kext[d];
-        ctr[d] = 0;
-      }
-    }
-    acc.normalize();
-    R.hi.push_back(acc.hi);
-    R.lo.push_back(acc.lo);
-    R.nrm.push_back(std::sqrt(na) * std::sqrt(nb));
+    offA[s] = oa;
+    offB[s] = ob;
+  }
+  DevBuf dOA(ns * 8), dOB(ns * 8), dOut(ns * 24);
+  R.dIdx = DevBuf(ns * sizeof(size_t));
+  R.dGot = DevBuf(ns * 8);
+  CU(cudaMemcpy(dOA.p, offA.data(), ns * 8, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(dOB.p, offB.data(), ns * 8, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(R.dIdx.p, R.idx.data(), ns * sizeof(size_t), cudaMemcpyHostToDevice));
+  k_reference<<<unsigned((ns + 127) / 128), 128, 0, st>>>(dA, dB, dOA.as<int64_t>(), dOB.as<int64_t>(),
+                                                          ns, it, dOut.as<double>());
+  CU(cudaStreamSynchronize(st));
+  CU(cudaGetLastError());
+  std::vector<double> out(3 * ns);
+  CU(cudaMemcpy(out.data(), dOut.p, ns * 24, cudaMemcpyDeviceToHost));
+  R.hi.resize(ns);
+  R.lo.resize(ns);
+  R.nrm.resize(ns);
+  for (size_t s = 0; s < ns; ++s) {
+    R.hi[s] = out[3 * s];
+    R.lo[s] = out[3 * s + 1];
+    R.nrm[s] = out[3 * s + 2];
   }
   return R;
 }
 
-Accuracy check(const Reference& R, const std::vector<double>& hC) {
+// Gather the sampled outputs of the device C and compare them with the reference.
+Accuracy check(Reference& R, const double* dC, cudaStream_t st) {
+  size_t ns = R.idx.size();
+  k_gather<<<unsigned((ns + 255) / 256), 256, 0, st>>>(dC, R.dIdx.as<size_t>(), ns, R.dGot.as<double>());
+  CU(cudaStreamSynchronize(st));
+  CU(cudaGetLastError());
+  std::vector<double> got(ns);
+  CU(cudaMemcpy(got.data(), R.dGot.p, ns * 8, cudaMemcpyDeviceToHost));
   Accuracy a;
-  for (size_t s = 0; s < R.idx.size(); ++s) {
-    double got = hC[R.idx[s]], ref = R.hi[s], d = std::fabs((got - ref) - R.lo[s]);
+  for (size_t s = 0; s < ns; ++s) {
+    double g = got[s], ref = R.hi[s], d = std::fabs((g - ref) - R.lo[s]);
     ++a.samples;
-    if (!std::isfinite(got)) { ++a.bad; continue; }
+    if (!std::isfinite(g)) { ++a.bad; continue; }
     if (ref != 0) a.max_rel = std::max(a.max_rel, d / std::fabs(ref));
     if (R.nrm[s] != 0) a.max_norm = std::max(a.max_norm, d / R.nrm[s]);
   }
@@ -412,8 +469,7 @@ struct Bench {
   cutensorHandle_t tens = nullptr;
   imd_handle_t imd = nullptr;
   DevBuf dA, dB, dC;
-  std::vector<double> hA, hB, hC;
-  Reference R;
+  Reference R;  // sampled reference (host memory O(samples); operands stay on the device)
   Json meta;     // fields common to every record
   FILE* out = stdout;
 
@@ -431,6 +487,11 @@ struct Bench {
     fprintf(out, "%s\n", rec.dump().c_str());
     fflush(out);
     fprintf(stderr, "  %s\n", j.dump().c_str());
+  }
+  static double host_maxrss_mib() {  // peak resident set of this process so far
+    rusage u{};
+    getrusage(RUSAGE_SELF, &u);
+    return double(u.ru_maxrss) / 1024.0;
   }
   std::string gpu_state() {
     return sh("nvidia-smi --query-gpu=clocks.sm,clocks.mem,temperature.gpu,power.draw,pstate,"
@@ -451,7 +512,7 @@ struct Bench {
       j.num("max_relerr", acc->max_rel).num("max_normerr", acc->max_norm);
       j.integer("err_samples", acc->samples).integer("nonfinite", acc->bad);
     }
-    j.str("gpu_after", gpu_state()).str("status", "ok");
+    j.str("gpu_after", gpu_state()).num("host_maxrss_mib", host_maxrss_mib()).str("status", "ok");
     for (auto& kv : extra.kv) j.kv.push_back(kv);
     emit(j);
   }
@@ -465,9 +526,7 @@ struct Bench {
   double flops() const { return 2.0 * double(c.m) * double(c.n) * double(c.k) * double(c.b); }
 
   Accuracy result_accuracy() {
-    CU(cudaStreamSynchronize(s));
-    CU(cudaMemcpy(hC.data(), dC.p, dC.bytes, cudaMemcpyDeviceToHost));
-    return check(R, hC);
+    return check(R, dC.as<double>(), s);
   }
   void poison_C() { CU(cudaMemset(dC.p, 0xff, dC.bytes)); }  // NaN everywhere
 
@@ -487,12 +546,7 @@ struct Bench {
     k_fill<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1), o.phi);
     CU(cudaStreamSynchronize(s));
     CU(cudaGetLastError());
-    hA.resize(c.A.size);
-    hB.resize(c.B.size);
-    hC.resize(c.C.size);
-    CU(cudaMemcpy(hA.data(), dA.p, dA.bytes, cudaMemcpyDeviceToHost));
-    CU(cudaMemcpy(hB.data(), dB.p, dB.bytes, cudaMemcpyDeviceToHost));
-    R = make_reference(c, hA, hB, o.samples, o.seed);
+    R = make_reference(c, dA.as<double>(), dB.as<double>(), o.samples, o.seed, s);
 
     // GEMM view. A: L ++ (I ++ K | K ++ I); B: L ++ (J ++ K | K ++ J); C: L ++ I ++ J.
     auto pick = [&](const std::string& have, const std::string& X, bool& kfast) {
