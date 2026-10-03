@@ -438,6 +438,7 @@ struct Options {
   long long samples = 256;
   int phase_reps = 5;  // profiled imd calls (per-phase marks), after the timed loop
   std::vector<int> vec_modes = {IMD_VEC_GENERATE};  // imd: --vec generate,resident (v1.2)
+  std::vector<int> groups = {0};  // imd: --g 1,2,4,0 (residue group size g; 0 = N)
   double phi = 0.5;
   uint64_t seed = 1;
   std::string out;
@@ -845,14 +846,14 @@ struct Bench {
     for (auto d : {da, db, dc}) cutensorDestroyTensorDescriptor(d);
   }
 
-  void method_imd(int N, int vec_mode) {
+  void method_imd(int N, int vec_mode, int g) {
     auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
       lab.assign(x.labels.begin(), x.labels.end());
       return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
     };
     std::vector<int32_t> la, lb, lc;
     imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
-    imd_options_t opt{N, 0, IMD_RN, IMD_EMULATE, vec_mode};
+    imd_options_t opt{N, g, IMD_RN, IMD_EMULATE, vec_mode};
     size_t wsb = 0;
     CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
     imd_plan_t plan = nullptr;
@@ -878,8 +879,10 @@ struct Bench {
     });
 #endif
     extra.integer("plan_device_bytes", (long long)plan_dev).num("plan_create_ms", 1e3 * create_s);
-    record("imd", vec_mode == IMD_VEC_RESIDENT ? "RN g=N vec=resident" : "RN g=N", N, T, &acc,
-           flops(), wsb, extra);
+    const std::string gs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
+    extra.integer("g", (long long)((g == 0 || g >= N) ? N : g));
+    record("imd", vec_mode == IMD_VEC_RESIDENT ? gs + " vec=resident" : gs, N, T, &acc, flops(),
+           wsb, extra);
   }
 
 #ifdef IMD_BENCH_PROFILE
@@ -977,7 +980,7 @@ void usage() {
           "usage: imd_bench --name NAME --spec 'ab,bc->ac' --ext a=..,b=..,c=.. [--methods LIST]\n"
           "  [--N 8,14,20] [--emu dyn,fix55] [--emu-ws-mib 2048] [--reps 10] [--warmup 2]\n"
           "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--phase-reps 5]\n"
-          "  [--vec generate,resident]\n"
+          "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)]\n"
           "  [--out file.jsonl]\n");
 }
 
@@ -1006,6 +1009,10 @@ int main(int argc, char** argv) {
       B.o.vec_modes.clear();
       for (auto& v : split(a["vec"], ','))
         B.o.vec_modes.push_back(v == "resident" ? IMD_VEC_RESIDENT : IMD_VEC_GENERATE);
+    }
+    if (a.count("g")) {
+      B.o.groups.clear();
+      for (auto& v : split(a["g"], ',')) B.o.groups.push_back(std::stoi(v));
     }
     if (a.count("phi")) B.o.phi = std::stod(a["phi"]);
     if (a.count("seed")) B.o.seed = std::stoull(a["seed"]);
@@ -1042,7 +1049,9 @@ int main(int argc, char** argv) {
     else if (m == "cutensor") guarded(m, "", 0, [&] { B.method_cutensor(); });
     else if (m == "imd")
       for (int N : Ns)
-        for (int v : B.o.vec_modes) guarded(m, "", N, [&] { B.method_imd(N, v); });
+        for (int v : B.o.vec_modes)
+          for (int g : B.o.groups)
+            if (g <= N) guarded(m, "", N, [&] { B.method_imd(N, v, g); });
     else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
     else { fprintf(stderr, "unknown method %s\n", m.c_str()); return 2; }
   }

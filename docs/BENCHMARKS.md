@@ -538,3 +538,30 @@ the library, and skipping K0 (NOTES-M4 proposal 1).
 - **Clock locking**: clocks are recorded, not locked (governor `powersave`, turbo on).
   The spread column shows run-to-run noise. Most variants are under 5 %; a few small
   ones are not.
+
+## Residue-group size g: speed vs workspace (2026-10-03, `bench/results/g-sweep-66af510.jsonl`)
+
+N = 14, RN, vec_mode GENERATE, quiet-gated. Workspace ≈ (g/8)(|A|+|B|) + (N/8)|C|.
+Each cell: TFLOPS-eq as % of g = N, workspace as % of g = N.
+
+| case | g=7 | g=4 | g=2 | g=1 |
+|---|---|---|---|---|
+| sq1024 | 99% / 67% | 86% / 52% | 57% / 43% | 36% / 38% |
+| sq2048 | 90% / 67% | 74% / 52% | 61% / 43% | 49% / 38% |
+| sq8192 | 99% / 67% | 95% / 52% | 87% / 43% | 70% / 38% |
+| r_lowk | 97% / 90% | 93% / 86% | 86% / 83% | 66% / 81% |
+| r_bigk | 89% / 52% | 75% / 31% | 61% / 17% | 41% / 10% |
+| r_skinny | 84% / 55% | 68% / 36% | 52% / 24% | 33% / 17% |
+| t_ikl | 88% / 67% | 72% / 52% | 57% / 43% | 37% / 38% |
+| t_df | 95% / 75% | 84% / 64% | 68% / 57% | 52% / 54% |
+| t_cc | 94% / 67% | 83% / 52% | 69% / 43% | 50% / 38% |
+| s_cc16 | 89% / 67% | 74% / 52% | 57% / 43% | 46% / 38% |
+
+- The cost is almost entirely in the pack (K2/K3): each residue group re-reads the FP64
+  operand, so pack traffic goes from (8 + N)·|A| bytes at g = N to about N/g·(8 + g)·|A|.
+  Example: sq8192 pack A 2.28 ms (g = 14) → 10.5 ms (g = 1). On small shapes the GEMM also
+  loses occupancy (sq1024 K4 0.09 → 0.33 ms) because each launch has fewer moduli.
+- The floor is (N/8)|C| (the product planes), so shapes with large C relative to A+B
+  (r_lowk) gain little from small g; shapes with large operands (r_bigk, r_skinny) gain most.
+- g = 7 halves the residue memory for ≤ 12% (often ≤ 5%) slowdown; g ≤ 2 is a
+  last resort.
