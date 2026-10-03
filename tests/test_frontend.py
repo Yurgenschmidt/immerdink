@@ -588,6 +588,47 @@ def suite_robust(lib, cuda, verbose):
     if verbose:
         print("  ok  A == B (one buffer for both operands) bit-exact")
 
+    # Peak device memory: cudaMemGetInfo bracketing of imd_contract (PLAN M3). Free device
+    # memory must be the same before the call and after it completes; the caller's
+    # workspace is the only memory used (the allocation shim and the guard zones of
+    # run_case check the same more strictly). Another process using the GPU can move the
+    # free count, so the check passes if any of 5 attempts brackets exactly; an allocation
+    # by the library would move it in every attempt. A warm-up call first loads the
+    # kernels (CUDA lazy loading takes device memory on a kernel's first launch).
+    A, B, C = tc.matrix(random.Random(3), 300, 200, 500)
+    tA, tB, tC = tdesc(A), tdesc(B), tdesc(C)
+    _, need = lib.workspace_size(tA, tB, tC, 14)
+    _, plan = lib.plan_create(tA, tB, tC, 14)
+    sizes = [8 * buffer_for(d)[0] for d in (A, B, C)] + [need]
+    bufs = [cuda.malloc(n_) for n_ in sizes]
+    try:
+        for p_, n_ in zip(bufs, sizes):
+            cuda.memset(p_, 0, n_)
+        args = (plan, 1.0, bufs[0].value, bufs[1].value, 0.0, bufs[2].value, bufs[3].value, need)
+        if lib.contract(*args) != "SUCCESS":
+            raise Fail("memory bracket: warm-up failed")
+        cuda.sync()
+        deltas = []
+        for _ in range(5):
+            f0, _ = cuda.mem_info()
+            st = lib.contract(*args)
+            cuda.sync()
+            f1, _ = cuda.mem_info()
+            deltas.append(f0 - f1)
+            if st != "SUCCESS":
+                raise Fail(f"memory bracket: {st}")
+            if f0 == f1:
+                break
+        else:
+            raise Fail(f"memory bracket: free device memory moved by {deltas} bytes")
+    finally:
+        for p_ in bufs:
+            cuda.free(p_)
+        lib.plan_destroy(plan)
+    if verbose:
+        print(f"  ok  cudaMemGetInfo bracket: no device memory beyond the {need}-byte workspace "
+              f"(attempts: {len(deltas)})")
+
     # Launch splits via the test-only limits (production values restored after each). Every
     # run of one problem uses the same fill for C's unaddressed gaps (rng seed 77), so the
     # whole C buffers can be compared bit for bit.
