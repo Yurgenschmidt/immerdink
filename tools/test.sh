@@ -7,11 +7,15 @@
 #   IMMERDINK_BUILD_DIR   build directory (default <repo>/build)
 #   IMMERDINK_CUTLASS_DIR CUTLASS checkout (default: the third_party/cutlass submodule)
 #   IMMERDINK_WERROR      ON (default) / OFF: warnings in immerdink's own code are errors
+#   IMMERDINK_BUILD_JOBS  parallel compile jobs (default: min(nproc, MemAvailable / 3 GiB);
+#                         one CUTLASS nvcc/cicc job can take ~2-3 GiB)
+# Runs inside the shared immerdink memory budget (tools/memcap.sh).
 # Correctness tests are pass/fail, so this is not gated on a quiet machine
 # (tools/run_quiet.sh); it runs no timing benchmarks.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
+grep -q "/immerdink.slice/" /proc/self/cgroup 2>/dev/null || exec "$here/memcap.sh" "$here/test.sh" "$@"
 env_dir="${IMMERDINK_ENV:-$HOME/miniforge3/envs/immerdink}"
 build="${IMMERDINK_BUILD_DIR:-$root/build}"
 
@@ -26,5 +30,8 @@ cfg=(-S "$root" -B "$build" -G Ninja
 [ -n "${IMMERDINK_CUTLASS_DIR:-}" ] && cfg+=(-DIMMERDINK_CUTLASS_DIR="$IMMERDINK_CUTLASS_DIR")
 
 cmake "${cfg[@]}"
-cmake --build "$build"
+avail_gb=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1048576 ))
+jobs="${IMMERDINK_BUILD_JOBS:-$(( avail_gb / 3 < $(nproc) ? avail_gb / 3 : $(nproc) ))}"
+[ "$jobs" -ge 1 ] || jobs=1
+cmake --build "$build" -j "$jobs"
 ctest --test-dir "$build" --output-on-failure "$@"
