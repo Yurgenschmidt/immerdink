@@ -12,7 +12,8 @@ on INT8 tensor cores (CUDA, sm_89 first).
 - [spec/README.md](spec/README.md): TLA+ specs, real-width certificate, bit-exact oracle
 
 Build and run all correctness tests: `tools/test.sh` (conda env `immerdink`; see
-[docs/NOTES-M0.md](docs/NOTES-M0.md)).
+[docs/NOTES-M0.md](docs/NOTES-M0.md)). Status: M1 (end-to-end emulated contraction on
+sm_89, bit-exact against the oracle) is described in [docs/NOTES-M1.md](docs/NOTES-M1.md).
 
 Day-to-day work lands on `dev`; `main` only changes via pull request.
 

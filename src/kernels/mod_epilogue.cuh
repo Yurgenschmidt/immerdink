@@ -3,7 +3,8 @@
 // A CUTLASS 2.x Sm80 epilogue-visitor node. One batched launch covers several moduli:
 // batch z = s*b + lambda (s = slot in the residue group, b = batch count of the GEMM view),
 // and the node reads p_l and its reduction constants from the __constant__ table at
-// l = slot0 + z / b. A VisitorScalarBroadcast cannot express z / b (DESIGN §4).
+// l = slot0 + z / b. A VisitorScalarBroadcast cannot express z / b (DESIGN §4). When the
+// batch count is split over several launches, batch0 is the z of the launch's first batch.
 //
 //   store-mod (chunk c = 0):  Sm80EVT<AuxStore<u8>, VisitorModP>                 W = acc mod p
 //   add-mod   (chunk c > 0):  Sm80EVT<AuxStore<u8>, Sm80EVT<VisitorModP, AuxLoad<u8>>>
@@ -29,7 +30,8 @@ struct VisitorModP {
 
   struct Arguments {
     int32_t slot0 = 0;             // modulus index of slot 0 (g0)
-    int32_t batches_per_slot = 1;  // b
+    int64_t batches_per_slot = 1;  // b
+    int64_t batch0 = 0;            // z of this launch's batch 0 (batch-count split, §4)
   };
   using Params = Arguments;
 
@@ -83,7 +85,8 @@ struct VisitorModP {
   template <class ProblemShape>
   CUTLASS_DEVICE auto get_callbacks(cutlass::gemm::GemmCoord threadblock_tile_offset, int,
                                     ProblemShape) {
-    return Callbacks(params_ptr->slot0 + threadblock_tile_offset.k() / params_ptr->batches_per_slot);
+    const int64_t z = params_ptr->batch0 + threadblock_tile_offset.k();
+    return Callbacks(params_ptr->slot0 + static_cast<int>(z / params_ptr->batches_per_slot));
   }
 };
 

@@ -3,8 +3,10 @@
     C[i,j] <- alpha * sum_h A[i,h] * B[h,j] + beta * C[i,j]
 
 A is m x k, B is k x n, C is m x n; all entries are Python floats (IEEE binary64).
-Tensors, IndexMap lowering and batching (b > 1) are out of scope: b = 1 and the canonical
-k-order is simply h = 0, 1, ..., k-1 (DESIGN §1.1).
+contract() is one batch of the GEMM view with canonical k-order h = 0, 1, ..., k-1
+(DESIGN §1.1). contract_tensor() (end of file) adds the tensor front end: the §5 lowering
+(canonical orders, int64 scatter vectors, role swap), batching (b > 1) and the §4 DIRECT
+dispatch for K-empty contractions, i.e. exactly what the library computes.
 
 Every step of DESIGN §3 is implemented literally and in exact integer arithmetic:
 
@@ -47,6 +49,7 @@ locally by the identical greedy rule and cross-checked against the DESIGN §2 ta
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
 import struct
@@ -488,7 +491,8 @@ def contract(A, B, C, alpha: float, beta: float, N: int, rounding: str = "RN",
     A: m x k, B: k x n, C: m x n (lists of lists of floats).  A and B are not touched
     when alpha == 0 or k == 0; C is not touched when beta == 0 (pass a poisoned object to
     check).  Shapes may be given explicitly (m, n, k) so that unread operands can be None.
-    `trace`, if a dict, receives sigma, tau, flags, quantized operands, W planes, z and D.
+    `trace`, if a dict, receives sigma, tau, flags, quantized operands, residue planes
+    RA[l][i][h] / RB[l][j][h] (every modulus l), W planes, z and D.
     `_rule` / `_L_w` override the shift rule / CRT word width: negative tests only."""
     if m is None:
         m = len(A)
@@ -525,11 +529,14 @@ def contract(A, B, C, alpha: float, beta: float, N: int, rounding: str = "RN",
 
     # K2-K4 per residue group: residues (§3.4) then per-modulus chunked GEMM (§3.5)
     Wplanes = [None] * N
+    RAall, RBall = [None] * N, [None] * N             # trace only: residue planes
     for G in plan.groups():
         RA = {l: [[residue(mu, ep, plan.p[l]) for mu, ep in QA[i]] for i in range(m)] for l in G}
         RB = {l: [[residue(mu, ep, plan.p[l]) for mu, ep in QB[j]] for j in range(n)] for l in G}
         for l in G:
             Wplanes[l] = modular_gemm(RA[l], RB[l], plan.p[l], plan.chunk)
+            if trace is not None:
+                RAall[l], RBall[l] = RA[l], RB[l]
         del RA, RB                                    # buffers reused by the next group
 
     # K5: CRT, unscale, native path, alpha/beta
@@ -549,7 +556,7 @@ def contract(A, B, C, alpha: float, beta: float, N: int, rounding: str = "RN",
             out[i][j] = finish(i, j, E)
     if trace is not None:
         trace.update(plan=plan, sigma=sigma, tau=tau, fA=fA, fB=fB, QA=QA, QB=QB,
-                     W=Wplanes, z=Z, D=Dm, srow=srow, scol=scol)
+                     RA=RAall, RB=RBall, W=Wplanes, z=Z, D=Dm, srow=srow, scol=scol)
     return out
 
 
@@ -574,6 +581,285 @@ def exact_dot(a_row, b_col):
 def qvalue(q) -> int:
     mu, eps = q
     return mu << eps
+
+
+# ---------------------------------------------------------------------------------------
+# §5 IndexMap lowering and the tensor front end (§1.1, §3.7, §4 DIRECT)
+# ---------------------------------------------------------------------------------------
+#
+# What the library computes for a tensor contraction is a function of the GEMM view: b
+# independent m x n x k matrix contractions over the canonical index spaces of §1.1, read
+# and written through int64 additive scatter vectors (§5 step 10). Numerically only the
+# canonical K order matters (it is the native path's fma order, §3.7); everything else in
+# the emulated path is exact or per element. The lowering below is a literal transcription
+# of DESIGN §5 steps 1-8 and 10 (step 9, fusion, is a pure performance transformation: it
+# merges consecutive labels without changing the enumeration, so it is not modelled).
+#
+# ORACLE-CHOICE (shared with the library; see docs/NOTES-M1.md):
+#   * the coalescing swap of step 8 is applied FIRST, and the canonical orders are then
+#     computed in the post-swap frame (A, B, m, n and I, J are the post-swap ones, so
+#     "big" in the K key is the post-swap A when m >= n);
+#   * "position" is the first occurrence in the caller's A.labels ++ B.labels ++ C.labels;
+#   * K-empty (k = 1 after lowering) and mode DIRECT dispatch to the native path for every
+#     element: acc = +0, fma in canonical k order (a single fma for K-empty), then alpha/beta
+#     exactly as §3.7.
+
+INT64_MAX = 2**63 - 1
+GEMM_DIM_MAX = 2**31 - 1        # §5 row 5: CUTLASS GemmCoord is int (EMULATE only)
+EMULATE, DIRECT = "EMULATE", "DIRECT"
+
+
+class Desc:
+    """A strided tensor descriptor (§6 imd_tensor_t): extents, strides (elements), labels."""
+
+    def __init__(self, extent, stride, label):
+        assert len(extent) == len(stride) == len(label)
+        self.extent, self.stride, self.label = list(extent), list(stride), list(label)
+
+    def empty(self):
+        return 0 in self.extent
+
+
+def stride_rule(d: Desc) -> bool:
+    """§5 row 4 on a non-empty tensor: over modes with extent > 1 sorted by |stride|,
+    each |s_(t)| > sum_{u<t} |s_(u)| (e_(u) - 1)."""
+    below = 0
+    for a, _, e in sorted((abs(s), p, e) for p, (e, s) in enumerate(zip(d.extent, d.stride))
+                          if e > 1):
+        if a <= below:
+            return False
+        below += a * (e - 1)
+    return True
+
+
+def _radix_vec(modes, X):
+    """§5 step 10: v[q] = sum_j s_X(mode_j) * digit_j(q), mixed radix, first mode fastest."""
+    size = math.prod(e for _, e, _ in modes)
+    v = [0] * size
+    digits = [0] * len(modes)
+    cur = 0
+    for q in range(size):
+        v[q] = cur
+        for j, (_, e, st) in enumerate(modes):        # odometer increment
+            digits[j] += 1
+            cur += st[X]
+            if digits[j] < e:
+                break
+            cur -= st[X] * e
+            digits[j] = 0
+    return v
+
+
+class GemmView:
+    """Result of lower(): the b x (m x n x k) GEMM view and its scatter vectors.
+
+    order[g] is the canonical label order of group g in {I, J, K, L} (first fastest);
+    stride[X][label] the merged strides in the POST-SWAP frame (X in A, B, C; 0 where the
+    label is absent: the stride-0 lowering of step 6); vec[name] the int64 scatter vectors
+    A_row, A_k, A_bat, B_k, B_col, B_bat, C_row, C_col, C_bat (post-swap A and B)."""
+
+    VEC_ORDER = ("A_row", "A_k", "A_bat", "B_k", "B_col", "B_bat", "C_row", "C_col", "C_bat")
+
+    def vec_region(self):
+        """The §4a vec region contents in order (A: row, k, batch; B: k, col, batch; C: row,
+        col, batch)."""
+        out = []
+        for name in self.VEC_ORDER:
+            out += self.vec[name]
+        return out
+
+    def empty_output(self):
+        return self.b == 0 or self.m == 0 or self.n == 0
+
+
+def lower(A: Desc, B: Desc, C: Desc, mode=EMULATE) -> GemmView:
+    """DESIGN §5 lowering with the legality rows 1-5 in precedence order (rows 6-7 are
+    execute-time). Raises InvalidValue / NotSupported."""
+    T = {"A": A, "B": B, "C": C}
+    for d in T.values():
+        if any(e < 0 for e in d.extent):
+            raise InvalidValue("negative extent")
+    ext, members, ms, first = {}, {}, {}, {}
+    pos = 0
+    for X in ("A", "B", "C"):                          # steps 1-2
+        d = T[X]
+        for e, s, l in zip(d.extent, d.stride, d.label):
+            if ext.setdefault(l, e) != e:
+                raise InvalidValue(f"row 1: extent mismatch for label {l}")
+            members.setdefault(l, []).append(X)
+            ms[(X, l)] = ms.get((X, l), 0) + s
+            first.setdefault(l, pos)
+            pos += 1
+    if len(set(C.label)) != len(C.label):
+        raise NotSupported("row 2: repeated label in C")
+    for l, mem in members.items():
+        if set(mem) == {"C"} and ext[l] > 1:
+            raise NotSupported("row 3: label only in C with extent > 1")
+    if not C.empty() and not stride_rule(C):
+        raise InvalidValue("row 4: C fails the sorted-|stride| rule")
+    if any(abs(v) > INT64_MAX for v in ms.values()):
+        raise InvalidValue("row 5: merged diagonal stride")
+    for d in T.values():
+        if not d.empty() and sum(abs(s) * (e - 1) for e, s in zip(d.extent, d.stride)) > INT64_MAX:
+            raise InvalidValue("row 5: span")
+    cls = {}
+    for l, mem in members.items():                     # steps 4-7
+        s = set(mem)
+        cls[l] = ("L" if s == {"A", "B", "C"} else "I" if s == {"A", "C"} else
+                  "J" if s == {"B", "C"} else "I" if s == {"C"} else "K")
+    size = {g: math.prod(ext[l] for l in cls if cls[l] == g and ext[l] != 1) for g in "IJKL"}
+    if any(v > INT64_MAX for v in size.values()):
+        raise InvalidValue("row 5: extent product")
+    stride = {X: {l: ms.get((X, l), 0) for l in ext} for X in "ABC"}
+    # step 8, coalescing: C's smallest-|stride| mode with extent > 1 in I -> swap roles
+    swapped = False
+    if not C.empty():
+        kept = [(abs(s), p) for p, (e, s) in enumerate(zip(C.extent, C.stride)) if e > 1]
+        if kept:
+            swapped = cls[C.label[min(kept)[1]]] == "I"
+    if swapped:
+        stride["A"], stride["B"] = stride["B"], stride["A"]
+        cls = {l: {"I": "J", "J": "I"}.get(c, c) for l, c in cls.items()}
+        size["I"], size["J"] = size["J"], size["I"]
+    v = GemmView()
+    v.m, v.n, v.k, v.b = size["I"], size["J"], size["K"], size["L"]
+    v.swapped = swapped
+    for x, y in ((v.m, v.k), (v.k, v.n), (v.m, v.n)):
+        if v.b * x * y > INT64_MAX:
+            raise InvalidValue("row 5: operand size")
+    if mode == EMULATE and not v.empty_output() and \
+            (v.m > GEMM_DIM_MAX or -(-v.n // 16) * 16 > GEMM_DIM_MAX):
+        raise InvalidValue("row 5: m or n_hat > 2^31-1 (EMULATE)")
+    # step 8: canonical orders (post-swap frame, see ORACLE-CHOICE above)
+    big, oth = ("A", "B") if v.m >= v.n else ("B", "A")
+
+    def a(X, l):
+        return abs(stride[X][l])
+
+    keys = {"I": lambda l: (a("C", l), a("A", l), first[l]),
+            "J": lambda l: (a("C", l), a("B", l), first[l]),
+            "L": lambda l: (a("C", l), a("A", l), a("B", l), first[l]),
+            "K": lambda l: (a(big, l), a(oth, l), first[l])}
+    v.order = {g: sorted((l for l in cls if cls[l] == g and ext[l] != 1), key=keys[g])
+               for g in "IJKL"}
+    v.ext, v.stride, v.first = ext, stride, first
+    # step 9 (fusion) is not modelled: performance only, the enumeration is unchanged.
+    v.vec = {}
+    if not v.empty_output():
+        modes = {g: [(l, ext[l], {X: stride[X][l] for X in "ABC"}) for l in v.order[g]]
+                 for g in "IJKL"}
+        for name, X, g in (("A_row", "A", "I"), ("A_k", "A", "K"), ("A_bat", "A", "L"),
+                           ("B_k", "B", "K"), ("B_col", "B", "J"), ("B_bat", "B", "L"),
+                           ("C_row", "C", "I"), ("C_col", "C", "J"), ("C_bat", "C", "L")):
+            v.vec[name] = _radix_vec(modes[g], X)
+    return v
+
+
+class Tensor:
+    """Tensor data for contract_tensor: a flat list of floats `buf`, the index `base` of
+    the element with all mode indices 0 (strides may be negative), and a Desc."""
+
+    def __init__(self, buf, base, desc: Desc):
+        self.buf, self.base, self.desc = buf, base, desc
+
+
+def contract_tensor(A: Tensor, B: Tensor, C: Tensor, alpha: float, beta: float, N: int,
+                    rounding: str = "RN", g: int | None = None, mode=EMULATE,
+                    chunk: int = K_C_ALIGNED, trace: dict | None = None):
+    """C[I,J,L] <- alpha sum_K A[I,K,L] B[K,J,L] + beta C[I,J,L] (DESIGN §1) through the
+    §5 lowering. Returns a new flat list for C's buffer (elements C does not address are
+    copied unchanged). Dispatch (§3.7, §4):
+      SCALE  alpha = 0 or k = 0: C <- beta == 0 ? +0 : RN(beta C); A, B not read;
+      DIRECT K-empty (k = 1 after lowering) or mode DIRECT: native fma dot, acc = +0;
+      GEMM   otherwise: contract() per batch lambda on the gathered canonical matrices.
+    `trace` receives view, kind and, per batch of the GEMM path, contract()'s trace."""
+    if not (N_MIN <= N <= N_MAX):
+        raise InvalidValue(f"N={N}")
+    if rounding not in ("RN", "TRUNC") or mode not in (EMULATE, DIRECT):
+        raise InvalidValue("option")
+    if not (g in (None, 0) or 1 <= g <= N):
+        raise InvalidValue(f"g={g}")
+    view = lower(A.desc, B.desc, C.desc, mode)
+    out = list(C.buf)
+    if trace is not None:
+        trace.update(view=view, batches=[], kind="NOOP")
+    if view.empty_output():
+        return out
+    m, n, k, b, vec = view.m, view.n, view.k, view.b, view.vec
+    # plan time: §3.2 RN acceptance applies only when the emulated GEMM would run
+    if mode == EMULATE and k > 1:
+        Plan(N, k, rounding, g, chunk)
+    opA, opB = (B, A) if view.swapped else (A, B)     # post-swap A' is the caller's B
+    reads_ab = alpha != 0.0 and k != 0
+    kind = "SCALE" if not reads_ab else "DIRECT" if (mode == DIRECT or k == 1) else "GEMM"
+    if trace is not None:
+        trace["kind"] = kind
+
+    def gather_a(lam):
+        return [[opA.buf[opA.base + vec["A_bat"][lam] + vec["A_row"][i] + vec["A_k"][h]]
+                 for h in range(k)] for i in range(m)]
+
+    def gather_b(lam):
+        return [[opB.buf[opB.base + vec["B_bat"][lam] + vec["B_k"][h] + vec["B_col"][j]]
+                 for j in range(n)] for h in range(k)]
+
+    def c_off(lam, i, j):
+        return C.base + vec["C_bat"][lam] + vec["C_row"][i] + vec["C_col"][j]
+
+    for lam in range(b):
+        Cl = ([[C.buf[c_off(lam, i, j)] for j in range(n)] for i in range(m)]
+              if beta != 0.0 else None)                 # C is not read when beta = 0
+        if kind == "SCALE":
+            res = [[(0.0 if beta == 0.0 else mul(beta, Cl[i][j])) for j in range(n)]
+                   for i in range(m)]
+        elif kind == "DIRECT":
+            Al, Bl = gather_a(lam), gather_b(lam)
+            res = [[None] * n for _ in range(m)]
+            for i in range(m):
+                for j in range(n):
+                    D = native_dot(Al[i], [Bl[h][j] for h in range(k)])
+                    E = D if alpha == 1.0 else mul(alpha, D)
+                    res[i][j] = E if beta == 0.0 else fma(beta, Cl[i][j], E)
+        else:
+            t = {} if trace is not None else None
+            res = contract(gather_a(lam), gather_b(lam), Cl, alpha, beta, N, rounding, g,
+                           chunk, m=m, n=n, k=k, trace=t)
+            if trace is not None:
+                trace["batches"].append(t)
+        for i in range(m):
+            for j in range(n):
+                out[c_off(lam, i, j)] = res[i][j]
+    return out
+
+
+def einsum_addresses(A: Desc, B: Desc, C: Desc):
+    """Brute-force sorted list of the einsum's (C, A, B) element-offset triples: one per
+    assignment of every label (a repeated label takes one index: diagonal). Tests only."""
+    labels = []
+    for d in (A, B, C):
+        for l, e in zip(d.label, d.extent):
+            if l not in [x for x, _ in labels]:
+                labels.append((l, e))
+    out = []
+    for idx in itertools.product(*[range(e) for _, e in labels]):
+        asg = {l: i for (l, _), i in zip(labels, idx)}
+        out.append(tuple(sum(s * asg[l] for s, l in zip(d.stride, d.label)) for d in (C, A, B)))
+    return sorted(out)
+
+
+def view_addresses(view: GemmView):
+    """Sorted (C, A, B) offset triples generated by the GEMM view (caller's A/B frame)."""
+    vec = view.vec
+    out = []
+    for lam in range(view.b):
+        for i in range(view.m):
+            for j in range(view.n):
+                for h in range(view.k):
+                    a = vec["A_bat"][lam] + vec["A_row"][i] + vec["A_k"][h]
+                    bb = vec["B_bat"][lam] + vec["B_k"][h] + vec["B_col"][j]
+                    c = vec["C_bat"][lam] + vec["C_row"][i] + vec["C_col"][j]
+                    out.append((c, bb, a) if view.swapped else (c, a, bb))
+    return sorted(out)
 
 
 if __name__ == "__main__":
