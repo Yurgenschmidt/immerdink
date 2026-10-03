@@ -37,7 +37,7 @@ while IFS='|' read -r name spec ext methods Ns emu extra; do
       more=(${AFTER_ARGS:-})
     fi
     tag="BEFORE_COMMIT"; [ "$side" = after ] && tag="AFTER_COMMIT"
-    BENCH_COMMIT="${!tag:-$side}" "$root/tools/run_bench.sh" "$bin" "${common[@]}" --methods "$m" \
+    BENCH_COMMIT="${!tag:-$side}" "$root/tools/run_bench.sh" "$root/bench/warm_run.sh" "$bin" "${common[@]}" --methods "$m" \
       "${more[@]}" --out "$out" </dev/null
     rc=$?
     if [ $rc = 3 ]; then echo "machine never got quiet; stopping before $name ($side)" >&2; exit 3; fi

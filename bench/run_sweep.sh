@@ -40,7 +40,7 @@ while IFS='|' read -r name spec ext methods Ns emu extra; do
   # shellcheck disable=SC2206
   args+=($extra)
   echo "== $name $(date -Is)"
-  QUIET_LOG="$logdir/$name.quiet" "$root/tools/run_bench.sh" "$build/imd_bench" "${args[@]}" </dev/null
+  QUIET_LOG="$logdir/$name.quiet" "$root/tools/run_bench.sh" "$here/warm_run.sh" "$build/imd_bench" "${args[@]}" </dev/null
   rc=$?
   if [ $rc = 3 ]; then
     echo "machine never got quiet; stopping the sweep before case $name" >&2

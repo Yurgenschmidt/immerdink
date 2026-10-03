@@ -616,3 +616,14 @@ t_cc 1.19 → 1.32×, t_df 1.35 → 1.52×, t_nn 1.19 → 1.30×, t_permout 1.19
 (KF, unchanged) within noise (identical nsys kernel times). ncu: the scale + pack phase reads
 half the DRAM bytes at g = N and one operand read less at any g. Tables, the threads-per-CTA
 measurement and the g analysis: [NOTES-D4.md](NOTES-D4.md).
+
+## Clock state and warm-up (2026-10-03)
+
+GPU Boost picks the SM clock from power (450 W cap), temperature and recent load, so separate
+benchmark processes landed at about 2535–2820 MHz, swinging small-shape timings by ±10–30 %.
+`bench/run_sweep.sh` and `bench/run_ab.sh` now run each case through `bench/warm_run.sh`: a
+fixed 3 s dense warm-up (`BENCH_WARMUP_S`, 0 disables) inside the same GPU-lock hold, then the
+case, then a `{"case", "clock_state"}` line (SM clock, power, temperature, clock-event reasons;
+a `nvidia-smi -lgc` lock shows up as `applications_clocks_setting: Active`). Check: three
+separate runs of s512 all at 2805 MHz, timings within ~5 %. For publishable small-shape numbers,
+lock clocks (`sudo nvidia-smi -lgc <f>,<f>`, reset with `-rgc`); that is a manual, root step.
