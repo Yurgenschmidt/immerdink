@@ -177,7 +177,12 @@ available on sm_89.
 
 ## Later (designed-for, not scheduled)
 
-- Internal tiling within a workspace budget.
+- ~~Internal tiling within a workspace budget.~~ **Out of scope** (Eric, 2026-10-03):
+  immerdink stays at kernel level. Operands and workspace are caller-owned device memory
+  used on the caller's stream; immerdink does no host↔device data movement and no
+  out-of-core or tiling orchestration (callers such as ehrenfest own that). Likewise no
+  immerdink-owned CUDA graphs: `imd_contract` must instead stay **stream-capture safe**
+  (no allocation, no host sync; add a capture test).
 - **Shape-dependent kernel selection.** Use cases vary widely in m:n:k (skinny, low-k,
   long-k, tiny batched) and in plan count (dozens of live plans or one hot plan; Eric,
   2026-10-03). M4 kept one K4 tile config because the alternatives were slower on the
@@ -206,7 +211,7 @@ available on sm_89.
   sign), whether to skip redundant output blocks in the GEMM tiling or only in the scatter,
   and IndexMap/TLA+ extensions for packed legality and injectivity. Not before M4.
 - Accurate-mode scaling.
-- Python package (nanobind).
+- Python package (nanobind), device arrays only (cupy / DLPack); no host-array transfers.
 - Hopper/Blackwell back ends.
 - Fused variants (MEMORY_MODEL §7).
 
