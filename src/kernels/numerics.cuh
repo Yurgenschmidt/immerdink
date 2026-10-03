@@ -217,37 +217,56 @@ __device__ __forceinline__ double round_scaled(const uint32_t (&x)[L], bool neg,
 // §3.6 running CRT over the N planes for one element: x <- 0; for l: y = (q_l W_l) mod p_l;
 // x += M_l y (one carry chain); if x >= P: x -= P. Then z = x <= H ? x : x - P, returned as
 // (|z| limbs, sign). L = L32(N) limbs suffice (2P <= 2^(32 L)).
-// One §3.6 step for plane l: y = (q_l W_l) mod p_l; x += M_l y; if x >= P: x -= P.
+// x += M y; if x >= P: x -= P, on L u32 limbs, as one PTX carry chain (two mad chains for
+// the low and high halves of M_w y, then x - P with the borrow deciding the select). All
+// arithmetic is mod 2^(32 L) and the true x + M y < 2P <= 2^(32 L) (cert_crt_peak), so
+// carries out of the top limb are zero in the exact sum and dropping them is exact; the
+// borrow of x - P is exactly the predicate x < P of §3.6.
+template <int L>
+__device__ __forceinline__ void crt_mac_sub(uint32_t (&x)[L], const uint32_t (&M)[L], uint32_t y,
+                                            const uint32_t (&P)[L]);
+template <>
+__device__ __forceinline__ void crt_mac_sub<1>(uint32_t (&x)[1], const uint32_t (&M)[1], uint32_t y,
+                                              const uint32_t (&P)[1]) {
+  asm("{\n\t.reg .u32 t0, bw;\n\t.reg .pred p_ge;\n\tmad.lo.u32 %0, %1, %2, %0;\n\tsub.cc.u32 t0, %0, %3;\n\tsubc.u32 bw, 0, 0;\n\tsetp.eq.u32 p_ge, bw, 0;\n\tselp.u32 %0, t0, %0, p_ge;\n\t}" : "+r"(x[0]) : "r"(M[0]), "r"(y), "r"(P[0]));
+}
+template <>
+__device__ __forceinline__ void crt_mac_sub<2>(uint32_t (&x)[2], const uint32_t (&M)[2], uint32_t y,
+                                              const uint32_t (&P)[2]) {
+  asm("{\n\t.reg .u32 t<2>, bw;\n\t.reg .pred p_ge;\n\tmad.lo.cc.u32 %0, %2, %4, %0;\n\tmadc.lo.u32 %1, %3, %4, %1;\n\tmad.hi.u32 %1, %2, %4, %1;\n\tsub.cc.u32 t0, %0, %5;\n\tsubc.cc.u32 t1, %1, %6;\n\tsubc.u32 bw, 0, 0;\n\tsetp.eq.u32 p_ge, bw, 0;\n\tselp.u32 %0, t0, %0, p_ge;\n\tselp.u32 %1, t1, %1, p_ge;\n\t}" : "+r"(x[0]), "+r"(x[1]) : "r"(M[0]), "r"(M[1]), "r"(y), "r"(P[0]), "r"(P[1]));
+}
+template <>
+__device__ __forceinline__ void crt_mac_sub<3>(uint32_t (&x)[3], const uint32_t (&M)[3], uint32_t y,
+                                              const uint32_t (&P)[3]) {
+  asm("{\n\t.reg .u32 t<3>, bw;\n\t.reg .pred p_ge;\n\tmad.lo.cc.u32 %0, %3, %6, %0;\n\tmadc.lo.cc.u32 %1, %4, %6, %1;\n\tmadc.lo.u32 %2, %5, %6, %2;\n\tmad.hi.cc.u32 %1, %3, %6, %1;\n\tmadc.hi.u32 %2, %4, %6, %2;\n\tsub.cc.u32 t0, %0, %7;\n\tsubc.cc.u32 t1, %1, %8;\n\tsubc.cc.u32 t2, %2, %9;\n\tsubc.u32 bw, 0, 0;\n\tsetp.eq.u32 p_ge, bw, 0;\n\tselp.u32 %0, t0, %0, p_ge;\n\tselp.u32 %1, t1, %1, p_ge;\n\tselp.u32 %2, t2, %2, p_ge;\n\t}" : "+r"(x[0]), "+r"(x[1]), "+r"(x[2]) : "r"(M[0]), "r"(M[1]), "r"(M[2]), "r"(y), "r"(P[0]), "r"(P[1]), "r"(P[2]));
+}
+template <>
+__device__ __forceinline__ void crt_mac_sub<4>(uint32_t (&x)[4], const uint32_t (&M)[4], uint32_t y,
+                                              const uint32_t (&P)[4]) {
+  asm("{\n\t.reg .u32 t<4>, bw;\n\t.reg .pred p_ge;\n\tmad.lo.cc.u32 %0, %4, %8, %0;\n\tmadc.lo.cc.u32 %1, %5, %8, %1;\n\tmadc.lo.cc.u32 %2, %6, %8, %2;\n\tmadc.lo.u32 %3, %7, %8, %3;\n\tmad.hi.cc.u32 %1, %4, %8, %1;\n\tmadc.hi.cc.u32 %2, %5, %8, %2;\n\tmadc.hi.u32 %3, %6, %8, %3;\n\tsub.cc.u32 t0, %0, %9;\n\tsubc.cc.u32 t1, %1, %10;\n\tsubc.cc.u32 t2, %2, %11;\n\tsubc.cc.u32 t3, %3, %12;\n\tsubc.u32 bw, 0, 0;\n\tsetp.eq.u32 p_ge, bw, 0;\n\tselp.u32 %0, t0, %0, p_ge;\n\tselp.u32 %1, t1, %1, p_ge;\n\tselp.u32 %2, t2, %2, p_ge;\n\tselp.u32 %3, t3, %3, p_ge;\n\t}" : "+r"(x[0]), "+r"(x[1]), "+r"(x[2]), "+r"(x[3]) : "r"(M[0]), "r"(M[1]), "r"(M[2]), "r"(M[3]), "r"(y), "r"(P[0]), "r"(P[1]), "r"(P[2]), "r"(P[3]));
+}
+template <>
+__device__ __forceinline__ void crt_mac_sub<5>(uint32_t (&x)[5], const uint32_t (&M)[5], uint32_t y,
+                                              const uint32_t (&P)[5]) {
+  asm("{\n\t.reg .u32 t<5>, bw;\n\t.reg .pred p_ge;\n\tmad.lo.cc.u32 %0, %5, %10, %0;\n\tmadc.lo.cc.u32 %1, %6, %10, %1;\n\tmadc.lo.cc.u32 %2, %7, %10, %2;\n\tmadc.lo.cc.u32 %3, %8, %10, %3;\n\tmadc.lo.u32 %4, %9, %10, %4;\n\tmad.hi.cc.u32 %1, %5, %10, %1;\n\tmadc.hi.cc.u32 %2, %6, %10, %2;\n\tmadc.hi.cc.u32 %3, %7, %10, %3;\n\tmadc.hi.u32 %4, %8, %10, %4;\n\tsub.cc.u32 t0, %0, %11;\n\tsubc.cc.u32 t1, %1, %12;\n\tsubc.cc.u32 t2, %2, %13;\n\tsubc.cc.u32 t3, %3, %14;\n\tsubc.cc.u32 t4, %4, %15;\n\tsubc.u32 bw, 0, 0;\n\tsetp.eq.u32 p_ge, bw, 0;\n\tselp.u32 %0, t0, %0, p_ge;\n\tselp.u32 %1, t1, %1, p_ge;\n\tselp.u32 %2, t2, %2, p_ge;\n\tselp.u32 %3, t3, %3, p_ge;\n\tselp.u32 %4, t4, %4, p_ge;\n\t}" : "+r"(x[0]), "+r"(x[1]), "+r"(x[2]), "+r"(x[3]), "+r"(x[4]) : "r"(M[0]), "r"(M[1]), "r"(M[2]), "r"(M[3]), "r"(M[4]), "r"(y), "r"(P[0]), "r"(P[1]), "r"(P[2]), "r"(P[3]), "r"(P[4]));
+}
+
+
+// One §3.6 step for plane l: y = (q_l W_l) mod p_l (q_l W_l < 2^16: the 32-bit magic,
+// device/modp.hpp mod_p_small32); x += M_l y; if x >= P: x -= P.
 template <int L>
 __device__ __forceinline__ void crt_step(uint32_t (&x)[L], uint32_t Wl, int l, int N) {
   using imd::device::c_tables;
   const uint32_t p = c_tables.moduli[l];
-  const uint32_t y = imd::device::mod_p_small(c_tables.q[N][l] * Wl, p, c_tables.epi_magic[l]);
-  uint64_t carry = 0;
+  const uint32_t y =
+      imd::device::mod_p_small32(c_tables.q[N][l] * Wl, p, imd::device::c_magic32.m[l]);
+  uint32_t M[L], P[L];
 #pragma unroll
   for (int w = 0; w < L; ++w) {
-    const uint64_t t = uint64_t{x[w]} + uint64_t{c_tables.M[N][l][w]} * y + carry;
-    x[w] = static_cast<uint32_t>(t);
-    carry = t >> 32;
+    M[w] = c_tables.M[N][l][w];
+    P[w] = c_tables.P[N][w];
   }
-  // carry == 0: the peak x + M_l y < 2P <= 2^(32 L) (cert_crt_peak)
-  bool ge = true;  // x >= P
-#pragma unroll
-  for (int w = L - 1; w >= 0; --w) {
-    if (x[w] != c_tables.P[N][w]) {
-      ge = x[w] > c_tables.P[N][w];
-      break;
-    }
-  }
-  if (ge) {
-    uint64_t borrow = 0;
-#pragma unroll
-    for (int w = 0; w < L; ++w) {
-      const uint64_t t = uint64_t{x[w]} - c_tables.P[N][w] - borrow;
-      x[w] = static_cast<uint32_t>(t);
-      borrow = (t >> 32) & 1;
-    }
-  }
+  crt_mac_sub<L>(x, M, y, P);
 }
 
 template <int L>

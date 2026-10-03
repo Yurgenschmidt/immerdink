@@ -50,7 +50,12 @@ int main() {
     for (uint32_t n = 0; n < (1u << 16); ++n)
       small_bad += mod_p_small(n, p, c::kTables.epi_magic[l]) != n % p;
   }
-  std::printf("CRT step (q W) mod p: 20 x 65536 values, %llu mismatches\n",
+  for (int l = 0; l < c::kNMax; ++l) {  // the 32-bit-magic variant used by K5 (M4)
+    const uint32_t p = c::kTables.moduli[l];
+    for (uint32_t n = 0; n < (1u << 16); ++n)
+      small_bad += imd::device::mod_p_small32(n, p, imd::device::kMagic32.m[l]) != n % p;
+  }
+  std::printf("CRT step (q W) mod p: 2 x 20 x 65536 values, %llu mismatches\n",
               static_cast<unsigned long long>(small_bad));
 
   // §3.5: every reachable accumulator of every modulus, split into work items.

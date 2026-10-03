@@ -40,6 +40,19 @@ IMD_HD uint32_t mod_p_small(uint32_t n, uint32_t p, uint64_t magic) {
   return n - p * q;
 }
 
+// §3.6 y = n mod p for n < 2^16 with the 32-bit magic m32 = ceil(2^32/p): n m32 = (n 2^32 +
+// n e) / p with 0 <= e < p, and n e < 2^16 * 2^8 <= 2^32 / p for p <= 256, so
+// floor(n m32 / 2^32) = floor(n / p). p = 256: the low byte. (Exhaustive CPU test.)
+IMD_HD uint32_t mod_p_small32(uint32_t n, uint32_t p, uint32_t m32) {
+  if (p == 256u) return n & 255u;
+#if defined(__CUDA_ARCH__)
+  const uint32_t q = __umulhi(n, m32);
+#else
+  const auto q = static_cast<uint32_t>((uint64_t{n} * m32) >> 32);
+#endif
+  return n - p * q;
+}
+
 // §3.4 residue of a quantized magnitude mu < 2^56, by byte weights (DESIGN §3.4 allows any
 // exact reduction): mu = sum_i b_i 2^(8i), so mu = sum_i b_i w_i (mod p) with w_i = 2^(8i)
 // mod p. lo = bits 0..31 and hi = bits 32..63 of mu (hi < 2^24); wlo / whi pack w_0..w_3 /

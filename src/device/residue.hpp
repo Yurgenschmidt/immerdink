@@ -24,6 +24,21 @@ constexpr ByteWeights make_byte_weights(const imd::constants::Tables& t) {
   return w;
 }
 
+// ceil(2^32 / p_l) for mod_p_small32, from epi_magic = ceil(2^64 / p_l):
+// ceil(ceil(2^64/p) / 2^32) = ceil(2^32/p). 0 for p = 256 (reduced by mask).
+struct Magic32 {
+  uint32_t m[imd::constants::kNMax];
+};
+constexpr Magic32 make_magic32(const imd::constants::Tables& t) {
+  Magic32 r{};
+  for (int l = 0; l < imd::constants::kNMax; ++l)
+    r.m[l] = t.moduli[l] == 256u ? 0u
+                                 : static_cast<uint32_t>((t.epi_magic[l] >> 32) +
+                                                         ((t.epi_magic[l] & 0xFFFFFFFFull) != 0));
+  return r;
+}
+inline constexpr Magic32 kMagic32 = make_magic32(imd::constants::kTables);
+
 inline constexpr ByteWeights kByteWeights = make_byte_weights(imd::constants::kTables);
 
 }  // namespace imd::device

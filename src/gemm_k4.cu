@@ -24,16 +24,27 @@ namespace {
 using namespace cute;
 namespace c = imd::constants;
 
-using TB = cutlass::gemm::GemmShape<128, 256, 64>;
-using Warp = cutlass::gemm::GemmShape<64, 64, 64>;
+// Tile and stages are overridable at compile time for A/B benchmarks only.
+#ifndef IMD_K4_TM
+#  define IMD_K4_TM 128
+#  define IMD_K4_TN 256
+#  define IMD_K4_WM 64
+#  define IMD_K4_WN 64
+#  define IMD_K4_STAGES 3
+#endif
+using TB = cutlass::gemm::GemmShape<IMD_K4_TM, IMD_K4_TN, 64>;
+using Warp = cutlass::gemm::GemmShape<IMD_K4_WM, IMD_K4_WN, 64>;
 using Inst = cutlass::gemm::GemmShape<16, 8, 32>;
-constexpr int kStages = 3;
+constexpr int kStages = IMD_K4_STAGES;
 constexpr int kEVTStages = 1;
 // Identity swizzle with up to 8 N tiles per M step (CUTLASS picks log_tile from the tiled
 // shape): a wave of 128 CTAs covers ~16 x 8 tiles instead of 128 x 1, so the A and B
 // panels it streams stay in L2 at large k (16384^3: 1 GB less DRAM traffic per modulus).
 // The tile offset's k() is still blockIdx.z = the batch index that VisitorModP reads.
-constexpr int kSwizzle = 8;
+#ifndef IMD_K4_SWIZZLE
+#  define IMD_K4_SWIZZLE 8  // overridable for A/B benchmarks only
+#endif
+constexpr int kSwizzle = IMD_K4_SWIZZLE;
 constexpr int kAlign = 16;  // int8 / u8 elements per 128-bit access
 constexpr auto kRound = cutlass::FloatRoundStyle::round_toward_zero;
 
