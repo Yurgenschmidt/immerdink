@@ -8,12 +8,12 @@
 // vectors off = v_bat[lambda] + v_row[i] + v_k[h], so arbitrary strides work.
 //
 // K2/K3 gather through a shared-memory tile, coalesced along the operand's smallest-|stride|
-// mode, and write K-contiguous 16-byte vectors. K5 maps consecutive threads to consecutive
-// j-bar, which (after the §5 step 8 swap) runs along C's fastest label when that label is
-// in I or J: C writes, W reads and the C scatter-vector reads are then coalesced.
-// The kernels are written for exactness first. TODO(M4): pack tile shapes and the
-// per-element modulo, single-pass K1 (its reads are not tiled yet), a register-resident
-// CRT, wider K5 stores, a K5 mapping for C's fastest label in L.
+// mode, and write K-contiguous 16-byte vectors; residues by byte weights (dp4a). K1 reads
+// over the same row tiles when the pack reads along rows, else one block per row. K5 takes
+// 4 consecutive j-bar per thread; when C's fastest label is a batch label it stages a
+// lambda x j-bar tile in shared memory and writes C lambda-fastest. Every launch choice
+// here (tile shapes, grids, thread mappings) leaves the results bitwise unchanged.
+// M4 measurements and the remaining gaps: docs/NOTES-M4.md.
 #include <algorithm>
 #include <climits>
 #include <cstdint>

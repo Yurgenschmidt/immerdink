@@ -2,9 +2,10 @@
 // with the mod-p -> u8 epilogue (store-mod for chunk 0, add-mod after), batch z = s*b +
 // lambda, modulus l = g0 + z / b from __constant__ (imd::kernels::VisitorModP).
 //
-// One tile configuration for now: 128x256x64, 3 stages (72 KB smem), verified in M0
-// (tests/test_cutlass_mod_epilogue.cu). TODO(M4): the DESIGN §4 tile menu chosen by wave
-// quantization; 128-bit epilogue stores.
+// One tile configuration: 128x256x64, 3 stages (72 KB smem), verified in M0
+// (tests/test_cutlass_mod_epilogue.cu). M4 A/B runs (docs/NOTES-M4.md) found 256x128x64 s3
+// within noise of it and 128x128x64 s4/s5 slower on every benchmark shape, so the DESIGN §4
+// tile menu is not instantiated. The epilogue already stores 16 u8 per access.
 #include <algorithm>
 #include <cstdint>
 
