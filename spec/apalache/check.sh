@@ -11,9 +11,14 @@
 # Apalache: $APALACHE_MC, else tools/apalache/bin/apalache-mc in this checkout
 # or in the main checkout of this repository (tools/get_apalache.sh installs
 # it; it needs Java >= 21). Knobs: APA_JOBS (checks run concurrently,
-# default 4), APA_TIMEOUT (seconds per check, default 600).
+# default 1), APA_TIMEOUT (seconds per check, default 600), JVM_ARGS (passed
+# to apalache-mc's JVM; default -Xmx4g). Z3 runs in the same process and uses
+# native memory on top of the heap; each query here is small (well under
+# 1 GB). The whole run sits inside tools/memcap.sh's shared memory budget.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"; cd "$here"
+grep -q "/immerdink.slice/" /proc/self/cgroup 2>/dev/null || exec "$here/../../tools/memcap.sh" "$here/check.sh" "$@"
+export JVM_ARGS="${JVM_ARGS:--Xmx4g}"
 root="$(cd "$here/../.." && pwd)"
 
 APA="${APALACHE_MC:-}"
@@ -53,7 +58,7 @@ crt20_nosub      |CRTWord20 |                |Init  |NextNoSub|XBelowP       |20
 '
 
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-jobs_max="${APA_JOBS:-4}"
+jobs_max="${APA_JOBS:-1}"
 
 run_one() {  # fields of one CHECKS line -> $tmp/<name>.verdict
   local name="$1" mod="$2" cinit="$3" init="$4" next="$5" inv="$6" len="$7" expect="$8"

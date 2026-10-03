@@ -32,8 +32,10 @@
 (*           GemmMax when the emulated GEMM runs (EMULATE, non-empty       *)
 (*           output, k >= 2), on the POST-swap m and nh (INVALID_VALUE);   *)
 (*           then execute time                                             *)
-(*           (imd_contract, DESIGN §6 order): null pointer                 *)
-(*           (INVALID_VALUE), empty output (SUCCESS, nothing touched),     *)
+(*           (imd_contract, DESIGN §6 order): null pointer             *)
+(*           (INVALID_VALUE; C always, A/B only when alpha # 0 and k # 0,  *)
+(*           ws only when workspace_size > 0), empty output (SUCCESS,      *)
+(*           nothing touched),                                             *)
 (*           ALIASING (C vs A/B byte hulls; workspace [ws, ws +            *)
 (*           workspace_size) vs A/B/C), MISALIGNED (A/B/C not 8-byte,      *)
 (*           ws not AlignWS-aligned), INSUFFICIENT_WORKSPACE.              *)
@@ -143,6 +145,11 @@
 (*  "PosSwapped"   §5 step 8    position tie-break from the swapped        *)
 (*                              descriptor (B.l ++ A.l ++ C.l)             *)
 (*  "Null"       §6 1           null pointers not rejected                 *)
+(*  "NullStrict" §6 1           any null pointer rejected (the pre-M1      *)
+(*                              literal rule: A/B even when alpha = 0 or   *)
+(*                              k = 0, ws even when workspace_size = 0)    *)
+(*  "NullWsLax"  §6 1           null ws accepted even when                 *)
+(*                              workspace_size > 0                         *)
 (*  "WsAlias"    §5 row 6       workspace vs A/B/C test dropped            *)
 (*  "WsRangeBytes" row 6        workspace range [ws, ws + ws_bytes)        *)
 (*                              instead of [ws, ws + workspace_size)       *)
@@ -539,6 +546,7 @@ LimitExceeded(d)   == LET u == SDims(d) IN
 (* pointer. An Execs record is                                             *)
 (*   [mode |-> "EMULATE" | "DIRECT",                                       *)
 (*    nul  |-> subset of {"A", "B", "C", "ws"}: null pointers,             *)
+(*    a0   |-> alpha = 0 (only the §6 null rule depends on it here),       *)
 (*    mis  |-> [Tens -> 0..7],                                             *)
 (*    wsp  |-> <<anchor, side, delta>>: where ws is placed. anchor "far":  *)
 (*             FarWs; else ws = (byte hull end of anchor) + delta (side    *)
@@ -546,7 +554,7 @@ LimitExceeded(d)   == LET u == SDims(d) IN
 (*             so delta = 0 TOUCHES the anchor and +-1 overlaps one byte,  *)
 (*    dws  |-> ws_bytes - workspace_size].                                 *)
 
-XDef  == [mode |-> "EMULATE", nul |-> {}, mis |-> [X \in Tens |-> 0],
+XDef  == [mode |-> "EMULATE", nul |-> {}, a0 |-> FALSE, mis |-> [X \in Tens |-> 0],
           wsp |-> <<"far", "after", 0>>, dws |-> 0]
 FarWs == 1024 * AlignWS
 
@@ -568,6 +576,13 @@ WsRangeD(d, x)   == <<WsAddr(d, x), WsAddr(d, x) + WsSizeDesign(d, x.mode)>>
 CAliasB(d, x) == \/ Intersect(BHull(d, x, "C"), BHull(d, x, "A"))
                  \/ Intersect(BHull(d, x, "C"), BHull(d, x, "B"))
 WsHitR(d, x, r) == \E X \in Tens : Intersect(r, BHull(d, x, X))
+\* §6 1 (DESIGN v1.1 after M1): C must always be non-null; A and B only
+\* when alpha # 0 and k # 0 (otherwise they are never read); ws only when
+\* workspace_size > 0. sz is the workspace_size used for the test.
+NullBad(d, x, sz) ==
+    \/ "C" \in x.nul
+    \/ {"A", "B"} \cap x.nul # {} /\ ~x.a0 /\ UDims(d).k # 0
+    \/ "ws" \in x.nul /\ sz > 0
 MisAl(d, x)   == (\E X \in Tens : x.mis[X] # 0) \/ WsAddr(d, x) % AlignWS # 0
 
 -----------------------------------------------------------------------------
@@ -588,7 +603,11 @@ StatusX(d, x, off) ==
           ELSE "SUCCESS"
         wsr == IF Drop = "WsRangeBytes" THEN <<WsAddr(d, x), WsAddr(d, x) + WsBytesArg(d, x)>>
                ELSE WsRange(d, x)
-        cNull  == <<on("Null") /\ x.nul # {}, "INVALID_VALUE">>
+        cNull  == <<on("Null") /\ CASE Drop = "NullStrict" -> x.nul # {}
+                                     [] Drop = "NullWsLax"  ->
+                                          NullBad(d, [x EXCEPT !.nul = @ \ {"ws"}], 0)
+                                     [] OTHER -> NullBad(d, x, WsSizeImpl(d, x.mode)),
+                    "INVALID_VALUE">>
         cEmpty == <<EmptyOut(d), "SUCCESS">>
         cAlias == <<(on("Aliasing") /\ CAliasB(d, x)) \/ (on("WsAlias") /\ WsHitR(d, x, wsr)),
                     "ALIASING">>
@@ -801,7 +820,7 @@ Reasons(d, x) ==
        <<"CStride",   ~Empty(d, "C") /\ ~StrideRule(d, "C"),     "INVALID_VALUE">>,
        <<"GemmLimit", x.mode = "EMULATE" /\ ~EmptyOut(d) /\ u.k >= 2
                       /\ (u.m > GemmMax \/ CeilQ(u.n) > GemmMax), "INVALID_VALUE">>,
-       <<"Null",      x.nul # {},                                "INVALID_VALUE">>,
+       <<"Null",      NullBad(d, x, WsSizeDesign(d, x.mode)),    "INVALID_VALUE">>,
        <<"-",         EmptyOut(d),                               "SUCCESS">>,
        <<"Aliasing",  CAliasB(d, x),                             "ALIASING">>,
        <<"WsAlias",   WsHitR(d, x, WsRangeD(d, x)),              "ALIASING">>,
@@ -974,12 +993,15 @@ LimitScope ==
 -----------------------------------------------------------------------------
 (* imd_contract execute-time checks (DESIGN §5 rows 6-7, §6).             *)
 
-\* §6 1: no accepted call dereferences a null pointer: C and ws when
-\* anything is done, A and B when they are read (GEMM / DIRECT).
+\* §6 1: no accepted call dereferences a null pointer: C whenever anything
+\* is done, ws whenever the call uses workspace bytes, A and B when they
+\* are read (GEMM / DIRECT with alpha # 0; alpha = 0 is C <- beta*C, DESIGN
+\* §4, so A and B are not read, cf. Pipeline AlphaZeroNoABRead).
 NoNullDeref ==
     ok /\ low.kind # "NOOP" =>
-        /\ {"C", "ws"} \cap xa.nul = {}
-        /\ low.kind \in {"GEMM", "DIRECT"} => {"A", "B"} \cap xa.nul = {}
+        /\ "C" \notin xa.nul
+        /\ WsSizeImpl(desc, xa.mode) > 0 => "ws" \notin xa.nul
+        /\ low.kind \in {"GEMM", "DIRECT"} /\ ~xa.a0 => {"A", "B"} \cap xa.nul = {}
 
 \* §4 / §5 row 6: the workspace bytes the call uses, [ws, ws +
 \* workspace_size), share no byte with any element of A, B or C (the GEMM
@@ -1015,11 +1037,12 @@ ASSUME Drop \in {"none", "Extents", "RepeatC", "COnly", "CStride", "Aliasing",
                  "GemmLimit", "GemmLimitN", "GemmLimitDirect", "GemmLimitEmpty",
                  "Null", "WsAlias", "WsRangeBytes", "Misaligned", "Insufficient",
                  "OrderNullEmpty", "OrderEmptyLast", "OrderAlignFirst",
-                 "OrderInsuffFirst", "OrderPreSwap", "PosSwapped", "GemmLimitK"}
+                 "OrderInsuffFirst", "OrderPreSwap", "PosSwapped", "GemmLimitK",
+                 "NullStrict", "NullWsLax"}
 ASSUME GemmMax >= 1 /\ AlignWS >= 8 /\ AlignWS % 8 = 0
 ASSUME \A x \in Execs :
           /\ x.mode \in {"EMULATE", "DIRECT"}
-          /\ x.nul \subseteq {"A", "B", "C", "ws"}
+          /\ x.nul \subseteq {"A", "B", "C", "ws"} /\ x.a0 \in BOOLEAN
           /\ x.mis \in [Tens -> 0..7]
           /\ x.wsp[1] \in Tens \cup {"far"} /\ x.wsp[2] \in {"after", "before"}
           /\ x.dws \in Int

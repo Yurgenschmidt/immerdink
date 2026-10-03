@@ -94,7 +94,9 @@
 (*               touching / one byte into C, A, B, ws_bytes = size - 1,   *)
 (*               size, size + 8 (slack overlapping A is fine), both modes. *)
 (*  pos_contract_order  null x misalignment x ws placement x ws_bytes:    *)
-(*               every pair of §6 checks firing together.                  *)
+(*               every pair of §6 checks firing together; the null rule's  *)
+(*               conditions ON their boundaries (C always; A/B at k = 0    *)
+(*               and alpha = 0; ws at workspace_size = 0).                 *)
 (*                                                                         *)
 (* NEGATIVE models (must fail as their "\* EXPECT:" says):                 *)
 (*  neg_cstride  Drop "CStride": a C with |s_t| = span (one below the      *)
@@ -125,6 +127,10 @@
 (*  neg_insufficient   one §6 check dropped (ws_range: [ws, ws + ws_bytes)*)
 (*               instead of [ws, ws + workspace_size)): NoNullDeref,      *)
 (*               WsNoAlias, AliasingSound, AlignedAccess, WsSufficient.    *)
+(*  neg_null_strict  any null rejected (A/B at alpha = 0 or k = 0, ws at  *)
+(*               workspace_size = 0): StatusCorrect (over-rejection).      *)
+(*  neg_null_ws_lax  a null ws accepted although workspace_size > 0:      *)
+(*               NoNullDeref.                                              *)
 (*  neg_order_*  the §6 checks reordered (null/empty, empty last,          *)
 (*               MISALIGNED before ALIASING, INSUFFICIENT before           *)
 (*               MISALIGNED): StatusCorrect. These orders are POLICY (no  *)
@@ -173,15 +179,19 @@ MisC4     == [Mis0 EXCEPT !["C"] = 4]
 WsPlaces  == {<<"far", "after", 0>>, <<"C", "after", 0>>, <<"C", "after", -1>>,
               <<"C", "before", 0>>, <<"C", "before", 1>>, <<"A", "after", 0>>,
               <<"A", "before", 0>>, <<"A", "before", 1>>, <<"B", "after", -1>>}
-Ex(md, nl, ms, wp, dw) == [mode |-> md, nul |-> nl, mis |-> ms, wsp |-> wp, dws |-> dw]
+Ex(md, nl, ms, wp, dw) == [mode |-> md, nul |-> nl, a0 |-> FALSE, mis |-> ms, wsp |-> wp, dws |-> dw]
+ExA0(md, nl, ms, wp, dw) == [Ex(md, nl, ms, wp, dw) EXCEPT !.a0 = TRUE]
 \* ws placement x insufficient/exact/larger ws_bytes x both modes.
 ExWs      == {Ex(md, {}, Mis0, wp, dw) : md \in {"EMULATE", "DIRECT"},
                                           wp \in WsPlaces, dw \in {-1, 0, 8}}
-\* null x misalignment x (far / touching / overlapping ws) x ws_bytes.
+\* null x misalignment x (far / touching / overlapping ws) x ws_bytes,
+\* plus alpha = 0 with a null A or B (the §6 null rule's alpha condition).
 ExOrder   == {Ex("EMULATE", nl, ms, wp, dw) :
-                nl \in {{}, {"A"}, {"C"}, {"ws"}}, ms \in {Mis0, MisA4, MisC4},
+                nl \in {{}, {"A"}, {"B"}, {"C"}, {"ws"}}, ms \in {Mis0, MisA4, MisC4},
                 wp \in {<<"far", "after", 0>>, <<"C", "after", 0>>, <<"C", "after", -1>>},
                 dw \in {-1, 0}}
+             \cup {ExA0("EMULATE", nl, Mis0, <<"far", "after", 0>>, 0) :
+                    nl \in {{}, {"A"}, {"B"}, {"A", "B"}, {"ws"}}}
 
 -----------------------------------------------------------------------------
 (* Boundary sentinels (constant-level; TLC evaluates them as ASSUMEs).     *)
@@ -455,10 +465,18 @@ CovX == [
   wsslack  |-> <<DDot(5), XE({}, Mis0, <<"A", "before", 0>>, 8), "SUCCESS">>,
   wsdirect |-> <<DDot(5), Ex("DIRECT", {}, Mis0, <<"C", "after", 0>>, 0), "SUCCESS">>,
   \* --- status order (pos_contract_order) ---
-  \* DESIGN-literal §6: a null pointer beats the empty output, even ws when
-  \* workspace_size = 0, and a null A is rejected when k = 0 (A unread).
-  nullempty |-> <<DEmpty, XE({"ws"}, Mis0, <<"far", "after", 0>>, 0), "INVALID_VALUE">>,
-  nullAk0  |-> <<DK0, XE({"A"}, Mis0, <<"far", "after", 0>>, 0), "INVALID_VALUE">>,
+  \* §6 1 (DESIGN after M1): a null C beats the empty output; a null ws is
+  \* fine when workspace_size = 0 (empty output) and rejected when > 0; a
+  \* null A or B is fine when k = 0 or alpha = 0 (never read), rejected
+  \* otherwise. Each is ON the boundary of its condition.
+  nullCempty  |-> <<DEmpty, XE({"C"}, Mis0, <<"far", "after", 0>>, 0), "INVALID_VALUE">>,
+  nullwsempty |-> <<DEmpty, XE({"ws"}, Mis0, <<"far", "after", 0>>, 0), "SUCCESS">>,
+  nullws   |-> <<DDot(5), XE({"ws"}, Mis0, <<"far", "after", 0>>, 0), "INVALID_VALUE">>,
+  nullAk0  |-> <<DK0, XE({"A"}, Mis0, <<"far", "after", 0>>, 0), "SUCCESS">>,
+  nullA    |-> <<DDot(5), XE({"A"}, Mis0, <<"far", "after", 0>>, 0), "INVALID_VALUE">>,
+  nullB    |-> <<DDot(5), XE({"B"}, Mis0, <<"far", "after", 0>>, 0), "INVALID_VALUE">>,
+  nullABa0 |-> <<DDot(5), ExA0("EMULATE", {"A", "B"}, Mis0, <<"far", "after", 0>>, 0), "SUCCESS">>,
+  nullwsa0 |-> <<DDot(5), ExA0("EMULATE", {"ws"}, Mis0, <<"far", "after", 0>>, 0), "INVALID_VALUE">>,
   emptymis |-> <<DEmpty, XE({}, MisC4, <<"C", "after", -1>>, -1), "SUCCESS">>,
   aliasmis |-> <<DDot(1), XE({}, MisC4, <<"far", "after", 0>>, 0), "ALIASING">>,
   wsamis   |-> <<DDot(5), XE({}, Mis0, <<"C", "after", -1>>, -1), "ALIASING">>,
@@ -467,6 +485,8 @@ CovX == [
   ordok    |-> <<DDot(5), XE({}, Mis0, <<"far", "after", 0>>, 0), "SUCCESS">>
 ]
 ASSUME MustCover \subseteq DOMAIN Cov \cup DOMAIN CovX
+\* The null-ws boundary: an empty output needs no workspace, a dot does.
+ASSUME WsSizeDesign(DEmpty, "EMULATE") = 0 /\ WsSizeDesign(DDot(5), "EMULATE") > 0
 ASSUME \A c \in MustCover \cap DOMAIN Cov : InSpace(Cov[c]) /\ Status(Cov[c]) = "SUCCESS"
 ASSUME \A c \in MustCover \cap DOMAIN CovX :
           /\ InSpace(CovX[c][1]) /\ CovX[c][2] \in Execs
