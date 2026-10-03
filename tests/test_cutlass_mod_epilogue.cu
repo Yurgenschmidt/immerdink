@@ -1,10 +1,15 @@
 // CUTLASS de-risking for M1 (part 2): the K4 GEMM with the DESIGN §3.5/§4 epilogue,
-// run on sm_89 and compared bit-exactly with a CPU reference.
+// run on sm_89 and compared bit-exactly with a CPU reference. Two realizations:
+//  - CUTLASS GemmUniversal + the Sm80 EVT epilogue (kernels/mod_epilogue.cuh), K4 until A2;
+//  - imd::kernels::K4Gemm (kernels/k4_gemm.cuh), K4 since A2: persistent CTAs (here also
+//    with very few resident CTAs, so every CTA loops over many tiles and overlaps its next
+//    prologue with the register epilogue), and with the batch count split over launches.
 //
 // One batched launch per K-chunk covers a residue group: batch z = s*b + lambda, modulus
 // l = g0 + z / b from the __constant__ table (imd::kernels::VisitorModP). Chunk 0 stores
 // W = acc mod p_l, later chunks W = (W + acc) mod p_l, into u8 planes W_l[lambda][i][n_hat].
 // Expected: W = (sum over all of k of r_A r_B) mod p_l, independent of the chunking.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <random>
@@ -16,12 +21,13 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/default_gemm_universal_with_visitor.h"
+#include "kernels/k4_gemm.cuh"
 #include "kernels/mod_epilogue.cuh"  // also brings in the Sm80 EVT visitors
 
 namespace {
 
 namespace c = imd::constants;
-using namespace cute;
+using cute::_1;
 
 #define CUDA_CHECK(x)                                                                    \
   do {                                                                                   \
@@ -62,6 +68,7 @@ using GemmFor = cutlass::gemm::device::GemmUniversalAdapter<
         cutlass::arch::OpMultiplyAddSaturate, kEVTStages>::GemmKernel>;
 using GemmStore = GemmFor<EVTStore>;
 using GemmAdd = GemmFor<EVTAdd>;
+using K4 = imd::kernels::K4Gemm<TB, Warp, kStages>;  // the production K4 kernel (A2)
 
 template <class Gemm>
 void run(typename Gemm::Arguments const& args) {
@@ -93,7 +100,38 @@ struct Problem {
   }
 };
 
-std::vector<uint8_t> gpu_k4(const Problem& P) {
+// How K4 runs: the CUTLASS EVT kernel, or K4Gemm with `resident` persistent CTAs and at
+// most `zsplit` batches per launch (0: all).
+struct Kernel {
+  bool k4gemm = false;
+  int resident = 0, zsplit = 0;
+};
+
+template <bool kAdd>
+void launch_k4gemm(const Problem& P, const Kernel& K, const int8_t* A, const int8_t* B,
+                   uint8_t* W0, int kc) {
+  static bool attr = false;
+  if (!attr) {
+    CUDA_CHECK(cudaFuncSetAttribute(imd::kernels::k4_kernel<K4, false>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, K4::kSmemBytes));
+    CUDA_CHECK(cudaFuncSetAttribute(imd::kernels::k4_kernel<K4, true>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, K4::kSmemBytes));
+    attr = true;
+  }
+  const int batch = P.slots * P.b, zs = K.zsplit > 0 ? K.zsplit : batch;
+  const int64_t plane_a = int64_t(P.m) * P.k_hat, plane_b = int64_t(P.n_hat) * P.k_hat,
+                plane_w = int64_t(P.m) * P.n_hat;
+  for (int z0 = 0; z0 < batch; z0 += zs) {
+    const int zc = std::min(zs, batch - z0);
+    auto p = K4::make_params(P.m, P.n_hat, kc, P.k_hat, P.k_hat, P.n_hat, zc, K.resident);
+    K4::set_call(p, A + z0 * plane_a, B + z0 * plane_b, W0 + z0 * plane_w, plane_a, plane_b,
+                 plane_w, P.g0, P.b, z0);
+    imd::kernels::k4_kernel<K4, kAdd><<<p.grid, K4::kThreads, K4::kSmemBytes>>>(p);
+    CUDA_CHECK(cudaGetLastError());
+  }
+}
+
+std::vector<uint8_t> gpu_k4(const Problem& P, const Kernel& K) {
   int8_t *dA = nullptr, *dB = nullptr;
   uint8_t* dW = nullptr;
   const size_t w_bytes = size_t(c::kNMax) * P.b * P.m * P.n_hat;
@@ -113,7 +151,12 @@ std::vector<uint8_t> gpu_k4(const Problem& P) {
     const cutlass::gemm::GemmCoord size{P.m, P.n_hat, k1 - k0};
     const int8_t* A = dA + k0;
     const int8_t* B = dB + k0;
-    if (c == 0) {
+    if (K.k4gemm) {
+      if (c == 0)
+        launch_k4gemm<false>(P, K, A, B, W0, k1 - k0);
+      else
+        launch_k4gemm<true>(P, K, A, B, W0, k1 - k0);
+    } else if (c == 0) {
       typename EVTStore::Arguments cb{mod, {W0, {ld_w, _1{}, plane}}};
       run<GemmStore>({cutlass::gemm::GemmUniversalMode::kBatched, size, batch, cb, A, B, nullptr,
                       nullptr, int64_t(P.m) * P.k_hat, int64_t(P.n_hat) * P.k_hat, 0, 0, P.k_hat,
@@ -144,8 +187,8 @@ int64_t dot(const Problem& P, int s, int lam, int i, int j, int h0, int h1) {
 
 int failures = 0;
 
-void check(const char* name, const Problem& P) {
-  const auto W = gpu_k4(P);
+void check_with(const char* name, const Problem& P, const Kernel& K) {
+  const auto W = gpu_k4(P, K);
   size_t bad = 0, checked = 0;
   for (int l = 0; l < c::kNMax; ++l) {
     const int s = l - P.g0;
@@ -162,8 +205,20 @@ void check(const char* name, const Problem& P) {
                          i, j, got, (long long)want);
         }
   }
-  std::printf("%-44s %zu bytes, %zu mismatches\n", name, checked, bad);
+  std::printf("%-44s %-24s %zu bytes, %zu mismatches\n", name,
+              !K.k4gemm ? "CUTLASS EVT" : K.resident > 8 ? "K4Gemm" : "K4Gemm, few CTAs + zsplit",
+              checked, bad);
   failures += bad != 0;
+}
+
+// Every problem through the EVT kernel, K4Gemm with one CTA per SM, and K4Gemm with 3
+// persistent CTAs and the batch count split into launches of 2.
+void check(const char* name, const Problem& P) {
+  int sms = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+  check_with(name, P, Kernel{});
+  check_with(name, P, Kernel{true, sms, 0});
+  check_with(name, P, Kernel{true, 3, 2});
 }
 
 // Uniform residues in p_l's symmetric range [-floor(p/2), ceil(p/2) - 1] (DESIGN §3.4).
