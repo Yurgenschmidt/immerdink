@@ -312,20 +312,34 @@ struct PackEmitterT {
     }
   }
   // The E int8 residues for modulus l, as E / 4 little-endian u32 words.
+  // Branch-free in the common case: mu mod p by byte weights and one umulhi64 for every
+  // modulus, p = 256 included (its weights are 1, 0, ..., so the dot product is the low byte,
+  // and with magic 2^56 = 2^64 / 256 the quotient is 0: the same value as mod_p_bytes' mask).
+  // The rare eps > 0 factor is applied only when some element of this thread has one.
   __device__ __forceinline__ void emit(int l, uint32_t (&w)[E / 4]) const {
     const uint32_t p = c_tables.moduli[l], half = (p + 1) / 2;
     const uint64_t magic = c_tables.epi_magic[l];
+    const uint64_t magic_all = p == 256u ? uint64_t{1} << 56 : magic;
     const uint32_t wlo = imd::device::c_byte_weights.lo[l], whi = imd::device::c_byte_weights.hi[l];
+    uint32_t r[E];
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
+      const uint32_t s = imd::device::dot_bytes(lo[e], wlo) + imd::device::dot_bytes(hi[e], whi);
+      r[e] = s - p * static_cast<uint32_t>(imd::device::umulhi64(magic_all, s));
+    }
+    if (has_eps != 0) {
+#pragma unroll
+      for (int e = 0; e < E; ++e)
+        if ((has_eps >> e) & 1u)
+          r[e] = imd::device::mod_p_small(r[e] * c_tables.pow2_mod[l][eps[e]], p, magic);
+    }
 #pragma unroll
     for (int q = 0; q < E / 4; ++q) w[q] = 0;
 #pragma unroll
     for (int e = 0; e < E; ++e) {
-      uint32_t r = imd::device::mod_p_bytes(lo[e], hi[e], wlo, whi, p, magic);
-      if ((has_eps >> e) & 1u)
-        r = imd::device::mod_p_small(r * c_tables.pow2_mod[l][eps[e]], p, magic);
-      if (((neg >> e) & 1u) && r != 0) r = p - r;
-      const uint32_t s = r >= half ? r - p : r;  // SMod as an int8 bit pattern (low byte)
-      w[e / 4] |= (s & 255u) << (8 * (e % 4));
+      const uint32_t v = ((neg >> e) & 1u) && r[e] != 0 ? p - r[e] : r[e];
+      const uint32_t sm = v >= half ? v - p : v;  // SMod as an int8 bit pattern (low byte)
+      w[e / 4] |= (sm & 255u) << (8 * (e % 4));
     }
   }
   // Store the residues for modulus l at dst (aligned to E bytes).
@@ -979,7 +993,11 @@ static void launch_k1(const ExecPlan& p, const Operand& opA, const Operand& opB,
         k1_tiled<kThreads><<<blocks, kThreads, 0, stream>>>(sa, radix, lg_th);
     } else {
       const unsigned blocks = k1_blocks(rows, 8.0 * double(p.k), p.sms);
-      if (int64_t{blocks} < 2 * int64_t{p.sms})
+      if (int64_t{blocks} < 2 * int64_t{p.sms} && rows > int64_t{blocks} && blocks >= unsigned(p.sms))
+        // Long rows, capped grid: two 512-thread blocks per SM, so one block streams a row
+        // while the other is in its reductions / sigma tail (A4, r_bigk).
+        k1_scale<512><<<2 * p.sms, 512, 0, stream>>>(sa);
+      else if (int64_t{blocks} < 2 * int64_t{p.sms})
         k1_scale<1024><<<blocks, 1024, 0, stream>>>(sa);
       else
         k1_scale<kThreads><<<blocks, kThreads, 0, stream>>>(sa);
