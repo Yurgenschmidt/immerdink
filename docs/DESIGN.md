@@ -19,7 +19,7 @@ the host API (§6a); changed text is marked **[v1.4]**. v1.5 adds a small set of
 configurations chosen per plan (§4; bit-identical results, same launches and workspace), the
 optional plan-time autotuning option `k4_tune` (§6) and the choice in the host API (§6a), and
 takes the fused launch KF up to k̂ ≤ 1024 (§4); changed text is marked **[v1.5]**. §6b is a
-DRAFT for review (D1 packed operands, not implemented). The change lists are at the end.
+D1 packed operands: design APPROVED (Eric, 2026-10-03, all §6b.10 recommendations), not yet implemented. The change lists are at the end.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -937,7 +937,7 @@ tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH).
 
 ---
 
-## 6b. Packed operands — **DRAFT for review** (ROADMAP D1) [v1.6-draft]
+## 6b. Packed operands — **APPROVED design, not yet implemented** (ROADMAP D1) [v1.6]
 
 Nothing in this section is implemented. It replaces the "Reserved, not v1" packed-operand
 bullet of §6 once approved. **Binding user decision:** an **explicit** packed-operand
@@ -1312,7 +1312,7 @@ operands, non-finite inputs]**
   oracle: `pack()` returning the §6b.4 bytes and `contract_tensor(..., packs=...)`, and
   the bit-for-bit GPU test of every byte.
 
-### 6b.10 Open questions for review (recommendation first)
+### 6b.10 Design questions — resolved: every recommendation (the first option of each) adopted by Eric, 2026-10-03
 
 1. **Entry point.** A new `imd_contract_packed` with `imd_operand_t` (recommended: the v1
    `imd_contract` signature and ABI stay untouched; a packed plan through `imd_contract`
@@ -1465,7 +1465,7 @@ operands, non-finite inputs]**
   (`fused` = 1, `kernel_launches` accordingly). Same outputs and workspace; Pipeline's
   `Fused` is k̂-independent, so no spec change.
 
-## Draft v1.6 (D1 packed operands; DRAFT for review, not implemented)
+## v1.6 (D1 packed operands; design approved 2026-10-03, implementation pending)
 
 - **§6b (new, DRAFT).** An explicit packed-operand handle (`imd_pack_create` / `imd_pack` /
   `imd_plan_create_packed` / `imd_contract_packed`) and the CUDA-free sizing and
