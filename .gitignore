@@ -11,3 +11,4 @@ proofs/.lake/
 # CMake build tree, agent worktrees
 build/
 .claude/
+bench/_deps/
