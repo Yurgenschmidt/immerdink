@@ -410,7 +410,7 @@ this precedence order; the first failing check wins:
 | 3 | label only in C with extent > 1 | NOT_SUPPORTED |
 | 4 | non-empty C fails the **sorted-\|stride\| rule**: over C's modes with extent > 1, sorted by \|stride\|, each \|s₍t₎\| > Σ_{u<t} \|s₍u₎\|(e₍u₎−1) (sufficient for injectivity) | INVALID_VALUE |
 | 5 | overflow: extent products or spans exceed int64; workspace total exceeds uint64; in EMULATE mode with a non-empty output and k ≥ 2, m or n̂ > 2³¹−1 (CUTLASS limit; not applied to DIRECT, K-empty or k = 0) | INVALID_VALUE |
-| 6 | C ∩ A or C ∩ B (byte intervals; checked even when k = 0, conservatively); workspace ∩ A, B or C, using the bytes actually used, `[ws, ws + workspace_size)` | ALIASING (execute time) |
+| 6 | C ∩ A or C ∩ B: byte intervals of the non-empty tensors, checked even when A or B is not read (α = 0 or k = 0); workspace ∩ A, B or C, using the bytes actually used, `[ws, ws + workspace_size)`. Conservative: interleaved but disjoint tensors are rejected (an exact lattice test is a possible later refinement) | ALIASING (execute time) |
 | 7 | A, B or C not 8-byte aligned; workspace not 256-byte aligned | MISALIGNED (execute time) |
 
 Allowed:
@@ -474,13 +474,20 @@ const char*  imd_status_string(imd_status_t);
   `imd_workspace_size` is exactly §4a and never applies it.
 - `imd_contract` checks, in order:
   1. null pointers → INVALID_VALUE. C must always be non-null. A and B must be non-null
-     only when α ≠ 0 and k ≠ 0, and ws only when `workspace_size > 0`;
+     only when α ≠ 0 and k ≠ 0, and ws only when `workspace_size > 0`. The rule uses the
+     plan's k, α and `workspace_size` only, not whether the output is empty or whether
+     this call would actually touch the workspace (e.g. α = 0 with `workspace_size > 0`
+     still needs a non-null ws). Conservative by design;
   2. an empty output → SUCCESS with nothing touched;
   3. ALIASING (§5 row 6);
   4. MISALIGNED;
   5. `ws_bytes < workspace_size` → INSUFFICIENT_WORKSPACE.
 - `imd_contract` does no host synchronization and no allocation, and has no hidden mode
-  switches.
+  switches. (Tested: an LD_PRELOAD shim counts CUDA allocations; guard zones around the
+  workspace.)
+- Test-only hooks (launch-limit overrides, lowering dump) are not part of the production
+  library: they are built only with `IMMERDINK_BUILD_TESTS=ON` (M4 moves them; until then
+  they are exported but unused in production).
 - A workspace belongs to at most **one** in-flight `imd_contract` at a time.
 - **Lifetime:** a plan must outlive every in-flight `imd_contract` that uses it, because
   K0 copies asynchronously from the plan's pinned buffer.

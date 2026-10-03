@@ -85,7 +85,7 @@ every modulus, on CPU against the oracle.
   α/β special cases, non-finite inputs, and K-chunking at k > 131056.
 - Accuracy matches the oracle's φ-sweep tables.
 
-## M2 — Tensor front end (IndexMap)
+## M2 — Tensor front end (IndexMap) ✅ (done 2026-10-03)
 
 - Label lowering per DESIGN §5.
 - Int64 scatter vectors.
@@ -100,7 +100,7 @@ every modulus, on CPU against the oracle.
 - The CC fixtures (`acQ,bdQ->acbd`, `ijdkQ,ldQ->klij`, `kjbc,kiac->abij`, the six (T)
   permutations) pass.
 
-## M3 — Robustness
+## M3 — Robustness ✅ (done 2026-10-03)
 
 - Batch-launch splitting (gridDim.z ≤ 65535).
 - DIRECT kernel for K-empty contractions.
@@ -113,6 +113,10 @@ every modulus, on CPU against the oracle.
 - Results are bitwise identical across K-chunk lengths and residue groups.
 - Every DESIGN §3.7/§5 edge case behaves as specified.
 
+**Status (2026-10-03):** M2 and M3 done; see `docs/NOTES-M2M3.md`. 22 ctest tests,
+including `contract_highrank` (operand ranks 6–12, ≤ 15 labels, layouts that defeat
+fusion, hard size guards; ~1.6 s, ~190 MB). compute-sanitizer memcheck/initcheck clean.
+
 ## M4 — Performance
 
 Work order, by expected payoff:
@@ -121,6 +125,12 @@ Work order, by expected payoff:
 2. Epilogue mod cost (magic multiply, 128-bit stores).
 3. Tile and stage selection by wave quantization.
 4. CRT kernel (multi-word integer, N u8 reads per element).
+5. From NOTES-M2M3: K5 picks its thread-fastest axis (ī, j̄ or λ) from C's fastest label
+   (today a batch-fastest C is written strided); K1 reads over the pack's tiles (or folded
+   into the pack's read phase); pack pivots along rows only when the tile fills.
+6. Hygiene: test hooks only with `IMMERDINK_BUILD_TESTS=ON`; `oracle.lower` builds
+   scatter vectors lazily (the full-list version needed tens of GB on a legal 2^31-row
+   descriptor); TLA+ models for the n̂ grid split and the κ ≥ T scope.
 
 **Baselines**, all run under `run_bench.sh`, reporting median and spread plus machine
 conditions:
