@@ -17,8 +17,8 @@ static int64_t g_count = 0;
 
 int64_t imd_shim_alloc_count(void) { return __atomic_load_n(&g_count, __ATOMIC_SEQ_CST); }
 
-// The test proves interposition by observing imd_plan_create's one cudaMallocHost (the
-// pinned scatter vectors) in the count.
+// tests/test_contract.py proves interposition by observing the one cudaMalloc of an
+// IMD_VEC_RESIDENT imd_plan_create (DESIGN v1.2) in the count.
 
 // The real entry point: the next definition in the global scope, or (when libcudart was
 // loaded RTLD_LOCAL, as Python's ctypes does) libcudart's own definition.

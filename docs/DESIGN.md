@@ -602,6 +602,15 @@ const char*  imd_status_string(imd_status_t);
     depends on it.)
   - Not thread-safe: the test hooks and the benchmark-only phase marks
     (`IMMERDINK_PROFILE`).
+- **Kernel-level scope and stream capture [v1.2].** immerdink moves no data between host
+  and device in `imd_contract` (no per-call copy at all in `IMD_VEC_GENERATE`), owns no
+  streams, events or graphs, and does no internal tiling; the caller orchestrates.
+  `imd_contract` only launches kernels on the caller's stream, so it may be captured into a
+  CUDA graph (`cudaStreamCaptureModeGlobal`) and replayed: the graph rewrites everything it
+  reads in the workspace (tested in both vec modes: `tests/test_graph.cpp`). A replayed
+  graph keeps the kernel arguments of the capture (pointers, α, β), and a resident plan
+  must outlive every replay. (`imd_plan_create` with `IMD_VEC_RESIDENT` builds its vectors
+  on `cudaStreamPerThread` and waits for them; plan creation is not capturable.)
 - Callers tile I/J/L themselves, since sub-views are valid inputs. Tiling over I/J/L leaves
   results bitwise unchanged; tiling over K by the caller does change them. The library
   handles K chunking and the batch-launch split internally.

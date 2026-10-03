@@ -144,6 +144,9 @@ int main() {
         !ok(cudaMemcpy(D[q].B, b.data(), P[q].nB * 8, cudaMemcpyHostToDevice), "upload B"))
       return 1;
   }
+  // pageable cudaMemcpy may return before the DMA lands; the threads' streams are
+  // non-blocking (not ordered after the legacy stream)
+  if (!ok(cudaDeviceSynchronize(), "upload sync")) return 1;
   imd_handle_t h = nullptr;
   if (!ok(imd_create(&h), "imd_create")) return 1;
   size_t wsb = 0;

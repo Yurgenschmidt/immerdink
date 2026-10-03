@@ -197,9 +197,18 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
             raise Fail(f"{vname}: workspace {ws_bytes} != params {want_ws}")
         if ws_bytes > MAX_WORKSPACE:
             raise Fail(f"{vname}: workspace {ws_bytes} > {MAX_WORKSPACE} (test guard)")
+        allocs0 = lib.alloc_count()
         st, plan = lib.plan_create(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec)
         if st != "SUCCESS":
             raise Fail(f"{vname}: imd_plan_create {st}")
+        # CUDA allocations of plan creation (shim): one device allocation for resident
+        # vectors, none otherwise (no pinned memory in v1.2). The resident count also proves
+        # the shim interposes the library's runtime calls.
+        if allocs0 is not None:
+            want_allocs = 1 if (pvec == params.VEC_RESIDENT and not view.empty_output()) else 0
+            if lib.alloc_count() - allocs0 != want_allocs:
+                raise Fail(f"{vname}: imd_plan_create made {lib.alloc_count() - allocs0} CUDA "
+                           f"allocations, expected {want_allocs}")
         dA, dB, dC = cuda.malloc(bufA.nbytes), cuda.malloc(bufB.nbytes), cuda.malloc(bufC.nbytes)
         dW = cuda.malloc(ws_bytes + 2 * GUARD)
         try:

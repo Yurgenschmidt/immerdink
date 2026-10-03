@@ -157,3 +157,78 @@ only at large k, and there it is a 1.5× win.
 - Test hooks only with `IMMERDINK_BUILD_TESTS=ON`: done.
 - `oracle.lower` building scatter vectors lazily, and TLA+ models for the n̂ grid split and
   the κ ≥ T scope: not done (spec / oracle work, outside this kernel pass).
+
+## v1.2: the three design proposals, implemented (DESIGN v1.2)
+
+The user approved proposals 1–3 for v1, plus (for proposal 1) a per-plan option
+`vec_mode` and `imd_plan_device_bytes`. Design and specs first: DESIGN v1.2 (changed text
+marked **[v1.2]**), `spec/HostAPI.tla` (new: host threads, plan lifetime, workspace
+sharing), `spec/Pipeline.tla` (K0 as a multi-CTA kernel, `VecResident`, `K1Split`).
+All timings: `bench/run_sweep.sh bench/sweep_v12.txt` (quiet-gated), N = 14, ms, CUDA
+events; before = `bench/results/v12-before-4438ac5.jsonl`, after =
+`bench/results/v12-after12-95f81f1.jsonl`. (The VS Code GPU renderer process, like the
+Claude desktop one, was added to `QUIET_GPU_IGNORE` for these runs; GPU utilization and
+load stayed gated.)
+
+### Changes 1 + 2: K4 parameters at plan creation; K0 on the device
+
+| case | before (v1.1) | GENERATE | RESIDENT | K0 before → GENERATE / RESIDENT |
+|---|---|---|---|---|
+| sq1024 | 0.223 | 0.188 (−16 %) | 0.184 (−18 %) | 0.026 → 0.004 / 0.003 |
+| sq2048 | 0.946 | 0.956 | 0.956 | 0.061 → 0.005 / 0.002 |
+| sq8192 | 32.4 | 32.6 | 33.6 | 0.191 → 0.005 / 0.002 |
+| r_lowk | 6.98 | 7.18 | 7.28 | 0.126 → 0.005 / 0.002 |
+| r_bigk | 12.3 | 12.2 | 12.3 | 0.278 → 0.005 / 0.003 |
+| r_skinny | 4.64 | 4.31 (−7 %) | 4.37 (−6 %) | 0.161 → 0.005 / 0.002 |
+| r_mm | 3.46 | 2.97 (−14 %) | 2.97 (−14 %) | 0.347 → 0.005 / 0.002 |
+| t_nn | 5.64 | 5.02 (−11 %) | 5.03 (−11 %) | 0.082 → 0.005 / 0.002 |
+| t_batch | 2.82 | 2.77 | 2.76 | 0.050 → 0.014 / 0.002 |
+| t_ikl | 3.02 | 2.90 (−4 %) | 2.89 (−4 %) | 0.035 → 0.005 / 0.002 |
+| t_cc | 5.05 | 5.10 | 5.14 | 0.073 → 0.005 / 0.005 |
+
+(Whole-call medians. The "K0" column is the phase between the first two marks, so it
+includes launch overhead; RESIDENT launches nothing there.) sq8192 / r_lowk / sq2048 /
+t_cc move by ≤ 3 %, which is K4 run-to-run noise at the 450 W cap (see above); their K0
+saving (0.06–0.19 ms) is below that noise. The NOTES estimate (5–9 % on small or long-k
+shapes) was met or exceeded: the PCIe copy was ≈ 2 GB/s effective, the generate kernel
+writes the same bytes in ≈ 3–10 µs.
+
+- **Pinned copy as a third mode?** No shape is faster with it (its K0 is 7–70× the
+  generate kernel's), so it is removed, not kept.
+- **GENERATE vs RESIDENT:** the difference is the 2–10 µs generate kernel, below the noise
+  of every case. RESIDENT only pays when calls are tiny and very frequent; its cost is
+  device memory for the plan's lifetime.
+- **Change 1 (host side):** `imd_plan_create` now takes 0.4–1.2 ms here (the `plan_create_ms`
+  field; it includes the occupancy query and `cudaFuncSetAttribute` per K4 kernel and, for
+  RESIDENT, the build-and-wait), and `imd_contract` no longer calls
+  `GemmUniversalBase::initialize`. The per-call host saving is not visible in GPU-event
+  times on these shapes (the host runs ahead); its point is that `imd_contract` touches no
+  CUTLASS host state and never writes the plan (thread safety).
+
+**Many plans** (`bench/plans_probe.py`, 32 live plans of one shape per mode,
+`bench/results/v12-plans-probe-95f81f1.jsonl`; allocations counted by the LD_PRELOAD shim):
+
+| shape (m×n×k) | mode | plan device bytes (exact) | device bytes / plan (driver) | CUDA allocs / plan | pinned / plan | create (median) |
+|---|---|---|---|---|---|---|
+| sq1024 | GENERATE | 0 | 0 ¹ | 0 | 0 | 0.012 ms |
+| sq1024 | RESIDENT | 49,176 | 65,536 | 1 | 0 | 0.025 ms |
+| r_mm 1000×64×50000 | GENERATE | 0 | 0 | 0 | 0 | 0.011 ms |
+| r_mm | RESIDENT | 817,048 | 1,048,576 | 1 | 0 | 0.034 ms |
+| tall 4·10⁶×64×64 | GENERATE | 0 | 0 | 0 | 0 | 0.011 ms |
+| tall | RESIDENT | 64,002,072 | 65,011,712 | 1 | 0 | 0.123 ms |
+
+¹ The first sq1024 batch measured 64 KiB per plan in `cudaMemGetInfo`: the CUDA module
+loads triggered by the first plan's `cudaFuncSetAttribute` (one-time, process-wide), not
+plan memory (0 allocations). Plans created after the first take < 0.04 ms (the K4
+parameter cache is a few Params structs per plan; host bytes O(rank)). The driver rounds
+RESIDENT allocations up (64 KiB, 1 MiB, 2 MiB granules), which `imd_plan_device_bytes`
+does not count (DESIGN §6). A v1.1 plan pinned the same 8·(2m+2n+2k+3b) bytes of host
+memory that RESIDENT now puts on the device (64 MB per plan for "tall").
+
+**Tests added:** both vec modes in every `run_case` (stage checks, the resident vectors
+against the oracle, `imd_plan_device_bytes` exactness, plan-creation allocation counts,
+bitwise mode invariance); `tests/test_threads.cpp` (8 threads, shared and own plans, both
+modes, generate plans destroyed before their stream is synchronized; bit-identical to a
+sequential run; a mutant that updates the plan's cached parameters in place is caught 7/7
+runs); `tests/test_graph.cpp` (one call captured into a CUDA graph in global capture
+mode and replayed twice, bit-exact, both modes, incl. the β-only path).
