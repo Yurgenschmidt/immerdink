@@ -592,10 +592,12 @@ def qvalue(q) -> int:
 # and written through int64 additive scatter vectors (§5 step 10). Numerically only the
 # canonical K order matters (it is the native path's fma order, §3.7); everything else in
 # the emulated path is exact or per element. The lowering below is a literal transcription
-# of DESIGN §5 steps 1-8 and 10 (step 9, fusion, is a pure performance transformation: it
-# merges consecutive labels without changing the enumeration, so it is not modelled).
+# of DESIGN §5 steps 1-10. Step 9 (fusion) merges consecutive labels of a group without
+# changing the enumeration, so the scatter vectors built from the fused modes equal the
+# ones built label by label (spec/test_oracle.py checks this); the fused modes are part of
+# the view so the library's lowering can be compared with them.
 #
-# ORACLE-CHOICE (shared with the library; see docs/NOTES-M1.md):
+# DESIGN v1.1 §5 step 8 (shared with the library):
 #   * the coalescing swap of step 8 is applied FIRST, and the canonical orders are then
 #     computed in the post-swap frame (A, B, m, n and I, J are the post-swap ones, so
 #     "big" in the K key is the post-swap A when m >= n);
@@ -727,9 +729,9 @@ def lower(A: Desc, B: Desc, C: Desc, mode=EMULATE) -> GemmView:
     for x, y in ((v.m, v.k), (v.k, v.n), (v.m, v.n)):
         if v.b * x * y > INT64_MAX:
             raise InvalidValue("row 5: operand size")
-    if mode == EMULATE and not v.empty_output() and \
+    if mode == EMULATE and not v.empty_output() and v.k >= 2 and \
             (v.m > GEMM_DIM_MAX or -(-v.n // 16) * 16 > GEMM_DIM_MAX):
-        raise InvalidValue("row 5: m or n_hat > 2^31-1 (EMULATE)")
+        raise InvalidValue("row 5: m or n_hat > 2^31-1 (EMULATE, k >= 2)")
     # step 8: canonical orders (post-swap frame, see ORACLE-CHOICE above)
     big, oth = ("A", "B") if v.m >= v.n else ("B", "A")
 
@@ -743,11 +745,23 @@ def lower(A: Desc, B: Desc, C: Desc, mode=EMULATE) -> GemmView:
     v.order = {g: sorted((l for l in cls if cls[l] == g and ext[l] != 1), key=keys[g])
                for g in "IJKL"}
     v.ext, v.stride, v.first = ext, stride, first
-    # step 9 (fusion) is not modelled: performance only, the enumeration is unchanged.
+    # step 9: within each group, in canonical order, merge consecutive modes g, g' iff
+    # s_X(g') = s_X(g) e(g) for EVERY tensor X carrying the group (stride-0 carriers too).
+    # A tensor that does not carry the group has stride 0 on both, where the test holds
+    # trivially, so testing all three tensors is the rule.
+    v.fused = {}
+    for g in "IJKL":
+        fused = []                                     # [labels, extent, {X: stride}]
+        for l in v.order[g]:
+            if fused and all(stride[X][l] == fused[-1][2][X] * fused[-1][1] for X in "ABC"):
+                fused[-1][0].append(l)
+                fused[-1][1] *= ext[l]
+            else:
+                fused.append([[l], ext[l], {X: stride[X][l] for X in "ABC"}])
+        v.fused[g] = fused
     v.vec = {}
     if not v.empty_output():
-        modes = {g: [(l, ext[l], {X: stride[X][l] for X in "ABC"}) for l in v.order[g]]
-                 for g in "IJKL"}
+        modes = {g: [(tuple(ls), e, st) for ls, e, st in v.fused[g]] for g in "IJKL"}
         for name, X, g in (("A_row", "A", "I"), ("A_k", "A", "K"), ("A_bat", "A", "L"),
                            ("B_k", "B", "K"), ("B_col", "B", "J"), ("B_bat", "B", "L"),
                            ("C_row", "C", "I"), ("C_col", "C", "J"), ("C_bat", "C", "L")):

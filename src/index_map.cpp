@@ -182,6 +182,47 @@ imd_status_t lower(const imd_tensor_t& A, const imd_tensor_t& B, const imd_tenso
   // The vec entry count 2m + 2k + 2n + 3b fits int64 whenever the §4a vec byte size
   // (8x that, overflow-checked in uint64 by workspace_layout) does.
 
+  // Step 8: canonical orders in the post-swap frame (the swap above came first).
+  const int big = r.m >= r.n ? kA : kB, oth = big == kA ? kB : kA;
+  for (int g = 0; g < 4; ++g) {
+    std::vector<const LabelInfo*> grp;
+    for (const LabelInfo& li : labels)
+      if (static_cast<int>(li.cls) == g && li.extent != 1) grp.push_back(&li);
+    auto key = [&](const LabelInfo* l) -> std::array<uint64_t, 4> {
+      const uint64_t a = abs_u64(l->stride[kA]), b = abs_u64(l->stride[kB]),
+                     c = abs_u64(l->stride[kC]), p = static_cast<uint64_t>(l->first_pos);
+      switch (static_cast<LabelClass>(g)) {
+        case LabelClass::I: return {c, a, p, 0};
+        case LabelClass::J: return {c, b, p, 0};
+        case LabelClass::L: return {c, a, b, p};
+        case LabelClass::K: return {abs_u64(l->stride[big]), abs_u64(l->stride[oth]), p, 0};
+      }
+      return {};
+    };
+    // Keys are distinct: positions are.
+    std::sort(grp.begin(), grp.end(),
+              [&](const LabelInfo* x, const LabelInfo* y) { return key(x) < key(y); });
+    // Step 9: fusion. A tensor that does not carry the group has stride 0 on both modes,
+    // where the condition holds trivially, so checking all three tensors is the rule.
+    for (const LabelInfo* li : grp) {
+      r.order[g].push_back(li->label);
+      std::vector<FusedMode>& f = r.fused[g];
+      bool merge = !f.empty();
+      for (int x = 0; merge && x < 3; ++x) {
+        int64_t next = 0;
+        merge = mul_i64(f.back().stride[x], f.back().extent, &next) && next == li->stride[x];
+      }
+      if (merge) {
+        f.back().extent *= li->extent;  // a factor of the group size: no overflow
+      } else {
+        FusedMode fm;
+        fm.extent = li->extent;
+        for (int x = 0; x < 3; ++x) fm.stride[x] = li->stride[x];
+        f.push_back(fm);
+      }
+    }
+  }
+
   r.labels = std::move(labels);
   *out = std::move(r);
   return IMD_STATUS_SUCCESS;
@@ -195,36 +236,18 @@ int64_t scatter_vector_count(const Lowered& lw) {
 
 namespace {
 
-// One canonical group: labels in canonical order (first fastest).
-std::vector<const LabelInfo*> canonical_order(const Lowered& lw, LabelClass cls) {
-  std::vector<const LabelInfo*> g;
-  for (const LabelInfo& li : lw.labels)
-    if (li.cls == cls && li.extent != 1) g.push_back(&li);
-  const int big = lw.m >= lw.n ? kA : kB, oth = big == kA ? kB : kA;
-  auto key = [&](const LabelInfo* l) -> std::array<uint64_t, 4> {
-    const uint64_t a = abs_u64(l->stride[kA]), b = abs_u64(l->stride[kB]),
-                   c = abs_u64(l->stride[kC]), pos = static_cast<uint64_t>(l->first_pos);
-    switch (cls) {
-      case LabelClass::I: return {c, a, pos, 0};
-      case LabelClass::J: return {c, b, pos, 0};
-      case LabelClass::L: return {c, a, b, pos};
-      case LabelClass::K: return {abs_u64(l->stride[big]), abs_u64(l->stride[oth]), pos, 0};
-    }
-    return {};
-  };
-  std::sort(g.begin(), g.end(), [&](const LabelInfo* x, const LabelInfo* y) { return key(x) < key(y); });
-  return g;
-}
+constexpr int kRowClass[2] = {static_cast<int>(LabelClass::I), static_cast<int>(LabelClass::J)};
+constexpr int kL = static_cast<int>(LabelClass::L), kK = static_cast<int>(LabelClass::K);
 
-// Mixed-radix scatter vector of tensor X over the group's canonical order (first fastest),
-// by an odometer: no intermediate leaves the tensor's span (row 5), so int64 is exact.
-int64_t* radix_vec(const std::vector<const LabelInfo*>& order, int X, int64_t size, int64_t* out) {
-  std::vector<int64_t> digit(order.size(), 0);
+// Mixed-radix scatter vector of tensor X over a group's fused modes (first fastest), by an
+// odometer: no intermediate leaves the tensor's span (row 5), so int64 is exact.
+int64_t* radix_vec(const std::vector<FusedMode>& modes, int X, int64_t size, int64_t* out) {
+  std::vector<int64_t> digit(modes.size(), 0);
   int64_t cur = 0;
   for (int64_t q = 0; q < size; ++q) {
     out[q] = cur;
-    for (size_t t = 0; t < order.size(); ++t) {
-      const int64_t e = order[t]->extent, s = order[t]->stride[X];
+    for (size_t t = 0; t < modes.size(); ++t) {
+      const int64_t e = modes[t].extent, s = modes[t].stride[X];
       if (digit[t] + 1 < e) {
         ++digit[t];
         cur += s;
@@ -239,9 +262,34 @@ int64_t* radix_vec(const std::vector<const LabelInfo*>& order, int X, int64_t si
 
 }  // namespace
 
+PackPivot pack_pivot(const Lowered& lw, int X) {
+  // rho = r + rows * lambda: the row group's fused modes, then L's, first fastest.
+  uint64_t best = UINT64_MAX;
+  int64_t radix = 1, best_radix = 1;
+  for (const int g : {kRowClass[X], kL}) {
+    for (const FusedMode& fm : lw.fused[g]) {
+      const uint64_t s = abs_u64(fm.stride[X]);
+      if (s != 0 && s < best) {
+        best = s;
+        best_radix = radix;
+      }
+      radix *= fm.extent;  // a prefix product of b * rows, which fits int64
+    }
+  }
+  const uint64_t h_step = lw.fused[kK].empty() ? 0 : abs_u64(lw.fused[kK].front().stride[X]);
+  PackPivot p;
+  if (best != UINT64_MAX && (h_step == 0 || best < h_step)) {
+    p.along_rows = true;
+    p.radix = best_radix;
+  }
+  return p;
+}
+
 void build_scatter_vectors(const Lowered& lw, int64_t* out) {
-  const auto I = canonical_order(lw, LabelClass::I), J = canonical_order(lw, LabelClass::J),
-             K = canonical_order(lw, LabelClass::K), L = canonical_order(lw, LabelClass::L);
+  const auto& I = lw.fused[static_cast<int>(LabelClass::I)];
+  const auto& J = lw.fused[static_cast<int>(LabelClass::J)];
+  const auto& K = lw.fused[kK];
+  const auto& L = lw.fused[kL];
   out = radix_vec(I, kA, lw.m, out);
   out = radix_vec(K, kA, lw.k, out);
   out = radix_vec(L, kA, lw.b, out);

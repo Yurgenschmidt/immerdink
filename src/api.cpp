@@ -78,8 +78,10 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
     return st;
 
   const Lowered& lw = out->lowered;
-  // §5 row 5, GemmCoord part: EMULATE mode with a non-empty output only (DESIGN v1.1).
-  if (out->options.mode == IMD_EMULATE && !lw.empty_output() && !imd::detail::gemm_dims_ok(lw))
+  // §5 row 5, GemmCoord part: only when the emulated GEMM runs (EMULATE, non-empty output,
+  // k >= 2); not for DIRECT, K-empty or k = 0.
+  if (out->options.mode == IMD_EMULATE && !lw.empty_output() && lw.k >= 2 &&
+      !imd::detail::gemm_dims_ok(lw))
     return IMD_STATUS_INVALID_VALUE;
   const auto layout = imd::detail::workspace_layout({lw.m, lw.n, lw.k, lw.b,
                                                      out->options.num_moduli,
@@ -162,6 +164,31 @@ uint64_t ceil_sqrt(uint64_t k) {
 
 bool aligned(const void* p, uintptr_t a) { return (reinterpret_cast<uintptr_t>(p) & (a - 1)) == 0; }
 
+// §5 row 6: the bytes a strided FP64 tensor can address, [lo, hi), or none (lo == hi) for
+// an empty tensor or a null pointer. Extent-1 modes contribute nothing; a rank-0 tensor
+// is one element. Exact in 128 bits (spans fit int64 by row 5).
+using imd::detail::i128;
+struct ByteInterval {
+  i128 lo = 0, hi = 0;
+};
+ByteInterval byte_interval(const TensorCopy& t, const void* p) {
+  ByteInterval r;
+  if (p == nullptr) return r;
+  i128 neg = 0, pos = 0;
+  for (size_t d = 0; d < t.extent.size(); ++d) {
+    if (t.extent[d] == 0) return r;
+    const i128 span = static_cast<i128>(t.stride[d]) * (t.extent[d] - 1);
+    (span < 0 ? neg : pos) += span;
+  }
+  const i128 base = static_cast<i128>(reinterpret_cast<uintptr_t>(p));
+  r.lo = base + 8 * neg;
+  r.hi = base + 8 * pos + 8;
+  return r;
+}
+bool overlap(const ByteInterval& x, const ByteInterval& y) {
+  return x.lo < x.hi && y.lo < y.hi && x.lo < y.hi && y.lo < x.hi;
+}
+
 }  // namespace
 
 extern "C" {
@@ -237,6 +264,11 @@ imd_status_t imd_plan_create(imd_handle_t handle, const imd_tensor_t* A, const i
         e.rhs[w] = uint64_t{rhs[2 * w]} | (uint64_t{rhs[2 * w + 1]} << 32);
       e.rhs_bits = big_bitlen(rhs);
       e.lhs_shift = rn ? 2 : 0;
+      for (int x = 0; x < 2; ++x) {
+        const imd::detail::PackPivot pv = imd::detail::pack_pivot(lw, x);
+        e.pack_along_rows[x] = pv.along_rows;
+        e.pack_radix[x] = pv.radix;
+      }
     }
     if (e.path != imd::detail::Path::kNoop) {
       // §5 step 10: scatter vectors in pinned host memory (K0 copies them asynchronously).
@@ -277,10 +309,22 @@ imd_status_t imd_contract(imd_plan_t plan, double alpha, const double* A, const 
   if (C == nullptr || (reads_ab && (A == nullptr || B == nullptr)) || (need > 0 && ws == nullptr))
     return IMD_STATUS_INVALID_VALUE;
   if (e.path == imd::detail::Path::kNoop) return IMD_STATUS_SUCCESS;  // nothing touched
-  // TODO(M3): §5 row 6, ALIASING (C vs A/B byte intervals; workspace [ws, ws + need) vs
-  // A, B and C). Not checked yet: the pointers are only required to be non-null.
-  // §5 row 7: FP64 tensors 8-byte aligned, workspace 256-byte aligned.
-  if (!aligned(C, 8) || (reads_ab && (!aligned(A, 8) || !aligned(B, 8))) ||
+  // §5 row 6, ALIASING: C vs A and C vs B as byte intervals, also when A / B are not read
+  // (alpha = 0 or k = 0), conservatively; a null A / B (allowed only when not read) has no
+  // bytes. The workspace bytes actually used, [ws, ws + workspace_size), vs A, B and C.
+  const ByteInterval iA = byte_interval(plan->A, A), iB = byte_interval(plan->B, B),
+                     iC = byte_interval(plan->C, C);
+  ByteInterval iW;
+  if (need > 0) {
+    iW.lo = static_cast<i128>(reinterpret_cast<uintptr_t>(ws));
+    iW.hi = iW.lo + static_cast<i128>(need);
+  }
+  if (overlap(iC, iA) || overlap(iC, iB) || overlap(iW, iA) || overlap(iW, iB) ||
+      overlap(iW, iC))
+    return IMD_STATUS_ALIASING;
+  // §5 row 7: A, B and C 8-byte aligned (a null pointer counts as aligned: it is only
+  // allowed where it is not read), workspace 256-byte aligned.
+  if (!aligned(A, 8) || !aligned(B, 8) || !aligned(C, 8) ||
       (need > 0 && !aligned(ws, c::kRegionAlign)))
     return IMD_STATUS_MISALIGNED;
   if (ws_bytes < need) return IMD_STATUS_INSUFFICIENT_WORKSPACE;
