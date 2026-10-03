@@ -641,9 +641,9 @@ def suite_replay(lib, cuda, verbose):
     real = o.contract
 
     def record(A, B, C, alpha, beta, N, rounding="RN", g=None, chunk=o.K_C_ALIGNED, m=None,
-               n=None, k=None, trace=None, _rule=None, _L_w=None):
-        out = real(A, B, C, alpha, beta, N, rounding, g, chunk, m, n, k, trace, _rule, _L_w)
-        if chunk == o.K_C_ALIGNED and _rule is None and _L_w is None:
+               n=None, k=None, trace=None, _rule=None, _L_w=None, **ext):
+        out = real(A, B, C, alpha, beta, N, rounding, g, chunk, m, n, k, trace, _rule, _L_w, **ext)
+        if chunk == o.K_C_ALIGNED and _rule is None and _L_w is None and not any(ext.values()):
             calls.append((A, B, C, alpha, beta, N, rounding, g, m, n, k))
         return out
 

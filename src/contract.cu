@@ -978,6 +978,11 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
       a.rows_pad[x] = x == 0 ? p.m : p.n_hat;
       a.radix[x] = p.pack_radix[x];
       a.along_rows[x] = p.pack_along_rows[x] ? 1 : 0;
+      if (p.packed & (1 << x)) {  // v1.7: a packed operand has no tiles (and no RB rows)
+        a.tiles[x] = 0;
+        a.rows_pad[x] = a.rows[x];
+        continue;
+      }
       const int64_t D = p.b * a.rows[x] / a.radix[x];
       a.tiles[x] = a.radix[x] * ((D + th - 1) / th);
       total += a.tiles[x];
@@ -1311,7 +1316,8 @@ imd_status_t k0_generate(const ExecPlan& p, int64_t* vec, cudaStream_t stream) {
 }
 
 imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, const double* B,
-                              double beta, double* C, void* ws, cudaStream_t stream) {
+                              double beta, double* C, void* ws, cudaStream_t stream,
+                              const void* const* packed) {
   if (p.path == Path::kNoop) return IMD_STATUS_SUCCESS;
   // K0: generate the scatter vectors into ws.vec (IMD_VEC_GENERATE), or use the plan's
   // resident copy (IMD_VEC_RESIDENT: no K0, no vec region).
@@ -1357,6 +1363,26 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
   auto* RA = region<int8_t>(ws, p, Region::RA);
   auto* RB = region<int8_t>(ws, p, Region::RB);
   auto* W = region<uint8_t>(ws, p, Region::W);
+  // v1.7 (DESIGN §6b): a packed operand's sigma, flags and residues come from its packed
+  // buffer (only read; the workspace has no sX, fX, RX). The B role reads blocks at the
+  // pack's batch stride r k_hat (§6b.4), and a residue group is the slice of planes g0...
+  int64_t batch[2] = {0, 0};  // K4 operand batch strides (0: the workspace's)
+  for (int x = 0; x < 2; ++x) {
+    if (!(p.packed & (1 << x))) continue;
+    auto* base = static_cast<unsigned char*>(const_cast<void*>(packed[x]));
+    auto* s = reinterpret_cast<int16_t*>(base + p.pack_off[x][kPackSig]);
+    auto* f = reinterpret_cast<uint8_t*>(base + p.pack_off[x][kPackFlag]);
+    auto* r = reinterpret_cast<int8_t*>(base + p.pack_off[x][kPackRes]);
+    (x == 0 ? sA : sB) = s;
+    (x == 0 ? fA : fB) = f;
+    (x == 0 ? RA : RB) = r;
+    batch[x] = (x == 0 ? p.m : p.n) * p.k_hat;
+  }
+  // The GEMM operand of group g0: the workspace's slots, or the pack's planes g0...
+  const auto operand = [&](int x, int g0) -> const int8_t* {
+    const int8_t* R = x == 0 ? RA : RB;
+    return (p.packed & (1 << x)) ? R + int64_t{g0} * p.b * batch[x] : R;
+  };
   const Operand opA{A, out.a_bat, out.a_row, out.a_k, p.m};
   const Operand opB{B, out.b_bat, out.b_col, out.b_k, p.n};
 
@@ -1371,6 +1397,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
   } else {  // per operand: K1, or v1.6 KL (K1 + its group-1 pack; analysis.hpp fused_large)
     for (int x = 0; x < 2; ++x) {
       const Operand& op = x == 0 ? opA : opB;
+      if (p.packed & (1 << x)) continue;  // v1.7: scaled and packed by imd_pack
       if (p.fused_large & (1 << x)) {
         if (const imd_status_t st = launch_kl(p, x, op, x == 0 ? sA : sB, x == 0 ? fA : fB,
                                               x == 0 ? RA : RB, stream);
@@ -1388,7 +1415,8 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
   for (int g0 = 0; g0 < p.N; g0 += p.g) {
     const int gsize = std::min(p.g, p.N - g0);
     if (use_kf && g0 == 0) {  // group 1 was packed by KF
-      if (const imd_status_t st = k4_group(*p.k4, RA, RB, W, g0, gsize, stream);
+      if (const imd_status_t st = k4_group(*p.k4, operand(0, g0), operand(1, g0), W, g0, gsize,
+                                           stream, batch[0], batch[1]);
           st != IMD_STATUS_SUCCESS)
         return st;
       continue;
@@ -1396,6 +1424,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
     PackArgs pa{};
     pa.b = p.b, pa.k = p.k, pa.k_hat = p.k_hat, pa.g0 = g0, pa.gsize = gsize, pa.trunc = p.trunc;
     for (int x = 0; x < 2; ++x) {
+      if (p.packed & (1 << x)) continue;                     // v1.7: its planes are in the pack
       if (g0 == 0 && (p.fused_large & (1 << x))) continue;  // group 1 of x was packed by KL
       pa.op = x == 0 ? opA : opB;
       pa.rows_pad = x == 0 ? p.m : p.n_hat;
@@ -1416,7 +1445,8 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
       IMD_PROF(stream, x == 0 ? "K2 pack A" : "K3 pack B");
     }
     if (cudaPeekAtLastError() != cudaSuccess) return IMD_STATUS_CUDA_ERROR;
-    if (const imd_status_t st = k4_group(*p.k4, RA, RB, W, g0, gsize, stream);
+    if (const imd_status_t st = k4_group(*p.k4, operand(0, g0), operand(1, g0), W, g0, gsize,
+                                         stream, batch[0], batch[1]);
         st != IMD_STATUS_SUCCESS)
       return st;
   }
@@ -1433,6 +1463,96 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
   }
   IMD_PROF(stream, "K5 crt");
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
+}
+
+// ---- imd_pack (DESIGN v1.7 §6b): X's scatter vectors and the packed buffer's zero bytes,
+// then one KL launch for sigma, the flags and all N residue planes ------------------------
+//
+// The pack is X as the GEMM's A of a one-operand view (pack_exec: rows m = r, g = N), so KL
+// (v1.6) writes exactly the §6b.4 rows: sigma and the flag at lambda r + rho, plane l of row
+// (lambda, rho) at l b r k_hat + (lambda r + rho) k_hat with zero K padding (rows_pad = r, the
+// group being every plane). kp_prep writes everything else of [0, pack_bytes): the two gaps
+// after sig and flag and, from the end of the planes, the tail and the last gap. No byte is
+// written twice; no block reads what another writes (KL reads only X and the vectors, which
+// kp_prep wrote in the previous launch).
+
+namespace {
+
+template <int Cap>
+__global__ void __launch_bounds__(kThreads)
+    kp_prep(const __grid_constant__ K0Args<Cap> a, uint8_t* packed, uint64_t g0_lo, uint64_t g0_hi,
+            uint64_t g1_lo, uint64_t g1_hi, uint64_t t_lo, uint64_t t_hi) {
+  const uint64_t gt = blockIdx.x * uint64_t{blockDim.x} + threadIdx.x;
+  const uint64_t gs = uint64_t{gridDim.x} * blockDim.x;
+  for (uint64_t q = gt; q < static_cast<uint64_t>(a.start[9]); q += gs)
+    a.out[q] = k0_entry(a, static_cast<int64_t>(q));
+  for (uint64_t i = g0_lo + gt; i < g0_hi; i += gs) packed[i] = 0;   // after sig (< 256 B)
+  for (uint64_t i = g1_lo + gt; i < g1_hi; i += gs) packed[i] = 0;   // after flag (< 256 B)
+  for (uint64_t i = t_lo + kVec * gt; i < t_hi; i += kVec * gs)      // tail + last gap
+    *reinterpret_cast<uint4*>(packed + i) = make_uint4(0, 0, 0, 0);
+}
+
+// The vectors of a pack: rows (class I = the pack's R), k-bar (K) and batches (L), X's
+// strides in slot A, in the vec region's first three sub-vectors (the others are empty).
+template <int Cap>
+K0Args<Cap> kp_args(const ExecPlan& p, int64_t* vec) {
+  K0Args<Cap> a{};
+  const int64_t r = p.m, k = p.k, b = p.b;
+  for (int v = 0; v < 10; ++v) a.start[v] = v == 0 ? 0 : v == 1 ? r : v == 2 ? r + k : r + k + b;
+  for (int v = 0; v < 9; ++v) a.cls[v] = kVecClass[v], a.tensor[v] = 0;
+  for (int c = 0; c < 4; ++c) a.first[c] = p.vec_desc.first[c], a.count[c] = p.vec_desc.count[c];
+  for (size_t t = 0; t < p.vec_desc.modes.size(); ++t) {
+    a.extent[t] = p.vec_desc.modes[t].extent;
+    for (int x = 0; x < 3; ++x) a.stride[t][x] = p.vec_desc.modes[t].stride[x];
+  }
+  a.out = vec;
+  return a;
+}
+static_assert(kVecClass[0] == 0 && kVecClass[1] == 2 && kVecClass[2] == 3,
+              "sub-vectors 0-2 are A's rows (I), k-bar (K) and batches (L)");
+
+template <int Cap>
+imd_status_t launch_kp_prep(const ExecPlan& p, const PackLayout& pl, uint8_t* packed,
+                            int64_t* vec, cudaStream_t stream) {
+  const uint64_t sig_end = pl.offset[kPackSig] + pl.bytes[kPackSig];
+  const uint64_t flag_end = pl.offset[kPackFlag] + pl.bytes[kPackFlag];
+  const uint64_t planes_end = pl.offset[kPackRes] + static_cast<uint64_t>(p.N) *
+                                                        static_cast<uint64_t>(p.b * p.m * p.k_hat);
+  const int64_t work = std::max<int64_t>(
+      p.vec_count, static_cast<int64_t>((pl.total - planes_end) / kVec));
+  kp_prep<Cap><<<blocks_for(work), kThreads, 0, stream>>>(
+      kp_args<Cap>(p, vec), packed, sig_end, pl.offset[kPackFlag], flag_end, pl.offset[kPackRes],
+      planes_end, pl.total);
+  return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
+}
+
+}  // namespace
+
+int32_t pack_kl_lg_rows(const ExecPlan& p) {
+  if (!p.pack_along_rows[0]) return -1;  // KL's rule: th = 4096 / pow2(k_hat) along k-bar
+  int lg_tk = 6;
+  while (lg_tk < 9 && (int64_t{1} << lg_tk) < p.k_hat) ++lg_tk;
+  return 12 - lg_tk;  // 8 rows (tk = 512) .. 64 rows (tk = 64) side by side
+}
+
+imd_status_t enqueue_pack(const ExecPlan& p, const PackLayout& pl, const double* X, void* packed,
+                          void* ws, cudaStream_t stream) {
+  if (pl.total == 0) return IMD_STATUS_SUCCESS;  // an empty pack
+  auto* out = static_cast<uint8_t*>(packed);
+  auto* vec = static_cast<int64_t*>(ws);
+  const imd_status_t st = p.vec_desc.modes.size() <= static_cast<size_t>(kK0SmallModes)
+                              ? launch_kp_prep<kK0SmallModes>(p, pl, out, vec, stream)
+                              : launch_kp_prep<kK0MaxModes>(p, pl, out, vec, stream);
+  if (st != IMD_STATUS_SUCCESS) return st;
+  IMD_PROF(stream, "pack prep");
+  const Operand op{X, vec + p.m + p.k, vec, vec + p.m, p.m};  // v_bat, v_row, v_k, rows = r
+  if (const imd_status_t s2 = launch_kl(p, 0, op, reinterpret_cast<int16_t*>(out + pl.offset[kPackSig]),
+                                        out + pl.offset[kPackFlag],
+                                        reinterpret_cast<int8_t*>(out + pl.offset[kPackRes]), stream);
+      s2 != IMD_STATUS_SUCCESS)
+    return s2;
+  IMD_PROF(stream, "pack KL");
+  return IMD_STATUS_SUCCESS;
 }
 
 }  // namespace imd::detail

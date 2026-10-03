@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(ROOT, "spec"))
 import params  # noqa: E402
 
 STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT_WORKSPACE",
-          "MISALIGNED", "CUDA_ERROR", "ALLOC_FAILED"]
+          "MISALIGNED", "CUDA_ERROR", "ALLOC_FAILED", "PACK_MISMATCH"]
 RN, TRUNC = 0, 1
 EMULATE, DIRECT = 0, 1
 VEC_GENERATE, VEC_RESIDENT = 0, 1      # DESIGN v1.2 imd_options_t.vec_mode
@@ -41,6 +41,38 @@ def make_tensor(extent, stride, label):
     r = len(extent)
     t = Tensor(r, (C.c_int64 * r)(*extent), (C.c_int64 * r)(*stride), (C.c_int32 * r)(*label))
     return t
+
+
+class PackDesc(C.Structure):
+    """imd_pack_desc_t (DESIGN v1.7 §6b.5)."""
+    _fields_ = [("struct_size", C.c_uint32), ("num_moduli", C.c_int32), ("rounding", C.c_int32),
+                ("order", C.c_int32), ("tensor", C.POINTER(Tensor)),
+                ("num_contracted", C.c_int32), ("contracted", C.POINTER(C.c_int32)),
+                ("num_batch", C.c_int32), ("batch", C.POINTER(C.c_int32)),
+                ("num_rows", C.c_int32), ("rows", C.POINTER(C.c_int32))]
+
+
+class Operand(C.Structure):
+    """imd_operand_t (DESIGN v1.7 §6b.5)."""
+    _fields_ = [("data", C.c_void_p), ("packed", C.c_void_p), ("packed_bytes", C.c_size_t),
+                ("pack", C.c_void_p)]
+
+
+ORDER_AUTO, ORDER_GIVEN = 0, 1
+
+
+def make_pack_desc(od):
+    """An imd_pack_desc_t of an oracle.PackDesc (arrays kept alive on the struct)."""
+    t = make_tensor(od.tensor.extent, od.tensor.stride, od.tensor.label)
+    lists = [list(od.contracted), list(od.batch), list(od.rows or [])]
+    arrs = [(C.c_int32 * max(len(x), 1))(*x) for x in lists]
+    d = PackDesc(C.sizeof(PackDesc), od.N, RN if od.rounding == "RN" else TRUNC,
+                 ORDER_AUTO if od.order == "AUTO" else ORDER_GIVEN, C.pointer(t),
+                 len(lists[0]), arrs[0] if lists[0] else None,
+                 len(lists[1]), arrs[1] if lists[1] else None,
+                 len(lists[2]), arrs[2] if lists[2] else None)
+    d._keep = (t, arrs)
+    return d
 
 
 def dense(extent):
@@ -72,6 +104,23 @@ class Library:
         for f in ("imd_create", "imd_destroy", "imd_plan_create", "imd_plan_destroy",
                   "imd_contract", "imd_plan_device_bytes"):
             getattr(self.lib, f).restype = C.c_int
+        # v1.7 (DESIGN §6b): packed operands
+        L = self.lib
+        L.imd_pack_create.argtypes = [C.c_void_p, C.POINTER(PackDesc), C.POINTER(C.c_void_p)]
+        L.imd_pack_destroy.argtypes = [C.c_void_p]
+        L.imd_pack_bytes.argtypes = [C.c_void_p, C.POINTER(C.c_size_t), C.POINTER(C.c_size_t)]
+        L.imd_pack.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p, C.c_size_t, C.c_void_p,
+                               C.c_size_t, C.c_void_p]
+        L.imd_plan_create_packed.argtypes = [C.c_void_p] + [C.POINTER(Tensor)] * 3 + \
+            [C.POINTER(Options), C.c_void_p, C.c_void_p, C.POINTER(C.c_void_p)]
+        L.imd_contract_packed.argtypes = [C.c_void_p, C.c_double, C.POINTER(Operand),
+                                          C.POINTER(Operand), C.c_double, C.c_void_p, C.c_void_p,
+                                          C.c_size_t, C.c_void_p]
+        L.imd_workspace_size_packed.argtypes = [C.POINTER(Tensor)] * 3 + \
+            [C.POINTER(Options), C.c_void_p, C.POINTER(C.c_size_t)]
+        for f in ("imd_pack_create", "imd_pack_destroy", "imd_pack_bytes", "imd_pack",
+                  "imd_plan_create_packed", "imd_contract_packed", "imd_workspace_size_packed"):
+            getattr(L, f).restype = C.c_int
         self._handle = None
         # Test-only hooks (src/test_hooks.cpp); absent from a library built without them.
         self.has_test_hooks = hasattr(self.lib, "imd_test_set_limits")
@@ -226,6 +275,45 @@ class Library:
 
     def contract(self, plan, alpha, A, B, beta, Cp, ws, ws_bytes, stream=None):
         return STATUS[self.lib.imd_contract(plan, alpha, A, B, beta, Cp, ws, ws_bytes, stream)]
+
+    # ---- v1.7 (DESIGN §6b): packed operands --------------------------------------------
+
+    def pack_create(self, desc):
+        """(status, imd_pack_t or None) of a PackDesc (make_pack_desc)."""
+        h = C.c_void_p()
+        st = self.lib.imd_pack_create(self.handle(), C.byref(desc), C.byref(h))
+        return STATUS[st], (h if st == 0 else None)
+
+    def pack_destroy(self, pack):
+        assert self.lib.imd_pack_destroy(pack) == 0
+
+    def pack_bytes(self, pack):
+        pb, wb = C.c_size_t(7), C.c_size_t(7)
+        assert self.lib.imd_pack_bytes(pack, C.byref(pb), C.byref(wb)) == 0
+        return pb.value, wb.value
+
+    def pack(self, pack, X, packed, packed_bytes, ws, ws_bytes, stream=None):
+        return STATUS[self.lib.imd_pack(pack, X, packed, packed_bytes, ws, ws_bytes, stream)]
+
+    def plan_create_packed(self, A, B, Cc, N, packA, packB, g=0, rounding=RN, mode=EMULATE,
+                           vec=VEC_GENERATE, k4_tune=0):
+        plan = C.c_void_p()
+        st = self.lib.imd_plan_create_packed(self.handle(), C.byref(A), C.byref(B), C.byref(Cc),
+                                             C.byref(Options(N, g, rounding, mode, vec, k4_tune)),
+                                             packA, packB, C.byref(plan))
+        return STATUS[st], (plan if st == 0 else None)
+
+    def contract_packed(self, plan, alpha, opA, opB, beta, Cp, ws, ws_bytes, stream=None):
+        """opA / opB: Operand structs (or None for a NULL imd_operand_t*)."""
+        return STATUS[self.lib.imd_contract_packed(plan, alpha,
+                                                   C.byref(opA) if opA is not None else None,
+                                                   C.byref(opB) if opB is not None else None,
+                                                   beta, Cp, ws, ws_bytes, stream)]
+
+    def plan_packed(self, plan):
+        """(packed slots: bit 0 / 1 = caller's A / B, pack bytes of post-swap A, B) of a plan."""
+        v = self.plan_sizes(plan)
+        return v[38], v[39], v[40]
 
 
 class Cuda:
