@@ -171,16 +171,10 @@ available on sm_89.
 
 ---
 
-## Questions for you (Eric)
+## Resolved setup decisions (2026-10-02)
 
-Everything else is decided in DESIGN.md with a stated reason. Push back on anything.
-
-1. **Lean toolchain.** Lean isn't visible from the shell (no `~/.elan`). When you've set it
-   up, I'll start `proofs/`. Alternatively, I can install `elan` into `~/.elan` myself
-   (about 1–2 GB with the Mathlib cache), if you'd like.
-2. **Downloads.** May I:
-   - create the `immerdink` conda env (~GBs)?
-   - add CUTLASS v4.8.0 as a submodule (shallow)?
-   - optionally fetch Apalache 0.62.3 (192 MB, into `tools/`)? It would prove the
-     real-width bounds symbolically in addition to `params.py`.
-3. **License.** MIT (as GEMMul8) or BSD-3 (as CUTLASS)?
+- **Lean:** elan 4.2.4 / Lean 4.34.1 / Lake 5.0 are in `~/.elan/bin`, which is not on the
+  non-interactive PATH; scripts use the full path.
+- **Environment:** the `immerdink` conda env exists (`environment.yml`). CUTLASS v4.8.0 is
+  a submodule. Apalache 0.62.3 installs via `tools/get_apalache.sh`.
+- **License:** MIT.
