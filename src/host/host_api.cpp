@@ -2,6 +2,7 @@
 // thread-safe host queries over analysis.hpp. No exception crosses this boundary; nothing
 // here touches CUDA, a device or global state.
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <new>
@@ -16,7 +17,9 @@ using imd::detail::ExecPlan;
 
 // The version-1 size of imd_lowering_t (§6a): fields are only ever appended.
 constexpr uint32_t kLoweringV1Size = 136;
-static_assert(sizeof(imd_lowering_t) == kLoweringV1Size, "imd_lowering_t v1 layout changed");
+constexpr uint32_t kLoweringV2Size = 152;  // + fused, reserved, kernel_launches (v1.4)
+static_assert(offsetof(imd_lowering_t, fused) == kLoweringV1Size, "imd_lowering_t v1 layout changed");
+static_assert(sizeof(imd_lowering_t) == kLoweringV2Size, "imd_lowering_t v2 layout changed");
 static_assert(sizeof(imd_region_t) == 16, "imd_region_t layout changed");
 
 // Runs f() and maps a host allocation failure to ALLOC_FAILED (the queries allocate only
@@ -129,6 +132,11 @@ imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B, const im
       r.k_chunks = kc.k_chunks;
       r.gemm_launches = kc.launches;
     }
+    // v1.4: the fused launch and the kernel launches per call (contract.cu runs exactly these).
+    const bool fused = imd::detail::fused_path(e);
+    r.fused = fused ? 1 : 0;
+    r.kernel_launches = imd::detail::plan_launches(e, fused, an.options.vec_mode == IMD_VEC_RESIDENT,
+                                                   r.gemm_launches);
     if (plan_st != IMD_STATUS_SUCCESS) return plan_st;
     r.plan_device_bytes = e.device_bytes;
     r.plan_host_bytes = imd::detail::plan_host_bytes(*A, *B, *C, an, e);

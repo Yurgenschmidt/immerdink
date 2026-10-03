@@ -32,6 +32,20 @@ IMD_HOST_INTERNAL imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t
 // kGemm with k = 0 is the beta-only path (§3.7: K0 and one scale kernel).
 inline bool emulates(const ExecPlan& e) { return e.path == Path::kGemm && e.k >= 2; }
 
+// v1.4 (DESIGN §4 "KF"): the fused scale-and-pack launch is used iff the emulated GEMM runs
+// and one pack tile row covers all of k_hat (k_hat <= kFusedKHatMax, so a row's 16-element
+// pieces lie in one warp). A pure function of the lowering: deterministic at plan time.
+constexpr int64_t kFusedKHatMax = 512;
+inline bool fused_path(const ExecPlan& e) { return emulates(e) && e.k_hat <= kFusedKHatMax; }
+
+// Kernel launches of one imd_contract with alpha != 0 (DESIGN §4, §6a kernel_launches):
+// NOOP 0; DIRECT / SCALE: K0 (generate mode) + 1; EMULATE: fused ? KF : K0 (generate) + 2 K1,
+// then per residue group not packed by KF two packs (+ one launch zeroing the B rows
+// n..n_hat-1 if n_hat > n), the K4 launches, and K5. `fused` and `resident` are the plan's
+// choices (fused_path, vec_mode = IMD_VEC_RESIDENT); `k4_launches` is plan_k4_counts.
+IMD_HOST_INTERNAL int64_t plan_launches(const ExecPlan& e, bool fused, bool resident,
+                                        int64_t k4_launches);
+
 // kappa = ceil(sqrt(k)) exactly (k >= 1; 0 for k = 0), DESIGN §3.2.
 IMD_HOST_INTERNAL uint64_t ceil_sqrt_u64(uint64_t k);
 
