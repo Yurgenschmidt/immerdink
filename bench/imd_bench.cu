@@ -439,6 +439,9 @@ struct Options {
   int phase_reps = 5;  // profiled imd calls (per-phase marks), after the timed loop
   std::vector<int> vec_modes = {IMD_VEC_GENERATE};  // imd: --vec generate,resident (v1.2)
   std::vector<int> groups = {0};  // imd: --g 1,2,4,0 (residue group size g; 0 = N)
+  // imd: --k4 rule,tune,0,1,2,3 (A3: the K4 configuration; -1 = the plan-time rule, -2 =
+  // the k4_tune plan option, 0.. = forced through the benchmark hook)
+  std::vector<int> k4 = {-1};
   double phi = 0.5;
   uint64_t seed = 1;
   std::string out;
@@ -846,20 +849,34 @@ struct Bench {
     for (auto d : {da, db, dc}) cutensorDestroyTensorDescriptor(d);
   }
 
-  void method_imd(int N, int vec_mode, int g) {
+  // k4: -1 the plan-time rule, -2 the k4_tune plan option, >= 0 a forced configuration
+  // (benchmark hook; needs the profiling build).
+  void method_imd(int N, int vec_mode, int g, int k4 = -1) {
     auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
       lab.assign(x.labels.begin(), x.labels.end());
       return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
     };
     std::vector<int32_t> la, lb, lc;
     imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
-    imd_options_t opt{N, g, IMD_RN, IMD_EMULATE, vec_mode};
+    imd_options_t opt{N, g, IMD_RN, IMD_EMULATE, vec_mode, k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF};
     size_t wsb = 0;
     CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
+    imd_lowering_t low{};
+    low.struct_size = sizeof low;
+    imd_lowering(&A, &B, &C, &opt, &low);
     imd_plan_t plan = nullptr;
+#ifdef IMD_BENCH_PROFILE
+    if (imd_prof_set_k4_config(k4 >= 0 ? k4 : -1) != 0) throw Failure("imd_prof_set_k4_config");
+#else
+    if (k4 >= 0) throw Failure("--k4 <config> needs the profiling build");
+#endif
     const auto c0 = std::chrono::steady_clock::now();
-    CI(imd_plan_create(imd, &A, &B, &C, &opt, &plan));
+    const imd_status_t pst = imd_plan_create(imd, &A, &B, &C, &opt, &plan);
     const double create_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+#ifdef IMD_BENCH_PROFILE
+    imd_prof_set_k4_config(-1);
+#endif
+    CI(pst);
     size_t plan_dev = 0;
     CI(imd_plan_device_bytes(plan, &plan_dev));
     // A resident plan must outlive in-flight work (its kernels read the plan's vectors).
@@ -881,8 +898,17 @@ struct Bench {
     extra.integer("plan_device_bytes", (long long)plan_dev).num("plan_create_ms", 1e3 * create_s);
     const std::string gs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
     extra.integer("g", (long long)((g == 0 || g >= N) ? N : g));
-    record("imd", vec_mode == IMD_VEC_RESIDENT ? gs + " vec=resident" : gs, N, T, &acc, flops(),
-           wsb, extra);
+    // A3: the K4 configuration of the rule (host query) and the one the plan runs.
+    int32_t k4_run = -1;
+#ifdef IMD_BENCH_PROFILE
+    imd_prof_plan_k4(plan, &k4_run);
+#endif
+    extra.integer("k4_rule", low.k4_config).integer("k4_config", k4_run)
+        .integer("k4_tune_bytes", (long long)low.k4_tune_bytes);
+    std::string vs = vec_mode == IMD_VEC_RESIDENT ? gs + " vec=resident" : gs;
+    if (k4 == -2) vs += " k4=tune";
+    else if (k4 >= 0) vs += " k4=" + std::to_string(k4);
+    record("imd", vs, N, T, &acc, flops(), wsb, extra);
   }
 
 #ifdef IMD_BENCH_PROFILE
@@ -980,7 +1006,7 @@ void usage() {
           "usage: imd_bench --name NAME --spec 'ab,bc->ac' --ext a=..,b=..,c=.. [--methods LIST]\n"
           "  [--N 8,14,20] [--emu dyn,fix55] [--emu-ws-mib 2048] [--reps 10] [--warmup 2]\n"
           "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--phase-reps 5]\n"
-          "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)]\n"
+          "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)] [--k4 rule,tune,0,1,2,3]\n"
           "  [--out file.jsonl]\n");
 }
 
@@ -1013,6 +1039,11 @@ int main(int argc, char** argv) {
     if (a.count("g")) {
       B.o.groups.clear();
       for (auto& v : split(a["g"], ',')) B.o.groups.push_back(std::stoi(v));
+    }
+    if (a.count("k4")) {
+      B.o.k4.clear();
+      for (auto& v : split(a["k4"], ','))
+        B.o.k4.push_back(v == "rule" ? -1 : v == "tune" ? -2 : std::stoi(v));
     }
     if (a.count("phi")) B.o.phi = std::stod(a["phi"]);
     if (a.count("seed")) B.o.seed = std::stoull(a["seed"]);
@@ -1051,7 +1082,8 @@ int main(int argc, char** argv) {
       for (int N : Ns)
         for (int v : B.o.vec_modes)
           for (int g : B.o.groups)
-            if (g <= N) guarded(m, "", N, [&] { B.method_imd(N, v, g); });
+            for (int k4 : B.o.k4)
+              if (g <= N) guarded(m, "", N, [&] { B.method_imd(N, v, g, k4); });
     else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
     else { fprintf(stderr, "unknown method %s\n", m.c_str()); return 2; }
   }

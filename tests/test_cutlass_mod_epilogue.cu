@@ -3,7 +3,8 @@
 //  - CUTLASS GemmUniversal + the Sm80 EVT epilogue (kernels/mod_epilogue.cuh), K4 until A2;
 //  - imd::kernels::K4Gemm (kernels/k4_gemm.cuh), K4 since A2: persistent CTAs (here also
 //    with very few resident CTAs, so every CTA loops over many tiles and overlaps its next
-//    prologue with the register epilogue), and with the batch count split over launches.
+//    prologue with the register epilogue), and with the batch count split over launches,
+//    in every K4 configuration (DESIGN v1.5 §4, A3).
 //
 // One batched launch per K-chunk covers a residue group: batch z = s*b + lambda, modulus
 // l = g0 + z / b from the __constant__ table (imd::kernels::VisitorModP). Chunk 0 stores
@@ -21,6 +22,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/default_gemm_universal_with_visitor.h"
+#include "host/k4_config.hpp"
 #include "kernels/k4_gemm.cuh"
 #include "kernels/mod_epilogue.cuh"  // also brings in the Sm80 EVT visitors
 
@@ -68,7 +70,14 @@ using GemmFor = cutlass::gemm::device::GemmUniversalAdapter<
         cutlass::arch::OpMultiplyAddSaturate, kEVTStages>::GemmKernel>;
 using GemmStore = GemmFor<EVTStore>;
 using GemmAdd = GemmFor<EVTAdd>;
-using K4 = imd::kernels::K4Gemm<TB, Warp, kStages>;  // the production K4 kernel (A2)
+// The production K4 kernels (A2), one per K4 configuration (DESIGN v1.5 §4,
+// host/k4_config.hpp): all must give the same W bit for bit.
+template <int kCfg>
+using K4For = imd::kernels::K4Gemm<
+    cutlass::gemm::GemmShape<imd::detail::kK4Configs[kCfg].tile_m, imd::detail::kK4Configs[kCfg].tile_n, 64>,
+    cutlass::gemm::GemmShape<imd::detail::kK4Configs[kCfg].warp_m, imd::detail::kK4Configs[kCfg].warp_n, 64>,
+    imd::detail::kK4Configs[kCfg].stages>;
+static_assert(imd::detail::kK4ConfigCount == 4, "one K4For instantiation per configuration below");
 
 template <class Gemm>
 void run(typename Gemm::Arguments const& args) {
@@ -100,14 +109,15 @@ struct Problem {
   }
 };
 
-// How K4 runs: the CUTLASS EVT kernel, or K4Gemm with `resident` persistent CTAs and at
-// most `zsplit` batches per launch (0: all).
+// How K4 runs: the CUTLASS EVT kernel, or K4Gemm in configuration `cfg` with `resident`
+// persistent CTAs and at most `zsplit` batches per launch (0: all).
 struct Kernel {
   bool k4gemm = false;
   int resident = 0, zsplit = 0;
+  int cfg = 0;
 };
 
-template <bool kAdd>
+template <class K4, bool kAdd>
 void launch_k4gemm(const Problem& P, const Kernel& K, const int8_t* A, const int8_t* B,
                    uint8_t* W0, int kc) {
   static bool attr = false;
@@ -152,10 +162,19 @@ std::vector<uint8_t> gpu_k4(const Problem& P, const Kernel& K) {
     const int8_t* A = dA + k0;
     const int8_t* B = dB + k0;
     if (K.k4gemm) {
-      if (c == 0)
-        launch_k4gemm<false>(P, K, A, B, W0, k1 - k0);
-      else
-        launch_k4gemm<true>(P, K, A, B, W0, k1 - k0);
+      const auto run_cfg = [&](auto k4) {
+        using K4 = decltype(k4);
+        if (c == 0)
+          launch_k4gemm<K4, false>(P, K, A, B, W0, k1 - k0);
+        else
+          launch_k4gemm<K4, true>(P, K, A, B, W0, k1 - k0);
+      };
+      switch (K.cfg) {
+        case 0: run_cfg(K4For<0>{}); break;
+        case 1: run_cfg(K4For<1>{}); break;
+        case 2: run_cfg(K4For<2>{}); break;
+        default: run_cfg(K4For<3>{}); break;
+      }
     } else if (c == 0) {
       typename EVTStore::Arguments cb{mod, {W0, {ld_w, _1{}, plane}}};
       run<GemmStore>({cutlass::gemm::GemmUniversalMode::kBatched, size, batch, cb, A, B, nullptr,
@@ -205,20 +224,26 @@ void check_with(const char* name, const Problem& P, const Kernel& K) {
                          i, j, got, (long long)want);
         }
   }
-  std::printf("%-44s %-24s %zu bytes, %zu mismatches\n", name,
-              !K.k4gemm ? "CUTLASS EVT" : K.resident > 8 ? "K4Gemm" : "K4Gemm, few CTAs + zsplit",
-              checked, bad);
+  char how[64];
+  if (!K.k4gemm)
+    std::snprintf(how, sizeof how, "CUTLASS EVT");
+  else
+    std::snprintf(how, sizeof how, "K4Gemm %dx%d%s", imd::detail::kK4Configs[K.cfg].tile_m,
+                  imd::detail::kK4Configs[K.cfg].tile_n, K.resident > 8 ? "" : ", few CTAs + zsplit");
+  std::printf("%-44s %-34s %zu bytes, %zu mismatches\n", name, how, checked, bad);
   failures += bad != 0;
 }
 
-// Every problem through the EVT kernel, K4Gemm with one CTA per SM, and K4Gemm with 3
-// persistent CTAs and the batch count split into launches of 2.
+// Every problem through the EVT kernel and, in every K4 configuration, K4Gemm with one CTA
+// per SM and K4Gemm with 3 persistent CTAs and the batch count split into launches of 2.
 void check(const char* name, const Problem& P) {
   int sms = 0;
   CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
   check_with(name, P, Kernel{});
-  check_with(name, P, Kernel{true, sms, 0});
-  check_with(name, P, Kernel{true, 3, 2});
+  for (int cfg = 0; cfg < imd::detail::kK4ConfigCount; ++cfg) {
+    check_with(name, P, Kernel{true, sms, 0, cfg});
+    check_with(name, P, Kernel{true, 3, 2, cfg});
+  }
 }
 
 // Uniform residues in p_l's symmetric range [-floor(p/2), ceil(p/2) - 1] (DESIGN §3.4).

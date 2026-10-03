@@ -118,7 +118,18 @@ imd_status_t imd_plan_create(imd_handle_t handle, const imd_tensor_t* A, const i
       }
     }
     if (emulated) {  // §4 / §6 v1.2: every K4 launch shape's parameters, built here once
-      if (const imd_status_t st = imd::detail::k4_prepare(e, &e.k4); st != IMD_STATUS_SUCCESS)
+      // v1.5: the K4 configuration. libimmerdink_host's rule for this device's SM count (what
+      // imd_lowering reports for sm_count = e.sms), or the fastest one timed (k4_tune).
+      e.k4_config = imd::detail::k4_select(e, e.sms);
+      if (imd::detail::k4_config_override() >= 0) {
+        e.k4_config = imd::detail::k4_config_override();  // test / benchmark hook only
+      } else if (an.options.k4_tune == IMD_K4_TUNE_ON) {
+        if (const imd_status_t st = imd::detail::k4_tune(e, &e.k4_config, nullptr);
+            st != IMD_STATUS_SUCCESS)
+          return st;
+      }
+      if (const imd_status_t st = imd::detail::k4_prepare(e, e.k4_config, &e.k4);
+          st != IMD_STATUS_SUCCESS)
         return st;
     }
     if (e.path != imd::detail::Path::kNoop && an.options.vec_mode == IMD_VEC_RESIDENT) {
@@ -209,6 +220,18 @@ IMD_API int imd_prof_plan_dims(imd_plan_t plan, int64_t* out) {
   const imd::detail::ExecPlan& e = plan->exec;
   const int64_t v[7] = {e.m, e.n, e.k, e.b, e.n_hat, e.k_hat, static_cast<int64_t>(e.path)};
   for (int i = 0; i < 7; ++i) out[i] = v[i];
+  return 0;
+}
+// Benchmark-only (v1.5): the K4 configuration a plan runs (IMD_K4_*; -1 without K4), and
+// the configuration every later plan runs (-1: the rule / k4_tune).
+IMD_API int imd_prof_plan_k4(imd_plan_t plan, int32_t* config) {
+  if (plan == nullptr || config == nullptr) return 1;
+  *config = plan->exec.k4 ? plan->exec.k4_config : -1;
+  return 0;
+}
+IMD_API int imd_prof_set_k4_config(int32_t config) {
+  if (config < -1 || config >= IMD_K4_CONFIG_COUNT) return 1;
+  imd::detail::k4_config_override() = config;
   return 0;
 }
 #endif

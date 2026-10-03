@@ -110,11 +110,12 @@ target_compile_options(imd_cutlass INTERFACE
 
 # --- Library -----------------------------------------------------------------------------
 # The library: C ABI (api.cpp), K0-K5 + DIRECT kernels (contract.cu), K4 CUTLASS GEMM
-# (gemm_k4.cu).
+# (gemm_k4.cu, one K4Gemm instantiation per configuration in src/k4/).
 # Test-only hooks (src/test_hooks.cpp: launch-limit override, lowering dump) are built only
 # with IMMERDINK_BUILD_TESTS=ON, and the benchmark phase marks (src/profile.cpp) only with
 # IMMERDINK_PROFILE=ON; a production build exports neither.
-add_library(immerdink SHARED src/api.cpp src/contract.cu src/gemm_k4.cu)
+add_library(immerdink SHARED src/api.cpp src/contract.cu src/gemm_k4.cu
+  src/k4/k4_cfg0.cu src/k4/k4_cfg1.cu src/k4/k4_cfg2.cu src/k4/k4_cfg3.cu)
 if(IMMERDINK_BUILD_TESTS)
   target_sources(immerdink PRIVATE src/test_hooks.cpp)
 endif()

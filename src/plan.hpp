@@ -31,11 +31,29 @@ LaunchLimits& launch_limits();
 LaunchLimits default_launch_limits();
 
 // K4 setup at plan creation (gemm_k4.cu, DESIGN v1.2 §6): for every launch shape of the
-// call (K-chunk length, batch count, n-hat part; store-mod / add-mod), the K4Gemm kernel
-// parameters, built from the device's SM count and the kernels' occupancy, after setting
-// their dynamic shared-memory attribute. All of this host state is built here, never in
-// imd_contract. SUCCESS, CUDA_ERROR, or NOT_SUPPORTED if a shape is out of K4's limits.
-imd_status_t k4_prepare(const ExecPlan& p, std::shared_ptr<const K4Plan>* out);
+// call (K-chunk length, batch count, n-hat part; store-mod / add-mod), the kernel parameters
+// of K4 configuration `cfg` (IMD_K4_*, DESIGN v1.5 §4), built from the device's SM count and
+// the kernels' occupancy, after setting their dynamic shared-memory attribute. All of this
+// host state is built here, never in imd_contract. SUCCESS, CUDA_ERROR, INVALID_VALUE (no
+// such configuration), or NOT_SUPPORTED if a shape is out of K4's limits.
+imd_status_t k4_prepare(const ExecPlan& p, int cfg, std::shared_ptr<const K4Plan>* out);
+
+// Plan-time autotuning (imd_options_t.k4_tune, DESIGN v1.5 §6): with k4_tune_bytes(p) > 0,
+// allocate that much device memory, time group 1's K4 launches once (after one warm-up run)
+// in every configuration on cudaStreamPerThread, free it, and set *cfg to the fastest (the
+// incoming *cfg, the rule's choice, unless another is strictly faster). With
+// k4_tune_bytes(p) = 0, nothing runs and *cfg is unchanged. SUCCESS, ALLOC_FAILED (the
+// temporary allocation) or CUDA_ERROR. `report` (optional): the times, for benchmarks.
+struct K4TuneReport {
+  bool tuned = false;
+  float ms[IMD_K4_CONFIG_COUNT] = {};
+};
+imd_status_t k4_tune(const ExecPlan& p, int32_t* cfg, K4TuneReport* report);
+
+// Test / benchmark hook state (gemm_k4.cu; test_hooks.cpp imd_test_set_k4_config): -1 = the
+// plan-time rule or k4_tune (production), else the IMD_K4_* every later plan runs. Read by
+// imd_plan_create only.
+int& k4_config_override();
 
 // K4 for one residue group (gemm_k4.cu): every K-chunk (store-mod, then add-mod) of the
 // batched int8 TN GEMMs W_l[lambda] = RA_s[lambda] RB_s[lambda]^T mod p_l, l = g0 + s,
@@ -62,6 +80,7 @@ const ExecPlan* exec_of(imd_plan_t plan);
 struct K4Footprint {
   int64_t store_shapes = 0, add_shapes = 0, launches = 0;
   uint64_t bytes = 0;
+  int32_t config = 0;  // the configuration whose parameters the plan holds (v1.5)
 };
 K4Footprint k4_footprint(const K4Plan& k4, int N, int g);
 

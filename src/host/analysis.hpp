@@ -77,7 +77,7 @@ IMD_HOST_INTERNAL uint64_t plan_host_bytes(const imd_tensor_t& A, const imd_tens
 
 // sizeof(K4Plan) and of one std::map entry of its store-mod / add-mod kernel parameter
 // maps, for this build (gemm_k4.cu static_asserts these against the real types).
-constexpr uint64_t kK4PlanBytes = 176;
+constexpr uint64_t kK4PlanBytes = 184;
 constexpr uint64_t kK4StoreEntryBytes = 280;
 constexpr uint64_t kK4AddEntryBytes = 280;
 
