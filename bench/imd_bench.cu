@@ -21,6 +21,11 @@
 //             time, its MEMORY_MODEL §4 lower bound and the time as % of that bound
 //             (the timed whole-call loop runs with the marks switched off)
 //   bw        device-to-device copy of A (achievable DRAM bandwidth)
+//   packed    v1.7 (DESIGN §6b, D1): the caller's A or B (--pack A,B) packed once with
+//             imd_pack (imd_pack_desc_for: bit-identical C) and reused by R contractions
+//             (--reuse 1,4,16): R x imd_contract vs imd_pack + R x imd_contract_packed,
+//             interleaved per repetition, plus imd_pack / imd_contract / imd_contract_packed
+//             alone; workspaces and pack bytes
 // Matrix-only methods (dgemm, emu, gemmul8) need the GEMM view: A = [L][I|K], B = [L][J|K],
 // C = [L][I][J] (either I/K or J/K order). If a case is not in that layout the method is
 // timed twice: on pre-permuted operands ("gemm-view") and as "perm+<method>", which
@@ -912,6 +917,126 @@ struct Bench {
     record("imd", vs, N, T, &acc, flops(), wsb, extra);
   }
 
+  // v1.7 (DESIGN §6b, ROADMAP D1): one operand packed once (imd_pack_desc_for: the plain
+  // call's orders, so C is bit-identical) and reused by R contractions. `which`: 0 = the
+  // caller's A, 1 = B. Per R in --reuse, interleaved in each repetition (same clock state):
+  //   plain   R x imd_contract
+  //   packed  imd_pack + R x imd_contract_packed (same partner, same C)
+  // and, timed the same way, imd_pack alone, one imd_contract and one imd_contract_packed.
+  // One record per R: medians, the ratio plain / packed, the workspaces and the pack bytes;
+  // the packed C is checked bit for bit against the plain one.
+  void method_packed(int N, int which, const std::vector<int>& reuse) {
+    auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
+      lab.assign(x.labels.begin(), x.labels.end());
+      return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
+    };
+    std::vector<int32_t> la, lb, lc;
+    imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
+    const imd_options_t opt{N, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    imd_pack_desc_t desc{};
+    desc.struct_size = sizeof desc;
+    int32_t labels[64];
+    CI(imd_pack_desc_for(&A, &B, &C, &opt, which, &desc, labels, 64));
+    imd_pack_t pack = nullptr;
+    CI(imd_pack_create(imd, &desc, &pack));
+    std::unique_ptr<imd_pack_s, imd_status_t (*)(imd_pack_t)> pguard(pack, imd_pack_destroy);
+    size_t pb = 0, pw = 0, wsb = 0, wsp = 0;
+    CI(imd_pack_bytes(pack, &pb, &pw));
+    const imd_packing_t packing = {which == 0 ? &desc : nullptr, which == 1 ? &desc : nullptr};
+    CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
+    CI(imd_workspace_size_packed(&A, &B, &C, &opt, &packing, &wsp));
+    imd_lowering_t lu{}, lp{};
+    lu.struct_size = lp.struct_size = sizeof lu;
+    imd_lowering(&A, &B, &C, &opt, &lu);
+    imd_lowering_packed(&A, &B, &C, &opt, &packing, &lp);
+    imd_plan_t plain = nullptr, packed = nullptr;
+    CI(imd_plan_create(imd, &A, &B, &C, &opt, &plain));
+    std::unique_ptr<imd_plan_st, imd_status_t (*)(imd_plan_t)> g1(plain, imd_plan_destroy);
+    CI(imd_plan_create_packed(imd, &A, &B, &C, &opt, which == 0 ? pack : nullptr,
+                              which == 1 ? pack : nullptr, &packed));
+    std::unique_ptr<imd_plan_st, imd_status_t (*)(imd_plan_t)> g2(packed, imd_plan_destroy);
+    DevBuf ws(wsb), wsP(wsp), P(pb), PW(pw);
+    const double* X = which == 0 ? dA.as<double>() : dB.as<double>();
+    const imd_operand_t opX{X, P.p, pb, pack};
+    const imd_operand_t opO{which == 0 ? dB.as<double>() : dA.as<double>(), nullptr, 0, nullptr};
+    const imd_operand_t& oA = which == 0 ? opX : opO;
+    const imd_operand_t& oB = which == 0 ? opO : opX;
+    auto do_pack = [&] { CI(imd_pack(pack, X, P.p, pb, PW.p, pw, s)); };
+    auto do_plain = [&] {
+      CI(imd_contract(plain, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
+    };
+    auto do_packed = [&] {
+      CI(imd_contract_packed(packed, 1.0, &oA, &oB, 0.0, dC.as<double>(), wsP.p, wsp, s));
+    };
+    // bit-identity of the two paths (imd_pack_desc_for orders)
+    poison_C();
+    do_plain();
+    CU(cudaStreamSynchronize(s));
+    std::vector<double> ref(c.C.size), got(c.C.size);
+    CU(cudaMemcpy(ref.data(), dC.p, c.C.size * 8, cudaMemcpyDeviceToHost));
+    poison_C();
+    do_pack();
+    do_packed();
+    CU(cudaStreamSynchronize(s));
+    CU(cudaMemcpy(got.data(), dC.p, c.C.size * 8, cudaMemcpyDeviceToHost));
+    const bool identical = std::memcmp(ref.data(), got.data(), c.C.size * 8) == 0;
+    Accuracy acc = result_accuracy();
+    // Timed units, interleaved per repetition.
+    cudaEvent_t e0, e1;
+    CU(cudaEventCreate(&e0));
+    CU(cudaEventCreate(&e1));
+    auto timed = [&](const std::function<void()>& f) {
+      CU(cudaEventRecord(e0, s));
+      f();
+      CU(cudaEventRecord(e1, s));
+      CU(cudaEventSynchronize(e1));
+      float ms = 0;
+      CU(cudaEventElapsedTime(&ms, e0, e1));
+      return double(ms) * 1e-3;
+    };
+    const int Rmax = *std::max_element(reuse.begin(), reuse.end());
+    for (int w = 0; w < o.warmup; ++w) { do_pack(); do_plain(); do_packed(); }
+    CU(cudaStreamSynchronize(s));
+    Timing tp, tc, tcp;
+    std::map<int, Timing> tplain, tpacked;
+    double total = 0;
+    for (int r = 0; r < o.reps; ++r) {
+      tp.t.push_back(timed(do_pack));
+      tc.t.push_back(timed(do_plain));
+      tcp.t.push_back(timed(do_packed));
+      for (int R : reuse) {
+        const double a = timed([&] { for (int i = 0; i < R; ++i) do_plain(); });
+        const double b = timed([&] { do_pack(); for (int i = 0; i < R; ++i) do_packed(); });
+        tplain[R].t.push_back(a);
+        tpacked[R].t.push_back(b);
+        total += a + b;
+      }
+      if (r + 1 >= o.min_reps && total > o.max_seconds) break;
+    }
+    CU(cudaGetLastError());
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    (void)Rmax;
+    for (int R : reuse) {
+      Json e;
+      e.str("pack", which == 0 ? "A" : "B").integer("R", R);
+      e.num("plain_R_ms", 1e3 * tplain[R].median()).num("packed_R_ms", 1e3 * tpacked[R].median());
+      e.num("speedup_R", tplain[R].median() / tpacked[R].median());
+      e.num("pack_ms", 1e3 * tp.median()).num("contract_ms", 1e3 * tc.median());
+      e.num("contract_packed_ms", 1e3 * tcp.median());
+      e.num("pack_vs_contract", tp.median() / tc.median());
+      e.num("contract_packed_vs_contract", tcp.median() / tc.median());
+      e.integer("ws_bytes_plain", (long long)wsb).integer("ws_bytes_packed", (long long)wsp);
+      e.integer("pack_bytes", (long long)pb).integer("pack_ws_bytes", (long long)pw);
+      e.integer("kernel_launches_plain", lu.kernel_launches).integer("kernel_launches_packed", lp.kernel_launches);
+      e.integer("fused", lp.fused).integer("fused_large", lp.fused_large).integer("swapped", lp.swapped);
+      e.raw("bit_identical", identical ? "true" : "false");
+      record("packed", std::string("pack ") + (which == 0 ? "A" : "B") + " R=" + std::to_string(R), N,
+             tpacked[R], &acc, R * flops(), wsp, e);
+    }
+    CU(cudaStreamSynchronize(s));
+  }
+
 #ifdef IMD_BENCH_PROFILE
   // Per-phase times from the library's event marks, against MEMORY_MODEL §4 lower bounds
   // (g = N, beta = 0, rho = 1, datasheet peaks as in bench/summarize.py).
@@ -1012,6 +1137,7 @@ void usage() {
           "  [--N 8,14,20] [--emu dyn,fix55] [--emu-ws-mib 2048] [--reps 10] [--warmup 2]\n"
           "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--phase-reps 5]\n"
           "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)] [--k4 rule,tune,0,1,2,3]\n"
+          "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--out file.jsonl]\n");
 }
 
@@ -1083,13 +1209,20 @@ int main(int argc, char** argv) {
     else if (m == "int8") guarded(m, "", 1, [&] { B.method_int8(); });
     else if (m == "gemmul8") for (int N : Ns) guarded(m, "", N, [&] { B.method_gemmul8(N); });
     else if (m == "cutensor") guarded(m, "", 0, [&] { B.method_cutensor(); });
-    else if (m == "imd")
+    else if (m == "imd") {  // braces: the else-if chain below must not bind to the inner if
       for (int N : Ns)
         for (int v : B.o.vec_modes)
           for (int g : B.o.groups)
             for (int k4 : B.o.k4)
               if (g <= N) guarded(m, "", N, [&] { B.method_imd(N, v, g, k4); });
-    else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
+    } else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
+    else if (m == "packed") {  // v1.7 (D1): --pack A,B --reuse 1,4,16
+      std::vector<int> reuse;
+      for (auto& v : split(a.count("reuse") ? a["reuse"] : "1,4,16", ',')) reuse.push_back(std::stoi(v));
+      for (int N : Ns)
+        for (auto& w : split(a.count("pack") ? a["pack"] : "A", ','))
+          guarded(m, "pack " + w, N, [&] { B.method_packed(N, w == "B" ? 1 : 0, reuse); });
+    }
     else { fprintf(stderr, "unknown method %s\n", m.c_str()); return 2; }
   }
   if (B.out != stdout) fclose(B.out);
