@@ -67,9 +67,17 @@ __device__ __forceinline__ u128 shfl_down_u128(u128 v, int d) {
   return (static_cast<u128>(hi) << 64) | lo;
 }
 
+// K1 as one launch (both passes per row, kBoth) or, DESIGN v1.2 §4, as two launches: K1a
+// (kGamma) writes the flags and gamma into sigma's slots (scratch; kNoGamma for a row with
+// no finite nonzero entry), K1b (kSigma) reads gamma back and overwrites it with sigma. In
+// K1b a row belongs to one block, whose threads all read its gamma before the block-wide
+// barrier that precedes the sigma store (spec/Pipeline.tla neg_k1_sigma_row_split).
+enum K1Pass : int { kBoth = 0, kGamma = 1, kSigma = 2 };
+constexpr int kNoGamma = INT16_MIN;  // gamma is in [-1074, 1023]
+
 // One block of T threads per row (T = 1024 for long or few rows: more loads in flight per
 // row while few rows are resident, so the second pass re-reads from L2).
-template <int T>
+template <int T, int P>
 __global__ void __launch_bounds__(T) k1_scale(ScaleArgs a) {
   constexpr int kW = T / 32;
   __shared__ int s_max[kW];
@@ -80,26 +88,39 @@ __global__ void __launch_bounds__(T) k1_scale(ScaleArgs a) {
   for (int64_t r = blockIdx.x; r < total; r += gridDim.x) {
     const int64_t lam = r / a.op.rows, i = r % a.op.rows;
     const double* X = a.op.X + (a.op.v_bat[lam] + a.op.v_row[i]);
-    // pass 1: flag and gamma = max ilogb over finite nonzero entries
     int gmax = INT_MIN, flag = 0;
+    if constexpr (P == kSigma) {  // gamma from K1a (every thread reads it before the barrier)
+      const int g = a.sigma[r];
+      gmax = g == kNoGamma ? INT_MIN : g;
+    } else {
+      // pass 1: flag and gamma = max ilogb over finite nonzero entries
 #pragma unroll 4
-    for (int64_t h = threadIdx.x; h < a.k; h += blockDim.x) {
-      const uint64_t bits = to_bits(X[a.op.v_k[h]]);
-      if (non_finite(bits)) flag = 1;
-      else if (finite_nonzero(bits)) gmax = max(gmax, ilogb_bits(bits));
-    }
-    gmax = __reduce_max_sync(0xffffffffu, gmax);
-    flag = __reduce_or_sync(0xffffffffu, static_cast<unsigned>(flag));
-    if (lane == 0) {
-      s_max[warp] = gmax;
-      s_flag[warp] = flag;
-    }
-    __syncthreads();
-    gmax = INT_MIN;
-    flag = 0;
-    for (int w = 0; w < kW; ++w) {
-      gmax = max(gmax, s_max[w]);
-      flag |= s_flag[w];
+      for (int64_t h = threadIdx.x; h < a.k; h += blockDim.x) {
+        const uint64_t bits = to_bits(X[a.op.v_k[h]]);
+        if (non_finite(bits)) flag = 1;
+        else if (finite_nonzero(bits)) gmax = max(gmax, ilogb_bits(bits));
+      }
+      gmax = __reduce_max_sync(0xffffffffu, gmax);
+      flag = __reduce_or_sync(0xffffffffu, static_cast<unsigned>(flag));
+      if (lane == 0) {
+        s_max[warp] = gmax;
+        s_flag[warp] = flag;
+      }
+      __syncthreads();
+      gmax = INT_MIN;
+      flag = 0;
+      for (int w = 0; w < kW; ++w) {
+        gmax = max(gmax, s_max[w]);
+        flag |= s_flag[w];
+      }
+      if constexpr (P == kGamma) {
+        if (threadIdx.x == 0) {
+          a.sigma[r] = static_cast<int16_t>(gmax == INT_MIN ? kNoGamma : gmax);
+          a.flag[r] = static_cast<uint8_t>(flag);
+        }
+        __syncthreads();  // shared arrays are reused by the next row
+        continue;
+      }
     }
     // pass 2: S = sum ceil(m_h^2 2^(2(e_h - gamma) + F)), exact (order-independent)
     u128 S = 0;
@@ -121,7 +142,7 @@ __global__ void __launch_bounds__(T) k1_scale(ScaleArgs a) {
         sigma = largest_u(tot, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
       }
       a.sigma[r] = static_cast<int16_t>(sigma);  // range certified (cert_shift_range)
-      a.flag[r] = static_cast<uint8_t>(flag);
+      if constexpr (P == kBoth) a.flag[r] = static_cast<uint8_t>(flag);
     }
     __syncthreads();  // shared arrays are reused by the next row
   }
@@ -168,11 +189,11 @@ inline int pack_tile_lg_rows(bool along_rows, int64_t D) {
 // would be strided). A block takes th rows rho = lo + radix * d, d in [d0, d0 + th), over
 // all of k-bar (the pack's row enumeration; th = 8 here, see the launch); thread tid always
 // works on row dl = tid mod th, so a warp reads th rows side by side (coalesced along the
-// pivot) and 32 / th consecutive k-bar. Same two passes
+// pivot) and 32 / th consecutive k-bar. Same two passes (or one of them: P as in k1_scale)
 // and the same exact integers as k1_scale: gamma (and the flag) per row, then S per row;
 // the per-thread partial results are combined in shared memory (max, or, u128 sum: exact
 // and order-independent).
-template <int T>
+template <int T, int P>
 __global__ void __launch_bounds__(T) k1_tiled(ScaleArgs a, int64_t radix, int lg_th) {
   __shared__ int s_max[T];
   __shared__ int s_flag[T];
@@ -193,36 +214,48 @@ __global__ void __launch_bounds__(T) k1_tiled(ScaleArgs a, int64_t radix, int lg
       if (d < D) {
         const int64_t rho = lo + radix * d, lam = rho / rows, r = rho % rows;
         s_base[tid] = a.op.v_bat[lam] + a.op.v_row[r];
+        if constexpr (P == kSigma) {  // gamma from K1a, read before the barriers below
+          const int g = a.sigma[rho];
+          s_gamma[tid] = g == kNoGamma ? INT_MIN : g;
+        }
       }
     }
     __syncthreads();
     const bool valid = s_valid[dl];
     const double* X = a.op.X + (valid ? s_base[dl] : 0);
-    // pass 1: flag and gamma
-    int gmax = INT_MIN, flag = 0;
-    if (valid) {
+    if constexpr (P != kSigma) {
+      // pass 1: flag and gamma
+      int gmax = INT_MIN, flag = 0;
+      if (valid) {
 #pragma unroll 4
-      for (int64_t h = h_first; h < a.k; h += h_step) {
-        const uint64_t bits = to_bits(X[a.op.v_k[h]]);
-        if (non_finite(bits)) flag = 1;
-        else if (finite_nonzero(bits)) gmax = max(gmax, ilogb_bits(bits));
+        for (int64_t h = h_first; h < a.k; h += h_step) {
+          const uint64_t bits = to_bits(X[a.op.v_k[h]]);
+          if (non_finite(bits)) flag = 1;
+          else if (finite_nonzero(bits)) gmax = max(gmax, ilogb_bits(bits));
+        }
       }
-    }
-    s_max[tid] = gmax;
-    s_flag[tid] = flag;
-    __syncthreads();
-    if (tid < th) {
-      int g = INT_MIN, f = 0;
-      for (int u = 0; u < per_row; ++u) {
-        g = max(g, s_max[tid + (u << lg_th)]);
-        f |= s_flag[tid + (u << lg_th)];
+      s_max[tid] = gmax;
+      s_flag[tid] = flag;
+      __syncthreads();
+      if (tid < th) {
+        int g = INT_MIN, f = 0;
+        for (int u = 0; u < per_row; ++u) {
+          g = max(g, s_max[tid + (u << lg_th)]);
+          f |= s_flag[tid + (u << lg_th)];
+        }
+        s_gamma[tid] = g;
+        s_rflag[tid] = f;
+        if (P == kGamma && s_valid[tid]) {
+          const int64_t rho = lo + radix * ((dt << lg_th) + tid);
+          a.sigma[rho] = static_cast<int16_t>(g == INT_MIN ? kNoGamma : g);
+          a.flag[rho] = static_cast<uint8_t>(f);
+        }
       }
-      s_gamma[tid] = g;
-      s_rflag[tid] = f;
+      __syncthreads();
+      if constexpr (P == kGamma) continue;  // (the barrier above protects the shared arrays)
     }
-    __syncthreads();
     // pass 2: S
-    gmax = s_gamma[dl];
+    const int gmax = s_gamma[dl];
     u128 S = 0;
     if (valid && gmax != INT_MIN) {
 #pragma unroll 4
@@ -243,7 +276,7 @@ __global__ void __launch_bounds__(T) k1_tiled(ScaleArgs a, int64_t radix, int lg
         sigma = largest_u(tot, a.lhs_shift, a.rhs, a.rhs_bits) - g;
       }
       a.sigma[rho] = static_cast<int16_t>(sigma);
-      a.flag[rho] = static_cast<uint8_t>(s_rflag[tid]);
+      if constexpr (P == kBoth) a.flag[rho] = static_cast<uint8_t>(s_rflag[tid]);
     }
     __syncthreads();  // shared arrays are reused by the next tile
   }
@@ -614,6 +647,42 @@ imd_status_t launch_k0(const ExecPlan& p, int64_t* vec, cudaStream_t stream) {
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
 
+// K1 launch for operand x (0 = A, 1 = B) and pass P (kBoth, kGamma or kSigma).
+#ifndef IMD_K1_SPLIT
+#  define IMD_K1_SPLIT 1  // overridable for A/B benchmarks only (0: the v1.1 one-launch K1)
+#endif
+constexpr bool kSplitK1 = IMD_K1_SPLIT != 0;
+
+template <int T, int P>
+void launch_k1_tp(const ExecPlan& p, const ScaleArgs& sa, int x, unsigned blocks, cudaStream_t s) {
+  if (p.pack_along_rows[x])
+    k1_tiled<T, P><<<blocks, T, 0, s>>>(sa, p.pack_radix[x], 3);
+  else
+    k1_scale<T, P><<<blocks, T, 0, s>>>(sa);
+}
+template <int P>
+void launch_k1_p(const ExecPlan& p, const ScaleArgs& sa, int x, cudaStream_t s) {
+  const int64_t rows = p.b * sa.op.rows;
+  // Along rows (the operand's smallest-|stride| mode is a row / batch mode): tiles of 8
+  // rows side by side (64-byte segments, whole sectors), as in the pack (lg_th = 3).
+  const int64_t work = p.pack_along_rows[x]
+                           ? p.pack_radix[x] * ((rows / p.pack_radix[x] + 7) >> 3)
+                           : rows;
+  const double row_bytes = 8.0 * double(p.k) * (p.pack_along_rows[x] ? 8.0 : 1.0);
+  // Both passes in one launch: few enough blocks that the rows in flight stay in L2 for the
+  // second pass. One pass streams: a block per row (tile), as many as there are.
+  const unsigned blocks = P == kBoth ? k1_blocks(work, row_bytes, p.sms) : blocks_for(work, 1);
+  if (int64_t{blocks} < 2 * int64_t{p.sms})
+    launch_k1_tp<1024, P>(p, sa, x, blocks, s);
+  else
+    launch_k1_tp<kThreads, P>(p, sa, x, blocks, s);
+}
+void launch_k1(const ExecPlan& p, const ScaleArgs& sa, int x, int pass, cudaStream_t s) {
+  if (pass == kGamma) launch_k1_p<kGamma>(p, sa, x, s);
+  else if (pass == kSigma) launch_k1_p<kSigma>(p, sa, x, s);
+  else launch_k1_p<kBoth>(p, sa, x, s);
+}
+
 template <class T>
 T* region(void* ws, const ExecPlan& p, Region r) {
   return reinterpret_cast<T*>(static_cast<unsigned char*>(ws) +
@@ -678,35 +747,21 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
   const Operand opA{A, out.a_bat, out.a_row, out.a_k, p.m};
   const Operand opB{B, out.b_bat, out.b_col, out.b_k, p.n};
 
-  // K1
+  // K1: one launch per operand (kBoth), or K1a for A and B, then K1b for A and B
+  // (IMD_K1_SPLIT, DESIGN v1.2 §4: each pass one streaming read, grid not capped for L2).
   ScaleArgs sa{};
   sa.b = p.b, sa.k = p.k, sa.rhs_bits = p.rhs_bits, sa.lhs_shift = p.lhs_shift;
   for (int w = 0; w < 4; ++w) sa.rhs[w] = p.rhs[w];
-  for (int x = 0; x < 2; ++x) {
-    sa.op = x == 0 ? opA : opB;
-    sa.sigma = x == 0 ? sA : sB;
-    sa.flag = x == 0 ? fA : fB;
-    const int64_t rows = p.b * sa.op.rows;
-    if (p.pack_along_rows[x]) {  // rows are read side by side: tiles as in the pack
-      const int64_t radix = p.pack_radix[x], D = rows / radix;
-      // 8 rows side by side (64-byte segments, whole sectors) keep the per-block re-read
-      // footprint small, so more rows fit in L2 for the second pass.
-      const int lg_th = 3;
-      const int64_t tiles = radix * ((D + (int64_t{1} << lg_th) - 1) >> lg_th);
-      const unsigned blocks =
-          k1_blocks(tiles, 8.0 * double(p.k) * double(int64_t{1} << lg_th), p.sms);
-      if (int64_t{blocks} < 2 * int64_t{p.sms})
-        k1_tiled<1024><<<blocks, 1024, 0, stream>>>(sa, radix, lg_th);
-      else
-        k1_tiled<kThreads><<<blocks, kThreads, 0, stream>>>(sa, radix, lg_th);
-    } else {
-      const unsigned blocks = k1_blocks(rows, 8.0 * double(p.k), p.sms);
-      if (int64_t{blocks} < 2 * int64_t{p.sms})
-        k1_scale<1024><<<blocks, 1024, 0, stream>>>(sa);
-      else
-        k1_scale<kThreads><<<blocks, kThreads, 0, stream>>>(sa);
+  const int passes[2] = {kSplitK1 ? int{kGamma} : int{kBoth}, kSplitK1 ? int{kSigma} : -1};
+  for (const int pass : passes) {
+    if (pass < 0) break;
+    for (int x = 0; x < 2; ++x) {
+      sa.op = x == 0 ? opA : opB;
+      sa.sigma = x == 0 ? sA : sB;
+      sa.flag = x == 0 ? fA : fB;
+      launch_k1(p, sa, x, pass, stream);
+      IMD_PROF(stream, x == 0 ? "K1 scale A" : "K1 scale B");
     }
-    IMD_PROF(stream, x == 0 ? "K1 scale A" : "K1 scale B");
   }
   if (cudaPeekAtLastError() != cudaSuccess) return IMD_STATUS_CUDA_ERROR;
 
