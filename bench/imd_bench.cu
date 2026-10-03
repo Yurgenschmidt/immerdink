@@ -488,6 +488,17 @@ struct Bench {
     fflush(out);
     fprintf(stderr, "  %s\n", j.dump().c_str());
   }
+  // Peak memory charged to this process' cgroup (the tools/memcap.sh scope: anon + page
+  // cache + pinned), in MiB; NaN if not readable.
+  static double cgroup_peak_mib() {
+    std::string cg = read_file("/proc/self/cgroup");  // "0::/path\n"
+    auto p = cg.find("::");
+    if (p == std::string::npos) return NAN;
+    std::string path = cg.substr(p + 2);
+    while (!path.empty() && path.back() == '\n') path.pop_back();
+    std::string v = read_file(("/sys/fs/cgroup" + path + "/memory.peak").c_str());
+    return v.empty() ? NAN : std::stod(v) / 1048576.0;
+  }
   static double host_maxrss_mib() {  // peak resident set of this process so far
     rusage u{};
     getrusage(RUSAGE_SELF, &u);
@@ -512,7 +523,8 @@ struct Bench {
       j.num("max_relerr", acc->max_rel).num("max_normerr", acc->max_norm);
       j.integer("err_samples", acc->samples).integer("nonfinite", acc->bad);
     }
-    j.str("gpu_after", gpu_state()).num("host_maxrss_mib", host_maxrss_mib()).str("status", "ok");
+    j.str("gpu_after", gpu_state()).num("host_maxrss_mib", host_maxrss_mib())
+        .num("cgroup_peak_mib", cgroup_peak_mib()).str("status", "ok");
     for (auto& kv : extra.kv) j.kv.push_back(kv);
     emit(j);
   }

@@ -78,7 +78,8 @@ def headline(recs, N):
                 continue
             if r["method"] == "bw":
                 extra = f"{r['gbps']:.0f} GB/s"
-                print(f"| {name if first else ''} | | | bw (D2D copy) | {ms(r['median_s'])} | "
+                print(f"| {name if first else ''} | {('`' + r['spec'] + '`') if first else ''} | "
+                      f"{shape(r) if first else ''} | bw (D2D copy) | {ms(r['median_s'])} | "
                       f"{r['spread_pct']:.1f} | {extra} | | |")
                 first = False
                 continue
@@ -162,6 +163,13 @@ def main():
     meta = next((r for r in recs if r.get("status") == "ok"), {})
     print(f"<!-- {a.jsonl}: commit {meta.get('commit')}, env {meta.get('env')}, {meta.get('gpu')}, "
           f"driver {meta.get('driver')}, cuBLAS {meta.get('cublas')}, cuTENSOR {meta.get('cutensor')} -->")
+    rss = [(r["host_maxrss_mib"], r["case"]) for r in recs if r.get("host_maxrss_mib") is not None]
+    if rss:
+        print(f"<!-- peak host RSS of any bench process: {max(rss)[0]:.0f} MiB (case {max(rss)[1]}) -->")
+    cg = [(r["cgroup_peak_mib"], r["case"]) for r in recs if r.get("cgroup_peak_mib") is not None]
+    if cg:
+        print(f"<!-- peak cgroup (memcap scope) memory of any bench process: {max(cg)[0]:.0f} MiB "
+              f"(case {max(cg)[1]}) -->")
     print(f"\n### All cases (N = {a.N} for the Ozaki-II methods)\n")
     headline(recs, a.N)
     print("\n### N sweep\n")
