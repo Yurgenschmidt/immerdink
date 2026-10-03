@@ -45,6 +45,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -436,6 +437,7 @@ struct Options {
   double max_seconds = 15;  // timed-loop budget per method/variant (after min_reps)
   long long samples = 256;
   int phase_reps = 5;  // profiled imd calls (per-phase marks), after the timed loop
+  std::vector<int> vec_modes = {IMD_VEC_GENERATE};  // imd: --vec generate,resident (v1.2)
   double phi = 0.5;
   uint64_t seed = 1;
   std::string out;
@@ -843,19 +845,23 @@ struct Bench {
     for (auto d : {da, db, dc}) cutensorDestroyTensorDescriptor(d);
   }
 
-  void method_imd(int N) {
+  void method_imd(int N, int vec_mode) {
     auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
       lab.assign(x.labels.begin(), x.labels.end());
       return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
     };
     std::vector<int32_t> la, lb, lc;
     imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
-    imd_options_t opt{N, 0, IMD_RN, IMD_EMULATE};
+    imd_options_t opt{N, 0, IMD_RN, IMD_EMULATE, vec_mode};
     size_t wsb = 0;
     CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
     imd_plan_t plan = nullptr;
+    const auto c0 = std::chrono::steady_clock::now();
     CI(imd_plan_create(imd, &A, &B, &C, &opt, &plan));
-    // The plan must outlive in-flight work (K0 reads its pinned buffer): sync first.
+    const double create_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+    size_t plan_dev = 0;
+    CI(imd_plan_device_bytes(plan, &plan_dev));
+    // A resident plan must outlive in-flight work (its kernels read the plan's vectors).
     auto destroy = [](imd_plan_t p) { cudaDeviceSynchronize(); imd_plan_destroy(p); };
     std::unique_ptr<imd_plan_st, decltype(destroy)> guard(plan, destroy);
     DevBuf ws(wsb);
@@ -871,21 +877,23 @@ struct Bench {
       CI(imd_contract(plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
     });
 #endif
-    record("imd", "RN g=N", N, T, &acc, flops(), wsb, extra);
+    extra.integer("plan_device_bytes", (long long)plan_dev).num("plan_create_ms", 1e3 * create_s);
+    record("imd", vec_mode == IMD_VEC_RESIDENT ? "RN g=N vec=resident" : "RN g=N", N, T, &acc,
+           flops(), wsb, extra);
   }
 
 #ifdef IMD_BENCH_PROFILE
   // Per-phase times from the library's event marks, against MEMORY_MODEL §4 lower bounds
   // (g = N, beta = 0, rho = 1, datasheet peaks as in bench/summarize.py).
   Json profile_imd(imd_plan_t plan, int N, const std::function<void()>& call) {
-    constexpr double kBW = 1008e9, kOps = 660.6e12, kPcie = 32e9, kKc = 131056;
+    constexpr double kBW = 1008e9, kOps = 660.6e12, kKc = 131056;
     int64_t d[7];
     CI(imd_prof_plan_dims(plan, d) == 0 ? IMD_STATUS_SUCCESS : IMD_STATUS_INVALID_VALUE);
     const double m = double(d[0]), n = double(d[1]), k = double(d[2]), b = double(d[3]),
                  nh = double(d[4]), kh = double(d[5]);
     const double nc = std::ceil(kh / kKc);
     std::map<std::string, double> lb;
-    lb["K0 vec"] = 8 * (2 * m + 2 * n + 2 * k + 3 * b) / kPcie;
+    lb["K0 vec"] = 8 * (2 * m + 2 * n + 2 * k + 3 * b) / kBW;  // v1.2: generated (written once)
     lb["K1 scale A"] = 8 * b * m * k / kBW;
     lb["K1 scale B"] = 8 * b * n * k / kBW;
     lb["K2 pack A"] = (8 * b * m * k + N * b * m * kh) / kBW;
@@ -969,6 +977,7 @@ void usage() {
           "usage: imd_bench --name NAME --spec 'ab,bc->ac' --ext a=..,b=..,c=.. [--methods LIST]\n"
           "  [--N 8,14,20] [--emu dyn,fix55] [--emu-ws-mib 2048] [--reps 10] [--warmup 2]\n"
           "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--phase-reps 5]\n"
+          "  [--vec generate,resident]\n"
           "  [--out file.jsonl]\n");
 }
 
@@ -993,6 +1002,11 @@ int main(int argc, char** argv) {
     if (a.count("max-seconds")) B.o.max_seconds = std::stod(a["max-seconds"]);
     if (a.count("samples")) B.o.samples = std::stoll(a["samples"]);
     if (a.count("phase-reps")) B.o.phase_reps = std::stoi(a["phase-reps"]);
+    if (a.count("vec")) {
+      B.o.vec_modes.clear();
+      for (auto& v : split(a["vec"], ','))
+        B.o.vec_modes.push_back(v == "resident" ? IMD_VEC_RESIDENT : IMD_VEC_GENERATE);
+    }
     if (a.count("phi")) B.o.phi = std::stod(a["phi"]);
     if (a.count("seed")) B.o.seed = std::stoull(a["seed"]);
     B.o.min_reps = std::min(B.o.min_reps, B.o.reps);
@@ -1026,7 +1040,9 @@ int main(int argc, char** argv) {
     else if (m == "int8") guarded(m, "", 1, [&] { B.method_int8(); });
     else if (m == "gemmul8") for (int N : Ns) guarded(m, "", N, [&] { B.method_gemmul8(N); });
     else if (m == "cutensor") guarded(m, "", 0, [&] { B.method_cutensor(); });
-    else if (m == "imd") for (int N : Ns) guarded(m, "", N, [&] { B.method_imd(N); });
+    else if (m == "imd")
+      for (int N : Ns)
+        for (int v : B.o.vec_modes) guarded(m, "", N, [&] { B.method_imd(N, v); });
     else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
     else { fprintf(stderr, "unknown method %s\n", m.c_str()); return 2; }
   }

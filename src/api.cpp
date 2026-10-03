@@ -32,10 +32,11 @@ struct TensorCopy {
         label(t.label, t.label + t.rank) {}
 };
 
+// Read-only after imd_plan_create returns (DESIGN v1.2 §6): imd_contract never writes it.
 struct imd_plan_st {
   imd_options_t options{};  // residue_group normalized to [1, N]
   imd::detail::Lowered lowered;
-  imd::detail::ExecPlan exec;  // exec.vec_host: pinned, owned (freed by the destructor)
+  imd::detail::ExecPlan exec;  // exec.vec_dev: IMD_VEC_RESIDENT device vectors, owned
   TensorCopy A, B, C;          // for M3's aliasing check (§5 row 6)
 
   imd_plan_st(const imd_options_t& o, const imd::detail::Lowered& lw, const imd_tensor_t& a,
@@ -44,7 +45,7 @@ struct imd_plan_st {
   imd_plan_st(const imd_plan_st&) = delete;
   imd_plan_st& operator=(const imd_plan_st&) = delete;
   ~imd_plan_st() {
-    if (exec.vec_host != nullptr) cudaFreeHost(const_cast<int64_t*>(exec.vec_host));
+    if (exec.vec_dev != nullptr) cudaFree(exec.vec_dev);
   }
 };
 
@@ -63,7 +64,8 @@ struct Analysis {
 bool options_ok(const imd_options_t& o) {
   return o.num_moduli >= c::kNMin && o.num_moduli <= c::kNMax && o.residue_group >= 0 &&
          o.residue_group <= o.num_moduli && (o.rounding == IMD_RN || o.rounding == IMD_TRUNC) &&
-         (o.mode == IMD_EMULATE || o.mode == IMD_DIRECT);
+         (o.mode == IMD_EMULATE || o.mode == IMD_DIRECT) &&
+         (o.vec_mode == IMD_VEC_GENERATE || o.vec_mode == IMD_VEC_RESIDENT);
 }
 
 // Shared by imd_workspace_size and imd_plan_create: argument checks, then the §5 legality
@@ -89,7 +91,8 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
   const auto layout = imd::detail::workspace_layout({lw.m, lw.n, lw.k, lw.b,
                                                      out->options.num_moduli,
                                                      out->options.residue_group,
-                                                     out->options.mode == IMD_DIRECT});
+                                                     out->options.mode == IMD_DIRECT,
+                                                     out->options.vec_mode == IMD_VEC_RESIDENT});
   if (!layout) return IMD_STATUS_INVALID_VALUE;
   if (layout->total > SIZE_MAX) return IMD_STATUS_INVALID_VALUE;
   out->layout = *layout;
@@ -194,6 +197,11 @@ bool overlap(const ByteInterval& x, const ByteInterval& y) {
 
 }  // namespace
 
+// For src/test_hooks.cpp (same library, not exported): the plan's execution data.
+namespace imd::detail {
+const ExecPlan* exec_of(imd_plan_t plan) { return plan == nullptr ? nullptr : &plan->exec; }
+}  // namespace imd::detail
+
 extern "C" {
 
 imd_status_t imd_create(imd_handle_t* handle) {
@@ -275,17 +283,43 @@ imd_status_t imd_plan_create(imd_handle_t handle, const imd_tensor_t* A, const i
       e.k5_batch_fast = imd::detail::k5_batch_fastest(lw);
     }
     if (e.path != imd::detail::Path::kNoop) {
-      // §5 step 10: scatter vectors in pinned host memory (K0 copies them asynchronously).
+      // §5 step 10 (v1.2): the fused-mode descriptor K0 generates the vectors from.
       e.vec_count = imd::detail::scatter_vector_count(lw);
-      void* host = nullptr;
-      const cudaError_t err =
-          cudaMallocHost(&host, static_cast<size_t>(e.vec_count) * sizeof(int64_t));
+      for (int c = 0; c < 4; ++c) {
+        e.vec_desc.first[c] = static_cast<int32_t>(e.vec_desc.modes.size());
+        e.vec_desc.count[c] = static_cast<int32_t>(lw.fused[c].size());
+        for (const imd::detail::FusedMode& f : lw.fused[c])
+          e.vec_desc.modes.push_back({f.extent, {f.stride[0], f.stride[1], f.stride[2]}});
+      }
+      if (e.vec_desc.modes.size() > static_cast<size_t>(imd::detail::kMaxVecModes))
+        return IMD_STATUS_INVALID_VALUE;  // unreachable: at most 62 fused modes per class
+      int device = 0;
+      if (cudaGetDevice(&device) != cudaSuccess ||
+          cudaDeviceGetAttribute(&e.sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        cudaGetLastError();
+        return IMD_STATUS_CUDA_ERROR;
+      }
+    }
+    if (emulated) {  // §4 / §6 v1.2: every K4 launch shape's parameters, built here once
+      if (const imd_status_t st = imd::detail::k4_prepare(e, &e.k4); st != IMD_STATUS_SUCCESS)
+        return st;
+    }
+    if (e.path != imd::detail::Path::kNoop && an.options.vec_mode == IMD_VEC_RESIDENT) {
+      // §4 K0 v1.2 IMD_VEC_RESIDENT: build the vectors once in plan-owned device memory
+      // (freed by the plan), on this thread's default stream, and wait for them.
+      e.vec_resident = true;
+      void* dev = nullptr;
+      const cudaError_t err = cudaMalloc(&dev, static_cast<size_t>(e.vec_count) * sizeof(int64_t));
       if (err != cudaSuccess) {
         cudaGetLastError();  // clear the (non-sticky) error state
         return err == cudaErrorMemoryAllocation ? IMD_STATUS_ALLOC_FAILED : IMD_STATUS_CUDA_ERROR;
       }
-      e.vec_host = static_cast<const int64_t*>(host);
-      imd::detail::build_scatter_vectors(lw, static_cast<int64_t*>(host));
+      e.vec_dev = static_cast<int64_t*>(dev);
+      if (imd::detail::k0_generate(e, e.vec_dev, cudaStreamPerThread) != IMD_STATUS_SUCCESS ||
+          cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        cudaGetLastError();
+        return IMD_STATUS_CUDA_ERROR;  // the plan (and vec_dev) is freed by unique_ptr
+      }
     }
     *plan = p.release();
     return IMD_STATUS_SUCCESS;
@@ -298,6 +332,13 @@ imd_status_t imd_plan_create(imd_handle_t handle, const imd_tensor_t* A, const i
 
 imd_status_t imd_plan_destroy(imd_plan_t plan) {
   delete plan;
+  return IMD_STATUS_SUCCESS;
+}
+
+imd_status_t imd_plan_device_bytes(imd_plan_t plan, size_t* bytes) {
+  if (plan == nullptr || bytes == nullptr) return IMD_STATUS_INVALID_VALUE;
+  // DESIGN §4a v1.2 "plan device bytes": exactly what imd_plan_create requested.
+  *bytes = plan->exec.vec_resident ? static_cast<size_t>(plan->exec.vec_count) * sizeof(int64_t) : 0;
   return IMD_STATUS_SUCCESS;
 }
 

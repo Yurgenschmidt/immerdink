@@ -10,7 +10,7 @@ transcription of DESIGN §5 steps 1-8 (partial) and legality rows 1-5. The C++ t
 
 Format: whitespace-separated tokens, one record per case:
     case NAME
-    opts N g rounding mode
+    opts N g rounding mode vec_mode                 (vec_mode: DESIGN v1.2)
     tensor A rank e_1..e_r s_1..s_r l_1..l_r      (likewise B, C)
     expect STATUS                                 (when STATUS != SUCCESS)
     expect SUCCESS bytes m n k b swapped
@@ -30,6 +30,7 @@ INT64_MAX = 2**63 - 1
 INT32_MAX = 2**31 - 1
 RN, TRUNC = 0, 1
 EMULATE, DIRECT = 0, 1
+VEC_GENERATE, VEC_RESIDENT = 0, 1
 OK, INVALID, UNSUPPORTED = "SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED"
 
 
@@ -103,11 +104,13 @@ def lower(A, B, C):
 
 
 MODE_NAME = {EMULATE: params.EMULATE, DIRECT: params.DIRECT}
+VEC_NAME = {VEC_GENERATE: params.VEC_GENERATE, VEC_RESIDENT: params.VEC_RESIDENT}
 
 
-def expect(A, B, C, N, g, rnd, mode):
+def expect(A, B, C, N, g, rnd, mode, vec=VEC_GENERATE):
     """(status, bytes, (m, n, k, b, swapped), regions)."""
-    if not (2 <= N <= 20) or not (0 <= g <= N) or rnd not in (RN, TRUNC) or mode not in MODE_NAME:
+    if not (2 <= N <= 20) or not (0 <= g <= N) or rnd not in (RN, TRUNC) or mode not in MODE_NAME \
+            or vec not in VEC_NAME:
         return INVALID, None, None, None
     try:
         m, n, k, b, sw = lower(A, B, C)
@@ -117,10 +120,11 @@ def expect(A, B, C, N, g, rnd, mode):
     if mode == EMULATE and b * m * n != 0 and (m > INT32_MAX or params.align_up(n, 16) > INT32_MAX):
         return INVALID, None, None, None
     try:
-        ws = params.workspace_size(m, n, k, b, N, g, MODE_NAME[mode])
+        ws = params.workspace_size(m, n, k, b, N, g, MODE_NAME[mode], VEC_NAME[vec])
     except OverflowError:
         return INVALID, None, None, None
-    return OK, ws, (m, n, k, b, sw), params.region_offsets(m, n, k, b, N, g, MODE_NAME[mode])
+    return OK, ws, (m, n, k, b, sw), params.region_offsets(m, n, k, b, N, g, MODE_NAME[mode],
+                                                          VEC_NAME[vec])
 
 
 def dense(ext, order=None, sign=None):
@@ -146,14 +150,14 @@ def T(ext, lab, st=None):
 CASES = []
 
 
-def add(name, A, B, C, N=14, g=0, rnd=RN, mode=EMULATE, want=None):
+def add(name, A, B, C, N=14, g=0, rnd=RN, mode=EMULATE, want=None, vec=VEC_GENERATE):
     """Record a case. `want` = (status,) or (status, m, n, k, b, swapped) is a hand-derived
     expectation that the generator itself must reproduce."""
-    status, ws, mnkb, regs = expect(A, B, C, N, g, rnd, mode)
+    status, ws, mnkb, regs = expect(A, B, C, N, g, rnd, mode, vec)
     if want is not None:
         got = (status,) if len(want) == 1 else (status,) + tuple(mnkb or ())
         assert got == tuple(want), f"{name}: generator gives {got}, hand-derived {want}"
-    CASES.append((name, (N, g, rnd, mode), (A, B, C), status, ws, mnkb, regs))
+    CASES.append((name, (N, g, rnd, mode, vec), (A, B, C), status, ws, mnkb, regs))
 
 
 def matrix(m, n, k, b):
@@ -167,12 +171,13 @@ def grid():
     ks = [0, 1, 2, 15, 16, 17, 131056, 131057, 262200]
     for N, g in ((2, 1), (2, 2), (9, 2), (14, 0), (14, 7), (20, 20)):
         for mode in (EMULATE, DIRECT):
-            for m in ms:
-                for n in ms:
-                    for k in ks:
-                        for b in (0, 1, 3):
-                            add(f"grid_m{m}_n{n}_k{k}_b{b}_N{N}_g{g}_mode{mode}",
-                                *matrix(m, n, k, b), N=N, g=g, mode=mode)
+            for vec in (VEC_GENERATE, VEC_RESIDENT):
+                for m in ms:
+                    for n in ms:
+                        for k in ks:
+                            for b in (0, 1, 3):
+                                add(f"grid_m{m}_n{n}_k{k}_b{b}_N{N}_g{g}_mode{mode}_vec{vec}",
+                                    *matrix(m, n, k, b), N=N, g=g, mode=mode, vec=vec)
 
 
 def tensors():
@@ -297,6 +302,8 @@ def tensors():
                                     ("g_neg", (9, -1, RN, EMULATE)), ("g_big", (9, 10, RN, EMULATE)),
                                     ("rounding2", (9, 0, 2, EMULATE)), ("mode2", (9, 0, RN, 2))):
         add(f"opt_{name}", *matrix(5, 6, 7, 1), N=N, g=g, rnd=rnd, mode=mode, want=(INVALID,))
+    add("opt_vec2", *matrix(5, 6, 7, 1), N=9, vec=2, want=(INVALID,))
+    add("opt_vec_neg", *matrix(5, 6, 7, 1), N=9, vec=-1, want=(INVALID,))
     add("opt_trunc_direct_g9", *matrix(5, 6, 7, 2), N=9, g=9, rnd=TRUNC, mode=DIRECT,
         want=(OK, 5, 6, 7, 2, False))
 
@@ -330,14 +337,14 @@ def random_cases(count, seed=20261002):
         N = rng.randint(2, 20)
         g = rng.randint(0, N)
         add(f"random_{t}", *tens, N=N, g=g, rnd=rng.choice((RN, TRUNC)),
-            mode=rng.choice((EMULATE, EMULATE, DIRECT)))
+            mode=rng.choice((EMULATE, EMULATE, DIRECT)), vec=rng.choice((VEC_GENERATE, VEC_RESIDENT)))
 
 
 def write(path):
     out = []
-    for name, (N, g, rnd, mode), tens, status, ws, mnkb, regs in CASES:
+    for name, (N, g, rnd, mode, vec), tens, status, ws, mnkb, regs in CASES:
         out.append(f"case {name}")
-        out.append(f"opts {N} {g} {rnd} {mode}")
+        out.append(f"opts {N} {g} {rnd} {mode} {vec}")
         for tn, (e, s, l) in zip("ABC", tens):
             out.append(f"tensor {tn} {len(e)} " + " ".join(str(v) for v in e + s + l))
         if status == OK:

@@ -527,8 +527,9 @@ const char*  imd_status_string(imd_status_t);
 
 - **[v1.2] API additions** (approved): the `vec_mode` option and `imd_plan_device_bytes`.
   `imd_options_t` grows by one int32 (20 bytes); a zero-initialized field is the default,
-  so `{N, g, rounding, mode}` initializers keep their meaning, but callers built against
-  the v1.1 header must be rebuilt (the struct size changed). An unknown `vec_mode` is
+  so `{N, g, rounding, mode}` initializers keep their meaning (`-Wextra` now warns about
+  the missing initializer), but callers built against the v1.1 header must be rebuilt
+  (the struct size changed). An unknown `vec_mode` is
   INVALID_VALUE (in `imd_workspace_size` too, which depends on it).
 
 - `imd_workspace_size` is a **pure host function**: no GPU, no allocation, and exactly

@@ -336,11 +336,11 @@ def suite_legality(lib, cuda, verbose):
             raise Fail(f"legality '{name}': oracle {st_o}, expected {want}")
         st_w, _ = lib.workspace_size(tdesc(A), tdesc(B), tdesc(C), 9)
         st_p = st_w
-        # imd_plan_create pins 8 (2m + 2n + 2k + 3b) bytes of scatter vectors: only for
+        # 8 (2m + 2n + 2k + 3b) bytes of scatter vectors (workspace or resident): only for
         # small legal problems (the failing ones fail before any allocation).
         st_l, lw = lib.lowering(tdesc(A), tdesc(B), tdesc(C))
         if st_l != "SUCCESS" or 8 * (2 * (lw["m"] + lw["n"] + lw["k"]) + 3 * lw["b"]) <= \
-                lib.MAX_PLAN_HOST:
+                lib.MAX_PLAN_VEC:
             st_p, plan = lib.plan_create(tdesc(A), tdesc(B), tdesc(C), 9)
             if plan is not None:
                 lib.plan_destroy(plan)

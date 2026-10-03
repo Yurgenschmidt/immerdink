@@ -1,5 +1,6 @@
 // K0-K5 and the DIRECT kernel (DESIGN §3, §4). One stream, in order:
-//   K0 vec    cudaMemcpyAsync: the plan's pinned scatter vectors -> ws.vec
+//   K0 vec    kernel: the scatter vectors -> ws.vec from the plan's fused-mode descriptor
+//             (a kernel argument); skipped with IMD_VEC_RESIDENT (the plan's device copy)
 //   K1 scale  A rows, B cols: non-finite flags and shifts sigma / tau (int16)
 //   per residue group G:  K2 / K3 pack A, B -> int8 residues;  K4 GEMMs (gemm_k4.cu)
 //   K5 crt    per (lambda, i, j): flagged ? native fma dot : exact CRT, one rounding; alpha/beta
@@ -250,16 +251,8 @@ __global__ void __launch_bounds__(T) k1_tiled(ScaleArgs a, int64_t radix, int lg
 
 // Blocks for a two-pass kernel whose blocks each re-read `bytes_per_block`: enough to fill
 // the GPU, but few enough that the rows in flight (about 40 MB) stay in the 72 MB L2 for
-// the second pass.
-int sm_count() {
-  int dev = 0, sms = 128;
-  if (cudaGetDevice(&dev) == cudaSuccess)
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-  return sms;
-}
-
-unsigned k1_blocks(int64_t work_items, double bytes_per_block) {
-  const int sms = sm_count();
+// the second pass. `sms` is the plan's SM count (read at plan creation).
+unsigned k1_blocks(int64_t work_items, double bytes_per_block, int sms) {
   const double fit = 40.0 * (1 << 20) / std::max(1.0, bytes_per_block);
   const int64_t cap = std::max<int64_t>(sms, static_cast<int64_t>(fit));
   return blocks_for(std::min(work_items, cap), 1);
@@ -562,6 +555,65 @@ void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
   }
 }
 
+// ---- K0: §5 step 10 scatter vectors from the fused-mode descriptor (DESIGN v1.2 §4) -------
+//
+// The nine vectors in §4a order, each over one class's fused modes (first fastest) with one
+// tensor's strides: entry q of a vector is sum_t stride_X(mode_t) digit_t(q), the mixed-radix
+// digits of q (index_map.cpp radix_vec computes the same integers incrementally). The
+// descriptor is the kernel argument (by value): no host or plan memory is read on the GPU.
+// Two capacities keep the argument small for the usual few modes; a class has at most 62
+// fused modes (extents >= 2, product < 2^63), so 4 * 62 <= kK0MaxModes.
+constexpr int kK0SmallModes = 8, kK0MaxModes = kMaxVecModes;
+// Sub-vector v: its class (LabelClass order I, J, K, L) and tensor (A, B, C).
+constexpr int8_t kVecClass[9] = {0, 2, 3, 2, 1, 3, 0, 1, 3};
+constexpr int8_t kVecTensor[9] = {0, 0, 0, 1, 1, 1, 2, 2, 2};
+
+template <int Cap>
+struct K0Args {
+  int64_t start[10];  // sub-vector v covers entries [start[v], start[v + 1])
+  int8_t cls[9], tensor[9];
+  int32_t first[4], count[4];
+  int64_t extent[Cap];
+  int64_t stride[Cap][3];
+  int64_t* out;
+};
+
+template <int Cap>
+__global__ void __launch_bounds__(kThreads) k0_vec(const __grid_constant__ K0Args<Cap> a) {
+  const int64_t total = a.start[9];
+  for (int64_t q = blockIdx.x * int64_t{blockDim.x} + threadIdx.x; q < total;
+       q += int64_t{gridDim.x} * blockDim.x) {
+    int v = 0;
+    while (q >= a.start[v + 1]) ++v;  // empty sub-vectors are skipped
+    const int c = a.cls[v], x = a.tensor[v];
+    int64_t r = q - a.start[v], off = 0;
+    for (int t = a.first[c]; t < a.first[c] + a.count[c]; ++t) {
+      const int64_t e = a.extent[t];
+      off += a.stride[t][x] * (r % e);
+      r /= e;
+    }
+    a.out[q] = off;
+  }
+}
+
+template <int Cap>
+imd_status_t launch_k0(const ExecPlan& p, int64_t* vec, cudaStream_t stream) {
+  K0Args<Cap> a{};
+  const VecOffsets o = vec_offsets(p);
+  const int64_t starts[10] = {o.a_row, o.a_k, o.a_bat, o.b_k, o.b_col,
+                              o.b_bat, o.c_row, o.c_col, o.c_bat, p.vec_count};
+  for (int v = 0; v < 10; ++v) a.start[v] = starts[v];
+  for (int v = 0; v < 9; ++v) a.cls[v] = kVecClass[v], a.tensor[v] = kVecTensor[v];
+  for (int c = 0; c < 4; ++c) a.first[c] = p.vec_desc.first[c], a.count[c] = p.vec_desc.count[c];
+  for (size_t t = 0; t < p.vec_desc.modes.size(); ++t) {
+    a.extent[t] = p.vec_desc.modes[t].extent;
+    for (int x = 0; x < 3; ++x) a.stride[t][x] = p.vec_desc.modes[t].stride[x];
+  }
+  a.out = vec;
+  k0_vec<Cap><<<blocks_for(p.vec_count), kThreads, 0, stream>>>(a);
+  return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
+}
+
 template <class T>
 T* region(void* ws, const ExecPlan& p, Region r) {
   return reinterpret_cast<T*>(static_cast<unsigned char*>(ws) +
@@ -570,15 +622,24 @@ T* region(void* ws, const ExecPlan& p, Region r) {
 
 }  // namespace
 
+imd_status_t k0_generate(const ExecPlan& p, int64_t* vec, cudaStream_t stream) {
+  if (p.vec_count == 0) return IMD_STATUS_SUCCESS;
+  if (p.vec_desc.modes.size() <= static_cast<size_t>(kK0SmallModes))
+    return launch_k0<kK0SmallModes>(p, vec, stream);
+  if (p.vec_desc.modes.size() <= static_cast<size_t>(kK0MaxModes))
+    return launch_k0<kK0MaxModes>(p, vec, stream);
+  return IMD_STATUS_CUDA_ERROR;  // unreachable: at most 4 * 62 fused modes
+}
+
 imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, const double* B,
                               double beta, double* C, void* ws, cudaStream_t stream) {
   if (p.path == Path::kNoop) return IMD_STATUS_SUCCESS;
-  // K0: scatter vectors -> ws.vec (pinned source: truly asynchronous)
-  int64_t* vec = region<int64_t>(ws, p, Region::vec);
+  // K0: generate the scatter vectors into ws.vec (IMD_VEC_GENERATE), or use the plan's
+  // resident copy (IMD_VEC_RESIDENT: no K0, no vec region).
   IMD_PROF(stream, "begin");
-  if (cudaMemcpyAsync(vec, p.vec_host, static_cast<size_t>(p.vec_count) * sizeof(int64_t),
-                      cudaMemcpyHostToDevice, stream) != cudaSuccess)
-    return IMD_STATUS_CUDA_ERROR;
+  int64_t* vec = p.vec_resident ? p.vec_dev : region<int64_t>(ws, p, Region::vec);
+  if (!p.vec_resident)
+    if (const imd_status_t st = k0_generate(p, vec, stream); st != IMD_STATUS_SUCCESS) return st;
   IMD_PROF(stream, "K0 vec");
   const VecOffsets vo = vec_offsets(p);
 
@@ -632,14 +693,15 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
       // footprint small, so more rows fit in L2 for the second pass.
       const int lg_th = 3;
       const int64_t tiles = radix * ((D + (int64_t{1} << lg_th) - 1) >> lg_th);
-      const unsigned blocks = k1_blocks(tiles, 8.0 * double(p.k) * double(int64_t{1} << lg_th));
-      if (int64_t{blocks} < 2 * int64_t{sm_count()})
+      const unsigned blocks =
+          k1_blocks(tiles, 8.0 * double(p.k) * double(int64_t{1} << lg_th), p.sms);
+      if (int64_t{blocks} < 2 * int64_t{p.sms})
         k1_tiled<1024><<<blocks, 1024, 0, stream>>>(sa, radix, lg_th);
       else
         k1_tiled<kThreads><<<blocks, kThreads, 0, stream>>>(sa, radix, lg_th);
     } else {
-      const unsigned blocks = k1_blocks(rows, 8.0 * double(p.k));
-      if (int64_t{blocks} < 2 * int64_t{sm_count()})
+      const unsigned blocks = k1_blocks(rows, 8.0 * double(p.k), p.sms);
+      if (int64_t{blocks} < 2 * int64_t{p.sms})
         k1_scale<1024><<<blocks, 1024, 0, stream>>>(sa);
       else
         k1_scale<kThreads><<<blocks, kThreads, 0, stream>>>(sa);
@@ -672,7 +734,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
       IMD_PROF(stream, x == 0 ? "K2 pack A" : "K3 pack B");
     }
     if (cudaPeekAtLastError() != cudaSuccess) return IMD_STATUS_CUDA_ERROR;
-    if (const imd_status_t st = k4_group(RA, RB, W, p.m, p.n_hat, p.k_hat, p.b, g0, gsize, stream);
+    if (const imd_status_t st = k4_group(*p.k4, RA, RB, W, g0, gsize, stream);
         st != IMD_STATUS_SUCCESS)
       return st;
   }

@@ -15,7 +15,7 @@ The hand proofs of the parametric lemmas (for all k, N and inputs) are in
 Current status:
 - 191 TLC models, all as expected (about 9 min with the default parallelism);
 - 20 Apalache checks, all as expected (about 30 s, one at a time);
-- 24/24 certificates;
+- 25/25 certificates;
 - the oracle suite passes.
 
 ## Conventions
@@ -81,6 +81,9 @@ Current status:
   (`tools/get_apalache.sh`) or `$APALACHE_MC`; usage notes: no RECURSIVE or CHOOSE,
   type annotations, constants precomputed.
 
-## Known follow-ups (DESIGN v1.1 items not yet in a model)
+## Known follow-ups (DESIGN items not yet in a model)
+- IndexMap's workspace claims (`WorkspaceFits`, `WorkspaceExact`) model the default
+  `IMD_VEC_GENERATE` layout; the v1.2 `IMD_VEC_RESIDENT` layout (no vec region) is checked by
+  Pipeline (`LayoutExact`, `RegionsUsed`, `PlanBytesExact`) and `params.py cert_workspace`.
 - Pipeline: the per-batch modulus table is abstracted away. α is not an IndexMap input
   (only the §6 null rule depends on it there); the α = 0 read rules are in Pipeline.

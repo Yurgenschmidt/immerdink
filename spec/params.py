@@ -71,6 +71,7 @@ KMAX_CERT = 2**40                    # k range for the int16 shift certificate
 SIZE_T_MAX = 2**64 - 1
 RN, TRUNC = "RN", "TRUNC"
 EMULATE, DIRECT = "EMULATE", "DIRECT"
+VEC_GENERATE, VEC_RESIDENT = "GENERATE", "RESIDENT"   # DESIGN v1.2 vec_mode
 
 # ---------------------------------------------------------------------------
 # Integer helpers
@@ -395,7 +396,9 @@ def crt_reconstruct(W, c, track=None):
 # §4a workspace
 
 
-def _check_shape(m, n, k, b, N, g, mode):
+def _check_shape(m, n, k, b, N, g, mode, vec=VEC_GENERATE):
+    if vec not in (VEC_GENERATE, VEC_RESIDENT):
+        raise ValueError(vec)
     for name, v in (("m", m), ("n", n), ("k", k), ("b", b)):
         if not isinstance(v, int) or v < 0:
             raise ValueError(f"{name}={v} must be a nonnegative int")
@@ -410,16 +413,29 @@ def _check_shape(m, n, k, b, N, g, mode):
     return g
 
 
-def workspace_size(m, n, k, b, N, g, mode=EMULATE):
+def plan_device_bytes(m, n, k, b, vec=VEC_GENERATE):
+    """DESIGN v1.2 §4a "plan device bytes" (imd_plan_device_bytes): the resident scatter
+    vectors, 8 (2m + 2n + 2k + 3b), for a non-empty output with vec_mode RESIDENT; else 0."""
+    if vec not in (VEC_GENERATE, VEC_RESIDENT):
+        raise ValueError(vec)
+    if vec == VEC_GENERATE or b * m * n == 0:
+        return 0
+    return 8 * (2 * m + 2 * n + 2 * k + 3 * b)
+
+
+def workspace_size(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE):
     """DESIGN §4a, transcribed literally as a closed form:
     sum of align(bytes) over sA sB fA fB vec RA RB W; 0 if b*m*n = 0;
     only align(vec) in DIRECT mode, when k = 0, or when K is empty (k = 1 after lowering:
-    extent-1 labels are dropped, so k = 1 <=> K-empty, dispatched to DIRECT; DESIGN v1.1 §4/§4a)."""
-    g = _check_shape(m, n, k, b, N, g, mode)
+    extent-1 labels are dropped, so k = 1 <=> K-empty, dispatched to DIRECT; DESIGN v1.1 §4/§4a).
+    v1.2: with vec = RESIDENT the vec term is 0 everywhere (the vectors are plan memory)."""
+    g = _check_shape(m, n, k, b, N, g, mode, vec)
     if b * m * n == 0:
         return 0
     A = lambda x: align_up(x, REGION_ALIGN)  # noqa: E731
-    vec = A(8 * (2 * m + 2 * n + 2 * k + 3 * b))
+    if 8 * (2 * m + 2 * n + 2 * k + 3 * b) > SIZE_T_MAX:   # either mode needs the vectors
+        raise OverflowError("scatter vectors do not fit size_t")
+    vec = 0 if vec == VEC_RESIDENT else A(8 * (2 * m + 2 * n + 2 * k + 3 * b))
     if mode == DIRECT or k <= 1:
         total = vec
     else:
@@ -444,13 +460,16 @@ _REGIONS = [
 ]
 
 
-def region_offsets(m, n, k, b, N, g, mode=EMULATE):
-    """[(name, start, end)] laid out in §4a order at 256-B-aligned offsets."""
-    g = _check_shape(m, n, k, b, N, g, mode)
+def region_offsets(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE):
+    """[(name, start, end)] laid out in §4a order at 256-B-aligned offsets (no vec region
+    with vec = RESIDENT)."""
+    g = _check_shape(m, n, k, b, N, g, mode, vec)
     if b * m * n == 0:
         return []
     kh, nh = align_up(k, K_ALIGN), align_up(n, N_ALIGN)
     names = ["vec"] if (mode == DIRECT or k <= 1) else [r[0] for r in _REGIONS]
+    if vec == VEC_RESIDENT:
+        names = [x for x in names if x != "vec"]
     out, off = [], 0
     for name, f in _REGIONS:
         if name not in names:
@@ -1285,14 +1304,15 @@ def cert_workspace():
     for N in (2, 9, 14, 20):
         for g in sorted({1, 2, N // 2 or 1, N}):
             for mode in (EMULATE, DIRECT):
-                for m in ms:
-                    for n in ms:
-                        for k in ks:
-                            for b in bs:
-                                ws = workspace_size(m, n, k, b, N, g, mode)
-                                regs = region_offsets(m, n, k, b, N, g, mode)
-                                _check_layout(m, n, k, b, N, g, mode, ws, regs)
-                                n_cases += 1
+                for vec in (VEC_GENERATE, VEC_RESIDENT):
+                    for m in ms:
+                        for n in ms:
+                            for k in ks:
+                                for b in bs:
+                                    ws = workspace_size(m, n, k, b, N, g, mode, vec)
+                                    regs = region_offsets(m, n, k, b, N, g, mode, vec)
+                                    _check_layout(m, n, k, b, N, g, mode, ws, regs, vec)
+                                    n_cases += 1
     # monotonicity (EMULATE, k >= 1): a planner may price with it
     for N in (2, 14):
         for g in (1, N):
@@ -1328,10 +1348,21 @@ def cert_workspace():
         #  K-empty (k = 1) dispatches to DIRECT: vec 8*(34+66+2+9)=888 -> 1024
         ((17, 33, 1, 3, 9, 0, EMULATE), 1024, [("vec", 0, 888)]),
         ((17, 0, 5, 3, 9, 2, EMULATE), 0, []),
+        #  v1.2 RESIDENT (17,33,5,3,N=9,g=2): the GENERATE example without vec (1024):
+        #   sA 0 sB 256 fA 512 fB 768 RA 1024..2656 RB 2816..7424 W 7424..29456; 29696
+        ((17, 33, 5, 3, 9, 2, EMULATE, VEC_RESIDENT), 29696,
+         [("sA", 0, 102), ("sB", 256, 454), ("fA", 512, 563), ("fB", 768, 867),
+          ("RA", 1024, 2656), ("RB", 2816, 7424), ("W", 7424, 29456)]),
+        ((17, 33, 5, 3, 9, 2, DIRECT, VEC_RESIDENT), 0, []),
+        ((17, 33, 0, 3, 9, 0, EMULATE, VEC_RESIDENT), 0, []),
     ]
     for args, want, regs_want in worked:
         need(workspace_size(*args) == want, f"worked example {args}: {workspace_size(*args)} != {want}")
         need(region_offsets(*args) == regs_want, f"worked example {args} offsets")
+    # plan device bytes: (17,33,5,3) RESIDENT 8*(34+66+10+9) = 952; GENERATE / empty 0
+    need(plan_device_bytes(17, 33, 5, 3, VEC_RESIDENT) == 952, "plan device bytes")
+    need(plan_device_bytes(17, 33, 5, 3) == 0 and plan_device_bytes(0, 33, 5, 3, VEC_RESIDENT) == 0,
+         "plan device bytes (GENERATE / empty)")
     ex = workspace_size(8192, 8192, 8192, 1, 14, 14)
     return f"{n_cases} shapes, {len(worked)} hand-computed examples; 8192^3 N=14: {ex / 2**30:.3f} GiB"
 
@@ -1344,17 +1375,19 @@ def _design_region_bytes(m, n, k, b, N, g):
             "RA": g * b * m * kh, "RB": g * b * nh * kh, "W": N * b * m * nh}
 
 
-def _check_layout(m, n, k, b, N, g, mode, ws, regs):
+def _check_layout(m, n, k, b, N, g, mode, ws, regs, vec=VEC_GENERATE):
     gg = N if g == 0 else g
     if b * m * n == 0:
         need(ws == 0 and regs == [], "zero-size rule")
         return
     lit = _design_region_bytes(m, n, k, b, N, gg)
+    res = vec == VEC_RESIDENT     # v1.2: no vec region
     if mode == DIRECT or k <= 1:
-        need([r[0] for r in regs] == ["vec"], "DIRECT/k=0/K-empty rule")
-        need(ws == align_up(lit["vec"], 256), "vec only")
+        need([r[0] for r in regs] == ([] if res else ["vec"]), "DIRECT/k=0/K-empty rule")
+        need(ws == (0 if res else align_up(lit["vec"], 256)), "vec only")
     else:
-        need([r[0] for r in regs] == ["sA", "sB", "fA", "fB", "vec", "RA", "RB", "W"], "region order")
+        order = ["sA", "sB", "fA", "fB", "vec", "RA", "RB", "W"]
+        need([r[0] for r in regs] == [x for x in order if not (res and x == "vec")], "region order")
     total, prev_end = 0, 0
     for name, start, end in regs:
         need(end - start == lit[name], f"{name} size {end - start} != DESIGN {lit[name]}")
