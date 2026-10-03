@@ -31,10 +31,10 @@ LaunchLimits& launch_limits();
 LaunchLimits default_launch_limits();
 
 // K4 setup at plan creation (gemm_k4.cu, DESIGN v1.2 §6): for every launch shape of the
-// call (K-chunk length, batch count, n-hat part; store-mod / add-mod), the CUTLASS kernel
+// call (K-chunk length, batch count, n-hat part; store-mod / add-mod), the K4Gemm kernel
 // parameters, built from the device's SM count and the kernels' occupancy, after setting
-// their dynamic shared-memory attribute. All CUTLASS host state is touched here, never in
-// imd_contract. SUCCESS, CUDA_ERROR, or NOT_SUPPORTED if CUTLASS rejects a shape.
+// their dynamic shared-memory attribute. All of this host state is built here, never in
+// imd_contract. SUCCESS, CUDA_ERROR, or NOT_SUPPORTED if a shape is out of K4's limits.
 imd_status_t k4_prepare(const ExecPlan& p, std::shared_ptr<const K4Plan>* out);
 
 // K4 for one residue group (gemm_k4.cu): every K-chunk (store-mod, then add-mod) of the

@@ -32,8 +32,8 @@ milestone like M2/M3, L ≈ multi-milestone or research.
 | # | Item | Addresses | Evidence | Size | Your decision |
 |---|---|---|---|---|---|
 | A1 | **Small-problem overhead** — fewer launches for small shapes (fuse K1 into the pack; one fused small-problem path; cheaper K4 setup) | ~50–70 µs/call floor; s128–s512 at 0.35–0.8× GEMMul8, worse at N = 8 | compare sweep; nsys launch gaps | M | none (kernel sequence change ⇒ Pipeline.tla first) |
-| A2 | **K4 epilogue / main-loop overlap** at moderate k (warp-specialized or pipelined mod-p epilogue) | K4 at 60–66% of bound at k ≈ 1024: low-k, DF, batch-innermost cases | per-phase profile; ncu now available | M–L | none |
-| A3 | **Shape-dependent tile selection** — per-plan selection function, small table (or plan-time autotune) | one K4 config for every m:n:k; skinny/small/long-k | r_bigk 0.91–0.99×, small shapes | M | autotune at plan time allowed? (adds plan-creation cost) |
+| A2 ✅ | **K4 epilogue / main-loop overlap** (done 2026-10-03: persistent K4 + register-only mod-p epilogue; K4 at k=1024 60–64% → 80–86% of bound; docs/NOTES-A2.md) at moderate k (warp-specialized or pipelined mod-p epilogue) | K4 at 60–66% of bound at k ≈ 1024: low-k, DF, batch-innermost cases | per-phase profile; ncu now available | M–L | none |
+| A3 | **Shape-dependent tile selection** — per-plan selection function, small table (or plan-time autotune) | one K4 config for every m:n:k; skinny/small/long-k | r_bigk 0.91–0.99×, small shapes | M | plan-time autotuning *possibly acceptable* (Eric, 2026-10-03; not decided — keep it optional, measure plan-creation cost) |
 | A4 | Leftovers: K1 on very long rows (55% of bound), K5 tuning | few % on long-k / large | per-phase profile | S | none |
 
 ## Phase B — Interfaces

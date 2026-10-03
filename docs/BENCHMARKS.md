@@ -565,3 +565,11 @@ Each cell: TFLOPS-eq as % of g = N, workspace as % of g = N.
   (r_lowk) gain little from small g; shapes with large operands (r_bigk, r_skinny) gain most.
 - g = 7 halves the residue memory for ≤ 12% (often ≤ 5%) slowdown; g ≤ 2 is a
   last resort.
+
+## A2: K4 epilogue / main-loop overlap (2026-10-03, `bench/sweep_a2.txt`)
+
+K4 is now `K4Gemm` (persistent, register-only mod-p epilogue). Before/after interleaved in one
+session: `bench/results/a2-before-ab-c63117a.jsonl` vs `a2-after-3e419b2.jsonl` (the latter
+with GEMMul8 and cuBLASLt int8). K4 at k = 1024 went from 60–64 % to 80–86 % of its bound,
+whole calls 1.07–1.20× faster at moderate k; full tables, ncu analysis and what was tried:
+[NOTES-A2.md](NOTES-A2.md).
