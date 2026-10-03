@@ -572,6 +572,14 @@ def suite_bigk(lib, cuda, verbose):
     TA, TB = gen(rng, (170, k), "phi"), gen(rng, (k, 1), "uniform")
     run_case(lib, cuda, "long rows (170x1, k=32768, N=3 RN)", A, B, C, TA, TB,
              np.zeros((170, 1)), 1.0, 0.0, 3, 0, "RN", rng=rng, expect_kind="GEMM", verbose=verbose)
+    # A3: rows too long for two per SM in L2 (2 x 128 x 8 k > 64 MiB): one 1024-thread block
+    # per SM, grid-strided over more rows than blocks (both K1 variants walk pass 2 backwards).
+    k = 40000
+    A, B, C = matrix(rng, 130, 1, k, a_kfast=True, b_kfast=True)
+    TA, TB = gen(rng, (130, k), "wide"), gen(rng, (k, 1), "uniform")
+    run_case(lib, cuda, "longer rows (130x1, k=40000, N=2 TRUNC)", A, B, C, TA, TB,
+             np.zeros((130, 1)), 1.0, 0.0, 2, 0, "TRUNC", rng=rng, expect_kind="GEMM",
+             verbose=verbose)
 
 
 def suite_api(lib, cuda, verbose):
