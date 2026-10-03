@@ -573,3 +573,16 @@ session: `bench/results/a2-before-ab-c63117a.jsonl` vs `a2-after-3e419b2.jsonl` 
 with GEMMul8 and cuBLASLt int8). K4 at k = 1024 went from 60–64 % to 80–86 % of its bound,
 whole calls 1.07–1.20× faster at moderate k; full tables, ncu analysis and what was tried:
 [NOTES-A2.md](NOTES-A2.md).
+
+## A1 / A4: small-problem overhead, K1 long rows, K5 (2026-10-03)
+
+The fused launch KF (DESIGN v1.4 §4: K0 + K1 + group 1's packs for k̂ ≤ 512), launch-shape
+changes for small grids, K5 without local memory and with coalesced stores, and the K1
+long-row grid. Before = dev + A2 (`2961ea4`), after = `19335ff`, interleaved per case in one
+session (gated, GPU lock): `bench/results/a1-ab2-{before,after}.jsonl` (small cases, 40
+calls) and `a1-ab1-{before,after}.jsonl` (every compare case but sq16384). Small shapes at
+N = 8 went from 0.34–0.52× GEMMul8 to 0.92–0.96× (s128–s512), s_df / s_perm from 0.7× to
+1.27–1.36×; at N = 14 every small shape is at or above GEMMul8; large shapes unchanged
+within noise (after/before 0.89–1.03). K5 at N = 8 is at 91–96 % of its bound (was
+61–64 %), K1 on r_bigk at 67–69 % (was 55 %). nsys breakdowns, tables and the remaining
+floor: [NOTES-A1.md](NOTES-A1.md).
