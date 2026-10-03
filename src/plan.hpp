@@ -39,9 +39,10 @@ LaunchLimits default_launch_limits();
 imd_status_t k4_prepare(const ExecPlan& p, int cfg, std::shared_ptr<const K4Plan>* out);
 
 // Plan-time autotuning (imd_options_t.k4_tune, DESIGN v1.5 §6): with k4_tune_bytes(p) > 0,
-// allocate that much device memory, time group 1's K4 launches once (after one warm-up run)
-// in every configuration on cudaStreamPerThread, free it, and set *cfg to the fastest (the
-// incoming *cfg, the rule's choice, unless another is strictly faster). With
+// allocate that much device memory, time group 1's K4 launches in every configuration on
+// cudaStreamPerThread (a warm-up run, then 3 interleaved rounds of ~0.1 ms batches; the
+// minimum per run), free it, and set *cfg to the fastest (the incoming *cfg, the rule's
+// choice, unless another is strictly faster). With
 // k4_tune_bytes(p) = 0, nothing runs and *cfg is unchanged. SUCCESS, ALLOC_FAILED (the
 // temporary allocation) or CUDA_ERROR. `report` (optional): the times, for benchmarks.
 struct K4TuneReport {

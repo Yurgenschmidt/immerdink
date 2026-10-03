@@ -658,15 +658,19 @@ const char*  imd_status_string(imd_status_t);
   (the `imd_lowering` `k4_config` for that `sm_count`). On, for a plan with the emulated
   GEMM and `k4_tune_bytes > 0` (§6a; 0 above 256 MiB, where the rule is kept):
   `imd_plan_create` allocates `k4_tune_bytes` of device memory (group 1's RA, RB and W
-  planes, one allocation), zeroes it, runs group 1's K4 launches once per configuration
-  (one warm-up run, then one run timed with events) on `cudaStreamPerThread`, frees the
-  memory and keeps the fastest configuration (the rule's unless another is strictly
-  faster). It reads no user data and writes nothing the plan keeps but the choice.
+  planes, one allocation), zeroes it and times group 1's K4 launches in every configuration
+  on `cudaStreamPerThread`: one warm-up run each, which sizes a batch of back-to-back runs
+  of about 0.1 ms (1–32 runs), then three rounds of one batch per configuration,
+  interleaved; the minimum per run counts. It frees the memory and keeps the fastest
+  configuration (the rule's unless another is strictly faster). It reads no user data and
+  writes nothing the plan keeps but the choice. (A single timed run per configuration, the
+  first version, picked 10–30 % slower configurations for small problems: NOTES-A3 §5.)
   - Results are bit-identical whatever the choice (§4), so tuning changes speed only;
     the choice itself may differ between plans (timing noise).
   - Costs: plan creation synchronizes `cudaStreamPerThread`, and `cudaMalloc`/`cudaFree`
-    may synchronize the device; plan creation time grows by the allocation and
-    2 × (number of configurations) runs of group 1's K4 launches (NOTES-A3 measures it).
+    may synchronize the device; plan creation time grows by the allocation, the zeroing
+    and about 4 × (0.1 ms or one run) of group 1's K4 launches per configuration
+    (NOTES-A3 §5 measures it).
     Not capturable (as plan creation never was).
   - Statuses: the temporary allocation failing is ALLOC_FAILED, a launch or timing error
     CUDA_ERROR; the plan is not created in either case.

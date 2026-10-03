@@ -188,31 +188,55 @@ imd_status_t k4_tune(const ExecPlan& p, int32_t* cfg, K4TuneReport* report) {
   if (cudaMemsetAsync(buf, 0, static_cast<size_t>(bytes), s) != cudaSuccess ||
       cudaEventCreate(&e0) != cudaSuccess || cudaEventCreate(&e1) != cudaSuccess)
     st = IMD_STATUS_CUDA_ERROR;
-  float best_ms = 0;
-  int best = *cfg;
-  // The rule's choice first: another configuration replaces it only if strictly faster.
-  int order[kK4ConfigCount];
-  order[0] = *cfg;
-  for (int c = 0, i = 1; c < kK4ConfigCount; ++c)
-    if (c != *cfg) order[i++] = c;
+  // Candidates, the rule's choice first (another one replaces it only if strictly faster).
+  struct Cand {
+    int cfg;
+    std::shared_ptr<const K4Plan> plan;
+    int reps;
+    float best_ms;
+  };
+  Cand cands[kK4ConfigCount];
+  int nc = 0;
   for (int i = 0; i < kK4ConfigCount && st == IMD_STATUS_SUCCESS; ++i) {
+    const int c = i == 0 ? *cfg : (i <= *cfg ? i - 1 : i);
     std::shared_ptr<const K4Plan> kp;
-    const imd_status_t ps = k4_prepare(p, order[i], &kp);
+    const imd_status_t ps = k4_prepare(p, c, &kp);
     if (ps == IMD_STATUS_NOT_SUPPORTED) continue;  // not runnable here: not a candidate
-    if (ps != IMD_STATUS_SUCCESS) {
-      st = ps;
-      break;
-    }
+    if (ps != IMD_STATUS_SUCCESS) st = ps;
+    else cands[nc++] = Cand{c, std::move(kp), 1, 0.0f};
+  }
+  // Time `reps` back-to-back runs of group 1's launches; ms per run.
+  const auto timed = [&](const Cand& c, float* ms) {
+    bool ok = cudaEventRecord(e0, s) == cudaSuccess;
+    for (int r = 0; ok && r < c.reps; ++r) ok = run_group(*c.plan, RA, RB, W, 0, gsize, s, false);
+    ok = ok && cudaEventRecord(e1, s) == cudaSuccess && cudaEventSynchronize(e1) == cudaSuccess &&
+         cudaEventElapsedTime(ms, e0, e1) == cudaSuccess;
+    *ms /= static_cast<float>(c.reps);
+    return ok;
+  };
+  // One warm-up run each (instruction cache, clocks), which also sizes the batches: about
+  // kTuneBatchMs of back-to-back runs per timing (at most kTuneMaxReps), so launch jitter
+  // and the event resolution stay small against short kernels. Then kTuneTrials rounds,
+  // interleaved over the candidates (a clock ramp affects them alike); the minimum counts.
+  constexpr float kTuneBatchMs = 0.1f;
+  constexpr int kTuneMaxReps = 32, kTuneTrials = 3;
+  for (int i = 0; i < nc && st == IMD_STATUS_SUCCESS; ++i) {
     float ms = 0;
-    // One warm-up run (instruction cache, clocks), then one timed run of group 1's launches.
-    if (!run_group(*kp, RA, RB, W, 0, gsize, s, false) || cudaEventRecord(e0, s) != cudaSuccess ||
-        !run_group(*kp, RA, RB, W, 0, gsize, s, false) || cudaEventRecord(e1, s) != cudaSuccess ||
-        cudaEventSynchronize(e1) != cudaSuccess || cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess) {
-      st = IMD_STATUS_CUDA_ERROR;
-      break;
+    if (!timed(cands[i], &ms)) st = IMD_STATUS_CUDA_ERROR;
+    const float want = ms > 0 ? kTuneBatchMs / ms : float(kTuneMaxReps);
+    cands[i].reps = want >= kTuneMaxReps ? kTuneMaxReps : std::max(1, static_cast<int>(want + 0.999f));
+  }
+  for (int t = 0; t < kTuneTrials && st == IMD_STATUS_SUCCESS; ++t)
+    for (int i = 0; i < nc && st == IMD_STATUS_SUCCESS; ++i) {
+      float ms = 0;
+      if (!timed(cands[i], &ms)) st = IMD_STATUS_CUDA_ERROR;
+      if (t == 0 || ms < cands[i].best_ms) cands[i].best_ms = ms;
     }
-    if (report != nullptr) report->ms[order[i]] = ms;
-    if (i == 0 || ms < best_ms) best_ms = ms, best = order[i];
+  int best = *cfg;
+  float best_ms = 0;
+  for (int i = 0; i < nc && st == IMD_STATUS_SUCCESS; ++i) {
+    if (report != nullptr) report->ms[cands[i].cfg] = cands[i].best_ms;
+    if (i == 0 || cands[i].best_ms < best_ms) best_ms = cands[i].best_ms, best = cands[i].cfg;
   }
   if (e0 != nullptr) cudaEventDestroy(e0);
   if (e1 != nullptr) cudaEventDestroy(e1);
@@ -222,7 +246,7 @@ imd_status_t k4_tune(const ExecPlan& p, int32_t* cfg, K4TuneReport* report) {
     cudaGetLastError();
     return st;
   }
-  if (report != nullptr) report->tuned = true;
+  if (report != nullptr) report->tuned = nc > 0;
   *cfg = best;
   return IMD_STATUS_SUCCESS;
 }

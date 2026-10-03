@@ -60,9 +60,10 @@ enum { IMD_VEC_GENERATE = 0, IMD_VEC_RESIDENT = 1 };
 enum { IMD_K4_128x256 = 0, IMD_K4_128x128 = 1, IMD_K4_64x128 = 2, IMD_K4_64x64 = 3,
        IMD_K4_CONFIG_COUNT = 4 };
 /* imd_options_t.k4_tune (v1.5): plan-time autotuning of the K4 configuration. OFF (default):
- * the rule. ON: imd_plan_create times every configuration once on the plan's device (group
- * 1's K4 launches on temporary device memory of imd_lowering_t k4_tune_bytes, freed before
- * it returns) and keeps the fastest; with k4_tune_bytes = 0 it keeps the rule's choice. */
+ * the rule. ON: imd_plan_create times every configuration on the plan's device (group 1's
+ * K4 launches, a few short batches each, on temporary device memory of imd_lowering_t
+ * k4_tune_bytes, freed before it returns) and keeps the fastest; with k4_tune_bytes = 0 it
+ * keeps the rule's choice. */
 enum { IMD_K4_TUNE_OFF = 0, IMD_K4_TUNE_ON = 1 };
 
 /* A strided FP64 tensor view. extent, stride (in elements, any sign) and label each have

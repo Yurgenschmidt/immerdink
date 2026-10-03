@@ -5,6 +5,9 @@
 # (tools/run_bench.sh: machine-wide lock, quiet machine, GPU lock).
 #   bench/run_ab.sh <before imd_bench> <after imd_bench> <sweep file> <before.jsonl> <after.jsonl>
 # Extra imd_bench arguments for the after binary only: $AFTER_ARGS (e.g. "--k4 rule,tune").
+# AFTER_METHODS (default imd): the after binary's methods. Use the case's methods (e.g.
+# "gemmul8,imd") for small cases: the GPU clock state depends on what ran before in the
+# process (A3: the before process at 2820 MHz after GEMMul8, an imd-only one at 2535 MHz).
 # CASES (grep -E regex) selects cases; BEFORE_COMMIT / AFTER_COMMIT label the records.
 # Stops (exit 3) if the machine never gets quiet.
 set -uo pipefail
@@ -29,7 +32,7 @@ while IFS='|' read -r name spec ext methods Ns emu extra; do
     if [ "$side" = before ]; then
       bin="$before"; out="$out_b"; m="$(echo "$methods" | xargs)"; more=()
     else
-      bin="$after"; out="$out_a"; m=imd
+      bin="$after"; out="$out_a"; m="${AFTER_METHODS:-imd}"
       # shellcheck disable=SC2206
       more=(${AFTER_ARGS:-})
     fi
