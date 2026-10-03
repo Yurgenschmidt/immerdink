@@ -6,3 +6,4 @@ tools/apalache/
 
 # Lean / Lake build artifacts
 proofs/.lake/
+.claude/

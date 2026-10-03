@@ -46,13 +46,14 @@ Spec follow-ups, to do before or alongside M2/M3 (see `spec/README.md`):
 - workspace aliasing and MISALIGNED statuses;
 - K-empty → DIRECT in Pipeline and the oracle.
 
-## L — Lean formalization (parallel track; does not block implementation)
+## L — Lean formalization ✅ (done 2026-10-02)
 
 - `proofs/` Lake project (Lean 4 + Mathlib) proving PROOFS.md's L1–L4: shift rule ⇒ norm
   budget, running CRT, error contract, K-chunk carry.
 - Statements use exact arithmetic only; the final FP rounding is a hypothesis.
 
 **Exit:** all four lemmas machine-checked with no `sorry`. A CI target builds `proofs/`.
+**Status:** met. `tools/check_proofs.sh` passes; 48 headline theorems use only the standard axioms.
 
 ## M0 — Scaffolding
 

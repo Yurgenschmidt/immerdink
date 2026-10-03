@@ -27,7 +27,9 @@ Notation:
 - `x_h = a_h·2^{−γ}`, so `1 ≤ max|x_h| < 2` and `‖x‖ ≥ 1`.
 - `F ∈ ℕ`, and `S = Σ_h ⌈x_h²·2^F⌉ ∈ ℕ`.
 - `T ∈ ℕ`, and `κ = ⌈√k⌉ ∈ ℕ`.
-- RN: `R = (2T − κ)²`, `c = 4`, and we assume `2T − κ ≥ 1`. TRUNC: `R = T²`, `c = 1`.
+- RN: `R = (2T − κ)²`, `c = 4`, and we assume `2T − κ ≥ 1`. TRUNC: `R = T²`, `c = 1`, and
+  we assume `T ≥ 1`.
+- Only `2^γ ≤ max_h |a_h|` is used, so all results stay sound if γ is underestimated.
 - `u` is the largest integer with `c·S·4^u ≤ R·2^F`, and `σ = u − γ`.
 - `a'_h = q(a_h·2^σ)`.
 
@@ -91,6 +93,8 @@ subtraction restores `x_l < P`. ∎
 *Proof.* `x_N ≡ Σ_l M_l y_l (mod P)`, because each subtraction removes a multiple of P.
 Modulo p_j: `M_l ≡ 0` for l ≠ j, and `M_j y_j ≡ M_j q_j W_j ≡ W_j`. ∎
 
+P need not be even: L2c holds for any H with `2H + 1 ≤ P`, including `H = ⌊(P−1)/2⌋`.
+
 **Claim L2c (exact recovery).** If `Z ∈ ℤ`, `Z ≡ W_j (mod p_j)` for all j, and `|Z| ≤ H`,
 then `z = Z`.
 
@@ -106,6 +110,8 @@ Combining L1c and L2c with `Z = Σ a'b'` gives that the emulated product is exac
 ## L3. Error contract (DESIGN §3.8)
 
 **Setting.**
+- a and b are nonzero. For a zero row, σ := 0 gives `a' = 0` and `z = 0`, so
+  `|D − Σab| ≤ u|D|`.
 - a and b are finite, with quantized forms `a'_h = a_h2^σ + δ_h` and `b'_h = b_h2^τ + ε_h`,
   where `|δ_h|, |ε_h| ≤ ρ`.
 - `z = Σ_h a'_h b'_h`, which is exact by L1 + L2 + L4.
@@ -133,7 +139,7 @@ Then take absolute values and sum. ∎
 
 **Setting.**
 - Integers `r_h, s_h` with `|r_h s_h| ≤ Q`.
-- Chunks `C_0, …, C_{n−1}` partition `[0, k)`, with `|C_c| ≤ K`.
+- Chunks `C_0, …, C_{n−1}` partition `[0, k)`, with `n ≥ 1` and `|C_c| ≤ K`.
 - `Q·K ≤ A_max`, where `A_max = 2³¹ − 1`.
 - The accumulator saturates: any partial sum in any order is clamped to `[−A_max−1, A_max]`.
 - Epilogue: `W_0 = acc_0 mod p` and `W_c = (W_{c−1} + acc_c) mod p`, with mod in `[0, p)`.
@@ -146,7 +152,8 @@ So saturation never triggers, and `acc_c = Σ_{h∈C_c} r_h s_h` exactly. ∎
 
 *Proof.* By induction on c, using that the chunks partition `[0,k)`. ∎
 
-**Claim L4c (int32 epilogue).** `W_{c−1} + acc_c ∈ [−Q·K, (p − 1) + Q·K] ⊆ int32`. For
+**Claim L4c (int32 epilogue).** This is a separate numeric fact, not a consequence of
+`Q·K ≤ A_max`; it needs `(p − 1) + Q·K ≤ 2³¹ − 1`. `W_{c−1} + acc_c ∈ [−Q·K, (p − 1) + Q·K] ⊆ int32`. For
 `Q = 128²` and `K = 131056` the maximum is 2147221759, which is ≤ 2³¹ − 1. ∎
 
 The hypothesis `Q·K ≤ A_max` must hold for **every** order (a bound on `Σ|products|`), not
@@ -155,7 +162,17 @@ saturation.
 
 ---
 
-## Formalization plan (`proofs/`, Lean 4 + Mathlib)
+## Formalization status
+
+**Done.** All lemmas are machine-checked in `proofs/` (Lean 4.34.1, Mathlib v4.34.1), with no
+`sorry`, `admit` or new axioms. The capstone `emulated_product_exact` chains L1c + L4 + L2c.
+Run `tools/check_proofs.sh`. The lemma-to-theorem map and modelling choices are in
+`proofs/NOTES.md`. Still taken as hypotheses:
+- the IEEE rounding property;
+- the residue map's int8 range;
+- facts about the 20 concrete moduli, which `spec/params.py` certifies.
+
+## Formalization plan (as written before the proofs)
 
 | Lemma | Lean statement sketch | Main Mathlib ingredients |
 |---|---|---|
