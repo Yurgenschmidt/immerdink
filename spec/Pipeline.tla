@@ -33,6 +33,14 @@
 (*                    its own vec CTAs write for the later kernels         *)
 (*        MParts: gridDim.y of a pack launch (KF and K2/K3): the group's   *)
 (*                    slots are split over MParts CTAs per row             *)
+(*        FusedLarge (DESIGN v1.6 §4, chosen at plan time per operand):    *)
+(*                    for each operand X in FusedLarge ONE launch "KL_X"   *)
+(*                    replaces K1 of X and group 1's pack of X: per row of *)
+(*                    X one CTA reads the row through the scatter vectors  *)
+(*                    (written by K0, a separate launch that has retired), *)
+(*                    computes σ itself, packs group 1's slots and stores  *)
+(*                    σ and the flag; the other operand keeps K1 and its   *)
+(*                    group-1 pack (launched per operand: "scaleop")       *)
 (*        launch limits (gridDim.z and gridDim.y splits), C must not alias *)
 (*        A or B, two                                                      *)
 (*        streams without events are a hazard                              *)
@@ -139,6 +147,7 @@ CONSTANTS
     K1Split,             \* K1 as two launches: γ pass (K1a), then S pass (K1b)
     Fused,               \* v1.4: K0 + K1 + group 1's packs as one launch (KF)
     MParts,              \* v1.4: CTAs per row of a pack launch (moduli parts)
+    FusedLarge,          \* v1.6: operands ⊆ {"A", "B"} scaled + packed by KL
     TwoStreams,          \* packs on a second stream (NOT v1; future option)
     UseEvents,           \* cross-stream event edges (only with TwoStreams)
     Bug,                 \* "none", one injected design-rule violation, or a
@@ -193,6 +202,15 @@ Bugs == {"none",
          "fusedNoSigma",  \* KF uses σ / the flag but does not store them
          "fusedAllGroups",\* KF packs EVERY group into the g slots (one
                           \* launch for all groups)
+         "largeWithK0",   \* K0's CTAs run in the same launch as the KL CTAs
+                          \* (no kernel boundary between writing the
+                          \* vectors and KL reading them)
+         "largeRowSplit", \* KL splits a long row over two CTAs (column
+                          \* segments); the second takes σ from sA, stored
+                          \* by the first in the same launch
+         "largeNoSigma",  \* KL uses σ / the flag but does not store them
+         "largeAllGroups",\* KL packs EVERY group of its operand into the g
+                          \* slots (one launch for all groups)
          "padMinimal"}    \* HARMLESS: K padding only in A and only by the
                           \* first group's pack; B rows n..n̂ never written
 \* Deviations from DESIGN that are shown NOT to break anything (positive models).
@@ -446,9 +464,32 @@ K0Seq == IF VecResident THEN <<>> ELSE <<KVec>>
 \* (their packs read the σ / τ and vectors KF stored).
 FusedGP == IF Bug = "fusedAllGroups" THEN <<KFused>> \o GemmSeqsFrom(1)
            ELSE <<KFused>> \o GemmSeq(1) \o GroupsFrom(2)
+\* v1.6 fused large path: K0, then per operand (A, then B) one launch: KL_X
+\* (K1 of X + group 1's pack of X) if X ∈ FusedLarge, else K1 of X alone
+\* ("scaleop"); then group 1's packs of the other operands, group 1's GEMMs,
+\* and groups 2.. as usual (their packs read the σ / τ that KL stored).
+\* Field p of a "large" / "scaleop" kernel is the operand (0 = A, 1 = B).
+OpIdx(X)    == IF X = "A" THEN 0 ELSE 1
+KLarge(X)   == Kr("large", 1, 0, OpIdx(X))
+KScaleOp(X) == Kr("scaleop", 0, 0, OpIdx(X))
+OpKernel(X) == IF X \in FusedLarge THEN KLarge(X) ELSE KScaleOp(X)
+\* "largeWithK0": K0's CTAs and every KL CTA in ONE launch ("largevec").
+LargeHead == IF Bug = "largeWithK0"
+             THEN <<Kr("largevec", 1, 0, 0)>>
+                  \o (IF "A" \in FusedLarge THEN <<>> ELSE <<KScaleOp("A")>>)
+                  \o (IF "B" \in FusedLarge THEN <<>> ELSE <<KScaleOp("B")>>)
+             ELSE K0Seq \o <<OpKernel("A"), OpKernel("B")>>
+\* No pack of a KL operand in group 1 (in the "largeAllGroups" negative: in
+\* no group, KL having packed them all).
+LargeSkips(X, gi) == X \in FusedLarge /\ (gi = 1 \/ Bug = "largeAllGroups")
+PacksL(gi) == (IF LargeSkips("A", gi) THEN <<>> ELSE <<Kr("packA", gi, 0, 0)>>)
+              \o (IF LargeSkips("B", gi) THEN <<>> ELSE <<Kr("packB", gi, 0, 0)>>)
+RECURSIVE GroupsL(_)
+GroupsL(gi) == IF gi > NG THEN <<>> ELSE PacksL(gi) \o GemmSeq(gi) \o GroupsL(gi + 1)
 ProgFull == IF Empty THEN <<>>
             ELSE IF UseDirect THEN K0Seq \o <<KDirect>>
             ELSE IF Fused THEN FusedGP \o <<KCrt>>
+            ELSE IF FusedLarge # {} THEN LargeHead \o GroupsL(1) \o <<KCrt>>
             ELSE IF Bug = "crtEarly"
                  THEN K0Seq \o K1Seq \o SubSeq(GP, 1, Len(GP) - 1)
                       \o <<KCrt>> \o SubSeq(GP, Len(GP), Len(GP))
@@ -495,6 +536,15 @@ FusedVecCTAs == IF VecResident \/ Bug = "fusedNoVec" THEN {} ELSE {<<"v", X>> : 
 FusedCTAs == {<<"a", x[1], x[2], y>> : x \in RowsA, y \in Parts}
              \cup {<<"b", lam, j, y>> : lam \in Bs, j \in NHs, y \in Parts}
              \cup FusedVecCTAs
+\* v1.6 KL of operand p: one CTA per A row / (padded) B column and row
+\* segment; one segment (a CTA owns its whole row) except in the
+\* "largeRowSplit" negative.
+Segs == IF Bug = "largeRowSplit" THEN {0, 1} ELSE {0}
+LargeCTAs(p) == IF p = 0 THEN {<<"a", x[1], x[2], s>> : x \in RowsA, s \in Segs}
+                ELSE {<<"b", lam, j, s>> : lam \in Bs, j \in NHs, s \in Segs}
+\* K1 of one operand (the operand not in FusedLarge).
+ScaleOpCTAs(p) == IF p = 0 THEN {<<"a", x[1], x[2]>> : x \in RowsA}
+                  ELSE {<<"b", x[1], x[2]>> : x \in ColsB}
 CTAsOf(kr) ==
     CASE kr.kind = "vec"    -> K0CTAs                 \* one per tensor's vectors
       [] kr.kind \in {"scale", "gamma"} -> K1CTAs     \* one per A row / B column
@@ -505,6 +555,10 @@ CTAsOf(kr) ==
       [] kr.kind = "packA"  -> {<<x[1], x[2], y>> : x \in RowsA, y \in Parts}  \* A row, moduli part
       [] kr.kind = "packB"  -> Bs \X NHs \X Parts       \* one (padded) B column and part each
       [] kr.kind = "fused"  -> FusedCTAs
+      [] kr.kind = "scaleop" -> ScaleOpCTAs(kr.p)
+      [] kr.kind = "large"  -> LargeCTAs(kr.p)
+      [] kr.kind = "largevec" -> {<<"v", X>> : X \in K0CTAs}
+                                 \cup UNION {LargeCTAs(OpIdx(X)) : X \in FusedLarge}
       [] kr.kind = "gemm"   -> PartZ(kr.gi, kr.p) \X Ms \X (0..(GridY(kr.q) - 1))
                                                         \* (batch z, row ī, N tile y)
       [] kr.kind \in {"crt", "direct"} -> Elems         \* one C element each
@@ -531,6 +585,11 @@ WellFormed ==
     /\ Bug \in {"fusedReadsVec", "fusedSharedSigma", "fusedNoVec", "fusedNoSigma",
                 "fusedAllGroups"} => Fused
     /\ Bug = "fusedNoVec" => ~VecResident
+    /\ FusedLarge \subseteq {"A", "B"}
+    /\ FusedLarge # {} => ~Fused /\ ~K1Split /\ ~TwoStreams   \* v1.6: single stream
+    /\ Bug \in {"largeWithK0", "largeRowSplit", "largeNoSigma", "largeAllGroups"}
+          => FusedLarge # {}
+    /\ Bug = "largeWithK0" => ~VecResident
 
 \* Preconditions of the design; each has a boundary-tight positive model and
 \* a negative model at boundary + 1 (see MC_Pipeline.tla).
@@ -725,7 +784,7 @@ PackBStep(gi, t) ==
 FusedSlots(y) == IF Bug = "fusedAllGroups"
                  THEN UNION {PartSlots(gi, y) : gi \in 1..NG} ELSE PartSlots(1, y)
 \* The group whose residues a slot ends up holding (the last one written).
-FusedGroup(s) == IF Bug = "fusedAllGroups"
+FusedGroup(s) == IF Bug \in {"fusedAllGroups", "largeAllGroups"}
                  THEN CHOOSE gi \in 1..NG : s < GrpSize(gi) /\ \A g2 \in (gi + 1)..NG : s >= GrpSize(g2)
                  ELSE 1
 FusedStoresSigma(y) == y = 0 /\ Bug # "fusedNoSigma"
@@ -761,6 +820,49 @@ FusedStep(t) ==
                    IF real
                    THEN ReadAB \cup ClobB(lam, x)
                         \cup Stale(viaVec /\ "B" \notin vecV)
+                        \cup (IF shared THEN SigmaRead(sfB[<<lam, x>>]) ELSE {})
+                   ELSE {})
+         /\ UNCHANGED <<vecV, sfA, ra, w, cw, cval, aDirty, bDirty>>
+
+\* v1.6 KL (K1 + group 1's pack of one operand in one launch), one atomic
+\* step per CTA <<"a", λ, ī, seg>> (or <<"b", λ, ĵ, seg>>): read row ī of A_λ
+\* through the scatter vectors (K0 retired before this launch), compute σ
+\* and the flag from the whole row (segment 0, the row's only CTA), write the
+\* residues of every slot of group 1 and store σ / the flag for the later
+\* groups' packs and K5. B columns ĵ ≥ n write zero rows only.
+\* Negatives: largeWithK0 (the vectors are read in the launch that writes
+\* them), largeRowSplit (segment 1 of a row takes σ from sA, stored by
+\* segment 0 in the same launch), largeNoSigma (σ not stored), largeAllGroups
+\* (every group of the operand packed into the same g slots by the one launch).
+LargeStores(seg) == seg = 0 /\ Bug # "largeNoSigma"
+LargeSlots == IF Bug = "largeAllGroups" THEN UNION {0..(GrpSize(gi) - 1) : gi \in 1..NG}
+              ELSE 0..(GrpSize(1) - 1)
+LargeStep(t) ==
+    LET lam == t[2]  x == t[3]  seg == t[4]
+        shared == seg # 0                      \* σ taken from sA / sB
+        real   == t[1] = "a" \/ x < n
+    IN
+    IF t[1] = "a"
+    THEN /\ ra' = RAWrite(lam, x, LargeSlots, FusedGroup)
+         /\ sfA' = IF LargeStores(seg)
+                   THEN [sfA EXCEPT ![<<lam, x>>] = IF flagA[<<lam, x>>] THEN 1 ELSE 0]
+                   ELSE sfA
+         /\ Access(VecA(lam, x) \cup RACells(lam, x, LargeSlots, FusedGroup)
+                   \cup (IF LargeStores(seg) \/ shared THEN {AccSA(lam, x)} ELSE {})
+                   \cup (IF LargeStores(seg) THEN {AccFA(lam, x)} ELSE {}),
+                   ReadAB \cup ClobA(lam, x) \cup Stale("A" \notin vecV)
+                   \cup (IF shared THEN SigmaRead(sfA[<<lam, x>>]) ELSE {}))
+         /\ UNCHANGED <<vecV, sfB, rb, w, cw, cval, aDirty, bDirty>>
+    ELSE /\ rb' = RBWrite(lam, x, LargeSlots, FusedGroup)
+         /\ sfB' = IF real /\ LargeStores(seg)
+                   THEN [sfB EXCEPT ![<<lam, x>>] = IF flagB[<<lam, x>>] THEN 1 ELSE 0]
+                   ELSE sfB
+         /\ Access(RBCells(lam, x, LargeSlots)
+                   \cup (IF real THEN VecB(lam, x) ELSE {})
+                   \cup (IF real /\ (LargeStores(seg) \/ shared) THEN {AccSB(lam, x)} ELSE {})
+                   \cup (IF real /\ LargeStores(seg) THEN {AccFB(lam, x)} ELSE {}),
+                   IF real
+                   THEN ReadAB \cup ClobB(lam, x) \cup Stale("B" \notin vecV)
                         \cup (IF shared THEN SigmaRead(sfB[<<lam, x>>]) ELSE {})
                    ELSE {})
          /\ UNCHANGED <<vecV, sfA, ra, w, cw, cval, aDirty, bDirty>>
@@ -850,6 +952,9 @@ Body(kr, t) ==
       [] kr.kind = "packA"  -> PackAStep(kr.gi, t)
       [] kr.kind = "packB"  -> PackBStep(kr.gi, t)
       [] kr.kind = "fused"  -> FusedStep(t)
+      [] kr.kind = "scaleop" -> ScanStep(t, FALSE)
+      [] kr.kind = "large"  -> LargeStep(t)
+      [] kr.kind = "largevec" -> IF t[1] = "v" THEN VecStep(t[2]) ELSE LargeStep(t)
       [] kr.kind = "gemm"   -> GemmStep(kr, t)
       [] kr.kind = "crt"    -> IF TrivialK5 THEN TrivialStep(t) ELSE CrtStep(t)
       [] kr.kind = "direct" -> IF TrivialK5 THEN TrivialStep(t) ELSE DirectStep(t)
@@ -1040,7 +1145,8 @@ DispatchByDescriptor ==
          LET kinds == {Prog[a][i].kind : i \in DOMAIN Prog[a]} IN
          /\ ("direct" \in kinds) <=> (~Empty /\ (Direct \/ KEmpty))
          /\ "direct" \in kinds => kinds \cap {"scale", "gamma", "sigma", "k1merged", "packA",
-                                              "packB", "fused", "gemm", "crt"} = {}
+                                              "packB", "fused", "scaleop", "large",
+                                              "largevec", "gemm", "crt"} = {}
     /\ WorkspaceSize = SumSeq([i \in DOMAIN Regions |-> Align(Bytes(Regions[i]))])
 
 \* §4 launch limits: each batched launch has gridDim.z <= MaxZ, and the

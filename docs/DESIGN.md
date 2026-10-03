@@ -1,4 +1,4 @@
-# immerdink — design (v1.5)
+# immerdink — design (v1.6)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -18,7 +18,10 @@ and measured but not adopted) and the §6 thread and lifetime rules that follow 
 the host API (§6a); changed text is marked **[v1.4]**. v1.5 adds a small set of K4 tile
 configurations chosen per plan (§4; bit-identical results, same launches and workspace), the
 optional plan-time autotuning option `k4_tune` (§6) and the choice in the host API (§6a), and
-takes the fused launch KF up to k̂ ≤ 1024 (§4); changed text is marked **[v1.5]**. The change lists are at the end.
+takes the fused launch KF up to k̂ ≤ 1024 (§4); changed text is marked **[v1.5]**. v1.6 adds the
+per-operand fused scale-and-pack launch KL for k̂ > 1024 (§4, chosen at plan time; same results,
+same workspace, one DRAM read of the operand less) and reports it in the host API (§6a);
+changed text is marked **[v1.6]**. The change lists are at the end.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -286,6 +289,7 @@ K0 vec      kernel: generate the scatter vectors → ws.vec from the fused-mode 
             (a kernel argument, by value); not launched with IMD_VEC_RESIDENT      [v1.2]
 K1 scale    A rows, B cols: flags + σ, τ (int16)       one launch, two passes per row (γ, then S)
             (the split K1a/K1b below is specified and checked, not used: [v1.2])
+            [v1.6] per operand: K1 of that operand, or KL (below: K1 + its group-1 pack)
 for each residue group G (g moduli; ⌈N/g⌉ groups):
   K2 pack   A → A'_l[λ][ī][k̂]  for l ∈ G   (gather via scatter vectors, smem transpose,
   K3 pack   B → B'_l[λ][j̄][k̂]  for l ∈ G    K-contiguous int8, zero padding)  re-read A, B
@@ -328,6 +332,79 @@ Rules **[spec: Pipeline Fused, MParts; pos_fused_*, neg_fused_*]**:
   row a 4096-value tile holds 4 of, with KF's per-row offsets (8 KB) inside the 48 KB of
   static shared memory. The threshold is a launch-shape property only: Pipeline's `Fused`
   model has no k̂ in it (a KF CTA owns whole rows for any k̂), so the spec is unchanged.
+
+**[v1.6] Fused large path KL (plan-time choice, per operand).** Without KF (k̂ > 1024), K1
+reads every operand row twice (γ, then S; the second pass mostly from L2) and group 1's pack
+reads it again from DRAM, so a large operand streams from DRAM twice before its first GEMM
+(and once more per later group). For each operand x (the GEMM's A or B, post-swap) whose
+`fused_large` bit is set (a pure function of the lowering, reported by `imd_lowering`, §6a),
+one launch **KL_x** replaces K1 of x and group 1's pack of x (for B including the launch that
+zeroes RB rows n..n̂−1, which KL_B does itself). K0 runs as before (generate mode); the other
+operand keeps its K1 launch and its group-1 pack; groups 2.. are packed by K2/K3 from the σ/τ
+KL stored, as after KF:
+```
+K0 vec      (unchanged)
+per operand x = A, B:   fused_large(x) ? KL_x : K1 of x
+for each residue group G:
+  K2 / K3   for every operand, except group 1's pack of a KL operand
+  K4 gemm   (unchanged)
+K5 crt      (unchanged)
+
+KL_x        per row tile (th rows × all of k̂; th·tk = 4096 FP64, tk = pow2 ≤ 4096; a row
+            spans nc = ⌈k̂/tk⌉ chunks of tk): ONE CTA owns whole rows
+  pass 1    chunks c = 0..nc−1 gathered through the scatter vectors (ws.vec or the plan's
+            copy) into shared memory, coalesced as in K2/K3; per thread 16 consecutive k̄ of
+            one row: flag, γ; chunk 0 kept in registers, chunk nc−1 stays in shared memory
+  reduce    per row over its tk/16 threads (warp shuffles + a shared-memory combine): flag,
+            γ = the §3.2 row exponent
+  pass 2    S over chunk 0 (registers), chunk nc−1 (shared memory), then chunks nc−2 … 1
+            re-read (most recently read first: from L2); per row σ = largest_u(S) − γ: the
+            same exact integers as K1 (max, or, u128 sum: order-independent)
+  pass 3    §3.3/§3.4 residues of every slot of group 1 (K-contiguous 16-byte stores, as
+            K2/K3): chunk 0 (registers), the chunk in shared memory, then the others re-read
+            ascending (from L2)
+  store     σ/τ and the flag (one thread per row); KL_B also zeroes RB rows n..n̂−1 of
+            group 1 (grid-strided, after its rows)
+```
+Rules **[spec: Pipeline FusedLarge; pos_large_*, neg_large_*]**:
+- KL reads the scatter vectors from the vec region, so **K0 retires before KL starts** (a
+  separate launch; `neg_large_with_k0`). Unlike KF it does not compute offsets from the
+  descriptor: K0's grid is negligible for large problems, and a vec read is one cached load
+  per k̄ instead of a mixed-radix decode.
+- **One CTA owns each row**: the CTA that packs a row computes its σ from the whole row and
+  never reads σ written in the same launch (`neg_large_row_split`: a long row split over two
+  CTAs that pass σ through sA reads junk). A row cannot be split across CTAs without a
+  grid-wide combine between pass 2 and pass 3 (S needs γ of the whole row first, and the
+  ceiling terms of §3.2 cannot be rescaled from a per-segment γ); KL does not do that.
+- KL stores σ/τ and the flags for the later groups' packs and K5 (`neg_large_no_sigma`).
+- KL packs **group 1 only** (RA/RB slots are reused per group; `neg_large_all_groups`).
+- KL_A and KL_B are independent of each other and of the other operand's K1 (disjoint
+  outputs); exactly the §4a workspace and the same bits in every region as the unfused
+  sequence; `α = 0` / `k = 0` calls run K0 + the β kernel as before.
+
+DRAM traffic of operand x (|x| = 8·b·rows·k bytes), before → after, group 1 and K1:
+`2|x|` (K1 pass 1 + pack; K1's pass 2 from L2) → `|x|`; the residue writes are unchanged.
+Every later group still reads |x| once (below: g). On chip: chunk 0 in registers and the last
+chunk in shared memory, so rows with nc ≤ 2 (k̂ ≤ 8192 read along k̄) are read exactly once;
+longer rows re-read nc − 2 chunks from L2 in pass 2 and in pass 3. The rows in flight
+(resident CTAs × th rows × 8k̂ bytes) are kept within an L2 budget of 64 MiB (as K1, A3):
+with nc > 2, a grid of more than one CTA per SM only while 2·SMs·th·8k̂ ≤ 64 MiB, else one
+CTA per SM (r_mm-like 400 KB rows: 51 MB in flight). Rows beyond 64 MiB / SMs (k̂ > 65536 on
+128 SMs) partly miss L2 in passes 2/3; pass 2 walking backwards and pass 3 forwards keeps
+the most recently read chunks first, and the DRAM reads never exceed the unfused path's.
+
+**Residue groups (g < N).** KL removes one DRAM read of x whatever g: `(1 + ⌈N/g⌉)|x|` →
+`⌈N/g⌉|x|` (N = 14: g = 14: 2 → 1; g = 7: 3 → 2; g = 2: 8 → 7). Cutting the later groups'
+reads as well would need the residues of all N moduli of x at once, i.e. N slots for x:
+exactly the g = N workspace whose RA (or RB) term g < N was chosen to avoid (the large
+operand's residues dominate the workspace). A smaller stand-in does not exist: the
+quantized a' (|μ| ≤ 2⁵³, §3.3) needs as many bytes as the FP64 input, which is also smaller
+than the remaining residues whenever N − g > 8. So the workspace formula (§4a) is
+unchanged and later groups re-read x as before.
+
+**Selection (`fused_large`, libimmerdink_host).** Bit 0 (A) / bit 1 (B) is set iff the plan
+runs the emulated GEMM without KF (k̂ > 1024). It is decided at plan time from the lowering
+only (no SM count, no data), so `imd_lowering` reports the plan's choice exactly.
 
 **[v1.4] Moduli parts.** A pack launch (K2/K3 and KF) with fewer tiles than about two per
 SM splits the group's slots over `gridDim.y` block rows: part y of a row writes the slots
@@ -535,6 +612,9 @@ plan device bytes (imd_plan_device_bytes) [v1.2]
 ```
 **[spec: Pipeline LayoutExact, RegionsUsed, PlanBytesExact, pos_resident_*,
 neg_resident_ws_vec, neg_resident_reads_ws]**
+- **[v1.6]** The fused paths (KF, KL) change no region: they write the same regions with the
+  same bits (group 1's slots of RA/RB, σ/τ, flags) as the kernels they replace (§4 "Residue
+  groups": why KL does not hold more than g slots).
 - The caller must pass `ws_bytes ≥ workspace_size`.
 - The result includes the tail padding after W, up to 255 bytes.
 - If any product or the total overflows uint64, the call returns INVALID_VALUE.
@@ -815,7 +895,8 @@ imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
                           const imd_tensor_t* C, const imd_options_t*, imd_lowering_t* out);
 const char*  imd_status_string(imd_status_t);
 
-typedef struct {               /* 136 bytes in version 1, 152 in v2 [v1.4], 168 in v3 [v1.5] */
+typedef struct {               /* 136 bytes in version 1, 152 in v2 [v1.4], 168 in v3 [v1.5],
+                                  176 in v4 [v1.6] */
   uint32_t struct_size;        /* in: sizeof(imd_lowering_t) as the caller compiled it  */
   int32_t  status, lowered, dispatch, swapped, num_moduli, residue_group, num_groups;
   int64_t  m, n, k, b, n_hat, k_hat, vec_entries, k_chunks, gemm_launches;
@@ -825,6 +906,8 @@ typedef struct {               /* 136 bytes in version 1, 152 in v2 [v1.4], 168 
   int32_t  sm_count;           /* version 3 [v1.5]: in (0 = 128) and out */
   int32_t  k4_config;          /* version 3: IMD_K4_* of the rule (§4) */
   uint64_t k4_tune_bytes;      /* version 3: temporary bytes of a k4_tune plan creation */
+  int32_t  fused_large;        /* version 4 [v1.6]: bit 0 / bit 1: KL for the GEMM's A / B */
+  int32_t  reserved4;          /* version 4: 0 */
 } imd_lowering_t;
 enum { IMD_DISPATCH_NOOP, IMD_DISPATCH_EMULATE, IMD_DISPATCH_DIRECT, IMD_DISPATCH_SCALE };
 enum { IMD_K4_128x256, IMD_K4_128x128, IMD_K4_64x128, IMD_K4_64x64, IMD_K4_CONFIG_COUNT };
@@ -887,6 +970,16 @@ Semantics:
     Python transcription of the rule for several SM counts), `host_vs_plan` (every real
     plan runs the rule's configuration for its device's SM count; tuned plans have the
     same sizes).
+  - **[v1.6] Version 4** appends `fused_large` and `reserved4` (0), valid whenever
+    `lowered = 1`: bit 0 (bit 1) is set iff the plan scales and packs the GEMM's A (B,
+    post-swap) with KL (§4 "Fused large path"; 0 when `fused`, and 0 off EMULATE), and
+    `kernel_launches` on EMULATE becomes `(fused ? 1 : v + 2) + (⌈N/g⌉ − 1)·(2 + [n̂ > n]) +
+    (fused ? 0 : [A not KL] + [B not KL]·(1 + [n̂ > n])) + gemm_launches + 1` (with
+    `fused_large = 0` this is the version-2 count: KL replaces K1 of its operand one for one
+    and removes that operand's group-1 pack launches). A version-3 caller gets exactly the
+    version-3 fields (its `kernel_launches` is the v4 count, which is what the library
+    launches). Tested: `host_c_api`, `host_python`, `host_vs_plan` (every real plan's choice
+    and launch count equal the query), and the launch counts of every contract test call.
   - `dispatch`: NOOP (b·m·n = 0), EMULATE (K0–K5; EMULATE mode, k ≥ 2), DIRECT (K0 + the
     native kernel; DIRECT mode or K-empty), SCALE (k = 0: K0 + the β kernel, §3.7). A call
     with α = 0 also runs only K0 and the β kernel; that is per call, not per plan.
@@ -1043,3 +1136,24 @@ tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH).
 - **§4 KF for k̂ ≤ 1024** (was 512): plans with 512 < k̂ ≤ 1024 take the fused launch
   (`fused` = 1, `kernel_launches` accordingly). Same outputs and workspace; Pipeline's
   `Fused` is k̂-independent, so no spec change.
+
+## Changes v1.5 → v1.6 (fused K1 + pack for large operands, docs/NOTES-D4.md)
+
+- **§4 KL.** For k̂ > 1024 (no KF), each operand whose `fused_large` bit is set is scaled and
+  packed for group 1 by one launch KL instead of K1 + K2/K3 (+ the zero-rows launch for B):
+  one CTA per row tile owns whole rows, reads them once from DRAM (chunk 0 in registers, the
+  last chunk in shared memory, middle chunks re-read from L2 within a 64 MiB budget of rows
+  in flight), computes σ with the same exact integers as K1 and stores σ, the flags and
+  group 1's residues exactly as the separate kernels did. K0 stays a separate launch (KL
+  reads the vectors). Results and the §4a workspace are unchanged; for g < N later groups
+  still re-read the operand (holding all N residues would be the g = N workspace).
+  **[spec: Pipeline FusedLarge; pos_large_g3, pos_large_g1, pos_large_a_g2,
+  pos_large_b_resident, pos_large_batch2; neg_large_with_k0, neg_large_row_split,
+  neg_large_no_sigma, neg_large_all_groups]**
+- **§6a.** `IMD_HOST_API_VERSION` 4: `imd_lowering_t` grows to 176 bytes with `fused_large`
+  and `reserved4` (appended; version-1/2/3 callers unaffected); `kernel_launches` counts KL.
+  libimmerdink_host stays the one implementation of the choice (`fused_large`) and the count
+  (`plan_launches`).
+- **§6 test hooks.** `imd_test_set_fused` can also force KL for both operands of every emulated
+  plan (and KL with 64-row tiles, so short rows span several chunks), for the bit-exactness
+  tests.

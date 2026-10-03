@@ -172,10 +172,13 @@ The kernels run in sequence, so a time lower bound is the sum over kernels of
 | K0 vec (GENERATE; none with RESIDENT) | `W_vec` written, nothing read (v1.1: an H2D copy from pinned memory) | `O(W_vec/8 · rank)` integer ops |
 | K1 scale | `s_T·b·(m·k + k·n)` read | `O(b·(mk + kn))` integer ops |
 | K2/K3 pack | `⌈N/g⌉·s_T·b·(m·k + k·n)` read + `N·b·(m·k̂ + n̂·k̂)` written | `O(N·b·(mk+kn))` |
+| KL (v1.6, per operand x, replaces K1 of x and group 1's pack of x) | `s_T·b·rows_x·k` read + `g·b·rows_pad_x·k̂` written; L2 re-reads only for rows longer than two 4096-value chunks | as K1 + one group's pack |
 | K4 GEMM | `ρ·N·b·(m·k̂ + n̂·k̂)` read + `N·b·m·n̂·(2·n_chunks − 1)` u8 written/read | `2·N·b·m·n̂·k̂` int8 ops |
 | K5 CRT | `N·b·m·n̂` read + `s_T·b·m·n·(1 + [β≠0])` | `O(N·b·m·n)` integer ops |
 
 Here:
+- With KL for operand x (DESIGN v1.6 §4), x is read `⌈N/g⌉` times from DRAM in total
+  instead of `1 + ⌈N/g⌉` (K1's own second pass hits L2 in both cases).
 - `ρ ≥ 1` is the GEMM tiling's operand re-read factor (1 if L2 captures all reuse).
 - `n_chunks = ⌈k / 131056⌉`.
 - The flagged-element native path adds `s_T·k·(n·#flaggedRows + m·#flaggedCols)` bytes.
