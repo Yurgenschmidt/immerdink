@@ -224,6 +224,12 @@ available on sm_89.
     get exactly the numbers the kernels use. Python (ctypes now, nanobind later) and other
     languages call that ABI; nothing is reimplemented. `spec/params.py` and the oracle stay
     as independent verification (tests compare them with the C), not as an API.
+    **Done (2026-10-03, DESIGN v1.3 §6a):** `libimmerdink_host.so` + `immerdink_host.h`
+    (`imd_workspace_size`, `imd_workspace_layout`, `imd_plan_bytes`, `imd_lowering`,
+    `imd_host_api_version`), linked by libimmerdink for all plan sizing;
+    `python/immerdink/host.py` (ctypes, einsum front end, `g_tradeoff`); tests
+    `host_c_api`, `workspace_vs_params`, `host_python`, `host_vs_plan`, `host_cuda_free`.
+    g stays the only workspace knob (no budget option; Eric, 2026-10-03).
 - **Performance model (later, not yet).** Predict per-phase time from MEMORY_MODEL §4/§5
   bounds plus measured efficiencies (the per-phase profiling already reports both), so
   callers can estimate cost and choose N, g and vec_mode. Same surface as the memory API.

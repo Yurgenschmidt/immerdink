@@ -6,6 +6,8 @@ and on-chip resources, written so they can be lifted into other code.
 - §2–§3 are **exact**. They equal `imd_workspace_size`, are certified by
   `spec/params.py` (`workspace_size`, `region_offsets`, `cert_workspace`), and are
   model-checked by `spec: Pipeline LayoutExact`. The design source is DESIGN §4a.
+- Programs get these numbers from `libimmerdink_host` (§3a): the CUDA-free library whose
+  code libimmerdink itself uses to size plans and workspaces.
 - §4–§6 are **models** (lower bounds and estimates), not guarantees.
 
 All sizes are in **bytes**. `⌈x⌉_a` means "round x up to a multiple of a".
@@ -108,6 +110,56 @@ For large square problems the three big terms are about `N·m·k`, `N·n·k` and
     columns.
   - Caller tiling over K changes results; avoid it.
 - **N** scales the residue and product terms linearly. Choose it from §6.
+
+## 3a. Getting exact footprints from another program (no GPU)
+
+`libimmerdink_host.so` (DESIGN §6a; header `immerdink/immerdink_host.h`) answers every
+question of §3 for concrete descriptors and options, with no GPU, CUDA runtime or driver.
+It is the code libimmerdink runs at plan creation, so the answers are what the kernels use
+(`host_vs_plan` checks real plans against it); spec/params.py only verifies it.
+
+| Question | C | Python (`python/immerdink/host.py`) |
+|---|---|---|
+| workspace bytes for (A, B, C, N, g, rounding, mode, vec_mode) | `imd_workspace_size` | `workspace_size` |
+| the §3 region table (offset, bytes per region) | `imd_workspace_layout` | `workspace_layout` |
+| plan device bytes `D_plan`, plan host payload | `imd_plan_bytes` | `plan_bytes` |
+| GEMM view, dispatch, groups, K4 launches, all sizes, plan-time status | `imd_lowering` | `lowering` |
+| workspace for every g = 1..N | (loop over g) | `g_tradeoff`, `python3 -m immerdink.host` |
+
+The **g trade-off** for a CC-shaped contraction (o = 40, v = 200; N = 14):
+
+```
+$ PYTHONPATH=python python3 -m immerdink.host "kjbc,kiac->abij" a=200,b=200,c=200,i=40,j=40,k=40 -N 14
+kjbc,kiac->abij  N=14  EMULATE  m=8000 n=8000 k=8000 b=1  (swapped)  status SUCCESS
+plan: 0 device bytes, 2,352 host bytes
+  g  workspace bytes      GiB  vs g=N groups launches
+  1    1,024,432,896    0.954     38%     14       14
+  2    1,152,432,896    1.073     43%      7        7
+  4    1,408,432,896    1.312     52%      4        4
+  7    1,792,432,896    1.669     67%      2        2
+ 14    2,688,432,896    2.504    100%      1        1
+```
+(rows g = 3, 5, 6, 8–13 omitted here). The part independent of g is the W planes, `N·b·m·n̂` =
+896 MB; each step of g adds `b·(m + n̂)·k̂` = 128 MB of residues. BENCHMARKS ("Residue-group
+size g") gives the speed side: g = 7 cost ≤ 12 % on every benchmarked shape, g ≤ 2 is
+a last resort.
+
+From C (link `-limmerdink_host`; no CUDA include path needed):
+
+```c
+#include "immerdink/immerdink_host.h"
+/* A, B, C: imd_tensor_t descriptors as for imd_plan_create */
+for (int32_t g = 1; g <= 14; ++g) {
+  const imd_options_t o = {14, g, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE};
+  size_t ws = 0, dev = 0, host = 0;
+  if (imd_workspace_size(&A, &B, &C, &o, &ws) != IMD_STATUS_SUCCESS) break;
+  imd_plan_bytes(&A, &B, &C, &o, &dev, &host);   /* NOT_SUPPORTED if kappa >= T (RN) */
+  printf("g=%d workspace %zu plan device %zu host %zu\n", g, ws, dev, host);
+}
+```
+
+Peak device memory for a set of live plans and one call at a time is then exactly
+`T_user + max workspace_size + Σ plan_device_bytes` (§3), all from these queries.
 
 ## 4. Compulsory global-memory traffic (lower bound)
 
