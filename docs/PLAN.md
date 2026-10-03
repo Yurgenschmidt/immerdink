@@ -68,7 +68,7 @@ Spec follow-ups, to do before or alongside M2/M3 (see `spec/README.md`):
 **Exit:** builds clean; `imd_workspace_size` matches `params.workspace_size` on a grid of
 shapes; CI-able test target runs under `run_quiet.sh`.
 
-## M1 — Matrix Ozaki-II on the GPU (canonical layouts only)
+## M1 — Ozaki-II on the GPU ✅ (done 2026-10-03)
 
 Kernels:
 - K1 scale: shifts plus non-finite detection.
