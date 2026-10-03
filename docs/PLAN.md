@@ -117,7 +117,7 @@ every modulus, on CPU against the oracle.
 including `contract_highrank` (operand ranks 6–12, ≤ 15 labels, layouts that defeat
 fusion, hard size guards; ~1.6 s, ~190 MB). compute-sanitizer memcheck/initcheck clean.
 
-## M4 — Performance
+## M4 — Performance ✅ (done 2026-10-03)
 
 Work order, by expected payoff:
 1. Gather-pack at coalesced bandwidth on interleaved permutations. This is the
