@@ -3,9 +3,9 @@
 
     python3 tests/harness.py [--lib build/libimmerdink.so]
 
-M0: imd_workspace_size on a few tensor descriptors vs spec/params.py workspace_size.
-M1 adds the bit-exact comparison of imd_contract against spec/oracle.py here (the
-`Library` wrapper is the place to add imd_plan_create / imd_contract bindings).
+imd_workspace_size on a few tensor descriptors vs spec/params.py workspace_size. The
+`Library` and `Cuda` wrappers are also used by tests/test_contract.py (bit-exact
+imd_contract vs spec/oracle.py).
 """
 
 import argparse
@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(ROOT, "spec"))
 import params  # noqa: E402
 
 STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT_WORKSPACE",
-          "MISALIGNED", "CUDA_ERROR"]
+          "MISALIGNED", "CUDA_ERROR", "ALLOC_FAILED"]
 RN, TRUNC = 0, 1
 EMULATE, DIRECT = 0, 1
 
@@ -58,6 +58,26 @@ class Library:
         f.restype = C.c_int
         self.lib.imd_status_string.argtypes = [C.c_int]
         self.lib.imd_status_string.restype = C.c_char_p
+        self.lib.imd_create.argtypes = [C.POINTER(C.c_void_p)]
+        self.lib.imd_destroy.argtypes = [C.c_void_p]
+        self.lib.imd_plan_create.argtypes = [C.c_void_p] + [C.POINTER(Tensor)] * 3 + \
+            [C.POINTER(Options), C.POINTER(C.c_void_p)]
+        self.lib.imd_plan_destroy.argtypes = [C.c_void_p]
+        self.lib.imd_contract.argtypes = [C.c_void_p, C.c_double, C.c_void_p, C.c_void_p,
+                                          C.c_double, C.c_void_p, C.c_void_p, C.c_size_t,
+                                          C.c_void_p]
+        for f in ("imd_create", "imd_destroy", "imd_plan_create", "imd_plan_destroy",
+                  "imd_contract"):
+            getattr(self.lib, f).restype = C.c_int
+        self._handle = None
+
+    def handle(self):
+        if self._handle is None:
+            h = C.c_void_p()
+            st = self.lib.imd_create(C.byref(h))
+            assert st == 0, STATUS[st]
+            self._handle = h
+        return self._handle
 
     def workspace_size(self, A, B, Cc, N, g=0, rounding=RN, mode=EMULATE):
         out = C.c_size_t(0)
@@ -67,6 +87,57 @@ class Library:
         assert name == "IMD_STATUS_" + STATUS[st], name
         return STATUS[st], out.value
 
+    def plan_create(self, A, B, Cc, N, g=0, rounding=RN, mode=EMULATE):
+        """(status, plan handle or None)."""
+        plan = C.c_void_p()
+        st = self.lib.imd_plan_create(self.handle(), C.byref(A), C.byref(B), C.byref(Cc),
+                                      C.byref(Options(N, g, rounding, mode)), C.byref(plan))
+        return STATUS[st], (plan if st == 0 else None)
+
+    def plan_destroy(self, plan):
+        assert self.lib.imd_plan_destroy(plan) == 0
+
+    def contract(self, plan, alpha, A, B, beta, Cp, ws, ws_bytes, stream=None):
+        return STATUS[self.lib.imd_contract(plan, alpha, A, B, beta, Cp, ws, ws_bytes, stream)]
+
+
+class Cuda:
+    """The few CUDA runtime calls the tests need (same libcudart as libimmerdink)."""
+
+    H2D, D2H = 1, 2
+
+    def __init__(self):
+        self.rt = C.CDLL("libcudart.so.13")
+        self.rt.cudaMalloc.argtypes = [C.POINTER(C.c_void_p), C.c_size_t]
+        self.rt.cudaFree.argtypes = [C.c_void_p]
+        self.rt.cudaMemcpy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int]
+        self.rt.cudaMemset.argtypes = [C.c_void_p, C.c_int, C.c_size_t]
+        self.rt.cudaGetErrorString.argtypes = [C.c_int]
+        self.rt.cudaGetErrorString.restype = C.c_char_p
+
+    def check(self, err, what):
+        if err != 0:
+            raise RuntimeError(f"{what}: {self.rt.cudaGetErrorString(err).decode()}")
+
+    def malloc(self, nbytes):
+        p = C.c_void_p()
+        self.check(self.rt.cudaMalloc(C.byref(p), max(int(nbytes), 1)), "cudaMalloc")
+        return p
+
+    def free(self, p):
+        self.check(self.rt.cudaFree(p), "cudaFree")
+
+    def upload(self, p, arr):
+        self.check(self.rt.cudaMemcpy(p, arr.ctypes.data, arr.nbytes, self.H2D), "cudaMemcpy H2D")
+
+    def download(self, arr, p):
+        self.check(self.rt.cudaMemcpy(arr.ctypes.data, p, arr.nbytes, self.D2H), "cudaMemcpy D2H")
+
+    def memset(self, p, value, nbytes):
+        self.check(self.rt.cudaMemset(p, value, nbytes), "cudaMemset")
+
+    def sync(self):
+        self.check(self.rt.cudaDeviceSynchronize(), "cudaDeviceSynchronize (kernel error)")
 
 def default_lib():
     for d in ("build", "."):

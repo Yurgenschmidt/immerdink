@@ -26,7 +26,22 @@ target_include_directories(test_cutlass_mod_epilogue PRIVATE "${PROJECT_SOURCE_D
 target_link_libraries(test_cutlass_mod_epilogue PRIVATE imd_constants imd_cutlass)
 add_test(NAME cutlass_mod_epilogue COMMAND test_cutlass_mod_epilogue)
 
+# PLAN M1: exhaustive CPU check of the §3.5 / §3.6 modular reductions (the kernels' code).
+find_package(Threads REQUIRED)
+add_executable(test_mod_exhaustive test_mod_exhaustive.cpp)
+target_include_directories(test_mod_exhaustive PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(test_mod_exhaustive PRIVATE imd_constants imd_warnings Threads::Threads)
+add_test(NAME mod_exhaustive_cpu COMMAND test_mod_exhaustive)
+
 if(Python3_FOUND)
+  # imd_contract on the GPU vs spec/oracle.py, bit for bit (tests/test_contract.py).
+  foreach(suite api stages e2e tensor bigk)
+    add_test(NAME contract_${suite}
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                     --lib "$<TARGET_FILE:immerdink>" --suite ${suite} -v)
+    set_tests_properties(contract_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+  endforeach()
+
   # imd_workspace_size and the C++ lowering vs spec/params.py on generated descriptors.
   set(vectors "${CMAKE_CURRENT_BINARY_DIR}/workspace_vectors.txt")
   add_custom_command(
