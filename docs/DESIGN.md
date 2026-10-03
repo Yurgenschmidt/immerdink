@@ -485,6 +485,7 @@ const char*  imd_status_string(imd_status_t);
     N and rounding;
   - complex values via the 2M method (2 GEMMs per modulus, moduli with √−1);
   - accurate-mode scaling, which is incompatible with independent packing.
+  - adaptive precision, possibly via an Ozaki-I slice mode sharing this pipeline (PLAN, Later).
 
 ---
 
