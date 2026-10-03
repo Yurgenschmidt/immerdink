@@ -53,8 +53,10 @@ using GemmFor = cutlass::gemm::device::GemmUniversalAdapter<
 using GemmStore = GemmFor<EVTStore>;
 using GemmAdd = GemmFor<EVTAdd>;
 
-constexpr int64_t kMaxBatch = 65535;                 // gridDim.z
-constexpr int64_t kMaxNPerLaunch = 65535 * TB::kN;   // gridDim.y (identity swizzle: N tiles)
+constexpr int64_t kMaxBatch = 65535;   // gridDim.z
+constexpr int64_t kMaxNTiles = 65535;  // gridDim.y (identity swizzle: N tiles)
+
+LaunchLimits g_limits = {c::kKcPrime, kMaxBatch, kMaxNTiles};
 
 template <class Gemm>
 bool run(typename Gemm::Arguments const& args, cudaStream_t stream) {
@@ -67,16 +69,21 @@ bool run(typename Gemm::Arguments const& args, cudaStream_t stream) {
 
 }  // namespace
 
+LaunchLimits& launch_limits() { return g_limits; }
+LaunchLimits default_launch_limits() { return {c::kKcPrime, kMaxBatch, kMaxNTiles}; }
+
 imd_status_t k4_group(const int8_t* RA, const int8_t* RB, uint8_t* W, int64_t m, int64_t n_hat,
                       int64_t k_hat, int64_t b, int g0, int gsize, cudaStream_t stream) {
   const int64_t batches = int64_t{gsize} * b;
   const int64_t plane_a = m * k_hat, plane_b = n_hat * k_hat, plane_w = m * n_hat;
-  for (int64_t k0 = 0; k0 < k_hat; k0 += c::kKcPrime) {  // K-chunks (§3.5), 16-aligned
-    const int64_t kc = std::min<int64_t>(c::kKcPrime, k_hat - k0);
-    for (int64_t z0 = 0; z0 < batches; z0 += kMaxBatch) {  // batch-count split (§4)
-      const int64_t zc = std::min(kMaxBatch, batches - z0);
-      for (int64_t j0 = 0; j0 < n_hat; j0 += kMaxNPerLaunch) {
-        const int64_t nc = std::min(kMaxNPerLaunch, n_hat - j0);
+  const int64_t chunk = g_limits.k_chunk, max_batch = g_limits.max_batch;
+  const int64_t n_per_launch = g_limits.max_n_tiles * TB::kN;
+  for (int64_t k0 = 0; k0 < k_hat; k0 += chunk) {  // K-chunks (§3.5), 16-aligned
+    const int64_t kc = std::min<int64_t>(chunk, k_hat - k0);
+    for (int64_t z0 = 0; z0 < batches; z0 += max_batch) {  // batch-count split (§4)
+      const int64_t zc = std::min(max_batch, batches - z0);
+      for (int64_t j0 = 0; j0 < n_hat; j0 += n_per_launch) {
+        const int64_t nc = std::min(n_per_launch, n_hat - j0);
         const cutlass::gemm::GemmCoord size{static_cast<int>(m), static_cast<int>(nc),
                                             static_cast<int>(kc)};
         const int8_t* A = RA + z0 * plane_a + k0;

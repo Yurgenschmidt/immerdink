@@ -960,7 +960,10 @@ def test_dgemm_like():
 
 def rand_desc_triple(rng):
     """Random small legal-looking contraction: labels 0..5, extents 0..3, random dense
-    layouts (permuted, some negative strides), optional diagonal / single-operand labels."""
+    layouts (permuted, some negative strides), optional diagonal / single-operand labels.
+    The small rank (at most 6 labels) is a coverage choice for this brute-force address
+    check, not a limit of the lowering or the library (any rank is legal); operand ranks
+    6-12 run on the GPU in tests/test_frontend.py suite highrank (ctest contract_highrank)."""
     nl = rng.randint(1, 5)
     ext = {l: rng.choice((1, 2, 2, 3, 3)) for l in range(nl)}
     if rng.random() < 0.05:
@@ -987,7 +990,7 @@ def rand_desc_triple(rng):
 def test_tensor():
     rng = random.Random(81)
     # Scatter o GEMM o Gather generates exactly the einsum's (C, A, B) address triples.
-    checked = swapped = diag = 0
+    checked = swapped = diag = fused = 0
     for _ in range(400):
         A, B, C = rand_desc_triple(rng)
         try:
@@ -1008,10 +1011,35 @@ def test_tensor():
         for g in "IJKL":
             ks = [key[g](q) for q in v.order[g]]
             assert ks == sorted(ks) and all(v.ext[q] != 1 for q in v.order[g])
+            check_fusion(v, g)
         checked += 1
+        fused += sum(len(v.order[g]) - len(v.fused[g]) for g in "IJKL")
         swapped += v.swapped
         diag += len(set(A.label)) != len(A.label)
-    assert checked > 100 and swapped > 10 and diag > 3, (checked, swapped, diag)
+    assert checked > 100 and swapped > 10 and diag > 3 and fused > 10, \
+        (checked, swapped, diag, fused)
+
+    # Fusion (§5 step 9) on hand-made cases. 'ij k1 k2, k1 k2 j' dense: k1 k2 fuse in K.
+    i, j, k1, k2, x = 1, 2, 3, 4, 5
+    v = o.lower(o.Desc([3, 4, 5], [20, 5, 1], [i, k1, k2]), o.Desc([4, 5, 6], [30, 6, 1], [k1, k2, j]),
+                o.Desc([3, 6], [6, 1], [i, j]))
+    assert [ls for ls, _, _ in v.fused["K"]] == [[k2, k1]], v.fused
+    check_fusion(v, "K")
+    # The unsound v1 rule (spec IndexMap neg_fusion): an A-only label x adjacent to a K
+    # label in A must NOT fuse with it, because B carries K with stride 0 for x.
+    v = o.lower(o.Desc([3, 4, 5], [20, 5, 1], [i, k1, x]), o.Desc([4, 6], [6, 1], [k1, j]),
+                o.Desc([3, 6], [6, 1], [i, j]))
+    assert len(v.fused["K"]) == 2, v.fused
+    check_fusion(v, "K")
+    # I fuses only if adjacent in A AND in C: 'abk,k->ab' with C transposed does not fuse.
+    a, bb = 6, 7
+    # (C's fastest label is in I, so the view is swapped and a, bb end up in J.)
+    for cst, want in (([4, 1, 1], 1), ([1, 3, 1], 2)):
+        v = o.lower(o.Desc([3, 4, 5], [20, 5, 1], [a, bb, k1]), o.Desc([5, 1], [1, 1], [k1, j]),
+                    o.Desc([3, 4, 1], cst, [a, bb, j]))
+        grp = "J" if v.swapped else "I"
+        assert sorted(v.order[grp]) == [a, bb] and len(v.fused[grp]) == want, v.fused
+        check_fusion(v, grp)
 
     # 'ikl,kjl->ijl' (b = 3, permuted A, C with l slowest): equals the per-batch matrix
     # contraction in the natural order (the emulated path does not depend on K order).
@@ -1090,7 +1118,29 @@ def test_tensor():
         pass
     o.contract_tensor(o.Tensor(None, 0, Abig), o.Tensor(None, 0, Bbig), o.Tensor([1.0], 0, Cs),
                       0.0, 1.0, 2, mode=o.DIRECT)
-    RESULTS["tensor"] = f"{checked} random lowerings ({swapped} swapped, {diag} diagonal)"
+    RESULTS["tensor"] = f"{checked} random lowerings ({swapped} swapped, {diag} diagonal, {fused} fusions)"
+
+
+def check_fusion(v, g):
+    """§5 step 9 on group g of view v: the fused modes split the canonical order into
+    consecutive runs; each run is a chain (s_X(q) = s_X(p) e(p) for every tensor X), runs
+    are maximal, and the fused enumeration equals the label-by-label one."""
+    assert [q for ls, _, _ in v.fused[g] for q in ls] == v.order[g]
+
+    def chain(p, q):
+        return all(v.stride[X][q] == v.stride[X][p] * v.ext[p] for X in "ABC")
+    for t, (ls, e, st) in enumerate(v.fused[g]):
+        assert e == math.prod(v.ext[q] for q in ls)
+        assert st == {X: v.stride[X][ls[0]] for X in "ABC"}
+        assert all(chain(p, q) for p, q in zip(ls, ls[1:]))
+        if t + 1 < len(v.fused[g]):
+            nxt = v.fused[g][t + 1][0][0]
+            assert not all(v.stride[X][nxt] == st[X] * e for X in "ABC"), "fusion not maximal"
+    single = [(q, v.ext[q], {X: v.stride[X][q] for X in "ABC"}) for q in v.order[g]]
+    fused = [(tuple(ls), e, st) for ls, e, st in v.fused[g]]
+    for X in "ABC":
+        assert o._radix_vec(single, X) == o._radix_vec(fused, X)
+
 
 
 def sigma_extremes():

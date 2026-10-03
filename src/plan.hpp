@@ -25,6 +25,10 @@ struct ExecPlan {
   bool trunc = false;    // rounding = TRUNC
   WorkspaceLayout layout;
 
+  // K2 / K3 gather tiling (index_map.hpp pack_pivot), for the GEMM's A and B operands.
+  bool pack_along_rows[2] = {false, false};
+  int64_t pack_radix[2] = {1, 1};
+
   // §5 step 10 scatter vectors, in the §4a vec order, in pinned host memory owned by the
   // plan (K0 copies them to ws.vec with cudaMemcpyAsync).
   const int64_t* vec_host = nullptr;
@@ -60,6 +64,18 @@ inline VecOffsets vec_offsets(const ExecPlan& p) {
 // caller when p.swapped). Returns SUCCESS or CUDA_ERROR (launch errors only; no sync).
 imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, const double* B,
                               double beta, double* C, void* ws, cudaStream_t stream);
+
+// Launch limits of K4 (gemm_k4.cu). Production values are the hardware / DESIGN limits:
+// K-chunk K_c' (§3.5), batch count <= 65535 (gridDim.z) and N tiles <= 65535 (gridDim.y)
+// per launch. Only the test hook imd_test_set_limits (test_hooks.cpp) changes them, to
+// exercise the chunk / batch / n-hat splits on small shapes; results must not change.
+struct LaunchLimits {
+  int64_t k_chunk;      // multiple of 16 in [16, K_c']
+  int64_t max_batch;    // [1, 65535]
+  int64_t max_n_tiles;  // [1, 65535]
+};
+LaunchLimits& launch_limits();
+LaunchLimits default_launch_limits();
 
 // K4 for one residue group (gemm_k4.cu): every K-chunk (store-mod, then add-mod) of the
 // batched int8 TN GEMMs W_l[lambda] = RA_s[lambda] RB_s[lambda]^T mod p_l, l = g0 + s,

@@ -133,16 +133,36 @@ def bit_mismatches(got, want):
     return np.nonzero((gb != wb) & ~(np.isnan(got) & np.isnan(want)))[0]
 
 
+GUARD = 4096   # poisoned bytes before and after the workspace; must stay untouched (M3)
+MAX_HOST_BUFFER = 64 << 20    # bytes per operand buffer (keeps every test process small)
+MAX_WORKSPACE = 512 << 20     # device workspace bytes per case
+
+
 def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, rounding="RN",
-             mode=o.EMULATE, rng=None, expect_kind=None, verbose=False):
-    """Run one contraction on the GPU and in the oracle; raise Fail on any difference."""
+             mode=o.EMULATE, rng=None, expect_kind=None, verbose=False, chunk=o.K_C_ALIGNED):
+    """Run one contraction on the GPU and in the oracle; raise Fail on any difference.
+    The workspace sits between two GUARD-byte poisoned zones that must stay untouched (the
+    library touches only [ws, ws + workspace_size)); with the allocation shim loaded,
+    imd_contract must not allocate. `chunk` is the oracle's K-chunk length (the library's
+    is set with lib.set_limits). Returns the GPU's C buffer."""
     rng = rng or random.Random(0)
     lenA, _ = buffer_for(A)
     lenB, _ = buffer_for(B)
     lenC, _ = buffer_for(Cd)
+    for X, n_el in (("A", lenA), ("B", lenB), ("C", lenC)):   # host memory guard
+        if 8 * n_el > MAX_HOST_BUFFER:
+            raise Fail(f"{name}: {X} buffer of {8 * n_el} bytes > {MAX_HOST_BUFFER} (test guard)")
     bufA, baseA = scatter(TA, A, gen(rng, (lenA,), "uniform"))
     bufB, baseB = scatter(TB, B, gen(rng, (lenB,), "uniform"))
     bufC, baseC = scatter(TC, Cd, gen(rng, (lenC,), "uniform"))
+
+    if lib.has_test_hooks:   # size guard before the (pure Python) oracle materialises it
+        st, lw = lib.lowering(hz.make_tensor(A.extent, A.stride, A.label),
+                              hz.make_tensor(B.extent, B.stride, B.label),
+                              hz.make_tensor(Cd.extent, Cd.stride, Cd.label))
+        if st == "SUCCESS" and (lw["b"] * lw["m"] * lw["n"] * max(lw["k"], 1) > 2**27 or
+                                2 * (lw["m"] + lw["n"] + lw["k"]) + 3 * lw["b"] > 2**22):
+            raise Fail(f"{name}: view {lw['b']}x{lw['m']}x{lw['n']}x{lw['k']} too big (test guard)")
 
     # oracle
     t0 = time.time()
@@ -150,7 +170,8 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
     want = np.array(o.contract_tensor(o.Tensor(bufA.tolist(), baseA, A),
                                       o.Tensor(bufB.tolist(), baseB, B),
                                       o.Tensor(bufC.tolist(), baseC, Cd), alpha, beta, N,
-                                      rounding, g, mode, trace=trace), dtype=np.float64)
+                                      rounding, g, mode, chunk=chunk, trace=trace),
+                    dtype=np.float64)
     t_oracle = time.time() - t0
     view, kind = trace["view"], trace["kind"]
     if expect_kind is not None and kind != expect_kind:
@@ -169,29 +190,38 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
                                                                    N, gg, pmode)
     if ws_bytes != want_ws:
         raise Fail(f"{name}: workspace {ws_bytes} != params {want_ws}")
+    if ws_bytes > MAX_WORKSPACE:
+        raise Fail(f"{name}: workspace {ws_bytes} > {MAX_WORKSPACE} (test guard)")
     st, plan = lib.plan_create(tA, tB, tC, N, g, RND[rounding], MODE[mode])
     if st != "SUCCESS":
         raise Fail(f"{name}: imd_plan_create {st}")
     dA, dB, dC = cuda.malloc(bufA.nbytes), cuda.malloc(bufB.nbytes), cuda.malloc(bufC.nbytes)
-    dW = cuda.malloc(ws_bytes)
+    dW = cuda.malloc(ws_bytes + 2 * GUARD)
     try:
         cuda.upload(dA, bufA)
         cuda.upload(dB, bufB)
         cuda.upload(dC, bufC)
-        cuda.memset(dW, 0xA5, max(ws_bytes, 1))   # poison: every byte read must be written
+        cuda.memset(dW, 0xA5, ws_bytes + 2 * GUARD)   # poison: every byte read must be written
         pA = (dA.value or 0) + 8 * baseA
         pB = (dB.value or 0) + 8 * baseB
         pC = (dC.value or 0) + 8 * baseC
+        pW = dW.value + GUARD
+        allocs = lib.alloc_count()
         t0 = time.time()
-        st = lib.contract(plan, alpha, pA, pB, beta, pC, dW, ws_bytes)
+        st = lib.contract(plan, alpha, pA, pB, beta, pC, pW, ws_bytes)
         if st != "SUCCESS":
             raise Fail(f"{name}: imd_contract {st}")
         cuda.sync()
         t_gpu = time.time() - t0
+        if allocs is not None and lib.alloc_count() != allocs:
+            raise Fail(f"{name}: imd_contract allocated ({lib.alloc_count() - allocs} calls)")
         got = np.empty_like(bufC)
         cuda.download(got, dC)
-        ws = np.empty(max(ws_bytes, 1), dtype=np.uint8)
-        cuda.download(ws, dW)
+        wsg = np.empty(ws_bytes + 2 * GUARD, dtype=np.uint8)
+        cuda.download(wsg, dW)
+        if (wsg[:GUARD] != 0xA5).any() or (wsg[GUARD + ws_bytes:] != 0xA5).any():
+            raise Fail(f"{name}: bytes outside [ws, ws + workspace_size) were written")
+        ws = wsg[GUARD:GUARD + max(ws_bytes, 1)]
     finally:
         for p in (dA, dB, dC, dW):
             cuda.free(p)
@@ -212,6 +242,7 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
         print(f"  ok  {name}: {kind} m={view.m} n={view.n} k={view.k} b={view.b} N={N} g={gg} "
               f"{rounding} a={alpha} b={beta} swap={view.swapped} "
               f"(oracle {t_oracle:.2f}s, gpu {t_gpu:.3f}s)", flush=True)
+    return got
 
 
 def check_stages(name, view, trace, ws, N, g):
@@ -529,10 +560,14 @@ SUITES = {"api": suite_api, "replay": suite_replay, "stages": suite_stages, "e2e
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--lib", default=hz.default_lib())
+    ap.add_argument("--shim", help="tests/alloc_shim.c library, already in LD_PRELOAD: "
+                                   "imd_contract must not allocate")
     ap.add_argument("--suite", action="append", choices=sorted(SUITES))
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     lib, cuda = hz.Library(args.lib), hz.Cuda()
+    if args.shim:
+        lib.load_alloc_shim(args.shim)
     t0 = time.time()
     try:
         for s in args.suite or list(SUITES):

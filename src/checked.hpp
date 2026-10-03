@@ -6,6 +6,7 @@
 namespace imd::detail {
 
 __extension__ typedef unsigned __int128 u128;  // GNU extension (g++, nvcc host side)
+__extension__ typedef __int128 i128;
 
 // |x| as uint64, defined for INT64_MIN.
 constexpr uint64_t abs_u64(int64_t x) {
