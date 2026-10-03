@@ -13,7 +13,7 @@ The hand proofs of the parametric lemmas (for all k, N and inputs) are in
 `docs/PROOFS.md`, as a Lean blueprint.
 
 Current status:
-- 191 TLC models, all as expected (about 9 min with the default parallelism);
+- 230 TLC models, all as expected (about 9 min with the default parallelism);
 - 20 Apalache checks, all as expected (about 30 s, one at a time);
 - 25/25 certificates;
 - the oracle suite passes.
