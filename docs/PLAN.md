@@ -136,8 +136,10 @@ Work order, by expected payoff:
 log, A/B of K4 tiles, design proposals) and `docs/BENCHMARKS.md` ("M4 sweep"): sq8192 N = 14
 at 35.05 TFLOPS-eq (GEMMul8 31.15 in the same run), sq16384 234 ms (GEMMul8 242), permuted
 cases within 0–5 % of the matrix case at equal m, n, k (t_ikl 2.91 vs t_batch 2.77 ms),
-per-phase % of the §4 bound reported by `imd_bench`. Items 1–5 done except the K4 tile
-menu (A/B: no gain on the benchmark shapes); item 6: test hooks gated, the oracle and
+per-phase % of the §4 bound reported by `imd_bench`. Items 1, 4, 5 done; item 3: A/B of
+tiles and stages found no gain on the benchmark shapes (one config kept, swizzle 8 added);
+item 2 not changed (K4 is at the cuBLASLt int8 rate for k ≥ 4096; at k = 1024 the
+un-overlapped mod-p epilogue is the remaining K4 gap); item 6: test hooks gated, the oracle and
 TLA+ follow-ups still open. Not done: K0 on the device and a two-launch K1 (DESIGN
 changes, proposed in NOTES-M4), CUTLASS operators cached per plan.
 
