@@ -491,7 +491,11 @@ def exec_status_cases(lib, cuda, verbose):
         call("ALIASING", alpha=0.0, beta=1.0, p=dict(C=pA), what="C == A, alpha = 0")
         call("ALIASING", p=dict(W=pA - 256), what="workspace overlaps A")
         call("ALIASING", p=dict(W=pB), what="workspace overlaps B")
-        call("ALIASING", p=dict(W=(pC - need + 256) // 256 * 256), what="workspace end overlaps C")
+        pC2 = base + 32768                 # far from A and B: only C can overlap
+        assert pC2 - need > pB + nB and pC2 + nC < pW
+        call("ALIASING", p=dict(C=pC2, W=(pC2 - need + 256) // 256 * 256),
+             what="workspace end overlaps C (only C)")
+        call("ALIASING", p=dict(C=pW + need - 8), what="C starts in the workspace's last 8 bytes")
         call("SUCCESS", p=dict(W=pW, C=pW + need), what="C right after [ws, ws + size)")
         call("SUCCESS", p=dict(B=pA), what="A == B (allowed; same buffer, shapes differ)")
         # 4. MISALIGNED (after ALIASING)
