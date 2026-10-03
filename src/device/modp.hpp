@@ -27,23 +27,35 @@ IMD_HD uint64_t umulhi64(uint64_t a, uint64_t b) {
 // floor(a n / 2^64) = floor((ah n + floor(al n / 2^32)) / 2^32), because dropping the
 // fraction al n / 2^32 - floor(..) < 1 from the integer ah n 2^32 + al n cannot cross a
 // multiple of 2^64; ah n + floor(al n / 2^32) < 2^64. Same value as umulhi64(a, n) (so
-// cert_barrett's proof applies unchanged); on the device one IMAD.HI.U32 + one
-// IMAD.WIDE.U32 instead of the generic 64 x 64 high product (5 instructions).
+// cert_barrett's proof applies unchanged). On the device: t = umulhi(al, n), then the low
+// and high halves of ah n + t as one carry chain (mad.lo.cc, madc.hi), 3 multiplies instead
+// of the generic 64 x 64 high product (5 instructions + carries).
 IMD_HD uint32_t umulhi64_u32(uint64_t a, uint32_t n) {
   const auto al = static_cast<uint32_t>(a), ah = static_cast<uint32_t>(a >> 32);
 #if defined(__CUDA_ARCH__)
   const uint32_t t = __umulhi(al, n);
+  uint32_t q;
+  asm("{\n\t.reg .u32 lo;\n\t"
+      "mad.lo.cc.u32 lo, %1, %2, %3;\n\t"
+      "madc.hi.u32 %0, %1, %2, 0;\n\t}"
+      : "=r"(q)
+      : "r"(ah), "r"(n), "r"(t));
+  return q;
 #else
   const auto t = static_cast<uint32_t>((uint64_t{al} * n) >> 32);
-#endif
   return static_cast<uint32_t>((uint64_t{ah} * n + t) >> 32);
+#endif
 }
 
 // §3.5 epilogue for p != 256: n = v + bias in [0, 2^32), q = umulhi64(magic, n) = n div p,
 // v mod p = n - p q (all u32 words), exact for v in [epi_vmin, epi_vmax] (cert_barrett).
-IMD_HD uint32_t mod_p_barrett(int32_t v, uint32_t p, uint32_t bias, uint64_t magic) {
+// neg_p = 2^32 - p, so n - p q = n + neg_p q mod 2^32 (one IMAD; callers hoist neg_p).
+IMD_HD uint32_t mod_p_barrett_neg(int32_t v, uint32_t neg_p, uint32_t bias, uint64_t magic) {
   const uint32_t n = static_cast<uint32_t>(v) + bias;
-  return n - p * umulhi64_u32(magic, n);
+  return n + neg_p * umulhi64_u32(magic, n);
+}
+IMD_HD uint32_t mod_p_barrett(int32_t v, uint32_t p, uint32_t bias, uint64_t magic) {
+  return mod_p_barrett_neg(v, 0u - p, bias, magic);
 }
 
 // §3.5 epilogue: the non-negative residue v mod p for v in the certified reachable range
