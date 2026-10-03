@@ -18,7 +18,8 @@ and measured but not adopted) and the §6 thread and lifetime rules that follow 
 the host API (§6a); changed text is marked **[v1.4]**. v1.5 adds a small set of K4 tile
 configurations chosen per plan (§4; bit-identical results, same launches and workspace), the
 optional plan-time autotuning option `k4_tune` (§6) and the choice in the host API (§6a), and
-takes the fused launch KF up to k̂ ≤ 1024 (§4); changed text is marked **[v1.5]**. The change lists are at the end.
+takes the fused launch KF up to k̂ ≤ 1024 (§4); changed text is marked **[v1.5]**. §6b is a
+DRAFT for review (D1 packed operands, not implemented). The change lists are at the end.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -767,7 +768,7 @@ const char*  imd_status_string(imd_status_t);
 - **Reserved, not v1** (the API and specs must not preclude these):
   - a packed-operand API `imd_pack` / `imd_contract_packed`. Fast-mode σ depends only on
     the operand itself, so packs are reusable across contractions with the same K labels,
-    N and rounding;
+    N and rounding; **DRAFT design in §6b** (D1, for review);
   - complex values via the 2M method (2 GEMMs per modulus, moduli with √−1);
   - accurate-mode scaling, which is incompatible with independent packing.
   - adaptive precision, possibly via an Ozaki-I slice mode sharing this pipeline (PLAN, Later).
@@ -936,6 +937,426 @@ tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH).
 
 ---
 
+## 6b. Packed operands — **DRAFT for review** (ROADMAP D1) [v1.6-draft]
+
+Nothing in this section is implemented. It replaces the "Reserved, not v1" packed-operand
+bullet of §6 once approved. **Binding user decision:** an **explicit** packed-operand
+handle, not implicit plan-level caching; kernel level only (caller-owned device memory,
+the caller's stream, no allocation or synchronization in a call, capture-safe).
+**[spec: PackedOperand, 11 pos / 17 neg]**
+
+### 6b.1 What a packed operand is
+
+A packed operand is one FP64 operand X in exactly the form the emulated GEMM consumes:
+per row the shift σ (§3.2) and the non-finite flag (§3.1), and **all N** residue planes
+(§3.3–§3.4) over the whole canonical K, in a byte layout (§6b.4) that is a function of X
+alone. `imd_pack` writes it once, on the caller's stream, into caller-owned device memory;
+any number of contractions read it in place of scaling and packing X themselves.
+
+Per contraction that uses it, a packed operand saves X's K1 pass, X's ⌈N/g⌉ pack passes (or
+X's share of KF) and the workspace regions sX, fX, RX. It costs the caller
+`N·b·r·k̂` bytes (≈ N/8 × the FP64 operand, 1.75× at N = 14) for as long as it is kept.
+(Measured share of what it removes: the pack is 10–15 % of large calls; at small shapes K1
++ pack of one operand is ≈ 15 µs of ≈ 50 µs at N = 8, NOTES-A1.)
+
+Notation: X has three label classes as seen by the pack — **K** (contracted: X's labels not
+in C), **L** (batch: in C and in the partner) and **R** (rows: the rest); `b`, `r`, `k` are
+their extent products after §5 steps 2 and 4 (diagonals merged, extent-1 modes dropped),
+`k̂ = ⌈k⌉₁₆`.
+
+### 6b.2 What the packed bytes depend on (compatibility analysis)
+
+From §3, §4, §5 and `spec/oracle.py` (`scale_vector`, `quantize`, `residue`, `lower`):
+
+| Packed item | Depends on | Source |
+|---|---|---|
+| flag fX[λ,ρ] | X's values over the row's K cells | §3.1 |
+| σ[λ,ρ] | X's values over the row's K cells, **with multiplicity** (S counts every canonical k̄, so a stride-0 K mode duplicates entries); **k** (RN only: `R = (2T − κ)²`, κ = ⌈√k⌉); **N** (T); **rounding** (rule and R) | §3.2 step 4 |
+| a′ | value, σ, rounding (RN-even / trunc) | §3.3 |
+| residue of plane l | a′, p_l: the moduli prefix of length N | §3.4 |
+| byte position | the R, L and K **enumerations** (orders and extents), k̂ (= ⌈k⌉₁₆), the region/row/plane strides | §4a, §6b.4 |
+
+σ does **not** depend on the partner: the fast-mode scaling is per side (Cauchy–Schwarz),
+which is why §7 rejects accurate mode for v1. The bytes do **not** depend on: the
+partner's values or strides, C, α, β, the residue-group size g (all N planes are stored; a
+group is a contiguous slice, §6b.4), moduli parts (a launch split), the K-chunking (K4
+reads chunks of the same rows), the K4 configuration and `k4_tune` (bit-identical W, §4),
+`vec_mode`, KF vs unfused (same bits, §4), fusion (§5 step 9 merges modes without changing
+the enumeration), the stream.
+
+**Where v1.5 couples X's layout to the partner and C** (§5 step 8):
+1. **K order** = (|s_big|, |s_other|, position), big = A iff m ≥ n: it depends on the
+   partner's extents (which side is big), the partner's strides (second key) and the
+   label positions in `A ++ B ++ C`.
+2. **R order** (I of A or J of B) = (|s_C|, |s_X|, position): it depends on C.
+3. **L order** = (|s_C|, |s_A|, |s_B|, position): it depends on C and the partner.
+4. **The role swap** is decided by C: X may be post-swap A (m rows, RA layout) or B (n̂
+   rows, RB layout: the workspace pads only B to n̂).
+5. **k** includes **partner-only** labels (§5 step 6: summed, stride 0 in X): they change
+   S (duplicated entries), κ, k̂ and the layout.
+
+**Resolution.**
+- **The pack fixes its own orders; a plan built against it adopts them.** For each class
+  the packed operand carries (K, L, and X's own rows), the plan's canonical order is the
+  pack's; the partner's gather and C's scatter vectors follow it. Any order within a class
+  is a valid GEMM view (the enumeration of each class is a bijection whatever the order;
+  fusion stays sound, it only tests stride products); the follow-up IndexMap model with an
+  adopted order is listed in §6b.9.
+- **Numerical consequence: none for finite data.** The emulated result is independent of
+  the K order: S is an exact sum, residues are per element, W is an exact integer sum mod
+  p (any order below K_c', cert_kc), CRT is exact **[spec: PackedOperand
+  EmulatedOrderFree]**. Only the native path of **flagged** outputs (§3.7: an fma chain in
+  canonical K order) is order-sensitive, when a finite partial sum overflows (oracle A7:
+  NaN vs −Inf). Precisely: **a packed contraction is bit-identical to the unpacked
+  contraction run with the pack's orders**; it is bit-identical to the plain unpacked
+  contraction for every unflagged output, and for flagged outputs whenever the two K
+  orders agree **[spec: PackedOperand CEqual; neg_witness_native_order]**. The default
+  (AUTO, §6b.5) K order is X's stride order, which is also v1.5's K order whenever X is the
+  "big" operand with distinct K strides; `IMD_PACK_ORDER_GIVEN` with the helper
+  `imd_pack_desc_for` reproduces any one contraction's v1.5 orders exactly.
+- **Performance consequence.** The partner's K gather (K1, K2/K3, KF) and C's scatter
+  (K5) follow X's orders instead of their own: the partner's pack tiles may read across
+  strides, and in the post-swap B role j̄'s fastest mode is X's fastest row mode, not
+  necessarily C's (the swap's coalescing goal is lost; K5 writes C strided). The L order
+  affects the partner and C the same way. Mitigation: GIVEN orders for the contraction
+  that matters (or two packs of one tensor). To be measured in implementation.
+- **The swap is unchanged** (decided by C, §5 step 8); the layout is **role-agnostic**
+  (§6b.4), so one pack serves either post-swap role.
+- **Partner-only K labels → PACK_MISMATCH.** The plan's K would contain a label X does
+  not carry; X's rows would need duplicating along it. Not supported (the caller can sum
+  the partner over that label first). X-only K labels are fine: they are in the pack's K
+  set and the partner carries them with stride 0.
+
+**The compatibility key** (the "packed layout descriptor"): a canonical sequence of int64
+words, computed by `imd_pack_create` from the pack descriptor and by plan creation for each
+packed slot from its own lowering, and compared **word for word**:
+1. `IMD_PACK_FORMAT` (1): fixes k̂ = ⌈k⌉₁₆, the regions and their alignment, the strides,
+   the tail, the zero-padding rule and the moduli table. Bumped by any change to the bytes
+   (e.g. if D4 or E1 needs another K alignment).
+2. N and rounding.
+3. b, r, k.
+4. The **FP64 element map**: for each class in the order L, R, K, the fused modes
+   (extent, stride in X), in the pack's canonical order, fused over **X's strides alone**
+   (maximal runs with `s′ = s·e`). It is label-free: the same tensor under renamed labels
+   matches. The plan computes it from its classes restricted to X, in its (adopted) orders,
+   with X's strides — so a partner-only K label appears as a mode (e, 0) and mismatches,
+   and a label that is batch in the plan but a row in the pack mismatches.
+
+The key is **sound** (equal keys ⇒ equal σ, flags and bytes for equal X values) but not
+complete (two descriptors that enumerate the same elements but fuse differently are
+rejected; safe). Strides are in the key so that the FP64 pointer the contract receives
+addresses the elements the pack read (K5's native path). Not in the key: everything in
+the "does not depend" list above, the role, the mode (a DIRECT plan accepts a matching
+pack and does not read it).
+
+**Each key part is necessary [spec: PackedOperand]:** binding a pack that differs in one
+part gives a wrong result — a K order not adopted (`neg_order`), N (`neg_n`), rounding
+(`neg_rnd`), the K set (`neg_kset`), the format's k̂ (`neg_kalign`), two packs with
+different K orders (`neg_partner_order`); with the key check, every such pack is rejected
+and every matching one accepted (`pos_key_check`, `pos_key_check_both`,
+`AcceptedWhenKeyMatches`).
+
+### 6b.3 κ ≥ T
+
+k is fixed by the pack (the K set is in the key), N too. So `imd_pack_create` applies the
+§3.2 RN acceptance itself: RN, k ≥ 2 and κ ≥ T → NOT_SUPPORTED (such a pack could never
+feed an emulated GEMM). Plan creation keeps its rule and, with equal k and N, gives the
+same answer; nothing is checked at contract time. A pack whose K is empty after lowering
+(k = 1) is NOT_SUPPORTED too: every contraction with it dispatches DIRECT (§5) and would
+never read it. k = 0 or b·r = 0: a valid pack of 0 bytes (`imd_pack` does nothing).
+
+### 6b.4 Byte layout (format 1) — the contract
+
+```
+region  bytes                      contents
+sig     2·b·r                      int16 σ of row (λ, ρ) at index λ·r + ρ
+flag    1·b·r                      u8 non-finite flag, same index
+res     N·b·r·k̂ + (⌈r⌉₁₆ − r)·k̂    int8 residue of plane l ∈ [0, N), batch λ, row ρ, k̄:
+                                   offset l·b·r·k̂ + (λ·r + ρ)·k̂ + k̄
+                                   k̄ ∈ [k, k̂): 0;  the last (⌈r⌉₁₆ − r)·k̂ bytes ("tail"): 0
+pack_bytes = Σ align₂₅₆(region) in this order;  0 if b·r·k = 0
+```
+- Every byte of `[0, pack_bytes)` is written by `imd_pack`, alignment gaps with 0: the
+  bytes are a pure function of (key, X's values), so packs can be compared or hashed.
+- **Role A** (post-swap): K4 reads m = r rows per batch at batch stride r·k̂ — exactly the
+  v1 RA layout `[slot][λ][ī][k̂]`.
+- **Role B**: the GEMM's N extent is n̂ = ⌈r⌉₁₆; block (l, λ) is read from its start at
+  batch stride r·k̂ (not v1's n̂·k̂), so its rows r..n̂−1 are the first rows of the next
+  block, or the tail after the last block. Those rows only feed W columns ≥ n, which K5
+  never reads (§4 Padding; Pipeline "B padding rows: nothing"), are finite int8 (no
+  saturation: K_c' counts every position) and initialized, and the tail keeps the last
+  block in bounds **[spec: NoOOBRead; neg_notail, neg_brole]**. Padding rows to ⌈r⌉₁₆
+  instead would cost up to 16× for batch-heavy operands with few rows (r = 1); the tail
+  costs at most 15·k̂ bytes once.
+- **Residue groups and parts**: group G = planes [g₀, g₀ + |G|) is the contiguous slice at
+  `res + g₀·b·r·k̂` with batch index z = s·b + λ at stride r·k̂, v1's z addressing; so the
+  layout is independent of g and of moduli parts **[spec: CEqual over g ∈ Gs]**.
+- **K padding is zero** in every pack. Numerically one zero side suffices, but two packed
+  operands meet with no in-line partner to supply it **[spec: neg_nopad]**.
+- **Alignment**: k̂ is a multiple of 16, so every row is 16-byte aligned (CUTLASS); the
+  buffer must be 256-byte aligned (MISALIGNED).
+- The packed buffer replaces the workspace regions sX, fX and RX of the operand's
+  post-swap role: those have 0 bytes in the packed plan's §4a layout (§6b.6).
+
+### 6b.5 API
+
+**Host library** (libimmerdink_host, CUDA-free, pure, thread-safe; `IMD_HOST_API_VERSION`
+4):
+```c
+#define IMD_PACK_FORMAT 1
+enum { IMD_PACK_ORDER_AUTO = 0, IMD_PACK_ORDER_GIVEN = 1 };
+
+typedef struct {
+  uint32_t            struct_size;     /* sizeof(imd_pack_desc_t) as the caller compiled it */
+  int32_t             num_moduli;      /* N, 2..20 (no 0 = default: N is part of the key)  */
+  int32_t             rounding;        /* IMD_RN | IMD_TRUNC                               */
+  int32_t             order;           /* IMD_PACK_ORDER_AUTO | IMD_PACK_ORDER_GIVEN       */
+  const imd_tensor_t* tensor;          /* X: extents, strides (elements), labels           */
+  int32_t             num_contracted;  /* K: X's labels summed over (not in C)             */
+  const int32_t*      contracted;      /*   GIVEN: in canonical order, first fastest       */
+  int32_t             num_batch;       /* L: X's labels in C and in the partner            */
+  const int32_t*      batch;           /*   GIVEN: in canonical order                      */
+  int32_t             num_rows;        /* GIVEN: X's remaining labels in order; AUTO: 0    */
+  const int32_t*      rows;            /*   (AUTO: NULL)                                   */
+} imd_pack_desc_t;
+
+typedef struct {
+  uint32_t     struct_size;            /* in */
+  int32_t      status, format, num_moduli, rounding, reserved;
+  int64_t      b, r, k, k_hat;
+  uint64_t     kappa;                  /* ⌈√k⌉ */
+  imd_region_t sig, flag, res;         /* offsets and bytes in the packed buffer */
+  uint64_t     pack_bytes;             /* §6b.4 total */
+  uint64_t     pack_ws_bytes;          /* workspace imd_pack needs (may be 0) */
+  uint64_t     key_digest;             /* FNV-1a of the key words: diagnostics only */
+} imd_pack_layout_t;
+
+typedef struct { const imd_pack_desc_t* A; const imd_pack_desc_t* B; } imd_packing_t;
+                                       /* NULL member: that operand is packed in-line */
+
+imd_status_t imd_pack_layout(const imd_pack_desc_t*, imd_pack_layout_t* out);
+imd_status_t imd_pack_desc_for(const imd_tensor_t* A, const imd_tensor_t* B,
+                               const imd_tensor_t* C, const imd_options_t*,
+                               int32_t operand,          /* 0 = caller's A, 1 = caller's B */
+                               imd_pack_desc_t* out, int32_t* labels, int32_t capacity);
+imd_status_t imd_workspace_size_packed(const imd_tensor_t* A, const imd_tensor_t* B,
+                                       const imd_tensor_t* C, const imd_options_t*,
+                                       const imd_packing_t*, size_t* bytes);
+imd_status_t imd_workspace_layout_packed(const imd_tensor_t* A, const imd_tensor_t* B,
+                                         const imd_tensor_t* C, const imd_options_t*,
+                                         const imd_packing_t*, imd_region_t* regions,
+                                         int32_t capacity, int32_t* num_regions,
+                                         size_t* total);
+imd_status_t imd_lowering_packed(const imd_tensor_t* A, const imd_tensor_t* B,
+                                 const imd_tensor_t* C, const imd_options_t*,
+                                 const imd_packing_t*, imd_lowering_t* out);
+```
+- `imd_pack_layout`: statuses SUCCESS, INVALID_VALUE (N or rounding out of range; a listed
+  label not in X, listed twice, or in two lists; GIVEN with a missing row label; AUTO with
+  `rows`; §5 rows 1 and 5 applied to X alone: inconsistent repeated-label extents, span or
+  extent-product overflow), NOT_SUPPORTED (§6b.3: κ ≥ T with RN; K empty). AUTO orders each
+  class by (|s_X| after the diagonal merge, first position in X's labels).
+- `imd_pack_desc_for`: fills `out` (GIVEN) with the classes and orders that v1.5's
+  unpacked plan of (A, B, C, options) uses for one operand, its label lists written into
+  the caller's `labels[capacity]` (`out`'s pointers point into it; `out->tensor` = the
+  argument). A pack made from it reproduces that contraction bit for bit, including flagged
+  outputs, with v1.5's C-write coalescing.
+- `imd_workspace_size_packed` / `imd_workspace_layout_packed`: §4a with sX, fX, RX of each
+  packed operand's **post-swap** role at 0 bytes (same region order, `bytes = 0` = absent).
+  Same statuses as the in-line functions plus PACK_MISMATCH (they compute the slot keys:
+  they are the plan-time compatibility check, without a GPU).
+- `imd_lowering_packed`: as `imd_lowering`, for the packed plan; **version 4** of
+  `imd_lowering_t` (176 bytes) appends `int32_t packed` (bit 0: caller's A packed, bit 1:
+  caller's B) and `int32_t pack_mismatch` (0, or the first differing key part:
+  `IMD_PACK_MISMATCH_FORMAT, _MODULI, _ROUNDING, _CLASSES` (incl. partner-only K labels),
+  `_EXTENTS, _STRIDES, _ORDER` (two packs' K or L orders differ)). `kernel_launches`,
+  `fused` and the plan bytes describe the packed plan (no K1 or pack launches for a packed
+  operand; KF, if chosen, works on the in-line operand only).
+- New status **`IMD_STATUS_PACK_MISMATCH` (8)**, appended; `imd_status_string` names it.
+
+**Device library** (libimmerdink):
+```c
+typedef struct imd_pack_s* imd_pack_t;   /* immutable host object: the key and the layout */
+
+imd_status_t imd_pack_create(imd_handle_t, const imd_pack_desc_t*, imd_pack_t*);
+imd_status_t imd_pack_destroy(imd_pack_t);
+imd_status_t imd_pack_bytes(imd_pack_t, size_t* pack_bytes, size_t* pack_ws_bytes);
+imd_status_t imd_pack(imd_pack_t, const double* X, void* packed, size_t packed_bytes,
+                      void* ws, size_t ws_bytes, cudaStream_t);
+
+imd_status_t imd_plan_create_packed(imd_handle_t, const imd_tensor_t* A,
+                                    const imd_tensor_t* B, const imd_tensor_t* C,
+                                    const imd_options_t*, imd_pack_t packA, imd_pack_t packB,
+                                    imd_plan_t*);        /* NULL pack: that operand in-line */
+
+typedef struct {
+  const double* data;          /* the FP64 operand (always: K5's native path, DIRECT)     */
+  const void*   packed;        /* imd_pack's output, or NULL when the plan packs in-line   */
+  size_t        packed_bytes;
+  imd_pack_t    pack;          /* a handle whose key equals the plan's slot key, or NULL   */
+} imd_operand_t;
+
+imd_status_t imd_contract_packed(imd_plan_t, double alpha, const imd_operand_t* A,
+                                 const imd_operand_t* B, double beta, double* C,
+                                 void* ws, size_t ws_bytes, cudaStream_t);
+```
+- `imd_pack_create`: `imd_pack_layout`'s statuses, ALLOC_FAILED (the host object). The
+  handle copies the descriptor (O(rank)); no device work.
+- `imd_pack` checks, in order: null pointers (X and packed when `pack_bytes > 0`, ws when
+  `pack_ws_bytes > 0`) → INVALID_VALUE; `pack_bytes = 0` → SUCCESS, nothing touched;
+  ALIASING (packed ∩ X; ws ∩ X or packed); MISALIGNED (X 8, packed and ws 256 bytes);
+  `packed_bytes < pack_bytes` or `ws_bytes < pack_ws_bytes` → INSUFFICIENT_WORKSPACE. Then it
+  launches only (no allocation, no synchronization). Its kernel(s) are an implementation
+  choice (the D4 work may change them); only the bytes of §6b.4 are specified.
+- `imd_plan_create_packed`: the §6 plan-time checks, then the key of each packed slot
+  against the plan's lowering with adopted orders (§6b.2) → PACK_MISMATCH, then §3.2 RN
+  acceptance (last, as in §5). `options.num_moduli` and `rounding` must equal the packs'
+  (else PACK_MISMATCH: `_MODULI` / `_ROUNDING`); `residue_group`, `vec_mode`, `k4_tune`,
+  `mode` are free. The plan **copies the keys**; it keeps no reference to the handles.
+  With both handles NULL it is `imd_plan_create`.
+- `imd_contract_packed` checks, in order:
+  1. A or B (the `imd_operand_t*`) NULL → INVALID_VALUE; for each operand: `packed` non-NULL
+     iff the plan packs it, and then `pack` non-NULL with a key equal to the plan's slot
+     key, else PACK_MISMATCH (host-only compare of O(rank) words);
+  2. §6's null rule with `data` for A and B, plus `packed` when α ≠ 0, k ≠ 0, the dispatch
+     is EMULATE and `pack_bytes > 0` → INVALID_VALUE;
+  3. an empty output → SUCCESS, nothing touched;
+  4. ALIASING: C ∩ any of A.data, B.data, A.packed, B.packed; ws ∩ any of those or C
+     (byte intervals as §5 row 6; a packed buffer's interval is `[packed, packed +
+     pack_bytes)`). Packed buffers may overlap each other and either FP64 operand (all are
+     only read);
+  5. MISALIGNED (packed buffers 256 bytes);
+  6. `ws_bytes` < the packed workspace size, or `packed_bytes < pack_bytes` →
+     INSUFFICIENT_WORKSPACE.
+  `imd_contract` on a plan made with a pack returns PACK_MISMATCH (it has no packed
+  pointers to read).
+- **Dispatch.** EMULATE reads the packed σ, flags and residues and the FP64 data only for
+  flagged outputs; DIRECT, K-empty, SCALE (k = 0, α = 0) and NOOP never read the packed
+  buffer (DIRECT reads `data`).
+- **`vec_mode`**: unchanged. The vec region (or the plan's resident copy) still holds X's
+  vectors: K5's native path reads X through them.
+- **KF / fused paths**: the plan-time choice is unchanged in form; KF (and D4's fused
+  variants) scale and pack only the in-line operand. With both operands packed no scale or
+  pack kernel runs: K0 (generate mode), K4, K5.
+- **K4**: `k4_select` has the same inputs (m, n̂, k̂, b, N, g, SMs); a packed operand
+  changes only K4's operand pointer and, in the B role, its batch stride (r·k̂). `k4_tune`
+  times the plan's own parameters on its private temporary memory, as now.
+
+**Versioning.** `IMD_HOST_API_VERSION` 4 adds the functions, `IMD_STATUS_PACK_MISMATCH`, the
+`IMD_PACK_*` enums and `imd_lowering_t` v4; `imd_pack_desc_t` and `imd_pack_layout_t` carry
+`struct_size` (trailing fields may be added; older callers get what they know). Nothing
+existing changes. The **packed bytes are versioned by `IMD_PACK_FORMAT`**, which is part of
+the key: a pack is valid for any library version with the same format.
+
+### 6b.6 Workspace and plan bytes with packed operands
+
+- §4a unchanged except: for a packed post-swap A, `sA = fA = RA = 0` bytes; for a packed B,
+  `sB = fB = RB = 0`. vec and W unchanged. (Both packed at 8192³, N = 14: 2.625 GiB → W +
+  vec only, ≈ 0.88 GiB.)
+- Plan device bytes unchanged (§4a); plan host bytes grow by the copied keys (O(rank)),
+  reported by `imd_lowering_packed`.
+- The pack buffer: `pack_bytes` (§6b.4) per packed operand, owned by the caller; `imd_pack`'s
+  workspace `pack_ws_bytes`, needed only during `imd_pack`. With the user tensors and the
+  workspace, that is all the device memory (MEMORY_MODEL §3 to be updated).
+
+### 6b.7 Threads, lifetime and ordering
+
+- **`imd_pack_t`** is immutable after creation: any number of threads may pass one handle
+  to `imd_pack`, `imd_plan_create_packed` and `imd_contract_packed` concurrently. It may be
+  destroyed once every call that was passed it has **returned** (no GPU work reads it:
+  `imd_pack`'s kernel arguments are copied at launch; plans copy the key). A plan outlives
+  the handles it was created with; `imd_contract_packed` needs *a* handle with the same
+  key (it may be a new one).
+- **The packed buffer** is caller-owned device memory on the plan's device. `imd_pack`
+  writes it on its stream; `imd_contract_packed` only reads it, so **any number of
+  in-flight contracts may read one packed buffer concurrently**, on any streams
+  (`pos_stream_events`, witness `neg_witness_concurrent`). The caller orders, as for any
+  stream-ordered library: **RAW** — every contract that reads it after `imd_pack` on the
+  same stream or behind an event (`neg_stream_no_raw`); **WAR** — a re-pack into it, a
+  `cudaFree[Async]` of it, or any other write, after every contract reading it, by stream
+  order or events (`neg_stream_no_war`, `neg_stream_free_early`).
+- **The FP64 operand** must hold the values that were packed from the start of `imd_pack`
+  until every contract using that pack has completed: K5's native path reads it for flagged
+  outputs, and a result mixing two versions is neither contraction
+  (`neg_stream_writex_early`). If X changes, re-pack.
+- Two `imd_pack` calls into one buffer must not overlap (like a workspace, §6 rule 1);
+  into distinct buffers, any concurrency.
+- **Capture**: `imd_pack` and `imd_contract_packed` only launch kernels on the caller's
+  stream (no synchronization, allocation or host↔device copy), so both may be captured
+  into a CUDA graph; a replay keeps the captured pointers. Plan and pack creation are not
+  capturable (as before; pack creation does no device work at all).
+- **[spec: PackedOperand StreamSpec: NoStaleRead, PackReadsX1, CompleteAtEnd,
+  Termination]**; host-side handle lifetime follows HostAPI's pattern (to be added there
+  in implementation).
+
+### 6b.8 Semantics summary (amends §1)
+
+For a contraction with packed operands, C is a pure function of (input bits, α, β, N,
+rounding, the canonical orders, library format), where the orders are the packs' (§6b.2).
+For unflagged outputs the orders do not matter, so C equals the unpacked v1.5 result; for
+flagged outputs it equals the unpacked result in the pack's K order. Results do not depend
+on whether the pack was made by this or an earlier call, g, parts, chunking, K4
+configuration, `vec_mode` or KF. **[spec: PackedOperand SigmaEqual, WEqual, CEqual,
+EmulatedOrderFree over N ∈ {2, 3}, RN and TRUNC, both roles, g ∈ 1..N, one or two packed
+operands, non-finite inputs]**
+
+### 6b.9 Not in this draft (implementation phase)
+
+- IndexMap: lowering with adopted orders (EinsumPreserved for any order within a class;
+  the slot-key computation; PACK_MISMATCH's place in the status precedence).
+- Pipeline: a packed slot (no K1/K2/K3 for it; K4 reads the caller's buffer, B role at
+  stride r·k̂ with the tail; K5 reads σ and flags from it). Pipeline is being changed by
+  D4; packed slots go in after D4 lands.
+- HostAPI: the pack handle (immutable, destroy after return).
+- `params.py`: `cert_pack_layout` (§6b.4 bytes, overflow to uint64 → INVALID_VALUE);
+  oracle: `pack()` returning the §6b.4 bytes and `contract_tensor(..., packs=...)`, and
+  the bit-for-bit GPU test of every byte.
+
+### 6b.10 Open questions for review (recommendation first)
+
+1. **Entry point.** A new `imd_contract_packed` with `imd_operand_t` (recommended: the v1
+   `imd_contract` signature and ABI stay untouched; a packed plan through `imd_contract`
+   is PACK_MISMATCH) — or widen `imd_contract`.
+2. **Plans take handles.** `imd_plan_create_packed(…, imd_pack_t, imd_pack_t)`
+   (recommended: one key computation, the handle is what users hold) — or descriptors
+   (`imd_packing_t`, as the host queries take).
+3. **Contract-time key check through a handle** (recommended: O(rank) host compare, catches
+   a buffer of the wrong pack *kind*; it cannot catch a wrong buffer of the right kind) —
+   or no handle at contract time (plan-time check only, slightly leaner).
+4. **FP64 data required at contract** (recommended: bit-exact, flagged outputs need it;
+   costs nothing unless an output is flagged) — or optional with a documented deviation
+   (`data = NULL` ⇒ flagged outputs are NaN), which lets a caller drop X after packing.
+5. **Orders.** AUTO = X's stride order by default plus GIVEN and `imd_pack_desc_for`
+   (recommended) — or GIVEN only, or AUTO only. With AUTO only, C writes in the B role and
+   the partner's gather may be strided (§6b.2), and flagged outputs may differ from the
+   unpacked call.
+6. **Role-agnostic layout with a tail** (recommended; one pack serves both post-swap roles,
+   ≤ 15·k̂ extra bytes) — or rows padded to ⌈r⌉₁₆ (simpler K4 strides, up to 16× bytes for
+   r = 1), or per-role packs (two layouts, two keys).
+7. **One handle for both roles** (recommended: follows from 6; the swap stays C's).
+8. **TRUNC packs** allowed (recommended: rounding is just a key field) — or RN only.
+9. **g-free layout** with all N planes (recommended; g stays an in-line workspace knob) —
+   or g-dependent packs (no benefit: a group is a contiguous slice either way).
+10. **Partner-only K labels → PACK_MISMATCH** (recommended) — or support them (needs a
+    stride-0 read of the packed row along that label, which K4's dense TN operand cannot
+    express).
+11. **Statuses.** New PACK_MISMATCH (8) with a reason code in `imd_lowering_packed`
+    (recommended); a short packed buffer reuses INSUFFICIENT_WORKSPACE (recommended) — or a
+    new INSUFFICIENT_PACK.
+12. **No header in the packed buffer** (recommended: pure data, the bytes are a function of
+    key and values; `key_digest` exists for diagnostics only) — or a device-side header
+    with the digest, checked by a debug build.
+13. **`imd_pack` takes a workspace** sized by the host API (recommended: keeps the pack
+    kernel free, e.g. D4's fused pack or a split long-row K1 may need scratch; 0 if not) —
+    or no workspace parameter.
+14. **K-empty packs → NOT_SUPPORTED, DIRECT plans accept and ignore packs** (recommended) —
+    or reject packs in DIRECT plans.
+15. **Interaction with C1 (adaptive precision)**: N is in the key, so a pack serves one N.
+    An Ozaki-I slice format (C1(c)) would be a new `IMD_PACK_FORMAT` where one pack serves
+    every N′ ≤ N; out of scope here (recommended: keep N in the key for format 1).
+
+---
+
 ## 7. What was considered and rejected
 
 | Option | Why not |
@@ -1043,3 +1464,20 @@ tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH).
 - **§4 KF for k̂ ≤ 1024** (was 512): plans with 512 < k̂ ≤ 1024 take the fused launch
   (`fused` = 1, `kernel_launches` accordingly). Same outputs and workspace; Pipeline's
   `Fused` is k̂-independent, so no spec change.
+
+## Draft v1.6 (D1 packed operands; DRAFT for review, not implemented)
+
+- **§6b (new, DRAFT).** An explicit packed-operand handle (`imd_pack_create` / `imd_pack` /
+  `imd_plan_create_packed` / `imd_contract_packed`) and the CUDA-free sizing and
+  compatibility queries (`imd_pack_layout`, `imd_pack_desc_for`, `imd_*_packed`,
+  `imd_lowering_t` v4, `IMD_STATUS_PACK_MISMATCH`). The compatibility analysis: the packed
+  bytes depend on X's values over its K cells, k, N, rounding and the R/L/K enumerations,
+  not on the partner, C, g, parts, chunking, K4 configuration, `vec_mode` or KF; v1.5's
+  canonical orders and the swap couple X to the partner and C, so the pack fixes its own
+  orders and plans adopt them (bit-identical for unflagged outputs, and for all outputs in
+  the adopted order). The key (format, N, rounding, b·r·k, the label-free FP64 element map in
+  canonical order) is compared word for word. Byte layout format 1: σ, flags, all N planes
+  `[l][λ][ρ][k̂]` with zero K padding and a zeroed tail, role-agnostic and g-free.
+  Ordering (RAW/WAR on the packed buffer and the FP64 operand) is the caller's. **[spec:
+  PackedOperand (new): 11 pos / 17 neg]**. §1, §4, §4a, §5, §6, §6a are unchanged until
+  approval; §6 "Reserved" points here. Open questions: §6b.10.
