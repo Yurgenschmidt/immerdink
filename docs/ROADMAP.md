@@ -58,7 +58,7 @@ milestone like M2/M3, L ≈ multi-milestone or research.
 |---|---|---|---|---|
 | D1 | **Packed-operand reuse** — pack an operand once, use it in many contractions (kernel-level: caller owns the packed buffer) | same integrals/amplitudes in many contractions; pack is 10–15% of large calls, more at small g | M | interacts with C1(c) |
 | D2 | Complex (2M / 3M via the moduli table) | complex-valued workloads | M | needed by ehrenfest? |
-| D3 | **Packed symmetric contractions**, generic permutational symmetry (DF-CCSD PPL) | memory and flops of symmetric tensors; no generic kernels exist even without Ozaki | L–XL (research) | after D1; symmetry descriptor API |
+| D3 | **Packed symmetric contractions**, generic permutational symmetry (DF-CCSD PPL). Eric (2026-10-03): ideally **one kernel fits all** symmetry patterns; if that gets too hard, split it into separate sub-problems. Use TLA+ to settle whether the generic design is correct before choosing | memory and flops of symmetric tensors; no generic kernels exist even without Ozaki | L–XL (research) | after D1; symmetry descriptor API |
 | D4 | Fused variants (pack inside the GEMM main loop; MEMORY_MODEL §7) | workspace and pack traffic | L | after A2 |
 
 ## Phase E — Hardware
