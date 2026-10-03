@@ -1,0 +1,61 @@
+// Execute-time entry points shared by the host API (api.cpp) and the CUDA translation units
+// (contract.cu, gemm_k4.cu). The plan's data (ExecPlan, imd_plan_st) is CUDA-free and lives
+// in libimmerdink_host (src/host/plan_data.hpp); C++17 (it is included by nvcc TUs).
+#pragma once
+
+#include <cstdint>
+#include <memory>
+
+#include <cuda_runtime_api.h>
+
+#include "host/k4_launches.hpp"
+#include "host/plan_data.hpp"
+#include "immerdink/immerdink.h"
+
+namespace imd::detail {
+
+// Enqueue K0-K5 (contract.cu). A and B are the GEMM's operands (already swapped by the
+// caller when p.swapped). Reads `p` only. Returns SUCCESS or CUDA_ERROR (launch errors
+// only; no sync).
+imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, const double* B,
+                              double beta, double* C, void* ws, cudaStream_t stream);
+
+// K0 (contract.cu): write the p.vec_count scatter vectors to `vec` from p.vec_desc, on
+// `stream`. Also builds the resident copy at plan creation. SUCCESS or CUDA_ERROR.
+imd_status_t k0_generate(const ExecPlan& p, int64_t* vec, cudaStream_t stream);
+
+// K4's current launch limits (gemm_k4.cu; host/k4_launches.hpp LaunchLimits): the
+// production values unless the test hook imd_test_set_limits changed them. k4_prepare reads
+// them, so they apply to plans created afterwards.
+LaunchLimits& launch_limits();
+LaunchLimits default_launch_limits();
+
+// K4 setup at plan creation (gemm_k4.cu, DESIGN v1.2 §6): for every launch shape of the
+// call (K-chunk length, batch count, n-hat part; store-mod / add-mod), the CUTLASS kernel
+// parameters, built from the device's SM count and the kernels' occupancy, after setting
+// their dynamic shared-memory attribute. All CUTLASS host state is touched here, never in
+// imd_contract. SUCCESS, CUDA_ERROR, or NOT_SUPPORTED if CUTLASS rejects a shape.
+imd_status_t k4_prepare(const ExecPlan& p, std::shared_ptr<const K4Plan>* out);
+
+// K4 for one residue group (gemm_k4.cu): every K-chunk (store-mod, then add-mod) of the
+// batched int8 TN GEMMs W_l[lambda] = RA_s[lambda] RB_s[lambda]^T mod p_l, l = g0 + s,
+// s < gsize, over RA [s][lambda][m][k_hat], RB [s][lambda][n_hat][k_hat] and the u8 planes
+// W [l][lambda][m][n_hat]. Splits the batch count (<= 65535 per launch) and n_hat
+// (gridDim.y <= 65535). Copies the prepared parameters, sets this call's pointers and
+// launches; reads `k4` only. Returns SUCCESS or CUDA_ERROR.
+imd_status_t k4_group(const K4Plan& k4, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
+                      int gsize, cudaStream_t stream);
+
+// The execution data of a plan (api.cpp), for the test hooks; nullptr for a null plan.
+const ExecPlan* exec_of(imd_plan_t plan);
+
+// The K4 parameter sets a plan holds (gemm_k4.cu): store-mod and add-mod shape keys, the
+// launches of one call, and the host payload of the K4Plan (sizeof(K4Plan) plus its map
+// entries), for the test hook that checks libimmerdink_host's sizing against a real plan.
+struct K4Footprint {
+  int64_t store_shapes = 0, add_shapes = 0, launches = 0;
+  uint64_t bytes = 0;
+};
+K4Footprint k4_footprint(const K4Plan& k4, int N, int g);
+
+}  // namespace imd::detail

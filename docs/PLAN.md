@@ -1,0 +1,261 @@
+# immerdink — plan
+
+What is built, in what order, and what "done" means for each step. The design itself is
+in [DESIGN.md](DESIGN.md), memory/time formulas in [MEMORY_MODEL.md](MEMORY_MODEL.md),
+and background context in [CC_NOTES.md](CC_NOTES.md).
+
+Ground rules for every milestone:
+- **Spec before code.** A design change lands in DESIGN.md and the affected TLA+ spec,
+  with models passing, before any implementation change.
+- **Quiet machine for benchmarks.** Timing runs go through `tools/run_bench.sh`. It
+  serializes runs machine-wide, waits for `tools/quiet_check.sh`, and records the
+  conditions (`QUIET_LOG`) together with the commit and env.
+- Correctness tests (`tools/run_quiet.sh`) and TLC (`spec/check.sh`) are pass/fail, so they
+  run ungated and in parallel.
+- **Bitwise oracle.** Every GPU result is compared **bit-for-bit** with `spec/oracle.py`.
+  The emulated path is exact integer arithmetic plus specified roundings, so equality is
+  the right test, not a tolerance.
+- Work lands on `dev`; `main` changes only by PR.
+- Keep it simple. Where GEMMul8, the Ozaki papers or CUTLASS already solved something,
+  reuse that approach. Novelty is not a goal; a good, general TBLIS-style Ozaki-II kernel is.
+
+---
+
+## S — Specification ✅ (done 2026-10-02)
+
+| Artifact | Checks | Status |
+|---|---|---|
+| `spec/OzakiCRT.tla` | residues, int8 store, saturating/havoc INT32 accumulator, K-chunk carry, CRT uniqueness | 13 models ✅ |
+| `spec/CRTRealization.tla` | division-free running CRT refines exact CRT (exact → word → limbs) | 21 models ✅ |
+| `spec/OzakiScaling.tla` | exact-integer shift rule, RN/TRUNC, norm budget ⇒ CRT precondition, error bounds, single final rounding | 41 models ✅ |
+| `spec/IndexMap.tla` | lowering, legality and status precedence, `Scatter∘GEMM∘Gather = einsum`, injectivity, fusion | 18 models ✅ |
+| `spec/Pipeline.tla` | K0–K5 ordering, buffer reuse, exactly-once writes, read rules, exact workspace layout | 28 models ✅ |
+| `spec/params.py` | real-width certificate for every constant and bound | 24/24 ✅ |
+| `spec/oracle.py` | exact bit-level reference of DESIGN §3, the oracle for M1+ | suite passes ✅ |
+
+Every artifact went through adversarial review with mutation testing. Every surviving
+mutant was then killed by strengthening the models or tests. The review found real design
+bugs, now fixed in DESIGN v1.1:
+- a false error-bound inequality;
+- an unsound fusion rule;
+- an under-specified epilogue mod;
+- a missing per-batch modulus source.
+
+Spec follow-ups, to do before or alongside M2/M3 (see `spec/README.md`):
+- the operand-role swap in IndexMap;
+- workspace aliasing and MISALIGNED statuses;
+- K-empty → DIRECT in Pipeline and the oracle.
+
+## L — Lean formalization ✅ (done 2026-10-02)
+
+- `proofs/` Lake project (Lean 4 + Mathlib) proving PROOFS.md's L1–L4: shift rule ⇒ norm
+  budget, running CRT, error contract, K-chunk carry.
+- Statements use exact arithmetic only; the final FP rounding is a hypothesis.
+
+**Exit:** all four lemmas machine-checked with no `sorry`. A CI target builds `proofs/`.
+**Status:** met. `tools/check_proofs.sh` passes; 48 headline theorems use only the standard axioms.
+
+## M0 — Scaffolding
+
+- Dedicated conda env `immerdink` (`environment.yml`).
+- CMake + CUDA 13.4, `-gencode arch=compute_89,code=sm_89`, C++17 for CUTLASS TUs.
+- Vendor CUTLASS v4.8.0 (`098de2a`) as a git submodule, include path only.
+- `params.py --emit-header` generates the device constant tables. No hand-written constants.
+- Host types: tensor descriptor, status codes, the C ABI skeleton from DESIGN §6.
+- A test runner that feeds random cases to both the library and `oracle.py` and compares
+  bits.
+
+**Exit:** builds clean; `imd_workspace_size` matches `params.workspace_size` on a grid of
+shapes; CI-able test target runs under `run_quiet.sh`.
+
+## M1 — Ozaki-II on the GPU ✅ (done 2026-10-03)
+
+Kernels:
+- K1 scale: shifts plus non-finite detection.
+- K2/K3 pack: row-major A and column-major B only.
+- K4: CUTLASS 2.x batched int8 TN GEMM with the Sm80EVT mod→u8 epilogue (store-mod and
+  add-mod).
+- K5: CRT, unscale, α/β, and the native path for flagged elements.
+
+The mod reduction is verified **exhaustively** over every reachable int32 accumulator for
+every modulus, on CPU against the oracle.
+
+**Exit:**
+- Bitwise equal to the oracle for random m, n, k ∈ [1, 3000], N ∈ [2, 20], RN/TRUNC,
+  α/β special cases, non-finite inputs, and K-chunking at k > 131056.
+- Accuracy matches the oracle's φ-sweep tables.
+
+## M2 — Tensor front end (IndexMap) ✅ (done 2026-10-03)
+
+- Label lowering per DESIGN §5.
+- Int64 scatter vectors.
+- Gather-pack with shared-memory transposes for interleaved permutations.
+- Scatter in the CRT kernel, coalesced along C's fastest label.
+- Legality checks with statuses.
+
+**Exit:**
+- Bitwise equal to the oracle on random contractions: ranks ≤ 6, random permutations,
+  negative and zero strides, A/B diagonals, single-operand labels.
+- Every illegal case returns the right status.
+- The CC fixtures (`acQ,bdQ->acbd`, `ijdkQ,ldQ->klij`, `kjbc,kiac->abij`, the six (T)
+  permutations) pass.
+
+## M3 — Robustness ✅ (done 2026-10-03)
+
+- Batch-launch splitting (gridDim.z ≤ 65535).
+- DIRECT kernel for K-empty contractions.
+- C-vs-A/B aliasing check.
+- Zero-size and degenerate shapes.
+
+**Exit:**
+- Measured peak device memory equals `imd_workspace_size` exactly (cudaMemGetInfo
+  bracketing).
+- Results are bitwise identical across K-chunk lengths and residue groups.
+- Every DESIGN §3.7/§5 edge case behaves as specified.
+
+**Status (2026-10-03):** M2 and M3 done; see `docs/NOTES-M2M3.md`. 22 ctest tests,
+including `contract_highrank` (operand ranks 6–12, ≤ 15 labels, layouts that defeat
+fusion, hard size guards; ~1.6 s, ~190 MB). compute-sanitizer memcheck/initcheck clean.
+
+## M4 — Performance ✅ (done 2026-10-03)
+
+Work order, by expected payoff:
+1. Gather-pack at coalesced bandwidth on interleaved permutations. This is the
+   TBLIS-style kernel's main value.
+2. Epilogue mod cost (magic multiply, 128-bit stores).
+3. Tile and stage selection by wave quantization.
+4. CRT kernel (multi-word integer, N u8 reads per element).
+5. From NOTES-M2M3: K5 picks its thread-fastest axis (ī, j̄ or λ) from C's fastest label
+   (today a batch-fastest C is written strided); K1 reads over the pack's tiles (or folded
+   into the pack's read phase); pack pivots along rows only when the tile fills.
+6. Hygiene: test hooks only with `IMMERDINK_BUILD_TESTS=ON`; `oracle.lower` builds
+   scatter vectors lazily (the full-list version needed tens of GB on a legal 2^31-row
+   descriptor); TLA+ models for the n̂ grid split and the κ ≥ T scope.
+
+**Status (2026-10-03):** exit targets met; see `docs/NOTES-M4.md` (what changed, per-phase
+log, A/B of K4 tiles, design proposals) and `docs/BENCHMARKS.md` ("M4 sweep"): sq8192 N = 14
+at 35.05 TFLOPS-eq (GEMMul8 31.15 in the same run), sq16384 234 ms (GEMMul8 242), permuted
+cases within 0–5 % of the matrix case at equal m, n, k (t_ikl 2.91 vs t_batch 2.77 ms),
+per-phase % of the §4 bound reported by `imd_bench`. Items 1, 4, 5 done; item 3: A/B of
+tiles and stages found no gain on the benchmark shapes (one config kept, swizzle 8 added);
+item 2 not changed (K4 is at the cuBLASLt int8 rate for k ≥ 4096; at k = 1024 the
+un-overlapped mod-p epilogue is the remaining K4 gap); item 6: test hooks gated, the oracle and
+TLA+ follow-ups still open. Not done: K0 on the device and a two-launch K1 (DESIGN
+changes, proposed in NOTES-M4), CUTLASS operators cached per plan.
+
+**Baselines**, all run under `run_bench.sh`, reporting median and spread plus machine
+conditions:
+- native DGEMM (cuBLAS, `CUBLAS_COMPUTE_64F_PEDANTIC`, so env vars can't turn it into
+  emulation);
+- cuBLAS 13.7 fixed-point emulation (`CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT`);
+- cuBLASLt int8 TN GEMM (the GEMM-phase roofline);
+- GEMMul8 v3.5.2 (MIT; build in scratch);
+- cuTENSOR 2.7 FP64 contraction.
+
+Note that cuTENSOR's `CUTENSOR_COMPUTE_DESC_8XINT8` is Hopper+ only, so it is not
+available on sm_89.
+
+**Exit:**
+- 8192³ matrix at N = 14 at or above GEMMul8's measured 12.85 TFLOPS-equivalent (4090
+  Laptop). The desktop 4090 should exceed it.
+- Permuted tensor contractions within 15% of the matrix-case throughput at equal m, n, k.
+- Each phase reported as a % of its MEMORY_MODEL §5 lower bound.
+
+## M5 — Real-workload check (optional) ✅ (done 2026-10-03)
+
+- Run a few real contractions (CC_NOTES fixtures) and one small end-to-end calculation
+  against FP64, as a sanity check of the accuracy model.
+- Status: [ACCURACY.md](ACCURACY.md), scripts in `bench/accuracy/`.
+  - 4 CC-shaped fixtures × 5 stressing distributions × N = 8…20 × {RN, TRUNC}, with
+    **no §3.8 bound violation**.
+  - Max observed/bound is 0.2 while emulation error dominates, and 0.99 once the final
+    rounding dominates (N ≥ 16).
+  - A Jacobi iteration shows no error accumulation, and from N = 14 on it matches FP64.
+  - Recommended N: 14 for FP64-comparable normwise accuracy, 16 for the guarantee. Add
+    ≈ log₁₀(‖a‖‖b‖/|x|)/1.15 moduli for an elementwise target.
+  - ctest `accuracy_bound_quick` guards the bound.
+
+## Later (designed-for, not scheduled)
+
+- ~~Internal tiling within a workspace budget.~~ **Out of scope** (Eric, 2026-10-03):
+  immerdink stays at kernel level. Operands and workspace are caller-owned device memory
+  used on the caller's stream; immerdink does no host↔device data movement and no
+  out-of-core or tiling orchestration (callers such as ehrenfest own that). Likewise no
+  immerdink-owned CUDA graphs: `imd_contract` must instead stay **stream-capture safe**
+  (no allocation, no host sync; add a capture test).
+- **Shape-dependent kernel selection.** Use cases vary widely in m:n:k (skinny, low-k,
+  long-k, tiny batched) and in plan count (dozens of live plans or one hot plan; Eric,
+  2026-10-03). M4 kept one K4 tile config because the alternatives were slower on the
+  swept shapes; keep K4's tile/stage/swizzle choice a per-plan decision behind one
+  selection function, so a small shape-keyed table (or autotuning at plan time) can slot
+  in later. Every per-plan resource choice stays an option with an exact footprint query.
+- Packed-operand reuse API.
+- Complex via the 2M method (the specs are already parametric in the moduli table).
+- **Adaptive precision.** Wanted by Eric (2026-10-02); evaluate after M4. Options:
+  - an **Ozaki-I slice mode**. Slices form a prefix, so one packed operand serves any
+    precision, which suits reuse across precision levels. The same TBLIS pipeline works:
+    the pack emits slices instead of residues, the epilogue accumulates scaled FP64 instead
+    of reducing mod p, and there is no CRT;
+  - **Ozaki-II with per-call N**. Changing N changes the scaling, so operands must be
+    re-packed;
+  - a data-driven **auto / bounded-auto N** policy on top of either.
+- **Packed symmetric tensor contractions** (generic permutational symmetry). Wanted by
+  Eric (2026-10-03), long-term; motivating case: the particle–particle ladder (PPL) in
+  DF-CCSD. Operands and/or output are stored packed over permutational symmetry groups
+  (e.g. `a≤b`, `i<j`, with ± signs for antisymmetry). Contract them without unpacking: the
+  TBLIS pack reads the packed layout and expands it on the fly (scatter vectors plus a
+  per-element sign/zero mask), and the CRT/scatter writes only the unique output block.
+  The idea extends naturally: the Ozaki pack already touches every element once, so the
+  unpacking costs no extra pass. To our knowledge no such generic kernels exist even
+  without Ozaki. Design questions for later: the symmetry descriptor in the API (groups,
+  sign), whether to skip redundant output blocks in the GEMM tiling or only in the scatter,
+  and IndexMap/TLA+ extensions for packed legality and injectivity. Not before M4.
+- Accurate-mode scaling.
+- Python package (nanobind), device arrays only (cupy / DLPack); no host-array transfers.
+- **Next after the g sweep (Eric, 2026-10-03):**
+  - **g trade-off.** Benchmark g ∈ {1, 2, 4, 7, N} (workspace ≈ (g/8)(|A|+|B|) +
+    (N/8)|C|; only g = N has been measured). If the speed cost is modest, add a
+    cuTENSOR-style workspace budget option: plan creation picks the largest g that fits.
+  - **Externally accessible memory API.** Callers (e.g. ehrenfest) must be able to compute
+    exactly what immerdink needs without a GPU: workspace bytes per (descriptor, N, g,
+    vec_mode), plan device bytes, plan host bytes, and the per-region breakdown. **Single
+    source of truth:** a CUDA-free `libimmerdink_host` (lowering, legality, memory model,
+    later the performance model) with a plain C ABI, linked by the CUDA library, so callers
+    get exactly the numbers the kernels use. Python (ctypes now, nanobind later) and other
+    languages call that ABI; nothing is reimplemented. `spec/params.py` and the oracle stay
+    as independent verification (tests compare them with the C), not as an API.
+    **Done (2026-10-03, DESIGN v1.3 §6a):** `libimmerdink_host.so` + `immerdink_host.h`
+    (`imd_workspace_size`, `imd_workspace_layout`, `imd_plan_bytes`, `imd_lowering`,
+    `imd_host_api_version`), linked by libimmerdink for all plan sizing;
+    `python/immerdink/host.py` (ctypes, einsum front end, `g_tradeoff`); tests
+    `host_c_api`, `workspace_vs_params`, `host_python`, `host_vs_plan`, `host_cuda_free`.
+    g stays the only workspace knob (no budget option; Eric, 2026-10-03).
+- **Performance model (later, not yet).** Predict per-phase time from MEMORY_MODEL §4/§5
+  bounds plus measured efficiencies (the per-phase profiling already reports both), so
+  callers can estimate cost and choose N, g and vec_mode. Same surface as the memory API.
+- Hopper/Blackwell back ends.
+- Fused variants (MEMORY_MODEL §7).
+
+---
+
+## Testing matrix (applies from M1 on)
+
+| Layer | Method |
+|---|---|
+| constants / bounds | `params.py --check` (exact integers) |
+| design logic | TLC models (`spec/check.sh`) |
+| numerics | bitwise vs `oracle.py`; oracle vs exact `Fraction` reference for error bounds |
+| epilogue mod reduction | exhaustive over the reachable int32 range × every modulus |
+| legality | IndexMap-derived case table: every status code exercised |
+| memory | measured peak = formula, exactly |
+| performance | `run_bench.sh`; median plus spread; conditions, commit and env recorded |
+
+---
+
+## Resolved setup decisions (2026-10-02)
+
+- **Lean:** elan 4.2.4 / Lean 4.34.1 / Lake 5.0 are in `~/.elan/bin`, which is not on the
+  non-interactive PATH; scripts use the full path.
+- **Environment:** the `immerdink` conda env exists (`environment.yml`). CUTLASS v4.8.0 is
+  a submodule. Apalache 0.62.3 installs via `tools/get_apalache.sh`.
+- **License:** MIT.

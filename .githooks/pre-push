@@ -1,0 +1,9 @@
+#!/bin/sh
+# main is PR-only: refuse direct pushes. Merge via a pull request from dev.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_ref" = "refs/heads/main" ]; then
+    echo "pre-push: direct pushes to main are disabled; open a PR from dev instead." >&2
+    exit 1
+  fi
+done
+exit 0

@@ -1,0 +1,25 @@
+# Same-session immerdink vs GEMMul8 comparison (N=8,14), standard + small cases. Format as sweep_m4.txt.
+s128    | ik,jk->ij | i=128,j=128,k=128      | gemmul8,imd | 8,14 | dyn |
+s256    | ik,jk->ij | i=256,j=256,k=256      | gemmul8,imd | 8,14 | dyn |
+s512    | ik,jk->ij | i=512,j=512,k=512      | gemmul8,imd | 8,14 | dyn |
+s_lowk  | ik,jk->ij | i=2048,j=2048,k=64     | gemmul8,imd | 8,14 | dyn |
+s_batch | lik,ljk->lij | i=64,j=64,k=64,l=256 | gemmul8,imd | 8,14 | dyn |
+s_cc8   | kjbc,kiac->abij | i=8,j=8,k=8,a=64,b=64,c=64     | gemmul8,imd | 8,14 | dyn |
+s_cc16  | kjbc,kiac->abij | i=16,j=16,k=16,a=96,b=96,c=96  | gemmul8,imd | 8,14 | dyn |
+s_df    | acQ,bdQ->acbd | a=32,b=32,c=32,d=32,Q=256      | gemmul8,imd | 8,14 | dyn |
+s_perm  | abk,kcd->cadb | a=32,b=32,c=32,d=32,k=256      | gemmul8,imd | 8,14 | dyn |
+sq1024  | ik,jk->ij | i=1024,j=1024,k=1024   | gemmul8,imd | 8,14 | dyn |
+sq2048  | ik,jk->ij | i=2048,j=2048,k=2048   | gemmul8,imd | 8,14 | dyn |
+sq4096  | ik,jk->ij | i=4096,j=4096,k=4096   | gemmul8,imd | 8,14 | dyn |
+sq8192  | ik,jk->ij | i=8192,j=8192,k=8192   | gemmul8,imd | 8,14 | dyn | --max-seconds 6
+sq16384 | ik,jk->ij | i=16384,j=16384,k=16384 | gemmul8,imd | 14 | dyn | --reps 3 --warmup 1 --max-seconds 1 --emu-ws-mib 4096
+r_lowk  | ik,jk->ij | i=8192,j=8192,k=1024   | gemmul8,imd | 8,14 | dyn |
+r_bigk  | ik,jk->ij | i=2048,j=2048,k=32768  | gemmul8,imd | 8,14 | dyn |
+r_skinny| ik,jk->ij | i=16384,j=512,k=4096   | gemmul8,imd | 8,14 | dyn |
+r_mm    | ik,jk->ij | i=1000,j=64,k=50000    | gemmul8,imd | 8,14 | dyn |
+t_nn      | ik,kj->ij      | i=4096,j=4096,k=4096               | gemmul8,imd | 8,14 | dyn |
+t_batch   | lik,ljk->lij   | i=1024,j=1024,k=1024,l=16          | gemmul8,imd | 8,14 | dyn |
+t_ikl     | ikl,kjl->ijl   | i=1024,j=1024,k=1024,l=16          | gemmul8,imd | 8,14 | dyn |
+t_df      | acQ,bdQ->acbd  | a=64,b=64,c=64,d=64,Q=2048         | gemmul8,imd | 8,14 | dyn |
+t_cc      | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128  | gemmul8,imd | 8,14 | dyn |
+t_permout | abk,kcd->cadb  | a=64,b=64,c=64,d=64,k=4096         | gemmul8,imd | 8,14 | dyn |
