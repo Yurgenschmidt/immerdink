@@ -461,7 +461,68 @@ def suite_api(lib, cuda, verbose):
         print(f"  ok  plan-time statuses ({len(checks)} cases)")
 
 
-SUITES = {"api": suite_api, "stages": suite_stages, "e2e": suite_e2e, "tensor": suite_tensor,
+def suite_replay(lib, cuda, verbose):
+    """Every matrix contraction made by spec/test_oracle.py's hand-built boundary tests
+    (edges (5), non-finite (4), determinism (3), adversarial A1-A8, the phi x k x N x
+    rounding sweep (1)+(2)) replayed on the GPU:
+    shift-rule boundaries, subnormal double-rounding traps, the single beta fma, native-path
+    order, chunk splits... Calls with a non-default chunk / rule / word width are skipped
+    (not library options); k = 1 calls are padded to k = 2 with a zero (the library would
+    dispatch K-empty to DIRECT; the padded problem keeps the emulated path). Inputs that
+    must not be read (Poison) become NaN."""
+    import test_oracle as to
+    calls = []
+    real = o.contract
+
+    def record(A, B, C, alpha, beta, N, rounding="RN", g=None, chunk=o.K_C_ALIGNED, m=None,
+               n=None, k=None, trace=None, _rule=None, _L_w=None):
+        out = real(A, B, C, alpha, beta, N, rounding, g, chunk, m, n, k, trace, _rule, _L_w)
+        if chunk == o.K_C_ALIGNED and _rule is None and _L_w is None:
+            calls.append((A, B, C, alpha, beta, N, rounding, g, m, n, k))
+        return out
+
+    o.contract = record
+    try:
+        quiet = open(os.devnull, "w")
+        stdout, sys.stdout = sys.stdout, quiet
+        try:
+            for fn in (to.test_edges, to.test_nonfinite, to.test_determinism, to.test_adversarial,
+                       to.test_sweep):
+                fn()
+        finally:
+            sys.stdout = stdout
+            quiet.close()
+    finally:
+        o.contract = real
+
+    def mat(X, r, c):
+        try:
+            return np.array([[X[i][j] for j in range(c)] for i in range(r)], dtype=np.float64).reshape(r, c)
+        except (AssertionError, TypeError, IndexError):
+            return np.full((r, c), math.nan)          # Poison / None: must not be read
+
+    rng = random.Random(505)
+    done = 0
+    for t, (A, B, C, alpha, beta, N, rounding, g, m, n, k) in enumerate(calls):
+        m = len(A) if m is None else m
+        k = (len(A[0]) if m else len(B)) if k is None else k
+        n = (len(B[0]) if k else len(C[0])) if n is None else n
+        if m == 0 or n == 0:
+            continue
+        TA, TB, TC = mat(A, m, k), mat(B, k, n), mat(C, m, n)
+        if k == 1:
+            TA = np.concatenate([TA, np.zeros((m, 1))], axis=1)
+            TB = np.concatenate([TB, np.zeros((1, n))], axis=0)
+            k = 2
+        Ad, Bd, Cd = matrix(rng, m, n, k, a_kfast=True, b_kfast=False)
+        run_case(lib, cuda, f"replay[{t}]", Ad, Bd, Cd, TA, TB, TC, alpha, beta, N, g or 0,
+                 rounding, rng=rng, verbose=False)
+        done += 1
+    if verbose:
+        print(f"  ok  {done} of {len(calls)} recorded oracle-test contractions replayed bit-exact")
+
+
+SUITES = {"api": suite_api, "replay": suite_replay, "stages": suite_stages, "e2e": suite_e2e, "tensor": suite_tensor,
           "bigk": suite_bigk}
 
 

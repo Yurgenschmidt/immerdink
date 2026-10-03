@@ -35,7 +35,7 @@ add_test(NAME mod_exhaustive_cpu COMMAND test_mod_exhaustive)
 
 if(Python3_FOUND)
   # imd_contract on the GPU vs spec/oracle.py, bit for bit (tests/test_contract.py).
-  foreach(suite api stages e2e tensor bigk)
+  foreach(suite api stages e2e tensor bigk replay)
     add_test(NAME contract_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                      --lib "$<TARGET_FILE:immerdink>" --suite ${suite} -v)
