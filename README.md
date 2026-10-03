@@ -11,6 +11,9 @@ on INT8 tensor cores (CUDA, sm_89 first).
 - [docs/PROOFS.md](docs/PROOFS.md): proofs of the core lemmas (Lean blueprint)
 - [spec/README.md](spec/README.md): TLA+ specs, real-width certificate, bit-exact oracle
 
+Build and run all correctness tests: `tools/test.sh` (conda env `immerdink`; see
+[docs/NOTES-M0.md](docs/NOTES-M0.md)).
+
 Day-to-day work lands on `dev`; `main` only changes via pull request.
 
 ## License and credits
