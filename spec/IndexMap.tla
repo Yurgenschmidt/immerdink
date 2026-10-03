@@ -23,17 +23,35 @@
 (* (diagonal); a label only in A (or only in B) is summed; a label only in *)
 (* C is broadcast (v1 rejects it, see RuleCOnly).                          *)
 (*                                                                         *)
-(* IMPLEMENTATION MODEL (DESIGN §5 steps 1-10, §4 K2/K3/K4/K5):            *)
-(*  status   step 1 extents (INVALID_VALUE), step 3 repeated C label       *)
-(*           (NOT_SUPPORTED), step 7 C-only label with extent > 1          *)
-(*           (NOT_SUPPORTED), the sorted-|stride| rule on C                *)
-(*           (INVALID_VALUE), the C-vs-A/B interval test (ALIASING), in    *)
-(*           this precedence order.                                        *)
-(*  lower    step 2 diagonal merge (strides of a repeated label summed:    *)
-(*           MS below), step 4 extent-1 labels dropped, step 5/6           *)
-(*           classification by membership (A-only/B-only -> K with stride  *)
-(*           0 in the other operand), step 9 canonical order per group,    *)
-(*           step 8 fusion, step 10 additive scatter vectors               *)
+(* IMPLEMENTATION MODEL (DESIGN §5 steps 1-10, §4 K2/K3/K4/K5, §4a, §6):  *)
+(*  status   plan time (imd_plan_create), first failing row wins:          *)
+(*           1 extents (INVALID_VALUE), 2 repeated C label                 *)
+(*           (NOT_SUPPORTED), 3 C-only label with extent > 1              *)
+(*           (NOT_SUPPORTED), 4 the sorted-|stride| rule on a non-empty C  *)
+(*           (INVALID_VALUE), 5 the CUTLASS GemmCoord limit m, nh <=       *)
+(*           GemmMax when the emulated GEMM runs (EMULATE, non-empty       *)
+(*           output, k >= 2), on the POST-swap m and nh (INVALID_VALUE);   *)
+(*           then execute time                                             *)
+(*           (imd_contract, DESIGN §6 order): null pointer             *)
+(*           (INVALID_VALUE; C always, A/B only when alpha # 0 and k # 0,  *)
+(*           ws only when workspace_size > 0), empty output (SUCCESS,      *)
+(*           nothing touched),                                             *)
+(*           ALIASING (C vs A/B byte hulls; workspace [ws, ws +            *)
+(*           workspace_size) vs A/B/C), MISALIGNED (A/B/C not 8-byte,      *)
+(*           ws not AlignWS-aligned), INSUFFICIENT_WORKSPACE.              *)
+(*  swap     §5 step 8 coalescing: among C's modes with extent > 1, if the *)
+(*           smallest-|stride| one carries an I label, the operand roles   *)
+(*           are swapped (Cᵀ = BᵀAᵀ: the descriptors A and B exchange      *)
+(*           places, so I and J exchange) BEFORE everything that uses m,  *)
+(*           n: the §4a sizing, the GEMM limits, the lowering, and the     *)
+(*           canonical orders (post-swap roles; the position tie-break     *)
+(*           uses the CALLER's label order A.l ++ B.l ++ C.l).             *)
+(*  lower    on the (possibly swapped) descriptor: step 2 diagonal merge   *)
+(*           (strides of a repeated label summed: MS below), step 4        *)
+(*           extent-1 labels dropped, step 5/6 classification by           *)
+(*           membership (A-only/B-only -> K with stride 0 in the other     *)
+(*           operand), step 8 canonical order per group, step 9 fusion,    *)
+(*           step 10 additive scatter vectors                              *)
 (*              off_X(lam, row, col) = base_X + v_X,L[lam] + v_X,G1[row]   *)
 (*                                     + v_X,G2[col]                       *)
 (*           with (G1, G2) = (I, K) for A, (K, J) for B, (I, J) for C.     *)
@@ -46,17 +64,28 @@
 (*           cells; products with a PAD factor are 0.                      *)
 (*  scatter  K5: plane cell (lam*m + i)*nh + j, for j < n only, goes to    *)
 (*           off_C(lam, i, j). Columns j >= n are never scattered.         *)
-(*  plan     NOOP if b*m*n = 0 (nothing read or written), SCALE if k = 0   *)
-(*           (C <- beta*C: every C element written, A and B not read),     *)
-(*           GEMM otherwise.                                               *)
+(*  plan     dispatch by descriptor (§4, §4a): NOOP if b*m*n = 0 (nothing  *)
+(*           read or written), SCALE if k = 0 (C <- beta*C: every C        *)
+(*           element written, A and B not read), DIRECT if mode = DIRECT   *)
+(*           or K is empty (no K label after step 4; k = 1): native sum    *)
+(*           over the canonical k-bar order, no GEMM; GEMM otherwise.      *)
+(*  sizing   §4a per-region element counts and workspace_size in bytes     *)
+(*           (real widths, one modulus plane: N = g = 1; Pipeline checks   *)
+(*           the N/g structure), from the post-swap m, n, k, b.            *)
 (*                                                                         *)
 (* CLAIMS (invariants; each comment names the DESIGN statement it checks): *)
 (*  Partition, EinsumPreserved, ScatterExactlyOnce, ScatterCoversC,        *)
 (*  AccessInBounds, ReadsExact, ZeroExtentRules, PaddingInert,             *)
 (*  LayoutBijective, DecodeBijective, FusionPreservesAddresses,            *)
 (*  OperandIndependence, NoCAliasing, StrideRuleImpliesInjective,          *)
-(*  StatusCorrect (incl. the full precedence chain), CanonicalOrderSorted, *)
-(*  OrderIndependent (expensive; small models only), and                   *)
+(*  StatusCorrect (incl. the full plan + contract precedence chain),       *)
+(*  CanonicalOrderSorted, CanonicalOrderExact (the full key, post-swap     *)
+(*  roles, caller's position), OrderIndependent (expensive; small models), *)
+(*  the role swap: SwapWellDefined, SwapMakesJFastest (and every claim     *)
+(*  above holds on the swapped lowering), the sizing and dispatch:         *)
+(*  DispatchByDescriptor, WorkspaceFits, WorkspaceExact, GemmDimsFit,      *)
+(*  LimitScope, and the execute-time checks: NoNullDeref, WsNoAlias,       *)
+(*  AliasingSound, AlignedAccess, WsSufficient; and                        *)
 (*  StrideRuleNecessary (FALSE by design: a negative model shows the rule  *)
 (*  is only sufficient).                                                   *)
 (*                                                                         *)
@@ -92,13 +121,46 @@
 (*  "Single"     §5 step 6      A-only/B-only label -> K, stride 0 in the  *)
 (*                              other operand (dropped: the label is left  *)
 (*                              out of every group, as TBLIS would)        *)
-(*  "Fusion"     §5 step 8      fusion condition checked in EVERY tensor   *)
+(*  "Fusion"     §5 step 9      fusion condition checked in EVERY tensor   *)
 (*                              carrying the group (dropped: only in the   *)
 (*                              tensors where both labels appear, which is *)
-(*                              the literal DESIGN wording)                *)
+(*                              the literal v1 wording)                    *)
 (*  "COnly"      §5 step 7      C-only label with extent > 1 rejected      *)
 (*                              (dropping it is a POSITIVE model: the rule *)
 (*                              is a v1 policy, broadcasting is correct)   *)
+(*  "NoSwap"     §5 step 8      the coalescing role swap is not done       *)
+(*  "SwapFilter" §5 step 8      the swap looks at ALL of C's modes, not    *)
+(*                              only those with extent > 1                 *)
+(*  "SwapLate"   §5 step 8      the swap happens AFTER sizing: §4a sizes   *)
+(*                              and the GEMM limits use the pre-swap m, n  *)
+(*                              (the lowering itself still swaps)          *)
+(*  "GemmLimit"  §5 row 5       m, nh <= GemmMax not checked               *)
+(*  "GemmLimitN"      row 5     checks n instead of nh = ceil_Q(n)         *)
+(*  "GemmLimitDirect" row 5     also applied in DIRECT mode                *)
+(*  "GemmLimitEmpty"  row 5     also applied to an empty output            *)
+(*  "GemmLimitK"      row 5     also applied when k < 2 (no GEMM runs)     *)
+(*  "OrderPreSwap" §5 step 8    canonical orders computed BEFORE the swap  *)
+(*                              (K's "big" on the caller's roles; differs  *)
+(*                              only when m = n)                           *)
+(*  "PosSwapped"   §5 step 8    position tie-break from the swapped        *)
+(*                              descriptor (B.l ++ A.l ++ C.l)             *)
+(*  "Null"       §6 1           null pointers not rejected                 *)
+(*  "NullStrict" §6 1           any null pointer rejected (the pre-M1      *)
+(*                              literal rule: A/B even when alpha = 0 or   *)
+(*                              k = 0, ws even when workspace_size = 0)    *)
+(*  "NullWsLax"  §6 1           null ws accepted even when                 *)
+(*                              workspace_size > 0                         *)
+(*  "WsAlias"    §5 row 6       workspace vs A/B/C test dropped            *)
+(*  "WsRangeBytes" row 6        workspace range [ws, ws + ws_bytes)        *)
+(*                              instead of [ws, ws + workspace_size)       *)
+(*  "Misaligned" §5 row 7       alignment test dropped                     *)
+(*  "Insufficient" §6 5         ws_bytes >= workspace_size not checked     *)
+(* PRECEDENCE variants (the contract checks reordered; StatusCorrect, a   *)
+(* table written independently of the implementation chain, fails):      *)
+(*  "OrderNullEmpty"   empty output before the null check                 *)
+(*  "OrderEmptyLast"   empty output after INSUFFICIENT_WORKSPACE          *)
+(*  "OrderAlignFirst"  MISALIGNED before ALIASING                         *)
+(*  "OrderInsuffFirst" INSUFFICIENT_WORKSPACE before MISALIGNED           *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, Bags, TLC
 
@@ -115,17 +177,21 @@ CONSTANTS
     CanonicalLabels, \* TRUE: enumerate one labelling per renaming class
     Drop,            \* "none" or the ONE design rule this model drops
     CheckOrders,     \* TRUE: also compute OrderIndependent (expensive)
-    MustCover        \* names of coverage descriptors (defined in MC) that
+    MustCover,       \* names of coverage descriptors (defined in MC) that
                      \*   this model must enumerate AND accept (ASSUME in MC)
+    Execs,           \* set of execute-time argument records (see XDef)
+    GemmMax,         \* CUTLASS GemmCoord limit on m and nh (real 2^31 - 1)
+    AlignWS          \* workspace region alignment (real 256 bytes)
 
 VARIABLES
     desc,   \* the descriptor triple (chosen in Init, then constant)
     st,     \* its status
     low,    \* the lowering (a record), or "none" if rejected
     ein,    \* the einsum reference (a record), or "none" if rejected
-    el      \* el[X] = Elems(desc, X), cached
+    el,     \* el[X] = Elems(desc, X), cached
+    xa      \* the plan option and imd_contract arguments (an Execs record)
 
-vars == <<desc, st, low, ein, el>>
+vars == <<desc, st, low, ein, el, xa>>
 
 -----------------------------------------------------------------------------
 (* Helpers *)
@@ -237,19 +303,6 @@ IntervalAlias(d) == Intersect(Interval(d, "C"), Interval(d, "A"))
                  \/ Intersect(Interval(d, "C"), Interval(d, "B"))
 
 -----------------------------------------------------------------------------
-(* Status (DESIGN §5 lowering order; ALIASING is checked last, at execute *)
-(* time). The C rule applies only to a non-empty C (see design_issues).   *)
-
-Status(d) ==
-    IF Drop # "Extents" /\ ~ExtentsConsistent(d)            THEN "INVALID_VALUE"
-    ELSE IF Drop # "RepeatC" /\ RepeatedC(d)                 THEN "NOT_SUPPORTED"
-    ELSE IF Drop # "COnly" /\ COnlyBig(d)                    THEN "NOT_SUPPORTED"
-    ELSE IF Drop # "CStride" /\ ~Empty(d, "C") /\ ~StrideRule(d, "C")
-                                                             THEN "INVALID_VALUE"
-    ELSE IF Drop # "Aliasing" /\ IntervalAlias(d)            THEN "ALIASING"
-    ELSE "SUCCESS"
-
------------------------------------------------------------------------------
 (* Lowering (DESIGN §5 steps 2-10).                                       *)
 
 \* §5 steps 5-7: class by membership set.
@@ -288,7 +341,13 @@ Decode(o, ext, size) ==
            [l \in {o[j] : j \in 1..n} |->
               LET j == CHOOSE j \in 1..n : o[j] = l IN (q \div pre[j]) % ext[l]]]
 
-Lower(d) ==
+\* d is the descriptor the lowering works on (already swapped if sw); od is
+\* the CALLER's descriptor. DESIGN §5 step 8 (as implemented in M1): the
+\* swap comes first, the canonical orders are computed on the post-swap
+\* roles (so K's "big" operand compares the post-swap m, n), and the
+\* final tie-break "position" is taken from the caller's original label
+\* order od.A.l \o od.B.l \o od.C.l.
+Lower(d, mode, sw, od) ==
     LET labs == AllLab(d)
         ext  == [l \in labs |-> Ext(d, l)]
         ms   == [X \in Tens, l \in labs |-> MS(d, X, l)]
@@ -298,17 +357,24 @@ Lower(d) ==
         sz   == [g \in Grps |-> ProdOver(grp[g], ext)]
         m == sz["I"]  n == sz["J"]  k == sz["K"]  b == sz["L"]
         kh == CeilQ(k)  nh == CeilQ(n)
-        big == IF m >= n THEN "A" ELSE "B"                        \* step 9
+        \* step 8. Drop "OrderPreSwap": the order is computed BEFORE the
+        \* swap, i.e. "big" is decided on the caller's roles (the caller's
+        \* A = role B after a swap); this differs only when m = n.
+        big == IF Drop = "OrderPreSwap" /\ sw
+               THEN (IF n >= m THEN "B" ELSE "A")
+               ELSE (IF m >= n THEN "A" ELSE "B")
         oth == IF big = "A" THEN "B" ELSE "A"
+        \* Drop "PosSwapped": position taken from the swapped descriptor.
+        posd == IF Drop = "PosSwapped" THEN d ELSE od
         key == [g \in Grps |-> [l \in grp[g] |->
                   LET a == Abs(ms["A", l])  bb == Abs(ms["B", l])
-                      c == Abs(ms["C", l])  f == FirstPos(d, l)
+                      c == Abs(ms["C", l])  f == FirstPos(posd, l)
                   IN  CASE g = "I" -> <<c, a, 0, f>>
                         [] g = "J" -> <<c, bb, 0, f>>
                         [] g = "L" -> <<c, a, bb, f>>
                         [] g = "K" -> <<Abs(ms[big, l]), Abs(ms[oth, l]), 0, f>>]]
         ord  == [g \in Grps |-> SortBy(grp[g], key[g])]
-        \* step 8: g_t fuses into g_(t-1) iff s_X(g_t) = s_X(g_(t-1))*e(g_(t-1))
+        \* step 9: g_t fuses into g_(t-1) iff s_X(g_t) = s_X(g_(t-1))*e(g_(t-1))
         \* for every X in Chk.
         fuseOK(g, a, c) ==
             LET chk == IF Drop = "Fusion"
@@ -339,7 +405,8 @@ Lower(d) ==
         bufB == [q \in 0..(b * nh * kh - 1) |->
                    LET lam == q \div (nh * kh)  j == (q \div kh) % nh  h == q % kh
                    IN  IF h < k /\ j < n THEN Cell(offB(lam, h, j)) ELSE Pad]
-        kind == IF b * m * n = 0 THEN "NOOP" ELSE IF k = 0 THEN "SCALE" ELSE "GEMM"
+        kind == IF b * m * n = 0 THEN "NOOP" ELSE IF k = 0 THEN "SCALE"
+                ELSE IF mode = "DIRECT" \/ grp["K"] = {} THEN "DIRECT" ELSE "GEMM"
         \* K4 over the padded box; K5 scatters columns j < n only.
         gdom == {<<lam, i, j, h>> : lam \in 0..(b - 1), i \in 0..(m - 1),
                                      j \in 0..(nh - 1), h \in 0..(kh - 1)}
@@ -347,15 +414,26 @@ Lower(d) ==
         cb(t) == bufB[(t[1] * nh + t[3]) * kh + t[4]]
         nz   == {t \in gdom : ~ca(t)[1] /\ ~cb(t)[1]}
         cadr(t) == IF t[3] < n THEN offC(t[1], t[2], t[3]) ELSE Unscattered
-        contrib == IF kind = "GEMM"
-                   THEN MkBag(nz, [t \in nz |-> <<cadr(t), ca(t)[2], cb(t)[2]>>])
-                   ELSE EmptyBag
+        \* DIRECT: native sum over the canonical k-bar order, no padding.
+        ddom == {<<lam, i, j, h>> : lam \in 0..(b - 1), i \in 0..(m - 1),
+                                     j \in 0..(n - 1), h \in 0..(k - 1)}
+        contrib == CASE kind = "GEMM"
+                          -> MkBag(nz, [t \in nz |-> <<cadr(t), ca(t)[2], cb(t)[2]>>])
+                     [] kind = "DIRECT"
+                          -> MkBag(ddom, [t \in ddom |-> <<offC(t[1], t[2], t[3]),
+                                                           offA(t[1], t[2], t[4]),
+                                                           offB(t[1], t[4], t[3])>>])
+                     [] OTHER -> EmptyBag
         wdom == {<<lam, i, j>> : lam \in 0..(b - 1), i \in 0..(m - 1), j \in 0..(n - 1)}
         writes == IF kind = "NOOP" THEN EmptyBag
                   ELSE MkBag(wdom, [w \in wdom |-> offC(w[1], w[2], w[3])])
-        readsA == IF kind = "GEMM" THEN {bufA[q][2] : q \in {q \in DOMAIN bufA : ~bufA[q][1]}} ELSE {}
-        readsB == IF kind = "GEMM" THEN {bufB[q][2] : q \in {q \in DOMAIN bufB : ~bufB[q][1]}} ELSE {}
-    IN  [labs |-> labs, ext |-> ext, kept |-> kept, cls |-> cls, grp |-> grp,
+        readsA == CASE kind = "GEMM"   -> {bufA[q][2] : q \in {q \in DOMAIN bufA : ~bufA[q][1]}}
+                    [] kind = "DIRECT" -> {offA(t[1], t[2], t[4]) : t \in ddom}
+                    [] OTHER           -> {}
+        readsB == CASE kind = "GEMM"   -> {bufB[q][2] : q \in {q \in DOMAIN bufB : ~bufB[q][1]}}
+                    [] kind = "DIRECT" -> {offB(t[1], t[4], t[3]) : t \in ddom}
+                    [] OTHER           -> {}
+    IN  [d |-> d, swap |-> sw, labs |-> labs, ext |-> ext, kept |-> kept, cls |-> cls, grp |-> grp,
          sz |-> sz, m |-> m, n |-> n, k |-> k, b |-> b, kh |-> kh, nh |-> nh,
          ord |-> ord, unf |-> unf, fused |-> fused, vec |-> vec, vecU |-> vecU,
          dec |-> dec, bufA |-> bufA, bufB |-> bufB, kind |-> kind,
@@ -372,11 +450,184 @@ Einsum(d) ==
         clabs == Lab(d, "C")
         cpts == {y \in [clabs -> 0..MaxIdx(d)] : \A l \in clabs : y[l] < ext[l]}
     IN  [bag    |-> MkBag(pts, [x \in pts |-> <<addr("C", x), addr("A", x), addr("B", x)>>]),
-         readsA |-> {addr("A", x) : x \in pts},
-         readsB |-> {addr("B", x) : x \in pts},
+         reads  |-> [X \in {"A", "B"} |-> {addr(X, x) : x \in pts}],
          \* C output positions (assignments of C's labels): one write each
          cpos   |-> MkBag(cpts, [y \in cpts |-> addr("C", y)]),
          pts    |-> pts]
+
+-----------------------------------------------------------------------------
+(* GEMM dimensions, the coalescing role swap, dispatch and §4a sizing.     *)
+
+\* m, n, k, b of the GEMM view of d in d's OWN roles (no swap): a closed
+\* form over the classification (what imd_workspace_size can compute
+\* without building the lowering). kempty: no K label survives step 4.
+UDims(d) ==
+    LET labs == AllLab(d)
+        ext  == [l \in labs |-> Ext(d, l)]
+        kept == {l \in labs : ext[l] # 1}
+        grp(g) == {l \in kept : ClassOf(d, l) = g}
+    IN  [m |-> ProdOver(grp("I"), ext), n |-> ProdOver(grp("J"), ext),
+         k |-> ProdOver(grp("K"), ext), b |-> ProdOver(grp("L"), ext),
+         kempty |-> grp("K") = {}]
+
+\* Empty output (b*m*n = 0); invariant under the swap.
+EmptyOut(d) == LET u == UDims(d) IN u.b * u.m * u.n = 0
+
+\* §5 step 8 coalescing. The candidate modes are C's modes with extent > 1
+\* (Drop "SwapFilter": all of C's modes); FastMode is the one of smallest
+\* |stride| (first in mode order on a tie: SwapWellDefined shows there is
+\* no tie whenever the stride rule holds). The roles are swapped iff its
+\* label is an I label (membership exactly {A, C}).
+SwapCand(d)  == IF Drop = "SwapFilter" THEN Pos(d, "C")
+                ELSE {p \in Pos(d, "C") : d.C.e[p] > 1}
+FastMode(d)  == CHOOSE p \in SwapCand(d) :
+                  \A q \in SwapCand(d) : Abs(d.C.s[p]) < Abs(d.C.s[q])
+                                         \/ (Abs(d.C.s[p]) = Abs(d.C.s[q]) /\ p <= q)
+Member(d, l) == {X \in Tens : l \in Lab(d, X)}
+DoSwap(d)    == /\ Drop # "NoSwap"
+                /\ SwapCand(d) # {}
+                /\ Member(d, d.C.l[FastMode(d)]) = {"A", "C"}
+\* Cᵀ = BᵀAᵀ: the operand descriptors exchange roles (so I <-> J).
+Sw(d)        == [A |-> d.B, B |-> d.A, C |-> d.C]
+\* The descriptor the lowering, the sizing and the limits work on.
+LD(d)        == IF DoSwap(d) THEN Sw(d) ELSE d
+PDims(d)     == UDims(LD(d))                         \* post-swap (DESIGN)
+SDims(d)     == IF Drop = "SwapLate" THEN UDims(d) ELSE PDims(d)  \* what sizing uses
+
+LowerTop(d, mode) == Lower(LD(d), mode, DoSwap(d), d)
+
+\* Dispatch by descriptor (§4 DIRECT path, §4a): a pure function of the
+\* GEMM dimensions and the mode.
+DispKind(u, mode) ==
+    IF u.b * u.m * u.n = 0 THEN "NOOP"
+    ELSE IF u.k = 0 THEN "SCALE"
+    ELSE IF mode = "DIRECT" \/ u.kempty THEN "DIRECT"
+    ELSE "GEMM"
+
+\* §4a regions (one modulus plane, N = g = 1) as element counts, and their
+\* element widths in bytes.
+RegNames == {"sA", "sB", "fA", "fB", "vec", "RA", "RB", "W"}
+RegCells(u, r) ==
+    CASE r \in {"sA", "fA"} -> u.b * u.m
+      [] r \in {"sB", "fB"} -> u.b * u.n
+      [] r = "vec"          -> 2 * u.m + 2 * u.n + 2 * u.k + 3 * u.b
+      [] r = "RA"           -> u.b * u.m * CeilQ(u.k)
+      [] r = "RB"           -> u.b * CeilQ(u.n) * CeilQ(u.k)
+      [] r = "W"            -> u.b * u.m * CeilQ(u.n)
+RegWidth(r) == CASE r \in {"sA", "sB"} -> 2 [] r = "vec" -> 8 [] OTHER -> 1
+\* §4a: 0 for an empty output; only vec for DIRECT, K-empty and k = 0.
+SizedCells(u, mode) ==
+    LET kd == DispKind(u, mode) IN
+    [r \in RegNames |-> CASE kd = "NOOP" -> 0
+                          [] kd = "GEMM" -> RegCells(u, r)
+                          [] OTHER       -> IF r = "vec" THEN RegCells(u, r) ELSE 0]
+AlignUp(x) == ((x + AlignWS - 1) \div AlignWS) * AlignWS
+WsSizeU(u, mode) ==
+    LET c == SizedCells(u, mode) IN
+    SumOver(RegNames, [r \in RegNames |-> AlignUp(c[r] * RegWidth(r))])
+WsSizeImpl(d, mode)   == WsSizeU(SDims(d), mode)   \* imd_workspace_size as built
+WsSizeDesign(d, mode) == WsSizeU(PDims(d), mode)   \* DESIGN §4a
+
+\* §5 row 5, the CUTLASS GemmCoord limit (scaled: GemmMax). It applies
+\* exactly when the emulated GEMM runs: EMULATE mode, a non-empty output
+\* and k >= 2 (k = 0: C <- beta*C; k = 1: K-empty, dispatched to DIRECT),
+\* the same condition as the RN acceptance rule (orchestrator, M1).
+LimitApplies(d, x) == /\ x.mode = "EMULATE" \/ Drop = "GemmLimitDirect"
+                      /\ ~EmptyOut(d) \/ Drop = "GemmLimitEmpty"
+                      /\ UDims(d).k >= 2 \/ Drop = "GemmLimitK"
+LimitExceeded(d)   == LET u == SDims(d) IN
+                      \/ u.m > GemmMax
+                      \/ (IF Drop = "GemmLimitN" THEN u.n ELSE CeilQ(u.n)) > GemmMax
+
+-----------------------------------------------------------------------------
+(* Execute-time arguments (imd_contract) and checks (DESIGN §5 rows 6-7,  *)
+(* §6). Addresses are in BYTES: element a of tensor X occupies            *)
+(* [8a + mis[X], 8a + mis[X] + 8), mis[X] in 0..7 = misalignment of X's   *)
+(* pointer. An Execs record is                                             *)
+(*   [mode |-> "EMULATE" | "DIRECT",                                       *)
+(*    nul  |-> subset of {"A", "B", "C", "ws"}: null pointers,             *)
+(*    a0   |-> alpha = 0 (only the §6 null rule depends on it here),       *)
+(*    mis  |-> [Tens -> 0..7],                                             *)
+(*    wsp  |-> <<anchor, side, delta>>: where ws is placed. anchor "far":  *)
+(*             FarWs; else ws = (byte hull end of anchor) + delta (side    *)
+(*             "after") or (hull start) - workspace_size + delta ("before")*)
+(*             so delta = 0 TOUCHES the anchor and +-1 overlaps one byte,  *)
+(*    dws  |-> ws_bytes - workspace_size].                                 *)
+
+XDef  == [mode |-> "EMULATE", nul |-> {}, a0 |-> FALSE, mis |-> [X \in Tens |-> 0],
+          wsp |-> <<"far", "after", 0>>, dws |-> 0]
+FarWs == 1024 * AlignWS
+
+\* Byte hull of X: [8*lo + mis, 8*hi + mis) from the element interval.
+BHull(d, x, X) ==
+    LET iv == Interval(d, X) IN
+    IF iv[1] = iv[2] THEN <<0, 0>>
+    ELSE <<8 * iv[1] + x.mis[X], 8 * iv[2] + x.mis[X]>>
+WsAddr(d, x) ==
+    LET a == x.wsp[1] IN
+    IF a = "far" THEN FarWs
+    ELSE IF x.wsp[2] = "after" THEN BHull(d, x, a)[2] + x.wsp[3]
+    ELSE BHull(d, x, a)[1] - WsSizeDesign(d, x.mode) + x.wsp[3]
+WsBytesArg(d, x) == Max(0, WsSizeDesign(d, x.mode) + x.dws)       \* ws_bytes (size_t)
+\* [ws, ws + workspace_size): the bytes the call actually uses.
+WsRange(d, x)    == <<WsAddr(d, x), WsAddr(d, x) + WsSizeImpl(d, x.mode)>>
+WsRangeD(d, x)   == <<WsAddr(d, x), WsAddr(d, x) + WsSizeDesign(d, x.mode)>>
+
+CAliasB(d, x) == \/ Intersect(BHull(d, x, "C"), BHull(d, x, "A"))
+                 \/ Intersect(BHull(d, x, "C"), BHull(d, x, "B"))
+WsHitR(d, x, r) == \E X \in Tens : Intersect(r, BHull(d, x, X))
+\* §6 1 (DESIGN v1.1 after M1): C must always be non-null; A and B only
+\* when alpha # 0 and k # 0 (otherwise they are never read); ws only when
+\* workspace_size > 0. sz is the workspace_size used for the test.
+NullBad(d, x, sz) ==
+    \/ "C" \in x.nul
+    \/ {"A", "B"} \cap x.nul # {} /\ ~x.a0 /\ UDims(d).k # 0
+    \/ "ws" \in x.nul /\ sz > 0
+MisAl(d, x)   == (\E X \in Tens : x.mis[X] # 0) \/ WsAddr(d, x) % AlignWS # 0
+
+-----------------------------------------------------------------------------
+(* Status: the implementation chain. Plan time (imd_plan_create, §5 rows  *)
+(* 1-5) and then execute time (imd_contract, §6 order). `off` = rules      *)
+(* switched off (normally {Drop}).                                         *)
+
+StatusX(d, x, off) ==
+    LET on(r) == r \notin off
+        plan ==
+          IF on("Extents") /\ ~ExtentsConsistent(d)                THEN "INVALID_VALUE"
+          ELSE IF on("RepeatC") /\ RepeatedC(d)                     THEN "NOT_SUPPORTED"
+          ELSE IF on("COnly") /\ COnlyBig(d)                        THEN "NOT_SUPPORTED"
+          ELSE IF on("CStride") /\ ~Empty(d, "C") /\ ~StrideRule(d, "C")
+                                                                    THEN "INVALID_VALUE"
+          ELSE IF on("GemmLimit") /\ LimitApplies(d, x) /\ LimitExceeded(d)
+                                                                    THEN "INVALID_VALUE"
+          ELSE "SUCCESS"
+        wsr == IF Drop = "WsRangeBytes" THEN <<WsAddr(d, x), WsAddr(d, x) + WsBytesArg(d, x)>>
+               ELSE WsRange(d, x)
+        cNull  == <<on("Null") /\ CASE Drop = "NullStrict" -> x.nul # {}
+                                     [] Drop = "NullWsLax"  ->
+                                          NullBad(d, [x EXCEPT !.nul = @ \ {"ws"}], 0)
+                                     [] OTHER -> NullBad(d, x, WsSizeImpl(d, x.mode)),
+                    "INVALID_VALUE">>
+        cEmpty == <<EmptyOut(d), "SUCCESS">>
+        cAlias == <<(on("Aliasing") /\ CAliasB(d, x)) \/ (on("WsAlias") /\ WsHitR(d, x, wsr)),
+                    "ALIASING">>
+        cMis   == <<on("Misaligned") /\ MisAl(d, x), "MISALIGNED">>
+        cIns   == <<on("Insufficient") /\ WsBytesArg(d, x) < WsSizeImpl(d, x.mode),
+                    "INSUFFICIENT_WORKSPACE">>
+        chk == CASE Drop = "OrderNullEmpty"   -> <<cEmpty, cNull, cAlias, cMis, cIns>>
+                 [] Drop = "OrderEmptyLast"   -> <<cNull, cAlias, cMis, cIns, cEmpty>>
+                 [] Drop = "OrderAlignFirst"  -> <<cNull, cEmpty, cMis, cAlias, cIns>>
+                 [] Drop = "OrderInsuffFirst" -> <<cNull, cEmpty, cAlias, cIns, cMis>>
+                 [] OTHER                     -> <<cNull, cEmpty, cAlias, cMis, cIns>>
+        fire == {t \in 1..5 : chk[t][1]}
+    IN  IF plan # "SUCCESS" THEN plan
+        ELSE IF fire = {} THEN "SUCCESS"
+        ELSE chk[CHOOSE t \in fire : \A u \in fire : t <= u][2]
+
+FullStatus(d, x) == StatusX(d, x, {Drop})
+\* The status of a descriptor under the default execute arguments XDef
+\* (EMULATE, no null, aligned, workspace far away and large enough).
+Status(d) == FullStatus(d, XDef)
 
 -----------------------------------------------------------------------------
 (* Enumeration *)
@@ -406,8 +657,9 @@ Init ==
               desc = [A |-> Tensor(bA, lA, ee[1], sA),
                       B |-> Tensor(bB, lB, ee[2], sB),
                       C |-> Tensor(bC, lC, ee[3], sC)]
-    /\ st  = Status(desc)
-    /\ low = IF st = "SUCCESS" THEN Lower(desc) ELSE "none"
+    /\ xa \in Execs
+    /\ st  = FullStatus(desc, xa)
+    /\ low = IF st = "SUCCESS" THEN LowerTop(desc, xa.mode) ELSE "none"
     /\ ein = IF st = "SUCCESS" /\ ExtentsConsistent(desc) THEN Einsum(desc) ELSE "none"
     /\ el  = [X \in Tens |-> Elems(desc, X)]
 
@@ -415,17 +667,28 @@ Next == UNCHANGED vars
 Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
-(* Invariants. "ok" = the descriptor was accepted.                        *)
+(* Invariants. "ok" = the call was accepted (SUCCESS). The lowering works *)
+(* on low.d, the descriptor in GEMM roles (= desc unless the roles were    *)
+(* swapped); RoleA / RoleB name the USER tensor in GEMM role A / B.       *)
 
 ok == st = "SUCCESS"
 
+RoleA == IF low.swap THEN "B" ELSE "A"
+RoleB == IF low.swap THEN "A" ELSE "B"
+\* The einsum bag in GEMM roles: with Cᵀ = BᵀAᵀ every user contribution
+\* C[c] += A[a]*B[b] is computed as C[c] += A'[b]*B'[a] (a product, so the
+\* value is the same; the native path is fma(a_h, b_h, acc), symmetric too).
+SwapTriples(bg) == [t \in {<<u[1], u[3], u[2]>> : u \in DOMAIN bg} |-> bg[<<t[1], t[3], t[2]>>]]
+EinBag == IF low.swap THEN SwapTriples(ein.bag) ELSE ein.bag
+
 \* DESIGN §5 "classification is a partition": the kept labels (extent # 1)
-\* are split into I, J, K, L, each with the right membership set.
+\* are split into I, J, K, L, each with the right membership set (in GEMM
+\* roles: after a swap, the user's {B, C} labels are I).
 Partition ==
     ok => /\ UNION {low.grp[g] : g \in Grps} = low.kept
           /\ \A g, h \in Grps : g # h => low.grp[g] \cap low.grp[h] = {}
           /\ \A l \in low.kept :
-               LET M == {X \in Tens : l \in Lab(desc, X)} IN
+               LET M == {X \in Tens : l \in Lab(low.d, X)} IN
                CASE low.cls[l] = "I" -> M = {"A", "C"}
                                           \/ (M = {"C"} /\ (low.ext[l] = 0 \/ Drop = "COnly"))
                  [] low.cls[l] = "J" -> M = {"B", "C"}
@@ -434,10 +697,11 @@ Partition ==
                  [] OTHER            -> FALSE
 
 \* DESIGN §5 "lowering preserves the einsum" and "Scatter o GEMM o Gather =
-\* einsum": the packed, padded, fused, reordered GEMM view produces exactly
-\* the einsum's multiset of (addrC, addrA, addrB) contributions. A nonzero
-\* product in an unscattered column would appear with addrC = Unscattered.
-EinsumPreserved == ok => low.contrib = ein.bag
+\* einsum": the packed, padded, fused, reordered (and possibly role-
+\* swapped) GEMM view, or the DIRECT sum, produces exactly the einsum's
+\* multiset of (addrC, addrA, addrB) contributions. A nonzero product in an
+\* unscattered column would appear with addrC = Unscattered.
+EinsumPreserved == ok => low.contrib = EinBag
 
 \* DESIGN §5 "sorted-stride rule => scatter is injective", §4 "every C
 \* element is written exactly once": no C address is written twice.
@@ -451,13 +715,15 @@ ScatterCoversC ==
 
 \* Every access stays inside the tensor as described by ITS OWN modes.
 AccessInBounds ==
-    ok => /\ low.readsA \subseteq el["A"]
-          /\ low.readsB \subseteq el["B"]
+    ok => /\ low.readsA \subseteq el[RoleA]
+          /\ low.readsB \subseteq el[RoleB]
           /\ DOMAIN low.writes \subseteq el["C"]
 
-\* The gather reads exactly the elements the einsum uses (no more, no less).
+\* The gather (or the DIRECT kernel) reads exactly the elements the einsum
+\* uses (no more, no less).
 ReadsExact ==
-    ok /\ low.kind = "GEMM" => low.readsA = ein.readsA /\ low.readsB = ein.readsB
+    ok /\ low.kind \in {"GEMM", "DIRECT"} =>
+        low.readsA = ein.reads[RoleA] /\ low.readsB = ein.reads[RoleB]
 
 \* DESIGN §5 zero extents + §3.7 read rules: empty I/J/L -> no-op (nothing
 \* read or written, and indeed C is empty and the einsum has no terms);
@@ -510,9 +776,9 @@ DecodeBijective ==
                 /\ Cardinality(all) = low.sz[g]
                 /\ \A X \in Tens, q \in DOMAIN low.dec[g] :
                       low.vecU[X, g][q] =
-                        SumOver(G, [l \in G |-> low.dec[g][q][l] * MS(desc, X, l)])
+                        SumOver(G, [l \in G |-> low.dec[g][q][l] * MS(low.d, X, l)])
 
-\* DESIGN §5 step 8: fusion preserves every address: the scatter vectors
+\* DESIGN §5 step 9: fusion preserves every address: the scatter vectors
 \* built from the fused modes equal the label-by-label sums.
 FusionPreservesAddresses ==
     ok => \A X \in Tens, g \in Grps : low.vec[X, g] = low.vecU[X, g]
@@ -538,58 +804,91 @@ StrideRuleImpliesInjective ==
 StrideRuleNecessary ==
     \A X \in Tens : (~Empty(desc, X) /\ Injective(desc, X)) => StrideRule(desc, X)
 
-\* The rejection reasons in DESIGN's precedence order (§5 lowering order:
-\* step 1 extents, step 3 repeated C label, step 7 C-only label, then the
-\* §5-table C self-overlap rule, then the execute-time ALIASING test):
-\* <<rule name (the Drop that disables it), fires?, status>>. Written as a
-\* table, independently of the IF-chain in Status, so a reordering of
-\* Status is caught by StatusCorrect.
-Reasons(d) ==
-    << <<"Extents",  ~ExtentsConsistent(d),                 "INVALID_VALUE">>,
-       <<"RepeatC",  RepeatedC(d),                          "NOT_SUPPORTED">>,
-       <<"COnly",    COnlyBig(d),                           "NOT_SUPPORTED">>,
-       <<"CStride",  ~Empty(d, "C") /\ ~StrideRule(d, "C"), "INVALID_VALUE">>,
-       <<"Aliasing", IntervalAlias(d),                      "ALIASING">> >>
+\* The DESIGN status table, written independently of the implementation
+\* chain StatusX, in DESIGN's precedence order: §5 rows 1-5 (plan time),
+\* then §6 imd_contract 1-5 (null, empty output, ALIASING = §5 row 6 with
+\* its two halves, MISALIGNED = row 7, INSUFFICIENT_WORKSPACE).
+\* <<rule name (the Drop that disables it), fires?, status>>. Every
+\* condition here is the DESIGN one (post-swap m and nh, the byte range
+\* [ws, ws + workspace_size)), so a model whose implementation deviates is
+\* caught by StatusCorrect even when no semantic invariant notices.
+Reasons(d, x) ==
+    LET u == PDims(d) IN
+    << <<"Extents",   ~ExtentsConsistent(d),                     "INVALID_VALUE">>,
+       <<"RepeatC",   RepeatedC(d),                              "NOT_SUPPORTED">>,
+       <<"COnly",     COnlyBig(d),                               "NOT_SUPPORTED">>,
+       <<"CStride",   ~Empty(d, "C") /\ ~StrideRule(d, "C"),     "INVALID_VALUE">>,
+       <<"GemmLimit", x.mode = "EMULATE" /\ ~EmptyOut(d) /\ u.k >= 2
+                      /\ (u.m > GemmMax \/ CeilQ(u.n) > GemmMax), "INVALID_VALUE">>,
+       <<"Null",      NullBad(d, x, WsSizeDesign(d, x.mode)),    "INVALID_VALUE">>,
+       <<"-",         EmptyOut(d),                               "SUCCESS">>,
+       <<"Aliasing",  CAliasB(d, x),                             "ALIASING">>,
+       <<"WsAlias",   WsHitR(d, x, WsRangeD(d, x)),              "ALIASING">>,
+       <<"Misaligned", MisAl(d, x),                              "MISALIGNED">>,
+       <<"Insufficient", WsBytesArg(d, x) < WsSizeDesign(d, x.mode),
+                                                       "INSUFFICIENT_WORKSPACE">> >>
 \* The status of the FIRST enabled reason that fires; SUCCESS if none.
-ExpectedStatus(d) ==
-    LET R == Reasons(d)
+ExpectedStatus(d, x) ==
+    LET R == Reasons(d, x)
         F == {t \in 1..Len(R) : R[t][1] # Drop /\ R[t][2]}
     IN  IF F = {} THEN "SUCCESS" ELSE R[CHOOSE t \in F : \A u \in F : t <= u][3]
 
 \* DESIGN §5 / §6 statuses: each rejection has the right status and reason
 \* and comes in DESIGN's precedence order (first firing reason wins, e.g.
-\* C[i,i] with strides (1,1) is NOT_SUPPORTED, not INVALID_VALUE);
-\* acceptance implies every SEMANTIC legality fact (not just the cheap
-\* tests that imply them).
+\* C[i,i] with strides (1,1) is NOT_SUPPORTED, not INVALID_VALUE; a null
+\* pointer beats an empty output; ALIASING beats MISALIGNED beats
+\* INSUFFICIENT_WORKSPACE); acceptance of a non-empty output implies every
+\* SEMANTIC legality fact (not just the cheap tests that imply them). A
+\* aliasing B is never a reason to reject (no row of the table).
 StatusCorrect ==
-    /\ st \in {"SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING"}
-    /\ st = ExpectedStatus(desc)
+    /\ st \in {"SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING",
+               "MISALIGNED", "INSUFFICIENT_WORKSPACE"}
+    /\ st = ExpectedStatus(desc, xa)
     /\ ~ExtentsConsistent(desc) => st = "INVALID_VALUE"
     /\ st = "NOT_SUPPORTED" => ExtentsConsistent(desc) /\ Unsupported(desc)
-    /\ st = "INVALID_VALUE" => ~ExtentsConsistent(desc)
-                               \/ (~Empty(desc, "C") /\ ~StrideRule(desc, "C"))
-    /\ st = "ALIASING" => IntervalAlias(desc)
     /\ ok => /\ ExtentsConsistent(desc)
              /\ ~Unsupported(desc)
              /\ Injective(desc, "C")
              /\ el["C"] \cap (el["A"] \cup el["B"]) = {}
-    \* A aliasing B is never a reason to reject.
-    /\ (ExtentsConsistent(desc) /\ ~Unsupported(desc)
-        /\ (Empty(desc, "C") \/ StrideRule(desc, "C")) /\ ~IntervalAlias(desc)) => ok
 
-\* DESIGN §5 step 9 (and §1.1: the k-bar order is a fixed function of the
+\* DESIGN §5 step 8 (and §1.1: the k-bar order is a fixed function of the
 \* descriptors): within I, J and L the canonical order is non-decreasing in
 \* C's merged |stride| (so CRT scatter writes coalesce); within K it is
-\* non-decreasing in the LARGER operand's |stride| (A if m >= n, else B;
-\* stride 0 for a label the operand lacks). Ties are broken by a fixed key
-\* (see Lower) that DESIGN does not prescribe, so only the DESIGN key is
-\* checked. The "larger operand" is recomputed here from m, n.
+\* non-decreasing in the LARGER operand's |stride| (A if m >= n, else B, in
+\* GEMM roles; stride 0 for a label the operand lacks). Ties are broken by a
+\* fixed key (see CanonicalOrderExact). The "larger operand" is recomputed
+\* here from the post-swap m, n.
 CanonicalOrderSorted ==
     ok => LET bigX == IF low.m >= low.n THEN "A" ELSE "B"
               keyT(g) == IF g = "K" THEN bigX ELSE "C"
           IN  \A g \in Grps : \A t \in 1..(Len(low.ord[g]) - 1) :
-                Abs(MS(desc, keyT(g), low.ord[g][t]))
-                  <= Abs(MS(desc, keyT(g), low.ord[g][t + 1]))
+                Abs(MS(low.d, keyT(g), low.ord[g][t]))
+                  <= Abs(MS(low.d, keyT(g), low.ord[g][t + 1]))
+
+\* DESIGN §5 step 8 in full (orchestrator clarification, as built in M1):
+\* the swap comes FIRST; then I by (|s_C|, |s_A|, position), J by (|s_C|,
+\* |s_B|, position), L by (|s_C|, |s_A|, |s_B|, position) and K by (|s_big|,
+\* |s_other|, position), big = A if m >= n else B, all in the POST-swap
+\* roles (low.d, low.m, low.n), and position = first occurrence in the
+\* CALLER's A.labels ++ B.labels ++ C.labels (desc). Lexicographic keys;
+\* every group's order is exactly the sorted one. Written independently of
+\* Lower's key table.
+CanonicalOrderExact ==
+    ok => LET d == low.d
+              bigX == IF low.m >= low.n THEN "A" ELSE "B"
+              othX == IF bigX = "A" THEN "B" ELSE "A"
+              cat == desc.A.l \o desc.B.l \o desc.C.l
+              pos(l) == CHOOSE p \in 1..Len(cat) : cat[p] = l /\ \A q \in 1..(p - 1) : cat[q] # l
+              s(X, l) == Abs(MS(d, X, l))
+              kk(g, l) == CASE g = "I" -> <<s("C", l), s("A", l), pos(l)>>
+                            [] g = "J" -> <<s("C", l), s("B", l), pos(l)>>
+                            [] g = "L" -> <<s("C", l), s("A", l), s("B", l), pos(l)>>
+                            [] g = "K" -> <<s(bigX, l), s(othX, l), pos(l)>>
+              lt(u, v) == \E t \in DOMAIN u : u[t] < v[t] /\ \A r \in 1..(t - 1) : u[r] = v[r]
+          IN  \A g \in Grps :
+                /\ {low.ord[g][t] : t \in DOMAIN low.ord[g]} = low.grp[g]
+                /\ \A t \in 1..(Len(low.ord[g]) - 1) :
+                      lt(kk(g, low.ord[g][t]), kk(g, low.ord[g][t + 1]))
 
 \* DESIGN §1.1 / r_layout §4.1: the result does not depend on the group
 \* orders (canonical orders are a performance choice only). Every
@@ -600,22 +899,153 @@ OrderIndependent ==
       \A pI \in Perms(low.grp["I"]), pJ \in Perms(low.grp["J"]),
          pK \in Perms(low.grp["K"]), pL \in Perms(low.grp["L"]) :
         LET o == [I |-> pI, J |-> pJ, K |-> pK, L |-> pL]
+            dd == low.d
             md(g) == [t \in 1..Len(o[g]) |->
                         [e |-> low.ext[o[g][t]],
-                         s |-> [X \in Tens |-> MS(desc, X, o[g][t])]]]
+                         s |-> [X \in Tens |-> MS(dd, X, o[g][t])]]]
             v == [X \in Tens, g \in Grps |-> RadixVec(md(g), X, low.sz[g])]
             dom == {<<lam, i, j, h>> : lam \in 0..(low.b - 1), i \in 0..(low.m - 1),
                                         j \in 0..(low.n - 1), h \in 0..(low.k - 1)}
-            tr(t) == <<desc.C.base + v["C", "L"][t[1]] + v["C", "I"][t[2]] + v["C", "J"][t[3]],
-                       desc.A.base + v["A", "L"][t[1]] + v["A", "I"][t[2]] + v["A", "K"][t[4]],
-                       desc.B.base + v["B", "L"][t[1]] + v["B", "K"][t[4]] + v["B", "J"][t[3]]>>
-        IN  MkBag(dom, [t \in dom |-> tr(t)]) = ein.bag
+            tr(t) == <<dd.C.base + v["C", "L"][t[1]] + v["C", "I"][t[2]] + v["C", "J"][t[3]],
+                       dd.A.base + v["A", "L"][t[1]] + v["A", "I"][t[2]] + v["A", "K"][t[4]],
+                       dd.B.base + v["B", "L"][t[1]] + v["B", "K"][t[4]] + v["B", "J"][t[3]]>>
+        IN  MkBag(dom, [t \in dom |-> tr(t)]) = EinBag
+
+-----------------------------------------------------------------------------
+(* The coalescing role swap (DESIGN §5 step 8).                           *)
+
+\* C's modes with extent > 1 and the smallest |stride| among them.
+BigC(d) == {p \in Pos(d, "C") : d.C.e[p] > 1}
+MinS(d) == LET S == {Abs(d.C.s[p]) : p \in BigC(d)} IN CHOOSE v \in S : \A w \in S : v <= w
+
+\* (c) "The smallest |stride| is unique whenever rule 4 holds": over every
+\* enumerated descriptor with a non-empty C that satisfies the sorted-
+\* |stride| rule, exactly one mode of extent > 1 has the smallest |stride|,
+\* so the swap decision does not depend on a tie-break.
+SwapWellDefined ==
+    (~Empty(desc, "C") /\ StrideRule(desc, "C") /\ BigC(desc) # {}) =>
+        Cardinality({p \in BigC(desc) : Abs(desc.C.s[p]) = MinS(desc)}) = 1
+
+\* (b) "so that j-bar is C's fastest axis": if the fastest C mode (extent
+\* > 1) carries an I or a J label, then after the (possible) swap it is a J
+\* label, it is the FIRST label of the canonical J order, and consecutive
+\* j-bar indices are exactly that smallest |stride| apart in C's scatter
+\* vector (fusion included). (If it carries an L label, nothing is claimed.)
+SwapMakesJFastest ==
+    (ok /\ ~EmptyOut(desc) /\ BigC(desc) # {}) =>
+        LET S  == {p \in BigC(desc) : Abs(desc.C.s[p]) = MinS(desc)}
+            fl == desc.C.l[CHOOSE p \in S : TRUE]
+        IN  Member(desc, fl) \in {{"A", "C"}, {"B", "C"}} =>
+              /\ fl \in low.grp["J"]
+              /\ low.ord["J"][1] = fl
+              /\ Abs(low.vec["C", "J"][1] - low.vec["C", "J"][0]) = MinS(desc)
+
+-----------------------------------------------------------------------------
+(* Dispatch and §4a sizing.                                               *)
+
+\* Elements of each §4a region the call actually uses: K1 writes one
+\* sigma / flag per GEMM row of A' and column of B'; K0 copies the nine
+\* scatter vectors the lowering built; K2/K3 fill the canonical buffers; K4
+\* writes the b*m*nh plane. DIRECT and SCALE use only vec.
+UsedCells ==
+    LET kd == low.kind
+        pairs == {p \in Tens \X Grps : p[1] \in Car[p[2]]}
+        gemm(r, v) == IF kd = "GEMM" THEN v ELSE 0
+    IN  [r \in RegNames |->
+           CASE kd = "NOOP"   -> 0
+             [] r \in {"sA", "fA"} -> gemm(r, low.b * low.m)
+             [] r \in {"sB", "fB"} -> gemm(r, low.b * low.n)
+             [] r = "vec" -> SumOver(pairs, [p \in pairs |-> Cardinality(DOMAIN low.vec[p])])
+             [] r = "RA"  -> gemm(r, Cardinality(DOMAIN low.bufA))
+             [] r = "RB"  -> gemm(r, Cardinality(DOMAIN low.bufB))
+             [] r = "W"   -> gemm(r, low.b * low.m * low.nh)]
+
+\* §4 / §4a "K-empty -> DIRECT is documented dispatch by descriptor": the
+\* path taken is the closed-form function DispKind of the (post-swap)
+\* dimensions and the mode, which is also what sizes the workspace.
+DispatchByDescriptor ==
+    ok => /\ low.kind = DispKind(PDims(desc), xa.mode)
+          /\ <<low.m, low.n, low.k, low.b>> =
+               <<PDims(desc).m, PDims(desc).n, PDims(desc).k, PDims(desc).b>>
+
+\* §4a "workspace_size" covers every element the call uses, region by
+\* region (a region overrun corrupts the next region or runs past the end).
+WorkspaceFits ==
+    ok => \A r \in RegNames : UsedCells[r] <= SizedCells(SDims(desc), xa.mode)[r]
+
+\* §4a is EXACT: each region is exactly what is used (and so, with the
+\* swap, §4a's m and n are the post-swap ones).
+WorkspaceExact ==
+    ok => UsedCells = SizedCells(SDims(desc), xa.mode)
+
+\* §4 launch limits / §5 row 5: every CUTLASS GEMM that is launched has
+\* m <= GemmMax and nh <= GemmMax (GemmCoord is int).
+GemmDimsFit ==
+    ok /\ low.kind = "GEMM" => low.m <= GemmMax /\ low.nh <= GemmMax
+
+\* §5 row 5 scope: a call that runs no CUTLASS GEMM (DIRECT mode, an empty
+\* output, k = 0, or K-empty with k = 1) is never rejected because of the
+\* GEMM limits.
+LimitScope ==
+    (xa.mode = "DIRECT" \/ EmptyOut(desc) \/ PDims(desc).k < 2) =>
+        st = StatusX(desc, xa, {Drop, "GemmLimit"})
+
+-----------------------------------------------------------------------------
+(* imd_contract execute-time checks (DESIGN §5 rows 6-7, §6).             *)
+
+\* §6 1: no accepted call dereferences a null pointer: C whenever anything
+\* is done, ws whenever the call uses workspace bytes, A and B when they
+\* are read (GEMM / DIRECT with alpha # 0; alpha = 0 is C <- beta*C, DESIGN
+\* §4, so A and B are not read, cf. Pipeline AlphaZeroNoABRead).
+NoNullDeref ==
+    ok /\ low.kind # "NOOP" =>
+        /\ "C" \notin xa.nul
+        /\ WsSizeImpl(desc, xa.mode) > 0 => "ws" \notin xa.nul
+        /\ low.kind \in {"GEMM", "DIRECT"} /\ ~xa.a0 => {"A", "B"} \cap xa.nul = {}
+
+\* §4 / §5 row 6: the workspace bytes the call uses, [ws, ws +
+\* workspace_size), share no byte with any element of A, B or C (the GEMM
+\* path writes the workspace while K2/K3/K5 read A, B and K5 writes C).
+ElemBytesHit(x, X, a, r) == LET lo == 8 * a + x.mis[X] IN lo < r[2] /\ r[1] < lo + 8
+WsNoAlias ==
+    ok /\ low.kind # "NOOP" =>
+        LET r == WsRangeD(desc, xa) IN
+        \A X \in Tens : \A a \in el[X] : ~ElemBytesHit(xa, X, a, r)
+
+\* §5 row 6 soundness: ALIASING is reported only when C's byte hull meets
+\* A's or B's, or [ws, ws + workspace_size) meets a byte hull (the tests
+\* are conservative hull tests, never "more" than that).
+AliasingSound ==
+    st = "ALIASING" => CAliasB(desc, xa) \/ WsHitR(desc, xa, WsRangeD(desc, xa))
+
+\* §5 row 7: an accepted call that touches memory sees 8-byte aligned A,
+\* B, C and an AlignWS-aligned workspace (so every region offset of §4a,
+\* a multiple of AlignWS, is aligned in absolute terms).
+AlignedAccess ==
+    ok /\ low.kind # "NOOP" =>
+        (\A X \in Tens : xa.mis[X] = 0) /\ WsAddr(desc, xa) % AlignWS = 0
+
+\* §6 5: an accepted call has ws_bytes >= workspace_size (DESIGN §4a).
+WsSufficient ==
+    ok => WsBytesArg(desc, xa) >= WsSizeDesign(desc, xa.mode)
 
 -----------------------------------------------------------------------------
 (* Model well-formedness and coverage (checked by TLC as ASSUMEs).        *)
 
 ASSUME Drop \in {"none", "Extents", "RepeatC", "COnly", "CStride", "Aliasing",
-                 "Single", "Fusion"}
+                 "Single", "Fusion", "NoSwap", "SwapFilter", "SwapLate",
+                 "GemmLimit", "GemmLimitN", "GemmLimitDirect", "GemmLimitEmpty",
+                 "Null", "WsAlias", "WsRangeBytes", "Misaligned", "Insufficient",
+                 "OrderNullEmpty", "OrderEmptyLast", "OrderAlignFirst",
+                 "OrderInsuffFirst", "OrderPreSwap", "PosSwapped", "GemmLimitK",
+                 "NullStrict", "NullWsLax"}
+ASSUME GemmMax >= 1 /\ AlignWS >= 8 /\ AlignWS % 8 = 0
+ASSUME \A x \in Execs :
+          /\ x.mode \in {"EMULATE", "DIRECT"}
+          /\ x.nul \subseteq {"A", "B", "C", "ws"} /\ x.a0 \in BOOLEAN
+          /\ x.mis \in [Tens -> 0..7]
+          /\ x.wsp[1] \in Tens \cup {"far"} /\ x.wsp[2] \in {"after", "before"}
+          /\ x.dws \in Int
 ASSUME PadQ >= 1 /\ ExtentSet \subseteq 0..3 /\ ExtentSet # {}
 \* CeilQ is the PadQ-roundup (k-hat, n-hat of §4a), incl. values that are
 \* not multiples of PadQ and above one quantum.

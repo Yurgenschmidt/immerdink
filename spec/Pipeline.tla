@@ -24,7 +24,8 @@
 (*        are multiples of 16 (operand alignment)                          *)
 (*   §4a  workspace regions, sizes, order, 256-byte aligned offsets,       *)
 (*        workspace_size formula (incl. the 0 / vec-only cases)            *)
-(*   §4   DIRECT mode (native kernel, vec-only workspace)                  *)
+(*   §4   DIRECT path (native kernel, vec-only workspace), taken in mode   *)
+(*        DIRECT and, by descriptor, for every K-empty contraction (k = 1) *)
 (*                                                                         *)
 (* Data abstraction. Values are replaced by ghost VERSION TAGS that say    *)
 (* which write of THIS call a buffer element holds:                        *)
@@ -100,6 +101,8 @@ CONSTANTS
     AlignK, AlignN,      \* k̂ = ⌈k⌉_AlignK, n̂ = ⌈n⌉_AlignN (real 16, 16)
     WsBytes,             \* ws_bytes passed to imd_contract
     Direct,              \* mode = IMD_DIRECT
+    KEmpty,              \* the descriptor has no K label after lowering
+                         \* (outer / Hadamard product; then k = 1)
     TwoStreams,          \* packs on a second stream (NOT v1; future option)
     UseEvents,           \* cross-stream event edges (only with TwoStreams)
     Bug,                 \* "none", one injected design-rule violation, or a
@@ -123,6 +126,9 @@ Bugs == {"none",
          "rbStrideN",     \* RB (slot, λ) block stride uses n rows, not n̂
          "raSizedN",      \* RA sized for N moduli instead of g
          "fullWsK0",      \* k = 0 still allocates every region
+         "kEmptyEmulate", \* a K-empty contraction is dispatched to the
+                          \* emulated path (mode EMULATE) while the
+                          \* workspace is sized for DIRECT (align(vec))
          "padMinimal"}    \* HARMLESS: K padding only in A and only by the
                           \* first group's pack; B rows n..n̂ never written
 \* Deviations from DESIGN that are shown NOT to break anything (positive models).
@@ -154,7 +160,13 @@ RowsA  == Bs \X Ms                      \* (λ, ī)
 ColsB  == Bs \X Ns                      \* (λ, j̄)
 Elems  == Bs \X Ms \X Ns                \* (λ, ī, j̄) of C
 Empty  == b * m * n = 0                 \* BLAS no-op, 0 workspace
-FullWs == ~Empty /\ ~Direct /\ k > 0    \* emulated pipeline with all regions
+\* §4 DIRECT path: "K-empty -> DIRECT is documented dispatch by descriptor".
+\* UseDirect is the path the host program takes; SizeDirect is what the
+\* §4a formula (imd_workspace_size) assumes. They are the same function of
+\* (mode, descriptor) unless a negative model breaks the dispatch.
+UseDirect  == Direct \/ (KEmpty /\ Bug # "kEmptyEmulate")
+SizeDirect == Direct \/ KEmpty
+FullWs == ~Empty /\ ~UseDirect /\ k > 0  \* emulated pipeline with all regions
 
 \* Logical cells of the residue / product buffers.
 RADom == Slots \X Bs \X Ms \X KHs       \* RA[slot][λ][ī][h]
@@ -214,15 +226,21 @@ Width(r) == CASE r \in {"sA", "sB"} -> 2
               [] r = "vec"           -> 8
               [] OTHER               -> 1
 
-\* Regions present, in layout order (§4a; 0 if b·m·n = 0; vec only in
-\* DIRECT mode or when k = 0).
-Regions == IF Empty THEN <<>>
-           ELSE IF Direct \/ (k = 0 /\ Bug # "fullWsK0") THEN <<"vec">>
-           ELSE <<"sA", "sB", "fA", "fB", "vec", "RA", "RB", "W">>
+\* Regions present, in layout order (§4a; 0 if b·m·n = 0; vec only for
+\* the DIRECT path (mode DIRECT or K-empty) or when k = 0). RegionsFor(dir)
+\* is the layout of a call that takes (dir = TRUE) or skips the DIRECT path.
+AllRegions == <<"sA", "sB", "fA", "fB", "vec", "RA", "RB", "W">>
+RegionsFor(dir) == IF Empty THEN <<>>
+                   ELSE IF dir \/ (k = 0 /\ Bug # "fullWsK0") THEN <<"vec">>
+                   ELSE AllRegions
+\* The layout the kernels of this call use (offsets, accesses).
+Regions == RegionsFor(UseDirect)
 Active  == Range(Regions)
 
-\* THE FORMULA: workspace_size = Σ_regions align(bytes).
-WorkspaceSize == SumSeq([i \in DOMAIN Regions |-> Align(Bytes(Regions[i]))])
+\* THE FORMULA: workspace_size = Σ_regions align(bytes), for the regions of
+\* the path the descriptor dispatches to (SizeDirect).
+SizedRegions  == RegionsFor(SizeDirect)
+WorkspaceSize == SumSeq([i \in DOMAIN SizedRegions |-> Align(Bytes(SizedRegions[i]))])
 
 \* What the implementation reserves for each region when it computes the
 \* offsets (equal to the formula's term unless a negative model injects a bug).
@@ -311,13 +329,13 @@ GroupsFrom(gi) == IF gi > NG THEN <<>>
 GP == GroupsFrom(1)
 
 ProgFull == IF Empty THEN <<>>
-            ELSE IF Direct THEN <<KVec, KDirect>>
+            ELSE IF UseDirect THEN <<KVec, KDirect>>
             ELSE IF Bug = "crtEarly"
                  THEN <<KVec, KScale>> \o SubSeq(GP, 1, Len(GP) - 1)
                       \o <<KCrt>> \o SubSeq(GP, Len(GP), Len(GP))
             ELSE <<KVec, KScale>> \o GP \o <<KCrt>>
 \* α = 0 or k = 0: C <- β·C only (§3.7); K1-K4 are not launched.
-ProgTriv == IF Empty THEN <<>> ELSE <<KVec, IF Direct THEN KDirect ELSE KCrt>>
+ProgTriv == IF Empty THEN <<>> ELSE <<KVec, IF UseDirect THEN KDirect ELSE KCrt>>
 
 \* Indexed by "α = 0" (a host-side fact). Cached tables (zero-arity).
 Prog == [a \in BOOLEAN |-> IF a \/ k = 0 THEN ProgTriv ELSE ProgFull]
@@ -364,7 +382,8 @@ WellFormed ==
     /\ ChunkLen >= 1 /\ MaxZ >= 1
     /\ AlignWS >= 1 /\ AlignK >= 1 /\ AlignN >= 1
     /\ WsBytes \in Nat
-    /\ {Direct, TwoStreams, UseEvents, EnforcePreconditions} \subseteq BOOLEAN
+    /\ {Direct, KEmpty, TwoStreams, UseEvents, EnforcePreconditions} \subseteq BOOLEAN
+    /\ KEmpty => k = 1                     \* the K-empty GEMM view has k = 1
     /\ Bug \in Bugs
 
 \* Preconditions of the design; each has a boundary-tight positive model and
@@ -622,7 +641,7 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 (* launch split and stream assignment.                                     *)
 Expected(e) ==
     IF alpha0 \/ k = 0 THEN (IF beta0 THEN "zero" ELSE "betaC")
-    ELSE IF Direct \/ flagA[<<e[1], e[2]>>] \/ flagB[<<e[1], e[3]>>] THEN "native"
+    ELSE IF UseDirect \/ flagA[<<e[1], e[2]>>] \/ flagB[<<e[1], e[3]>>] THEN "native"
     ELSE "crt"
 
 -----------------------------------------------------------------------------
@@ -725,6 +744,20 @@ GemmAligned ==
            /\ AddrRA(s, lam, 0, c * ChunkLen) % AlignK = 0
            /\ AddrRB(s, lam, 0, c * ChunkLen) % AlignK = 0
            /\ AddrW(ModOf(gi, s), lam, 0, 0) % AlignN = 0
+
+\* §4 DIRECT path / §4a: "K-empty -> DIRECT is documented dispatch by
+\* descriptor". The DIRECT kernel is launched iff the output is non-empty
+\* and (mode = DIRECT or the descriptor is K-empty), for either value of
+\* the α = 0 input (a host-side fact that cannot change the path), no
+\* emulation kernel runs on that path, and the workspace the §4a formula
+\* reports is exactly the layout of the path taken (align(vec) there).
+\* Constant-level.
+DispatchByDescriptor ==
+    /\ \A a \in BOOLEAN :
+         LET kinds == {Prog[a][i].kind : i \in DOMAIN Prog[a]} IN
+         /\ ("direct" \in kinds) <=> (~Empty /\ (Direct \/ KEmpty))
+         /\ "direct" \in kinds => kinds \cap {"scale", "packA", "packB", "gemm", "crt"} = {}
+    /\ WorkspaceSize = SumSeq([i \in DOMAIN Regions |-> Align(Bytes(Regions[i]))])
 
 \* §4 launch limits: each batched launch has gridDim.z <= MaxZ, and the
 \* launches of a group cover its |G|·b batches exactly once.
