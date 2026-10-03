@@ -1,4 +1,4 @@
-# immerdink — design (v1.2)
+# immerdink — design (v1.3)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -12,8 +12,8 @@ This is the single source of truth for *what* v1 computes and *how*.
 v1.1 folds in the corrections found by the spec phase: adversarial review plus mutation
 testing of every artifact. v1.2 changes execution details after M4 (K0 generated on the
 device or plan-resident, GEMM parameters built at plan creation; a K1 split was specified
-and measured but not adopted) and the §6 thread and lifetime rules that follow from them; changed text is marked **[v1.2]**. Both change
-lists are at the end.
+and measured but not adopted) and the §6 thread and lifetime rules that follow from them; changed text is marked **[v1.2]**. v1.3 adds
+§6a, the CUDA-free host query API (no semantic change). The change lists are at the end.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -538,7 +538,8 @@ const char*  imd_status_string(imd_status_t);
   INVALID_VALUE (in `imd_workspace_size` too, which depends on it).
 
 - `imd_workspace_size` is a **pure host function**: no GPU, no allocation, and exactly
-  §4a.
+  §4a. **[v1.3]** It and the other host queries (§4a table, plan bytes, lowering summary)
+  live in the CUDA-free `libimmerdink_host` (§6a), which libimmerdink links.
 - Statuses: SUCCESS, INVALID_VALUE, NOT_SUPPORTED, ALIASING, INSUFFICIENT_WORKSPACE,
   MISALIGNED, ALLOC_FAILED (host allocation in plan creation), CUDA_ERROR.
 - `imd_plan_create` reports the §5 statuses and the RN acceptance rule (§3.2: κ ≥ T →
@@ -629,6 +630,138 @@ const char*  imd_status_string(imd_status_t);
 
 ---
 
+## 6a. Host query API (libimmerdink_host, CUDA-free) [v1.3]
+
+Callers that own memory and orchestration (e.g. ehrenfest) must know exactly what
+immerdink will need **without a GPU**: workspace bytes per (descriptors, N, g, vec_mode),
+the §4a region table, plan device and host bytes, and the lowering a performance model
+would consume. This section **only exposes** §3.2 (RN acceptance), §4 (dispatch, launch
+structure), §4a (layout, plan device bytes) and §5 (lowering, legality); they remain the
+specification, and no semantics change. The TLA+ specs are therefore unchanged
+(`IndexMap`, `Pipeline LayoutExact / PlanBytesExact`, `HostAPI` cover the same functions,
+now in another library).
+
+**Single source of truth.** `libimmerdink_host.so` (plain C++17, no CUDA headers, no CUDA
+libraries) holds the only implementation of the argument checks, the §5 lowering and
+legality, the §3.2 plan-time constants and RN acceptance, the §4a layout, the K4 launch
+structure and the plan sizes. `libimmerdink.so` links it (DT_NEEDED) and builds every plan
+from it: `imd_plan_create` = host analysis + plan data, then only the device parts (SM
+count, K4 kernel parameters, the resident vectors, allocated with exactly the host
+library's plan device bytes). `imd_workspace_size` and `imd_status_string` moved into the
+host library (same declarations, same header `immerdink.h`, which now includes
+`immerdink_host.h`). `spec/params.py` and `spec/oracle.py` are not an API; they stay the
+independent check of the C (tests compare them).
+
+```c
+#include "immerdink/immerdink_host.h"        /* no CUDA header; also included by immerdink.h */
+
+uint32_t     imd_host_api_version(void);      /* IMD_HOST_API_VERSION of the loaded library */
+imd_status_t imd_workspace_size(const imd_tensor_t* A, const imd_tensor_t* B,
+                                const imd_tensor_t* C, const imd_options_t*, size_t* bytes);
+typedef struct { uint64_t offset, bytes; } imd_region_t;      /* bytes 0: region absent */
+imd_status_t imd_workspace_layout(const imd_tensor_t* A, const imd_tensor_t* B,
+                                  const imd_tensor_t* C, const imd_options_t*,
+                                  imd_region_t* regions, int32_t capacity,
+                                  int32_t* num_regions, size_t* total);
+const char*  imd_region_name(int32_t region);  /* IMD_REGION_SA .. IMD_REGION_W: "sA" .. "W" */
+imd_status_t imd_plan_bytes(const imd_tensor_t* A, const imd_tensor_t* B,
+                            const imd_tensor_t* C, const imd_options_t*,
+                            size_t* device_bytes, size_t* host_bytes);
+imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
+                          const imd_tensor_t* C, const imd_options_t*, imd_lowering_t* out);
+const char*  imd_status_string(imd_status_t);
+
+typedef struct {               /* 136 bytes in version 1; fields are only appended */
+  uint32_t struct_size;        /* in: sizeof(imd_lowering_t) as the caller compiled it  */
+  int32_t  status, lowered, dispatch, swapped, num_moduli, residue_group, num_groups;
+  int64_t  m, n, k, b, n_hat, k_hat, vec_entries, k_chunks, gemm_launches;
+  uint64_t kappa, workspace_bytes, plan_device_bytes, plan_host_bytes;
+} imd_lowering_t;
+enum { IMD_DISPATCH_NOOP, IMD_DISPATCH_EMULATE, IMD_DISPATCH_DIRECT, IMD_DISPATCH_SCALE };
+```
+
+Semantics:
+- **`imd_workspace_size`**: unchanged (§4a, §6): statuses SUCCESS, INVALID_VALUE,
+  NOT_SUPPORTED from the argument checks and §5 rows 1–5; never the RN acceptance rule.
+- **`imd_workspace_layout`**: the same status; on SUCCESS the §4a table as data:
+  `regions[r]` for `r < min(capacity, IMD_REGION_COUNT)` in §4a order (sA sB fA fB vec RA
+  RB W), each `{offset, bytes}` with `bytes = 0` for a region absent from this call (empty
+  output, DIRECT / K-empty / k = 0, the vec region with `IMD_VEC_RESIDENT`);
+  `*num_regions = IMD_REGION_COUNT`, `*total = imd_workspace_size`. `capacity < 0`, or
+  `capacity > 0` with `regions = NULL` → INVALID_VALUE.
+- **`imd_plan_bytes`**: returns the **plan-time status**, i.e. what `imd_plan_create`
+  returns barring CUDA and allocation failures: the `imd_workspace_size` checks, then §3.2
+  RN acceptance (κ ≥ T with the emulated GEMM → NOT_SUPPORTED). On SUCCESS:
+  - `device_bytes` = §4a "plan device bytes" = `imd_plan_device_bytes` of that plan
+    (the bytes requested from `cudaMalloc`);
+  - `host_bytes` = the plan's **host payload**: `sizeof` the plan record + 20 bytes per
+    descriptor mode (extent, stride, label copies) + the lowering tables (per distinct
+    label, per label in the canonical orders, per fused mode) + the K0 fused-mode
+    descriptor (unless NOOP) + on EMULATE the K4 parameter block and one CUTLASS parameter
+    set per distinct K4 launch shape (store-mod and add-mod). Heap-allocator and container
+    bookkeeping are not included (as the driver's granularity is not in the device bytes).
+    It is a few KB; the exact `sizeof` values are those of the build, so it is reported by
+    the library rather than written into this document.
+  Either pointer may be NULL; outputs are written only on SUCCESS.
+- **`imd_lowering`**: fills the summary and returns the same plan-time status (also in
+  `status`). `out == NULL` or `out->struct_size < 136` → INVALID_VALUE with nothing
+  written. `lowered = 1` iff the `imd_workspace_size` checks passed; then `m, n, k, b`
+  (post-swap, §1.1), `swapped`, `n_hat`, `k_hat`, `kappa` (⌈√k⌉, 0 for k = 0),
+  `num_moduli`, `residue_group` (g normalized to [1, N]), `dispatch`, `vec_entries`
+  (2m + 2n + 2k + 3b, 0 on NOOP), `workspace_bytes`, and on EMULATE `num_groups` = ⌈N/g⌉,
+  `k_chunks` (K4 K-chunks per group, ⌈k̂/K_c'⌉) and `gemm_launches` (K4 kernel launches per
+  `imd_contract`, with the batch ≤ 65535 and n̂ ≤ 65535·256 splits) are valid even when the
+  status is NOT_SUPPORTED (κ ≥ T), so a caller sees why. `plan_device_bytes` and
+  `plan_host_bytes` are valid only on SUCCESS. With `lowered = 0` every field except
+  `struct_size`, `status` and `lowered` is 0.
+  - `dispatch`: NOOP (b·m·n = 0), EMULATE (K0–K5; EMULATE mode, k ≥ 2), DIRECT (K0 + the
+    native kernel; DIRECT mode or K-empty), SCALE (k = 0: K0 + the β kernel, §3.7). A call
+    with α = 0 also runs only K0 and the β kernel; that is per call, not per plan.
+- **Statuses** are those of §6; the queries can return SUCCESS, INVALID_VALUE,
+  NOT_SUPPORTED and (host allocation of the O(rank) lowering tables) ALLOC_FAILED.
+- **No GPU, no CUDA runtime, no driver.** The functions are **pure** (outputs depend only on
+  the arguments; no allocation visible to the caller, no global or static mutable state)
+  and **thread-safe** (any number of threads, concurrently with each other and with
+  libimmerdink). They read the descriptor arrays only during the call.
+- The K4 launch structure used for `k_chunks`, `gemm_launches` and the host bytes is the
+  production one (K_c' chunks, 65535 batches, 65535 N-tiles of 256); the test-only
+  launch-limit hook changes only libimmerdink's plans.
+
+**The workspace/speed knob is g only.** Callers query sizes for each g ∈ [1, N] and choose;
+there is no budget option (BENCHMARKS "Residue-group size g" gives the speed side).
+
+**ABI stability.**
+- Plain C: int32/int64/uint64/size_t/pointers, no bitfields, unions or enums in structs;
+  `imd_region_t` is 16 bytes, `imd_lowering_t` 136 bytes in version 1.
+- `IMD_HOST_API_VERSION` (header) and `imd_host_api_version()` (library) start at 1 and
+  grow by one whenever a function, an enum value or a trailing `imd_lowering_t` field is
+  added. Nothing that exists changes meaning, signature or layout; a change that would is
+  a new function name.
+- `imd_lowering_t` is versioned by `struct_size`: an older caller's smaller struct gets the
+  fields it knows; a newer caller's larger struct keeps its unknown trailing fields
+  untouched. Callers check `imd_host_api_version() >= ` the version they need.
+- `imd_tensor_t` and `imd_options_t` are §6's; `imd_options_t` has no size field (v1.2 grew
+  it; a further change would need a rebuild, as v1.2 did).
+- Internal C++ entry points of the host library (lowering, layout, plan data) are exported
+  for libimmerdink and the tests only; they are not in `include/` and carry no ABI promise
+  (both libraries are built together).
+
+**Python.** `python/immerdink/host.py` is a thin ctypes wrapper over these functions
+(nanobind later), with an einsum-style front end (`"kjbc,kiac->abij"` + extents + optional
+strides) and raw descriptors; it implements no sizing logic. Library lookup: argument,
+`$IMMERDINK_HOST_LIB`, `$IMMERDINK_LIB_DIR`, the build directory, the system path.
+
+**Tests** (`tools/test.sh`): `host_c_api` (C11, linked against libimmerdink_host only);
+`workspace_vs_params` (all §4a vectors plus a g = 1..N × vec_mode sweep vs `params.py`:
+status, layout, plan device bytes, lowering); `host_python` (wrapper == direct C calls ==
+`params.py` + `oracle.py`, including the κ ≥ T boundary and K4 splits);
+`host_vs_plan` (real plans: GEMM view, layout, device bytes, K4 parameter sets and
+launches, host payload counted from the live containers == the host queries);
+`host_cuda_free` (no CUDA in readelf/ldd/nm; the repository builds and passes its host
+tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH).
+
+---
+
 ## 7. What was considered and rejected
 
 | Option | Why not |
@@ -684,3 +817,13 @@ const char*  imd_status_string(imd_status_t);
   relaxed to "until every call using it has returned" (generate mode). ALLOC_FAILED no
   longer covers a pinned allocation. Public API: `imd_options_t.vec_mode` and
   `imd_plan_device_bytes` added (user-approved); nothing else changes. **[spec: HostAPI]**
+
+## Changes v1.2 → v1.3 (external memory API)
+
+- **§6a (new).** The lowering, legality, RN acceptance, §4a layout, K4 launch structure and
+  plan sizes move into the CUDA-free `libimmerdink_host` (C ABI, `immerdink_host.h`),
+  which `libimmerdink` links and uses for every plan: one implementation. New queries:
+  `imd_host_api_version`, `imd_workspace_layout`, `imd_region_name`, `imd_plan_bytes`,
+  `imd_lowering`. `imd_workspace_size` and `imd_status_string` move to the host library
+  with unchanged declarations. No computed value, status or kernel changes, so the TLA+
+  specs are unchanged; §3.2, §4, §4a and §5 remain the specification.
