@@ -59,3 +59,6 @@ open Immerdink
 #print axioms Error.end_to_end_trunc
 #print axioms Error.zero_row
 #print axioms Error.q_zero_rn
+
+-- Capstone (Exact.lean): L1c + L4 + L2c
+#print axioms Exact.emulated_product_exact
