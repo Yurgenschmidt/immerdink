@@ -382,6 +382,15 @@ def suite_packed(lib, cuda, verbose):
     # m = n = 1, b = 3300, g = N = 20: 66000 batches (the K4 batch split) over pack planes
     run("kl,kl->l (b=3300)", T([3, 3300], [K, L]), T([3, 3300], [K, L]), T([3300], [L]),
         which="AB", order="auto", N=20, kind="uniform")
+    # every residue-group size g = 1..N (a group is the slice of planes g0.. of the pack)
+    A, B, Cd = T([m, k, b], [I, K, L]), T([k, n, b], [K, J, L]), T([m, n, b], [I, J, L])
+    TA, TB, TC = tc.gen(rng, A.extent, "phi"), tc.gen(rng, B.extent, "phi"), tc.gen(rng, Cd.extent, "uniform")
+    tc.inject(rng, TB, 0.02)
+    for gg in range(1, 8):
+        for w in ("A", "B", "AB"):
+            run_packed_case(lib, cuda, f"g sweep g={gg} [{w}]", A, B, Cd, TA, TB, TC, 1.0, 0.5, 7,
+                            gg, "TRUNC" if gg % 2 else "RN", o.EMULATE, w, "auto", rng, verbose,
+                            full=False)
     # §3.7 native order through a pack (oracle A7): AUTO adopts X's K order (k1 fastest:
     # NaN), imd_pack_desc_for the plan's (k2 fastest: -Inf), as the plain call.
     MAX = 1.7976931348623157e308
