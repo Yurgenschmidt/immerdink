@@ -147,8 +147,11 @@ Why we deviate:
   (`|a'| ≤ T` reaches 2⁷⁷ at N = 20). It is never forced into int64.
 - **Why RN.** It is unbiased and halves the worst-case per-entry error.
   - TRUNC biases every product toward zero.
-  - Measured with the oracle: RN is about 2.4× more accurate (median) on zero-mean random
-    data, and 19–191× on same-sign data, which is worth about 0.2–0.9 moduli.
+  - Measured with the oracle: RN is about 1.5–3× more accurate (median) on zero-mean random
+    data, and 19–191× on same-sign data. One modulus is worth about 16× (≈4 bits per
+    operand), so that is about 0.3 moduli on zero-mean data and 1–2 on same-sign data. At
+    k = 1000 and φ ≤ 1, RN reaches native-FP64-level accuracy at N = 14, where TRUNC needs
+    15.
 - **The cost** is the `κ/2` slack in §3.2: a fraction `κ/(2T)` of the budget, which is
   `< 2⁻²⁰` for N ≥ 8 and k ≤ 2²⁴.
 - TRUNC stays available for comparisons that follow the paper exactly.
