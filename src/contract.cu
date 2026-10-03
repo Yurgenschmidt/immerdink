@@ -32,7 +32,6 @@ using imd::device::c_tables;
 using namespace imd::kernels;
 
 constexpr int kThreads = 256;
-constexpr int kWarps = kThreads / 32;
 constexpr int64_t kMaxBlocks = int64_t{1} << 20;  // grid-stride loops beyond this
 
 unsigned blocks_for(int64_t work, int per_block = kThreads) {
@@ -67,10 +66,14 @@ __device__ __forceinline__ u128 shfl_down_u128(u128 v, int d) {
   return (static_cast<u128>(hi) << 64) | lo;
 }
 
-__global__ void __launch_bounds__(kThreads) k1_scale(ScaleArgs a) {
-  __shared__ int s_max[kWarps];
-  __shared__ int s_flag[kWarps];
-  __shared__ u128 s_sum[kWarps];
+// One block of T threads per row (T = 1024 for long or few rows: more loads in flight per
+// row while few rows are resident, so the second pass re-reads from L2).
+template <int T>
+__global__ void __launch_bounds__(T) k1_scale(ScaleArgs a) {
+  constexpr int kW = T / 32;
+  __shared__ int s_max[kW];
+  __shared__ int s_flag[kW];
+  __shared__ u128 s_sum[kW];
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int64_t total = a.b * a.op.rows;
   for (int64_t r = blockIdx.x; r < total; r += gridDim.x) {
@@ -93,7 +96,7 @@ __global__ void __launch_bounds__(kThreads) k1_scale(ScaleArgs a) {
     __syncthreads();
     gmax = INT_MIN;
     flag = 0;
-    for (int w = 0; w < kWarps; ++w) {
+    for (int w = 0; w < kW; ++w) {
       gmax = max(gmax, s_max[w]);
       flag |= s_flag[w];
     }
@@ -113,7 +116,7 @@ __global__ void __launch_bounds__(kThreads) k1_scale(ScaleArgs a) {
       int sigma = 0;  // zero row (all entries zero or non-finite): sigma := 0
       if (gmax != INT_MIN) {
         u128 tot = 0;
-        for (int w = 0; w < kWarps; ++w) tot += s_sum[w];
+        for (int w = 0; w < kW; ++w) tot += s_sum[w];
         sigma = largest_u(tot, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
       }
       a.sigma[r] = static_cast<int16_t>(sigma);  // range certified (cert_shift_range)
@@ -246,12 +249,17 @@ __global__ void __launch_bounds__(kThreads) k1_tiled(ScaleArgs a, int64_t radix,
 // Blocks for a two-pass kernel whose blocks each re-read `bytes_per_block`: enough to fill
 // the GPU, but few enough that the rows in flight (about 40 MB) stay in the 72 MB L2 for
 // the second pass.
-unsigned k1_blocks(int64_t work_items, double bytes_per_block) {
+int sm_count() {
   int dev = 0, sms = 128;
   if (cudaGetDevice(&dev) == cudaSuccess)
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  return sms;
+}
+
+unsigned k1_blocks(int64_t work_items, double bytes_per_block) {
+  const int sms = sm_count();
   const double fit = 40.0 * (1 << 20) / std::max(1.0, bytes_per_block);
-  const int64_t cap = std::max<int64_t>(2 * int64_t{sms}, static_cast<int64_t>(fit));
+  const int64_t cap = std::max<int64_t>(sms, static_cast<int64_t>(fit));
   return blocks_for(std::min(work_items, cap), 1);
 }
 
@@ -605,7 +613,11 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
       k1_tiled<<<k1_blocks(tiles, 8.0 * double(p.k) * double(int64_t{1} << lg_th)), kThreads, 0,
                  stream>>>(sa, radix, lg_th);
     } else {
-      k1_scale<<<k1_blocks(rows, 8.0 * double(p.k)), kThreads, 0, stream>>>(sa);
+      const unsigned blocks = k1_blocks(rows, 8.0 * double(p.k));
+      if (int64_t{blocks} < 2 * int64_t{sm_count()})
+        k1_scale<1024><<<blocks, 1024, 0, stream>>>(sa);
+      else
+        k1_scale<kThreads><<<blocks, kThreads, 0, stream>>>(sa);
     }
     IMD_PROF(stream, x == 0 ? "K1 scale A" : "K1 scale B");
   }
