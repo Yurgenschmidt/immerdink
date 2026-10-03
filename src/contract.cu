@@ -72,6 +72,7 @@ struct ScaleArgs {
   uint8_t* flag;   // [lambda][rows]
   uint64_t rhs[4];
   int rhs_bits, lhs_shift;
+  int reverse;  // k1_scale: pass 2 walks each row backwards (launch choice, launch_k1)
 };
 
 __device__ __forceinline__ u128 shfl_down_u128(u128 v, int d) {
@@ -115,14 +116,22 @@ __global__ void __launch_bounds__(T) k1_scale(ScaleArgs a) {
       flag |= s_flag[w];
     }
     // pass 2: S = sum ceil(m_h^2 2^(2(e_h - gamma) + F)), exact (order-independent).
-    // A3: backwards along the row, so the part pass 1 read last (the part most likely still
-    // in L2 when the rows in flight exceed it) is re-read first; S is an exact u128 sum, so
-    // the order does not change it.
+    // A3: with a.reverse (rows in flight larger than the L2 budget, launch_k1), backwards
+    // along the row, so the part pass 1 read last (the part most likely still in L2) is
+    // re-read first; S is an exact u128 sum, so the order does not change it.
     u128 S = 0;
-    if (gmax != INT_MIN && static_cast<int64_t>(threadIdx.x) < a.k) {
-      const int64_t steps = (a.k - 1 - threadIdx.x) / blockDim.x;  // this thread's last h
+    if (gmax != INT_MIN && a.reverse) {
+      if (static_cast<int64_t>(threadIdx.x) < a.k) {
+        const int64_t steps = (a.k - 1 - threadIdx.x) / blockDim.x;  // this thread's last h
 #pragma unroll 4
-      for (int64_t h = threadIdx.x + steps * blockDim.x; h >= 0; h -= blockDim.x) {
+        for (int64_t h = threadIdx.x + steps * blockDim.x; h >= 0; h -= blockDim.x) {
+          const uint64_t bits = to_bits(X[a.op.v_k[h]]);
+          if (finite_nonzero(bits)) S += square_term(bits, gmax);
+        }
+      }
+    } else if (gmax != INT_MIN) {
+#pragma unroll 4
+      for (int64_t h = threadIdx.x; h < a.k; h += blockDim.x) {
         const uint64_t bits = to_bits(X[a.op.v_k[h]]);
         if (finite_nonzero(bits)) S += square_term(bits, gmax);
       }
@@ -276,10 +285,11 @@ __global__ void __launch_bounds__(T) k1_tiled(ScaleArgs a, int64_t radix, int lg
 // the SM count: a grid-strided block runs until all its rows are done, so the blocks beyond
 // the first wave would start only when a resident block finishes all its rows, nearly
 // doubling the time (A4: r_bigk, 2048 rows of 256 KB, had 160 blocks on 128 SMs).
-// Rows in flight of K1's two-blocks-per-SM long-row variant (launch_k1) may hold at most this
-// many bytes (about the 72 MB L2 less what the rest of the GPU keeps there): r_bigk's 256 x
-// 256 KB rows fit, r_mm's 256 x 400 KB do not.
-constexpr double kK1TwoPerSmBytes = 64.0 * (1 << 20);
+// L2 budget for K1's rows in flight (about the 72 MB L2 less what the rest of the GPU keeps
+// there), so that pass 2 re-reads from L2 (launch_k1, A3): the two-blocks-per-SM long-row
+// variant only while 2 x SMs rows fit (r_bigk's 256 x 256 KB do, r_mm's 256 x 400 KB do not);
+// beyond it, one 1024-thread block per SM walks pass 2 backwards.
+constexpr double kK1L2BudgetBytes = 64.0 * (1 << 20);
 
 unsigned k1_blocks(int64_t work_items, double bytes_per_block, int sms) {
   const double fit = 40.0 * (1 << 20) / std::max(1.0, bytes_per_block);
@@ -1005,14 +1015,19 @@ static void launch_k1(const ExecPlan& p, const Operand& opA, const Operand& opB,
     } else {
       const unsigned blocks = k1_blocks(rows, 8.0 * double(p.k), p.sms);
       if (int64_t{blocks} < 2 * int64_t{p.sms} && rows > int64_t{blocks} && blocks >= unsigned(p.sms) &&
-          2.0 * p.sms * 8.0 * double(p.k) <= kK1TwoPerSmBytes)
+          2.0 * p.sms * 8.0 * double(p.k) <= kK1L2BudgetBytes)
         // Long rows, capped grid: two 512-thread blocks per SM, so one block streams a row
         // while the other is in its reductions / sigma tail (A4, r_bigk). A3: only while the
         // 2 x SMs rows in flight fit the L2 budget; beyond it (r_mm: 400 KB rows, 102 MB in
         // flight) the second pass missed L2 and K1 read the operand twice from DRAM.
         k1_scale<512><<<2 * p.sms, 512, 0, stream>>>(sa);
-      else if (int64_t{blocks} < 2 * int64_t{p.sms})
+      else if (int64_t{blocks} < 2 * int64_t{p.sms}) {
+        // A3: rows in flight beyond the L2 budget (x300_100k: 128 rows of 800 KB): walk
+        // pass 2 backwards (NOTES-A3 §4; forward is faster while the rows fit: r_mm).
+        sa.reverse = double(std::min<int64_t>(blocks, rows)) * 8.0 * double(p.k) > kK1L2BudgetBytes;
         k1_scale<1024><<<blocks, 1024, 0, stream>>>(sa);
+        sa.reverse = 0;
+      }
       else
         k1_scale<kThreads><<<blocks, kThreads, 0, stream>>>(sa);
     }

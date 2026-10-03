@@ -573,13 +573,26 @@ def suite_bigk(lib, cuda, verbose):
     run_case(lib, cuda, "long rows (170x1, k=32768, N=3 RN)", A, B, C, TA, TB,
              np.zeros((170, 1)), 1.0, 0.0, 3, 0, "RN", rng=rng, expect_kind="GEMM", verbose=verbose)
     # A3: rows too long for two per SM in L2 (2 x 128 x 8 k > 64 MiB): one 1024-thread block
-    # per SM, grid-strided over more rows than blocks (both K1 variants walk pass 2 backwards).
+    # per SM, grid-strided over more rows than blocks; pass 2 forward (128 x 320 KB fit).
     k = 40000
     A, B, C = matrix(rng, 130, 1, k, a_kfast=True, b_kfast=True)
     TA, TB = gen(rng, (130, k), "wide"), gen(rng, (k, 1), "uniform")
     run_case(lib, cuda, "longer rows (130x1, k=40000, N=2 TRUNC)", A, B, C, TA, TB,
              np.zeros((130, 1)), 1.0, 0.0, 2, 0, "TRUNC", rng=rng, expect_kind="GEMM",
              verbose=verbose)
+    # ... and rows in flight beyond 64 MiB (60 x 1.2 MB): pass 2 backwards; two K-chunks.
+    k = 150000
+    A, B, C = matrix(rng, 60, 1, k, a_kfast=True, b_kfast=True)
+    TA, TB = gen(rng, (60, k), "phi"), gen(rng, (k, 1), "uniform")
+    TA[7, 1234] = math.nan
+    global MAX_HOST_BUFFER
+    saved, MAX_HOST_BUFFER = MAX_HOST_BUFFER, 80 << 20   # 72 MB of A: more than the budget
+    try:
+        run_case(lib, cuda, "very long rows (60x1, k=150000, N=3 TRUNC)", A, B, C, TA, TB,
+                 np.zeros((60, 1)), 1.0, 0.0, 3, 0, "TRUNC", rng=rng, expect_kind="GEMM",
+                 verbose=verbose)
+    finally:
+        MAX_HOST_BUFFER = saved
 
 
 def suite_api(lib, cuda, verbose):
