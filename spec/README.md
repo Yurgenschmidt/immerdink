@@ -27,8 +27,11 @@ Current status:
   precondition is necessary.
 - Some `neg_witness_*` models exist only to prove a corner case is *reachable*: a tie, a
   subnormal, overflow to Inf, an exact hit on the budget, and so on.
-- `check.sh` runs models in parallel (`TLC_JOBS`, `TLC_WORKERS`, `TLC_TIMEOUT`). Model
-  checking is pass/fail, so it is not gated on a quiet machine.
+- `check.sh` runs models in parallel (`TLC_JOBS`, `TLC_HEAP`, `TLC_WORKERS`, `TLC_TIMEOUT`).
+  Model checking is pass/fail, so it is not gated on a quiet machine. Each JVM's heap and
+  off-heap fingerprint set are capped (`TLC_HEAP`, default 2g), `TLC_JOBS` is clamped to what
+  fits in memory, and the run sits inside the shared `tools/memcap.sh` budget. All 121 models
+  peak at about 6.4 GB.
 - Every artifact was attacked with mutation testing: realistic single-point bugs injected
   into copies. Every mutant from the review and fix rounds is killed by some model or test.
 
