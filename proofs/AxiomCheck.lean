@@ -27,3 +27,25 @@ open Immerdink
 #print axioms Chunk.epi_input_range
 #print axioms Chunk.design_constants
 #print axioms Chunk.epi_input_int32
+
+-- L1 (Scaling.lean)
+#print axioms Scaling.l2_add_le
+#print axioms Scaling.l1_le_sqrt_mul_l2
+#print axioms Scaling.two_pow_le_S
+#print axioms Scaling.exists_max_rule
+#print axioms Scaling.not_rule_succ
+#print axioms Scaling.exists_u_rn
+#print axioms Scaling.exists_u_trunc
+#print axioms Scaling.no_rule_of_R_zero
+#print axioms Scaling.budget_rn
+#print axioms Scaling.budget_trunc
+#print axioms Scaling.budget_rn_int
+#print axioms Scaling.budget_trunc_int
+#print axioms Scaling.crt_precondition
+#print axioms Scaling.sigma_bound_rn
+#print axioms Scaling.sigma_bound_trunc
+#print axioms Scaling.row_rn
+#print axioms Scaling.row_trunc
+#print axioms Scaling.abs_rne_sub
+#print axioms Scaling.abs_truncZ_le
+#print axioms Scaling.abs_truncZ_sub_lt
