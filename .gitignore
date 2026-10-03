@@ -6,4 +6,7 @@ tools/apalache/
 
 # Lean / Lake build artifacts
 proofs/.lake/
+
+# CMake build tree, agent worktrees
+build/
 .claude/
