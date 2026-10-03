@@ -217,43 +217,58 @@ __device__ __forceinline__ double round_scaled(const uint32_t (&x)[L], bool neg,
 // §3.6 running CRT over the N planes for one element: x <- 0; for l: y = (q_l W_l) mod p_l;
 // x += M_l y (one carry chain); if x >= P: x -= P. Then z = x <= H ? x : x - P, returned as
 // (|z| limbs, sign). L = L32(N) limbs suffice (2P <= 2^(32 L)).
+// One §3.6 step for plane l: y = (q_l W_l) mod p_l; x += M_l y; if x >= P: x -= P.
+template <int L>
+__device__ __forceinline__ void crt_step(uint32_t (&x)[L], uint32_t Wl, int l, int N) {
+  using imd::device::c_tables;
+  const uint32_t p = c_tables.moduli[l];
+  const uint32_t y = imd::device::mod_p_small(c_tables.q[N][l] * Wl, p, c_tables.epi_magic[l]);
+  uint64_t carry = 0;
+#pragma unroll
+  for (int w = 0; w < L; ++w) {
+    const uint64_t t = uint64_t{x[w]} + uint64_t{c_tables.M[N][l][w]} * y + carry;
+    x[w] = static_cast<uint32_t>(t);
+    carry = t >> 32;
+  }
+  // carry == 0: the peak x + M_l y < 2P <= 2^(32 L) (cert_crt_peak)
+  bool ge = true;  // x >= P
+#pragma unroll
+  for (int w = L - 1; w >= 0; --w) {
+    if (x[w] != c_tables.P[N][w]) {
+      ge = x[w] > c_tables.P[N][w];
+      break;
+    }
+  }
+  if (ge) {
+    uint64_t borrow = 0;
+#pragma unroll
+    for (int w = 0; w < L; ++w) {
+      const uint64_t t = uint64_t{x[w]} - c_tables.P[N][w] - borrow;
+      x[w] = static_cast<uint32_t>(t);
+      borrow = (t >> 32) & 1;
+    }
+  }
+}
+
+template <int L>
+__device__ __forceinline__ void crt_finish(const uint32_t (&x)[L], int N, uint32_t (&mag)[L],
+                                           bool* neg);
+
 template <int L>
 __device__ __forceinline__ void crt(const uint8_t* W, int64_t plane, int N, uint32_t (&mag)[L],
                                     bool* neg) {
-  using imd::device::c_tables;
   uint32_t x[L];
 #pragma unroll
   for (int w = 0; w < L; ++w) x[w] = 0;
-  for (int l = 0; l < N; ++l) {
-    const uint32_t p = c_tables.moduli[l];
-    const uint32_t y = imd::device::mod_p_small(c_tables.q[N][l] * W[l * plane], p,
-                                                c_tables.epi_magic[l]);
-    uint64_t carry = 0;
-#pragma unroll
-    for (int w = 0; w < L; ++w) {
-      const uint64_t t = uint64_t{x[w]} + uint64_t{c_tables.M[N][l][w]} * y + carry;
-      x[w] = static_cast<uint32_t>(t);
-      carry = t >> 32;
-    }
-    // carry == 0: the peak x + M_l y < 2P <= 2^(32 L) (cert_crt_peak)
-    bool ge = true;  // x >= P
-#pragma unroll
-    for (int w = L - 1; w >= 0; --w) {
-      if (x[w] != c_tables.P[N][w]) {
-        ge = x[w] > c_tables.P[N][w];
-        break;
-      }
-    }
-    if (ge) {
-      uint64_t borrow = 0;
-#pragma unroll
-      for (int w = 0; w < L; ++w) {
-        const uint64_t t = uint64_t{x[w]} - c_tables.P[N][w] - borrow;
-        x[w] = static_cast<uint32_t>(t);
-        borrow = (t >> 32) & 1;
-      }
-    }
-  }
+  for (int l = 0; l < N; ++l) crt_step<L>(x, W[l * plane], l, N);
+  crt_finish<L>(x, N, mag, neg);
+}
+
+// §3.6 centering: z = x <= H ? x : x - P, as (|z| limbs, sign).
+template <int L>
+__device__ __forceinline__ void crt_finish(const uint32_t (&x)[L], int N, uint32_t (&mag)[L],
+                                           bool* neg) {
+  using imd::device::c_tables;
   bool gt = false;  // x > H
 #pragma unroll
   for (int w = L - 1; w >= 0; --w) {

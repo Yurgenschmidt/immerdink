@@ -28,6 +28,8 @@ struct ExecPlan {
   // K2 / K3 gather tiling (index_map.hpp pack_pivot), for the GEMM's A and B operands.
   bool pack_along_rows[2] = {false, false};
   int64_t pack_radix[2] = {1, 1};
+  // K5 thread mapping: lambda fastest (C's fastest label is a batch label) or j-bar fastest.
+  bool k5_batch_fast = false;
 
   // §5 step 10 scatter vectors, in the §4a vec order, in pinned host memory owned by the
   // plan (K0 copies them to ws.vec with cudaMemcpyAsync).

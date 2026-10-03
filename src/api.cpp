@@ -272,6 +272,7 @@ imd_status_t imd_plan_create(imd_handle_t handle, const imd_tensor_t* A, const i
         e.pack_along_rows[x] = pv.along_rows;
         e.pack_radix[x] = pv.radix;
       }
+      e.k5_batch_fast = imd::detail::k5_batch_fastest(lw);
     }
     if (e.path != imd::detail::Path::kNoop) {
       // §5 step 10: scatter vectors in pinned host memory (K0 copies them asynchronously).

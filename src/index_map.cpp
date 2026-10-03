@@ -262,6 +262,14 @@ int64_t* radix_vec(const std::vector<FusedMode>& modes, int X, int64_t size, int
 
 }  // namespace
 
+bool k5_batch_fastest(const Lowered& lw) {
+  const auto& L = lw.fused[kL];
+  const auto& J = lw.fused[static_cast<int>(LabelClass::J)];
+  if (L.empty()) return false;
+  if (J.empty()) return true;
+  return abs_u64(L.front().stride[kC]) < abs_u64(J.front().stride[kC]);
+}
+
 PackPivot pack_pivot(const Lowered& lw, int X) {
   // rho = r + rows * lambda: the row group's fused modes, then L's, first fastest.
   uint64_t best = UINT64_MAX;

@@ -314,22 +314,92 @@ __device__ __forceinline__ void store_out(const OutArgs& a, int64_t off, double 
   a.C[off] = a.beta == 0.0 ? E : __fma_rn(a.beta, a.C[off], E);  // C not read when beta = 0
 }
 
+// K5 core: the D values of the 4 consecutive j-bar j0..j0+3 of row (lambda, i); j0 is a
+// multiple of 4, so each plane's 4 bytes are one aligned u32 load (n_hat is a multiple of
+// 16). Elements with j >= n are not computed (D[e] unspecified).
 template <int L>
-__global__ void __launch_bounds__(kThreads) k5_crt(OutArgs a) {
-  const int64_t total = a.b * a.m * a.n, plane = a.b * a.m * a.n_hat;
-  for (int64_t idx = blockIdx.x * int64_t{blockDim.x} + threadIdx.x; idx < total;
-       idx += int64_t{gridDim.x} * blockDim.x) {
-    const int64_t j = idx % a.n, t = idx / a.n, i = t % a.m, lam = t / a.m;
-    double D;
-    if (a.fA[lam * a.m + i] != 0 || a.fB[lam * a.n + j] != 0) {
-      D = native_dot(a, lam, i, j);
+__device__ __forceinline__ void k5_quad(const OutArgs& a, int64_t lam, int64_t i, int64_t j0,
+                                        double (&D)[4]) {
+  const int64_t plane = a.b * a.m * a.n_hat, row = lam * a.m + i;
+  const uint8_t* W = a.W + row * a.n_hat + j0;
+  uint32_t x[4][L];
+#pragma unroll
+  for (int e = 0; e < 4; ++e)
+#pragma unroll
+    for (int w = 0; w < L; ++w) x[e][w] = 0;
+  for (int l = 0; l < a.N; ++l) {
+    const uint32_t wv = __ldg(reinterpret_cast<const uint32_t*>(W + l * plane));
+#pragma unroll
+    for (int e = 0; e < 4; ++e) crt_step<L>(x[e], (wv >> (8 * e)) & 255u, l, a.N);
+  }
+  const bool fa = a.fA[row] != 0;
+  const int sa = a.sA[row];
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    const int64_t j = j0 + e;
+    if (j >= a.n) break;
+    if (fa || a.fB[lam * a.n + j] != 0) {
+      D[e] = native_dot(a, lam, i, j);
     } else {
       uint32_t mag[L];
       bool neg;
-      crt<L>(a.W + ((lam * a.m + i) * a.n_hat + j), plane, a.N, mag, &neg);
-      D = round_scaled<L>(mag, neg, -(int{a.sA[lam * a.m + i]} + int{a.sB[lam * a.n + j]}));
+      crt_finish<L>(x[e], a.N, mag, &neg);
+      D[e] = round_scaled<L>(mag, neg, -(sa + int{a.sB[lam * a.n + j]}));
     }
-    store_out(a, a.c_bat[lam] + a.c_row[i] + a.c_col[j], D);
+  }
+}
+
+// K5, j-bar fastest (C's fastest label is in J): thread = 4 consecutive j-bar. W reads of a
+// warp are 128 contiguous bytes per plane; C writes run along C's fastest label.
+template <int L>
+__global__ void __launch_bounds__(kThreads) k5_crt(OutArgs a) {
+  const int64_t nq = (a.n + 3) / 4, total = a.b * a.m * nq;
+  for (int64_t idx = blockIdx.x * int64_t{blockDim.x} + threadIdx.x; idx < total;
+       idx += int64_t{gridDim.x} * blockDim.x) {
+    const int64_t jq = idx % nq, t = idx / nq, i = t % a.m, lam = t / a.m;
+    double D[4] = {0, 0, 0, 0};
+    k5_quad<L>(a, lam, i, 4 * jq, D);
+    const int64_t base = a.c_bat[lam] + a.c_row[i];
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+      if (4 * jq + e < a.n) store_out(a, base + a.c_col[4 * jq + e], D[e]);
+  }
+}
+
+// K5, lambda fastest (C's fastest label is a batch label, NOTES-M2M3 #4): a block takes a
+// tile of TL lambda x TJ j-bar of one row i (TL * TJ = 1024). It computes with j-bar
+// fastest (coalesced W reads), stages D in shared memory and writes C with lambda fastest
+// (coalesced C writes). TL = 2^lg_tl in [2, 32].
+template <int L>
+__global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
+  constexpr int kTile = 1024;
+  __shared__ double sD[kTile + 32];
+  const int tl = 1 << lg_tl, lg_tj = 10 - lg_tl, tj = 1 << lg_tj, pitch = tj + 1;
+  const int64_t n_lt = (a.b + tl - 1) >> lg_tl, n_jt = (a.n + tj - 1) >> lg_tj;
+  const int64_t tiles = a.m * n_lt * n_jt;
+  const int tid = threadIdx.x;
+  for (int64_t t = blockIdx.x; t < tiles; t += gridDim.x) {
+    const int64_t jt = t % n_jt, rest = t / n_jt, lt = rest % n_lt, i = rest / n_lt;
+    const int64_t lam0 = lt << lg_tl, j00 = jt << lg_tj;
+    {  // compute: thread = (lambda_l, 4 consecutive j-bar), j-bar fastest
+      const int jq = tid & ((tj >> 2) - 1), ll = tid >> (lg_tj - 2);
+      const int64_t lam = lam0 + ll, j0 = j00 + 4 * jq;
+      if (lam < a.b && j0 < a.n) {
+        double D[4] = {0, 0, 0, 0};
+        k5_quad<L>(a, lam, i, j0, D);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) sD[ll * pitch + 4 * jq + e] = D[e];
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int it = 0; it < kTile / kThreads; ++it) {  // store: lambda fastest
+      const int q = tid + it * kThreads, ll = q & (tl - 1), jl = q >> lg_tl;
+      const int64_t lam = lam0 + ll, j = j00 + jl;
+      if (lam < a.b && j < a.n)
+        store_out(a, a.c_bat[lam] + a.c_row[i] + a.c_col[j], sD[ll * pitch + jl]);
+    }
+    __syncthreads();
   }
 }
 
@@ -350,6 +420,19 @@ __global__ void __launch_bounds__(kThreads) k5_beta_only(OutArgs a) {
     const int64_t j = idx % a.n, t = idx / a.n, i = t % a.m, lam = t / a.m;
     const int64_t off = a.c_bat[lam] + a.c_row[i] + a.c_col[j];
     a.C[off] = a.beta == 0.0 ? 0.0 : __dmul_rn(a.beta, a.C[off]);
+  }
+}
+
+template <int L>
+void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
+  if (p.k5_batch_fast) {
+    int lg_tl = 1;
+    while (lg_tl < 5 && (int64_t{1} << lg_tl) < p.b) ++lg_tl;
+    const int64_t tl = int64_t{1} << lg_tl, tj = 1024 / tl;
+    const int64_t tiles = p.m * ((p.b + tl - 1) / tl) * ((p.n + tj - 1) / tj);
+    k5_crt_bfast<L><<<blocks_for(tiles, 1), kThreads, 0, stream>>>(out, lg_tl);
+  } else {
+    k5_crt<L><<<blocks_for(p.b * p.m * ((p.n + 3) / 4)), kThreads, 0, stream>>>(out);
   }
 }
 
@@ -452,11 +535,11 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
   // K5
   out.sA = sA, out.sB = sB, out.fA = fA, out.fB = fB, out.W = W;
   switch (imd::constants::kTables.L32[p.N]) {
-    case 1: k5_crt<1><<<out_blocks, kThreads, 0, stream>>>(out); break;
-    case 2: k5_crt<2><<<out_blocks, kThreads, 0, stream>>>(out); break;
-    case 3: k5_crt<3><<<out_blocks, kThreads, 0, stream>>>(out); break;
-    case 4: k5_crt<4><<<out_blocks, kThreads, 0, stream>>>(out); break;
-    case 5: k5_crt<5><<<out_blocks, kThreads, 0, stream>>>(out); break;
+    case 1: launch_k5<1>(p, out, stream); break;
+    case 2: launch_k5<2>(p, out, stream); break;
+    case 3: launch_k5<3>(p, out, stream); break;
+    case 4: launch_k5<4>(p, out, stream); break;
+    case 5: launch_k5<5>(p, out, stream); break;
     default: return IMD_STATUS_CUDA_ERROR;  // unreachable: L32 in 1..5 for N in 2..20
   }
   IMD_PROF(stream, "K5 crt");
