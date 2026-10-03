@@ -218,11 +218,12 @@ available on sm_89.
     cuTENSOR-style workspace budget option: plan creation picks the largest g that fits.
   - **Externally accessible memory API.** Callers (e.g. ehrenfest) must be able to compute
     exactly what immerdink needs without a GPU: workspace bytes per (descriptor, N, g,
-    vec_mode), plan device bytes, plan host bytes, and the per-region breakdown. Today this
-    exists as `imd_workspace_size` / `imd_plan_device_bytes` (C, need the library) and
-    `spec/params.py` (certified equal, but spec-internal). Make it a supported surface: C
-    entry points that need no CUDA context, plus a Python module (pure Python mirror or the
-    bindings) kept equal to the C by test.
+    vec_mode), plan device bytes, plan host bytes, and the per-region breakdown. **Single
+    source of truth:** a CUDA-free `libimmerdink_host` (lowering, legality, memory model,
+    later the performance model) with a plain C ABI, linked by the CUDA library, so callers
+    get exactly the numbers the kernels use. Python (ctypes now, nanobind later) and other
+    languages call that ABI; nothing is reimplemented. `spec/params.py` and the oracle stay
+    as independent verification (tests compare them with the C), not as an API.
 - **Performance model (later, not yet).** Predict per-phase time from MEMORY_MODEL §4/§5
   bounds plus measured efficiencies (the per-phase profiling already reports both), so
   callers can estimate cost and choose N, g and vec_mode. Same surface as the memory API.
