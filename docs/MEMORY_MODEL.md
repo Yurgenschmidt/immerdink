@@ -1,9 +1,12 @@
 # Memory model
 
-Explicit equations for the memory footprint (and compulsory memory traffic) of an
-Ozaki-II tensor contraction in immerdink. They are written to be lifted directly into
-other code. A `workspace_size()` query in the library will implement §3 exactly, and the
-pipeline TLA+ spec will carry §3 as an invariant.
+These are explicit equations for an immerdink contraction's device memory, memory traffic
+and on-chip resources, written so they can be lifted into other code.
+
+- §2–§3 are **exact**. They equal `imd_workspace_size`, are certified by
+  `spec/params.py` (`workspace_size`, `region_offsets`, `cert_workspace`), and are
+  model-checked by `spec: Pipeline LayoutExact`. The design source is DESIGN §4a.
+- §4–§6 are **models** (lower bounds and estimates), not guarantees.
 
 All sizes are in **bytes**. `⌈x⌉_a` means "round x up to a multiple of a".
 
@@ -11,173 +14,134 @@ All sizes are in **bytes**. `⌈x⌉_a` means "round x up to a multiple of a".
 
 ## 1. Symbols
 
-Contraction: `C[I,J,L] = α · Σ_K A[I,K,L] · B[K,J,L] + β · C[I,J,L]`
-(labels may appear in any order and with any strides in each tensor).
+The contraction is `C[I,J,L] = α · Σ_K A[I,K,L] · B[K,J,L] + β · C[I,J,L]`, with labels in
+any order and any strides. Extents are counted **after IndexMap lowering** (DESIGN §5):
+diagonals merged, extent-1 modes dropped, and A-only/B-only labels moved into K.
 
 | Symbol | Meaning |
 |---|---|
-| `m = ∏_{i∈I} e_i` | combined extent of indices free in A (rows of the GEMM view) |
-| `n = ∏_{j∈J} e_j` | combined extent of indices free in B (columns) |
-| `k = ∏_{κ∈K} e_κ` | combined extent of contracted indices |
-| `b = ∏_{λ∈L} e_λ` | combined extent of batch indices (in A, B and C); `b = 1` if none |
-| `s_T` | bytes per user element: 8 (FP64), 16 (complex128), 4 (FP32) |
-| `N` | number of moduli (≈ 14 for FP64-level accuracy, see §6) |
-| `s_e` | bytes per scaling exponent: 2 (int16 suffices for FP64) |
-| `p` | bytes per stored modular product: 4 (raw INT32) or 1 (reduced mod `m_l`, u8) |
-| `s_acc` | bytes per CRT accumulator element (16 for int128 / double-double) |
-| `g` | moduli processed per group (`1 ≤ g ≤ N`; `g = N` means ungrouped) |
-| `a_m, a_n, a_k` | alignment of the INT8 GEMM operands (typically `a_k = 16`, `a_m = a_n = 1`) |
-| `m̂, n̂, k̂` | `⌈m⌉_{a_m}`, `⌈n⌉_{a_n}`, `⌈k⌉_{a_k}` |
+| `m = ∏_{i∈I} e_i` | rows of the GEMM view (labels in A and C only) |
+| `n = ∏_{j∈J} e_j` | columns (labels in B and C only) |
+| `k = ∏_{κ∈K} e_κ` | contracted extent (labels in A and B, plus single-operand labels) |
+| `b = ∏_{λ∈L} e_λ` | batch extent (labels in A, B and C); `b = 1` if there are none |
+| `N` | number of moduli (2…20) |
+| `g` | moduli per residue group (1…N; the API default is N) |
+| `k̂, n̂` | `⌈k⌉₁₆`, `⌈n⌉₁₆`, the CUTLASS int8 alignment |
+| `align(x)` | `⌈x⌉₂₅₆`, the workspace region alignment |
+| `s_T` | bytes per user element (8 for FP64) |
 
 ## 2. User tensors (owned by the caller)
 
-Dense:
-
 ```
-T_user = s_T · b · (m·k + k·n + m·n)
-```
-
-Strided: for each tensor X with extents `e_d` and strides `σ_d` (in elements), the
-allocation is at least its span:
-
-```
-span(X) = s_T · (1 + Σ_d (e_d − 1)·|σ_d|)
-T_user  = span(A) + span(B) + span(C)
+dense:    T_user = s_T · b · (m·k + k·n + m·n)
+strided:  T_user = Σ_{X∈{A,B,C}} s_T · (1 + Σ_d (e_d − 1)·|σ_d|)      (span of each tensor)
 ```
 
-## 3. Library workspace
+## 3. Library workspace: exact
 
 ```
-W = W_E + W_R + W_P (+ W_gemm)
+W_sA  = 2·b·m                      int16 row shifts of A
+W_sB  = 2·b·n                      int16 column shifts of B
+W_fA  = 1·b·m                      u8 non-finite flags (A rows)
+W_fB  = 1·b·n                      u8 non-finite flags (B columns)
+W_vec = 8·(2m + 2n + 2k + 3b)      int64 scatter vectors
+W_RA  = g·b·m·k̂                    int8 residues of A, one group
+W_RB  = g·b·n̂·k̂                    int8 residues of B, one group
+W_W   = N·b·m·n̂                    u8 modular products, all N planes
+
+workspace_size =  Σ align(W_r) over r ∈ (sA, sB, fA, fB, vec, RA, RB, W), in this order
+               =  0                if b·m·n = 0                (empty output)
+               =  align(W_vec)     if mode = DIRECT, k = 0, or K-empty (k = 1)
 ```
 
-**Scaling exponents** (per `(I,L)` row of A, per `(J,L)` column of B):
+Rules:
+- Offsets are cumulative sums of the aligned sizes, so `offset(r) = Σ_{r'<r} align(W_r')`.
+- The caller must pass `ws_bytes ≥ workspace_size`.
+- An overflow of uint64 returns INVALID_VALUE.
+- **K-chunking costs no memory.** Each later chunk adds into the stored u8 planes.
+- **The batch-launch split costs no memory.**
 
-```
-W_E = s_e · b · (m + n)
-```
+Peak device memory: `P_dev = T_user + workspace_size`.
 
-**INT8 residue operands** (`g` moduli resident at a time):
+### Worked examples (exact, from `params.workspace_size`)
 
-```
-W_R = b · g · (m̂·k̂ + k̂·n̂)
-```
+| Shape (m, n, k, b) | N | g | workspace | user FP64 | ws / user |
+|---|---|---|---|---|---|
+| 8192³, 1 | 14 | 14 | 2,819,014,912 B (2.625 GiB) | 1.500 GiB | 1.75 |
+| 8192³, 1 | 14 | 1 | 1,074,184,448 B (1.000 GiB) | 1.500 GiB | 0.67 |
+| 8192³, 1 | 9 | 9 | 1,812,381,952 B (1.688 GiB) | 1.500 GiB | 1.13 |
+| 4096³, 1 | 14 | 14 | 704,864,512 B (0.656 GiB) | 0.375 GiB | 1.75 |
+| 2500³, 10 | 10 | 10 | 1,887,285,248 B (1.758 GiB) | 1.397 GiB | 1.26 |
+| 1000 × 64 × 50000, 1 | 12 | 12 | 639,988,736 B (0.596 GiB) | 0.397 GiB | 1.50 |
 
-**Modular products**, one variant per pipeline design:
+For large square problems the three big terms are about `N·m·k`, `N·n·k` and `N·m·n` bytes.
 
-| Variant | Description | `W_P` |
-|---|---|---|
-| **V0** | each INT8 GEMM writes raw INT32; one CRT pass at the end | `4 · b · N · m · n` |
-| **V1** | GEMM epilogue reduces mod `m_l` and stores u8 | `1 · b · N · m · n` |
-| **V2** | groups of `g` moduli; CRT accumulated into a running buffer | `b · m · n · (g·p + s_acc)` |
-| **V3** | CRT fused into the GEMM (register-resident accumulator) | `0` |
+### Knobs for reducing memory
+- **`g`** shrinks the residue terms by `N/g`. The cost is that A and B are re-read
+  `⌈N/g⌉` times (§4).
+- **The caller can tile I, J or L** (sub-views are valid inputs). The workspace then scales
+  with the tile's m, n and b.
+  - Results stay **bitwise identical**, because shifts depend only on full-K rows and
+    columns.
+  - Caller tiling over K changes results; avoid it.
+- **N** scales the residue and product terms linearly. Choose it from §6.
 
-With V2 or V3 the residues need only be resident for one group (`g < N` in `W_R`). The
-price is re-reading A and B (FP64) `⌈N/g⌉` times (§5).
+## 4. Compulsory global-memory traffic (lower bound)
 
-**`W_gemm`**: workspace internal to the INT8 GEMM. It is 0 for a non-split-K CUTLASS
-GEMM; split-K adds its partials or semaphores.
-
-### Consequence worth noting
-
-V1 costs `N` bytes per C element and V2 costs `g·p + s_acc`. So
-**V1 needs less memory than every grouped variant whenever `N < g·p + s_acc`**. With
-`s_acc = 16` that covers all FP64-level configurations (`N ≈ 14`). Grouping only pays off together with
-residue grouping (`W_R`), or for V0 (`p = 4`).
-
-### K splitting (exactness of INT32)
-
-The INT32 accumulator is exact (in any accumulation order) iff
-
-```
-k ≤ K_max = ⌊(2^31 − 1) / max_l ⌊m_l/2⌋²⌋        (= 131071 when m_l = 256 is used)
-```
-
-This is `NoAccOverflow` in `spec/OzakiCRT.tla`. For larger `k`, split into
-`⌈k / K_max⌉` sequential GEMMs. In V1 each later GEMM's epilogue adds into the stored u8
-residue mod `m_l`, so **no extra memory** is needed, only `N·b·m·n` extra reads per
-additional split.
-
-## 4. Peak device memory
-
-```
-P = T_user + W
-```
-
-### Worked example: `m = n = k = 8192`, `b = 1`, `N = 14`, FP64, no padding
-
-| Term | Bytes | |
-|---|---|---|
-| `T_user` | 8·3·2²⁶ | 1.50 GiB |
-| `W_E` | 2·2·8192 | 32 KiB |
-| `W_R` (g = N) | 14·2·2²⁶ | 1.75 GiB |
-| `W_P` V0 | 4·14·2²⁶ | 3.50 GiB |
-| `W_P` V1 | 14·2²⁶ | 0.875 GiB |
-| `W_P` V2 (g=2, p=1, s_acc=16) | 18·2²⁶ | 1.125 GiB |
-| **P (V0)** | | **6.75 GiB** |
-| **P (V1)** | | **4.125 GiB** |
-
-For comparison, native DGEMM needs only `T_user` = 1.5 GiB.
-
-## 5. Compulsory global-memory traffic (lower bound)
-
-Phases run in sequence, so a time lower bound is the sum over phases of
+The kernels run in sequence, so a time lower bound is the sum over kernels of
 `max(ops / peak_ops, bytes / bandwidth)`.
 
-| Phase | Bytes moved | Work |
+| Kernel | Bytes moved | Work |
 |---|---|---|
-| scaling pre-pass (reductions over K) | `s_T·b·(m·k + k·n)` | small |
-| residue pack (gather + scale + residues) | `s_T·b·(m·k + k·n) · ⌈N/g⌉` read + `b·N·(m̂·k̂ + k̂·n̂)` write | `O(N·(mk+kn))` |
-| INT8 GEMMs | `ρ · b·N·(m̂·k̂ + k̂·n̂)` read + `p·b·N·m·n` write | `2·b·N·m·n·k̂` int8 ops |
-| CRT + unscale + α/β + scatter | `p·b·N·m·n` read + `s_T·b·m·n·(1 + [β≠0])` | `O(N·m·n)` (V1/V0) |
+| K0 vec copy | `W_vec` (H2D, from pinned memory) | — |
+| K1 scale | `s_T·b·(m·k + k·n)` read | `O(b·(mk + kn))` integer ops |
+| K2/K3 pack | `⌈N/g⌉·s_T·b·(m·k + k·n)` read + `N·b·(m·k̂ + n̂·k̂)` written | `O(N·b·(mk+kn))` |
+| K4 GEMM | `ρ·N·b·(m·k̂ + n̂·k̂)` read + `N·b·m·n̂·(2·n_chunks − 1)` u8 written/read | `2·N·b·m·n̂·k̂` int8 ops |
+| K5 CRT | `N·b·m·n̂` read + `s_T·b·m·n·(1 + [β≠0])` | `O(N·b·m·n)` integer ops |
 
-`ρ ≥ 1` is the operand re-read factor of the GEMM tiling (1 if L2 captures all reuse).
+Here:
+- `ρ ≥ 1` is the GEMM tiling's operand re-read factor (1 if L2 captures all reuse).
+- `n_chunks = ⌈k / 131056⌉`.
+- The flagged-element native path adds `s_T·k·(n·#flaggedRows + m·#flaggedCols)` bytes.
 
-Worked example above, V1, β = 0, ρ = 1: about **7.75 GiB** of traffic (≈ 8 ms at the
-4090's ~1 TB/s) and `2·14·8192³ ≈ 1.54·10¹³` int8 ops (≈ 23 ms at the 660 TOPS dense
-peak). The paper's measured ~9.8 TFLOPS-equivalent is ≈ 112 ms for this size, so there is
-a lot of headroom between measured and bound. This is where the performance work is.
+**Example: 8192³, N = 14, g = 14, β = 0, ρ = 1.** About 7.75 GiB of traffic (≈ 8 ms at
+~1 TB/s) and `2·14·8192³ ≈ 1.54·10¹³` int8 ops (≈ 23 ms at the 4090's 660 TOPS dense
+peak). Published GEMMul8 runs take about 85 ms (4090 Laptop), so the headroom is in the
+non-GEMM kernels and GEMM efficiency.
 
-## 6. Choosing N (drives every term above)
+## 5. On-chip resources per CTA (CUTLASS 2.x int8 GEMM on sm_89)
 
-The CRT range must hold the exact integer product. With `M = ∏_l m_l` and the
-crude (any-order, worst-case) bound,
-
-```
-k · max_k|A'[i,k]| · max_k|B'[k,j]|  ≤  (M − 1)/2            (Preconditions in OzakiCRT.tla)
-```
-
-If the scaling keeps `β_A` bits per row of A and `β_B` bits per column of B, this gives
+For tile `BM × BN × BK`, `S` stages and `T` threads:
 
 ```
-log2 M ≥ 1 + log2 k + β_A + β_B     ⇒     N ≈ ⌈(1 + log2 k + β_A + β_B) / 7.9⌉
+smem_CTA  = S · (BM·BK + BK·BN)                     int8 operands (≤ 99 KB per block)
+regs_acc  = BM·BN / T                               int32 accumulators per thread
+CTAs/SM   = min(⌊smem_SM/smem_CTA⌋, ⌊65536/(regs_thread·T)⌋, ⌊1536/T⌋, 24)
+            smem_SM ≈ 100 KB
 ```
 
-using the greedy pairwise-coprime moduli `256, 255, 253, 251, 247, 241, 239, 233, 229,
-227, 223, 217, 211, 199, 197, 193, …` (`log2 M` = 47.8 at N=6, 102.5 at N=13, 110.2 at
-N=14, 125.4 at N=16). The paper's *fast mode* uses a Cauchy–Schwarz bound (`‖a_i‖₂‖b_j‖₂`)
-instead of the `k·max·max` bound, which is tighter and keeps more bits for the same N.
+Example: `128×128×64`, S = 3, T = 256 → `smem_CTA` = 48 KiB and `regs_acc` = 64. The
+prototype epilogue kernels compiled to about 226–228 registers per thread at 128×256, so 1
+CTA per SM.
 
-**CRT accumulator width.** Reconstruction needs integers up to:
-- `N·M·255` for a naive sum: fits in signed int128 for `N ≤ 14`;
-- `M·256` with a running mod-`M` reduction: fits for `N ≤ 15`.
+## 6. Choosing N
 
-Larger N needs wider integers or Garner mixed-radix reconstruction (open design question).
-
-## 7. On-chip resources per CTA (GPU, CUTLASS-style INT8 GEMM)
-
-Tile `BM × BN × BK`, `S` pipeline stages, `T` threads:
+Use the worst-case normwise error guidance (DESIGN §3.8):
 
 ```
-smem_CTA      = S · (BM·BK + BK·BN)                  (int8 operands)
-regs_acc      = BM·BN / T                            (INT32 accumulators per thread)
-regs_crt (V3) = BM·BN·s_acc / (4·T)                  (register-resident CRT accumulator)
-CTAs/SM       = min( ⌊smem_SM / smem_CTA⌋,
-                     ⌊65536 / (regs_thread · T)⌋,
-                     ⌊1536 / T⌋,  24 )               (sm_89 limits; smem_SM ≈ 100 KiB)
+RN:  |D − Σab| ≲ 2√k·s/(T − κ/2) · ‖a_ī‖₂‖b_j̄‖₂ ,   T = ⌊√⌊(P−1)/2⌋⌋,   s = √(1 + k·2⁻⁶⁰)
 ```
 
-Example: `128×128×64`, `S = 3`, `T = 256` gives `smem_CTA` = 48 KiB and `regs_acc` = 64.
-Adding a V3 int128 accumulator costs another 256 registers per thread, which exceeds
-the 255 limit. **V3 is infeasible at this tile size.** At `64×128` it costs 160 registers
-before addressing overhead, so one CTA per SM. This is why V1 is the starting design.
+`python3 spec/params.py --table` prints `log2 P`, `log2 T`, the RN-feasible k limit and
+this guidance for every N. Measured with the oracle at k = 1000, the emulated error
+matches native FP64 dot-product error at N = 14–15 for well-scaled data (φ ≤ 1), and at
+N = 16 for wide dynamic range (φ = 4).
+
+## 7. Alternatives considered (for comparison)
+
+| Variant | Product storage | Why not v1 |
+|---|---|---|
+| V0: raw int32 planes | `4·N·b·m·n` | 4× V1 for nothing once the epilogue reduces mod p |
+| V2: grouped CRT accumulator | `b·m·n·(g + 16)` | more than V1's `N·b·m·n` for every N ≤ 16 |
+| V3: register-resident CRT | 0 | a 128-bit accumulator adds `BM·BN·16/(4T)` registers per thread (256 at 128×128/256 threads), which exceeds the 255 limit |
+| GEMMul8 v3.5.2 | grouped uint32 planes, padded to 256 | ≈ 3.5 GiB at 8192³, N = 14, against our 2.625 GiB |

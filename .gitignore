@@ -1,3 +1,4 @@
 # TLC trace-exploration dumps and state dirs
 spec/*_TTrace_*
 spec/states/
+spec/__pycache__/

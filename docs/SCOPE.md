@@ -5,7 +5,9 @@ emulation. You get FP64-accurate (and later FP32-accurate) contractions
 `C[IJL] = α · Σ_K A[IKL] · B[KJL] + β · C[IJL]`, but the inner products run on INT8
 matrix hardware. Operands are never explicitly transposed into matrices.
 
-Status: specifying (see §4). No implementation yet, by design.
+Status: specification phase complete (see `spec/README.md`); implementation starts at PLAN M0.
+Docs: [DESIGN.md](DESIGN.md) (what and how), [PLAN.md](PLAN.md) (milestones, questions),
+[MEMORY_MODEL.md](MEMORY_MODEL.md) (equations), [PROOFS.md](PROOFS.md) (lemmas / Lean blueprint).
 
 ---
 
@@ -84,22 +86,28 @@ needed. There is no s8×s8 VNNI (AVX-VNNI-INT8) on this part.
 | D1 | **Spec-first.** Every core design question gets a TLA+ spec and TLC models before code. | Theory fully defined before implementation; see §6. |
 | D2 | **TBLIS-style, not GETT.** | Ozaki-II must rewrite A and B into N int8 residue copies anyway. Writing them in GEMM-canonical layout makes the tensor→matrix permutation free (TBLIS's insight, by force). GETT's per-contraction code generation buys nothing once operands are rewritten, and it adds an autotuner. The only tensor-aware kernels left are the gather (pack) and the scatter (CRT epilogue). |
 | D3 | **GPU (RTX 4090, sm_89) is the implementation target. No optimized CPU kernels.** | GPU-first is actually *simpler*: CUTLASS supplies the int8 GEMM, while a CPU path means hand-writing a BLIS nest that won't beat DGEMM on this CPU anyway. The CPU's role is the **exact reference oracle** (Python big-int/`Fraction`, no FP), which also matches the TLA+ semantics. |
-| D4 | **CUTLASS** for the int8 GEMM, starting with stock batched GEMM. Custom epilogue (mod-reduce → u8) is step 2. Packed/fused kernels come later. | Simple first. The memory model (MEMORY_MODEL.md) says V1 is the right first target. |
+| D4 | **CUTLASS 2.x** (`GemmUniversal` kBatched, SM80 int8 on sm_89) with an `Sm80EVT` mod-p → u8 epilogue from the start; v4.8.0 pinned. | 3.x has no sm80/sm89 builders; the epilogue was compile-verified; stock int32 output (V0) only as a baseline. |
 | D5 | **From scratch.** C++20 + CUDA (13.4), CMake. C ABI, then Python bindings (nanobind) later. | Everything is local. cuBLAS and cuTENSOR 2.7 are already in the `main` conda env for baselines. |
 | D6 | **Dedicated conda env** (`environment.yml`) instead of `main`. | `main` is used by another project's GPU test suite; isolating the env keeps versions and benchmarks clean. |
-| D7 | **Workload:** v1 serves real FP64 science (t1-dressed DF-CCSD, CCSD(T)), but the design stays general: complex (tensor networks), batched small contractions, large GEMM-like ones. | Batch indices (L) are in v1. Complex is not in v1, but nothing in the API or specs may preclude it. Small-problem behavior matters (CCSD(T) has many medium contractions). |
+| D7 | **General-purpose kernel.** CC was the motivation but drives no design choice; batch indices (L) are in v1; complex is reserved (2M method), not precluded. | User guidance: build a good Ozaki TBLIS-style kernel, don't overengineer toward a downstream user. |
 | D8 | **Accuracy contract:** the caller picks N. *Auto* and *bounded auto* (data-chosen N ≤ N_max) come later. A DGEMM-equivalent guarantee is low priority. | N is explicit, so memory and time are exact functions of it. Bounded auto keeps memory plannable: `workspace_size(problem, N_max)`. |
-| D9 | **Workspace:** caller-provided, with `workspace_size(problem, N)` returning exactly MEMORY_MODEL §3. | Fits planning memory in the downstream code. No allocation in the hot path. |
-| D10 | **CRT arithmetic:** exact signed int128 with running mod-M reduction. Caps N ≤ 15 with the greedy moduli. | Exact integers are fully specifiable in TLA+ (`CRTRealization` refines `OzakiCRT.Reconstructed`). Wider integers are a later extension if N > 15 is needed. |
+| D9 | **Workspace:** caller-provided; `imd_workspace_size` is a pure host function equal to MEMORY_MODEL §3 / DESIGN §4a (certified and model-checked). Callers tile I/J/L. | Exact, plannable memory; no allocation in the hot path. |
+| D10 | **CRT arithmetic:** exact unsigned multi-word running CRT (division-free, one conditional subtract), 32·L32-bit words: N ≤ 16 in 128 bits, N ≤ 20 in 160. | Replaces the first int128 running-mod plan (cap N ≤ 15); refines exact CRT (spec: CRTRealization). |
+| D11 | **Exact-integer fast-mode scaling** (Cauchy–Schwarz shift chosen by exact integer comparison) — [deviation] | Overflow-free, order-independent, reproducible, provable; at least as tight as the float-log rule. |
+| D12 | **Round-to-nearest-even quantization** by default (TRUNC available) — [deviation] | Unbiased; 2.4× (zero-mean) to 19–191× (same-sign data) more accurate at equal N; costs a negligible κ/2 slack. |
+| D13 | **Single final rounding** of the exact integer at the final exponent; bitwise determinism; Python oracle is bit-exact | Every emulated step is exact integer math, so the GPU must equal the oracle bit-for-bit. |
+| D14 | **Non-finite rows/columns** handled by a native FP64 fma path for the affected outputs only | IEEE-consistent propagation without host sync or a separate library. |
+| D15 | **IndexMap:** arbitrary int64 strides, A/B diagonals and single-operand labels lowered into K, sorted-stride C rule, status precedence, corrected fusion rule | General TBLIS-like semantics, always-on legality checks. |
+| D16 | **Verification stack:** TLA+ (design logic) + `params.py` (real-width certificate) + oracle (bit-exact numerics) + PROOFS.md → Lean (parametric lemmas) | Each covers what the others can't. |
 
-### Pipeline v1 (four kernels, TBLIS-style)
+### Pipeline v1 (TBLIS-style; full detail in DESIGN §4)
 
 ```
-1. scale    : strided reduction over K  → exponents e[I,L], f[J,L]
-2. pack     : strided gather of A,B → scale → trunc → N residue panels (int8, canonical TN layout)
-3. gemm     : CUTLASS batched int8 GEMM over (N moduli × L batch), INT32 accum,
-              epilogue: mod m_l → u8                                        (V1 in MEMORY_MODEL.md)
-4. crt      : N u8 residues → exact CRT → FP64 → unscale → α·, +β·C → strided scatter into C
+K0 vec   : copy plan's scatter vectors into the workspace
+K1 scale : strided pass over A rows / B cols → non-finite flags + exact int16 shifts σ, τ
+K2/K3    : strided gather of A, B → RN quantize → N int8 residue panels (canonical TN layout)
+K4 gemm  : CUTLASS batched int8 GEMM per K-chunk, epilogue (acc [+W]) mod p → u8 planes
+K5 crt   : exact multi-word CRT → one rounding → unscale → α/β → strided scatter into C
 ```
 
 Memory and traffic for each step are given in [MEMORY_MODEL.md](MEMORY_MODEL.md).
@@ -121,78 +129,11 @@ the C ABI is a reasonable later experiment. No Rust toolchain is installed local
 
 ---
 
-## 4. Specification plan (TLA+)
+## 4. Where the rest lives
 
-TLC limits: integers are 32-bit and there is no floating point. So specs are
-**parametric** and model-checked **scaled down** (e.g. 3-bit residues, 5-bit
-accumulators). Floating-point error analysis (scaling truncation, final FP64 rounding) is
-outside TLC. It is covered by (a) exact-rational toy-float models where TLC can enumerate,
-(b) the paper's bounds, and (c) the exact Python oracle.
-
-| Spec | Defines / checks | Status |
-|---|---|---|
-| `OzakiCRT` | Integer core for one output element: residues, INT-accumulator wrap, mod reduction, CRT. Invariants `ResiduesFit`, `NoAccOverflow` (order-independent), `CRTExact`. Each precondition has a negative model proving it is needed. | **drafted** |
-| `OzakiScaling` | Toy floating-point format (p-bit mantissa) → per-row/column exponent choice → truncation. Shows the scaling rule *implies* `OzakiCRT.Preconditions`, and checks the error bound exactly with rationals. | next |
-| `CRTRealization` | int128 running-mod reconstruction (D10) *refines* `OzakiCRT.Reconstructed`; scaled-down word widths, positive + negative (overflow) models. | next |
-| `IndexMap` | Label analysis → I/J/K/L classes; pack gather is a bijection onto the canonical buffer; C scatter is injective; batch indices; stride policy (negative/zero/aliasing). | next |
-| `Pipeline` | Kernel sequence and workspace lifetimes (V0/V1/V2), K-splitting, grouping. Each C element is finalized exactly once after all N contributions; workspace ≤ `W` from MEMORY_MODEL.md. | after IndexMap |
-| `CtaPipeline` | Multistage cp.async/barrier protocol, only if we write our own GEMM mainloop (not needed while CUTLASS owns it). | later |
-
-`spec/check.sh` runs all models: `MC_pos_*` must pass and `MC_neg_*` must violate their
-named invariant. Run `tools/quiet_check.sh` first.
-
----
-
-## 5. Milestones
-
-| #  | Milestone | Exit criterion |
-|----|-----------|----------------|
-| S  | **Specs**: OzakiCRT, OzakiScaling, IndexMap, Pipeline (+ CRTRealization) | All models green; every open design question below answered or in a spec |
-| M0 | Scaffolding: env, CMake, CUDA, tensor view type, exact Python oracle | Oracle matches the `OzakiCRT` semantics on random small cases |
-| M1 | Ozaki-II **matrix** DGEMM on GPU: pipeline v1 with stock CUTLASS (V0) | Error vs N and dynamic range φ matches the paper's curves |
-| M2 | Tensor front end: labels → I/J/K/L, gather-pack and scatter-CRT kernels | Random contractions (rank ≤ 6, random perms/strides) pass vs oracle |
-| M3 | V1 epilogue (mod → u8), K-split, workspace query = MEMORY_MODEL §3 | Measured peak memory equals the formula |
-| M4 | Performance: close the gap to the §5 lower bound in MEMORY_MODEL.md | Beat cuTENSOR FP64 and cuBLAS DGEMM; report % of bound |
-| M5 | Auto-N, FP32 emulation, complex, fused variants | — |
-
----
-
-## 6. Testing and benchmarking discipline
-
-**Accuracy tests:**
-- Inputs `(rand − 0.5)·exp(φ·randn)` with φ swept from 0 to about 4, as in the Ozaki
-  literature. Report max componentwise error relative to `|A||B|`, and normwise error.
-- Adversarial cases: zero rows, Inf/NaN, subnormals, huge dynamic range within one row,
-  K at `K_max` and `K_max + 1`, negative and zero strides, aliasing.
-
-**Benchmarks: the machine must be quiet first.** Every test or benchmark run starts with
-`tools/quiet_check.sh`, which checks load, top CPU users, GPU utilization and other compute
-processes, and records governor and turbo state. If the machine isn't quiet, we wait
-rather than run. Benchmarks also:
-- warm up, repeat, and report median and spread, not best-of,
-- record the conditions (load, clocks, temps, driver, commit) next to every result,
-- pin any CPU-side timing to P-cores.
-
----
-
-## 7. Open design questions
-
-Answered so far: D1–D10 above. Still open:
-
-1. **Non-finite inputs.** Inf/NaN cannot go through integer residues. Detect and fall back
-   to native FP64, propagate NaN to the affected rows/columns, or declare it unsupported?
-2. **Determinism.** The integer path is naturally bitwise reproducible. Make that a
-   guaranteed property?
-3. **Stride policy.** Negative strides? Zero strides (broadcast) in A/B? Must C be
-   non-self-overlapping (yes, presumably)? Aliasing between C and A/B?
-4. **Small-problem fallback.** Below some size, call native cuBLAS/cuTENSOR FP64? (D7
-   makes this relevant: CCSD(T) and batched workloads.)
-5. **Scaling mode.** Fast (norm bound) only for v1, or accurate mode too?
-6. **Streams/async.** Fully stream-ordered and async (cuBLAS-style handle + stream)?
-7. **CUTLASS pinning.** Git submodule at a pinned tag, or CMake FetchContent?
-8. **Batch-index scaling.** Per-batch exponents (`e[I,L]`), as in MEMORY_MODEL. Fine,
-   or should batch slices share exponents?
-9. **Moduli set.** Fixed greedy table (256, 255, 253, …), or allow caller-chosen moduli?
+- Specifications, models, certificate, oracle: [`spec/README.md`](../spec/README.md).
+- Milestones, testing/benchmark discipline, open questions: [PLAN.md](PLAN.md).
+- Design details (numerics, pipeline, workspace, IndexMap, API): [DESIGN.md](DESIGN.md).
 
 ## References
 - Ozaki, Uchino, Imamura. *Ozaki Scheme II: A GEMM-oriented emulation of floating-point matrix multiplication using an integer modular technique.* arXiv:2504.08009.

@@ -20,6 +20,7 @@
 # 2026-10-02; CHECK_QUIET is ignored). Knobs:
 #   TLC_JOBS     models run concurrently (default: nproc/4, at least 1)
 #   TLC_WORKERS  TLC worker threads per model (default 1; raise for big models)
+#   TLC_TIMEOUT  seconds per model before it is reported as TIMEOUT (default 900)
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"; cd "$here"
 JAR="${TLA2TOOLS:-$(ls -d "$HOME"/.vscode/extensions/tlaplus.vscode-ide-*/tools/tla2tools.jar 2>/dev/null | tail -1)}"
@@ -36,13 +37,15 @@ run_one() {  # cfg -> writes $tmp/<base>.verdict
   module="${base%%__*}"; kind="${base#*__}"
   dl="-deadlock"; grep -q '^\\\* CHECK_DEADLOCK' "$cfg" && dl=""
   t0=$SECONDS
-  out="$(java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers "${TLC_WORKERS:-1}" $dl \
+  out="$(timeout "${TLC_TIMEOUT:-900}" java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers "${TLC_WORKERS:-1}" $dl \
          -noGenerateSpecTE -metadir "$tmp/meta-$base" -config "$cfg" "$module.tla" 2>&1)"
+  local rc=$?
   dt=$((SECONDS - t0))
+  if [ "$rc" = 124 ]; then echo "FAIL  $base  (TIMEOUT after ${dt}s)" > "$tmp/$base.verdict"; return; fi
   case "$kind" in
     pos_*)
       if grep -q 'No error has been found' <<<"$out"; then
-        echo "PASS  $base  ($(grep -m1 -o '[0-9,]* distinct states found' <<<"$out"), ${dt}s)"
+        echo "PASS  $base  ($(grep -o '[0-9,]* distinct states found, 0 states left' <<<"$out" | tail -1 | sed 's/, 0 states left//'), ${dt}s)"
       else echo "FAIL  $base"; tail -30 <<<"$out"; fi ;;
     neg_*)
       expect="$(sed -n 's/^\\\* EXPECT: //p' "$cfg")"
