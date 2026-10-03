@@ -729,6 +729,30 @@ def cert_barrett():
             f"GM 32-bit form would need a 65-bit product for {len(wide)} moduli")
 
 
+@check("§3.6 y=(q W) mod p reuses ceil(2^64/p)")
+def cert_crt_y_reduction():
+    """The §3.6 step y = (q_l W_l) mod p_l reuses the §3.5 constant m = ceil(2^64/p) with
+    bias 0: n = q_l W_l < 2^16 (q_l < p_l, W_l < p_l <= 256), and umulhi64(m, n) = n div p
+    for EVERY n in [0, 2^16) and every p != 256 (exhaustive; p = 256 uses n & 255).
+    Also implied by barrett_plan's condition n * (m p - 2^64) < 2^64, re-checked here."""
+    for N in range(N_MIN, N_MAX + 1):
+        c = constants(N)
+        for p, q in zip(c["moduli"], c["q"]):
+            need(0 <= q < p and (p - 1) * q < 2**16, f"q W >= 2^16 for N={N} p={p}")
+    for p in REAL_MODULI:
+        plan = barrett_plan(p)
+        if plan["kind"] == "mask":
+            need(all((n & 255) == n % p for n in range(2**16)), "mask 256")
+            continue
+        m = plan["m"]
+        need((2**16 - 1) * (m * p - 2**MULHI_BITS) < 2**MULHI_BITS, f"condition p={p}")
+        for n in range(2**16):
+            q = (m * n) >> MULHI_BITS
+            if q != n // p or n - p * q != n % p:
+                raise CertFail(f"p={p} n={n}")
+    return "exhaustive over n in [0, 2^16) for all 20 moduli (19 umulhi64 + mask for 256)"
+
+
 @check("§3.4 residues fit int8")
 def cert_residues():
     """smod(x, p) in [-floor(p/2), ceil(p/2)-1] subset of int8, congruent, for every class."""

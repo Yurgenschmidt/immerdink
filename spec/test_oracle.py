@@ -954,6 +954,145 @@ def test_dgemm_like():
     RESULTS["dgemm_like"] = "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------------------
+# (8) tensor front end: §5 lowering, scatter vectors, swap, K-empty -> DIRECT
+# ---------------------------------------------------------------------------------------
+
+def rand_desc_triple(rng):
+    """Random small legal-looking contraction: labels 0..5, extents 0..3, random dense
+    layouts (permuted, some negative strides), optional diagonal / single-operand labels."""
+    nl = rng.randint(1, 5)
+    ext = {l: rng.choice((1, 2, 2, 3, 3)) for l in range(nl)}
+    if rng.random() < 0.05:
+        ext[rng.randrange(nl)] = 0
+    labs = list(range(nl))
+    la = [l for l in labs if rng.random() < 0.7]
+    lb = [l for l in labs if rng.random() < 0.7]
+    lc = [l for l in labs if (l in la or l in lb) and rng.random() < 0.5]
+    if la and rng.random() < 0.15:
+        la.append(rng.choice(la))                       # diagonal in A
+    rng.shuffle(la), rng.shuffle(lb), rng.shuffle(lc)
+
+    def mk(lab):
+        order = list(range(len(lab)))
+        rng.shuffle(order)
+        st, acc = [0] * len(lab), 1
+        for d in order:
+            st[d] = acc * rng.choice((1, 1, 1, -1))
+            acc *= max(ext[lab[d]], 1)
+        return o.Desc([ext[l] for l in lab], st, lab)
+    return mk(la), mk(lb), mk(lc)
+
+
+def test_tensor():
+    rng = random.Random(81)
+    # Scatter o GEMM o Gather generates exactly the einsum's (C, A, B) address triples.
+    checked = swapped = diag = 0
+    for _ in range(400):
+        A, B, C = rand_desc_triple(rng)
+        try:
+            v = o.lower(A, B, C)
+        except (o.InvalidValue, o.NotSupported):
+            continue
+        if v.empty_output():
+            continue
+        assert len(v.vec_region()) == 2 * v.m + 2 * v.n + 2 * v.k + 3 * v.b
+        assert o.view_addresses(v) == o.einsum_addresses(A, B, C), (A.label, B.label, C.label)
+        # canonical orders sorted as specified (post-swap frame)
+        big, oth = ("A", "B") if v.m >= v.n else ("B", "A")
+        s = {X: {lab: abs(x) for lab, x in v.stride[X].items()} for X in "ABC"}
+        key = {"I": lambda q: (s["C"][q], s["A"][q], v.first[q]),
+               "J": lambda q: (s["C"][q], s["B"][q], v.first[q]),
+               "L": lambda q: (s["C"][q], s["A"][q], s["B"][q], v.first[q]),
+               "K": lambda q: (s[big][q], s[oth][q], v.first[q])}
+        for g in "IJKL":
+            ks = [key[g](q) for q in v.order[g]]
+            assert ks == sorted(ks) and all(v.ext[q] != 1 for q in v.order[g])
+        checked += 1
+        swapped += v.swapped
+        diag += len(set(A.label)) != len(A.label)
+    assert checked > 100 and swapped > 10 and diag > 3, (checked, swapped, diag)
+
+    # 'ikl,kjl->ijl' (b = 3, permuted A, C with l slowest): equals the per-batch matrix
+    # contraction in the natural order (the emulated path does not depend on K order).
+    m, n, k, b = 4, 5, 7, 3
+    i, j, kk, l = 1, 2, 3, 4
+    A = o.Desc([m, k, b], [k * b, b, 1], [i, kk, l])
+    B = o.Desc([k, n, b], [1, k * b, k], [kk, j, l])          # k fastest
+    C = o.Desc([m, n, b], [n, 1, m * n], [i, j, l])
+    Ab = [rng.uniform(-1, 1) for _ in range(m * k * b)]
+    Bb = [rng.uniform(-1, 1) for _ in range(k * n * b)]
+    Cb = [rng.uniform(-1, 1) for _ in range(m * n * b)]
+    Ab[(1 * k + 2) * b + 1] = math.inf                        # one flagged row in batch 1
+    for N, rnd, alpha, beta in ((9, "RN", 1.0, 0.0), (14, "TRUNC", -1.5, 0.75)):
+        t = {}
+        out = o.contract_tensor(o.Tensor(Ab, 0, A), o.Tensor(Bb, 0, B), o.Tensor(Cb, 0, C),
+                                alpha, beta, N, rnd, trace=t)
+        assert t["kind"] == "GEMM" and not t["view"].swapped
+        for lam in range(b):
+            Am = [[Ab[(ii * k + h) * b + lam] for h in range(k)] for ii in range(m)]
+            Bm = [[Bb[h + jj * k * b + lam * k] for jj in range(n)] for h in range(k)]
+            Cm = [[Cb[ii * n + jj + lam * m * n] for jj in range(n)] for ii in range(m)]
+            ref = o.contract(Am, Bm, Cm, alpha, beta, N, rnd)
+            for ii in range(m):
+                for jj in range(n):
+                    assert same_bits(out[ii * n + jj + lam * m * n], ref[ii][jj])
+
+    # Role swap: C stored transposed (i fastest) -> swapped view, same values bit for bit.
+    Ct = o.Desc([m, n, b], [1, m, m * n], [i, j, l])
+    t = {}
+    out = o.contract_tensor(o.Tensor(Ab, 0, A), o.Tensor(Bb, 0, B), o.Tensor(Cb, 0, Ct),
+                            1.0, 0.0, 9, trace=t)
+    assert t["view"].swapped and (t["view"].m, t["view"].n) == (n, m)
+    ref = o.contract_tensor(o.Tensor(Ab, 0, A), o.Tensor(Bb, 0, B), o.Tensor(Cb, 0, C),
+                            1.0, 0.0, 9)
+    for lam in range(b):
+        for ii in range(m):
+            for jj in range(n):
+                assert same_bits(out[ii + jj * m + lam * m * n], ref[ii * n + jj + lam * m * n])
+
+    # K-empty (outer product) -> DIRECT: D = fma(a, b, +0), so (-1) * (+0) gives +0.
+    A1, B1, C1 = o.Desc([2], [1], [i]), o.Desc([3], [1], [j]), o.Desc([2, 3], [3, 1], [i, j])
+    a1, b1 = [-1.0, 3.0], [0.0, 2.5, -math.inf]
+    t = {}
+    out = o.contract_tensor(o.Tensor(a1, 0, A1), o.Tensor(b1, 0, B1),
+                            o.Tensor([7.0] * 6, 0, C1), 1.0, 0.0, 2, trace=t)
+    assert t["kind"] == "DIRECT"
+    assert same_bits(out[0], 0.0) and same_bits(out[1], -2.5) and out[2] == math.inf
+    assert same_bits(out[3], 0.0) and same_bits(out[4], 7.5) and out[5] == -math.inf
+    # extent-1 K label is dropped -> also K-empty; mode DIRECT on a real K.
+    A2 = o.Desc([2, 1], [1, 2], [i, kk])
+    B2 = o.Desc([1, 3], [3, 1], [kk, j])
+    out2 = o.contract_tensor(o.Tensor(a1, 0, A2), o.Tensor(b1, 0, B2),
+                             o.Tensor([7.0] * 6, 0, C1), 1.0, 0.0, 2)
+    assert all(same_bits(x, y) for x, y in zip(out, out2))
+    t = {}
+    o.contract_tensor(o.Tensor(Ab, 0, A), o.Tensor(Bb, 0, B), o.Tensor(Cb, 0, C), 1.0, 0.0,
+                      9, mode=o.DIRECT, trace=t)
+    assert t["kind"] == "DIRECT"
+    # alpha = 0 / k = 0: A and B are not read; beta = 0: C not read (NaN does not leak).
+    Ak0 = o.Desc([2, 0], [1, 2], [i, kk])
+    Bk0 = o.Desc([0, 3], [3, 1], [kk, j])
+    out = o.contract_tensor(o.Tensor(None, 0, Ak0), o.Tensor(None, 0, Bk0),
+                            o.Tensor([math.nan] * 6, 0, C1), 1.0, 0.0, 2)
+    assert all(same_bits(x, 0.0) for x in out)
+    out = o.contract_tensor(o.Tensor(None, 0, A), o.Tensor(None, 0, B), o.Tensor(Cb, 0, C),
+                            0.0, -2.0, 9)
+    assert all(same_bits(x, -2.0 * y) for x, y in zip(out, Cb))
+    # RN acceptance only when the emulated GEMM runs: kappa >= T at N = 2 (T = 180).
+    Abig, Bbig = o.Desc([1, 180 * 180], [0, 1], [i, kk]), o.Desc([180 * 180, 1], [1, 0], [kk, j])
+    Cs = o.Desc([1, 1], [1, 1], [i, j])
+    try:
+        o.contract_tensor(o.Tensor(None, 0, Abig), o.Tensor(None, 0, Bbig),
+                          o.Tensor([1.0], 0, Cs), 0.0, 1.0, 2)
+        raise AssertionError("RN kappa >= T accepted")
+    except o.NotSupported:
+        pass
+    o.contract_tensor(o.Tensor(None, 0, Abig), o.Tensor(None, 0, Bbig), o.Tensor([1.0], 0, Cs),
+                      0.0, 1.0, 2, mode=o.DIRECT)
+    RESULTS["tensor"] = f"{checked} random lowerings ({swapped} swapped, {diag} diagonal)"
+
+
 def sigma_extremes():
     """Theoretical sigma range (§3.2 step 5): k=1 row holding the least subnormal at N=20
     (largest sigma); k = 2^40 rows of values just below 2^1024 at N=2, TRUNC (smallest)."""
@@ -980,14 +1119,14 @@ def main():
                      ("determinism (3)", test_determinism), ("non-finite (4)", test_nonfinite),
                      ("edges (5)", test_edges), ("adversarial (A)", test_adversarial),
                      ("stats (6)", test_stats),
-                     ("dgemm-like (7)", test_dgemm_like)):
+                     ("dgemm-like (7)", test_dgemm_like), ("tensor front end (8)", test_tensor)):
         t1 = time.time()
         fn()
         print(f"PASS  {name:24s} {time.time() - t1:7.1f}s", flush=True)
     hi, hi_rn, lo = sigma_extremes()
     print()
     print("moduli source:", o.MODULI_SOURCE)
-    for key in ("params_crosscheck", "fma_checked", "crt_L128_N17_overflows", "neg_rn_without_kappa",
+    for key in ("tensor", "params_crosscheck", "fma_checked", "crt_L128_N17_overflows", "neg_rn_without_kappa",
                 "rn_boundary_N2_k32041", "sweep_runs", "determinism_runs"):
         print(f"{key}: {RESULTS[key]}")
     print(f"bound tightness: max |emul-exact|/l1-bound = {BOUND_STATS['l1_max_ratio']:.3f}; "
