@@ -194,10 +194,43 @@ def spec_k4_tune_bytes(m, n_hat, k_hat, b, g):
     return 0 if total > 256 << 20 else total
 
 
+# DESIGN v1.5 §4 "K4 configurations": (tile_m, tile_n, CTAs per SM) and the model constants
+# (round_ns, mac_fs by concurrency q = 1..CTAs per SM), transcribed from the DESIGN table.
+K4_TILES = [(128, 256, 1), (128, 128, 2), (64, 128, 2), (64, 64, 3)]
+K4_COSTS = [(2716, (418,)), (2550, (453, 456)), (1424, (505, 612)), (1333, (944, 1088, 802))]
+K4_MARGIN = 50   # permille
+SAT = (1 << 127) - 1
+
+
+def spec_k4_estimate(c, m, n_hat, k_hat, gb, sms):
+    """The estimate in fs: the busiest SM's j tiles in full rounds of `occ` concurrent CTAs
+    and one round of the rest; every intermediate clamped at 2^127 - 1 (as the C++ does)."""
+    tm, tn, occ = K4_TILES[c]
+    rnd_ns, mac_fs = K4_COSTS[c]
+    tiles = min(min(-(-m // tm) * -(-n_hat // tn), SAT) * gb, SAT)
+    j = -(-tiles // sms)
+    tile_macs = min(tm * tn * k_hat, SAT)
+
+    def round_fs(q):
+        return min(min(rnd_ns * 1000000, SAT) + min(min(tile_macs * q, SAT) * mac_fs[q - 1], SAT),
+                   SAT)
+
+    full, rest = divmod(j, occ)
+    est = min(full * round_fs(occ), SAT) if full else 0
+    return min(est + round_fs(rest), SAT) if rest else est
+
+
 def spec_k4_config(m, n_hat, k_hat, b, N, g, sms):
     """DESIGN v1.5 §4 "K4 configurations": the selection rule, written independently of
     src/host/k4_config.cpp."""
-    return 0
+    sms = sms if sms > 0 else 128
+    gb = min(g, N) * b
+    est = [spec_k4_estimate(c, m, n_hat, k_hat, gb, sms) for c in range(4)]
+    best, best_est = 0, est[0]
+    for c in range(1, 4):
+        if min(est[c] * 1000, SAT) < min(est[0] * (1000 - K4_MARGIN), SAT) and est[c] < best_est:
+            best, best_est = c, est[c]
+    return best
 
 
 # ---------------------------------------------------------------------------------------

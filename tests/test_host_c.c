@@ -97,7 +97,9 @@ int main(void) {
    * scratch of group 1 (g = 2, b = 3): RA 2*3*17*16 = 1632, RB 2*3*48*16 = 4608, W
    * 2*3*17*48 = 4896, each 256-aligned: 1792 + 4608 + 5120. */
   CHECK(lw.sm_count == 128);
-  CHECK(lw.k4_config >= 0 && lw.k4_config < IMD_K4_CONFIG_COUNT);
+  /* DESIGN §4 rule: 1 tile of every configuration per batch, 6 batches on 128 SMs: one
+   * round each; 64x64 has the smallest estimate (1.39 us vs 2.94 for 128x256). */
+  CHECK(lw.k4_config == IMD_K4_64x64);
   CHECK(lw.k4_tune_bytes == 11520);
   {
     imd_lowering_t l2;
@@ -105,7 +107,7 @@ int main(void) {
     l2.struct_size = sizeof l2;
     l2.sm_count = 46; /* an input: the rule for another device */
     CHECK(imd_lowering(&A, &B, &C, &opt, &l2) == IMD_STATUS_SUCCESS);
-    CHECK(l2.sm_count == 46 && l2.k4_config >= 0 && l2.k4_config < IMD_K4_CONFIG_COUNT);
+    CHECK(l2.sm_count == 46 && l2.k4_config == IMD_K4_64x64);
     CHECK(l2.m == 17 && l2.k4_tune_bytes == 11520);
     l2.sm_count = -1; /* invalid input: nothing written */
     l2.m = -7;

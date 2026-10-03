@@ -468,6 +468,25 @@ Properties checked by **[spec: Pipeline]**:
     of (m, n̂, k̂, b, N, g, SMs): it estimates each configuration's K4 time from its tile
     count and picks the smallest estimate (rule and constants below), fitted on the A3
     measurements (RTX 4090, 128 SMs).
+    - Per configuration c (tile tm×tn, o CTAs/SM): tiles = ⌈m/tm⌉·⌈n̂/tn⌉·g·b (one
+      group's launch); the busiest SM gets j = ⌈tiles/SMs⌉, run as ⌊j/o⌋ rounds of o
+      concurrent CTAs and, if r = j mod o > 0, one round of r. A round of q CTAs costs
+      `round_ns + q·tm·tn·k̂·mac_fs[q]`; est_c = the sum, in femtoseconds, computed in
+      unsigned 128-bit integers clamped at 2¹²⁷−1 after every operation.
+    - Constants (`kK4Costs`, least squares in relative error on nsys K4 kernel times of
+      every configuration on 84 (shape, N) cases):
+
+      | c | round_ns | mac_fs[1] | mac_fs[2] | mac_fs[3] |
+      |---|---|---|---|---|
+      | 128×256 | 2716 | 418 | | |
+      | 128×128 | 2550 | 453 | 456 | |
+      | 64×128 | 1424 | 505 | 612 | |
+      | 64×64 | 1333 | 944 | 1088 | 802 |
+    - Choice: 128×256 unless another configuration's estimate is below 95 % of 128×256's
+      (`kK4MarginPermille` = 50: model error); then the smallest estimate (ties: lower id).
+      On the 84 fitted cases the rule's K4 total is 4.1 % below always-128×256 and 0.4 %
+      above the per-case best, and it never picks a configuration slower than 128×256
+      (NOTES-A3 §3).
   - **Autotuning (optional plan option `k4_tune`, default off; §6).** The plan times every
     configuration once on its device and keeps the fastest. Not the default: plan creation
     then runs kernels and allocates temporarily, and timing on a shared GPU is noisy.
