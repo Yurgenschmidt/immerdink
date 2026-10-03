@@ -1,5 +1,5 @@
 # A2 (K4 epilogue / main-loop overlap): the sweep_compare.txt cases A2 reports on, plus the
-# cuBLASLt int8 GEMM (one modulus, int32 out) as K4's roofline. Format as sweep_m4.txt.
+# cuBLASLt int8 GEMM (one modulus, int32 out) as the K4 roofline. Format as sweep_m4.txt.
 r_lowk  | ik,jk->ij | i=8192,j=8192,k=1024   | int8,gemmul8,imd | 8,14 | dyn |
 t_df      | acQ,bdQ->acbd  | a=64,b=64,c=64,d=64,Q=2048         | int8,gemmul8,imd | 8,14 | dyn |
 t_ikl     | ikl,kjl->ijl   | i=1024,j=1024,k=1024,l=16          | int8,gemmul8,imd | 8,14 | dyn |
