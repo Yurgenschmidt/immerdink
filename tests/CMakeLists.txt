@@ -10,6 +10,22 @@ add_executable(test_constants test_constants.cpp)
 target_link_libraries(test_constants PRIVATE imd_constants imd_warnings)
 add_test(NAME constants_tables COMMAND test_constants)
 
+# CUDA smoke test: __constant__ tables on sm_89 + exhaustive epilogue mod reduction.
+add_executable(test_device_constants test_device_constants.cu)
+target_include_directories(test_device_constants PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(test_device_constants PRIVATE imd_constants imd_warnings)
+add_test(NAME device_constants COMMAND test_device_constants)
+
+# CUTLASS de-risking for M1: int8 batched TN GEMM, and the mod-p -> u8 EVT epilogue.
+add_executable(test_cutlass_int8_gemm test_cutlass_int8_gemm.cu)
+target_link_libraries(test_cutlass_int8_gemm PRIVATE imd_constants imd_cutlass)
+add_test(NAME cutlass_int8_gemm COMMAND test_cutlass_int8_gemm)
+
+add_executable(test_cutlass_mod_epilogue test_cutlass_mod_epilogue.cu)
+target_include_directories(test_cutlass_mod_epilogue PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(test_cutlass_mod_epilogue PRIVATE imd_constants imd_cutlass)
+add_test(NAME cutlass_mod_epilogue COMMAND test_cutlass_mod_epilogue)
+
 if(Python3_FOUND)
   # imd_workspace_size and the C++ lowering vs spec/params.py on generated descriptors.
   set(vectors "${CMAKE_CURRENT_BINARY_DIR}/workspace_vectors.txt")
@@ -34,3 +50,7 @@ if(Python3_FOUND)
                    "${IMD_GENERATED_INCLUDE}/immerdink/detail/constants.hpp"
                    "${PROJECT_SOURCE_DIR}/${IMD_CONSTANTS_HEADER}")
 endif()
+
+# GPU tests share one device; run them one at a time.
+set_tests_properties(device_constants cutlass_int8_gemm cutlass_mod_epilogue
+                     PROPERTIES RESOURCE_LOCK gpu)
