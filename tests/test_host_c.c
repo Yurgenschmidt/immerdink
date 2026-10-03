@@ -32,7 +32,7 @@ int main(void) {
   const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT, IMD_K4_TUNE_OFF};
 
   CHECK(imd_host_api_version() == IMD_HOST_API_VERSION);
-  CHECK(sizeof(imd_lowering_t) == 168 && IMD_HOST_API_VERSION >= 3);
+  CHECK(sizeof(imd_lowering_t) == 176 && IMD_HOST_API_VERSION >= 4);
   CHECK(sizeof(imd_options_t) == 24);
 
   size_t bytes = 0;
@@ -92,6 +92,8 @@ int main(void) {
   /* v2: k_hat = 16 <= 1024: the fused launch KF; then groups 2..5 with two packs and the B
    * padding rows (n_hat > n) each, 5 K4 launches and K5: 1 + 4 * 3 + 5 + 1 = 19. */
   CHECK(lw.fused == 1 && lw.reserved == 0 && lw.kernel_launches == 19);
+  /* v4: KF, so no KL. */
+  CHECK(lw.fused_large == 0 && lw.reserved4 == 0);
 
   /* v3: sm_count 0 -> the reference 128 SMs; a configuration of the table; the autotuning
    * scratch of group 1 (g = 2, b = 3): RA 2*3*17*16 = 1632, RB 2*3*48*16 = 4608, W
@@ -124,6 +126,12 @@ int main(void) {
     CHECK(imd_lowering(&A, &B, &C, &tune, &l2) == IMD_STATUS_SUCCESS);
     CHECK(l2.k4_config == lw.k4_config && l2.k4_tune_bytes == 11520 && l2.plan_host_bytes == host);
   }
+
+  /* A version-3 caller (struct_size 168) gets the v3 fields; the v4 tail is untouched. */
+  lw.fused_large = -5;
+  lw.struct_size = 168;
+  CHECK(imd_lowering(&A, &B, &C, &opt, &lw) == IMD_STATUS_SUCCESS);
+  CHECK(lw.m == 17 && lw.k4_tune_bytes == 11520 && lw.fused_large == -5);
 
   /* A version-2 caller (struct_size 152) gets the v2 fields; the v3 tail is untouched. */
   lw.sm_count = -5;
@@ -166,8 +174,10 @@ int main(void) {
     CHECK(imd_lowering(&a, &b, &c, &rn, &lw) == IMD_STATUS_NOT_SUPPORTED);
     CHECK(lw.status == IMD_STATUS_NOT_SUPPORTED && lw.lowered == 1 && lw.kappa == 180);
     CHECK(lw.workspace_bytes == bytes && lw.plan_host_bytes == 0);
-    /* k_hat > 1024: unfused, K0 + 2 K1 + 2 packs + 1 K4 + K5 (n_hat = n: no zero rows). */
-    CHECK(lw.fused == 0 && lw.kernel_launches == 7);
+    /* k_hat > 1024: no KF; v1.6: KL for A and B (both bits), so K0 + KL A + KL B + 1 K4 +
+     * K5 (group 1's packs are KL's; n_hat = n: no zero rows). */
+    CHECK(lw.fused == 0 && lw.fused_large == (IMD_FUSED_LARGE_A | IMD_FUSED_LARGE_B));
+    CHECK(lw.kernel_launches == 5);
     /* v3 fields are valid with lowered = 1, as k_chunks: 259200 + 1036800 + 128, aligned. */
     CHECK(lw.k4_tune_bytes == 259328 + 1036800 + 256 && lw.sm_count == 128);
   }

@@ -27,9 +27,10 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 3  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 4  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
-                                      imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5) */
+                                      imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
+                                   4: imd_lowering_t fused_large (v1.6) */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -182,7 +183,13 @@ typedef struct {
                               K4 configurations if k4_tune = IMD_K4_TUNE_ON (whatever this
                               call's option); 0: no tuning would run (no emulated GEMM, or
                               more than 256 MiB: the rule's choice is kept)               */
+  /* Version 4 (176 bytes; §4, §6a v1.6). Valid when lowered = 1, like k_chunks. */
+  int32_t fused_large;     /* bit 0 (1) / bit 1 (2): the GEMM's A / B (post-swap) is scaled and
+                              packed for group 1 by the fused large launch KL (k_hat > 1024,
+                              EMULATE); 0 otherwise. kernel_launches counts it            */
+  int32_t reserved4;       /* 0                                                         */
 } imd_lowering_t;
+enum { IMD_FUSED_LARGE_A = 1, IMD_FUSED_LARGE_B = 2 };
 
 /* Fills *out and returns the plan-time status (as imd_plan_bytes). INVALID_VALUE without
  * writing anything if out is NULL or out->struct_size < 136 (the version-1 size). With

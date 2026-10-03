@@ -68,7 +68,7 @@ bool overlap(const ByteInterval& x, const ByteInterval& y) {
 namespace imd::detail {
 const ExecPlan* exec_of(imd_plan_t plan) { return plan == nullptr ? nullptr : &plan->exec; }
 int& fused_override() {
-  static int v = -1;  // only the test hook changes it
+  static int v = -1;  // only the test hook changes it (-1, 0, 2, 3: test_hooks.cpp)
   return v;
 }
 }  // namespace imd::detail
@@ -104,7 +104,16 @@ imd_status_t imd_plan_create(imd_handle_t handle, const imd_tensor_t* A, const i
     if (const imd_status_t st = imd::detail::plan_data(an, &pd); st != IMD_STATUS_SUCCESS)
       return st;
     const bool emulated = imd::detail::emulates(pd);  // K4 parameters needed
-    if (imd::detail::fused_override() == 0) pd.fused = false;  // test hook only
+    // Test hook only: 0 = no fused launch at all; 2 / 3 = KL for both operands of every
+    // emulated plan (3: with 64-row KL tiles).
+    if (imd::detail::fused_override() == 0) {
+      pd.fused = false;
+      pd.fused_large = 0;
+    } else if (imd::detail::fused_override() >= 2 && emulated) {
+      pd.fused = false;
+      pd.fused_large = imd::detail::kFusedLargeA | imd::detail::kFusedLargeB;
+      if (imd::detail::fused_override() == 3) pd.kl_lg_rows = 6;
+    }
 
     auto p = std::make_unique<imd_plan_st>(an.options, an.lowered, *A, *B, *C);
     imd::detail::ExecPlan& e = p->exec;

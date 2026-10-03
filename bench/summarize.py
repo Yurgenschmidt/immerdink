@@ -152,7 +152,8 @@ def phase_table(recs, names, N):
 
 
 PHASE_GROUPS = OrderedDict([("K0 vec", ["K0 vec"]), ("K1 scale", ["K1 scale A", "K1 scale B"]),
-                            ("K2/K3 pack", ["K2 pack A", "K3 pack B"]), ("K4 GEMM", ["K4 gemm"]),
+                            ("K2/K3 pack", ["K2 pack A", "K3 pack B"]), ("KL", ["KL A", "KL B"]),
+                            ("K4 GEMM", ["K4 gemm"]),
                             ("K5 CRT", ["K5 crt"])])
 
 

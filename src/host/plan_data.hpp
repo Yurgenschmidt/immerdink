@@ -54,6 +54,13 @@ struct ExecPlan {
   // v1.4 (DESIGN §4 "KF"): K0 (generate mode), K1 and group 1's K2/K3 run as one fused
   // launch. Chosen at plan time from the lowering (analysis.hpp fused_path).
   bool fused = false;
+  // v1.6 (DESIGN §4 "KL"): bit x (0 = the GEMM's A, 1 = B) set iff operand x is scaled and
+  // packed for group 1 by one KL launch instead of K1 + its group-1 pack. Chosen at plan time
+  // from the lowering (analysis.hpp fused_large).
+  int32_t fused_large = 0;
+  // Test hook only (imd_test_set_fused 3): log2 of KL's tile height (rows per tile), -1 = the
+  // launch rule. Forcing 64-row tiles makes short rows span several chunks.
+  int32_t kl_lg_rows = -1;
   // v1.5 (DESIGN §4 "K4 configurations"): the K4 configuration (IMD_K4_*) the plan runs:
   // k4_select for the device's SM count, or the fastest one timed with k4_tune. Set by
   // libimmerdink at plan creation (plan_data leaves IMD_K4_128x256).

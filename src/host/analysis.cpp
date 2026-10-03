@@ -154,6 +154,7 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
     }
     e.k5_batch_fast = k5_batch_fastest(lw);
     e.fused = fused_path(e);
+    e.fused_large = fused_large(e);
   }
   if (e.path != Path::kNoop) {
     // §5 step 10 (v1.2): the fused-mode descriptor K0 generates the vectors from.
@@ -174,14 +175,20 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
   return IMD_STATUS_SUCCESS;
 }
 
-int64_t plan_launches(const ExecPlan& e, bool fused, bool resident, int64_t k4_launches) {
+int64_t plan_launches(const ExecPlan& e, bool fused, int32_t fused_large, bool resident,
+                      int64_t k4_launches) {
   if (e.path == Path::kNoop) return 0;
   const int64_t k0 = resident ? 0 : 1;
   if (!emulates(e)) return k0 + 1;  // DIRECT, K-empty or k = 0: K0 + one kernel
   const int64_t groups = (e.N + e.g - 1) / e.g;
-  const int64_t per_group = 2 + (e.n_hat > e.n ? 1 : 0);
-  const int64_t head = fused ? 1 : k0 + 2;
-  const int64_t packs = (fused ? groups - 1 : groups) * per_group;
+  const int64_t zero_rows = e.n_hat > e.n ? 1 : 0;
+  const int64_t per_group = 2 + zero_rows;
+  const int64_t head = fused ? 1 : k0 + 2;  // KF, or K0 + one scale launch per operand
+  // Group 1: no pack after KF; after K1 / KL, the packs of the operands not done by KL.
+  const int64_t group1 = fused ? 0
+                               : ((fused_large & kFusedLargeA) ? 0 : 1) +
+                                     ((fused_large & kFusedLargeB) ? 0 : 1 + zero_rows);
+  const int64_t packs = (groups - 1) * per_group + group1;
   if (k4_launches > INT64_MAX - head - packs - 1) return INT64_MAX;  // saturate like k4_counts
   return head + packs + k4_launches + 1;
 }

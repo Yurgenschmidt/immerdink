@@ -904,7 +904,8 @@ struct Bench {
     imd_prof_plan_k4(plan, &k4_run);
 #endif
     extra.integer("k4_rule", low.k4_config).integer("k4_config", k4_run)
-        .integer("k4_tune_bytes", (long long)low.k4_tune_bytes);
+        .integer("k4_tune_bytes", (long long)low.k4_tune_bytes)
+        .integer("fused", low.fused).integer("fused_large", low.fused_large);
     std::string vs = vec_mode == IMD_VEC_RESIDENT ? gs + " vec=resident" : gs;
     if (k4 == -2) vs += " k4=tune";
     else if (k4 >= 0) vs += " k4=" + std::to_string(k4);
@@ -927,6 +928,10 @@ struct Bench {
     lb["K1 scale B"] = 8 * b * n * k / kBW;
     lb["K2 pack A"] = (8 * b * m * k + N * b * m * kh) / kBW;
     lb["K3 pack B"] = (8 * b * n * k + N * b * nh * kh) / kBW;
+    // v1.6 KL (K1 + group 1's pack of one operand): one read of the operand, group 1's
+    // residues written (g = N here, like the pack bounds).
+    lb["KL A"] = (8 * b * m * k + N * b * m * kh) / kBW;
+    lb["KL B"] = (8 * b * n * k + N * b * nh * kh) / kBW;
     lb["K4 gemm"] = std::max(2.0 * N * b * m * nh * kh / kOps,
                              (N * b * (m * kh + nh * kh) + N * b * m * nh * (2 * nc - 1)) / kBW);
     lb["K5 crt"] = (N * b * m * nh + 8 * b * m * n) / kBW;

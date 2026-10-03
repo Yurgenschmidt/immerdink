@@ -200,7 +200,10 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
     # hooks, with the fused path disabled (fmode 0): every run bit-exact, all C identical.
     # fmode 1: the plan-time rule, but without the small-problem launch variants (K5 one
     # element per thread, KF four values per thread).
-    fmodes = (-1, 0, 1) if lib.has_test_hooks else (-1,)
+    # v1.6: fmode 2 forces the fused large launch KL (K1 + group 1's pack per operand) for
+    # both operands of every emulated case, fmode 3 the same with 64-row KL tiles, so rows
+    # longer than 64 span several chunks (registers, shared memory and re-read chunks).
+    fmodes = ((-1, 0, 1) + ((2, 3) if kind == "GEMM" else ())) if lib.has_test_hooks else (-1,)
     # v1.5 (DESIGN §4 "K4 configurations"): k4 -1 is the plan-time rule; with the test hooks
     # every emulated case also runs once in each K4 configuration (forced) and once with the
     # k4_tune plan option: all bit-exact vs the oracle and bit-identical to each other.
@@ -211,7 +214,7 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
         runs += [(hz.VEC_GENERATE, params.VEC_GENERATE, -1, c)
                  for c in list(range(K4_CONFIGS)) + ["tune"]]
     for vec, pvec, fmode, k4 in runs:
-        vname = f"{name} [{pvec}{ {-1: '', 0: ', unfused', 1: ', large launches'}[fmode]}" \
+        vname = f"{name} [{pvec}{ {-1: '', 0: ', unfused', 1: ', large launches', 2: ', KL', 3: ', KL 64-row tiles'}[fmode]}" \
                 f"{'' if k4 == -1 else f', K4 {k4}'}]"
         st, ws_bytes = lib.workspace_size(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec)
         if st != "SUCCESS":
@@ -224,7 +227,7 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
             raise Fail(f"{vname}: workspace {ws_bytes} > {MAX_WORKSPACE} (test guard)")
         allocs0 = lib.alloc_count()
         if lib.has_test_hooks:
-            lib.set_fused(0 if fmode == 0 else -1)
+            lib.set_fused(fmode if fmode in (0, 2, 3) else -1)
             lib.set_k4_config(k4 if isinstance(k4, int) else -1)
         try:
             st, plan = lib.plan_create(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec,
@@ -292,14 +295,21 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
             # imd_lowering kernel_launches, tests/test_host.py) says.
             if launches0 is not None and lib.has_test_hooks:
                 fused, kl = lib.plan_kernels(plan)
-                if fmode == 0 and fused:
-                    raise Fail(f"{vname}: the fused path was not disabled")
+                large = lib.plan_fused_large(plan)
+                if fmode == 0 and (fused or large):
+                    raise Fail(f"{vname}: the fused paths were not disabled")
+                if fmode in (2, 3) and (fused or large != 3):
+                    raise Fail(f"{vname}: KL not forced (fused {fused}, fused_large {large})")
+                emulated = mode == o.EMULATE and view.k > 1 and not view.empty_output()
+                if fmode in (-1, 1) and large != (3 if emulated and not fused else 0):
+                    raise Fail(f"{vname}: fused_large {large} against the plan-time rule")
                 if alpha == 0.0 and not view.empty_output():
                     kl = (0 if pvec == params.VEC_RESIDENT else 1) + 1   # K0 + beta kernel
                 if lib.launch_count() - launches0 != kl:
                     raise Fail(f"{vname}: imd_contract launched {lib.launch_count() - launches0} "
                                f"kernels, the plan says {kl}")
                 STATS["fused"] = STATS.get("fused", 0) + (1 if fused else 0)
+                STATS["kl"] = STATS.get("kl", 0) + (1 if large else 0)
             cuda.sync()
             t_gpu += time.time() - t0
             if allocs is not None and lib.alloc_count() != allocs:
@@ -705,7 +715,7 @@ def main():
     print(f"{STATS['cases']} contractions bit-exact vs spec/oracle.py "
           f"({STATS['elements']} C elements; dispatch {STATS['kinds']}; "
           f"{STATS['stage_bytes']} workspace bytes stage-checked; {STATS.get('fused', 0)} runs "
-          f"on the fused path; K4 configurations run {dict(sorted(STATS['k4'].items()))}) "
+          f"on the fused path KF, {STATS.get('kl', 0)} with KL; K4 configurations run {dict(sorted(STATS['k4'].items()))}) "
           f"in {time.time() - t0:.1f}s")
     return 0
 
