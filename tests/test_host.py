@@ -704,6 +704,8 @@ def suite_plan(args):
     f.restype = C.c_int
     lib.set_limits()  # production launch limits (the host queries use them)
     direct = Direct(args.host_lib)
+    host.load(args.host_lib)
+    os.environ["IMMERDINK_HOST_LIB"] = args.host_lib
     hdl = C.c_void_p()
     assert lib.lib.imd_create(C.byref(hdl)) == 0
     rng = random.Random(20261005)
@@ -763,10 +765,94 @@ def suite_plan(args):
         finally:
             lib.lib.imd_plan_destroy(plan)
 
+    n_packed = {}
+
+    def one_packed(descs, opts, what):
+        """v1.7 (DESIGN §6b): real packed plans (imd_pack_create + imd_plan_create_packed)
+        == imd_lowering_packed / imd_workspace_layout_packed: status, view, layout, launches,
+        fused paths, packed slots, pack bytes and the host payload (incl. the copied keys)."""
+        N, g, rnd, mode, vec = opts
+        A, B, Cd = (oracle.Desc(*d) for d in descs)
+        omode = oracle.EMULATE if mode == "EMULATE" else oracle.DIRECT
+        try:
+            oracle.lower(A, B, Cd, omode, build_vec=False)
+        except (oracle.InvalidValue, oracle.NotSupported):
+            return
+        co = c_opts(*opts)
+        for which in ((0,), (1,), (0, 1)):
+            for order in ("desc_for", "auto"):
+                specs = [None, None]
+                for x in which:
+                    if order == "desc_for":
+                        specs[x] = host.pack_desc_for(descs, operand=x, N=N, g=g, rounding=rnd,
+                                                      mode=mode, vec_mode=vec)
+                    else:
+                        X = descs[x]
+                        xl = list(dict.fromkeys(X[2]))
+                        specs[x] = host.PackSpec(host.Desc(*map(tuple, X)), N, rnd, "AUTO",
+                                                 tuple(lab for lab in xl if lab not in descs[2][2]),
+                                                 tuple(lab for lab in xl if lab in descs[2][2]
+                                                       and lab in descs[1 - x][2]))
+                if any(s is not None and spec_pack_status(s)[0] != "SUCCESS" for s in specs):
+                    continue
+                handles = [None, None]
+                try:
+                    for x in which:
+                        hst, handles[x] = lib.pack_create(harness.make_pack_desc(oracle_pack(specs[x])))
+                        if hst != "SUCCESS":
+                            raise Fail(f"{what}: imd_pack_create {hst}")
+                    st, low = direct.lowering(descs, co, packing=specs)
+                    T = [harness.make_tensor(*d) for d in descs]
+                    plan = C.c_void_p()
+                    pst = lib.lib.imd_plan_create_packed(hdl, *[C.byref(t) for t in T],
+                                                         C.byref(harness.Options(*co, 0)),
+                                                         handles[0], handles[1], C.byref(plan))
+                    if pst != st:
+                        lib.lib.imd_plan_destroy(plan)
+                        raise Fail(f"{what} packed {which} {order}: imd_plan_create_packed "
+                                   f"{STATUS[pst]}, imd_lowering_packed {STATUS[st]}")
+                    n_packed[STATUS[st]] = n_packed.get(STATUS[st], 0) + 1
+                    if pst != 0:
+                        continue
+                    try:
+                        cnt = C.c_int64(0)
+                        buf = (C.c_int64 * 64)()
+                        assert f(plan, buf, 64, C.byref(cnt)) == 0 and cnt.value <= 64
+                        v = list(buf)[:cnt.value]
+                        path, sw, m, n, k, b, nh, kh, NN, gg, total = v[:11]
+                        regs = [(v[11 + 2 * r], v[12 + 2 * r]) for r in range(8)]
+                        dev, store, add, launches, hbytes, fused, kernels = v[27:34]
+                        fused_large, slots, pbA, pbB = v[37:41]
+                        _, ltot, lay = direct.layout_packed(descs, co, specs)
+                        got = dict(swapped=sw, m=m, n=n, k=k, b=b, n_hat=nh, k_hat=kh,
+                                   workspace_bytes=total, gemm_launches=launches,
+                                   plan_device_bytes=dev, plan_host_bytes=hbytes, fused=fused,
+                                   kernel_launches=kernels, fused_large=fused_large, packed=slots)
+                        for key, val in got.items():
+                            if val != low[key]:
+                                raise Fail(f"{what} packed {which} {order}: plan {key} = {val}, "
+                                           f"imd_lowering_packed {low[key]}")
+                        if regs != lay or total != ltot:
+                            raise Fail(f"{what} packed: plan layout differs from the host query")
+                        roles = [(x == 0) != bool(sw) for x in (0, 1)]   # True: post-swap A
+                        want_pb = [0, 0]
+                        for x in which:
+                            want_pb[0 if roles[x] else 1] = host.pack_layout(specs[x]).pack_bytes
+                        if [pbA, pbB] != want_pb:
+                            raise Fail(f"{what} packed: plan pack bytes {pbA, pbB}, {want_pb}")
+                    finally:
+                        lib.lib.imd_plan_destroy(plan)
+                finally:
+                    for h in handles:
+                        if h is not None:
+                            lib.pack_destroy(h)
+
     for t in range(args.cases):
         descs = random_descs(rng)
         # v1.5: every 8th plan with k4_tune (its sizes must still equal the host queries).
         one(descs, random_opts(rng), f"random[{t}]", tune=int(t % 8 == 7))
+        if t % 4 == 0:
+            one_packed(descs, random_opts(rng), f"random[{t}]")
     for t in range(max(1, args.cases // 40)):
         descs = random_descs(rng, legal_bias=1.0)
         N = rng.randint(2, 20)
@@ -783,7 +869,9 @@ def suite_plan(args):
     lib.lib.imd_destroy(hdl)
     if args.verbose:
         print(f"  ok  {n_plans} plans ({n_k4} emulated, {n_tuned} autotuned) sized exactly as the "
-              f"host queries say, K4 configurations as the rule says")
+              f"host queries say, K4 configurations as the rule says; packed plans {n_packed}")
+    if n_packed.get("SUCCESS", 0) < 50:
+        raise Fail(f"too few packed plans: {n_packed}")
 
 
 def main():

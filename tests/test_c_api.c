@@ -160,6 +160,55 @@ int main(void) {
     ++failures;
   }
 
+  {
+    /* v1.7 (DESIGN §6b) from C: pack the 17 x 5 operand A[i,k] of ik,kj->ij and contract. */
+    const int64_t ea[2] = {17, 5}, sa[2] = {5, 1}, eb[2] = {5, 33}, sb[2] = {33, 1};
+    const int64_t ec[2] = {17, 33}, sc[2] = {33, 1};
+    const int32_t la[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
+    const imd_tensor_t A2 = {2, ea, sa, la}, B2 = {2, eb, sb, lb}, C2 = {2, ec, sc, lc};
+    const int32_t kk[1] = {3};
+    imd_pack_desc_t pd;
+    memset(&pd, 0, sizeof pd);
+    pd.struct_size = sizeof pd;
+    pd.num_moduli = 9, pd.rounding = IMD_RN, pd.order = IMD_PACK_ORDER_AUTO, pd.tensor = &A2;
+    pd.num_contracted = 1, pd.contracted = kk;
+    imd_pack_t pk = NULL;
+    imd_plan_t pp = NULL;
+    size_t pb = 0, pw = 0, wsb = 0;
+    const imd_packing_t packing = {&pd, NULL};
+    expect("pack create", imd_pack_create(h, &pd, &pk), IMD_STATUS_SUCCESS);
+    expect("pack bytes", imd_pack_bytes(pk, &pb, &pw), IMD_STATUS_SUCCESS);
+    expect("packed ws", imd_workspace_size_packed(&A2, &B2, &C2, &opt, &packing, &wsb),
+           IMD_STATUS_SUCCESS);
+    expect("plan packed", imd_plan_create_packed(h, &A2, &B2, &C2, &opt, pk, NULL, &pp),
+           IMD_STATUS_SUCCESS);
+    double *a = NULL, *b = NULL, *c = NULL;
+    void *packed = NULL, *pws = NULL, *ws = NULL;
+    if (cudaMalloc((void**)&a, 17 * 5 * 8) == cudaSuccess &&
+        cudaMalloc((void**)&b, 5 * 33 * 8) == cudaSuccess &&
+        cudaMalloc((void**)&c, 17 * 33 * 8) == cudaSuccess && cudaMalloc(&packed, pb) == cudaSuccess &&
+        cudaMalloc(&pws, pw) == cudaSuccess && cudaMalloc(&ws, wsb) == cudaSuccess) {
+      cudaMemset(a, 0, 17 * 5 * 8);
+      cudaMemset(b, 0, 5 * 33 * 8);
+      const imd_operand_t oa = {a, packed, pb, pk}, ob = {b, NULL, 0, NULL};
+      expect("imd_pack", imd_pack(pk, a, packed, pb, pws, pw, 0), IMD_STATUS_SUCCESS);
+      expect("imd_contract on a packed plan", imd_contract(pp, 1.0, a, b, 0.0, c, ws, wsb, 0),
+             IMD_STATUS_PACK_MISMATCH);
+      expect("imd_contract_packed", imd_contract_packed(pp, 1.0, &oa, &ob, 0.0, c, ws, wsb, 0),
+             IMD_STATUS_SUCCESS);
+      if (cudaDeviceSynchronize() != cudaSuccess) {
+        fprintf(stderr, "FAIL packed kernels\n");
+        ++failures;
+      }
+    } else {
+      fprintf(stderr, "FAIL packed allocations\n");
+      ++failures;
+    }
+    cudaFree(a), cudaFree(b), cudaFree(c), cudaFree(packed), cudaFree(pws), cudaFree(ws);
+    expect("plan destroy", imd_plan_destroy(pp), IMD_STATUS_SUCCESS);
+    expect("pack destroy", imd_pack_destroy(pk), IMD_STATUS_SUCCESS);
+  }
+
   expect("destroy", imd_destroy(h), IMD_STATUS_SUCCESS);
   printf("%s\n", failures == 0 ? "PASS" : "FAIL");
   return failures == 0 ? 0 : 1;

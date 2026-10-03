@@ -109,6 +109,97 @@ void run(const char* name, std::vector<int64_t> eA, std::vector<int32_t> lA, std
   imd_plan_destroy(plan);
 }
 
+// v1.7 (DESIGN §6b.7): imd_pack + imd_contract_packed captured into ONE graph (the pack
+// rewritten, then read, per replay) and replayed twice; each replay bit-identical to the
+// uncaptured plain imd_contract (imd_pack_desc_for packs reproduce it bit for bit).
+// `which`: bit 0 / 1 = pack the caller's A / B.
+void run_packed(const char* name, std::vector<int64_t> eA, std::vector<int32_t> lA,
+                std::vector<int64_t> eB, std::vector<int32_t> lB, std::vector<int64_t> eC,
+                std::vector<int32_t> lC, int N, int g, int which, int vec, imd_handle_t h) {
+  const auto sA = dense(eA), sB = dense(eB), sC = dense(eC);
+  const imd_tensor_t A{int32_t(eA.size()), eA.data(), sA.data(), lA.data()};
+  const imd_tensor_t B{int32_t(eB.size()), eB.data(), sB.data(), lB.data()};
+  const imd_tensor_t C{int32_t(eC.size()), eC.data(), sC.data(), lC.data()};
+  const imd_options_t o{N, g, IMD_RN, IMD_EMULATE, vec, IMD_K4_TUNE_OFF};
+  const int64_t nA = count(eA), nB = count(eB), nC = count(eC);
+  auto a = values(nA, 4), b = values(nB, 5);
+  const auto c0 = values(nC, 6);
+  a[nA / 3] = INFINITY;  // a flagged output: the native path reads the FP64 operand too
+  imd_pack_desc_t desc[2];
+  int32_t labels[2][8];
+  imd_pack_t hp[2] = {nullptr, nullptr};
+  size_t pb[2] = {0, 0}, pw[2] = {0, 0};
+  for (int x = 0; x < 2; ++x) {
+    if (!(which & (1 << x))) continue;
+    std::memset(&desc[x], 0, sizeof desc[x]);
+    desc[x].struct_size = sizeof desc[x];
+    CHECK(imd_pack_desc_for(&A, &B, &C, &o, x, &desc[x], labels[x], 8) == IMD_STATUS_SUCCESS);
+    CHECK(imd_pack_create(h, &desc[x], &hp[x]) == IMD_STATUS_SUCCESS);
+    CHECK(imd_pack_bytes(hp[x], &pb[x], &pw[x]) == IMD_STATUS_SUCCESS);
+  }
+  const imd_packing_t packing = {hp[0] ? &desc[0] : nullptr, hp[1] ? &desc[1] : nullptr};
+  size_t wsb = 0, wsp = 0;
+  CHECK(imd_workspace_size(&A, &B, &C, &o, &wsb) == IMD_STATUS_SUCCESS);
+  CHECK(imd_workspace_size_packed(&A, &B, &C, &o, &packing, &wsp) == IMD_STATUS_SUCCESS);
+  imd_plan_t plain = nullptr, packed = nullptr;
+  CHECK(imd_plan_create(h, &A, &B, &C, &o, &plain) == IMD_STATUS_SUCCESS);
+  CHECK(imd_plan_create_packed(h, &A, &B, &C, &o, hp[0], hp[1], &packed) == IMD_STATUS_SUCCESS);
+  double *dA = nullptr, *dB = nullptr, *dC = nullptr;
+  void *ws = nullptr, *dP[2] = {nullptr, nullptr}, *dPw[2] = {nullptr, nullptr};
+  cudaStream_t s = nullptr;
+  CHECK(cudaMalloc(&dA, nA * 8) == cudaSuccess && cudaMalloc(&dB, nB * 8) == cudaSuccess &&
+        cudaMalloc(&dC, nC * 8) == cudaSuccess && cudaMalloc(&ws, wsb + 256) == cudaSuccess);
+  for (int x = 0; x < 2; ++x)
+    if (hp[x]) CHECK(cudaMalloc(&dP[x], pb[x]) == cudaSuccess && cudaMalloc(&dPw[x], pw[x] + 1) == cudaSuccess);
+  CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess);
+  CHECK(cudaMemcpy(dA, a.data(), nA * 8, cudaMemcpyHostToDevice) == cudaSuccess);
+  CHECK(cudaMemcpy(dB, b.data(), nB * 8, cudaMemcpyHostToDevice) == cudaSuccess);
+  // reference: the plain uncaptured call
+  std::vector<double> ref(nC), got(nC);
+  CHECK(cudaMemcpy(dC, c0.data(), nC * 8, cudaMemcpyHostToDevice) == cudaSuccess);
+  CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  CHECK(imd_contract(plain, 1.0, dA, dB, 0.5, dC, ws, wsb, s) == IMD_STATUS_SUCCESS);
+  CHECK(cudaStreamSynchronize(s) == cudaSuccess);
+  CHECK(cudaMemcpy(ref.data(), dC, nC * 8, cudaMemcpyDeviceToHost) == cudaSuccess);
+  // capture: the packs, then the packed contraction, on one stream (stream order is RAW)
+  const imd_operand_t opA = {dA, dP[0], pb[0], hp[0]}, opB = {dB, dP[1], pb[1], hp[1]};
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  imd_status_t st[3] = {IMD_STATUS_SUCCESS, IMD_STATUS_SUCCESS, IMD_STATUS_SUCCESS};
+  CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal) == cudaSuccess);
+  for (int x = 0; x < 2; ++x)
+    if (hp[x]) st[x] = imd_pack(hp[x], x == 0 ? dA : dB, dP[x], pb[x], dPw[x], pw[x], s);
+  st[2] = imd_contract_packed(packed, 1.0, &opA, &opB, 0.5, dC, ws, wsp, s);
+  CHECK(cudaStreamEndCapture(s, &graph) == cudaSuccess);
+  CHECK(st[0] == IMD_STATUS_SUCCESS && st[1] == IMD_STATUS_SUCCESS && st[2] == IMD_STATUS_SUCCESS);
+  CHECK(cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess);
+  for (int replay = 0; replay < 2; ++replay) {
+    CHECK(cudaMemcpyAsync(dC, c0.data(), nC * 8, cudaMemcpyHostToDevice, s) == cudaSuccess);
+    CHECK(cudaMemsetAsync(ws, 0xA5, wsp, s) == cudaSuccess);
+    for (int x = 0; x < 2; ++x)  // the graph must rewrite every packed byte it reads
+      if (hp[x]) CHECK(cudaMemsetAsync(dP[x], 0xA5, pb[x], s) == cudaSuccess);
+    CHECK(cudaGraphLaunch(exec, s) == cudaSuccess);
+    if (const cudaError_t e = cudaStreamSynchronize(s); e != cudaSuccess)
+      std::fprintf(stderr, "%s vec_mode %d replay %d: %s\n", name, vec, replay, cudaGetErrorString(e));
+    CHECK(cudaGetLastError() == cudaSuccess);
+    CHECK(cudaMemcpy(got.data(), dC, nC * 8, cudaMemcpyDeviceToHost) == cudaSuccess);
+    if (std::memcmp(got.data(), ref.data(), nC * 8) != 0) {
+      std::fprintf(stderr, "FAIL %s vec_mode %d: packed replay %d differs from the plain call\n",
+                   name, vec, replay);
+      ++g_failures;
+    }
+  }
+  std::printf("  ok  %s, vec_mode %d: imd_pack + imd_contract_packed captured, replayed twice, "
+              "bit-identical to imd_contract\n", name, vec);
+  cudaGraphExecDestroy(exec);
+  cudaGraphDestroy(graph);
+  cudaStreamDestroy(s);
+  cudaFree(dA), cudaFree(dB), cudaFree(dC), cudaFree(ws);
+  for (int x = 0; x < 2; ++x) cudaFree(dP[x]), cudaFree(dPw[x]), imd_pack_destroy(hp[x]);
+  imd_plan_destroy(plain);
+  imd_plan_destroy(packed);
+}
+
 }  // namespace
 
 int main() {
@@ -125,6 +216,16 @@ int main() {
         {1, 4, 2}, 9, 0, -1.5, vec, h);
     run("alpha = 0 (beta-only K5)", {300, 700}, {1, 3}, {700, 200}, {3, 2}, {300, 200}, {1, 2}, 14,
         0, 0.0, vec, h);
+    // v1.7 packed operands: A packed (KF on B), both packed (K0, K4, K5 only), B packed with
+    // KL on A (k_hat > 1024), a batched tensor with A packed
+    run_packed("packed A, matrix 300x200x700 N=14 g=5", {300, 700}, {1, 3}, {700, 200}, {3, 2},
+               {300, 200}, {1, 2}, 14, 5, 1, vec, h);
+    run_packed("packed A and B, matrix 300x200x700 N=14 g=5", {300, 700}, {1, 3}, {700, 200},
+               {3, 2}, {300, 200}, {1, 2}, 14, 5, 3, vec, h);
+    run_packed("packed B, matrix 200x40x5000 N=8 g=3 (KL on A)", {200, 5000}, {1, 3}, {5000, 40},
+               {3, 2}, {200, 40}, {1, 2}, 8, 3, 2, vec, h);
+    run_packed("packed A, batched lik,lkj->ilj N=9", {4, 64, 200}, {4, 1, 3}, {4, 200, 48},
+               {4, 3, 2}, {64, 4, 48}, {1, 4, 2}, 9, 0, 1, vec, h);
   }
   imd_destroy(h);
   std::printf("%s\n", g_failures == 0 ? "PASS" : "FAIL");
