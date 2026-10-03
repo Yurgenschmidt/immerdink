@@ -59,7 +59,7 @@ milestone like M2/M3, L ≈ multi-milestone or research.
 | D1 | **Packed-operand reuse** — pack an operand once, use it in many contractions (kernel-level: caller owns the packed buffer) | same integrals/amplitudes in many contractions; pack is 10–15% of large calls, more at small g | M | interacts with C1(c) |
 | D2 | Complex (2M / 3M via the moduli table) | complex-valued workloads | M | needed by ehrenfest? |
 | D3 | **Packed symmetric contractions**, generic permutational symmetry (DF-CCSD PPL) | memory and flops of symmetric tensors; no generic kernels exist even without Ozaki | L–XL (research) | after D1; symmetry descriptor API |
-| D4 | Fused variants (pack inside the GEMM main loop; MEMORY_MODEL §7) | workspace and pack traffic | L | after A2 |
+| D4 | Fused variants (pack inside the GEMM main loop; MEMORY_MODEL §7) — **part 1 done** (2026-10-03, user decision: K1 + pack fusion for large shapes first): per-operand launch KL = K1 + group 1's pack for k̂ > 1024 (DESIGN v1.6, host API v4 `fused_large`); DRAM reads of the scale + pack phase halved at g = N (one operand read saved at any g; workspace unchanged); N = 8 vs GEMMul8: r_skinny 0.93 → 1.18×, r_bigk 0.98 → 1.09×, r_mm 0.97 → 1.02×; sq2048–sq8192 and t_nn / t_df / t_cc / t_permout 8–18 % faster at N = 8; small shapes (KF) unchanged; docs/NOTES-D4.md | workspace and pack traffic | L | part 2 (pack inside the GEMM) not started |
 
 ## Phase E — Hardware
 

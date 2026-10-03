@@ -394,7 +394,7 @@ longer rows re-read nc − 2 chunks from L2 in pass 2 and in pass 3. With nc > 2
 SMs (k̂ > 65536 on 128 SMs) partly miss L2 in passes 2/3; pass 2 walking backwards and pass 3
 forwards keeps the most recently read chunks first, and the DRAM reads never exceed the
 unfused path's. (The threads per CTA and E are launch choices measured in NOTES-D4 §2: 8
-values per thread is 10–15 % faster than 16 on on-chip rows, 4 is 10–35 % faster than 16 on
+values per thread is 9–16 % faster than 16 on on-chip rows, 4 is 8–40 % faster than 16 on
 re-read rows; they change no result.)
 
 **Residue groups (g < N).** KL removes one DRAM read of x whatever g: `(1 + ⌈N/g⌉)|x|` →

@@ -602,3 +602,17 @@ plan option (`bench/sweep_a3_tune.txt`, `a3-tune-ae2ac92.jsonl`) costs 1–24 ms
 creation and up to 256 MiB of temporary device memory for no measurable gain over the
 rule. Per-configuration K4 times on 84 cases (`a3-configs-{nsys,phases}.jsonl`), the rule
 fit, ncu analysis and tables: [NOTES-A3.md](NOTES-A3.md).
+
+## D4 part 1: fused K1 + pack for large operands (KL) (2026-10-03)
+
+One launch per operand (KL, DESIGN v1.6 §4) replaces K1 and group 1's pack whenever KF does
+not apply (k̂ > 1024): the operand is read from DRAM once instead of twice before its first
+GEMM. Before = dev `a572d85`, after = `197cd0f`, all of `bench/sweep_compare.txt` interleaved
+by `bench/run_ab.sh` with GEMMul8 first in both processes:
+`bench/results/{d4-before-a572d85,compare-197cd0f}.jsonl`. N = 8 / 14 vs GEMMul8 (same
+process): r_skinny 0.93 → 1.18× / 1.08 → 1.27×, r_bigk 0.98 → 1.09× / 1.01 → 1.08×, r_mm
+0.97 → 1.02× / 1.07 → 1.10×, sq2048 1.03 → 1.22×, sq4096 1.16 → 1.32×, sq8192 1.12 → 1.20×,
+t_cc 1.19 → 1.32×, t_df 1.35 → 1.52×, t_nn 1.19 → 1.30×, t_permout 1.19 → 1.33×; k̂ ≤ 1024
+(KF, unchanged) within noise (identical nsys kernel times). ncu: the scale + pack phase reads
+half the DRAM bytes at g = N and one operand read less at any g. Tables, the threads-per-CTA
+measurement and the g analysis: [NOTES-D4.md](NOTES-D4.md).
