@@ -55,7 +55,8 @@ index spaces, with `ī ∈ [0,m)`, `k̄ ∈ [0,k)`, `j̄ ∈ [0,n)` and `λ ∈ 
 C_λ[ī,j̄] ← α Σ_k̄ A_λ[ī,k̄] B_λ[k̄,j̄] + β C_λ[ī,j̄]
 ```
 
-The canonical orders are a fixed function of the descriptors (§5 step 8).
+The canonical orders are a fixed function of the descriptors (§5 step 8). NaN results
+are NaN, but their payload and sign are unspecified.
 
 ---
 
@@ -123,7 +124,8 @@ significand:
 - Soundness needs `2T − κ ≥ 1`. At `κ = 2T` no u exists; beyond that the squared rule is
   unsound. **[spec: OzakiScaling pos_kappa_2Tm1, neg_kappa_2T, neg_noreject]**
 - As an accuracy policy, plan time rejects `κ ≥ T` (NOT_SUPPORTED: "N too small for this
-  k").
+  k"). It does so only in EMULATE with a non-empty output and k ≥ 2, and the rule is
+  independent of α.
 - The §3.8 bound already exceeds 1 well before that, once `κ ≳ 0.4T`. So choose N with
   `params.py --table`.
 
@@ -268,7 +270,7 @@ Typical errors are smaller. Choosing N is the caller's job, guided by
 ```
 plan time:  IndexMap lowering → scatter vectors, canonical orders, chunking, launch split
 K0 vec      cudaMemcpyAsync: plan's pinned scatter vectors → ws.vec        (same stream)
-K1 scale    A rows, B cols: flags + σ, τ (int16)       reads A, B once
+K1 scale    A rows, B cols: flags + σ, τ (int16)       v1: two passes per row (γ, then S)
 for each residue group G (g moduli; ⌈N/g⌉ groups):
   K2 pack   A → A'_l[λ][ī][k̂]  for l ∈ G   (gather via scatter vectors, smem transpose,
   K3 pack   B → B'_l[λ][j̄][k̂]  for l ∈ G    K-contiguous int8, zero padding)  re-read A, B
@@ -313,6 +315,7 @@ Properties checked by **[spec: Pipeline]**:
 
 **Launch limits.**
 - The CUTLASS batch count `|G|·b` must be ≤ 65535 (gridDim.z), so plan time splits it.
+- The N-tile count must be ≤ 65535 (gridDim.y), so n̂ is split across launches if needed.
 - `m, n̂ ≤ 2³¹−1` (`GemmCoord` is int), and the per-launch K is ≤ K_c'.
 - `lda = ldb = k̂` and `ldc = n̂`. The batch strides are int64, so k̂ itself may exceed 2³¹.
 
@@ -379,7 +382,9 @@ Lowering, in order **[spec: IndexMap]**:
    - extent > 1 → NOT_SUPPORTED. This is a v1 policy: broadcasting is exact
      (`pos_conly`), and a later version may allow it.
    - extent 0 → C is empty → no-op.
-8. **Canonical orders**, a pure function of the descriptors:
+8. **Canonical orders**, a pure function of the descriptors. The coalescing role swap
+   below is applied **first**; orders are then computed on the post-swap roles, with
+   "position" taken from the caller's original label order:
    - I by (|s_C|, |s_A|, position); J by (|s_C|, |s_B|, position); L by (|s_C|, |s_A|,
      |s_B|, position).
    - K by (|s_big|, |s_other|, position), where "big" = A if m ≥ n, else B.
@@ -404,7 +409,7 @@ this precedence order; the first failing check wins:
 | 2 | repeated label in C | NOT_SUPPORTED |
 | 3 | label only in C with extent > 1 | NOT_SUPPORTED |
 | 4 | non-empty C fails the **sorted-\|stride\| rule**: over C's modes with extent > 1, sorted by \|stride\|, each \|s₍t₎\| > Σ_{u<t} \|s₍u₎\|(e₍u₎−1) (sufficient for injectivity) | INVALID_VALUE |
-| 5 | overflow: extent products or spans exceed int64; workspace total exceeds uint64; in EMULATE mode with a non-empty output, m or n̂ > 2³¹−1 (CUTLASS limit; not applied to DIRECT) | INVALID_VALUE |
+| 5 | overflow: extent products or spans exceed int64; workspace total exceeds uint64; in EMULATE mode with a non-empty output and k ≥ 2, m or n̂ > 2³¹−1 (CUTLASS limit; not applied to DIRECT, K-empty or k = 0) | INVALID_VALUE |
 | 6 | C ∩ A or C ∩ B (byte intervals; checked even when k = 0, conservatively); workspace ∩ A, B or C, using the bytes actually used, `[ws, ws + workspace_size)` | ALIASING (execute time) |
 | 7 | A, B or C not 8-byte aligned; workspace not 256-byte aligned | MISALIGNED (execute time) |
 
@@ -468,7 +473,8 @@ const char*  imd_status_string(imd_status_t);
   NOT_SUPPORTED). That rule applies only when the emulated GEMM would run;
   `imd_workspace_size` is exactly §4a and never applies it.
 - `imd_contract` checks, in order:
-  1. null pointers → INVALID_VALUE;
+  1. null pointers → INVALID_VALUE. C must always be non-null. A and B must be non-null
+     only when α ≠ 0 and k ≠ 0, and ws only when `workspace_size > 0`;
   2. an empty output → SUCCESS with nothing touched;
   3. ALIASING (§5 row 6);
   4. MISALIGNED;
@@ -476,6 +482,13 @@ const char*  imd_status_string(imd_status_t);
 - `imd_contract` does no host synchronization and no allocation, and has no hidden mode
   switches.
 - A workspace belongs to at most **one** in-flight `imd_contract` at a time.
+- **Lifetime:** a plan must outlive every in-flight `imd_contract` that uses it, because
+  K0 copies asynchronously from the plan's pinned buffer.
+- **ALLOC_FAILED** covers pinned or host allocation failure in plan creation; any other
+  CUDA failure is CUDA_ERROR.
+- **Threads:** v1 does not support concurrent first calls from several host threads
+  (CUTLASS caches device properties in unsynchronized statics). M4 caches the GEMM
+  operators in the handle, which fixes this.
 - Callers tile I/J/L themselves, since sub-views are valid inputs. Tiling over I/J/L leaves
   results bitwise unchanged; tiling over K by the caller does change them. The library
   handles K chunking and the batch-launch split internally.
@@ -485,6 +498,7 @@ const char*  imd_status_string(imd_status_t);
     N and rounding;
   - complex values via the 2M method (2 GEMMs per modulus, moduli with √−1);
   - accurate-mode scaling, which is incompatible with independent packing.
+  - adaptive precision, possibly via an Ozaki-I slice mode sharing this pipeline (PLAN, Later).
 
 ---
 

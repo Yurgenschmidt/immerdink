@@ -1,5 +1,7 @@
 // C ABI entry points (docs/DESIGN.md §6). No exception crosses this boundary.
+#include <array>
 #include <cstdint>
+#include <memory>
 #include <new>
 #include <vector>
 
@@ -9,6 +11,7 @@
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink.h"
 #include "index_map.hpp"
+#include "plan.hpp"
 #include "workspace.hpp"
 
 struct imd_handle_st {
@@ -29,8 +32,17 @@ struct TensorCopy {
 struct imd_plan_st {
   imd_options_t options{};  // residue_group normalized to [1, N]
   imd::detail::Lowered lowered;
-  imd::detail::WorkspaceLayout layout;
-  TensorCopy A, B, C;  // for M2's scatter vectors and M3's aliasing check
+  imd::detail::ExecPlan exec;  // exec.vec_host: pinned, owned (freed by the destructor)
+  TensorCopy A, B, C;          // for M3's aliasing check (§5 row 6)
+
+  imd_plan_st(const imd_options_t& o, const imd::detail::Lowered& lw, const imd_tensor_t& a,
+              const imd_tensor_t& b, const imd_tensor_t& c)
+      : options(o), lowered(lw), A(a), B(b), C(c) {}
+  imd_plan_st(const imd_plan_st&) = delete;
+  imd_plan_st& operator=(const imd_plan_st&) = delete;
+  ~imd_plan_st() {
+    if (exec.vec_host != nullptr) cudaFreeHost(const_cast<int64_t*>(exec.vec_host));
+  }
 };
 
 namespace {
@@ -66,6 +78,9 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
     return st;
 
   const Lowered& lw = out->lowered;
+  // §5 row 5, GemmCoord part: EMULATE mode with a non-empty output only (DESIGN v1.1).
+  if (out->options.mode == IMD_EMULATE && !lw.empty_output() && !imd::detail::gemm_dims_ok(lw))
+    return IMD_STATUS_INVALID_VALUE;
   const auto layout = imd::detail::workspace_layout({lw.m, lw.n, lw.k, lw.b,
                                                      out->options.num_moduli,
                                                      out->options.residue_group,
@@ -76,12 +91,63 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
   return IMD_STATUS_SUCCESS;
 }
 
-// Multi-limb (little-endian u32) comparison x >= y.
-bool limbs_ge(uint64_t x, const uint32_t (&y)[c::kMaxLimbs]) {
-  for (int i = c::kMaxLimbs - 1; i >= 2; --i)
-    if (y[i] != 0) return false;
-  const uint64_t y64 = (uint64_t{y[1]} << 32) | y[0];
-  return x >= y64;
+// Little-endian multi-word unsigned integers for the plan-time constants of §3.2.
+using Big = std::array<uint32_t, 8>;  // 256 bits
+
+Big big_from_limbs(const uint32_t (&x)[c::kMaxLimbs]) {
+  Big r{};
+  for (int i = 0; i < c::kMaxLimbs; ++i) r[i] = x[i];
+  return r;
+}
+Big big_from_u64(uint64_t x) {
+  Big r{};
+  r[0] = static_cast<uint32_t>(x);
+  r[1] = static_cast<uint32_t>(x >> 32);
+  return r;
+}
+bool big_ge(const Big& x, const Big& y) {
+  for (int i = 7; i >= 0; --i)
+    if (x[i] != y[i]) return x[i] > y[i];
+  return true;
+}
+Big big_sub(const Big& x, const Big& y) {  // requires x >= y
+  Big r{};
+  uint64_t borrow = 0;
+  for (int i = 0; i < 8; ++i) {
+    const uint64_t t = uint64_t{x[i]} - y[i] - borrow;
+    r[i] = static_cast<uint32_t>(t);
+    borrow = (t >> 32) & 1;
+  }
+  return r;
+}
+Big big_mul(const Big& x, const Big& y) {  // requires x y < 2^256
+  Big r{};
+  for (int i = 0; i < 8; ++i) {
+    uint64_t carry = 0;
+    for (int j = 0; i + j < 8; ++j) {
+      const uint64_t t = uint64_t{r[i + j]} + uint64_t{x[i]} * y[j] + carry;
+      r[i + j] = static_cast<uint32_t>(t);
+      carry = t >> 32;
+    }
+  }
+  return r;
+}
+Big big_shl(const Big& x, int s) {  // requires 0 <= s < 256 and no overflow
+  Big r{};
+  const int ws = s / 32, bs = s % 32;
+  for (int i = 7; i >= 0; --i) {
+    const int src = i - ws;
+    uint64_t v = 0;
+    if (src >= 0) v = uint64_t{x[src]} << bs;
+    if (src >= 1 && bs != 0) v |= x[src - 1] >> (32 - bs);
+    r[i] = static_cast<uint32_t>(v);
+  }
+  return r;
+}
+int big_bitlen(const Big& x) {
+  for (int i = 7; i >= 0; --i)
+    if (x[i] != 0) return 32 * i + 32 - __builtin_clz(x[i]);
+  return 0;
 }
 
 // kappa = ceil(sqrt(k)) exactly, k >= 1 (DESIGN §3.2).
@@ -105,7 +171,7 @@ imd_status_t imd_create(imd_handle_t* handle) {
   int device = 0;
   if (cudaGetDevice(&device) != cudaSuccess) return IMD_STATUS_CUDA_ERROR;
   auto* h = new (std::nothrow) imd_handle_st{device};
-  if (h == nullptr) return IMD_STATUS_CUDA_ERROR;  // no allocation status (NOTES-M0)
+  if (h == nullptr) return IMD_STATUS_ALLOC_FAILED;
   *handle = h;
   return IMD_STATUS_SUCCESS;
 }
@@ -126,7 +192,7 @@ imd_status_t imd_workspace_size(const imd_tensor_t* A, const imd_tensor_t* B,
     *bytes = static_cast<size_t>(an.layout.total);
     return IMD_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
-    return IMD_STATUS_CUDA_ERROR;
+    return IMD_STATUS_ALLOC_FAILED;
   } catch (...) {
     return IMD_STATUS_INVALID_VALUE;
   }
@@ -141,17 +207,54 @@ imd_status_t imd_plan_create(imd_handle_t handle, const imd_tensor_t* A, const i
     if (const imd_status_t st = analyze(A, B, C, options, &an); st != IMD_STATUS_SUCCESS)
       return st;
     const Lowered& lw = an.lowered;
+    const int N = an.options.num_moduli;
+    const bool rn = an.options.rounding == IMD_RN;
     // §3.2 RN acceptance (accuracy policy): reject kappa >= T when the emulated GEMM runs.
     const bool emulated = !lw.empty_output() && an.options.mode == IMD_EMULATE && lw.k > 1;
-    if (emulated && an.options.rounding == IMD_RN &&
-        limbs_ge(ceil_sqrt(static_cast<uint64_t>(lw.k)), c::kTables.T[an.options.num_moduli]))
-      return IMD_STATUS_NOT_SUPPORTED;
-    // TODO(M2): canonical orders, fusion, pinned scatter vectors, K-chunk / launch split.
-    *plan = new imd_plan_st{an.options, an.lowered, an.layout, TensorCopy(*A), TensorCopy(*B),
-                            TensorCopy(*C)};
+    const Big T = big_from_limbs(c::kTables.T[N]);
+    const Big kappa = big_from_u64(ceil_sqrt(static_cast<uint64_t>(lw.k)));
+    if (emulated && rn && big_ge(kappa, T)) return IMD_STATUS_NOT_SUPPORTED;
+
+    auto p = std::make_unique<imd_plan_st>(an.options, lw, *A, *B, *C);
+    imd::detail::ExecPlan& e = p->exec;
+    e.swapped = lw.swapped;
+    e.m = lw.m, e.n = lw.n, e.k = lw.k, e.b = lw.b;
+    e.k_hat = (lw.k + c::kKAlign - 1) / c::kKAlign * c::kKAlign;
+    e.n_hat = (lw.n + c::kNAlign - 1) / c::kNAlign * c::kNAlign;
+    e.N = N;
+    e.g = an.options.residue_group;
+    e.trunc = !rn;
+    e.layout = an.layout;
+    e.path = lw.empty_output()                                    ? imd::detail::Path::kNoop
+             : (an.options.mode == IMD_DIRECT || lw.k == 1) ? imd::detail::Path::kDirect
+                                                            : imd::detail::Path::kGemm;
+    if (emulated) {
+      // §3.2 step 4 right-hand side R 2^F: RN R = (2T - kappa)^2 (kappa < T here), TRUNC
+      // R = T^2. T < 2^78, so the base is < 2^80, R < 2^160 and R 2^F < 2^220.
+      const Big base = rn ? big_sub(big_shl(T, 1), kappa) : T;
+      const Big rhs = big_shl(big_mul(base, base), c::kF);
+      for (int w = 0; w < 4; ++w)
+        e.rhs[w] = uint64_t{rhs[2 * w]} | (uint64_t{rhs[2 * w + 1]} << 32);
+      e.rhs_bits = big_bitlen(rhs);
+      e.lhs_shift = rn ? 2 : 0;
+    }
+    if (e.path != imd::detail::Path::kNoop) {
+      // §5 step 10: scatter vectors in pinned host memory (K0 copies them asynchronously).
+      e.vec_count = imd::detail::scatter_vector_count(lw);
+      void* host = nullptr;
+      const cudaError_t err =
+          cudaMallocHost(&host, static_cast<size_t>(e.vec_count) * sizeof(int64_t));
+      if (err != cudaSuccess) {
+        cudaGetLastError();  // clear the (non-sticky) error state
+        return err == cudaErrorMemoryAllocation ? IMD_STATUS_ALLOC_FAILED : IMD_STATUS_CUDA_ERROR;
+      }
+      e.vec_host = static_cast<const int64_t*>(host);
+      imd::detail::build_scatter_vectors(lw, static_cast<int64_t*>(host));
+    }
+    *plan = p.release();
     return IMD_STATUS_SUCCESS;
   } catch (const std::bad_alloc&) {
-    return IMD_STATUS_CUDA_ERROR;
+    return IMD_STATUS_ALLOC_FAILED;
   } catch (...) {
     return IMD_STATUS_INVALID_VALUE;
   }
@@ -165,25 +268,30 @@ imd_status_t imd_plan_destroy(imd_plan_t plan) {
 imd_status_t imd_contract(imd_plan_t plan, double alpha, const double* A, const double* B,
                           double beta, double* C, void* ws, size_t ws_bytes,
                           cudaStream_t stream) {
-  (void)beta;
-  (void)stream;
+  // DESIGN §6 order: null pointers; empty output; ALIASING; MISALIGNED; workspace size.
   if (plan == nullptr) return IMD_STATUS_INVALID_VALUE;
-  const Lowered& lw = plan->lowered;
-  if (lw.empty_output()) return IMD_STATUS_SUCCESS;  // empty C: no-op, nothing touched
-
-  // §3.7: A and B are not read when alpha = 0 or k = 0.
-  const bool reads_ab = alpha != 0.0 && lw.k != 0;
-  const uint64_t need = plan->layout.total;
-  if (C == nullptr || (reads_ab && (A == nullptr || B == nullptr)) ||
-      (need > 0 && ws == nullptr))
+  const imd::detail::ExecPlan& e = plan->exec;
+  // §3.7: A and B are not read when alpha = 0 or k = 0; C is always required.
+  const bool reads_ab = alpha != 0.0 && e.k != 0;
+  const uint64_t need = e.layout.total;
+  if (C == nullptr || (reads_ab && (A == nullptr || B == nullptr)) || (need > 0 && ws == nullptr))
     return IMD_STATUS_INVALID_VALUE;
-  // TODO(M3): §5 row 6, ALIASING (C vs A/B byte intervals, workspace vs A/B/C).
+  if (e.path == imd::detail::Path::kNoop) return IMD_STATUS_SUCCESS;  // nothing touched
+  // TODO(M3): §5 row 6, ALIASING (C vs A/B byte intervals; workspace [ws, ws + need) vs
+  // A, B and C). Not checked yet: the pointers are only required to be non-null.
   // §5 row 7: FP64 tensors 8-byte aligned, workspace 256-byte aligned.
   if (!aligned(C, 8) || (reads_ab && (!aligned(A, 8) || !aligned(B, 8))) ||
       (need > 0 && !aligned(ws, c::kRegionAlign)))
     return IMD_STATUS_MISALIGNED;
   if (ws_bytes < need) return IMD_STATUS_INSUFFICIENT_WORKSPACE;
-  return IMD_STATUS_NOT_SUPPORTED;  // TODO(M1): K0-K5 kernels
+  // §5 step 8 role swap: the GEMM computes C^T = B^T A^T.
+  const double* gA = e.swapped ? B : A;
+  const double* gB = e.swapped ? A : B;
+  try {
+    return imd::detail::enqueue_contract(e, alpha, gA, gB, beta, C, ws, stream);
+  } catch (...) {
+    return IMD_STATUS_CUDA_ERROR;
+  }
 }
 
 const char* imd_status_string(imd_status_t status) {
@@ -195,6 +303,7 @@ const char* imd_status_string(imd_status_t status) {
     case IMD_STATUS_INSUFFICIENT_WORKSPACE: return "IMD_STATUS_INSUFFICIENT_WORKSPACE";
     case IMD_STATUS_MISALIGNED: return "IMD_STATUS_MISALIGNED";
     case IMD_STATUS_CUDA_ERROR: return "IMD_STATUS_CUDA_ERROR";
+    case IMD_STATUS_ALLOC_FAILED: return "IMD_STATUS_ALLOC_FAILED";
   }
   return "IMD_STATUS_<unknown>";
 }

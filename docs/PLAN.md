@@ -68,7 +68,7 @@ Spec follow-ups, to do before or alongside M2/M3 (see `spec/README.md`):
 **Exit:** builds clean; `imd_workspace_size` matches `params.workspace_size` on a grid of
 shapes; CI-able test target runs under `run_quiet.sh`.
 
-## M1 — Matrix Ozaki-II on the GPU (canonical layouts only)
+## M1 — Ozaki-II on the GPU ✅ (done 2026-10-03)
 
 Kernels:
 - K1 scale: shifts plus non-finite detection.
@@ -150,7 +150,14 @@ available on sm_89.
 - Internal tiling within a workspace budget.
 - Packed-operand reuse API.
 - Complex via the 2M method (the specs are already parametric in the moduli table).
-- Adaptive / bounded-auto N.
+- **Adaptive precision.** Wanted by Eric (2026-10-02); evaluate after M4. Options:
+  - an **Ozaki-I slice mode**. Slices form a prefix, so one packed operand serves any
+    precision, which suits reuse across precision levels. The same TBLIS pipeline works:
+    the pack emits slices instead of residues, the epilogue accumulates scaled FP64 instead
+    of reducing mod p, and there is no CRT;
+  - **Ozaki-II with per-call N**. Changing N changes the scaling, so operands must be
+    re-packed;
+  - a data-driven **auto / bounded-auto N** policy on top of either.
 - Accurate-mode scaling.
 - Python package (nanobind).
 - Hopper/Blackwell back ends.

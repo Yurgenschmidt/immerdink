@@ -1,8 +1,11 @@
 /* The public header is valid C (C11) and the C ABI links and runs from C:
  * imd_workspace_size on the DESIGN §4a worked example (17 x 33 x 5, b = 3, N = 9, g = 2),
- * the plan's RN acceptance rule, and the contract skeleton's argument checks (no kernels
- * yet: M1). */
+ * the plan's RN acceptance rule, the contract's argument checks in DESIGN §6 order, and one
+ * contraction on device buffers. */
 #include <stdio.h>
+#include <string.h>
+
+#include <cuda_runtime_api.h>
 
 #include "immerdink/immerdink.h"
 
@@ -56,9 +59,23 @@ int main(void) {
   expect("contract null C", imd_contract(plan, 1.0, NULL, NULL, 0.0, NULL, NULL, 0, 0),
          IMD_STATUS_INVALID_VALUE);
   {
-    /* Host buffers stand in for device pointers: the argument checks never dereference. */
-    static double a[17 * 5 * 3], b[5 * 33 * 3], c[17 * 33 * 3];
-    static _Alignas(256) unsigned char ws[30720 + 256];
+    /* Device buffers: a full contraction runs (bit-exactness is tests/test_contract.py). */
+    double *a = NULL, *b = NULL, *c = NULL;
+    unsigned char* ws = NULL;
+    if (cudaMalloc((void**)&a, sizeof(double) * 17 * 5 * 3) != cudaSuccess ||
+        cudaMalloc((void**)&b, sizeof(double) * 5 * 33 * 3) != cudaSuccess ||
+        cudaMalloc((void**)&c, sizeof(double) * 17 * 33 * 3) != cudaSuccess ||
+        cudaMalloc((void**)&ws, 30720 + 256) != cudaSuccess) {
+      fprintf(stderr, "FAIL cudaMalloc\n");
+      return 1;
+    }
+    cudaMemset(a, 0, sizeof(double) * 17 * 5 * 3);
+    cudaMemset(b, 0, sizeof(double) * 5 * 33 * 3);
+    cudaMemset(c, 0, sizeof(double) * 17 * 33 * 3);
+    expect("contract null A", imd_contract(plan, 1.0, NULL, b, 0.0, c, ws, 30720, 0),
+           IMD_STATUS_INVALID_VALUE);
+    expect("contract null ws", imd_contract(plan, 1.0, a, b, 0.0, c, NULL, 30720, 0),
+           IMD_STATUS_INVALID_VALUE);
     expect("contract misaligned C",
            imd_contract(plan, 1.0, a, b, 0.0, (double*)((char*)c + 4), ws, 30720, 0),
            IMD_STATUS_MISALIGNED);
@@ -67,9 +84,16 @@ int main(void) {
     expect("contract small ws", imd_contract(plan, 1.0, a, b, 0.0, c, ws, 30719, 0),
            IMD_STATUS_INSUFFICIENT_WORKSPACE);
     expect("contract alpha=0 does not need A/B",
-           imd_contract(plan, 0.0, NULL, NULL, 0.0, c, ws, 30720, 0), IMD_STATUS_NOT_SUPPORTED);
-    expect("contract (kernels are M1)", imd_contract(plan, 1.0, a, b, 0.0, c, ws, 30720, 0),
-           IMD_STATUS_NOT_SUPPORTED);
+           imd_contract(plan, 0.0, NULL, NULL, 0.0, c, ws, 30720, 0), IMD_STATUS_SUCCESS);
+    expect("contract", imd_contract(plan, 1.0, a, b, 0.5, c, ws, 30720, 0), IMD_STATUS_SUCCESS);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+      fprintf(stderr, "FAIL contract kernels\n");
+      ++failures;
+    }
+    cudaFree(a);
+    cudaFree(b);
+    cudaFree(c);
+    cudaFree(ws);
   }
   expect("plan_destroy", imd_plan_destroy(plan), IMD_STATUS_SUCCESS);
 
@@ -77,6 +101,28 @@ int main(void) {
   expect("RN kappa = T - 1", plan_n2(h, 179 * 179, IMD_RN), IMD_STATUS_SUCCESS);
   expect("RN kappa = T", plan_n2(h, 179 * 179 + 1, IMD_RN), IMD_STATUS_NOT_SUPPORTED);
   expect("TRUNC kappa = T", plan_n2(h, 179 * 179 + 1, IMD_TRUNC), IMD_STATUS_SUCCESS);
+
+  {
+    /* Empty output (m = 0): SUCCESS with nothing touched, but C must still be non-null. */
+    const int64_t e0[2] = {0, 5}, s0[2] = {5, 1}, ec0[2] = {0, 33}, sc0[2] = {33, 1};
+    const int32_t l0[2] = {1, 3}, lc0[2] = {1, 2};
+    const imd_tensor_t A0 = {2, e0, s0, l0}, C0 = {2, ec0, sc0, lc0};
+    const int64_t eb0[2] = {5, 33}, sb0[2] = {33, 1};
+    const int32_t lb0[2] = {3, 2};
+    const imd_tensor_t B0 = {2, eb0, sb0, lb0};
+    imd_plan_t p0 = NULL;
+    double dummy = 0.0;
+    expect("plan empty", imd_plan_create(h, &A0, &B0, &C0, &opt, &p0), IMD_STATUS_SUCCESS);
+    expect("contract empty, null C", imd_contract(p0, 1.0, &dummy, &dummy, 0.0, NULL, NULL, 0, 0),
+           IMD_STATUS_INVALID_VALUE);
+    expect("contract empty", imd_contract(p0, 1.0, &dummy, &dummy, 0.0, &dummy, NULL, 0, 0),
+           IMD_STATUS_SUCCESS);
+    imd_plan_destroy(p0);
+  }
+  if (strcmp(imd_status_string(IMD_STATUS_ALLOC_FAILED), "IMD_STATUS_ALLOC_FAILED") != 0) {
+    fprintf(stderr, "FAIL status string\n");
+    ++failures;
+  }
 
   expect("destroy", imd_destroy(h), IMD_STATUS_SUCCESS);
   printf("%s\n", failures == 0 ? "PASS" : "FAIL");

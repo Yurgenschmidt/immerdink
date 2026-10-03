@@ -5,6 +5,7 @@
 # machine. With QUIET_GATE=1 (what tools/run_bench.sh sets) the command takes the
 # machine-wide lock and waits (up to QUIET_WAIT seconds, default 900) for
 # tools/quiet_check.sh to report QUIET; exit 3 if it never does.
+# The command runs inside the shared immerdink memory budget (tools/memcap.sh).
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 [ $# -ge 1 ] || { echo "usage: $0 command [args...]" >&2; exit 2; }
@@ -23,4 +24,4 @@ if [ "${QUIET_GATE:-0}" = 1 ]; then
   done
   "$here/quiet_check.sh" > "${QUIET_LOG:-/dev/null}" 2>&1 || true   # record conditions
 fi
-"$@"
+"$here/memcap.sh" "$@"

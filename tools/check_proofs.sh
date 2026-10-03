@@ -10,6 +10,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Lean/Mathlib elaboration is memory-hungry: run inside the shared budget.
+grep -q "/immerdink.slice/" /proc/self/cgroup 2>/dev/null || exec "$ROOT/tools/memcap.sh" "$ROOT/tools/check_proofs.sh" "$@"
 PROOFS="$ROOT/proofs"
 LAKE="${LAKE:-$(command -v lake || echo "$HOME/.elan/bin/lake")}"
 
