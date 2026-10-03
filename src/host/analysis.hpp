@@ -36,7 +36,7 @@ inline bool emulates(const ExecPlan& e) { return e.path == Path::kGemm && e.k >=
 // v1.4 (DESIGN §4 "KF"): the fused scale-and-pack launch is used iff the emulated GEMM runs
 // and one pack tile row covers all of k_hat (k_hat <= kFusedKHatMax: a block owns whole
 // rows). A pure function of the lowering: deterministic at plan time.
-constexpr int64_t kFusedKHatMax = 512;
+constexpr int64_t kFusedKHatMax = 1024;  // 512 until A3 (DESIGN v1.5)
 inline bool fused_path(const ExecPlan& e) { return emulates(e) && e.k_hat <= kFusedKHatMax; }
 
 // Kernel launches of one imd_contract with alpha != 0 (DESIGN §4, §6a kernel_launches):

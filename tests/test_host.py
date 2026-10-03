@@ -165,10 +165,10 @@ def spec_expect(descs, N, g, rnd, mode, vec):
         exp.update(num_groups=len(groups), k_chunks=chunks,
                    gemm_launches=sum(chunks * -(-len(grp) * b // 65535) * nparts
                                      for grp in groups))
-    # v1.4 (DESIGN §4, §6a): the fused launch KF iff EMULATE and k_hat <= 512; kernel
+    # v1.4 (DESIGN §4, §6a): the fused launch KF iff EMULATE and k_hat <= 1024; kernel
     # launches per call with alpha != 0.
     k0 = 0 if vec == "RESIDENT" else 1
-    fused = dispatch == "EMULATE" and k_hat <= 512
+    fused = dispatch == "EMULATE" and k_hat <= 1024   # 512 until v1.5 (A3)
     if dispatch == "NOOP":
         launches = 0
     elif dispatch != "EMULATE":

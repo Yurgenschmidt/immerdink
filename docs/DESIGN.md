@@ -296,7 +296,7 @@ K5 crt      per (λ,ī,j̄): flagged ? native dot (reads A, B) : exact CRT; unsc
 If `α = 0` or `k = 0`, only K0 and K5 (β-only) run.
 
 **[v1.4] Fused path KF (plan-time choice).** When the emulated GEMM runs and
-`k̂ ≤ 512` (`fused`; a pure function of the lowering, reported by `imd_lowering`, §6a), one
+`k̂ ≤ 1024` (**[v1.5]**; 512 in v1.4) (`fused`; a pure function of the lowering, reported by `imd_lowering`, §6a), one
 launch **KF** replaces K0, K1 and group 1's K2/K3; then group 1's K4 launches, groups 2.. as
 above (K2, K3, K4, reading the σ/τ and vectors KF stored), and K5:
 ```
@@ -319,11 +319,15 @@ Rules **[spec: Pipeline Fused, MParts; pos_fused_*, neg_fused_*]**:
   after the previous group's GEMMs retire, as before (`neg_fused_all_groups`).
 - Exactly the §4a workspace and the same bits in every region (σ, flags, vec, RA, RB, W) as
   the unfused sequence; `α = 0` / `k = 0` calls run K0 + the β kernel as before.
-- Why k̂ ≤ 512: a tile of 4096 (or, for small operands, 1024) FP64 holds `th` whole rows
-  (tk = pow2 ≥ k̂, `th·tk` = the tile), so a block owns its rows; their per-row K1
-  reductions are warp shuffles plus, for rows spread over 2–4 warps, a shared-memory
+- Why k̂ ≤ 1024: a tile of 4096 (or, for small operands, 1024) FP64 holds `th` whole rows
+  (tk = pow2 ≥ k̂, `th·tk` = the tile; th ≥ 1), so a block owns its rows; their per-row K1
+  reductions are warp shuffles plus, for rows spread over 2–8 warps, a shared-memory
   combine. The point is fewer, fuller launches for small problems (docs/NOTES-A1.md): K1 and
-  the packs no longer read the operands separately and K0's launch disappears.
+  the packs no longer read the operands separately and K0's launch disappears. **[v1.5]**
+  1024 instead of 512 (A3, docs/NOTES-A3.md: sq1024-class shapes): tk = 1024 is the largest
+  row a 4096-value tile holds 4 of, with KF's per-row offsets (8 KB) inside the 48 KB of
+  static shared memory. The threshold is a launch-shape property only: Pipeline's `Fused`
+  model has no k̂ in it (a KF CTA owns whole rows for any k̂), so the spec is unchanged.
 
 **[v1.4] Moduli parts.** A pack launch (K2/K3 and KF) with fewer tiles than about two per
 SM splits the group's slots over `gridDim.y` block rows: part y of a row writes the slots
@@ -855,7 +859,7 @@ Semantics:
   status is NOT_SUPPORTED (κ ≥ T), so a caller sees why. `plan_device_bytes` and
   `plan_host_bytes` are valid only on SUCCESS. With `lowered = 0` every field except
   `struct_size`, `status` and `lowered` is 0.
-  - **[v1.4] Version 2** appends `fused` (1 iff EMULATE with k̂ ≤ 512: the §4 KF launch) and
+  - **[v1.4] Version 2** appends `fused` (1 iff EMULATE with k̂ ≤ 1024 (512 before v1.5): the §4 KF launch) and
     `kernel_launches`, the kernel launches of one `imd_contract` with α ≠ 0: NOOP 0; DIRECT
     and SCALE `v + 1`; EMULATE `(fused ? 1 : v + 2) + (⌈N/g⌉ − fused)·(2 + [n̂ > n]) +
     gemm_launches + 1`, with `v` = 1 for `IMD_VEC_GENERATE` (K0), 0 for resident vectors (a
@@ -1031,3 +1035,6 @@ tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH).
 - **§6a.** `IMD_HOST_API_VERSION` 3: `imd_lowering_t` grows to 168 bytes with `sm_count`
   (input and output), `k4_config` and `k4_tune_bytes` (appended; version-1/2 callers
   unaffected). libimmerdink_host stays the one implementation of the choice.
+- **§4 KF for k̂ ≤ 1024** (was 512): plans with 512 < k̂ ≤ 1024 take the fused launch
+  (`fused` = 1, `kernel_launches` accordingly). Same outputs and workspace; Pipeline's
+  `Fused` is k̂-independent, so no spec change.

@@ -89,7 +89,7 @@ int main(void) {
   CHECK(lw.k_chunks == 1 && lw.gemm_launches == 5);
   CHECK(lw.vec_entries == 119 && lw.workspace_bytes == 30720);
   CHECK(lw.plan_device_bytes == 0 && lw.plan_host_bytes == host);
-  /* v2: k_hat = 16 <= 512: the fused launch KF; then groups 2..5 with two packs and the B
+  /* v2: k_hat = 16 <= 1024: the fused launch KF; then groups 2..5 with two packs and the B
    * padding rows (n_hat > n) each, 5 K4 launches and K5: 1 + 4 * 3 + 5 + 1 = 19. */
   CHECK(lw.fused == 1 && lw.reserved == 0 && lw.kernel_launches == 19);
 
@@ -166,7 +166,7 @@ int main(void) {
     CHECK(imd_lowering(&a, &b, &c, &rn, &lw) == IMD_STATUS_NOT_SUPPORTED);
     CHECK(lw.status == IMD_STATUS_NOT_SUPPORTED && lw.lowered == 1 && lw.kappa == 180);
     CHECK(lw.workspace_bytes == bytes && lw.plan_host_bytes == 0);
-    /* k_hat > 512: unfused, K0 + 2 K1 + 2 packs + 1 K4 + K5 (n_hat = n: no zero rows). */
+    /* k_hat > 1024: unfused, K0 + 2 K1 + 2 packs + 1 K4 + K5 (n_hat = n: no zero rows). */
     CHECK(lw.fused == 0 && lw.kernel_launches == 7);
     /* v3 fields are valid with lowered = 1, as k_chunks: 259200 + 1036800 + 128, aligned. */
     CHECK(lw.k4_tune_bytes == 259328 + 1036800 + 256 && lw.sm_count == 128);

@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 
 #include "device/constants.cuh"
+#include "host/analysis.hpp"  // kFusedKHatMax
 #include "kernels/numerics.cuh"
 #include "plan.hpp"
 #include "profile.hpp"
@@ -769,11 +770,12 @@ T* region(void* ws, const ExecPlan& p, Region r) {
 
 // ---- KF: K0 + K1 + group 1's K2 / K3 in one launch (DESIGN v1.4 §4) ----------------------
 //
-// Chosen at plan time when k_hat <= 512 (analysis.hpp fused_path). A block of 256 threads
-// takes a tile of th rows by tk = pow2 >= k_hat columns (tk >= 16), th tk = 256 E: whole rows.
-// Each thread converts E consecutive k-bar of one row (E = 16, or E = 4 for small operands
-// with tk <= 128: 4x the blocks and a 4x shorter chain per thread), so a row's tk / E <= 32
-// threads are consecutive lanes of one warp. A block (tile t, part y):
+// Chosen at plan time when k_hat <= kKfKMax = 1024 (analysis.hpp fused_path; 512 until A3).
+// A block of 256 threads takes a tile of th rows by tk = pow2 >= k_hat columns (tk >= 16),
+// th tk = 256 E: whole rows. Each thread converts E consecutive k-bar of one row (E = 16, or
+// E = 4 for small operands: 4x the blocks and a 4x shorter chain per thread); a row's tk / E
+// threads are consecutive lanes, of one warp or (tk / E > 32) of consecutive warps, whose
+// partial results are combined in shared memory. A block (tile t, part y):
 //   1. row bases v_bat[lambda] + v_row[r] and v_k[h] computed from the descriptor (kernel
 //      argument), never read from the vec region (which this launch writes);
 //   2. the tile read into shared memory as in k23_pack (coalesced along the pivot);
@@ -787,6 +789,9 @@ T* region(void* ws, const ExecPlan& p, Region r) {
 // vec region, grid-strided: the later packs and K5 read them after this launch retires.
 // Every part recomputes sigma from the tile (identical integers), so no block reads another
 // block's output (spec: Pipeline neg_fused_shared_sigma, neg_fused_reads_vec).
+
+constexpr int kKfKMax = 1024;  // the largest tk: one row of a 4096-value tile per 4 rows
+static_assert(kKfKMax == kFusedKHatMax, "KF tiles must hold whole rows of every fused plan");
 
 template <int Cap>
 struct FusedArgs {
@@ -813,11 +818,12 @@ template <int Cap, int E>
 __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant__ FusedArgs<Cap> a) {
   constexpr int kLgE = E == 16 ? 4 : 2, kTE = kThreads * E, kLgTE = 8 + kLgE;
   constexpr int kRowsMax = kTE / 16;  // th for tk = 16
+  // 47.5 KB of static shared memory with E = 16 (the 48 KB limit): the output row offsets are
+  // recomputed per thread in step 5 instead of being kept per row here.
   __shared__ uint64_t tile[kTE + kTE / kVec + kRowsMax];
   __shared__ int64_t s_base[kRowsMax];
-  __shared__ int64_t s_out[kRowsMax];
   __shared__ bool s_valid[kRowsMax];
-  __shared__ int64_t s_vk[kTileKMax];
+  __shared__ int64_t s_vk[kKfKMax];
   __shared__ int s_wg[kThreads / 32];
   __shared__ unsigned s_wf[kThreads / 32];
   __shared__ u128 s_ws[kThreads / 32];
@@ -842,7 +848,6 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
         int64_t lam, r;
         divmod(rho, rows, &lam, &r);
         s_base[tid] = k0_offset(a.d, 3, x, lam) + k0_offset(a.d, x, x, r);
-        s_out[tid] = (lam * a.rows_pad[x] + r) * a.k_hat;
       }
     }
     for (int hl = tid; hl < tk; hl += kThreads) s_vk[hl] = hl < a.k ? k0_offset(a.d, 2, x, hl) : 0;
@@ -873,7 +878,7 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
       else if (finite_nonzero(bits[e])) gmax = max(gmax, ilogb_bits(bits[e]));
     }
     // Reduce over the row's lanes: within the warp (Gw = min(G, 32) lanes), then, for rows
-    // wider than a warp (G = 64, 128: E = 4 with tk = 256, 512), over the row's warps in
+    // wider than a warp (G = 64 .. 256: E = 4 with tk >= 256, E = 16 with tk = 1024), over the row's warps in
     // shared memory, combined by every thread in the same order (max, or, exact u128 sum).
     const int Gw = G < 32 ? G : 32, warp = tid / 32, lane = tid & 31;
     for (int o = Gw / 2; o > 0; o /= 2) {
@@ -917,7 +922,9 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
       PackEmitterT<E> em;
       em.load(bits, sigma, a.trunc != 0);
       const int64_t plane = a.b * a.rows_pad[x] * a.k_hat;
-      int8_t* dst = a.R[x] + s_out[dl] + hl;
+      int64_t lam, r;
+      divmod(lo + radix * (d0 + dl), rows, &lam, &r);
+      int8_t* dst = a.R[x] + (lam * a.rows_pad[x] + r) * a.k_hat + hl;
       for (int s = s_lo; s < s_hi; ++s) em.store(s, dst + s * plane);  // group 1: modulus = slot
     }
     __syncthreads();  // shared arrays are reused by the next tile
@@ -952,7 +959,7 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   a.R[0] = region<int8_t>(ws, p, Region::RA), a.R[1] = region<int8_t>(ws, p, Region::RB);
   a.b = p.b, a.k = p.k, a.k_hat = p.k_hat;
   int lg_tk = 4;
-  while ((int64_t{1} << lg_tk) < p.k_hat) ++lg_tk;  // k_hat <= 512: lg_tk <= 9
+  while ((int64_t{1} << lg_tk) < p.k_hat) ++lg_tk;  // k_hat <= kKfKMax: lg_tk <= 10
   a.lg_tk = lg_tk;
   a.gsize = std::min(p.g, p.N);
   a.trunc = p.trunc ? 1 : 0;
