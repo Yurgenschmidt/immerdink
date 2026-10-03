@@ -1,7 +1,10 @@
 #include "analysis.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 #include "checked.hpp"
 #include "immerdink/detail/constants.hpp"
@@ -106,6 +109,112 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
   return IMD_STATUS_SUCCESS;
 }
 
+imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
+                            const imd_options_t* options, const PackSource* const src[2],
+                            Analysis* out) {
+  if (const imd_status_t st = analyze(A, B, C, options, out); st != IMD_STATUS_SUCCESS) return st;
+  out->packed = PackedSlots{};
+  if (src[0] == nullptr && src[1] == nullptr) return IMD_STATUS_SUCCESS;
+  Lowered& lw = out->lowered;
+  PackedSlots& ps = out->packed;
+  const imd_tensor_t* X[2] = {A, B};
+  int role[2] = {0, 1};
+  for (int x = 0; x < 2; ++x) {
+    role[x] = (x == 0) != lw.swapped ? 0 : 1;  // post-swap role of the caller's operand x
+    if (src[x] != nullptr) {
+      ps.caller |= 1 << x;
+      ps.role |= 1 << role[x];
+    }
+  }
+  // §6b.6: the workspace without sX, fX, RX of the packed roles (no overflow: the in-line
+  // layout of the same shape fitted).
+  const auto layout = workspace_layout({lw.m, lw.n, lw.k, lw.b, out->options.num_moduli,
+                                        out->options.residue_group,
+                                        out->options.mode == IMD_DIRECT,
+                                        out->options.vec_mode == IMD_VEC_RESIDENT, ps.role});
+  if (!layout) return IMD_STATUS_INVALID_VALUE;
+  out->layout = *layout;
+  const auto mismatch = [&](int32_t reason) {
+    ps.mismatch = reason;
+    return IMD_STATUS_PACK_MISMATCH;
+  };
+  constexpr int kI = static_cast<int>(LabelClass::I), kJ = static_cast<int>(LabelClass::J),
+                kK = static_cast<int>(LabelClass::K), kL = static_cast<int>(LabelClass::L);
+  // Per packed operand (the caller's A, then B): format, N, rounding, then the classes,
+  // mapped onto the plan's labels by mode position in X.
+  std::vector<int32_t> adopted[2][3];  // per caller operand: K, L, rows (plan labels)
+  for (int x = 0; x < 2; ++x) {
+    if (src[x] == nullptr) continue;
+    const PackLowered& pl = *src[x]->pl;
+    if (pl.key.empty() || pl.key[0] != kPackFormat) return mismatch(IMD_PACK_MISMATCH_FORMAT);
+    if (pl.N != out->options.num_moduli) return mismatch(IMD_PACK_MISMATCH_MODULI);
+    if (pl.rounding != out->options.rounding) return mismatch(IMD_PACK_MISMATCH_ROUNDING);
+    const imd_tensor_t& T = *X[x];
+    if (src[x]->rank != T.rank) return mismatch(IMD_PACK_MISMATCH_CLASSES);
+    // pack label -> plan label, a bijection consistent at every position
+    std::vector<std::pair<int32_t, int32_t>> map;
+    for (int32_t p = 0; p < T.rank; ++p) {
+      const int32_t lp = src[x]->label[p], lx = T.label[p];
+      bool seen = false;
+      for (const auto& [a, b] : map) {
+        if ((a == lp) != (b == lx)) return mismatch(IMD_PACK_MISMATCH_CLASSES);
+        seen = seen || a == lp;
+      }
+      if (!seen) map.emplace_back(lp, lx);
+    }
+    const auto to_plan = [&](int32_t lp) {
+      for (const auto& [a, b] : map)
+        if (a == lp) return b;
+      return lp;  // unreachable: the pack's labels are X's
+    };
+    // a K label X does not carry (partner-only, §5 step 6): not supported (§6b.10 #10)
+    for (const int32_t lab : lw.order[kK])
+      if (find_label(lw, lab)->count[role[x]] == 0) return mismatch(IMD_PACK_MISMATCH_CLASSES);
+    const int plan_cls[3] = {kK, kL, role[x] == 0 ? kI : kJ};
+    for (int cl = 0; cl < 3; ++cl) {
+      for (const int32_t lp : pl.order[cl]) adopted[x][cl].push_back(to_plan(lp));
+      std::vector<int32_t> a = adopted[x][cl], b = lw.order[plan_cls[cl]];
+      std::sort(a.begin(), a.end());
+      std::sort(b.begin(), b.end());
+      if (a != b) return mismatch(IMD_PACK_MISMATCH_CLASSES);
+    }
+  }
+  if (src[0] != nullptr && src[1] != nullptr &&
+      (adopted[0][kPackK] != adopted[1][kPackK] || adopted[0][kPackL] != adopted[1][kPackL]))
+    return mismatch(IMD_PACK_MISMATCH_ORDER);
+  // Adopt the packs' orders (§6b.2); fusion is redone in them.
+  for (int x = 0; x < 2; ++x) {
+    if (src[x] == nullptr) continue;
+    adopt_order(&lw, kK, adopted[x][kPackK]);
+    adopt_order(&lw, kL, adopted[x][kPackL]);
+    adopt_order(&lw, role[x] == 0 ? kI : kJ, adopted[x][kPackR]);
+  }
+  // The slot keys, from the adopted lowering restricted to X (X's merged strides alone).
+  for (int x = 0; x < 2; ++x) {
+    if (src[x] == nullptr) continue;
+    std::vector<PackMode> f[3];
+    const int plan_cls[3] = {kK, kL, role[x] == 0 ? kI : kJ};
+    for (int cl = 0; cl < 3; ++cl)
+      for (const int32_t lab : lw.order[plan_cls[cl]]) {
+        const LabelInfo& li = *find_label(lw, lab);
+        pack_fuse_append(f[cl], li.extent, li.stride[role[x]]);
+      }
+    const int64_t rows = role[x] == 0 ? lw.m : lw.n;
+    ps.key[x] = pack_key(out->options.num_moduli, out->options.rounding, lw.b, rows, lw.k,
+                         f[kPackL], f[kPackR], f[kPackK]);
+    if (const int32_t r = key_mismatch(ps.key[x], src[x]->pl->key); r != 0) {
+      ps.key[0].clear(), ps.key[1].clear();
+      return mismatch(r);
+    }
+    ps.layout[role[x]] = src[x]->pl->layout;  // equal keys: the plan's (b, r, k, N) layout
+  }
+  return IMD_STATUS_SUCCESS;
+}
+
+bool kappa_at_least_T(uint64_t kappa, int N) {
+  return big_ge(big_from_u64(kappa), big_from_limbs(c::kTables.T[N]));
+}
+
 uint64_t ceil_sqrt_u64(uint64_t k) {
   uint64_t r = 0;
   for (int bit = 31; bit >= 0; --bit) {  // floor(sqrt(k)) < 2^32 for k < 2^64
@@ -114,6 +223,23 @@ uint64_t ceil_sqrt_u64(uint64_t k) {
   }
   return r * r == k ? r : r + 1;
 }
+
+namespace {
+
+// §3.2 step 4 right-hand side R 2^F: RN R = (2T - kappa)^2 (kappa < T), TRUNC R = T^2.
+// T < 2^78, so the base is < 2^80, R < 2^160 and R 2^F < 2^220.
+void set_shift_constants(int N, bool rn, uint64_t k, ExecPlan* e) {
+  const Big T = big_from_limbs(c::kTables.T[N]);
+  const Big kappa = big_from_u64(ceil_sqrt_u64(k));
+  const Big base = rn ? big_sub(big_shl(T, 1), kappa) : T;
+  const Big rhs = big_shl(big_mul(base, base), c::kF);
+  for (int w = 0; w < 4; ++w)
+    e->rhs[w] = uint64_t{rhs[2 * w]} | (uint64_t{rhs[2 * w + 1]} << 32);
+  e->rhs_bits = big_bitlen(rhs);
+  e->lhs_shift = rn ? 2 : 0;
+}
+
+}  // namespace
 
 imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
   const Lowered& lw = an.lowered;
@@ -132,21 +258,20 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
   e.path = lw.empty_output()                                ? Path::kNoop
            : (an.options.mode == IMD_DIRECT || lw.k == 1) ? Path::kDirect
                                                           : Path::kGemm;
+  // v1.7 (§6b): the packed post-swap operands and where their regions are in the packs.
+  e.packed = an.packed.role;
+  for (int x = 0; x < 2; ++x) {
+    if (!(e.packed & (1 << x))) continue;
+    for (int r = 0; r < 3; ++r) e.pack_off[x][r] = an.packed.layout[x].offset[r];
+    e.pack_bytes[x] = an.packed.layout[x].total;
+  }
   // §3.2 RN acceptance (accuracy policy): reject kappa >= T when the emulated GEMM runs.
   const bool emulated = emulates(e);  // non-empty output, EMULATE, k >= 2
-  const Big T = big_from_limbs(c::kTables.T[N]);
-  const Big kappa = big_from_u64(ceil_sqrt_u64(static_cast<uint64_t>(lw.k)));
-  if (emulated && rn && big_ge(kappa, T)) return IMD_STATUS_NOT_SUPPORTED;
+  if (emulated && rn && kappa_at_least_T(ceil_sqrt_u64(static_cast<uint64_t>(lw.k)), N))
+    return IMD_STATUS_NOT_SUPPORTED;
 
   if (emulated) {
-    // §3.2 step 4 right-hand side R 2^F: RN R = (2T - kappa)^2 (kappa < T here), TRUNC
-    // R = T^2. T < 2^78, so the base is < 2^80, R < 2^160 and R 2^F < 2^220.
-    const Big base = rn ? big_sub(big_shl(T, 1), kappa) : T;
-    const Big rhs = big_shl(big_mul(base, base), c::kF);
-    for (int w = 0; w < 4; ++w)
-      e.rhs[w] = uint64_t{rhs[2 * w]} | (uint64_t{rhs[2 * w + 1]} << 32);
-    e.rhs_bits = big_bitlen(rhs);
-    e.lhs_shift = rn ? 2 : 0;
+    set_shift_constants(N, rn, static_cast<uint64_t>(lw.k), &e);
     for (int x = 0; x < 2; ++x) {
       const PackPivot pv = pack_pivot(lw, x);
       e.pack_along_rows[x] = pv.along_rows;
@@ -182,12 +307,15 @@ int64_t plan_launches(const ExecPlan& e, bool fused, int32_t fused_large, bool r
   if (!emulates(e)) return k0 + 1;  // DIRECT, K-empty or k = 0: K0 + one kernel
   const int64_t groups = (e.N + e.g - 1) / e.g;
   const int64_t zero_rows = e.n_hat > e.n ? 1 : 0;
-  const int64_t per_group = 2 + zero_rows;
-  const int64_t head = fused ? 1 : k0 + 2;  // KF, or K0 + one scale launch per operand
+  // Per in-line operand (v1.7: a packed one has none): its pack per group (B: + zero rows).
+  const int64_t pack_a = (e.packed & 1) ? 0 : 1, pack_b = (e.packed & 2) ? 0 : 1 + zero_rows;
+  const int64_t per_group = pack_a + pack_b;
+  // KF, or K0 + one scale launch per in-line operand
+  const int64_t head = fused ? 1 : k0 + ((e.packed & 1) ? 0 : 1) + ((e.packed & 2) ? 0 : 1);
   // Group 1: no pack after KF; after K1 / KL, the packs of the operands not done by KL.
   const int64_t group1 = fused ? 0
-                               : ((fused_large & kFusedLargeA) ? 0 : 1) +
-                                     ((fused_large & kFusedLargeB) ? 0 : 1 + zero_rows);
+                               : ((fused_large & kFusedLargeA) ? 0 : pack_a) +
+                                     ((fused_large & kFusedLargeB) ? 0 : pack_b);
   const int64_t packs = (groups - 1) * per_group + group1;
   if (k4_launches > INT64_MAX - head - packs - 1) return INT64_MAX;  // saturate like k4_counts
   return head + packs + k4_launches + 1;
@@ -218,7 +346,43 @@ uint64_t plan_host_bytes(const imd_tensor_t& A, const imd_tensor_t& B, const imd
     bytes += kK4PlanBytes + kK4StoreEntryBytes * static_cast<uint64_t>(kc.store_shapes) +
              kK4AddEntryBytes * static_cast<uint64_t>(kc.add_shapes);
   }
+  // v1.7: the copied slot keys of the packed operands (§6b.6)
+  bytes += sizeof(int64_t) * (an.packed.key[0].size() + an.packed.key[1].size());
   return bytes;
+}
+
+void pack_exec(const PackLowered& pl, ExecPlan* out) {
+  ExecPlan& e = *out;
+  e = ExecPlan{};
+  e.path = Path::kGemm;
+  e.m = pl.r, e.n = 0, e.k = pl.k, e.b = pl.b;
+  e.k_hat = pl.k_hat;
+  e.N = pl.N;
+  e.g = pl.N;  // all N planes at once: the format is g-free (§6b.4)
+  e.trunc = pl.rounding == IMD_TRUNC;
+  if (pl.k >= 2) set_shift_constants(pl.N, pl.rounding == IMD_RN, static_cast<uint64_t>(pl.k), &e);
+  // X as the GEMM's A of a one-operand view: I = the pack's R, K, L (X's strides in slot A).
+  Lowered lw;
+  lw.m = pl.r, lw.k = pl.k, lw.b = pl.b;
+  constexpr int cls[3] = {static_cast<int>(LabelClass::K), static_cast<int>(LabelClass::L),
+                          static_cast<int>(LabelClass::I)};  // kPackK, kPackL, kPackR
+  for (int cl = 0; cl < 3; ++cl)
+    for (const PackMode& pm : pl.fused[cl]) {
+      FusedMode f;
+      f.extent = pm.extent;
+      f.stride[0] = pm.stride;
+      lw.fused[cls[cl]].push_back(f);
+    }
+  const PackPivot pv = pack_pivot(lw, 0);
+  e.pack_along_rows[0] = pv.along_rows;
+  e.pack_radix[0] = pv.radix;
+  for (int g = 0; g < 4; ++g) {
+    e.vec_desc.first[g] = static_cast<int32_t>(e.vec_desc.modes.size());
+    e.vec_desc.count[g] = static_cast<int32_t>(lw.fused[g].size());
+    for (const FusedMode& f : lw.fused[g])
+      e.vec_desc.modes.push_back({f.extent, {f.stride[0], f.stride[1], f.stride[2]}});
+  }
+  e.vec_count = pl.r + pl.k + pl.b;
 }
 
 }  // namespace imd::detail

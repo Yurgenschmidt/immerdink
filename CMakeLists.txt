@@ -81,7 +81,7 @@ target_include_directories(imd_constants INTERFACE "${PROJECT_SOURCE_DIR}/includ
 # (IMD_HOST_INTERNAL, src/host/export.hpp) are exported for libimmerdink and the tests only.
 add_library(immerdink_host SHARED
   src/host/index_map.cpp src/host/workspace.cpp src/host/analysis.cpp src/host/k4_config.cpp
-  src/host/host_api.cpp)
+  src/host/pack.cpp src/host/host_api.cpp)
 target_include_directories(immerdink_host PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 target_link_libraries(immerdink_host PRIVATE imd_constants imd_warnings)

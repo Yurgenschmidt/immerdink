@@ -11,15 +11,26 @@
 #include "index_map.hpp"
 #include "k4_config.hpp"
 #include "k4_launches.hpp"
+#include "pack.hpp"
 #include "plan_data.hpp"
 #include "workspace.hpp"
 
 namespace imd::detail {
 
+// v1.7 (DESIGN §6b): the packed slots of a plan (analyze_packed).
+struct PackedSlots {
+  int32_t caller = 0;    // bit x: the caller's operand x (0 = A, 1 = B) is packed
+  int32_t role = 0;      // bit x: the post-swap operand x is packed
+  int32_t mismatch = 0;  // IMD_PACK_MISMATCH_* of a PACK_MISMATCH status
+  std::vector<int64_t> key[2];  // slot keys per caller operand (SUCCESS; empty: in-line)
+  PackLayout layout[2];         // per post-swap role: the pack's layout (SUCCESS)
+};
+
 struct Analysis {
   imd_options_t options{};  // residue_group normalized to [1, N]
   Lowered lowered;
   WorkspaceLayout layout;
+  PackedSlots packed;       // v1.7: none unless analyze_packed found packs
 };
 
 // imd_workspace_size's status: null arguments and options (INVALID_VALUE), the §5 legality
@@ -29,23 +40,45 @@ IMD_HOST_INTERNAL imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t
                                        const imd_tensor_t* C, const imd_options_t* options,
                                        Analysis* out);
 
+// v1.7 (DESIGN §6b.5): imd_workspace_size's checks (analyze), then, for each caller operand
+// with a pack (src[x] non-null), the plan-time compatibility check: PACK_MISMATCH (reason in
+// out->packed.mismatch) if the pack's N or rounding differ from the options, if its labels
+// do not map onto X's by mode position, if the plan's K, L or X-row classes differ from the
+// pack's (a K label only in the partner included), or (both packed) if the two packs' K or L
+// orders differ; then the plan ADOPTS the packs' orders of K, L and each packed operand's
+// row class (adopt_order: fusion redone) and each slot key, computed from the adopted
+// lowering restricted to X, must equal the pack's key (EXTENTS / STRIDES). The workspace
+// layout omits sX, fX, RX of every packed post-swap role (also when the status is
+// PACK_MISMATCH). With no pack it is analyze. Never the §3.2 kappa rule.
+IMD_HOST_INTERNAL imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B,
+                                              const imd_tensor_t* C,
+                                              const imd_options_t* options,
+                                              const PackSource* const src[2], Analysis* out);
+
+// kappa >= T(N) (§3.2 RN acceptance), exactly.
+IMD_HOST_INTERNAL bool kappa_at_least_T(uint64_t kappa, int N);
+
 // The emulated GEMM runs (K1-K4: RN acceptance, K4 parameters): path kGemm with k >= 2.
 // kGemm with k = 0 is the beta-only path (§3.7: K0 and one scale kernel).
 inline bool emulates(const ExecPlan& e) { return e.path == Path::kGemm && e.k >= 2; }
 
 // v1.4 (DESIGN §4 "KF"): the fused scale-and-pack launch is used iff the emulated GEMM runs
 // and one pack tile row covers all of k_hat (k_hat <= kFusedKHatMax: a block owns whole
-// rows). A pure function of the lowering: deterministic at plan time.
+// rows). A pure function of the lowering: deterministic at plan time. v1.7 (§6b.5): KF
+// scales and packs the in-line operands only, so a plan with both operands packed has none.
 constexpr int64_t kFusedKHatMax = 1024;  // 512 until A3 (DESIGN v1.5)
-inline bool fused_path(const ExecPlan& e) { return emulates(e) && e.k_hat <= kFusedKHatMax; }
+inline bool fused_path(const ExecPlan& e) {
+  return emulates(e) && e.k_hat <= kFusedKHatMax && e.packed != 3;
+}
 
 // v1.6 (DESIGN §4 "KL"): the operands scaled and packed (group 1) by the fused large launch
-// KL, as a bit mask (bit 0: the GEMM's A, bit 1: its B, post-swap): every operand of a plan
-// with the emulated GEMM that does not take KF. A pure function of the lowering.
+// KL, as a bit mask (bit 0: the GEMM's A, bit 1: its B, post-swap): every in-line (v1.7: not
+// packed) operand of a plan with the emulated GEMM that does not take KF. A pure function of
+// the lowering.
 constexpr int32_t kFusedLargeA = 1, kFusedLargeB = 2;
 inline int32_t fused_large(const ExecPlan& e) {
   if (!emulates(e) || fused_path(e)) return 0;
-  return kFusedLargeA | kFusedLargeB;
+  return (kFusedLargeA | kFusedLargeB) & ~e.packed;
 }
 
 // Kernel launches of one imd_contract with alpha != 0 (DESIGN §4, §6a kernel_launches):
@@ -53,6 +86,7 @@ inline int32_t fused_large(const ExecPlan& e) {
 // scale launch per operand (K1 of it, or v1.6 KL), then per residue group two packs (+ one
 // launch zeroing the B rows n..n_hat-1 if n_hat > n), except group 1's packs of KF (both
 // operands) or of the KL operands (KL_B zeroes those rows itself), the K4 launches, and K5.
+// v1.7: a packed operand (e.packed) has no scale and no pack launch.
 // `fused`, `fused_large` and `resident` are the plan's choices (fused_path, fused_large,
 // vec_mode = IMD_VEC_RESIDENT); `k4_launches` is plan_k4_counts.
 IMD_HOST_INTERNAL int64_t plan_launches(const ExecPlan& e, bool fused, int32_t fused_large,
@@ -72,6 +106,14 @@ IMD_HOST_INTERNAL imd_status_t plan_data(const Analysis& an, ExecPlan* e);
 
 // The K4 launch counts of a plan (EMULATE path; zeros otherwise) under `lim`.
 IMD_HOST_INTERNAL K4Counts plan_k4_counts(const ExecPlan& e, const LaunchLimits& lim);
+
+// v1.7 (DESIGN §6b, imd_pack): the launch data of packing one operand, as an ExecPlan of
+// one GEMM operand (post-swap A, rows m = r, g = N: every plane is "group 1"): path kGemm,
+// m = r, n = 0, k, b, k_hat, N, the §3.2 step 4 constants of (N, k, rounding), the pack
+// pivot of X (pack_pivot over X's R and L modes), and the fused-mode descriptor of X's
+// classes R (as I), K and L with X's strides in slot A; vec_count = r + k + b (the rows, k
+// and batch vectors only). Requires a SUCCESS pack_lower. Its device bytes are 0.
+IMD_HOST_INTERNAL void pack_exec(const PackLowered& pl, ExecPlan* e);
 
 // The plan's host payload (DESIGN §6a "plan host bytes"), for a plan built from these
 // descriptors and this analysis and plan data, with the production K4 limits:

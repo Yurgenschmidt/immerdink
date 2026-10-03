@@ -14,6 +14,27 @@ namespace {
 constexpr int kA = 0, kB = 1, kC = 2;
 constexpr int64_t kInt32Max = std::numeric_limits<int32_t>::max();
 
+// §5 step 9 for one label appended to a group's fused modes (canonical order): merge into the
+// last mode iff s_X(new) = s_X(last) e(last) for every tensor X (stride-0 carriers included;
+// a tensor that does not carry the group has stride 0 on both, where the test holds).
+void fuse_append(std::vector<FusedMode>& f, const LabelInfo& li) {
+  bool merge = !f.empty();
+  for (int x = 0; merge && x < 3; ++x) {
+    int64_t next = 0;
+    merge = mul_i64(f.back().stride[x], f.back().extent, &next) && next == li.stride[x];
+  }
+  if (merge) {
+    f.back().extent *= li.extent;  // a factor of the group size: no overflow
+  } else {
+    FusedMode fm;
+    fm.extent = li.extent;
+    for (int x = 0; x < 3; ++x) fm.stride[x] = li.stride[x];
+    f.push_back(fm);
+  }
+}
+
+}  // namespace
+
 bool descriptor_ok(const imd_tensor_t& t) {
   if (t.rank < 0) return false;
   if (t.rank == 0) return true;
@@ -23,11 +44,13 @@ bool descriptor_ok(const imd_tensor_t& t) {
   return true;
 }
 
-bool is_empty(const imd_tensor_t& t) {
+bool tensor_empty(const imd_tensor_t& t) {
   for (int32_t d = 0; d < t.rank; ++d)
     if (t.extent[d] == 0) return true;
   return false;
 }
+
+namespace {
 
 // §5 row 4, for a non-empty tensor: over the modes with extent > 1 sorted by |stride|
 // (ties in mode order), |s_(t)| > sum_{u<t} |s_(u)| (e_(u) - 1). spec/IndexMap.tla
@@ -50,9 +73,11 @@ bool sorted_stride_rule(const imd_tensor_t& t) {
   return true;
 }
 
+}  // namespace
+
 // §5 row 5: the element span sum_d |s_d| (e_d - 1) of a non-empty tensor fits int64.
 bool span_fits(const imd_tensor_t& t) {
-  if (is_empty(t)) return true;
+  if (tensor_empty(t)) return true;
   int64_t span = 0;
   for (int32_t d = 0; d < t.rank; ++d) {
     if (t.extent[d] <= 1) continue;
@@ -64,8 +89,6 @@ bool span_fits(const imd_tensor_t& t) {
   }
   return true;
 }
-
-}  // namespace
 
 imd_status_t lower(const imd_tensor_t& A, const imd_tensor_t& B, const imd_tensor_t& C,
                    Lowered* out) {
@@ -108,7 +131,7 @@ imd_status_t lower(const imd_tensor_t& A, const imd_tensor_t& B, const imd_tenso
       return IMD_STATUS_NOT_SUPPORTED;
 
   // Row 4: the sorted-|stride| rule on a non-empty C (sufficient for injective writes).
-  const bool c_empty = is_empty(C);
+  const bool c_empty = tensor_empty(C);
   if (!c_empty && !sorted_stride_rule(C)) return IMD_STATUS_INVALID_VALUE;
 
   // Row 5 (part): spans and merged diagonal strides fit int64.
@@ -206,26 +229,25 @@ imd_status_t lower(const imd_tensor_t& A, const imd_tensor_t& B, const imd_tenso
     // where the condition holds trivially, so checking all three tensors is the rule.
     for (const LabelInfo* li : grp) {
       r.order[g].push_back(li->label);
-      std::vector<FusedMode>& f = r.fused[g];
-      bool merge = !f.empty();
-      for (int x = 0; merge && x < 3; ++x) {
-        int64_t next = 0;
-        merge = mul_i64(f.back().stride[x], f.back().extent, &next) && next == li->stride[x];
-      }
-      if (merge) {
-        f.back().extent *= li->extent;  // a factor of the group size: no overflow
-      } else {
-        FusedMode fm;
-        fm.extent = li->extent;
-        for (int x = 0; x < 3; ++x) fm.stride[x] = li->stride[x];
-        f.push_back(fm);
-      }
+      fuse_append(r.fused[g], *li);
     }
   }
 
   r.labels = std::move(labels);
   *out = std::move(r);
   return IMD_STATUS_SUCCESS;
+}
+
+const LabelInfo* find_label(const Lowered& lw, int32_t label) {
+  for (const LabelInfo& li : lw.labels)
+    if (li.label == label) return &li;
+  return nullptr;
+}
+
+void adopt_order(Lowered* lw, int g, const std::vector<int32_t>& order) {
+  lw->order[g] = order;
+  lw->fused[g].clear();
+  for (const int32_t lab : order) fuse_append(lw->fused[g], *find_label(*lw, lab));
 }
 
 bool gemm_dims_ok(const Lowered& lw) { return lw.m <= kInt32Max && lw.n <= kInt32Max - 15; }

@@ -64,6 +64,21 @@ struct Lowered {
 IMD_HOST_INTERNAL imd_status_t lower(const imd_tensor_t& A, const imd_tensor_t& B,
                                      const imd_tensor_t& C, Lowered* out);
 
+// Descriptor sanity (rank >= 0, arrays non-null for rank > 0, extents >= 0), emptiness (a zero
+// extent) and §5 row 5's span rule (sum_d |s_d| (e_d - 1) of a non-empty tensor fits int64);
+// shared with the pack descriptor checks (pack.cpp).
+bool descriptor_ok(const imd_tensor_t& t);
+bool tensor_empty(const imd_tensor_t& t);
+bool span_fits(const imd_tensor_t& t);
+
+// The LabelInfo of a label (nullptr if absent).
+IMD_HOST_INTERNAL const LabelInfo* find_label(const Lowered& lw, int32_t label);
+
+// DESIGN v1.7 §6b.2: replace group g's canonical order by `order` (a permutation of
+// lw->order[g]: the order a plan adopts from a pack) and redo step 9's fusion in it. Any
+// order within a class is a valid GEMM view (spec IndexMap, adopted orders).
+IMD_HOST_INTERNAL void adopt_order(Lowered* lw, int g, const std::vector<int32_t>& order);
+
 // §5 row 5, GemmCoord part: m <= 2^31-1 and n_hat <= 2^31-1. DESIGN applies it in EMULATE
 // mode with a non-empty output and k >= 2 only (when the emulated GEMM runs).
 IMD_HOST_INTERNAL bool gemm_dims_ok(const Lowered& lw);

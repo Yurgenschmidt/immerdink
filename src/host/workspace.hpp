@@ -18,6 +18,8 @@ struct WorkspaceShape {
   int residue_group = 0;               // g in [1, N] (0 already replaced by N)
   bool direct = false;                 // mode = DIRECT
   bool vec_resident = false;           // vec_mode = IMD_VEC_RESIDENT (v1.2): no vec region
+  int32_t packed = 0;                  // v1.7 (§6b.6): bit 0 / 1 = the post-swap A / B is read
+                                       // from a packed operand: no sX, fX, RX region
 };
 
 struct WorkspaceLayout {

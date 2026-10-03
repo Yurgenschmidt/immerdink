@@ -1190,8 +1190,8 @@ def pack_desc_for(A: Desc, B: Desc, C: Desc, mode, operand, N, rounding="RN") ->
     role, rowcls = _roles(v, operand)
     xl = list(dict.fromkeys(X.label))
     K = [l for l in v.order["K"] if l in xl]
-    L = list(v.order["L"])
-    R = list(v.order[rowcls])
+    L = [l for l in v.order["L"] if l in xl]
+    R = [l for l in v.order[rowcls] if l in xl]    # (an extent-0 C-only label is in I, §5 7)
     for l in xl:
         if l in K or l in L or l in R:
             continue
@@ -1199,7 +1199,7 @@ def pack_desc_for(A: Desc, B: Desc, C: Desc, mode, operand, N, rounding="RN") ->
     return PackDesc(X, N, rounding, ORDER_GIVEN, K, L, R)
 
 
-def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN"):
+def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN", build_vec=True):
     """imd_plan_create_packed's plan-time checks after §5 rows 1-5 (lower) and before the
     §3.2 RN acceptance (§6b.5): per packed caller operand (A, then B) the pack descriptor's
     own status (pack_lower), then PACK_MISMATCH reasons MODULI, ROUNDING, CLASSES (the
@@ -1244,7 +1244,7 @@ def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN"):
         if o is not None:
             for c, lst in o.items():
                 orders.setdefault(c, lst)
-    v = lower(A, B, C, mode, orders=orders)
+    v = lower(A, B, C, mode, build_vec=build_vec, orders=orders)
     keys = [None, None]
     for x in (0, 1):
         if pvs[x] is None:
