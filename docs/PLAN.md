@@ -178,6 +178,12 @@ available on sm_89.
 ## Later (designed-for, not scheduled)
 
 - Internal tiling within a workspace budget.
+- **Shape-dependent kernel selection.** Use cases vary widely in m:n:k (skinny, low-k,
+  long-k, tiny batched) and in plan count (dozens of live plans or one hot plan; Eric,
+  2026-10-03). M4 kept one K4 tile config because the alternatives were slower on the
+  swept shapes; keep K4's tile/stage/swizzle choice a per-plan decision behind one
+  selection function, so a small shape-keyed table (or autotuning at plan time) can slot
+  in later. Every per-plan resource choice stays an option with an exact footprint query.
 - Packed-operand reuse API.
 - Complex via the 2M method (the specs are already parametric in the moduli table).
 - **Adaptive precision.** Wanted by Eric (2026-10-02); evaluate after M4. Options:
