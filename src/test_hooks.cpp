@@ -8,6 +8,19 @@
 //       keeps every accumulator within the §3.5 bound); the others in [1, 65535].
 //       Returns 0, or 1 (nothing changed) for an invalid argument.
 //
+//   imd_test_set_fused(mode)
+//       mode -1: plans created afterwards take the v1.4 fused path KF when the plan-time
+//       rule (analysis.hpp fused_path) says so (production); 0: never (K0, K1 and the packs
+//       of group 1 run as separate launches). Results must not change. Returns 0, or 1 for
+//       another mode.
+//
+//   imd_test_set_k5_one_elem(per_sm)
+//       K5 (j-bar fastest) takes one element per thread while b m n <= per_sm x SMs, else
+//       4 per thread with warp-transposed stores. per_sm -1 restores the production value;
+//       0 always uses 4 per thread and also disables KF's 4-values-per-thread variant (no
+//       small-problem launch variant anywhere). Applies to later imd_contract calls; results
+//       must not change. Returns 0, or 1 for a negative value other than -1.
+//
 //   imd_test_plan_vec(plan, dev, count)
 //       The plan's resident scatter vectors (IMD_VEC_RESIDENT, DESIGN v1.2): *dev = their
 //       device address (NULL for a generate plan), *count = their int64 entries (the vec
@@ -27,12 +40,15 @@
 //       it allocated (0 for a generate plan); the K4 parameter sets (store, add) and the
 //       K4 launches of one call; and its host payload, counted from the live containers:
 //       sizeof(imd_plan_st) + descriptor copies + lowering tables + K0 descriptor + K4Plan
-//       with its map entries. Returns 0, or 1 for a null argument; *count as above.
+//       with its map entries; then (v1.4) whether it takes the fused path and its kernel
+//       launches per imd_contract with alpha != 0. Returns 0, or 1 for a null argument;
+//       *count as above.
 #include <cstdint>
 #include <vector>
 
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink.h"
+#include "host/analysis.hpp"
 #include "host/index_map.hpp"
 #include "plan.hpp"
 
@@ -47,6 +63,19 @@ IMD_API int imd_test_set_limits(int64_t k_chunk, int64_t max_batch, int64_t max_
   if (max_batch < 1 || max_batch > def.max_batch) return 1;
   if (max_n_tiles < 1 || max_n_tiles > def.max_n_tiles) return 1;
   imd::detail::launch_limits() = {k_chunk, max_batch, max_n_tiles};
+  return 0;
+}
+
+IMD_API int imd_test_set_fused(int mode) {
+  if (mode != -1 && mode != 0) return 1;
+  imd::detail::fused_override() = mode;
+  return 0;
+}
+
+IMD_API int imd_test_set_k5_one_elem(int64_t per_sm) {
+  if (per_sm < -1) return 1;
+  static const int64_t production = imd::detail::k5_one_elem_per_sm();
+  imd::detail::k5_one_elem_per_sm() = per_sm == -1 ? production : per_sm;
   return 0;
 }
 
@@ -118,6 +147,8 @@ IMD_API int imd_test_plan_sizes(imd_plan_t plan, int64_t* out, int64_t cap, int6
   host += e.vec_desc.modes.size() * sizeof(imd::detail::VecMode);
   host += k4.bytes;
   v.push_back(static_cast<int64_t>(host));
+  v.push_back(e.fused ? 1 : 0);
+  v.push_back(imd::detail::plan_launches(e, e.fused, e.vec_resident, k4.launches));
   *count = static_cast<int64_t>(v.size());
   if (out != nullptr && *count <= cap)
     for (size_t i = 0; i < v.size(); ++i) out[i] = v[i];

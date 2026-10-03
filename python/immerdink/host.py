@@ -29,7 +29,7 @@ from dataclasses import dataclass
 __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "workspace_size",
            "workspace_layout", "plan_bytes", "lowering", "g_tradeoff", "REGIONS", "STATUS"]
 
-API_VERSION = 1  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+API_VERSION = 2  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
 
 STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT_WORKSPACE",
           "MISALIGNED", "CUDA_ERROR", "ALLOC_FAILED"]
@@ -73,10 +73,11 @@ class _Lowering(C.Structure):
                 ("n_hat", C.c_int64), ("k_hat", C.c_int64), ("vec_entries", C.c_int64),
                 ("k_chunks", C.c_int64), ("gemm_launches", C.c_int64),
                 ("kappa", C.c_uint64), ("workspace_bytes", C.c_uint64),
-                ("plan_device_bytes", C.c_uint64), ("plan_host_bytes", C.c_uint64)]
+                ("plan_device_bytes", C.c_uint64), ("plan_host_bytes", C.c_uint64),
+                ("fused", C.c_int32), ("reserved", C.c_int32), ("kernel_launches", C.c_int64)]
 
 
-assert C.sizeof(_Lowering) == 136
+assert C.sizeof(_Lowering) == 152  # version 2 (DESIGN §6a v1.4)
 
 
 # ------------------------------------------------------------------------------------------
@@ -291,6 +292,9 @@ class Lowering:
     workspace_bytes: int
     plan_device_bytes: int
     plan_host_bytes: int
+    fused: bool            # v2: the fused launch KF (K0 + K1 + group 1's packs)
+    reserved: int
+    kernel_launches: int   # v2: kernel launches of one imd_contract with alpha != 0
 
 
 def lowering(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",
@@ -302,7 +306,7 @@ def lowering(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="E
     r.struct_size = C.sizeof(_Lowering)
     st = h.lib.imd_lowering(*call.args(), C.byref(r))
     vals = {f: getattr(r, f) for f, _ in _Lowering._fields_ if f != "struct_size"}
-    vals.update(status=STATUS[st], lowered=bool(r.lowered), swapped=bool(r.swapped),
+    vals.update(status=STATUS[st], lowered=bool(r.lowered), swapped=bool(r.swapped), fused=bool(r.fused),
                 dispatch=DISPATCH[r.dispatch])
     return Lowering(**vals)
 

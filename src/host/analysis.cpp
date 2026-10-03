@@ -152,6 +152,7 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
       e.pack_radix[x] = pv.radix;
     }
     e.k5_batch_fast = k5_batch_fastest(lw);
+    e.fused = fused_path(e);
   }
   if (e.path != Path::kNoop) {
     // §5 step 10 (v1.2): the fused-mode descriptor K0 generates the vectors from.
@@ -170,6 +171,18 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
       e.device_bytes = static_cast<uint64_t>(e.vec_count) * sizeof(int64_t);
   }
   return IMD_STATUS_SUCCESS;
+}
+
+int64_t plan_launches(const ExecPlan& e, bool fused, bool resident, int64_t k4_launches) {
+  if (e.path == Path::kNoop) return 0;
+  const int64_t k0 = resident ? 0 : 1;
+  if (!emulates(e)) return k0 + 1;  // DIRECT, K-empty or k = 0: K0 + one kernel
+  const int64_t groups = (e.N + e.g - 1) / e.g;
+  const int64_t per_group = 2 + (e.n_hat > e.n ? 1 : 0);
+  const int64_t head = fused ? 1 : k0 + 2;
+  const int64_t packs = (fused ? groups - 1 : groups) * per_group;
+  if (k4_launches > INT64_MAX - head - packs - 1) return INT64_MAX;  // saturate like k4_counts
+  return head + packs + k4_launches + 1;
 }
 
 K4Counts plan_k4_counts(const ExecPlan& e, const LaunchLimits& lim) {

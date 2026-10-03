@@ -1,4 +1,4 @@
-# immerdink — design (v1.3)
+# immerdink — design (v1.4)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -13,7 +13,9 @@ v1.1 folds in the corrections found by the spec phase: adversarial review plus m
 testing of every artifact. v1.2 changes execution details after M4 (K0 generated on the
 device or plan-resident, GEMM parameters built at plan creation; a K1 split was specified
 and measured but not adopted) and the §6 thread and lifetime rules that follow from them; changed text is marked **[v1.2]**. v1.3 adds
-§6a, the CUDA-free host query API (no semantic change). The change lists are at the end.
+§6a, the CUDA-free host query API (no semantic change). v1.4 adds the fused small-k launch KF
+(§4, chosen at plan time; same results, same workspace) and reports the launch structure in
+the host API (§6a); changed text is marked **[v1.4]**. The change lists are at the end.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -288,6 +290,43 @@ for each residue group G (g moduli; ⌈N/g⌉ groups):
 K5 crt      per (λ,ī,j̄): flagged ? native dot (reads A, B) : exact CRT; unscale; α/β; scatter
 ```
 If `α = 0` or `k = 0`, only K0 and K5 (β-only) run.
+
+**[v1.4] Fused path KF (plan-time choice).** When the emulated GEMM runs and
+`k̂ ≤ 512` (`fused`; a pure function of the lowering, reported by `imd_lowering`, §6a), one
+launch **KF** replaces K0, K1 and group 1's K2/K3; then group 1's K4 launches, groups 2.. as
+above (K2, K3, K4, reading the σ/τ and vectors KF stored), and K5:
+```
+KF          per pack tile (th rows × all of k̂, one tile row = one whole operand row) and
+            moduli part y: offsets from the fused-mode descriptor (kernel argument, as K0);
+            the tile into shared memory; per row the §3.1/§3.2 integers of K1 (flag, γ, S, σ:
+            the same exact integers, reduced across the row's lanes); part 0 stores σ/τ and
+            the flags; residues of part y's slots of group 1 (as K2/K3); then part-0 blocks
+            zero RB rows n..n̂−1 of group 1 and, with IMD_VEC_GENERATE, write the vec region
+```
+Rules **[spec: Pipeline Fused, MParts; pos_fused_*, neg_fused_*]**:
+- KF reads **nothing another block of KF writes**: its row and k̂ offsets are computed from
+  the descriptor, never read from the vec region its own vec blocks write
+  (`neg_fused_reads_vec`), and every moduli part computes σ itself from its tile instead of
+  reading part 0's stored σ (`neg_fused_shared_sigma`).
+- KF still produces every output of the kernels it replaces, for the later kernels: σ/τ and
+  the flags (`neg_fused_no_sigma`: group 2's packs and K5 read junk) and the vec region
+  (`neg_fused_no_vec`).
+- KF packs **group 1 only**: the RA/RB slots are reused per group, so later groups are packed
+  after the previous group's GEMMs retire, as before (`neg_fused_all_groups`).
+- Exactly the §4a workspace and the same bits in every region (σ, flags, vec, RA, RB, W) as
+  the unfused sequence; `α = 0` / `k = 0` calls run K0 + the β kernel as before.
+- Why k̂ ≤ 512: a tile of 4096 (or, for small operands, 1024) FP64 holds `th` whole rows
+  (tk = pow2 ≥ k̂, `th·tk` = the tile), so a block owns its rows; their per-row K1
+  reductions are warp shuffles plus, for rows spread over 2–4 warps, a shared-memory
+  combine. The point is fewer, fuller launches for small problems (docs/NOTES-A1.md): K1 and
+  the packs no longer read the operands separately and K0's launch disappears.
+
+**[v1.4] Moduli parts.** A pack launch (K2/K3 and KF) with fewer tiles than about two per
+SM splits the group's slots over `gridDim.y` block rows: part y of a row writes the slots
+`[y·|G|/ny, (y+1)·|G|/ny)` and re-reads its tile. Disjoint outputs, same values
+**[spec: Pipeline MParts, pos_pack_parts]**. K5 takes one or four j̄ per thread (a launch
+choice; with four, a warp's results are transposed through shared memory so C stores are
+coalesced). Neither changes any result.
 
 **K0 and the scatter vectors [v1.2].** The plan option `vec_mode` chooses where the
 vectors live; both modes give bitwise identical results.
@@ -685,11 +724,13 @@ imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
                           const imd_tensor_t* C, const imd_options_t*, imd_lowering_t* out);
 const char*  imd_status_string(imd_status_t);
 
-typedef struct {               /* 136 bytes in version 1; fields are only appended */
+typedef struct {               /* 136 bytes in version 1, 152 in version 2 [v1.4] */
   uint32_t struct_size;        /* in: sizeof(imd_lowering_t) as the caller compiled it  */
   int32_t  status, lowered, dispatch, swapped, num_moduli, residue_group, num_groups;
   int64_t  m, n, k, b, n_hat, k_hat, vec_entries, k_chunks, gemm_launches;
   uint64_t kappa, workspace_bytes, plan_device_bytes, plan_host_bytes;
+  int32_t  fused, reserved;    /* version 2 [v1.4] */
+  int64_t  kernel_launches;    /* version 2 [v1.4] */
 } imd_lowering_t;
 enum { IMD_DISPATCH_NOOP, IMD_DISPATCH_EMULATE, IMD_DISPATCH_DIRECT, IMD_DISPATCH_SCALE };
 ```
@@ -728,6 +769,14 @@ Semantics:
   status is NOT_SUPPORTED (κ ≥ T), so a caller sees why. `plan_device_bytes` and
   `plan_host_bytes` are valid only on SUCCESS. With `lowered = 0` every field except
   `struct_size`, `status` and `lowered` is 0.
+  - **[v1.4] Version 2** appends `fused` (1 iff EMULATE with k̂ ≤ 512: the §4 KF launch) and
+    `kernel_launches`, the kernel launches of one `imd_contract` with α ≠ 0: NOOP 0; DIRECT
+    and SCALE `v + 1`; EMULATE `(fused ? 1 : v + 2) + (⌈N/g⌉ − fused)·(2 + [n̂ > n]) +
+    gemm_launches + 1`, with `v` = 1 for `IMD_VEC_GENERATE` (K0), 0 for resident vectors (a
+    call with α = 0 launches `v + 1`). Both are valid whenever `lowered = 1`, like
+    `k_chunks`. A version-1 caller (struct_size 136) gets exactly the version-1 fields.
+    Tested: the LD_PRELOAD shim counts `cudaLaunchKernel` during every test call and
+    compares it with the plan, and the plan with the host query.
   - `dispatch`: NOOP (b·m·n = 0), EMULATE (K0–K5; EMULATE mode, k ≥ 2), DIRECT (K0 + the
     native kernel; DIRECT mode or K-empty), SCALE (k = 0: K0 + the β kernel, §3.7). A call
     with α = 0 also runs only K0 and the β kernel; that is per call, not per plan.
@@ -849,3 +898,19 @@ tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH).
   configuration"). Same launches (host/k4_launches.hpp), same §3.5 arithmetic on the same
   values (the umulhi64 of cert_barrett is evaluated from 32-bit words), bit-identical W.
   No cert, spec or Apalache bound changes. Measurements: docs/NOTES-A2.md.
+
+## Changes v1.3 → v1.4 (small-problem overhead, docs/NOTES-A1.md)
+
+- **§4 KF.** A plan with the emulated GEMM and k̂ ≤ 512 runs K0 (generate mode), K1 and
+  group 1's K2/K3 as one launch, which computes its offsets from the descriptor and σ per
+  block, and stores σ/τ, the flags, the vec region and group 1's residues exactly as the
+  separate kernels did. Results and the §4a workspace are unchanged. **[spec: Pipeline
+  Fused; pos_fused_g3, pos_fused_g1, pos_fused_g2_parts, pos_fused_resident,
+  pos_fused_batch2; neg_fused_reads_vec, neg_fused_shared_sigma, neg_fused_no_vec,
+  neg_fused_no_sigma, neg_fused_all_groups]**
+- **§4 moduli parts and K5 mapping.** Pack launches may split a group's slots over
+  `gridDim.y`; K5 takes 1 or 4 j̄ per thread. Launch choices only. **[spec: Pipeline MParts;
+  pos_pack_parts]**
+- **§6a.** `IMD_HOST_API_VERSION` 2: `imd_lowering_t` grows to 152 bytes with `fused` and
+  `kernel_launches` (appended; version-1 callers unaffected). libimmerdink_host stays the one
+  implementation of the choice (`fused_path`) and the count (`plan_launches`).

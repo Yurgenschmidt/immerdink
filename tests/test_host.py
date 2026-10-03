@@ -58,7 +58,7 @@ class CO(C.Structure):
 LOWERING_FIELDS = ["status", "lowered", "dispatch", "swapped", "num_moduli", "residue_group",
                    "num_groups", "m", "n", "k", "b", "n_hat", "k_hat", "vec_entries",
                    "k_chunks", "gemm_launches", "kappa", "workspace_bytes",
-                   "plan_device_bytes", "plan_host_bytes"]
+                   "plan_device_bytes", "plan_host_bytes", "fused", "kernel_launches"]
 
 
 class Direct:
@@ -95,14 +95,21 @@ class Direct:
         st = self.lib.imd_plan_bytes(*self._args(descs, opts), C.byref(d), C.byref(h))
         return st, d.value, h.value
 
-    def lowering(self, descs, opts):
-        raw = (C.c_uint8 * 136)()
-        C.c_uint32.from_buffer(raw, 0).value = 136
+    def lowering(self, descs, opts, size=152):
+        """imd_lowering into a raw struct of `size` bytes (152: version 2; 136: a version-1
+        caller, whose struct must come back with the v1 fields only)."""
+        raw = (C.c_uint8 * (size + 16))(*([0xEE] * (size + 16)))
+        C.c_uint32.from_buffer(raw, 0).value = size
         st = self.lib.imd_lowering(*self._args(descs, opts), raw)
+        if any(raw[i] != 0xEE for i in range(size, size + 16)):
+            raise Fail("imd_lowering wrote past struct_size")
         i32 = [C.c_int32.from_buffer(raw, 4 * i).value for i in range(8)]
         i64 = [C.c_int64.from_buffer(raw, 32 + 8 * i).value for i in range(9)]
         u64 = [C.c_uint64.from_buffer(raw, 104 + 8 * i).value for i in range(4)]
-        return st, dict(zip(LOWERING_FIELDS, i32[1:] + i64 + u64))
+        v2 = []
+        if size >= 152:
+            v2 = [C.c_int32.from_buffer(raw, 136).value, C.c_int64.from_buffer(raw, 144).value]
+        return st, dict(zip(LOWERING_FIELDS, i32[1:] + i64 + u64 + v2))
 
 
 # ---------------------------------------------------------------------------------------
@@ -150,6 +157,19 @@ def spec_expect(descs, N, g, rnd, mode, vec):
         exp.update(num_groups=len(groups), k_chunks=chunks,
                    gemm_launches=sum(chunks * -(-len(grp) * b // 65535) * nparts
                                      for grp in groups))
+    # v1.4 (DESIGN §4, §6a): the fused launch KF iff EMULATE and k_hat <= 512; kernel
+    # launches per call with alpha != 0.
+    k0 = 0 if vec == "RESIDENT" else 1
+    fused = dispatch == "EMULATE" and k_hat <= 512
+    if dispatch == "NOOP":
+        launches = 0
+    elif dispatch != "EMULATE":
+        launches = k0 + 1                          # K0 + DIRECT / beta kernel
+    else:
+        per_group = 2 + (1 if n_hat > n else 0)    # K2, K3 (+ B padding rows)
+        launches = ((1 if fused else k0 + 2) + (exp["num_groups"] - fused) * per_group
+                    + exp["gemm_launches"] + 1)
+    exp.update(fused=int(fused), kernel_launches=launches)
     return status, exp
 
 
@@ -208,8 +228,11 @@ def check_case(direct, descs, opts, what):
     kw = dict(N=N, g=g, rounding=rnd, mode=mode, vec_mode=vec)
     want_st, exp = spec_expect(descs, N, g, rnd, mode, vec)
 
-    # Python wrapper == direct C, for every query.
+    # Python wrapper == direct C, for every query; a version-1 caller gets the same v1 fields.
     st_c, low_c = direct.lowering(descs, co)
+    st_1, low_1 = direct.lowering(descs, co, size=136)
+    if st_1 != st_c or any(low_1[f] != low_c[f] for f in low_1):
+        raise Fail(f"{what}: a version-1 imd_lowering_t differs from version 2")
     lw = host.lowering(descs, **kw)
     if lw.status != STATUS[st_c]:
         raise Fail(f"{what}: wrapper status {lw.status}, C {STATUS[st_c]}")
@@ -248,7 +271,8 @@ def check_case(direct, descs, opts, what):
     if low_c["lowered"] != 1:
         raise Fail(f"{what}: lowered = 0")
     for f in ("m", "n", "k", "b", "n_hat", "k_hat", "kappa", "workspace_bytes", "num_moduli",
-              "residue_group", "vec_entries", "num_groups", "k_chunks", "gemm_launches"):
+              "residue_group", "vec_entries", "num_groups", "k_chunks", "gemm_launches",
+              "fused", "kernel_launches"):
         if low_c[f] != exp[f]:
             raise Fail(f"{what}: {f} = {low_c[f]}, spec {exp[f]}")
     if bool(low_c["swapped"]) != exp["swapped"] or host.DISPATCH[low_c["dispatch"]] != exp["dispatch"]:
@@ -370,14 +394,15 @@ def suite_plan(args):
             v = list(buf)[:cnt.value]
             path, sw, m, n, k, b, nh, kh, N, g, total = v[:11]
             regs = [(v[11 + 2 * r], v[12 + 2 * r]) for r in range(8)]
-            dev, store, add, launches, hbytes = v[27:32]
+            dev, store, add, launches, hbytes, fused, kernels = v[27:34]
             _, ltot, lay = direct.layout(descs, co)
             _, pdev, phost = direct.plan_bytes(descs, co)
             dsz = C.c_size_t(0)
             assert lib.lib.imd_plan_device_bytes(plan, C.byref(dsz)) == 0
             got = dict(dispatch="SCALE" if k == 0 and path else path_of[path], swapped=sw, m=m, n=n, k=k, b=b, n_hat=nh,
                        k_hat=kh, num_moduli=N, residue_group=g, workspace_bytes=total,
-                       gemm_launches=launches, plan_device_bytes=dev, plan_host_bytes=hbytes)
+                       gemm_launches=launches, plan_device_bytes=dev, plan_host_bytes=hbytes,
+                       fused=fused, kernel_launches=kernels)
             want = dict(low, dispatch=host.DISPATCH[low["dispatch"]])
             for key, val in got.items():
                 if val != want[key]:

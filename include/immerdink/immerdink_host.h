@@ -27,7 +27,7 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 1
+#define IMD_HOST_API_VERSION 2  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4) */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -150,6 +150,12 @@ typedef struct {
   uint64_t workspace_bytes;   /* imd_workspace_size                               */
   uint64_t plan_device_bytes; /* imd_plan_bytes; valid only when status = SUCCESS  */
   uint64_t plan_host_bytes;   /* imd_plan_bytes; valid only when status = SUCCESS  */
+  /* Version 2 (152 bytes; §4, §6a v1.4). Valid when lowered = 1, like k_chunks. */
+  int32_t fused;           /* 1: EMULATE with the fused launch KF (K0 + K1 + the packs of
+                              group 1), chosen by k_hat <= 512; else 0                */
+  int32_t reserved;        /* 0                                                       */
+  int64_t kernel_launches; /* kernel launches of one imd_contract with alpha != 0 (an
+                              alpha = 0 call launches K0 (generate mode) + 1)          */
 } imd_lowering_t;
 
 /* Fills *out and returns the plan-time status (as imd_plan_bytes). INVALID_VALUE without

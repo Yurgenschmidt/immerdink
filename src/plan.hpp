@@ -46,6 +46,13 @@ imd_status_t k4_prepare(const ExecPlan& p, std::shared_ptr<const K4Plan>* out);
 imd_status_t k4_group(const K4Plan& k4, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
                       int gsize, cudaStream_t stream);
 
+// Test hook state (api.cpp; test_hooks.cpp imd_test_set_fused): -1 = the plan-time rule
+// (production), 0 = never take the v1.4 fused path. Read by imd_plan_create only.
+int& fused_override();
+// K5's one-element-per-thread limit (contract.cu; elements per SM), read by imd_contract;
+// changed only by the test hook imd_test_set_k5_one_elem (not thread-safe, like the hooks).
+int64_t& k5_one_elem_per_sm();
+
 // The execution data of a plan (api.cpp), for the test hooks; nullptr for a null plan.
 const ExecPlan* exec_of(imd_plan_t plan);
 

@@ -51,6 +51,9 @@ struct ExecPlan {
   int64_t pack_radix[2] = {1, 1};
   // K5 thread mapping: lambda fastest (C's fastest label is a batch label) or j-bar fastest.
   bool k5_batch_fast = false;
+  // v1.4 (DESIGN §4 "KF"): K0 (generate mode), K1 and group 1's K2/K3 run as one fused
+  // launch. Chosen at plan time from the lowering (analysis.hpp fused_path).
+  bool fused = false;
 
   // §5 step 10 scatter vectors (§4a vec order, vec_count entries), from vec_desc: generated
   // by K0 into ws.vec per call (IMD_VEC_GENERATE), or built once at plan creation into

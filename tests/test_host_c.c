@@ -32,7 +32,7 @@ int main(void) {
   const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT};
 
   CHECK(imd_host_api_version() == IMD_HOST_API_VERSION);
-  CHECK(sizeof(imd_lowering_t) == 136);
+  CHECK(sizeof(imd_lowering_t) == 152 && IMD_HOST_API_VERSION >= 2);
 
   size_t bytes = 0;
   CHECK(imd_workspace_size(&A, &B, &C, &opt, &bytes) == IMD_STATUS_SUCCESS);
@@ -88,6 +88,16 @@ int main(void) {
   CHECK(lw.k_chunks == 1 && lw.gemm_launches == 5);
   CHECK(lw.vec_entries == 119 && lw.workspace_bytes == 30720);
   CHECK(lw.plan_device_bytes == 0 && lw.plan_host_bytes == host);
+  /* v2: k_hat = 16 <= 512: the fused launch KF; then groups 2..5 with two packs and the B
+   * padding rows (n_hat > n) each, 5 K4 launches and K5: 1 + 4 * 3 + 5 + 1 = 19. */
+  CHECK(lw.fused == 1 && lw.reserved == 0 && lw.kernel_launches == 19);
+
+  /* A version-1 caller (struct_size 136) gets the v1 fields; the v2 tail is untouched. */
+  lw.fused = -5;
+  lw.kernel_launches = -5;
+  lw.struct_size = 136;
+  CHECK(imd_lowering(&A, &B, &C, &opt, &lw) == IMD_STATUS_SUCCESS);
+  CHECK(lw.m == 17 && lw.fused == -5 && lw.kernel_launches == -5);
 
   /* Versioning: struct_size below the version-1 size -> INVALID_VALUE, nothing written. */
   lw.struct_size = 8;
@@ -114,6 +124,8 @@ int main(void) {
     CHECK(imd_lowering(&a, &b, &c, &rn, &lw) == IMD_STATUS_NOT_SUPPORTED);
     CHECK(lw.status == IMD_STATUS_NOT_SUPPORTED && lw.lowered == 1 && lw.kappa == 180);
     CHECK(lw.workspace_bytes == bytes && lw.plan_host_bytes == 0);
+    /* k_hat > 512: unfused, K0 + 2 K1 + 2 packs + 1 K4 + K5 (n_hat = n: no zero rows). */
+    CHECK(lw.fused == 0 && lw.kernel_launches == 7);
   }
 
   /* Illegal descriptors: the §5 status, lowered = 0. */

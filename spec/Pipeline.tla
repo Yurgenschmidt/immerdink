@@ -24,6 +24,15 @@
 (*                       MaxY N-tiles): epilogue store-mod (c = 0) /       *)
 (*                       add-mod (c > 0) into the u8 planes W_l[λ][ī][n̂]   *)
 (*          K5 crt    per (λ,ī,j̄): flagged ? native dot : CRT; α/β; C     *)
+(*        Fused (DESIGN v1.4 §4, chosen at plan time): ONE launch "KF"     *)
+(*                    replaces K0, K1 and group 1's two packs: per A row / *)
+(*                    B column and moduli part y it computes σ itself,     *)
+(*                    packs the part's slots, and (part 0 only) stores σ   *)
+(*                    and the flag; its offsets come from the descriptor   *)
+(*                    (kernel argument), never from the vec region, which  *)
+(*                    its own vec CTAs write for the later kernels         *)
+(*        MParts: gridDim.y of a pack launch (KF and K2/K3): the group's   *)
+(*                    slots are split over MParts CTAs per row             *)
 (*        launch limits (gridDim.z and gridDim.y splits), C must not alias *)
 (*        A or B, two                                                      *)
 (*        streams without events are a hazard                              *)
@@ -128,6 +137,8 @@ CONSTANTS
                          \* plan-owned device memory ("pvec", built at plan
                          \* creation); no K0, no vec region in the workspace
     K1Split,             \* K1 as two launches: γ pass (K1a), then S pass (K1b)
+    Fused,               \* v1.4: K0 + K1 + group 1's packs as one launch (KF)
+    MParts,              \* v1.4: CTAs per row of a pack launch (moduli parts)
     TwoStreams,          \* packs on a second stream (NOT v1; future option)
     UseEvents,           \* cross-stream event edges (only with TwoStreams)
     Bug,                 \* "none", one injected design-rule violation, or a
@@ -171,6 +182,17 @@ Bugs == {"none",
                           \* over γ in place as soon as it is done
          "packWaitsGamma",\* 2 streams: the packs' K1 event edge is from K1a,
                           \* not K1b
+         "fusedReadsVec", \* KF's row CTAs read the scatter vectors from the
+                          \* vec region (as K1 / K2 do), which KF's own vec
+                          \* CTAs write in the same launch
+         "fusedSharedSigma",\* KF's moduli-part CTAs y > 0 read σ from sA
+                          \* (written by part 0 of the same launch) instead
+                          \* of computing it
+         "fusedNoVec",    \* KF has no vec CTAs (K0 dropped, nothing writes
+                          \* the vec region)
+         "fusedNoSigma",  \* KF uses σ / the flag but does not store them
+         "fusedAllGroups",\* KF packs EVERY group into the g slots (one
+                          \* launch for all groups)
          "padMinimal"}    \* HARMLESS: K padding only in A and only by the
                           \* first group's pack; B rows n..n̂ never written
 \* Deviations from DESIGN that are shown NOT to break anything (positive models).
@@ -402,6 +424,7 @@ K1FinalKind == CASE ~K1Split               -> "scale"
                  [] OTHER                  -> "sigma"
 KCrt    == Kr("crt", 0, 0, 0)
 KDirect == Kr("direct", 0, 0, 0)
+KFused  == Kr("fused", 1, 0, 0)       \* KF: K0 + K1 + packs of group 1 (v1.4)
 
 \* For chunk c, for z part p, for y part q: one batched GEMM launch.
 GemmSeq(gi) == LET P == NParts(gi)  Q == NYParts IN
@@ -412,11 +435,20 @@ GroupsFrom(gi) == IF gi > NG THEN <<>>
                   ELSE <<Kr("packA", gi, 0, 0), Kr("packB", gi, 0, 0)>>
                        \o GemmSeq(gi) \o GroupsFrom(gi + 1)
 GP == GroupsFrom(1)
+\* Every group's GEMMs and nothing else (the "fusedAllGroups" negative: one
+\* KF launch packed every group into the same g slots beforehand).
+RECURSIVE GemmSeqsFrom(_)
+GemmSeqsFrom(gi) == IF gi > NG THEN <<>> ELSE GemmSeq(gi) \o GemmSeqsFrom(gi + 1)
 
 \* K0 runs unless the vectors are resident in the plan.
 K0Seq == IF VecResident THEN <<>> ELSE <<KVec>>
+\* v1.4 fused path: KF, then group 1's GEMMs, then groups 2.. as usual
+\* (their packs read the σ / τ and vectors KF stored).
+FusedGP == IF Bug = "fusedAllGroups" THEN <<KFused>> \o GemmSeqsFrom(1)
+           ELSE <<KFused>> \o GemmSeq(1) \o GroupsFrom(2)
 ProgFull == IF Empty THEN <<>>
             ELSE IF UseDirect THEN K0Seq \o <<KDirect>>
+            ELSE IF Fused THEN FusedGP \o <<KCrt>>
             ELSE IF Bug = "crtEarly"
                  THEN K0Seq \o K1Seq \o SubSeq(GP, 1, Len(GP) - 1)
                       \o <<KCrt>> \o SubSeq(GP, Len(GP), Len(GP))
@@ -452,6 +484,17 @@ Deps == [a \in BOOLEAN |-> [i \in DOMAIN Prog[a] |->
 \* CTAs of each kernel (any grid; what matters is which outputs each owns).
 K0CTAs == IF Bug = "k0NoC" THEN {"A", "B"} ELSE {"A", "B", "C"}
 K1CTAs == {<<"a", x[1], x[2]>> : x \in RowsA} \cup {<<"b", x[1], x[2]>> : x \in ColsB}
+\* v1.4 moduli parts: CTA part y of a pack launch writes the slots
+\* [y·|G| div MParts, (y+1)·|G| div MParts) (contract.cu: blockIdx.y of gridDim.y).
+Parts == 0..(MParts - 1)
+PartSlots(gi, y) == {s \in 0..(GrpSize(gi) - 1) :
+                       (y * GrpSize(gi)) \div MParts <= s /\ s < ((y + 1) * GrpSize(gi)) \div MParts}
+\* KF's CTAs: per A row / B column (padded columns included) and moduli part,
+\* plus one per tensor's vectors (none with resident vectors).
+FusedVecCTAs == IF VecResident \/ Bug = "fusedNoVec" THEN {} ELSE {<<"v", X>> : X \in {"A", "B", "C"}}
+FusedCTAs == {<<"a", x[1], x[2], y>> : x \in RowsA, y \in Parts}
+             \cup {<<"b", lam, j, y>> : lam \in Bs, j \in NHs, y \in Parts}
+             \cup FusedVecCTAs
 CTAsOf(kr) ==
     CASE kr.kind = "vec"    -> K0CTAs                 \* one per tensor's vectors
       [] kr.kind \in {"scale", "gamma"} -> K1CTAs     \* one per A row / B column
@@ -459,8 +502,9 @@ CTAsOf(kr) ==
                                THEN {<<t[1], t[2], t[3], hf>> : t \in K1CTAs, hf \in {0, 1}}
                                ELSE K1CTAs
       [] kr.kind = "k1merged" -> {<<"g">> \o t : t \in K1CTAs} \cup {<<"s">> \o t : t \in K1CTAs}
-      [] kr.kind = "packA"  -> RowsA                    \* one A row each
-      [] kr.kind = "packB"  -> Bs \X NHs                \* one (padded) B column each
+      [] kr.kind = "packA"  -> {<<x[1], x[2], y>> : x \in RowsA, y \in Parts}  \* A row, moduli part
+      [] kr.kind = "packB"  -> Bs \X NHs \X Parts       \* one (padded) B column and part each
+      [] kr.kind = "fused"  -> FusedCTAs
       [] kr.kind = "gemm"   -> PartZ(kr.gi, kr.p) \X Ms \X (0..(GridY(kr.q) - 1))
                                                         \* (batch z, row ī, N tile y)
       [] kr.kind \in {"crt", "direct"} -> Elems         \* one C element each
@@ -482,6 +526,11 @@ WellFormed ==
     /\ Bug = "packWaitsGamma" => TwoStreams /\ UseEvents
     /\ VecResident \in BOOLEAN
     /\ Bug \in {"residentWsVec", "residentReadsWs"} => VecResident
+    /\ Fused \in BOOLEAN /\ MParts \in Nat /\ MParts >= 1
+    /\ Fused => ~TwoStreams /\ ~K1Split          \* v1.4: single stream, one-launch K1
+    /\ Bug \in {"fusedReadsVec", "fusedSharedSigma", "fusedNoVec", "fusedNoSigma",
+                "fusedAllGroups"} => Fused
+    /\ Bug = "fusedNoVec" => ~VecResident
 
 \* Preconditions of the design; each has a boundary-tight positive model and
 \* a negative model at boundary + 1 (see MC_Pipeline.tla).
@@ -612,42 +661,109 @@ SigmaStep(t) ==
 RealHs == {h \in KHs : h < k}
 PadHs  == {h \in KHs : h >= k}
 
-\* K2: quantize row ī of A_λ with σ, write the residues of every modulus of
-\* group gi into slot s, K padded with zeros up to k̂.
+\* The residue / padding writes of one pack CTA for A row (λ, ī) or B column
+\* (λ, ĵ) over the slots `slots`; slot s receives modulus ModOf(gs(s), s),
+\* i.e. the residues of group gs(s).
+PadA(gi) == IF Bug = "noPad" \/ (Bug = "padMinimal" /\ gi > 1) THEN {} ELSE PadHs
+RAWrite(lam, i, slots, gs(_)) ==
+    [x \in RADom |->
+       IF x[2] = lam /\ x[3] = i /\ x[1] \in slots
+       THEN (IF x[4] \in RealHs THEN ModOf(gs(x[1]), x[1])
+             ELSE IF x[4] \in PadA(gs(x[1])) THEN Zero ELSE ra[x])
+       ELSE ra[x]]
+RACells(lam, i, slots, gs(_)) ==
+    {AccRA(s, lam, i, h) : s \in slots, h \in RealHs}
+    \cup UNION {{AccRA(s, lam, i, h) : h \in PadA(gs(s))} : s \in slots}
+BRes(j) == IF j < n THEN RealHs ELSE {}                               \* residues
+BPad(j) == IF Bug \in {"noPad", "padMinimal"} THEN {}
+           ELSE IF j < n THEN PadHs ELSE KHs                           \* zeros
+RBWrite(lam, j, slots, gs(_)) ==
+    [x \in RBDom |->
+       IF x[2] = lam /\ x[3] = j /\ x[1] \in slots
+       THEN (IF x[4] \in BRes(j) THEN ModOf(gs(x[1]), x[1])
+             ELSE IF x[4] \in BPad(j) THEN Zero ELSE rb[x])
+       ELSE rb[x]]
+RBCells(lam, j, slots) == {AccRB(s, lam, j, h) : s \in slots, h \in BRes(j) \cup BPad(j)}
+
+\* K2: quantize row ī of A_λ with σ, write the residues of the moduli of
+\* part t[3] of group gi into their slots, K padded with zeros up to k̂.
 PackAStep(gi, t) ==
-    LET lam == t[1]  i == t[2]  sz == GrpSize(gi)
-        pad == IF Bug = "noPad" \/ (Bug = "padMinimal" /\ gi > 1) THEN {} ELSE PadHs
+    LET lam == t[1]  i == t[2]  slots == PartSlots(gi, t[3])
+        G(s) == gi
     IN
-    /\ ra' = [x \in RADom |->
-                IF x[2] = lam /\ x[3] = i /\ x[1] < sz
-                THEN (IF x[4] \in RealHs THEN ModOf(gi, x[1])
-                      ELSE IF x[4] \in pad THEN Zero ELSE ra[x])
-                ELSE ra[x]]
-    /\ Access(VecA(lam, i) \cup {AccSA(lam, i)}
-              \cup {AccRA(s, lam, i, h) : s \in 0..(sz - 1), h \in RealHs \cup pad},
+    /\ ra' = RAWrite(lam, i, slots, G)
+    /\ Access(VecA(lam, i) \cup {AccSA(lam, i)} \cup RACells(lam, i, slots, G),
               ReadAB \cup Reuse(gi) \cup ClobA(lam, i)
               \cup Stale("A" \notin vecV) \cup SigmaRead(sfA[<<lam, i>>]))
     /\ UNCHANGED <<vecV, sfA, sfB, rb, w, cw, cval, aDirty, bDirty>>
 
 \* K3: same for column j̄ of B_λ; CTAs j̄ ∈ n..n̂-1 write zero rows.
 PackBStep(gi, t) ==
-    LET lam == t[1]  j == t[2]  sz == GrpSize(gi)  real == j < n
-        noB == Bug \in {"noPad", "padMinimal"}
-        res == IF real THEN RealHs ELSE {}                      \* residues
-        pad == IF noB THEN {} ELSE IF real THEN PadHs ELSE KHs  \* zeros
+    LET lam == t[1]  j == t[2]  slots == PartSlots(gi, t[3])  real == j < n
+        G(s) == gi
     IN
-    /\ rb' = [x \in RBDom |->
-                IF x[2] = lam /\ x[3] = j /\ x[1] < sz
-                THEN (IF x[4] \in res THEN ModOf(gi, x[1])
-                      ELSE IF x[4] \in pad THEN Zero ELSE rb[x])
-                ELSE rb[x]]
-    /\ Access({AccRB(s, lam, j, h) : s \in 0..(sz - 1), h \in res \cup pad}
+    /\ rb' = RBWrite(lam, j, slots, G)
+    /\ Access(RBCells(lam, j, slots)
               \cup (IF real THEN VecB(lam, j) \cup {AccSB(lam, j)} ELSE {}),
               Reuse(gi)
               \cup (IF real THEN ReadAB \cup ClobB(lam, j)
                                  \cup Stale("B" \notin vecV) \cup SigmaRead(sfB[<<lam, j>>])
                     ELSE {}))
     /\ UNCHANGED <<vecV, sfA, sfB, ra, w, cw, cval, aDirty, bDirty>>
+
+\* v1.4 KF (K0 + K1 + group 1's packs in one launch), one atomic step per CTA:
+\*   <<"v", X>>         writes tensor X's scatter vectors (K0's job);
+\*   <<"a", λ, ī, y>>   reads row ī of A_λ through offsets computed from the
+\*                      descriptor (no vec read), computes σ and the flag
+\*                      itself, packs the slots of part y of group 1 and
+\*                      (part 0 only) stores σ / the flag for later kernels;
+\*   <<"b", λ, ĵ, y>>   the same for column ĵ of B_λ (ĵ ≥ n: zero rows).
+\* Negatives: fusedReadsVec (reads the vec region of its own launch),
+\* fusedSharedSigma (parts y > 0 read part 0's σ from sA), fusedNoSigma (σ
+\* not stored), fusedNoVec (no vec CTAs), fusedAllGroups (every group packed
+\* into the same g slots by the one launch).
+FusedSlots(y) == IF Bug = "fusedAllGroups"
+                 THEN UNION {PartSlots(gi, y) : gi \in 1..NG} ELSE PartSlots(1, y)
+\* The group whose residues a slot ends up holding (the last one written).
+FusedGroup(s) == IF Bug = "fusedAllGroups"
+                 THEN CHOOSE gi \in 1..NG : s < GrpSize(gi) /\ \A g2 \in (gi + 1)..NG : s >= GrpSize(g2)
+                 ELSE 1
+FusedStoresSigma(y) == y = 0 /\ Bug # "fusedNoSigma"
+FusedStep(t) ==
+    IF t[1] = "v" THEN VecStep(t[2])
+    ELSE
+    LET lam == t[2]  x == t[3]  y == t[4]  slots == FusedSlots(y)
+        shared == Bug = "fusedSharedSigma" /\ y > 0      \* σ read from sA / sB
+        viaVec == Bug = "fusedReadsVec"
+        real   == t[1] = "a" \/ x < n
+    IN
+    IF t[1] = "a"
+    THEN /\ ra' = RAWrite(lam, x, slots, FusedGroup)
+         /\ sfA' = IF FusedStoresSigma(y)
+                   THEN [sfA EXCEPT ![<<lam, x>>] = IF flagA[<<lam, x>>] THEN 1 ELSE 0]
+                   ELSE sfA
+         /\ Access(RACells(lam, x, slots, FusedGroup)
+                   \cup (IF viaVec THEN VecA(lam, x) ELSE {})
+                   \cup (IF FusedStoresSigma(y) \/ shared THEN {AccSA(lam, x)} ELSE {})
+                   \cup (IF FusedStoresSigma(y) THEN {AccFA(lam, x)} ELSE {}),
+                   ReadAB \cup ClobA(lam, x)
+                   \cup Stale(viaVec /\ "A" \notin vecV)
+                   \cup (IF shared THEN SigmaRead(sfA[<<lam, x>>]) ELSE {}))
+         /\ UNCHANGED <<vecV, sfB, rb, w, cw, cval, aDirty, bDirty>>
+    ELSE /\ rb' = RBWrite(lam, x, slots, FusedGroup)
+         /\ sfB' = IF real /\ FusedStoresSigma(y)
+                   THEN [sfB EXCEPT ![<<lam, x>>] = IF flagB[<<lam, x>>] THEN 1 ELSE 0]
+                   ELSE sfB
+         /\ Access(RBCells(lam, x, slots)
+                   \cup (IF real /\ viaVec THEN VecB(lam, x) ELSE {})
+                   \cup (IF real /\ (FusedStoresSigma(y) \/ shared) THEN {AccSB(lam, x)} ELSE {})
+                   \cup (IF real /\ FusedStoresSigma(y) THEN {AccFB(lam, x)} ELSE {}),
+                   IF real
+                   THEN ReadAB \cup ClobB(lam, x)
+                        \cup Stale(viaVec /\ "B" \notin vecV)
+                        \cup (IF shared THEN SigmaRead(sfB[<<lam, x>>]) ELSE {})
+                   ELSE {})
+         /\ UNCHANGED <<vecV, sfA, ra, w, cw, cval, aDirty, bDirty>>
 
 \* K4: chunk c of the int8 GEMM for batch z = s·b + λ (modulus l), row ī,
 \* the columns of N tile y of y part kr.q; epilogue store-mod (c = 0) or
@@ -733,6 +849,7 @@ Body(kr, t) ==
       [] kr.kind = "k1merged" -> IF t[1] = "g" THEN ScanStep(Tail(t), TRUE) ELSE SigmaStep(Tail(t))
       [] kr.kind = "packA"  -> PackAStep(kr.gi, t)
       [] kr.kind = "packB"  -> PackBStep(kr.gi, t)
+      [] kr.kind = "fused"  -> FusedStep(t)
       [] kr.kind = "gemm"   -> GemmStep(kr, t)
       [] kr.kind = "crt"    -> IF TrivialK5 THEN TrivialStep(t) ELSE CrtStep(t)
       [] kr.kind = "direct" -> IF TrivialK5 THEN TrivialStep(t) ELSE DirectStep(t)
@@ -923,7 +1040,7 @@ DispatchByDescriptor ==
          LET kinds == {Prog[a][i].kind : i \in DOMAIN Prog[a]} IN
          /\ ("direct" \in kinds) <=> (~Empty /\ (Direct \/ KEmpty))
          /\ "direct" \in kinds => kinds \cap {"scale", "gamma", "sigma", "k1merged", "packA",
-                                              "packB", "gemm", "crt"} = {}
+                                              "packB", "fused", "gemm", "crt"} = {}
     /\ WorkspaceSize = SumSeq([i \in DOMAIN Regions |-> Align(Bytes(Regions[i]))])
 
 \* §4 launch limits: each batched launch has gridDim.z <= MaxZ, and the
