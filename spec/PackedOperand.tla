@@ -1,6 +1,9 @@
 ---------------------------- MODULE PackedOperand ----------------------------
 (***************************************************************************)
-(* Packed-operand reuse (DESIGN §6b, DRAFT for review; ROADMAP D1).        *)
+(* Packed-operand reuse (DESIGN §6b v1.7, approved; implementation D1).    *)
+(* The adopted lowering and the key in general are IndexMap's (Packing);   *)
+(* the packed slot in the kernel sequence Pipeline's (Packed); the handle  *)
+(* lifetime HostAPI's (PackMode).                                          *)
 (*                                                                         *)
 (* An operand X is packed once (imd_pack) into a caller-owned buffer: its  *)
 (* shifts σ, non-finite flags and all N residue planes, laid out by the    *)

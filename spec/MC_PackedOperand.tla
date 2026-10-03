@@ -1,6 +1,6 @@
 -------------------------- MODULE MC_PackedOperand --------------------------
 (***************************************************************************)
-(* Model values for PackedOperand (DESIGN §6b, DRAFT). Each cfg substitutes *)
+(* Model values for PackedOperand (DESIGN §6b). Each cfg substitutes        *)
 (* Cmp and Strm with one of the scenarios below (cfgs cannot hold records  *)
 (* or negative numbers).                                                   *)
 (*                                                                         *)
