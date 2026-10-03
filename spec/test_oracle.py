@@ -960,7 +960,10 @@ def test_dgemm_like():
 
 def rand_desc_triple(rng):
     """Random small legal-looking contraction: labels 0..5, extents 0..3, random dense
-    layouts (permuted, some negative strides), optional diagonal / single-operand labels."""
+    layouts (permuted, some negative strides), optional diagonal / single-operand labels.
+    The small rank (at most 6 labels) is a coverage choice for this brute-force address
+    check, not a limit of the lowering or the library (any rank is legal); operand ranks
+    6-12 run on the GPU in tests/test_frontend.py suite highrank (ctest contract_highrank)."""
     nl = rng.randint(1, 5)
     ext = {l: rng.choice((1, 2, 2, 3, 3)) for l in range(nl)}
     if rng.random() < 0.05:
