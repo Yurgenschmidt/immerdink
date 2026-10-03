@@ -10,9 +10,9 @@ This is the single source of truth for *what* v1 computes and *how*.
 - **[deviation]** marks a departure from published Ozaki-II, with the reason.
 
 v1.1 folds in the corrections found by the spec phase: adversarial review plus mutation
-testing of every artifact. v1.2 changes three execution details after M4 (K0 generated on
-the device, K1 in two launches, GEMM parameters built at plan creation) and the §6 thread
-and lifetime rules that follow from them; changed text is marked **[v1.2]**. Both change
+testing of every artifact. v1.2 changes execution details after M4 (K0 generated on the
+device or plan-resident, GEMM parameters built at plan creation; a K1 split was specified
+and measured but not adopted) and the §6 thread and lifetime rules that follow from them; changed text is marked **[v1.2]**. Both change
 lists are at the end.
 
 Sources:
@@ -278,8 +278,8 @@ plan time:  IndexMap lowering → fused-mode descriptor, canonical orders, chunk
             split; K4 GEMM parameters (CUTLASS device properties, occupancy, smem attribute)
 K0 vec      kernel: generate the scatter vectors → ws.vec from the fused-mode descriptor
             (a kernel argument, by value); not launched with IMD_VEC_RESIDENT      [v1.2]
-K1a gamma   A rows, B cols: flags → fA, fB; γ (int16) → sA, sB (scratch)          [v1.2]
-K1b sigma   A rows, B cols: read γ back, S; σ, τ (int16) overwrite γ in sA, sB    [v1.2]
+K1 scale    A rows, B cols: flags + σ, τ (int16)       one launch, two passes per row (γ, then S)
+            (the split K1a/K1b below is specified and checked, not used: [v1.2])
 for each residue group G (g moduli; ⌈N/g⌉ groups):
   K2 pack   A → A'_l[λ][ī][k̂]  for l ∈ G   (gather via scatter vectors, smem transpose,
   K3 pack   B → B'_l[λ][j̄][k̂]  for l ∈ G    K-contiguous int8, zero padding)  re-read A, B
@@ -308,7 +308,11 @@ vectors live; both modes give bitwise identical results.
 - The v1.1 pinned host buffer + `cudaMemcpyAsync` is gone (measured slower than both
   modes on every benchmark shape; docs/NOTES-M4.md "v1.2").
 
-**K1 in two launches [v1.2].**
+**K1 in two launches [v1.2]: specified and model-checked, measured, NOT adopted.**
+The split below is a valid alternative (the spec checks both); implemented, it was slower
+on every benchmark shape (K1 +17 % at r_bigk, +79 % at sq8192: two full streaming reads
+cost more than one read plus a re-read that mostly hits L2; docs/NOTES-M4.md "v1.2"), so
+v1.2 keeps the one-launch K1.
 - K1a reads every A row and B column once: the flags into fA/fB and the row exponent γ
   (§3.2 step 2, int16; zero rows marked) into sA/sB, used as **scratch**.
 - K1b reads them again with γ from sA/sB, computes S and overwrites γ with σ (τ).
@@ -341,8 +345,8 @@ Properties checked by **[spec: Pipeline]**:
 - **No stale reads.**
   - No buffer is read before it is written for the current group or chunk (the scatter
     vectors per tensor, as K0's CTAs write them).
-  - σ/τ are final before a pack or K5 reads them; K1b reads γ, never junk or σ
-    (`SigmaFinalAtUse`) **[v1.2]**.
+  - With the (unused) K1 split: σ/τ are final before a pack or K5 reads them; K1b reads γ,
+    never junk or σ (`SigmaFinalAtUse`) **[v1.2]**.
   - Residue buffers are reused only after the group's GEMMs retire.
   - Chunks partition `[0,k̂)`.
 - **Exact layout.** Regions are disjoint, 256-aligned, gap-free per region, and equal to
@@ -353,7 +357,8 @@ Properties checked by **[spec: Pipeline]**:
   time → ALIASING.
 - **Streams.**
   - Two streams without events produce a hazard.
-  - Safe two-stream operation needs three event edges: K1b → pack (RAW), pack(G) → gemm(G)
+  - Safe two-stream operation needs three event edges: K1 → pack (RAW; from K1b with the
+    split), pack(G) → gemm(G)
     (RAW), and last gemm(G) → pack(G+1) (WAR). With single-buffered RA/RB those edges
     serialize everything anyway.
   - So v1 is single-stream.
@@ -395,8 +400,8 @@ Properties checked by **[spec: Pipeline]**:
 align(x) = ⌈x⌉₂₅₆      k̂ = ⌈k⌉₁₆      n̂ = ⌈n⌉₁₆      g ∈ [1, N]
 
 region      bytes                       contents
-sA          2·b·m                       int16 shifts σ  (A rows; γ between K1a and K1b)
-sB          2·b·n                       int16 shifts τ  (B cols; γ between K1a and K1b)
+sA          2·b·m                       int16 shifts σ  (A rows)
+sB          2·b·n                       int16 shifts τ  (B cols)
 fA          1·b·m                       u8 non-finite flags (A rows)
 fB          1·b·n                       u8 non-finite flags (B cols)
 vec         8·(2m + 2n + 2k + 3b)       int64 scatter vectors (A: row,k,batch; B: k,col,batch;
@@ -670,9 +675,10 @@ const char*  imd_status_string(imd_status_t);
   reported by the new `imd_plan_device_bytes`), K0 is skipped and the workspace has no vec
   region. The pinned copy is removed. **[spec: Pipeline neg_k0_no_c, pos_resident_*,
   neg_resident_*, PlanBytesExact; HostAPI pos_resident, neg_resident_early_destroy]**
-- **§4 K1.** Two launches: K1a (flags, γ into sA/sB as scratch) and K1b (S, σ over γ),
-  with the rules that make the scratch reuse safe. §4a sizes unchanged.
-  **[spec: Pipeline K1Split, SigmaFinalAtUse, neg_k1_*]**
+- **§4 K1.** Two launches, K1a (flags, γ into sA/sB as scratch) and K1b (S, σ over γ), are
+  specified with the rules that make the scratch reuse safe, but **not adopted**: measured
+  slower on every shape. **[spec: Pipeline K1Split, SigmaFinalAtUse, pos_k1_split*,
+  neg_k1_*]**
 - **§4 GEMM setup / §6.** K4's parameters are built at plan creation and only copied by
   `imd_contract`. The thread-safety rules are stated precisely; the plan lifetime rule is
   relaxed to "until every call using it has returned" (generate mode). ALLOC_FAILED no

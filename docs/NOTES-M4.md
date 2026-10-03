@@ -6,7 +6,8 @@ the semantics, the §4a workspace layout, the K0–K5 sequence and buffer reuse 
 `spec/Pipeline.tla` and the public API are untouched. All 22 ctest tests pass bit for bit
 after every step (they compare with `spec/oracle.py`; the invariance tests check that
 results do not depend on tiling / launch choices). Design proposals that would need a
-DESIGN change are at the end; none was implemented.
+DESIGN change are at the end; none was implemented in M4 (the "v1.2" section at the very end
+implements them, after a DESIGN v1.2 and spec update).
 
 ## What M4 built
 
@@ -232,3 +233,39 @@ modes, generate plans destroyed before their stream is synchronized; bit-identic
 sequential run; a mutant that updates the plan's cached parameters in place is caught 7/7
 runs); `tests/test_graph.cpp` (one call captured into a CUDA graph in global capture
 mode and replayed twice, bit-exact, both modes, incl. the β-only path).
+
+### Change 3: K1 as two launches — specified, implemented, measured, NOT adopted
+
+Spec first (Pipeline `K1Split`: `SigmaFinalAtUse`; `neg_k1_merged`, `neg_k1_no_sigma`,
+`neg_k1_sigma_row_split`, `neg_k1_pack_waits_gamma`), then implemented (commit `e43d13b`:
+`k1_scale` / `k1_tiled` templated on the pass, γ stored in the σ slots with an int16
+sentinel for rows without finite nonzero entries, one block per row in K1b, uncapped
+grids for both passes). All 25 ctest tests were bit-exact. Timings
+(`bench/results/v12-k1split-e43d13b.jsonl` against `v12-after12-95f81f1.jsonl`, the
+same code without the split), K1 phase (A + B) and whole call, GENERATE, ms:
+
+| case | K1 one launch | K1 split | whole call one launch | whole call split |
+|---|---|---|---|---|
+| sq1024 | 0.023 | 0.036 | 0.188 | 0.203 (+8 %) |
+| sq2048 | 0.120 | 0.152 | 0.956 | 0.979 |
+| sq8192 | 1.32 | 2.35 | 32.6 | 34.1 |
+| r_lowk | 0.189 | 0.345 | 7.18 | 6.89 ² |
+| r_bigk | 2.00 | 2.34 | 12.18 | 11.86 ² |
+| r_skinny | 0.653 | 1.24 | 4.31 | 4.96 (+15 %) |
+| r_mm | 0.655 | 1.01 | 2.97 | 3.31 (+11 %) |
+| t_nn | 0.483 | 0.641 | 5.02 | 5.16 |
+| t_batch | 0.347 | 0.630 | 2.77 | 3.18 (+15 %) |
+| t_ikl | 0.442 | 0.650 | 2.90 | 3.10 (+7 %) |
+| t_cc | 0.366 | 0.638 | 5.10 | 5.17 |
+
+² Whole-call differences there are K4 noise (the K1 phase itself is slower; r_bigk's
+best-of-run is 11.51 ms without the split vs 11.83 with it).
+
+K1 is slower on **every** shape, including the long-row r_bigk the proposal targeted
+(+17 %), and the small shapes the orchestrator asked about regress too (sq1024 +8 %, r_mm
++11 %, t_batch +15 %). The proposal's estimate assumed the one-launch K1's second pass
+mostly misses L2 for long rows; measured, it mostly hits: the one-launch K1 costs about
+1.1–1.9 reads of the operands, two full streaming reads cost 2, and the extra launches
+(4 instead of 2) add about 10 µs on small shapes. Reverted; DESIGN v1.2 keeps the
+one-launch K1 and records the split as specified and model-checked but not adopted (the
+Pipeline models `pos_k1_split*` and `neg_k1_*` still check it).
