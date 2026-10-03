@@ -1017,8 +1017,23 @@ struct Bench {
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
     (void)Rmax;
+    // Per-phase event marks (profiling build): one plain call, one packed call, imd_pack.
+    Json phases;
+#ifdef IMD_BENCH_PROFILE
+    if (o.phase_reps > 0) {
+      const std::pair<const char*, std::function<void()>> runs[3] = {
+          {"plain_", do_plain}, {"packed_", do_packed}, {"pack_", do_pack}};
+      for (auto& [pre, fn] : runs) {
+        fprintf(stderr, "  %sphases:\n", pre);
+        Json pj = profile_imd(std::string(pre) == "plain_" ? plain : packed, N, fn);
+        for (auto& kv : pj.kv) phases.raw(pre + kv.first, kv.second);
+      }
+    }
+#endif
     for (int R : reuse) {
       Json e;
+      if (R == reuse.front())
+        for (auto& kv : phases.kv) e.kv.push_back(kv);
       e.str("pack", which == 0 ? "A" : "B").integer("R", R);
       e.num("plain_R_ms", 1e3 * tplain[R].median()).num("packed_R_ms", 1e3 * tpacked[R].median());
       e.num("speedup_R", tplain[R].median() / tpacked[R].median());

@@ -111,6 +111,36 @@ For large square problems the three big terms are about `N·m·k`, `N·n·k` and
   - Caller tiling over K changes results; avoid it.
 - **N** scales the residue and product terms linearly. Choose it from §6.
 
+### Packed operands (DESIGN v1.7 §6b, D1)
+
+A packed operand X (b batches, r rows, k contracted; k̂ = ⌈k⌉₁₆) lives in a caller-owned
+buffer for as long as the caller keeps it:
+
+```
+P_sig  = 2·b·r                                  int16 shifts
+P_flag = 1·b·r                                  u8 non-finite flags
+P_res  = N·b·r·k̂ + (⌈r⌉₁₆ − r)·k̂               int8 residues, all N planes, + zeroed tail
+pack_bytes    = align(P_sig) + align(P_flag) + align(P_res)      (0 if b·r·k = 0)
+pack_ws_bytes = align(8·(r + k + b))            imd_pack's workspace: X's scatter vectors,
+                                                only during imd_pack (0 for an empty pack)
+```
+
+A plan that reads X from its pack has no sX, fX, RX regions in its workspace (X's post-swap
+role); vec and W are unchanged:
+
+```
+workspace_size_packed = workspace_size − align(W_sX) − align(W_fX) − align(W_RX)  (per packed X)
+P_dev = T_user + workspace_size_packed + Σ_{kept packs} pack_bytes + Σ_{live plans} D_plan
+        (+ pack_ws_bytes while an imd_pack runs, if not taken from the workspace)
+```
+
+The pack holds all N planes (`≈ N/8` of the FP64 operand: 1.75× at N = 14); the workspace
+saves `g/N` of that per contraction (all of it at g = N). Example (8192³, N = 14, g = 14):
+one operand packed: workspace 1.75 GiB (−0.88 GiB), pack 0.88 GiB; both packed: workspace
+0.875 GiB (W + vec), packs 2 × 0.88 GiB. Exact numbers: `imd_pack_layout`,
+`imd_workspace_size_packed` (§3a), spec/params.py `pack_layout`, `pack_ws_bytes`,
+`workspace_size(packed=...)`.
+
 ## 3a. Getting exact footprints from another program (no GPU)
 
 `libimmerdink_host.so` (DESIGN §6a; header `immerdink/immerdink_host.h`) answers every
@@ -126,6 +156,9 @@ It is the code libimmerdink runs at plan creation, so the answers are what the k
 | GEMM view, dispatch, groups, K4 launches, all sizes, plan-time status | `imd_lowering` | `lowering` |
 | K4 configuration for an SM count; temporary bytes of a `k4_tune` plan creation (DESIGN v1.5) | `imd_lowering` (`sm_count` in, `k4_config`, `k4_tune_bytes`) | `lowering(..., sm_count=)` |
 | workspace for every g = 1..N | (loop over g) | `g_tradeoff`, `python3 -m immerdink.host` |
+| a packed operand's bytes, layout and imd_pack workspace (DESIGN v1.7) | `imd_pack_layout` | `pack_layout` |
+| the descriptor reproducing one contraction's orders | `imd_pack_desc_for` | `pack_desc_for` |
+| workspace / region table / summary of a plan with packed operands | `imd_workspace_size_packed`, `imd_workspace_layout_packed`, `imd_lowering_packed` | `packing=` on `workspace_size`, `workspace_layout`, `lowering` |
 
 The **g trade-off** for a CC-shaped contraction (o = 40, v = 200; N = 14):
 
