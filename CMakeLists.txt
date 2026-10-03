@@ -81,11 +81,14 @@ target_link_libraries(imd_core PUBLIC imd_constants CUDA::cudart PRIVATE imd_war
 set_target_properties(imd_core PROPERTIES CXX_VISIBILITY_PRESET hidden
                                           VISIBILITY_INLINES_HIDDEN ON)
 
-add_library(immerdink SHARED src/api.cpp)
+# The library: C ABI (api.cpp), K0-K5 + DIRECT kernels (contract.cu), K4 CUTLASS GEMM
+# (gemm_k4.cu).
+add_library(immerdink SHARED src/api.cpp src/contract.cu src/gemm_k4.cu)
 target_include_directories(immerdink PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
-target_link_libraries(immerdink PUBLIC CUDA::cudart PRIVATE imd_core imd_warnings)
+target_link_libraries(immerdink PUBLIC CUDA::cudart PRIVATE imd_core imd_cutlass imd_warnings)
 set_target_properties(immerdink PROPERTIES CXX_VISIBILITY_PRESET hidden
+                                           CUDA_VISIBILITY_PRESET hidden
                                            VISIBILITY_INLINES_HIDDEN ON)
 
 # --- Tests -------------------------------------------------------------------------------

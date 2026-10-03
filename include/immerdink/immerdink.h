@@ -29,7 +29,8 @@ typedef enum {
   IMD_STATUS_ALIASING = 3,
   IMD_STATUS_INSUFFICIENT_WORKSPACE = 4,
   IMD_STATUS_MISALIGNED = 5,
-  IMD_STATUS_CUDA_ERROR = 6
+  IMD_STATUS_CUDA_ERROR = 6,
+  IMD_STATUS_ALLOC_FAILED = 7 /* host (pinned) allocation failed in plan creation */
 } imd_status_t;
 
 /* Options: rounding (§3.3) and mode (§4 DIRECT path). */
@@ -56,7 +57,7 @@ typedef struct {
 typedef struct imd_handle_st* imd_handle_t;
 typedef struct imd_plan_st* imd_plan_t;
 
-/* Library context. Lifecycle functions are not listed in DESIGN §6 (see docs/NOTES-M0.md). */
+/* Library context (DESIGN §6 lifecycle). */
 IMD_API imd_status_t imd_create(imd_handle_t* handle);
 IMD_API imd_status_t imd_destroy(imd_handle_t handle);
 
@@ -65,6 +66,9 @@ IMD_API imd_status_t imd_workspace_size(const imd_tensor_t* A, const imd_tensor_
                                         const imd_tensor_t* C, const imd_options_t* options,
                                         size_t* bytes);
 
+/* Lowering, legality (§5 rows 1-5), RN acceptance (§3.2) and the plan's pinned scatter
+ * vectors. A plan must outlive every imd_contract enqueued with it (K0 copies from its
+ * pinned buffer asynchronously): synchronize the stream before imd_plan_destroy. */
 IMD_API imd_status_t imd_plan_create(imd_handle_t handle, const imd_tensor_t* A,
                                      const imd_tensor_t* B, const imd_tensor_t* C,
                                      const imd_options_t* options, imd_plan_t* plan);
