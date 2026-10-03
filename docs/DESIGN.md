@@ -277,7 +277,7 @@ Typical errors are smaller. Choosing N is the caller's job, guided by
 plan time:  IndexMap lowering → fused-mode descriptor, canonical orders, chunking, launch
             split; K4 GEMM parameters (CUTLASS device properties, occupancy, smem attribute)
 K0 vec      kernel: generate the scatter vectors → ws.vec from the fused-mode descriptor
-            (a kernel argument, by value)                                        [v1.2]
+            (a kernel argument, by value); not launched with IMD_VEC_RESIDENT      [v1.2]
 K1a gamma   A rows, B cols: flags → fA, fB; γ (int16) → sA, sB (scratch)          [v1.2]
 K1b sigma   A rows, B cols: read γ back, S; σ, τ (int16) overwrite γ in sA, sB    [v1.2]
 for each residue group G (g moduli; ⌈N/g⌉ groups):
@@ -289,15 +289,24 @@ K5 crt      per (λ,ī,j̄): flagged ? native dot (reads A, B) : exact CRT; unsc
 ```
 If `α = 0` or `k = 0`, only K0 and K5 (β-only) run.
 
-**K0 [v1.2].**
+**K0 and the scatter vectors [v1.2].** The plan option `vec_mode` chooses where the
+vectors live; both modes give bitwise identical results.
 - The scatter vectors are a pure function of the fused modes of §5 step 9 (per class I, J,
   K, L: extent and the stride in each tensor that carries it). The plan keeps that
-  descriptor (O(rank)); K0 receives it **by value** as its kernel argument and writes
-  exactly the §4a vec contents of §5 step 10, one thread per entry.
-- No PCIe copy, no pinned host buffer and no plan-owned device memory: the workspace stays
-  the only device memory a call uses, and no GPU work reads plan memory (§6 lifetime).
-- At most 62 fused modes per class (each has extent ≥ 2 and the class's extent product fits
-  int64), so the argument is bounded.
+  descriptor (O(rank) host bytes). At most 62 fused modes per class (each has extent ≥ 2
+  and the class's extent product fits int64), so it is bounded.
+- **`IMD_VEC_GENERATE` (default).** K0 is a kernel that receives the descriptor **by
+  value** (its kernel argument) and writes exactly the §4a vec contents of §5 step 10 into
+  the workspace, one thread per entry. No PCIe copy, no pinned host buffer, no plan-owned
+  device memory: the workspace stays the only device memory a call uses, and no GPU work
+  reads plan memory (§6 lifetime). `imd_workspace_size` is unchanged from v1.1.
+- **`IMD_VEC_RESIDENT` (opt-in).** `imd_plan_create` allocates `8·(2m + 2n + 2k + 3b)`
+  device bytes, fills them with the same kernel and waits for it; the kernels of every
+  call read that copy, K0 is not launched, and the workspace has **no vec region** (§4a).
+  `imd_plan_device_bytes` reports the plan's device bytes exactly. The plan must outlive
+  the GPU work of its calls (§6).
+- The v1.1 pinned host buffer + `cudaMemcpyAsync` is gone (measured slower than both
+  modes on every benchmark shape; docs/NOTES-M4.md "v1.2").
 
 **K1 in two launches [v1.2].**
 - K1a reads every A row and B column once: the flags into fA/fB and the row exponent γ
@@ -399,7 +408,15 @@ W           N·b·m·n̂                     u8 modular products, all N planes
 workspace_size = Σ_regions align(bytes), regions in this order at 256-aligned offsets
                = 0                if b·m·n = 0 (empty output: no-op)
                = align(vec)       if mode = DIRECT, K-empty, k = 0
+[v1.2] vec_mode = IMD_VEC_RESIDENT: the vec region is omitted everywhere (it is in the
+       plan's device memory instead), so DIRECT, K-empty and k = 0 need 0 bytes.
+
+plan device bytes (imd_plan_device_bytes) [v1.2]
+               = 8·(2m + 2n + 2k + 3b)   if vec_mode = IMD_VEC_RESIDENT and b·m·n > 0
+               = 0                       otherwise
 ```
+**[spec: Pipeline LayoutExact, RegionsUsed, PlanBytesExact, pos_resident_*,
+neg_resident_ws_vec, neg_resident_reads_ws]**
 - The caller must pass `ws_bytes ≥ workspace_size`.
 - The result includes the tail padding after W, up to 255 bytes.
 - If any product or the total overflows uint64, the call returns INVALID_VALUE.
@@ -490,7 +507,10 @@ typedef struct { int32_t rank; const int64_t* extent; const int64_t* stride; /* 
 typedef struct { int32_t num_moduli;      /* N, 2..20                        */
                  int32_t residue_group;   /* g, 0 = N                         */
                  int32_t rounding;        /* IMD_RN (default) | IMD_TRUNC     */
-                 int32_t mode; } imd_options_t;  /* IMD_EMULATE | IMD_DIRECT  */
+                 int32_t mode;            /* IMD_EMULATE | IMD_DIRECT         */
+                 int32_t vec_mode;        /* [v1.2] IMD_VEC_GENERATE (0, default)
+                                             | IMD_VEC_RESIDENT                */
+               } imd_options_t;
 
 imd_status_t imd_workspace_size(const imd_tensor_t* A, const imd_tensor_t* B,
                                 const imd_tensor_t* C, const imd_options_t*, size_t* bytes);
@@ -501,8 +521,15 @@ imd_status_t imd_contract(imd_plan_t, double alpha, const double* A, const doubl
 imd_status_t imd_create(imd_handle_t*);           /* lifecycle */
 imd_status_t imd_destroy(imd_handle_t);
 imd_status_t imd_plan_destroy(imd_plan_t);
+imd_status_t imd_plan_device_bytes(imd_plan_t, size_t* bytes);   /* [v1.2] §4a */
 const char*  imd_status_string(imd_status_t);
 ```
+
+- **[v1.2] API additions** (approved): the `vec_mode` option and `imd_plan_device_bytes`.
+  `imd_options_t` grows by one int32 (20 bytes); a zero-initialized field is the default,
+  so `{N, g, rounding, mode}` initializers keep their meaning, but callers built against
+  the v1.1 header must be rebuilt (the struct size changed). An unknown `vec_mode` is
+  INVALID_VALUE (in `imd_workspace_size` too, which depends on it).
 
 - `imd_workspace_size` is a **pure host function**: no GPU, no allocation, and exactly
   §4a.
@@ -529,16 +556,24 @@ const char*  imd_status_string(imd_status_t);
   applies to plans created after it (the K4 launch split is fixed at plan creation)
   **[v1.2]**; the hooks are not thread-safe.
 - A workspace belongs to at most **one** in-flight `imd_contract` at a time.
-- **Lifetime [v1.2]:** a plan may be destroyed as soon as every `imd_contract` that uses it
-  has **returned**; the GPU work already enqueued reads no plan memory (K0's descriptor and
-  K4's parameters are kernel arguments, copied at launch). (v1.1 required the plan to
-  outlive the GPU work, because K0 copied from the plan's pinned buffer; a plan-owned
-  device copy of the vectors would need that rule too.) The handle must outlive every
-  `imd_plan_create` that uses it. **[spec: HostAPI pos_shared_plan, neg_witness_early_destroy,
-  neg_pinned_early_destroy, neg_plandevice_early_destroy]**
-- **ALLOC_FAILED** covers host allocation failure in plan creation; any CUDA failure,
-  including plan creation's device-property and kernel-attribute calls, is CUDA_ERROR.
-  **[v1.2: no pinned allocation any more]**
+- **Lifetime [v1.2]:**
+  - `IMD_VEC_GENERATE`: a plan may be destroyed as soon as every `imd_contract` that uses
+    it has **returned**; the GPU work already enqueued reads no plan memory (K0's
+    descriptor and K4's parameters are kernel arguments, copied at launch).
+  - `IMD_VEC_RESIDENT`: the kernels read the plan's device vectors, so the plan must
+    outlive the GPU work of every call that uses it (synchronize those streams before
+    `imd_plan_destroy`), as v1.1 required for its pinned buffer.
+  - The handle must outlive every `imd_plan_create` that uses it.
+  - **[spec: HostAPI pos_shared_plan, neg_witness_early_destroy, pos_resident,
+    neg_resident_early_destroy, neg_pinned_early_destroy]**
+- **`imd_plan_device_bytes`** reports the device bytes the plan owns, exactly §4a's "plan
+  device bytes" (the bytes requested from `cudaMalloc`; the driver's allocation granularity
+  is not included). With the workspace and the user tensors this is all the device memory
+  immerdink uses (MEMORY_MODEL §3).
+- **ALLOC_FAILED** covers host allocation failure in plan creation and, with
+  `IMD_VEC_RESIDENT`, the plan's device allocation; any other CUDA failure, including plan
+  creation's device-property and kernel-attribute calls, is CUDA_ERROR. **[v1.2: no
+  pinned allocation any more]**
 - **Threads [v1.2] [spec: HostAPI]:**
   - `imd_plan_create` does all host-side GEMM setup: it reads the SM count and the K4
     kernels' occupancy, sets their dynamic shared-memory attribute (CUDA runtime calls,
@@ -618,14 +653,18 @@ const char*  imd_status_string(imd_status_t);
 
 ## Changes v1.1 → v1.2 (after M4; docs/NOTES-M4.md "v1.2")
 
-- **§4 K0.** A kernel generates the scatter vectors from the fused-mode descriptor (a
-  kernel argument) instead of copying them from the plan's pinned buffer: no per-call PCIe
-  copy, no pinned or device memory in the plan. §4a is unchanged (same vec region, same
-  contents). **[spec: Pipeline neg_k0_no_c; HostAPI]**
+- **§4 K0, §4a, §6 `vec_mode`.** Default `IMD_VEC_GENERATE`: a kernel generates the
+  scatter vectors from the fused-mode descriptor (a kernel argument) instead of copying
+  them from the plan's pinned buffer: no per-call PCIe copy, no pinned or device memory in
+  the plan, §4a unchanged. Opt-in `IMD_VEC_RESIDENT`: the plan owns a device copy (exactly
+  reported by the new `imd_plan_device_bytes`), K0 is skipped and the workspace has no vec
+  region. The pinned copy is removed. **[spec: Pipeline neg_k0_no_c, pos_resident_*,
+  neg_resident_*, PlanBytesExact; HostAPI pos_resident, neg_resident_early_destroy]**
 - **§4 K1.** Two launches: K1a (flags, γ into sA/sB as scratch) and K1b (S, σ over γ),
   with the rules that make the scratch reuse safe. §4a sizes unchanged.
   **[spec: Pipeline K1Split, SigmaFinalAtUse, neg_k1_*]**
 - **§4 GEMM setup / §6.** K4's parameters are built at plan creation and only copied by
   `imd_contract`. The thread-safety rules are stated precisely; the plan lifetime rule is
-  relaxed to "until every call using it has returned". ALLOC_FAILED no longer covers a
-  pinned allocation. The public API is unchanged. **[spec: HostAPI]**
+  relaxed to "until every call using it has returned" (generate mode). ALLOC_FAILED no
+  longer covers a pinned allocation. Public API: `imd_options_t.vec_mode` and
+  `imd_plan_device_bytes` added (user-approved); nothing else changes. **[spec: HostAPI]**

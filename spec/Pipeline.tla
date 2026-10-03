@@ -8,7 +8,10 @@
 (*                    into the workspace from the fused-mode descriptor    *)
 (*                    (its kernel argument); one CTA per tensor's vectors  *)
 (*                    here, any interleaving (v1.1: a cudaMemcpyAsync from *)
-(*                    the plan's pinned buffer; plan lifetime: HostAPI)    *)
+(*                    the plan's pinned buffer; plan lifetime: HostAPI).   *)
+(*                    VecResident (IMD_VEC_RESIDENT): no K0, the vectors   *)
+(*                    are in plan-owned device memory ("pvec") and the     *)
+(*                    workspace has no vec region                          *)
 (*          K1 scale  per A row / B column: σ,τ and non-finite flags;      *)
 (*                    K1Split (v1.2 option): two launches, K1a writes γ    *)
 (*                    into sA/sB (scratch) and the flags, K1b reads γ back *)
@@ -121,6 +124,9 @@ CONSTANTS
     Direct,              \* mode = IMD_DIRECT
     KEmpty,              \* the descriptor has no K label after lowering
                          \* (outer / Hadamard product; then k = 1)
+    VecResident,         \* v1.2 IMD_VEC_RESIDENT: the scatter vectors live in
+                         \* plan-owned device memory ("pvec", built at plan
+                         \* creation); no K0, no vec region in the workspace
     K1Split,             \* K1 as two launches: γ pass (K1a), then S pass (K1b)
     TwoStreams,          \* packs on a second stream (NOT v1; future option)
     UseEvents,           \* cross-stream event edges (only with TwoStreams)
@@ -154,6 +160,10 @@ Bugs == {"none",
                           \* emulated path (mode EMULATE) while the
                           \* workspace is sized for DIRECT (align(vec))
          "k0NoC",         \* K0's grid covers only A's and B's vectors
+         "residentWsVec", \* resident vectors, but the workspace still has
+                          \* a vec region (sized for nothing)
+         "residentReadsWs",\* resident vectors, but the kernels read the
+                          \* workspace's vec region (not allocated)
          "k1Merged",      \* K1a and K1b CTAs in ONE launch (no kernel
                           \* boundary between the γ pass and the S pass)
          "noSigma",       \* K1b not launched (sA/sB keep γ)
@@ -277,11 +287,16 @@ Width(r) == CASE r \in {"sA", "sB"} -> 2
               [] OTHER               -> 1
 
 \* Regions present, in layout order (§4a; 0 if b·m·n = 0; vec only for
-\* the DIRECT path (mode DIRECT or K-empty) or when k = 0). RegionsFor(dir)
-\* is the layout of a call that takes (dir = TRUE) or skips the DIRECT path.
-AllRegions == <<"sA", "sB", "fA", "fB", "vec", "RA", "RB", "W">>
+\* the DIRECT path (mode DIRECT or K-empty) or when k = 0; no vec region
+\* with resident vectors). RegionsFor(dir) is the layout of a call that
+\* takes (dir = TRUE) or skips the DIRECT path.
+VecInWs    == ~VecResident \/ Bug = "residentWsVec"   \* the layout has a vec region
+VecReadsWs == ~VecResident \/ Bug = "residentReadsWs" \* kernels read vectors there
+AllRegions == IF VecInWs THEN <<"sA", "sB", "fA", "fB", "vec", "RA", "RB", "W">>
+              ELSE <<"sA", "sB", "fA", "fB", "RA", "RB", "W">>
 RegionsFor(dir) == IF Empty THEN <<>>
-                   ELSE IF dir \/ (k = 0 /\ Bug # "fullWsK0") THEN <<"vec">>
+                   ELSE IF dir \/ (k = 0 /\ Bug # "fullWsK0")
+                        THEN (IF VecInWs THEN <<"vec">> ELSE <<>>)
                    ELSE AllRegions
 \* The layout the kernels of this call use (offsets, accesses).
 Regions == RegionsFor(UseDirect)
@@ -303,11 +318,16 @@ Alloc(r) == CASE Bug = "noAlign"              -> Bytes(r)
 OffTbl == [r \in Active |->
              LET i == CHOOSE i \in DOMAIN Regions : Regions[i] = r
              IN  SumSeq([j \in 1..(i - 1) |-> Alloc(Regions[j])])]
-Off(r) == OffTbl[r]
+Off(r) == IF r \in Active THEN OffTbl[r] ELSE 0
+
+\* Plan-owned device bytes (resident vectors): exactly the vec contents.
+PlanBytes == IF VecResident /\ ~Empty THEN 8 * VecLen ELSE 0
 
 \* Byte addresses of the elements kernels touch (access = <<region, addr, width>>).
+\* Resident vectors are addressed in the plan's buffer "pvec" (offset 0).
 RBRows == IF Bug = "rbStrideN" THEN n ELSE NHat   \* rows per (slot, λ) block of RB
-AccVec(i)          == <<"vec", Off("vec") + 8 * i, 8>>
+AccVec(i)          == IF VecReadsWs THEN <<"vec", Off("vec") + 8 * i, 8>>
+                      ELSE <<"pvec", 8 * i, 8>>
 AccSA(lam, i)      == <<"sA", Off("sA") + 2 * (lam * m + i), 2>>
 AccSB(lam, j)      == <<"sB", Off("sB") + 2 * (lam * n + j), 2>>
 AccFA(lam, i)      == <<"fA", Off("fA") + lam * m + i, 1>>
@@ -351,6 +371,8 @@ ByteSet(r) == UNION {x[2]..(x[2] + x[3] - 1) : x \in Cells(r)}
 \* region, and ends at or below ws_bytes.
 AccOK(x) ==
     LET r == x[1]  a == x[2]  wd == x[3] IN
+    IF r = "pvec" THEN 0 <= a /\ a + wd <= PlanBytes   \* inside the plan's buffer
+    ELSE
     /\ r \in Active
     /\ Off(r) <= a /\ a + wd <= Off(r) + Bytes(r)
     /\ a + wd <= WsBytes
@@ -391,14 +413,16 @@ GroupsFrom(gi) == IF gi > NG THEN <<>>
                        \o GemmSeq(gi) \o GroupsFrom(gi + 1)
 GP == GroupsFrom(1)
 
+\* K0 runs unless the vectors are resident in the plan.
+K0Seq == IF VecResident THEN <<>> ELSE <<KVec>>
 ProgFull == IF Empty THEN <<>>
-            ELSE IF UseDirect THEN <<KVec, KDirect>>
+            ELSE IF UseDirect THEN K0Seq \o <<KDirect>>
             ELSE IF Bug = "crtEarly"
-                 THEN <<KVec>> \o K1Seq \o SubSeq(GP, 1, Len(GP) - 1)
+                 THEN K0Seq \o K1Seq \o SubSeq(GP, 1, Len(GP) - 1)
                       \o <<KCrt>> \o SubSeq(GP, Len(GP), Len(GP))
-            ELSE <<KVec>> \o K1Seq \o GP \o <<KCrt>>
+            ELSE K0Seq \o K1Seq \o GP \o <<KCrt>>
 \* α = 0 or k = 0: C <- β·C only (§3.7); K1-K4 are not launched.
-ProgTriv == IF Empty THEN <<>> ELSE <<KVec, IF UseDirect THEN KDirect ELSE KCrt>>
+ProgTriv == IF Empty THEN <<>> ELSE K0Seq \o <<IF UseDirect THEN KDirect ELSE KCrt>>
 
 \* Indexed by "α = 0" (a host-side fact). Cached tables (zero-arity).
 Prog == [a \in BOOLEAN |-> IF a \/ k = 0 THEN ProgTriv ELSE ProgFull]
@@ -456,6 +480,8 @@ WellFormed ==
     /\ Bug \in Bugs
     /\ Bug \in {"k1Merged", "noSigma", "sigmaRowSplit", "packWaitsGamma"} => K1Split
     /\ Bug = "packWaitsGamma" => TwoStreams /\ UseEvents
+    /\ VecResident \in BOOLEAN
+    /\ Bug \in {"residentWsVec", "residentReadsWs"} => VecResident
 
 \* Preconditions of the design; each has a boundary-tight positive model and
 \* a negative model at boundary + 1 (see MC_Pipeline.tla).
@@ -506,7 +532,7 @@ Init ==
     /\ pc = [st \in Streams |-> 1] /\ done = [st \in Streams |-> {}]
     /\ retired = {}
     /\ aDirty = [x \in RowsA |-> FALSE] /\ bDirty = [x \in ColsB |-> FALSE]
-    /\ vecV = {}
+    /\ vecV = IF VecResident THEN {"A", "B", "C"} ELSE {}   \* resident: built at plan creation
     /\ sfA = [x \in RowsA |-> -1] /\ sfB = [x \in ColsB |-> -1]
     /\ ra = [x \in RADom |-> 0] /\ rb = [x \in RBDom |-> 0]
     /\ w = [x \in WDom |-> {-1}]
@@ -763,7 +789,7 @@ TypeOK ==
     /\ \A x \in WDom : w[x] \subseteq {-1} \cup KHs
     /\ aDirty \in [RowsA -> BOOLEAN] /\ bDirty \in [ColsB -> BOOLEAN]
     /\ cw \in [Elems -> Nat] /\ cval \in [Elems -> CTags]
-    /\ touched \subseteq Active
+    /\ touched \subseteq Active \cup {"pvec"}
     /\ err \subseteq ErrKinds
 
 \* §4 "No stale reads": every read (vec, σ/flags, RA/RB chunk slices,
@@ -827,6 +853,15 @@ AccessesSafe == "oob" \notin err
 \* region the formula allocates (with LayoutExact: no byte is allocated for
 \* nothing except alignment padding).
 RegionsUsed == (AllDone /\ ~alpha0) => {r \in Active : Bytes(r) > 0} \subseteq touched
+
+\* v1.2 resident vectors: the plan's device buffer (what imd_plan_device_bytes
+\* reports) is exactly the nine vectors, gap-free (8 bytes per entry), and
+\* none for a generate plan. Constant-level.
+PlanBytesExact ==
+    /\ ~VecResident => PlanBytes = 0
+    /\ (VecResident /\ ~Empty) =>
+          /\ NCells("vec") * 8 = PlanBytes
+          /\ ByteSet("vec") = 0..(PlanBytes - 1)
 
 \* §4a layout facts. These are constant-level: TLC evaluates them once before
 \* the search and reports a failure as "The invariant of X is equal to FALSE".
