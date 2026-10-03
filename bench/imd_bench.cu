@@ -15,7 +15,11 @@
 //             the time of ONE modulus' GEMM (the GEMM-phase roofline is N times it)
 //   gemmul8   GEMMul8 INT8 fast mode, one call per batch, N from --N
 //   cutensor  cuTENSOR FP64 contraction on the original layouts
-//   imd       immerdink imd_plan_create + imd_contract, N from --N
+//   imd       immerdink imd_plan_create + imd_contract, N from --N. With a library built
+//             by this project (IMMERDINK_PROFILE=ON), --phase-reps more calls are made with
+//             per-phase event marks and the record gets "phases": per phase the median
+//             time, its MEMORY_MODEL §4 lower bound and the time as % of that bound
+//             (the timed whole-call loop runs with the marks switched off)
 //   bw        device-to-device copy of A (achievable DRAM bandwidth)
 // Matrix-only methods (dgemm, emu, gemmul8) need the GEMM view: A = [L][I|K], B = [L][J|K],
 // C = [L][I][J] (either I/K or J/K order). If a case is not in that layout the method is
@@ -35,6 +39,9 @@
 
 #ifdef IMD_BENCH_GEMMUL8
 #include <gemmul8.hpp>
+#endif
+#ifdef IMD_BENCH_PROFILE
+#include "profile_hooks.h"  // src/: per-phase event marks (libimmerdink built with IMMERDINK_PROFILE)
 #endif
 
 #include <algorithm>
@@ -428,6 +435,7 @@ struct Options {
   int reps = 10, warmup = 2, min_reps = 3;
   double max_seconds = 15;  // timed-loop budget per method/variant (after min_reps)
   long long samples = 256;
+  int phase_reps = 5;  // profiled imd calls (per-phase marks), after the timed loop
   double phi = 0.5;
   uint64_t seed = 1;
   std::string out;
@@ -857,8 +865,95 @@ struct Bench {
     }, s, o);
     Accuracy acc = result_accuracy();
     CU(cudaStreamSynchronize(s));
-    record("imd", "RN g=N (M1, pre-optimization)", N, T, &acc, flops(), wsb);
+    Json extra;
+#ifdef IMD_BENCH_PROFILE
+    extra = profile_imd(plan, N, [&] {
+      CI(imd_contract(plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
+    });
+#endif
+    record("imd", "RN g=N", N, T, &acc, flops(), wsb, extra);
   }
+
+#ifdef IMD_BENCH_PROFILE
+  // Per-phase times from the library's event marks, against MEMORY_MODEL §4 lower bounds
+  // (g = N, beta = 0, rho = 1, datasheet peaks as in bench/summarize.py).
+  Json profile_imd(imd_plan_t plan, int N, const std::function<void()>& call) {
+    constexpr double kBW = 1008e9, kOps = 660.6e12, kPcie = 32e9, kKc = 131056;
+    int64_t d[7];
+    CI(imd_prof_plan_dims(plan, d) == 0 ? IMD_STATUS_SUCCESS : IMD_STATUS_INVALID_VALUE);
+    const double m = double(d[0]), n = double(d[1]), k = double(d[2]), b = double(d[3]),
+                 nh = double(d[4]), kh = double(d[5]);
+    const double nc = std::ceil(kh / kKc);
+    std::map<std::string, double> lb;
+    lb["K0 vec"] = 8 * (2 * m + 2 * n + 2 * k + 3 * b) / kPcie;
+    lb["K1 scale A"] = 8 * b * m * k / kBW;
+    lb["K1 scale B"] = 8 * b * n * k / kBW;
+    lb["K2 pack A"] = (8 * b * m * k + N * b * m * kh) / kBW;
+    lb["K3 pack B"] = (8 * b * n * k + N * b * nh * kh) / kBW;
+    lb["K4 gemm"] = std::max(2.0 * N * b * m * nh * kh / kOps,
+                             (N * b * (m * kh + nh * kh) + N * b * m * nh * (2 * nc - 1)) / kBW);
+    lb["K5 crt"] = (N * b * m * nh + 8 * b * m * n) / kBW;
+    lb["DIRECT"] = 8 * b * (m * k + k * n + m * n) / kBW;
+    lb["K5 beta-only"] = 8 * b * m * n / kBW;
+
+    if (imd_prof_enable(1) != 0) throw Failure("imd_prof_enable failed");
+    std::map<std::string, std::vector<double>> per;  // phase -> per-call total ms
+    std::map<std::string, int> launches;
+    std::vector<std::string> order;
+    std::vector<double> totals;
+    for (int r = 0; r < o.phase_reps; ++r) {
+      imd_prof_reset();
+      call();
+      const char* tags[4096];
+      float ms[4096];
+      const int cnt = imd_prof_read(4096, tags, ms);
+      if (cnt < 0) throw Failure("imd_prof_read failed");
+      std::map<std::string, double> sum;
+      std::map<std::string, int> num;
+      double tot = 0;
+      for (int i = 0; i < cnt; ++i) {
+        std::string t = tags[i];
+        if (t.rfind("K4 gemm", 0) == 0) t = "K4 gemm";
+        if (!sum.count(t) && std::find(order.begin(), order.end(), t) == order.end()) order.push_back(t);
+        sum[t] += ms[i];
+        num[t] += 1;
+        tot += ms[i];
+      }
+      for (auto& [t, v] : sum) per[t].push_back(v);
+      launches = num;
+      totals.push_back(tot);
+    }
+    imd_prof_enable(0);
+    auto median = [](std::vector<double> v) {
+      std::sort(v.begin(), v.end());
+      return v.empty() ? NAN : (v.size() % 2 ? v[v.size() / 2] : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]));
+    };
+    std::string js = "{";
+    double lb_sum = 0;
+    fprintf(stderr, "  phases (N=%d, m=%lld n=%lld k=%lld b=%lld):\n", N, (long long)d[0],
+            (long long)d[1], (long long)d[2], (long long)d[3]);
+    for (auto& t : order) {
+      const double t_ms = median(per[t]);
+      const double l_ms = lb.count(t) ? lb[t] * 1e3 : NAN;
+      if (lb.count(t) && t != "K0 vec") lb_sum += l_ms;
+      Json p;
+      p.num("ms", t_ms).num("lb_ms", l_ms).num("pct_of_lb", 100.0 * l_ms / t_ms).integer("marks", launches[t]);
+      js += (js.size() > 1 ? ", " : "") + jstr(t) + ": " + p.dump();
+      fprintf(stderr, "    %-14s %9.3f ms  LB %9.3f ms  %5.1f %% of LB  (%d marks)\n", t.c_str(),
+              t_ms, l_ms, 100.0 * l_ms / t_ms, launches[t]);
+    }
+    js += "}";
+    const double tot = median(totals);
+    fprintf(stderr, "    %-14s %9.3f ms  LB %9.3f ms  %5.1f %% of LB (excl. K0)\n", "total", tot, lb_sum,
+            100.0 * lb_sum / tot);
+    Json e;
+    e.raw("phases", js).num("phase_total_ms", tot).num("phase_lb_ms", lb_sum).integer("phase_reps", o.phase_reps);
+    e.str("phase_view", std::to_string(d[0]) + "x" + std::to_string(d[1]) + "x" + std::to_string(d[2]) +
+                            " b=" + std::to_string(d[3]) + " n_hat=" + std::to_string(d[4]) +
+                            " k_hat=" + std::to_string(d[5]));
+    return e;
+  }
+#endif
 
   void method_bw() {
     DevBuf dst(dA.bytes);
@@ -873,7 +968,8 @@ void usage() {
   fprintf(stderr,
           "usage: imd_bench --name NAME --spec 'ab,bc->ac' --ext a=..,b=..,c=.. [--methods LIST]\n"
           "  [--N 8,14,20] [--emu dyn,fix55] [--emu-ws-mib 2048] [--reps 10] [--warmup 2]\n"
-          "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--out file.jsonl]\n");
+          "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--phase-reps 5]\n"
+          "  [--out file.jsonl]\n");
 }
 
 }  // namespace
@@ -896,6 +992,7 @@ int main(int argc, char** argv) {
     if (a.count("warmup")) B.o.warmup = std::stoi(a["warmup"]);
     if (a.count("max-seconds")) B.o.max_seconds = std::stod(a["max-seconds"]);
     if (a.count("samples")) B.o.samples = std::stoll(a["samples"]);
+    if (a.count("phase-reps")) B.o.phase_reps = std::stoi(a["phase-reps"]);
     if (a.count("phi")) B.o.phi = std::stod(a["phi"]);
     if (a.count("seed")) B.o.seed = std::stoull(a["seed"]);
     B.o.min_reps = std::min(B.o.min_reps, B.o.reps);
