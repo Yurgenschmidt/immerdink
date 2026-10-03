@@ -1,4 +1,4 @@
-# Dedicated env for immerdink (not created yet):
+# Dedicated env for immerdink:
 #   mamba env create -f environment.yml
 name: immerdink
 channels: [conda-forge]
