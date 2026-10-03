@@ -16,29 +16,14 @@
 #   because the constant-level specs stutter forever by design).
 #
 # Model checking is a pass/fail correctness check (CPU contention cannot change
-# its result), so it is NOT gated on a quiet machine by default. Knobs:
+# its result), so it is never gated on a quiet machine (user decision,
+# 2026-10-02; CHECK_QUIET is ignored). Knobs:
 #   TLC_JOBS     models run concurrently (default: nproc/4, at least 1)
 #   TLC_WORKERS  TLC worker threads per model (default 1; raise for big models)
-#   CHECK_QUIET=1  serialize machine-wide and wait for tools/quiet_check.sh first
-#                  (QUIET_WAIT seconds, default 900), as benchmarks do.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"; cd "$here"
 JAR="${TLA2TOOLS:-$(ls -d "$HOME"/.vscode/extensions/tlaplus.vscode-ide-*/tools/tla2tools.jar 2>/dev/null | tail -1)}"
 [ -f "$JAR" ] || { echo "tla2tools.jar not found; set TLA2TOOLS" >&2; exit 2; }
-
-if [ "${CHECK_QUIET:-0}" = 1 ]; then
-  exec 9>"${TLC_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/immerdink-tlc.lock}"
-  flock 9
-  waited=0
-  until ../tools/quiet_check.sh >/dev/null 2>&1; do
-    if [ "$waited" -ge "${QUIET_WAIT:-900}" ]; then
-      echo "machine not quiet after ${waited}s; not running TLC" >&2
-      ../tools/quiet_check.sh >&2; exit 3
-    fi
-    [ "$waited" = 0 ] && echo "waiting for a quiet machine..." >&2
-    sleep 15; waited=$((waited + 15))
-  done
-fi
 
 shopt -s nullglob
 cfgs=( MC_${1:-*}__${2:-*}.cfg )
