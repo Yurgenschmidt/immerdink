@@ -93,24 +93,6 @@ imd_status_t imd_workspace_size(const imd_tensor_t* A, const imd_tensor_t* B,
   });
 }
 
-imd_status_t imd_workspace_layout(const imd_tensor_t* A, const imd_tensor_t* B,
-                                  const imd_tensor_t* C, const imd_options_t* options,
-                                  imd_region_t* regions, int32_t capacity,
-                                  int32_t* num_regions, size_t* total) {
-  if (capacity < 0 || (capacity > 0 && regions == nullptr)) return IMD_STATUS_INVALID_VALUE;
-  return guarded([&] {
-    Analysis an;
-    if (const imd_status_t st = imd::detail::analyze(A, B, C, options, &an);
-        st != IMD_STATUS_SUCCESS)
-      return st;
-    const int32_t n = std::min<int32_t>(capacity, IMD_REGION_COUNT);
-    for (int32_t r = 0; r < n; ++r) regions[r] = {an.layout.offset[r], an.layout.bytes[r]};
-    if (num_regions != nullptr) *num_regions = IMD_REGION_COUNT;
-    if (total != nullptr) *total = static_cast<size_t>(an.layout.total);
-    return IMD_STATUS_SUCCESS;
-  });
-}
-
 const char* imd_region_name(int32_t region) {
   static const char* const kNames[IMD_REGION_COUNT] = {"sA", "sB", "fA", "fB",
                                                        "vec", "RA", "RB", "W"};
@@ -253,6 +235,13 @@ imd_status_t imd_workspace_size_packed(const imd_tensor_t* A, const imd_tensor_t
     *bytes = static_cast<size_t>(an.layout.total);
     return IMD_STATUS_SUCCESS;
   });
+}
+
+imd_status_t imd_workspace_layout(const imd_tensor_t* A, const imd_tensor_t* B,
+                                  const imd_tensor_t* C, const imd_options_t* options,
+                                  imd_region_t* regions, int32_t capacity,
+                                  int32_t* num_regions, size_t* total) {
+  return layout_impl(A, B, C, options, nullptr, regions, capacity, num_regions, total);
 }
 
 imd_status_t imd_workspace_layout_packed(const imd_tensor_t* A, const imd_tensor_t* B,
