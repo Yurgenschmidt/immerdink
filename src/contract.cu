@@ -78,6 +78,7 @@ __global__ void __launch_bounds__(kThreads) k1_scale(ScaleArgs a) {
     const double* X = a.op.X + (a.op.v_bat[lam] + a.op.v_row[i]);
     // pass 1: flag and gamma = max ilogb over finite nonzero entries
     int gmax = INT_MIN, flag = 0;
+#pragma unroll 4
     for (int64_t h = threadIdx.x; h < a.k; h += blockDim.x) {
       const uint64_t bits = to_bits(X[a.op.v_k[h]]);
       if (non_finite(bits)) flag = 1;
@@ -99,6 +100,7 @@ __global__ void __launch_bounds__(kThreads) k1_scale(ScaleArgs a) {
     // pass 2: S = sum ceil(m_h^2 2^(2(e_h - gamma) + F)), exact (order-independent)
     u128 S = 0;
     if (gmax != INT_MIN) {
+#pragma unroll 4
       for (int64_t h = threadIdx.x; h < a.k; h += blockDim.x) {
         const uint64_t bits = to_bits(X[a.op.v_k[h]]);
         if (finite_nonzero(bits)) S += square_term(bits, gmax);
@@ -155,6 +157,102 @@ inline int pack_tile_lg_rows(bool along_rows, int64_t D) {
   int lg = 3;
   while (lg < 6 && (int64_t{1} << lg) < D) ++lg;
   return lg;
+}
+
+// K1 over the pack's row tiles (NOTES-M2M3 #5), used when the pack reads along rows (the
+// operand's smallest-|stride| mode is a row / batch mode, so reading one row along k-bar
+// would be strided). A block takes th rows rho = lo + radix * d, d in [d0, d0 + th), over
+// all of k-bar; thread tid always works on row dl = tid mod th, so a warp reads th rows
+// side by side (coalesced along the pivot) and 32 / th consecutive k-bar. Same two passes
+// and the same exact integers as k1_scale: gamma (and the flag) per row, then S per row;
+// the per-thread partial results are combined in shared memory (max, or, u128 sum: exact
+// and order-independent).
+__global__ void __launch_bounds__(kThreads) k1_tiled(ScaleArgs a, int64_t radix, int lg_th) {
+  __shared__ int s_max[kThreads];
+  __shared__ int s_flag[kThreads];
+  __shared__ u128 s_sum[kThreads];
+  __shared__ int64_t s_base[kTileRowsMax];
+  __shared__ bool s_valid[kTileRowsMax];
+  __shared__ int s_gamma[kTileRowsMax];
+  __shared__ int s_rflag[kTileRowsMax];
+  const int tid = threadIdx.x, th = 1 << lg_th, dl = tid & (th - 1);
+  const int h_first = tid >> lg_th, h_step = kThreads >> lg_th, per_row = kThreads >> lg_th;
+  const int64_t rows = a.op.rows, D = a.b * rows / radix, n_d = (D + th - 1) >> lg_th;
+  const int64_t tiles = radix * n_d;
+  for (int64_t t = blockIdx.x; t < tiles; t += gridDim.x) {
+    const int64_t dt = t % n_d, lo = t / n_d;
+    if (tid < th) {
+      const int64_t d = (dt << lg_th) + tid;
+      s_valid[tid] = d < D;
+      if (d < D) {
+        const int64_t rho = lo + radix * d, lam = rho / rows, r = rho % rows;
+        s_base[tid] = a.op.v_bat[lam] + a.op.v_row[r];
+      }
+    }
+    __syncthreads();
+    const bool valid = s_valid[dl];
+    const double* X = a.op.X + (valid ? s_base[dl] : 0);
+    // pass 1: flag and gamma
+    int gmax = INT_MIN, flag = 0;
+    if (valid) {
+#pragma unroll 4
+      for (int64_t h = h_first; h < a.k; h += h_step) {
+        const uint64_t bits = to_bits(X[a.op.v_k[h]]);
+        if (non_finite(bits)) flag = 1;
+        else if (finite_nonzero(bits)) gmax = max(gmax, ilogb_bits(bits));
+      }
+    }
+    s_max[tid] = gmax;
+    s_flag[tid] = flag;
+    __syncthreads();
+    if (tid < th) {
+      int g = INT_MIN, f = 0;
+      for (int u = 0; u < per_row; ++u) {
+        g = max(g, s_max[tid + (u << lg_th)]);
+        f |= s_flag[tid + (u << lg_th)];
+      }
+      s_gamma[tid] = g;
+      s_rflag[tid] = f;
+    }
+    __syncthreads();
+    // pass 2: S
+    gmax = s_gamma[dl];
+    u128 S = 0;
+    if (valid && gmax != INT_MIN) {
+#pragma unroll 4
+      for (int64_t h = h_first; h < a.k; h += h_step) {
+        const uint64_t bits = to_bits(X[a.op.v_k[h]]);
+        if (finite_nonzero(bits)) S += square_term(bits, gmax);
+      }
+    }
+    s_sum[tid] = S;
+    __syncthreads();
+    if (tid < th && s_valid[tid]) {
+      const int64_t rho = lo + radix * ((dt << lg_th) + tid);
+      const int g = s_gamma[tid];
+      int sigma = 0;  // zero row: sigma := 0
+      if (g != INT_MIN) {
+        u128 tot = 0;
+        for (int u = 0; u < per_row; ++u) tot += s_sum[tid + (u << lg_th)];
+        sigma = largest_u(tot, a.lhs_shift, a.rhs, a.rhs_bits) - g;
+      }
+      a.sigma[rho] = static_cast<int16_t>(sigma);
+      a.flag[rho] = static_cast<uint8_t>(s_rflag[tid]);
+    }
+    __syncthreads();  // shared arrays are reused by the next tile
+  }
+}
+
+// Blocks for a two-pass kernel whose blocks each re-read `bytes_per_block`: enough to fill
+// the GPU, but few enough that the rows in flight (about 40 MB) stay in the 72 MB L2 for
+// the second pass.
+unsigned k1_blocks(int64_t work_items, double bytes_per_block) {
+  int dev = 0, sms = 128;
+  if (cudaGetDevice(&dev) == cudaSuccess)
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  const double fit = 40.0 * (1 << 20) / std::max(1.0, bytes_per_block);
+  const int64_t cap = std::max<int64_t>(2 * int64_t{sms}, static_cast<int64_t>(fit));
+  return blocks_for(std::min(work_items, cap), 1);
 }
 
 struct PackArgs {
@@ -495,12 +593,22 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
   ScaleArgs sa{};
   sa.b = p.b, sa.k = p.k, sa.rhs_bits = p.rhs_bits, sa.lhs_shift = p.lhs_shift;
   for (int w = 0; w < 4; ++w) sa.rhs[w] = p.rhs[w];
-  sa.op = opA, sa.sigma = sA, sa.flag = fA;
-  k1_scale<<<blocks_for(p.b * p.m, 1), kThreads, 0, stream>>>(sa);
-  IMD_PROF(stream, "K1 scale A");
-  sa.op = opB, sa.sigma = sB, sa.flag = fB;
-  k1_scale<<<blocks_for(p.b * p.n, 1), kThreads, 0, stream>>>(sa);
-  IMD_PROF(stream, "K1 scale B");
+  for (int x = 0; x < 2; ++x) {
+    sa.op = x == 0 ? opA : opB;
+    sa.sigma = x == 0 ? sA : sB;
+    sa.flag = x == 0 ? fA : fB;
+    const int64_t rows = p.b * sa.op.rows;
+    if (p.pack_along_rows[x]) {  // rows are read side by side: tiles as in the pack
+      const int64_t radix = p.pack_radix[x], D = rows / radix;
+      const int lg_th = pack_tile_lg_rows(true, D);
+      const int64_t tiles = radix * ((D + (int64_t{1} << lg_th) - 1) >> lg_th);
+      k1_tiled<<<k1_blocks(tiles, 8.0 * double(p.k) * double(int64_t{1} << lg_th)), kThreads, 0,
+                 stream>>>(sa, radix, lg_th);
+    } else {
+      k1_scale<<<k1_blocks(rows, 8.0 * double(p.k)), kThreads, 0, stream>>>(sa);
+    }
+    IMD_PROF(stream, x == 0 ? "K1 scale A" : "K1 scale B");
+  }
   if (cudaPeekAtLastError() != cudaSuccess) return IMD_STATUS_CUDA_ERROR;
 
   // K2 / K3 / K4 per residue group
