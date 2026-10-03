@@ -3,3 +3,6 @@ spec/*_TTrace_*
 spec/states/
 spec/__pycache__/
 tools/apalache/
+
+# Lean / Lake build artifacts
+proofs/.lake/
