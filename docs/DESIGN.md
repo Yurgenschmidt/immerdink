@@ -353,16 +353,18 @@ K5 crt      (unchanged)
 KL_x        per row tile (th rows × all of k̂; th·tk = 4096 FP64, tk = pow2 ≤ 4096; a row
             spans nc = ⌈k̂/tk⌉ chunks of tk): ONE CTA owns whole rows
   pass 1    chunks c = 0..nc−1 gathered through the scatter vectors (ws.vec or the plan's
-            copy) into shared memory, coalesced as in K2/K3; per thread 16 consecutive k̄ of
-            one row: flag, γ; chunk 0 kept in registers, chunk nc−1 stays in shared memory
-  reduce    per row over its tk/16 threads (warp shuffles + a shared-memory combine): flag,
+            copy; h·stride when the K class is one fused mode) into shared memory, coalesced
+            as in K2/K3; per thread E consecutive k̄ of one row (E = 8 with 512 threads, 2
+            CTAs per SM, for nc ≤ 2; E = 4 with 1024 threads, 1 CTA per SM, for nc > 2):
+            flag, γ; chunk 0 kept in registers, chunk nc−1 stays in shared memory
+  reduce    per row over its tk/E threads (warp shuffles + a shared-memory combine): flag,
             γ = the §3.2 row exponent
   pass 2    S over chunk 0 (registers), chunk nc−1 (shared memory), then chunks nc−2 … 1
             re-read (most recently read first: from L2); per row σ = largest_u(S) − γ: the
             same exact integers as K1 (max, or, u128 sum: order-independent)
-  pass 3    §3.3/§3.4 residues of every slot of group 1 (K-contiguous 16-byte stores, as
-            K2/K3): chunk 0 (registers), the chunk in shared memory, then the others re-read
-            ascending (from L2)
+  pass 3    §3.3/§3.4 residues of every slot of group 1 (K-contiguous 8- or 4-byte stores
+            per thread, coalesced per warp): chunk 0 (registers), the chunk in shared memory,
+            then the others re-read ascending (from L2)
   store     σ/τ and the flag (one thread per row); KL_B also zeroes RB rows n..n̂−1 of
             group 1 (grid-strided, after its rows)
 ```
@@ -386,12 +388,14 @@ DRAM traffic of operand x (|x| = 8·b·rows·k bytes), before → after, group 1
 `2|x|` (K1 pass 1 + pack; K1's pass 2 from L2) → `|x|`; the residue writes are unchanged.
 Every later group still reads |x| once (below: g). On chip: chunk 0 in registers and the last
 chunk in shared memory, so rows with nc ≤ 2 (k̂ ≤ 8192 read along k̄) are read exactly once;
-longer rows re-read nc − 2 chunks from L2 in pass 2 and in pass 3. The rows in flight
-(resident CTAs × th rows × 8k̂ bytes) are kept within an L2 budget of 64 MiB (as K1, A3):
-with nc > 2, a grid of more than one CTA per SM only while 2·SMs·th·8k̂ ≤ 64 MiB, else one
-CTA per SM (r_mm-like 400 KB rows: 51 MB in flight). Rows beyond 64 MiB / SMs (k̂ > 65536 on
-128 SMs) partly miss L2 in passes 2/3; pass 2 walking backwards and pass 3 forwards keeps
-the most recently read chunks first, and the DRAM reads never exceed the unfused path's.
+longer rows re-read nc − 2 chunks from L2 in pass 2 and in pass 3. With nc > 2 one
+1024-thread CTA per SM is resident, so the rows in flight are SMs × th × 8k̂ bytes (r_bigk
+32 MB, r_mm-like 400 KB rows 51 MB: inside K1's 64 MiB L2 budget, A3). Rows beyond 64 MiB /
+SMs (k̂ > 65536 on 128 SMs) partly miss L2 in passes 2/3; pass 2 walking backwards and pass 3
+forwards keeps the most recently read chunks first, and the DRAM reads never exceed the
+unfused path's. (The threads per CTA and E are launch choices measured in NOTES-D4 §2: 8
+values per thread is 10–15 % faster than 16 on on-chip rows, 4 is 10–35 % faster than 16 on
+re-read rows; they change no result.)
 
 **Residue groups (g < N).** KL removes one DRAM read of x whatever g: `(1 + ⌈N/g⌉)|x|` →
 `⌈N/g⌉|x|` (N = 14: g = 14: 2 → 1; g = 7: 3 → 2; g = 2: 8 → 7). Cutting the later groups'

@@ -320,7 +320,7 @@ struct PackArgs {
 // table, then the sign and SMod. Same congruence class as §3.4 `residue`, so the same int8.
 template <int E>  // E consecutive k-bar of one row: 16 (one uint4 per modulus) or 4 (one u32)
 struct PackEmitterT {
-  static_assert(E == 16 || E == 4, "16 or 4 values per emitter");
+  static_assert(E == 16 || E == 8 || E == 4, "16, 8 or 4 values per emitter");
   uint32_t lo[E], hi[E];  // mu = hi 2^32 + lo < 2^54
   int eps[E];
   uint32_t neg = 0, has_eps = 0;  // bit e: a'_e < 0 / eps_e > 0
@@ -373,6 +373,8 @@ struct PackEmitterT {
     emit(l, w);
     if constexpr (E == 16)
       *reinterpret_cast<uint4*>(dst) = make_uint4(w[0], w[1], w[2], w[3]);
+    else if constexpr (E == 8)
+      *reinterpret_cast<uint2*>(dst) = make_uint2(w[0], w[1]);
     else
       *reinterpret_cast<uint32_t*>(dst) = w[0];
   }
@@ -1000,12 +1002,12 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
 // ---- KL: K1 + group 1's K2 / K3 of ONE operand in one launch (DESIGN v1.6 §4) ------------
 //
 // For plans without KF (k_hat > kKfKMax), per operand with its fused_large bit (analysis.hpp
-// fused_large). A block of 256 threads owns whole rows: a tile of th rows by tk k-bar
+// fused_large). A block of 4096 / E threads owns whole rows: a tile of th rows by tk k-bar
 // (th tk = kTileElems, the k23_pack tile, shared-memory layout and read phase; reading along
 // k-bar tk = pow2 >= k_hat up to 4096, reading along rows th = 8), and a row of k_hat spans
-// nc = ceil(k_hat / tk) chunks of tk. In every chunk each thread works on the 16 consecutive
-// k-bar of one row it converts in k23_pack (a row's tk / 16 threads are consecutive lanes, of
-// one warp or of consecutive warps). Per tile:
+// nc = ceil(k_hat / tk) chunks of tk. In every chunk each thread works on E consecutive k-bar
+// of one row (E = 8, or 4 for rows of more than two chunks; a row's tk / E threads are
+// consecutive lanes, of one warp or of consecutive warps). Per tile:
 //   pass 1  chunks 0 .. nc-1 gathered into shared memory: the flag and gamma (max ilogb);
 //           chunk 0 is kept in registers, chunk nc-1 stays in shared memory;
 //   reduce  per row over its threads (warp shuffles, a shared-memory combine across warps);
@@ -1039,19 +1041,22 @@ __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl
   else if (finite_nonzero(bits)) gmax = max(gmax, ilogb_bits(bits));
 }
 
-__global__ void __launch_bounds__(kThreads, 2) kl_scale_pack(const __grid_constant__ LargeArgs a) {
+template <int E>  // values per thread: 8 (512 threads, 2 CTAs per SM) or 4 (1024 threads)
+__global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
+    kl_scale_pack(const __grid_constant__ LargeArgs a) {
+  constexpr int T = kTileElems / E, kLgE = E == 16 ? 4 : E == 8 ? 3 : 2;
   __shared__ uint64_t tile[kTileSmem];
   __shared__ int64_t s_base[kTileRowsMax];  // v_bat[lambda] + v_row[r]
   __shared__ bool s_valid[kTileRowsMax];
-  __shared__ int s_wg[kThreads / 32];
-  __shared__ unsigned s_wf[kThreads / 32];
-  __shared__ u128 s_ws[kThreads / 32];
+  __shared__ int s_wg[T / 32];
+  __shared__ unsigned s_wf[T / 32];
+  __shared__ u128 s_ws[T / 32];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int lg_th = a.lg_th, th = 1 << lg_th, lg_tk = 12 - lg_th, tk = 1 << lg_tk;
   const int pitch = tk + tk / kVec + 1;
-  const int G = tk / kVec, Gw = G < 32 ? G : 32;  // threads per row; G | 32 or 32 | G
+  const int G = tk / E, Gw = G < 32 ? G : 32;  // threads per row; G | 32 or 32 | G
   const int nw = G > 32 ? G / 32 : 1, w0 = warp & ~(nw - 1);  // the row's warps (G > 32)
-  const int dl = tid >> (lg_tk - 4), hl = (tid & (G - 1)) * kVec;  // this thread: row, k-bar
+  const int dl = tid >> (lg_tk - kLgE), hl = (tid & (G - 1)) * E;  // this thread: row, k-bar
   const uint64_t* mine = tile + dl * pitch + hl + hl / kVec;
   const int64_t rows = a.op.rows, D = a.b * rows / a.radix;
   const int64_t n_d = (D + th - 1) >> lg_th, tiles = a.radix * n_d;
@@ -1074,8 +1079,8 @@ __global__ void __launch_bounds__(kThreads, 2) kl_scale_pack(const __grid_consta
     const auto load = [&](int64_t c) {
       const int64_t h0 = c << lg_tk, h_end = a.k - h0;
 #pragma unroll 4
-      for (int it = 0; it < kTileElems / kThreads; ++it) {
-        const int q = tid + it * kThreads;
+      for (int it = 0; it < E; ++it) {
+        const int q = tid + it * T;
         const int ql = a.along_rows ? (q & (th - 1)) : (q >> lg_tk);
         const int qh = a.along_rows ? (q >> lg_th) : (q & (tk - 1));
         uint64_t v = 0;
@@ -1089,19 +1094,19 @@ __global__ void __launch_bounds__(kThreads, 2) kl_scale_pack(const __grid_consta
     // pass 1: flag and gamma; chunk 0 into registers
     load(0);
     __syncthreads();
-    uint64_t r0[kVec];
+    uint64_t r0[E];
 #pragma unroll
-    for (int e = 0; e < kVec; ++e) r0[e] = mine[e];
+    for (int e = 0; e < E; ++e) r0[e] = mine[e];
     int gmax = INT_MIN;
     unsigned fl = 0;
 #pragma unroll
-    for (int e = 0; e < kVec; ++e) scan_bits(r0[e], gmax, fl);
+    for (int e = 0; e < E; ++e) scan_bits(r0[e], gmax, fl);
     for (int64_t c = 1; c < nc; ++c) {
       __syncthreads();  // every thread has taken chunk c - 1
       load(c);
       __syncthreads();
 #pragma unroll
-      for (int e = 0; e < kVec; ++e) scan_bits(mine[e], gmax, fl);
+      for (int e = 0; e < E; ++e) scan_bits(mine[e], gmax, fl);
     }
     for (int o = Gw / 2; o > 0; o /= 2) {
       gmax = max(gmax, __shfl_xor_sync(0xffffffffu, gmax, o));
@@ -1117,13 +1122,13 @@ __global__ void __launch_bounds__(kThreads, 2) kl_scale_pack(const __grid_consta
     u128 S = 0;
     if (live) {
 #pragma unroll
-      for (int e = 0; e < kVec; ++e)
+      for (int e = 0; e < E; ++e)
         if (finite_nonzero(r0[e])) S += square_term(r0[e], gmax);
     }
     if (nc > 1) {
       if (live) {  // chunk nc - 1, still in shared memory
 #pragma unroll
-        for (int e = 0; e < kVec; ++e) {
+        for (int e = 0; e < E; ++e) {
           const uint64_t bits = mine[e];
           if (finite_nonzero(bits)) S += square_term(bits, gmax);
         }
@@ -1134,7 +1139,7 @@ __global__ void __launch_bounds__(kThreads, 2) kl_scale_pack(const __grid_consta
         __syncthreads();
         if (live) {
 #pragma unroll
-          for (int e = 0; e < kVec; ++e) {
+          for (int e = 0; e < E; ++e) {
             const uint64_t bits = mine[e];
             if (finite_nonzero(bits)) S += square_term(bits, gmax);
           }
@@ -1165,9 +1170,9 @@ __global__ void __launch_bounds__(kThreads, 2) kl_scale_pack(const __grid_consta
       dst_off = (lam * a.rows_pad + r) * a.k_hat + hl;
     }
     // pass 3: residues of every slot of group 1 (K padding h in [k, k_hat) is zero)
-    const auto emit = [&](const uint64_t (&bits)[kVec], int64_t c) {
+    const auto emit = [&](const uint64_t (&bits)[E], int64_t c) {
       if (valid && (c << lg_tk) + hl < a.k_hat) {  // k_hat is a multiple of 16
-        PackEmitter em;
+        PackEmitterT<E> em;
         em.load(bits, sigma, a.trunc != 0);
         int8_t* dst = a.R + dst_off + (c << lg_tk);
         for (int s = 0; s < a.gsize; ++s) em.store(s, dst + s * plane);
@@ -1180,16 +1185,16 @@ __global__ void __launch_bounds__(kThreads, 2) kl_scale_pack(const __grid_consta
         load(c);
         __syncthreads();
       }
-      uint64_t bits[kVec];
+      uint64_t bits[E];
 #pragma unroll
-      for (int e = 0; e < kVec; ++e) bits[e] = mine[e];
+      for (int e = 0; e < E; ++e) bits[e] = mine[e];
       emit(bits, c);
     }
     __syncthreads();  // the tile and the row info are reused by the next tile
   }
   // B rows n..n_hat-1 of every (slot, lambda) of group 1: zero (as k23_zero_rows)
   if (a.rows_pad > rows) {
-    const int64_t gt = blockIdx.x * int64_t{kThreads} + tid, gs = int64_t{gridDim.x} * kThreads;
+    const int64_t gt = blockIdx.x * int64_t{T} + tid, gs = int64_t{gridDim.x} * T;
     const int64_t pad_vecs = (a.rows_pad - rows) * a.k_hat / kVec;
     for (int64_t idx = gt; idx < int64_t{a.gsize} * a.b * pad_vecs; idx += gs) {
       const int64_t v = idx % pad_vecs, sl = idx / pad_vecs;
@@ -1233,12 +1238,15 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
   const int64_t th = int64_t{1} << lg_th, tk = kTileElems / th;
   const int64_t nc = (p.k_hat + tk - 1) / tk;
   const int64_t D = p.b * op.rows / a.radix, tiles = a.radix * ((D + th - 1) / th);
-  // Rows re-read in passes 2 / 3 (nc > 2) stay in L2 while the rows in flight fit the budget
-  // (two CTAs per SM); beyond it one CTA per SM (as K1, A3).
-  int64_t cap = kMaxBlocks;
-  if (nc > 2 && 2.0 * p.sms * double(th) * 8.0 * double(p.k_hat) > kK1L2BudgetBytes) cap = p.sms;
-  kl_scale_pack<<<static_cast<unsigned>(std::max<int64_t>(1, std::min(tiles, cap))), kThreads, 0,
-                  stream>>>(a);
+  // Threads per CTA (NOTES-D4 §2): rows held on chip (nc <= 2): 8 values per thread, 512
+  // threads, two CTAs per SM; longer rows (chunks re-read from L2): 4 values per thread, 1024
+  // threads, one CTA per SM, which also keeps the rows in flight at SMs x th x 8 k_hat bytes
+  // (r_bigk 32 MB, r_mm 51 MB: inside the L2 budget of K1, A3).
+  const unsigned grid = static_cast<unsigned>(std::max<int64_t>(1, std::min(tiles, kMaxBlocks)));
+  if (nc > 2)
+    kl_scale_pack<4><<<grid, kTileElems / 4, 0, stream>>>(a);
+  else
+    kl_scale_pack<8><<<grid, kTileElems / 8, 0, stream>>>(a);
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
 
