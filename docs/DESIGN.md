@@ -124,8 +124,11 @@ significand:
 - Soundness needs `2T − κ ≥ 1`. At `κ = 2T` no u exists; beyond that the squared rule is
   unsound. **[spec: OzakiScaling pos_kappa_2Tm1, neg_kappa_2T, neg_noreject]**
 - As an accuracy policy, plan time rejects `κ ≥ T` (NOT_SUPPORTED: "N too small for this
-  k"). It does so only in EMULATE with a non-empty output and k ≥ 2, and the rule is
-  independent of α.
+  k"). It applies only to RN (TRUNC has no κ term), only in EMULATE with a non-empty
+  output and k ≥ 2, and is independent of α. (At real sizes, T(N) ≥ 180 makes the k ≥ 2
+  clause implied; it is kept for a symbolic T.) It is the **last** plan-time check, after
+  every §5 row, so e.g. a GemmCoord overflow reports INVALID_VALUE first.
+  **[spec: IndexMap pos_kappa, neg_kappa_{drop,direct,empty,k,trunc}]**
 - The §3.8 bound already exceeds 1 well before that, once `κ ≳ 0.4T`. So choose N with
   `params.py --table`.
 
@@ -316,6 +319,9 @@ Properties checked by **[spec: Pipeline]**:
 **Launch limits.**
 - The CUTLASS batch count `|G|·b` must be ≤ 65535 (gridDim.z), so plan time splits it.
 - The N-tile count must be ≤ 65535 (gridDim.y), so n̂ is split across launches if needed.
+  The last launch may end in a partial N tile; CUTLASS predicates columns past n̂, and
+  the threadblock N (128 or 256 today) must be a multiple of 16 so every launch's B and W
+  pointers stay 16-byte aligned. **[spec: Pipeline pos_ysplit*, neg_ysplit_*, neg_ytile_misaligned]**
 - `m, n̂ ≤ 2³¹−1` (`GemmCoord` is int), and the per-launch K is ≤ K_c'.
 - `lda = ldb = k̂` and `ldc = n̂`. The batch strides are int64, so k̂ itself may exceed 2³¹.
 
