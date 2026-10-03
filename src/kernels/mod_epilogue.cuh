@@ -1,5 +1,9 @@
 // K4 epilogue (DESIGN §3.5, §4): int32 accumulator -> non-negative residue mod p_l -> u8.
 //
+// Since A2 the library's K4 is kernels/k4_gemm.cuh (register-only epilogue). This CUTLASS
+// EVT node is the pre-A2 realization, kept as a second, independent implementation that
+// tests/test_cutlass_mod_epilogue.cu checks against the same reference as K4Gemm.
+//
 // A CUTLASS 2.x Sm80 epilogue-visitor node. One batched launch covers several moduli:
 // batch z = s*b + lambda (s = slot in the residue group, b = batch count of the GEMM view),
 // and the node reads p_l and its reduction constants from the __constant__ table at

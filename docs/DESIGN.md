@@ -329,8 +329,9 @@ v1.2 keeps the one-launch K1.
 **Per-batch modulus in K4.**
 - One batched launch covers several moduli. A plain `VisitorScalarBroadcast` cannot
   express `slot = z div b`, because that is not linear in z.
-- The epilogue's compute node therefore reads `p` and the Barrett constant from a
-  `__constant__` table indexed by `g0 + blockIdx.z / b`.
+- The epilogue therefore reads `p` and the Barrett constants from a `__constant__` table
+  indexed by `g0 + (z0 + z) / b` (z: the tile's batch in the launch, z0: the launch's first
+  batch), once per tile.
 - That table is at most 20 entries and needs no workspace.
 
 **Padding.**
@@ -364,6 +365,9 @@ Properties checked by **[spec: Pipeline]**:
   - So v1 is single-stream.
 
 **Launch limits.**
+- (A2: the persistent K4Gemm grid has no gridDim limits of its own; the two splits below
+  were CUTLASS grid limits and are kept unchanged, so the launch structure, the host
+  queries that count it and the Pipeline spec are the same.)
 - The CUTLASS batch count `|G|·b` must be ≤ 65535 (gridDim.z), so plan time splits it.
 - The N-tile count must be ≤ 65535 (gridDim.y), so n̂ is split across launches if needed.
   The last launch may end in a partial N tile; CUTLASS predicates columns past n̂, and
@@ -373,16 +377,26 @@ Properties checked by **[spec: Pipeline]**:
 - `lda = ldb = k̂` and `ldc = n̂`. The batch strides are int64, so k̂ itself may exceed 2³¹.
 
 **GEMM configuration [CUT]:**
-- CUTLASS 2.x `gemm::device::GemmUniversal`, mode `kBatched`, `arch::Sm80` on sm_89.
-- int8 `mma.sync.m16n8k32`, `OpMultiplyAddSaturate`.
+- Our kernel `K4Gemm` (`src/kernels/k4_gemm.cuh`, A2) around CUTLASS 2.x's threadblock
+  main loop (`DefaultMma` → `MmaMultistage`, `arch::Sm80` on sm_89), batched.
+- int8 `mma.sync.m16n8k32`, `OpMultiplyAddSaturate` (`.satfinite`; measured free against
+  the wrapping form, docs/NOTES-A2.md).
 - TN layout: A RowMajor, B ColumnMajor, both K-contiguous. Alignment is 16, hence
   `k̂ = ⌈k⌉₁₆` and `n̂ = ⌈n⌉₁₆`.
-- `Sm80EVT` epilogue:
-  - a compute node implementing §3.5's exact reduction;
-  - `VisitorAuxLoad<u8>` for chunk continuation;
-  - `VisitorAuxStore<u8>`.
-- Tile menu (99 KB of smem): 256×128×64 s3 or 128×256×64 s3; 128×128×64 s4–5;
-  64×128×64 s6; 64×64×64 s6–10. Chosen by wave quantization over 128 SMs.
+- Persistent CTAs (grid = SMs × occupancy) over the launch's tiles in swizzle-8 order;
+  each CTA issues the next tile's cp.async prologue before the current tile's epilogue.
+- Epilogue in registers: each thread reduces its accumulators with §3.5's exact reduction
+  (chunk 0: `acc mod p`; later chunks: `(W + acc) mod p` with the old W bytes loaded and
+  shuffled to the accumulator layout), packs u8, and a 4×4 word transpose within each lane
+  quad gives each thread 16 consecutive bytes of a row (one 128-bit store). No shared
+  memory, no barriers. (Until A2: CUTLASS `GemmUniversal` with an `Sm80EVT` epilogue —
+  compute node, `VisitorAuxLoad<u8>`, `VisitorAuxStore<u8>` — kept in
+  `kernels/mod_epilogue.cuh` and still tested against the same reference.)
+- One tile: 128×256×64, 3 stages, 8 warps of 64×64 (72 KB smem, 1 CTA/SM). The menu
+  below was measured (M4, A2) and is not instantiated: 256×128×64 s3 and 128×256×64 s4
+  within noise; 128×128×64 s3 (2 CTAs/SM) L2-bandwidth-bound.
+  Menu (99 KB of smem): 256×128×64 s3 or 128×256×64 s3; 128×128×64 s3–5;
+  64×128×64 s6; 64×64×64 s6–10.
 - cuBLASLt (int32 out) is used only as a test oracle and baseline.
 
 **DIRECT path.**
@@ -827,3 +841,11 @@ tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH).
   `imd_lowering`. `imd_workspace_size` and `imd_status_string` move to the host library
   with unchanged declarations. No computed value, status or kernel changes, so the TLA+
   specs are unchanged; §3.2, §4, §4a and §5 remain the specification.
+
+## A2 (kernel-internal; no semantic, layout, API or spec change)
+
+- **§4 K4.** The CUTLASS `GemmUniversal` + `Sm80EVT` kernel is replaced by `K4Gemm`: the
+  same CUTLASS main loop in a persistent kernel with a register-only epilogue (see "GEMM
+  configuration"). Same launches (host/k4_launches.hpp), same §3.5 arithmetic on the same
+  values (the umulhi64 of cert_barrett is evaluated from 32-bit words), bit-identical W.
+  No cert, spec or Apalache bound changes. Measurements: docs/NOTES-A2.md.

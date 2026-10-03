@@ -12,7 +12,7 @@
 
 namespace imd::detail {
 
-// K4 tile width along n (CUTLASS threadblock N; gemm_k4.cu static_asserts it).
+// K4 tile width along n (K4Gemm threadblock N; gemm_k4.cu static_asserts it).
 constexpr int64_t kK4TileN = 256;
 constexpr int64_t kK4MaxBatch = 65535;   // gridDim.z
 constexpr int64_t kK4MaxNTiles = 65535;  // gridDim.y (identity swizzle: N tiles)
