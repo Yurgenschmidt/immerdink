@@ -15,6 +15,7 @@ struct WorkspaceShape {
   int num_moduli = 0;                  // N
   int residue_group = 0;               // g in [1, N] (0 already replaced by N)
   bool direct = false;                 // mode = DIRECT
+  bool vec_resident = false;           // vec_mode = IMD_VEC_RESIDENT (v1.2): no vec region
 };
 
 struct WorkspaceLayout {
@@ -27,6 +28,7 @@ struct WorkspaceLayout {
 //   b*m*n = 0                  -> total 0 (no regions)
 //   DIRECT, k = 0, k = 1       -> vec only (k = 1 after lowering means K is empty)
 //   otherwise                  -> sA sB fA fB vec RA RB W at cumulative 256-aligned offsets
+//   vec_resident               -> the same without vec (DIRECT, k = 0, k = 1: no regions)
 std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s);
 
 }  // namespace imd::detail

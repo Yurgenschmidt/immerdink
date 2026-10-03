@@ -61,7 +61,30 @@ Rules:
 - **K-chunking costs no memory.** Each later chunk adds into the stored u8 planes.
 - **The batch-launch split costs no memory.**
 
-Peak device memory: `P_dev = T_user + workspace_size`.
+### Scatter vectors: per call or per plan (DESIGN v1.2 `vec_mode`)
+
+```
+IMD_VEC_GENERATE (default):  W_vec is in the workspace (above); the plan owns 0 device
+                             bytes and 0 pinned bytes (O(rank) host bytes)
+IMD_VEC_RESIDENT:            the workspace has NO vec region (drop align(W_vec) above:
+                             DIRECT, k = 0 and K-empty need 0 bytes), and the plan owns
+                             D_plan = W_vec = 8·(2m + 2n + 2k + 3b) device bytes
+                             (imd_plan_device_bytes; 0 for an empty output)
+```
+
+`D_plan` is the size requested from `cudaMalloc`; the driver rounds allocations up to its
+own granularity, which is not counted. Neither mode pins host memory.
+
+Peak device memory, for one call and the plans alive at that time:
+
+```
+P_dev = T_user + workspace_size + Σ_{live plans} D_plan
+```
+
+With GENERATE the last term is 0, so `P_dev = T_user + workspace_size` as in v1.1.
+Example: m = 10⁸ rows, n = k = 64, b = 1 gives `W_vec` ≈ 1.6 GB; RESIDENT keeps that per
+plan for the plan's lifetime, GENERATE only inside the workspace of a running call (which
+the caller may share between plans used one after another).
 
 ### Worked examples (exact, from `params.workspace_size`)
 
@@ -93,7 +116,7 @@ The kernels run in sequence, so a time lower bound is the sum over kernels of
 
 | Kernel | Bytes moved | Work |
 |---|---|---|
-| K0 vec copy | `W_vec` (H2D, from pinned memory) | — |
+| K0 vec (GENERATE; none with RESIDENT) | `W_vec` written, nothing read (v1.1: an H2D copy from pinned memory) | `O(W_vec/8 · rank)` integer ops |
 | K1 scale | `s_T·b·(m·k + k·n)` read | `O(b·(mk + kn))` integer ops |
 | K2/K3 pack | `⌈N/g⌉·s_T·b·(m·k + k·n)` read + `N·b·(m·k̂ + n̂·k̂)` written | `O(N·b·(mk+kn))` |
 | K4 GEMM | `ρ·N·b·(m·k̂ + n̂·k̂)` read + `N·b·m·n̂·(2·n_chunks − 1)` u8 written/read | `2·N·b·m·n̂·k̂` int8 ops |

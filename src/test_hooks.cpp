@@ -8,6 +8,11 @@
 //       keeps every accumulator within the §3.5 bound); the others in [1, 65535].
 //       Returns 0, or 1 (nothing changed) for an invalid argument.
 //
+//   imd_test_plan_vec(plan, dev, count)
+//       The plan's resident scatter vectors (IMD_VEC_RESIDENT, DESIGN v1.2): *dev = their
+//       device address (NULL for a generate plan), *count = their int64 entries (the vec
+//       region's length in either mode). Returns 0, or 1 for a null argument.
+//
 //   imd_test_lowering(A, B, C, out, cap, count)
 //       Dump the §5 lowering (index_map.hpp) as int64s, for comparison with
 //       spec/oracle.py lower(): swapped, m, n, k, b; then per group I, J, K, L:
@@ -33,6 +38,14 @@ IMD_API int imd_test_set_limits(int64_t k_chunk, int64_t max_batch, int64_t max_
   if (max_batch < 1 || max_batch > def.max_batch) return 1;
   if (max_n_tiles < 1 || max_n_tiles > def.max_n_tiles) return 1;
   imd::detail::launch_limits() = {k_chunk, max_batch, max_n_tiles};
+  return 0;
+}
+
+IMD_API int imd_test_plan_vec(imd_plan_t plan, const int64_t** dev, int64_t* count) {
+  const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
+  if (e == nullptr || dev == nullptr || count == nullptr) return 1;
+  *dev = e->vec_resident ? e->vec_dev : nullptr;
+  *count = e->vec_count;
   return 0;
 }
 

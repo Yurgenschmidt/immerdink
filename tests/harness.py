@@ -22,6 +22,7 @@ STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT
           "MISALIGNED", "CUDA_ERROR", "ALLOC_FAILED"]
 RN, TRUNC = 0, 1
 EMULATE, DIRECT = 0, 1
+VEC_GENERATE, VEC_RESIDENT = 0, 1      # DESIGN v1.2 imd_options_t.vec_mode
 
 
 class Tensor(C.Structure):
@@ -31,7 +32,7 @@ class Tensor(C.Structure):
 
 class Options(C.Structure):
     _fields_ = [("num_moduli", C.c_int32), ("residue_group", C.c_int32),
-                ("rounding", C.c_int32), ("mode", C.c_int32)]
+                ("rounding", C.c_int32), ("mode", C.c_int32), ("vec_mode", C.c_int32)]
 
 
 def make_tensor(extent, stride, label):
@@ -66,8 +67,9 @@ class Library:
         self.lib.imd_contract.argtypes = [C.c_void_p, C.c_double, C.c_void_p, C.c_void_p,
                                           C.c_double, C.c_void_p, C.c_void_p, C.c_size_t,
                                           C.c_void_p]
+        self.lib.imd_plan_device_bytes.argtypes = [C.c_void_p, C.POINTER(C.c_size_t)]
         for f in ("imd_create", "imd_destroy", "imd_plan_create", "imd_plan_destroy",
-                  "imd_contract"):
+                  "imd_contract", "imd_plan_device_bytes"):
             getattr(self.lib, f).restype = C.c_int
         self._handle = None
         # Test-only hooks (src/test_hooks.cpp); absent from a library built without them.
@@ -78,6 +80,9 @@ class Library:
             self.lib.imd_test_lowering.argtypes = [C.POINTER(Tensor)] * 3 + \
                 [C.POINTER(C.c_int64), C.c_int64, C.POINTER(C.c_int64)]
             self.lib.imd_test_lowering.restype = C.c_int
+            self.lib.imd_test_plan_vec.argtypes = [C.c_void_p, C.POINTER(C.c_void_p),
+                                                   C.POINTER(C.c_int64)]
+            self.lib.imd_test_plan_vec.restype = C.c_int
         self.shim = None
 
     def load_alloc_shim(self, path):
@@ -126,33 +131,44 @@ class Library:
             self._handle = h
         return self._handle
 
-    def workspace_size(self, A, B, Cc, N, g=0, rounding=RN, mode=EMULATE):
+    def workspace_size(self, A, B, Cc, N, g=0, rounding=RN, mode=EMULATE, vec=VEC_GENERATE):
         out = C.c_size_t(0)
         st = self.lib.imd_workspace_size(C.byref(A), C.byref(B), C.byref(Cc),
-                                         C.byref(Options(N, g, rounding, mode)), C.byref(out))
+                                         C.byref(Options(N, g, rounding, mode, vec)), C.byref(out))
         name = self.lib.imd_status_string(st).decode()
         assert name == "IMD_STATUS_" + STATUS[st], name
         return STATUS[st], out.value
 
-    MAX_PLAN_HOST = 64 << 20   # test guard: pinned scatter-vector bytes per plan
+    MAX_PLAN_VEC = 64 << 20   # test guard: scatter-vector bytes (workspace or resident)
 
-    def plan_create(self, A, B, Cc, N, g=0, rounding=RN, mode=EMULATE):
-        """(status, plan handle or None). Test guard: a plan whose pinned scatter vectors
-        (8 (2m + 2n + 2k + 3b) bytes) exceed MAX_PLAN_HOST is never created (a descriptor
+    def plan_create(self, A, B, Cc, N, g=0, rounding=RN, mode=EMULATE, vec=VEC_GENERATE):
+        """(status, plan handle or None). Test guard: a plan whose scatter vectors
+        (8 (2m + 2n + 2k + 3b) bytes) exceed MAX_PLAN_VEC is never created (a descriptor
         that imd_workspace_size rejects fails plan creation before any allocation)."""
-        if self.has_test_hooks and self.workspace_size(A, B, Cc, N, g, rounding, mode)[0] == \
+        if self.has_test_hooks and self.workspace_size(A, B, Cc, N, g, rounding, mode, vec)[0] == \
                 "SUCCESS":
             st, lw = self.lowering(A, B, Cc)
             if st == "SUCCESS":
-                vec = 8 * (2 * (lw["m"] + lw["n"] + lw["k"]) + 3 * lw["b"])
-                assert vec <= self.MAX_PLAN_HOST, f"plan would pin {vec} bytes (test guard)"
+                nvec = 8 * (2 * (lw["m"] + lw["n"] + lw["k"]) + 3 * lw["b"])
+                assert nvec <= self.MAX_PLAN_VEC, f"plan vectors of {nvec} bytes (test guard)"
         plan = C.c_void_p()
         st = self.lib.imd_plan_create(self.handle(), C.byref(A), C.byref(B), C.byref(Cc),
-                                      C.byref(Options(N, g, rounding, mode)), C.byref(plan))
+                                      C.byref(Options(N, g, rounding, mode, vec)), C.byref(plan))
         return STATUS[st], (plan if st == 0 else None)
 
     def plan_destroy(self, plan):
         assert self.lib.imd_plan_destroy(plan) == 0
+
+    def plan_device_bytes(self, plan):
+        out = C.c_size_t(12345)
+        st = self.lib.imd_plan_device_bytes(plan, C.byref(out))
+        return STATUS[st], out.value
+
+    def plan_vec(self, plan):
+        """(device address or None, entries) of the plan's resident scatter vectors (test hook)."""
+        dev, cnt = C.c_void_p(), C.c_int64(0)
+        assert self.lib.imd_test_plan_vec(plan, C.byref(dev), C.byref(cnt)) == 0
+        return dev.value, cnt.value
 
     def contract(self, plan, alpha, A, B, beta, Cp, ws, ws_bytes, stream=None):
         return STATUS[self.lib.imd_contract(plan, alpha, A, B, beta, Cp, ws, ws_bytes, stream)]

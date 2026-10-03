@@ -25,7 +25,7 @@ static imd_status_t plan_n2(imd_handle_t h, int64_t k, int32_t rounding) {
   const int64_t ec[2] = {4, 16}, sc[2] = {16, 1};
   const int32_t la[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
   const imd_tensor_t A = {2, ea, sa, la}, B = {2, eb, sb, lb}, C = {2, ec, sc, lc};
-  const imd_options_t o = {2, 0, rounding, IMD_EMULATE};
+  const imd_options_t o = {2, 0, rounding, IMD_EMULATE, IMD_VEC_GENERATE};
   imd_plan_t plan = NULL;
   const imd_status_t st = imd_plan_create(h, &A, &B, &C, &o, &plan);
   imd_plan_destroy(plan);
@@ -39,7 +39,7 @@ int main(void) {
   const int64_t eC[3] = {17, 33, 3}, sC[3] = {99, 3, 1};
   const int32_t lA[3] = {1, 3, 4}, lB[3] = {3, 2, 4}, lC[3] = {1, 2, 4};
   const imd_tensor_t A = {3, eA, sA, lA}, B = {3, eB, sB, lB}, C = {3, eC, sC, lC};
-  const imd_options_t opt = {9, 2, IMD_RN, IMD_EMULATE};
+  const imd_options_t opt = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE};
   size_t bytes = 0;
 
   expect("workspace_size", imd_workspace_size(&A, &B, &C, &opt, &bytes), IMD_STATUS_SUCCESS);
@@ -51,6 +51,42 @@ int main(void) {
   imd_handle_t h = NULL;
   imd_plan_t plan = NULL;
   expect("create", imd_create(&h), IMD_STATUS_SUCCESS);
+  {
+    /* DESIGN v1.2 vec_mode: RESIDENT drops the vec region (30720 - 1024 = 29696, params.py
+     * cert_workspace) and the plan owns exactly 8 (34 + 66 + 10 + 9) = 952 device bytes. */
+    const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT};
+    const imd_options_t bad = {9, 2, IMD_RN, IMD_EMULATE, 2};
+    size_t dev = 1;
+    imd_plan_t pr = NULL;
+    expect("workspace_size resident", imd_workspace_size(&A, &B, &C, &res, &bytes),
+           IMD_STATUS_SUCCESS);
+    if (bytes != 29696) {
+      fprintf(stderr, "FAIL resident workspace bytes %zu, expected 29696\n", bytes);
+      ++failures;
+    }
+    expect("workspace_size vec_mode 2", imd_workspace_size(&A, &B, &C, &bad, &bytes),
+           IMD_STATUS_INVALID_VALUE);
+    expect("plan_create vec_mode 2", imd_plan_create(h, &A, &B, &C, &bad, &pr),
+           IMD_STATUS_INVALID_VALUE);
+    expect("plan_create resident", imd_plan_create(h, &A, &B, &C, &res, &pr), IMD_STATUS_SUCCESS);
+    expect("plan_device_bytes", imd_plan_device_bytes(pr, &dev), IMD_STATUS_SUCCESS);
+    if (dev != 952) {
+      fprintf(stderr, "FAIL resident plan device bytes %zu, expected 952\n", dev);
+      ++failures;
+    }
+    expect("plan_device_bytes null", imd_plan_device_bytes(pr, NULL), IMD_STATUS_INVALID_VALUE);
+    expect("plan_device_bytes null plan", imd_plan_device_bytes(NULL, &dev),
+           IMD_STATUS_INVALID_VALUE);
+    imd_plan_destroy(pr);
+    pr = NULL;
+    expect("plan_create generate", imd_plan_create(h, &A, &B, &C, &opt, &pr), IMD_STATUS_SUCCESS);
+    expect("plan_device_bytes generate", imd_plan_device_bytes(pr, &dev), IMD_STATUS_SUCCESS);
+    if (dev != 0) {
+      fprintf(stderr, "FAIL generate plan device bytes %zu, expected 0\n", dev);
+      ++failures;
+    }
+    imd_plan_destroy(pr);
+  }
   expect("plan_create null handle", imd_plan_create(NULL, &A, &B, &C, &opt, &plan),
          IMD_STATUS_INVALID_VALUE);
   expect("plan_create", imd_plan_create(h, &A, &B, &C, &opt, &plan), IMD_STATUS_SUCCESS);

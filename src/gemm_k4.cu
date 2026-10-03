@@ -6,8 +6,15 @@
 // (tests/test_cutlass_mod_epilogue.cu). M4 A/B runs (docs/NOTES-M4.md) found 256x128x64 s3
 // within noise of it and 128x128x64 s4/s5 slower on every benchmark shape, so the DESIGN §4
 // tile menu is not instantiated. The epilogue already stores 16 u8 per access.
+//
+// DESIGN v1.2 §6: imd_plan_create builds the kernel parameters of every launch shape
+// (k4_prepare: SM count, occupancy, smem attribute, CUTLASS Params); imd_contract copies
+// them, sets its pointers with Params::update and launches Kernel2 directly. CUTLASS's
+// GemmUniversalBase::initialize (and its device-property statics) is never called.
 #include <algorithm>
 #include <cstdint>
+#include <map>
+#include <memory>
 
 #include <cuda_runtime.h>
 
@@ -76,13 +83,106 @@ constexpr int64_t kMaxNTiles = 65535;  // gridDim.y (identity swizzle: N tiles)
 
 LaunchLimits g_limits = {c::kKcPrime, kMaxBatch, kMaxNTiles};
 
+// One K4 launch of a call: K-chunk [k0, k0 + kc), batches [z0, z0 + zc) of the group,
+// columns [j0, j0 + nc) of n_hat. Its CUTLASS parameters depend only on the shape key
+// (kc, zc, nc; store-mod for chunk 0, add-mod after); the pointers and the epilogue's
+// modulus offsets are set per call.
+struct Launch {
+  int64_t k0, kc, z0, zc, j0, nc;
+};
+struct ShapeKey {
+  int64_t kc, zc, nc;
+  bool operator<(const ShapeKey& o) const {
+    return kc != o.kc ? kc < o.kc : zc != o.zc ? zc < o.zc : nc < o.nc;
+  }
+};
+
+constexpr int kStoreSmem = int(sizeof(typename GemmStore::GemmKernel::SharedStorage));
+constexpr int kAddSmem = int(sizeof(typename GemmAdd::GemmKernel::SharedStorage));
+
+}  // namespace
+
+// Everything imd_contract needs to launch K4, fixed at plan creation (DESIGN v1.2 §6).
+struct K4Plan {
+  int64_t m = 0, n_hat = 0, k_hat = 0, b = 0;
+  int64_t chunk = 0, max_batch = 0, n_per_launch = 0;  // the launch limits at creation
+  std::map<ShapeKey, typename GemmStore::GemmKernel::Params> store;  // chunk 0
+  std::map<ShapeKey, typename GemmAdd::GemmKernel::Params> add;      // chunks > 0
+
+  // The launches of one group of gsize moduli, in order: K-chunk, batch part, n-hat part.
+  template <class F>
+  void for_each_launch(int gsize, F&& f) const {
+    const int64_t batches = int64_t{gsize} * b;
+    for (int64_t k0 = 0; k0 < k_hat; k0 += chunk) {  // K-chunks (§3.5), 16-aligned
+      const int64_t kc = std::min<int64_t>(chunk, k_hat - k0);
+      for (int64_t z0 = 0; z0 < batches; z0 += max_batch) {  // batch-count split (§4)
+        const int64_t zc = std::min(max_batch, batches - z0);
+        for (int64_t j0 = 0; j0 < n_hat; j0 += n_per_launch)  // n-hat split (gridDim.y)
+          f(Launch{k0, kc, z0, zc, j0, std::min(n_per_launch, n_hat - j0)});
+      }
+    }
+  }
+};
+
+namespace {
+
+// The CUTLASS arguments of launch L (null pointers at plan creation).
+template <class Gemm, class EVTArgs>
+typename Gemm::Arguments gemm_args(const K4Plan& k, const Launch& L, EVTArgs const& cb,
+                                   const int8_t* A, const int8_t* B) {
+  const int64_t plane_a = k.m * k.k_hat, plane_b = k.n_hat * k.k_hat;
+  const cutlass::gemm::GemmCoord size{static_cast<int>(k.m), static_cast<int>(L.nc),
+                                      static_cast<int>(L.kc)};
+  return {cutlass::gemm::GemmUniversalMode::kBatched, size, static_cast<int>(L.zc), cb, A, B,
+          nullptr, nullptr, plane_a, plane_b, 0, 0, k.k_hat, k.k_hat, 0, 0};
+}
+
+// This call's operand and plane pointers for launch L of group g0.
+struct CallPtrs {
+  const int8_t* A;
+  const int8_t* B;
+  uint8_t* W;
+};
+CallPtrs call_ptrs(const K4Plan& k, const Launch& L, const int8_t* RA, const int8_t* RB,
+                   uint8_t* W, int g0) {
+  const int64_t plane_a = k.m * k.k_hat, plane_b = k.n_hat * k.k_hat, plane_w = k.m * k.n_hat;
+  return {RA + L.z0 * plane_a + L.k0, RB + L.z0 * plane_b + L.j0 * k.k_hat + L.k0,
+          W + (int64_t{g0} * k.b + L.z0) * plane_w + L.j0};
+}
+
+// Epilogue arguments: store-mod (chunk 0) or add-mod (later chunks) into the planes at Wp,
+// modulus l = g0 + (z0 + blockIdx.z) / b.
+typename EVTStore::Arguments store_args(const K4Plan& k, const Launch& L, uint8_t* Wp, int g0) {
+  return {ModP::Arguments{g0, k.b, L.z0}, {Wp, {k.n_hat, _1{}, k.m * k.n_hat}}};
+}
+typename EVTAdd::Arguments add_args(const K4Plan& k, const Launch& L, uint8_t* Wp, int g0) {
+  return {{{Wp, uint8_t(0), {k.n_hat, _1{}, k.m * k.n_hat}}, ModP::Arguments{g0, k.b, L.z0}},
+          {Wp, {k.n_hat, _1{}, k.m * k.n_hat}}};
+}
+
+// Device setup of one kernel at plan creation: dynamic shared memory above 48 KB, then the
+// occupancy CUTLASS's own initialization would query (thread-safe CUDA runtime calls).
 template <class Gemm>
-bool run(typename Gemm::Arguments const& args, cudaStream_t stream) {
-  Gemm op;
-  cutlass::Status st = Gemm::can_implement(args);
-  if (st == cutlass::Status::kSuccess) st = op.initialize(args, nullptr, stream);
-  if (st == cutlass::Status::kSuccess) st = op.run(stream);
-  return st == cutlass::Status::kSuccess && cudaPeekAtLastError() == cudaSuccess;
+cudaError_t kernel_setup(int smem, int* occupancy) {
+  using K = typename Gemm::GemmKernel;
+  cudaError_t e = cudaSuccess;
+  if (smem >= (48 << 10))
+    e = cudaFuncSetAttribute(cutlass::Kernel2<K>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  if (e == cudaSuccess)
+    e = cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+        occupancy, cutlass::Kernel2<K>, K::kThreadCount, smem, cudaOccupancyDisableCachingOverride);
+  return e;
+}
+
+// Copy the prepared parameters, set this call's pointers (Params::update: operand pointers,
+// batch strides, epilogue arguments) and launch. The copy is local: the plan is not written.
+template <class Gemm>
+bool launch(typename Gemm::GemmKernel::Params params, typename Gemm::Arguments const& args,
+            int smem, cudaStream_t stream) {
+  using K = typename Gemm::GemmKernel;
+  params.update(args);
+  cutlass::Kernel2<K><<<params.get_grid_dims(), dim3(K::kThreadCount, 1, 1), smem, stream>>>(params);
+  return cudaPeekAtLastError() == cudaSuccess;
 }
 
 }  // namespace
@@ -90,45 +190,59 @@ bool run(typename Gemm::Arguments const& args, cudaStream_t stream) {
 LaunchLimits& launch_limits() { return g_limits; }
 LaunchLimits default_launch_limits() { return {c::kKcPrime, kMaxBatch, kMaxNTiles}; }
 
-imd_status_t k4_group(const int8_t* RA, const int8_t* RB, uint8_t* W, int64_t m, int64_t n_hat,
-                      int64_t k_hat, int64_t b, int g0, int gsize, cudaStream_t stream) {
-  const int64_t batches = int64_t{gsize} * b;
-  const int64_t plane_a = m * k_hat, plane_b = n_hat * k_hat, plane_w = m * n_hat;
-  const int64_t chunk = g_limits.k_chunk, max_batch = g_limits.max_batch;
-  const int64_t n_per_launch = g_limits.max_n_tiles * TB::kN;
-  for (int64_t k0 = 0; k0 < k_hat; k0 += chunk) {  // K-chunks (§3.5), 16-aligned
-    const int64_t kc = std::min<int64_t>(chunk, k_hat - k0);
-    for (int64_t z0 = 0; z0 < batches; z0 += max_batch) {  // batch-count split (§4)
-      const int64_t zc = std::min(max_batch, batches - z0);
-      for (int64_t j0 = 0; j0 < n_hat; j0 += n_per_launch) {
-        const int64_t nc = std::min(n_per_launch, n_hat - j0);
-        const cutlass::gemm::GemmCoord size{static_cast<int>(m), static_cast<int>(nc),
-                                            static_cast<int>(kc)};
-        const int8_t* A = RA + z0 * plane_a + k0;
-        const int8_t* B = RB + z0 * plane_b + j0 * k_hat + k0;
-        uint8_t* Wp = W + (int64_t{g0} * b + z0) * plane_w + j0;
-        const ModP::Arguments mod{g0, b, z0};
-        const typename StoreW::Arguments store{Wp, {n_hat, _1{}, plane_w}};
-        bool ok;
-        if (k0 == 0) {
-          typename EVTStore::Arguments cb{mod, store};
-          ok = run<GemmStore>({cutlass::gemm::GemmUniversalMode::kBatched, size,
-                               static_cast<int>(zc), cb, A, B, nullptr, nullptr, plane_a,
-                               plane_b, 0, 0, k_hat, k_hat, 0, 0},
-                              stream);
-        } else {
-          typename EVTAdd::Arguments cb{{{Wp, uint8_t(0), {n_hat, _1{}, plane_w}}, mod}, store};
-          ok = run<GemmAdd>({cutlass::gemm::GemmUniversalMode::kBatched, size,
-                             static_cast<int>(zc), cb, A, B, nullptr, nullptr, plane_a, plane_b,
-                             0, 0, k_hat, k_hat, 0, 0},
-                            stream);
-        }
-        if (!ok) return IMD_STATUS_CUDA_ERROR;
-        IMD_PROF(stream, k0 == 0 ? "K4 gemm store" : "K4 gemm add");
-      }
-    }
+imd_status_t k4_prepare(const ExecPlan& p, std::shared_ptr<const K4Plan>* out) {
+  auto k = std::make_shared<K4Plan>();
+  k->m = p.m, k->n_hat = p.n_hat, k->k_hat = p.k_hat, k->b = p.b;
+  k->chunk = g_limits.k_chunk, k->max_batch = g_limits.max_batch;
+  k->n_per_launch = g_limits.max_n_tiles * TB::kN;
+  int occ_store = 0, occ_add = 0;
+  if (kernel_setup<GemmStore>(kStoreSmem, &occ_store) != cudaSuccess ||
+      kernel_setup<GemmAdd>(kAddSmem, &occ_add) != cudaSuccess) {
+    cudaGetLastError();  // clear the (non-sticky) error state
+    return IMD_STATUS_CUDA_ERROR;
   }
+  bool ok = true;
+  for (int g0 = 0; g0 < p.N; g0 += p.g) {
+    k->for_each_launch(std::min(p.g, p.N - g0), [&](const Launch& L) {
+      const ShapeKey key{L.kc, L.zc, L.nc};
+      if (L.k0 == 0 && !k->store.count(key)) {
+        const auto args = gemm_args<GemmStore>(*k, L, store_args(*k, L, nullptr, 0), nullptr, nullptr);
+        ok = ok && GemmStore::can_implement(args) == cutlass::Status::kSuccess;
+        k->store.emplace(key, typename GemmStore::GemmKernel::Params(args, p.sms, occ_store));
+      } else if (L.k0 != 0 && !k->add.count(key)) {
+        const auto args = gemm_args<GemmAdd>(*k, L, add_args(*k, L, nullptr, 0), nullptr, nullptr);
+        ok = ok && GemmAdd::can_implement(args) == cutlass::Status::kSuccess;
+        k->add.emplace(key, typename GemmAdd::GemmKernel::Params(args, p.sms, occ_add));
+      }
+    });
+  }
+  if (!ok) return IMD_STATUS_NOT_SUPPORTED;
+  *out = std::move(k);
   return IMD_STATUS_SUCCESS;
+}
+
+imd_status_t k4_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
+                      int gsize, cudaStream_t stream) {
+  bool ok = true;
+  k.for_each_launch(gsize, [&](const Launch& L) {
+    if (!ok) return;
+    const ShapeKey key{L.kc, L.zc, L.nc};
+    const CallPtrs q = call_ptrs(k, L, RA, RB, W, g0);
+    if (L.k0 == 0) {
+      const auto it = k.store.find(key);
+      ok = it != k.store.end() &&
+           launch<GemmStore>(it->second,
+                             gemm_args<GemmStore>(k, L, store_args(k, L, q.W, g0), q.A, q.B),
+                             kStoreSmem, stream);
+    } else {
+      const auto it = k.add.find(key);
+      ok = it != k.add.end() &&
+           launch<GemmAdd>(it->second, gemm_args<GemmAdd>(k, L, add_args(k, L, q.W, g0), q.A, q.B),
+                           kAddSmem, stream);
+    }
+    IMD_PROF(stream, L.k0 == 0 ? "K4 gemm store" : "K4 gemm add");
+  });
+  return ok ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
 
 }  // namespace imd::detail

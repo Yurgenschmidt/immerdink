@@ -54,7 +54,8 @@ bool read_case(std::istream& in, Case* c) {
   for (;;) {
     in >> tok;
     if (tok == "opts") {
-      in >> c->opts.num_moduli >> c->opts.residue_group >> c->opts.rounding >> c->opts.mode;
+      in >> c->opts.num_moduli >> c->opts.residue_group >> c->opts.rounding >> c->opts.mode >>
+          c->opts.vec_mode;
     } else if (tok == "tensor") {
       std::string which;
       int rank = 0;
@@ -115,7 +116,8 @@ void check(const Case& c) {
 
   const int g = c.opts.residue_group == 0 ? c.opts.num_moduli : c.opts.residue_group;
   const auto L = imd::detail::workspace_layout(
-      {lw.m, lw.n, lw.k, lw.b, c.opts.num_moduli, g, c.opts.mode == IMD_DIRECT});
+      {lw.m, lw.n, lw.k, lw.b, c.opts.num_moduli, g, c.opts.mode == IMD_DIRECT,
+       c.opts.vec_mode == IMD_VEC_RESIDENT});
   if (!L) return fail(c, "layout overflow");
   std::vector<Region> got;
   for (int r = 0; r < 8; ++r)
@@ -132,7 +134,7 @@ void check_null_arguments() {
   const int64_t e[2] = {3, 4}, s[2] = {4, 1};
   const int32_t li[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
   const imd_tensor_t A{2, e, s, li}, B{2, e + 1, s, lb}, C{2, e, s, lc};
-  const imd_options_t o{9, 0, IMD_RN, IMD_EMULATE};
+  const imd_options_t o{9, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE};
   size_t bytes = 0;
   Case c;
   c.name = "null_arguments";

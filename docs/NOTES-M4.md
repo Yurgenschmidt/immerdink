@@ -6,7 +6,8 @@ the semantics, the §4a workspace layout, the K0–K5 sequence and buffer reuse 
 `spec/Pipeline.tla` and the public API are untouched. All 22 ctest tests pass bit for bit
 after every step (they compare with `spec/oracle.py`; the invariance tests check that
 results do not depend on tiling / launch choices). Design proposals that would need a
-DESIGN change are at the end; none was implemented.
+DESIGN change are at the end; none was implemented in M4 (the "v1.2" section at the very end
+implements them, after a DESIGN v1.2 and spec update).
 
 ## What M4 built
 
@@ -157,3 +158,114 @@ only at large k, and there it is a 1.5× win.
 - Test hooks only with `IMMERDINK_BUILD_TESTS=ON`: done.
 - `oracle.lower` building scatter vectors lazily, and TLA+ models for the n̂ grid split and
   the κ ≥ T scope: not done (spec / oracle work, outside this kernel pass).
+
+## v1.2: the three design proposals, implemented (DESIGN v1.2)
+
+The user approved proposals 1–3 for v1, plus (for proposal 1) a per-plan option
+`vec_mode` and `imd_plan_device_bytes`. Design and specs first: DESIGN v1.2 (changed text
+marked **[v1.2]**), `spec/HostAPI.tla` (new: host threads, plan lifetime, workspace
+sharing), `spec/Pipeline.tla` (K0 as a multi-CTA kernel, `VecResident`, `K1Split`).
+All timings: `bench/run_sweep.sh bench/sweep_v12.txt` (quiet-gated), N = 14, ms, CUDA
+events; before = `bench/results/v12-before-4438ac5.jsonl`, after =
+`bench/results/v12-after12-95f81f1.jsonl`. (The VS Code GPU renderer process, like the
+Claude desktop one, was added to `QUIET_GPU_IGNORE` for these runs; GPU utilization and
+load stayed gated.)
+
+### Changes 1 + 2: K4 parameters at plan creation; K0 on the device
+
+| case | before (v1.1) | GENERATE | RESIDENT | K0 before → GENERATE / RESIDENT |
+|---|---|---|---|---|
+| sq1024 | 0.223 | 0.188 (−16 %) | 0.184 (−18 %) | 0.026 → 0.004 / 0.003 |
+| sq2048 | 0.946 | 0.956 | 0.956 | 0.061 → 0.005 / 0.002 |
+| sq8192 | 32.4 | 32.6 | 33.6 | 0.191 → 0.005 / 0.002 |
+| r_lowk | 6.98 | 7.18 | 7.28 | 0.126 → 0.005 / 0.002 |
+| r_bigk | 12.3 | 12.2 | 12.3 | 0.278 → 0.005 / 0.003 |
+| r_skinny | 4.64 | 4.31 (−7 %) | 4.37 (−6 %) | 0.161 → 0.005 / 0.002 |
+| r_mm | 3.46 | 2.97 (−14 %) | 2.97 (−14 %) | 0.347 → 0.005 / 0.002 |
+| t_nn | 5.64 | 5.02 (−11 %) | 5.03 (−11 %) | 0.082 → 0.005 / 0.002 |
+| t_batch | 2.82 | 2.77 | 2.76 | 0.050 → 0.014 / 0.002 |
+| t_ikl | 3.02 | 2.90 (−4 %) | 2.89 (−4 %) | 0.035 → 0.005 / 0.002 |
+| t_cc | 5.05 | 5.10 | 5.14 | 0.073 → 0.005 / 0.005 |
+
+(Whole-call medians. The "K0" column is the phase between the first two marks, so it
+includes launch overhead; RESIDENT launches nothing there.) sq8192 / r_lowk / sq2048 /
+t_cc move by ≤ 3 %, which is K4 run-to-run noise at the 450 W cap (see above); their K0
+saving (0.06–0.19 ms) is below that noise. The NOTES estimate (5–9 % on small or long-k
+shapes) was met or exceeded: the PCIe copy was ≈ 2 GB/s effective, the generate kernel
+writes the same bytes in ≈ 3–10 µs.
+
+- **Pinned copy as a third mode?** No shape is faster with it (its K0 is 7–70× the
+  generate kernel's), so it is removed, not kept.
+- **GENERATE vs RESIDENT:** the difference is the 2–10 µs generate kernel, below the noise
+  of every case. RESIDENT only pays when calls are tiny and very frequent; its cost is
+  device memory for the plan's lifetime.
+- **Change 1 (host side):** `imd_plan_create` now takes 0.4–1.2 ms here (the `plan_create_ms`
+  field; it includes the occupancy query and `cudaFuncSetAttribute` per K4 kernel and, for
+  RESIDENT, the build-and-wait), and `imd_contract` no longer calls
+  `GemmUniversalBase::initialize`. The per-call host saving is not visible in GPU-event
+  times on these shapes (the host runs ahead); its point is that `imd_contract` touches no
+  CUTLASS host state and never writes the plan (thread safety).
+
+**Many plans** (`bench/plans_probe.py`, 32 live plans of one shape per mode,
+`bench/results/v12-plans-probe-95f81f1.jsonl`; allocations counted by the LD_PRELOAD shim):
+
+| shape (m×n×k) | mode | plan device bytes (exact) | device bytes / plan (driver) | CUDA allocs / plan | pinned / plan | create (median) |
+|---|---|---|---|---|---|---|
+| sq1024 | GENERATE | 0 | 0 ¹ | 0 | 0 | 0.012 ms |
+| sq1024 | RESIDENT | 49,176 | 65,536 | 1 | 0 | 0.025 ms |
+| r_mm 1000×64×50000 | GENERATE | 0 | 0 | 0 | 0 | 0.011 ms |
+| r_mm | RESIDENT | 817,048 | 1,048,576 | 1 | 0 | 0.034 ms |
+| tall 4·10⁶×64×64 | GENERATE | 0 | 0 | 0 | 0 | 0.011 ms |
+| tall | RESIDENT | 64,002,072 | 65,011,712 | 1 | 0 | 0.123 ms |
+
+¹ The first sq1024 batch measured 64 KiB per plan in `cudaMemGetInfo`: the CUDA module
+loads triggered by the first plan's `cudaFuncSetAttribute` (one-time, process-wide), not
+plan memory (0 allocations). Plans created after the first take < 0.04 ms (the K4
+parameter cache is a few Params structs per plan; host bytes O(rank)). The driver rounds
+RESIDENT allocations up (64 KiB, 1 MiB, 2 MiB granules), which `imd_plan_device_bytes`
+does not count (DESIGN §6). A v1.1 plan pinned the same 8·(2m+2n+2k+3b) bytes of host
+memory that RESIDENT now puts on the device (64 MB per plan for "tall").
+
+**Tests added:** both vec modes in every `run_case` (stage checks, the resident vectors
+against the oracle, `imd_plan_device_bytes` exactness, plan-creation allocation counts,
+bitwise mode invariance); `tests/test_threads.cpp` (8 threads, shared and own plans, both
+modes, generate plans destroyed before their stream is synchronized; bit-identical to a
+sequential run; a mutant that updates the plan's cached parameters in place is caught 7/7
+runs); `tests/test_graph.cpp` (one call captured into a CUDA graph in global capture
+mode and replayed twice, bit-exact, both modes, incl. the β-only path).
+
+### Change 3: K1 as two launches — specified, implemented, measured, NOT adopted
+
+Spec first (Pipeline `K1Split`: `SigmaFinalAtUse`; `neg_k1_merged`, `neg_k1_no_sigma`,
+`neg_k1_sigma_row_split`, `neg_k1_pack_waits_gamma`), then implemented (commit `e43d13b`:
+`k1_scale` / `k1_tiled` templated on the pass, γ stored in the σ slots with an int16
+sentinel for rows without finite nonzero entries, one block per row in K1b, uncapped
+grids for both passes). All 25 ctest tests were bit-exact. Timings
+(`bench/results/v12-k1split-e43d13b.jsonl` against `v12-after12-95f81f1.jsonl`, the
+same code without the split), K1 phase (A + B) and whole call, GENERATE, ms:
+
+| case | K1 one launch | K1 split | whole call one launch | whole call split |
+|---|---|---|---|---|
+| sq1024 | 0.023 | 0.036 | 0.188 | 0.203 (+8 %) |
+| sq2048 | 0.120 | 0.152 | 0.956 | 0.979 |
+| sq8192 | 1.32 | 2.35 | 32.6 | 34.1 |
+| r_lowk | 0.189 | 0.345 | 7.18 | 6.89 ² |
+| r_bigk | 2.00 | 2.34 | 12.18 | 11.86 ² |
+| r_skinny | 0.653 | 1.24 | 4.31 | 4.96 (+15 %) |
+| r_mm | 0.655 | 1.01 | 2.97 | 3.31 (+11 %) |
+| t_nn | 0.483 | 0.641 | 5.02 | 5.16 |
+| t_batch | 0.347 | 0.630 | 2.77 | 3.18 (+15 %) |
+| t_ikl | 0.442 | 0.650 | 2.90 | 3.10 (+7 %) |
+| t_cc | 0.366 | 0.638 | 5.10 | 5.17 |
+
+² Whole-call differences there are K4 noise (the K1 phase itself is slower; r_bigk's
+best-of-run is 11.51 ms without the split vs 11.83 with it).
+
+K1 is slower on **every** shape, including the long-row r_bigk the proposal targeted
+(+17 %), and the small shapes the orchestrator asked about regress too (sq1024 +8 %, r_mm
++11 %, t_batch +15 %). The proposal's estimate assumed the one-launch K1's second pass
+mostly misses L2 for long rows; measured, it mostly hits: the one-launch K1 costs about
+1.1–1.9 reads of the operands, two full streaming reads cost 2, and the extra launches
+(4 instead of 2) add about 10 µs on small shapes. Reverted; DESIGN v1.2 keeps the
+one-launch K1 and records the split as specified and model-checked but not adopted (the
+Pipeline models `pos_k1_split*` and `neg_k1_*` still check it).

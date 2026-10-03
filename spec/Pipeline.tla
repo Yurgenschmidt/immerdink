@@ -4,11 +4,18 @@
 (*                                                                         *)
 (* DESIGN.md mapping                                                       *)
 (*   §4   kernel sequence on one stream:                                   *)
-(*          K0 vec    cudaMemcpyAsync of the plan's scatter vectors into   *)
-(*                    the workspace (§4a "copied from the plan's pinned    *)
-(*                    buffer"; DESIGN does not list it as a step, see the  *)
-(*                    header note below)                                   *)
-(*          K1 scale  per A row / B column: σ,τ and non-finite flags       *)
+(*          K0 vec    v1.2: a kernel that generates the scatter vectors    *)
+(*                    into the workspace from the fused-mode descriptor    *)
+(*                    (its kernel argument); one CTA per tensor's vectors  *)
+(*                    here, any interleaving (v1.1: a cudaMemcpyAsync from *)
+(*                    the plan's pinned buffer; plan lifetime: HostAPI).   *)
+(*                    VecResident (IMD_VEC_RESIDENT): no K0, the vectors   *)
+(*                    are in plan-owned device memory ("pvec") and the     *)
+(*                    workspace has no vec region                          *)
+(*          K1 scale  per A row / B column: σ,τ and non-finite flags;      *)
+(*                    K1Split (v1.2 option): two launches, K1a writes γ    *)
+(*                    into sA/sB (scratch) and the flags, K1b reads γ back *)
+(*                    and overwrites it with σ                             *)
 (*          per residue group G (g moduli, ⌈N/g⌉ groups):                  *)
 (*            K2 pack A  -> RA[slot][λ][ī][k̂]   (K padded with 0)          *)
 (*            K3 pack B  -> RB[slot][λ][ĵ][k̂]   (rows n..n̂ zero)           *)
@@ -31,8 +38,10 @@
 (*                                                                         *)
 (* Data abstraction. Values are replaced by ghost VERSION TAGS that say    *)
 (* which write of THIS call a buffer element holds:                        *)
-(*   sfA/sfB  -1 = never written in this call (junk), else 0/1 = the flag  *)
-(*            K1 computed (σ/τ are written by the same CTA, same tag)      *)
+(*   sfA/sfB  -1 = never written in this call (junk); 0/1 = σ final and   *)
+(*            the flag K1 computed (σ/τ are written by the same CTA, same  *)
+(*            tag); 2/3 = K1a's γ in sA/sB (scratch), flag 0/1 final       *)
+(*   vecV     the tensors (A, B, C) whose scatter vectors K0 has written   *)
 (*   ra/rb    0 = junk, l = residue of modulus l, Zero = zero padding      *)
 (*            (modulus-independent: a zero is a zero for every p_l)        *)
 (*   w        set of K POSITIONS h ∈ [0, k̂) whose products are folded     *)
@@ -92,8 +101,12 @@
 (* Not modelled (DESIGN gap, see the design_issues of this artifact): the  *)
 (* per-batch modulus / Barrett table the batched K4 epilogue reads.       *)
 (*                                                                         *)
-(* Header note: the vec copy (K0) must precede K1 (K1 gathers A rows via   *)
-(* the scatter vectors); the model checks that order.                     *)
+(* Header note: K0 must precede K1 (K1 gathers A rows via the scatter      *)
+(* vectors); the model checks that order, per tensor's vectors.           *)
+(* K1 split (DESIGN v1.2 §4): sA/sB first hold γ (an intermediate) and    *)
+(* hold σ only after K1b. SigmaFinalAtUse checks that no pack or K5 reads *)
+(* γ as σ; NoStaleRead that K1b reads γ (not junk, not σ already written  *)
+(* over it).                                                               *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -111,6 +124,10 @@ CONSTANTS
     Direct,              \* mode = IMD_DIRECT
     KEmpty,              \* the descriptor has no K label after lowering
                          \* (outer / Hadamard product; then k = 1)
+    VecResident,         \* v1.2 IMD_VEC_RESIDENT: the scatter vectors live in
+                         \* plan-owned device memory ("pvec", built at plan
+                         \* creation); no K0, no vec region in the workspace
+    K1Split,             \* K1 as two launches: γ pass (K1a), then S pass (K1b)
     TwoStreams,          \* packs on a second stream (NOT v1; future option)
     UseEvents,           \* cross-stream event edges (only with TwoStreams)
     Bug,                 \* "none", one injected design-rule violation, or a
@@ -142,6 +159,18 @@ Bugs == {"none",
          "kEmptyEmulate", \* a K-empty contraction is dispatched to the
                           \* emulated path (mode EMULATE) while the
                           \* workspace is sized for DIRECT (align(vec))
+         "k0NoC",         \* K0's grid covers only A's and B's vectors
+         "residentWsVec", \* resident vectors, but the workspace still has
+                          \* a vec region (sized for nothing)
+         "residentReadsWs",\* resident vectors, but the kernels read the
+                          \* workspace's vec region (not allocated)
+         "k1Merged",      \* K1a and K1b CTAs in ONE launch (no kernel
+                          \* boundary between the γ pass and the S pass)
+         "noSigma",       \* K1b not launched (sA/sB keep γ)
+         "sigmaRowSplit", \* K1b splits a row over two CTAs, each writing σ
+                          \* over γ in place as soon as it is done
+         "packWaitsGamma",\* 2 streams: the packs' K1 event edge is from K1a,
+                          \* not K1b
          "padMinimal"}    \* HARMLESS: K padding only in A and only by the
                           \* first group's pack; B rows n..n̂ never written
 \* Deviations from DESIGN that are shown NOT to break anything (positive models).
@@ -258,11 +287,16 @@ Width(r) == CASE r \in {"sA", "sB"} -> 2
               [] OTHER               -> 1
 
 \* Regions present, in layout order (§4a; 0 if b·m·n = 0; vec only for
-\* the DIRECT path (mode DIRECT or K-empty) or when k = 0). RegionsFor(dir)
-\* is the layout of a call that takes (dir = TRUE) or skips the DIRECT path.
-AllRegions == <<"sA", "sB", "fA", "fB", "vec", "RA", "RB", "W">>
+\* the DIRECT path (mode DIRECT or K-empty) or when k = 0; no vec region
+\* with resident vectors). RegionsFor(dir) is the layout of a call that
+\* takes (dir = TRUE) or skips the DIRECT path.
+VecInWs    == ~VecResident \/ Bug = "residentWsVec"   \* the layout has a vec region
+VecReadsWs == ~VecResident \/ Bug = "residentReadsWs" \* kernels read vectors there
+AllRegions == IF VecInWs THEN <<"sA", "sB", "fA", "fB", "vec", "RA", "RB", "W">>
+              ELSE <<"sA", "sB", "fA", "fB", "RA", "RB", "W">>
 RegionsFor(dir) == IF Empty THEN <<>>
-                   ELSE IF dir \/ (k = 0 /\ Bug # "fullWsK0") THEN <<"vec">>
+                   ELSE IF dir \/ (k = 0 /\ Bug # "fullWsK0")
+                        THEN (IF VecInWs THEN <<"vec">> ELSE <<>>)
                    ELSE AllRegions
 \* The layout the kernels of this call use (offsets, accesses).
 Regions == RegionsFor(UseDirect)
@@ -284,11 +318,16 @@ Alloc(r) == CASE Bug = "noAlign"              -> Bytes(r)
 OffTbl == [r \in Active |->
              LET i == CHOOSE i \in DOMAIN Regions : Regions[i] = r
              IN  SumSeq([j \in 1..(i - 1) |-> Alloc(Regions[j])])]
-Off(r) == OffTbl[r]
+Off(r) == IF r \in Active THEN OffTbl[r] ELSE 0
+
+\* Plan-owned device bytes (resident vectors): exactly the vec contents.
+PlanBytes == IF VecResident /\ ~Empty THEN 8 * VecLen ELSE 0
 
 \* Byte addresses of the elements kernels touch (access = <<region, addr, width>>).
+\* Resident vectors are addressed in the plan's buffer "pvec" (offset 0).
 RBRows == IF Bug = "rbStrideN" THEN n ELSE NHat   \* rows per (slot, λ) block of RB
-AccVec(i)          == <<"vec", Off("vec") + 8 * i, 8>>
+AccVec(i)          == IF VecReadsWs THEN <<"vec", Off("vec") + 8 * i, 8>>
+                      ELSE <<"pvec", 8 * i, 8>>
 AccSA(lam, i)      == <<"sA", Off("sA") + 2 * (lam * m + i), 2>>
 AccSB(lam, j)      == <<"sB", Off("sB") + 2 * (lam * n + j), 2>>
 AccFA(lam, i)      == <<"fA", Off("fA") + lam * m + i, 1>>
@@ -332,6 +371,8 @@ ByteSet(r) == UNION {x[2]..(x[2] + x[3] - 1) : x \in Cells(r)}
 \* region, and ends at or below ws_bytes.
 AccOK(x) ==
     LET r == x[1]  a == x[2]  wd == x[3] IN
+    IF r = "pvec" THEN 0 <= a /\ a + wd <= PlanBytes   \* inside the plan's buffer
+    ELSE
     /\ r \in Active
     /\ Off(r) <= a /\ a + wd <= Off(r) + Bytes(r)
     /\ a + wd <= WsBytes
@@ -348,6 +389,17 @@ KrQ(kd, gi, c, p, q) == [kind |-> kd, gi |-> gi, c |-> c, p |-> p, q |-> q]
 Kr(kd, gi, c, p)     == KrQ(kd, gi, c, p, 0)
 KVec    == Kr("vec", 0, 0, 0)
 KScale  == Kr("scale", 0, 0, 0)
+KGamma  == Kr("gamma", 0, 0, 0)       \* K1a
+KSigma  == Kr("sigma", 0, 0, 0)       \* K1b
+\* K1 as launched: one kernel (v1.1), or K1a then K1b (K1Split).
+K1Seq == CASE ~K1Split          -> <<KScale>>
+           [] Bug = "k1Merged"  -> <<Kr("k1merged", 0, 0, 0)>>
+           [] Bug = "noSigma"   -> <<KGamma>>
+           [] OTHER             -> <<KGamma, KSigma>>
+\* The kernel whose retirement makes σ/τ final (the packs' RAW edge, 2 streams).
+K1FinalKind == CASE ~K1Split               -> "scale"
+                 [] Bug = "packWaitsGamma" -> "gamma"
+                 [] OTHER                  -> "sigma"
 KCrt    == Kr("crt", 0, 0, 0)
 KDirect == Kr("direct", 0, 0, 0)
 
@@ -361,14 +413,16 @@ GroupsFrom(gi) == IF gi > NG THEN <<>>
                        \o GemmSeq(gi) \o GroupsFrom(gi + 1)
 GP == GroupsFrom(1)
 
+\* K0 runs unless the vectors are resident in the plan.
+K0Seq == IF VecResident THEN <<>> ELSE <<KVec>>
 ProgFull == IF Empty THEN <<>>
-            ELSE IF UseDirect THEN <<KVec, KDirect>>
+            ELSE IF UseDirect THEN K0Seq \o <<KDirect>>
             ELSE IF Bug = "crtEarly"
-                 THEN <<KVec, KScale>> \o SubSeq(GP, 1, Len(GP) - 1)
+                 THEN K0Seq \o K1Seq \o SubSeq(GP, 1, Len(GP) - 1)
                       \o <<KCrt>> \o SubSeq(GP, Len(GP), Len(GP))
-            ELSE <<KVec, KScale>> \o GP \o <<KCrt>>
+            ELSE K0Seq \o K1Seq \o GP \o <<KCrt>>
 \* α = 0 or k = 0: C <- β·C only (§3.7); K1-K4 are not launched.
-ProgTriv == IF Empty THEN <<>> ELSE <<KVec, IF UseDirect THEN KDirect ELSE KCrt>>
+ProgTriv == IF Empty THEN <<>> ELSE K0Seq \o <<IF UseDirect THEN KDirect ELSE KCrt>>
 
 \* Indexed by "α = 0" (a host-side fact). Cached tables (zero-arity).
 Prog == [a \in BOOLEAN |-> IF a \/ k = 0 THEN ProgTriv ELSE ProgFull]
@@ -381,13 +435,13 @@ SProg == [a \in BOOLEAN |-> [st \in Streams |->
                       LAMBDA i : StreamOf(Prog[a][i]) = st)]]
 
 \* Cross-stream event edges (two streams only): a pack waits for K1 (RAW on
-\* σ, vec) and for every GEMM of the previous group (WAR on RA/RB reuse); a
+\* σ, vec; with K1Split from K1b, the launch that makes σ final) and for every GEMM of the previous group (WAR on RA/RB reuse); a
 \* GEMM waits for both packs of its group (RAW on RA/RB).
 Deps == [a \in BOOLEAN |-> [i \in DOMAIN Prog[a] |->
            LET P == Prog[a]  Ki == P[i] IN
            IF ~(TwoStreams /\ UseEvents) THEN {}
            ELSE CASE Ki.kind \in {"packA", "packB"} ->
-                       {j \in DOMAIN P : P[j].kind = "scale"}
+                       {j \in DOMAIN P : P[j].kind = K1FinalKind}
                        \cup (IF Ki.gi > 1 /\ Bug # "noWAR"
                              THEN {j \in DOMAIN P : P[j].kind = "gemm" /\ P[j].gi = Ki.gi - 1}
                              ELSE {})
@@ -396,10 +450,15 @@ Deps == [a \in BOOLEAN |-> [i \in DOMAIN Prog[a] |->
                   [] OTHER -> {}]]
 
 \* CTAs of each kernel (any grid; what matters is which outputs each owns).
+K0CTAs == IF Bug = "k0NoC" THEN {"A", "B"} ELSE {"A", "B", "C"}
+K1CTAs == {<<"a", x[1], x[2]>> : x \in RowsA} \cup {<<"b", x[1], x[2]>> : x \in ColsB}
 CTAsOf(kr) ==
-    CASE kr.kind = "vec"    -> {<<0>>}
-      [] kr.kind = "scale"  -> {<<"a", x[1], x[2]>> : x \in RowsA}
-                               \cup {<<"b", x[1], x[2]>> : x \in ColsB}
+    CASE kr.kind = "vec"    -> K0CTAs                 \* one per tensor's vectors
+      [] kr.kind \in {"scale", "gamma"} -> K1CTAs     \* one per A row / B column
+      [] kr.kind = "sigma"  -> IF Bug = "sigmaRowSplit"
+                               THEN {<<t[1], t[2], t[3], hf>> : t \in K1CTAs, hf \in {0, 1}}
+                               ELSE K1CTAs
+      [] kr.kind = "k1merged" -> {<<"g">> \o t : t \in K1CTAs} \cup {<<"s">> \o t : t \in K1CTAs}
       [] kr.kind = "packA"  -> RowsA                    \* one A row each
       [] kr.kind = "packB"  -> Bs \X NHs                \* one (padded) B column each
       [] kr.kind = "gemm"   -> PartZ(kr.gi, kr.p) \X Ms \X (0..(GridY(kr.q) - 1))
@@ -416,9 +475,13 @@ WellFormed ==
     /\ ChunkLen >= 1 /\ MaxZ >= 1 /\ TileN >= 1 /\ MaxY >= 1
     /\ AlignWS >= 1 /\ AlignK >= 1 /\ AlignN >= 1
     /\ WsBytes \in Nat
-    /\ {Direct, KEmpty, TwoStreams, UseEvents, EnforcePreconditions} \subseteq BOOLEAN
+    /\ {Direct, KEmpty, K1Split, TwoStreams, UseEvents, EnforcePreconditions} \subseteq BOOLEAN
     /\ KEmpty => k = 1                     \* the K-empty GEMM view has k = 1
     /\ Bug \in Bugs
+    /\ Bug \in {"k1Merged", "noSigma", "sigmaRowSplit", "packWaitsGamma"} => K1Split
+    /\ Bug = "packWaitsGamma" => TwoStreams /\ UseEvents
+    /\ VecResident \in BOOLEAN
+    /\ Bug \in {"residentWsVec", "residentReadsWs"} => VecResident
 
 \* Preconditions of the design; each has a boundary-tight positive model and
 \* a negative model at boundary + 1 (see MC_Pipeline.tla).
@@ -446,7 +509,7 @@ VARIABLES
     flagB,     \* flagB[λ,j̄]: column j̄ of B_λ has Inf/NaN (input data)
     aDirty,    \* aDirty[λ,ī]: row of A overwritten during the call (aliasing)
     bDirty,    \* bDirty[λ,j̄]: column of B overwritten during the call (aliasing)
-    vecV,      \* scatter vectors copied in this call
+    vecV,      \* tensors whose scatter vectors K0 wrote in this call
     sfA, sfB,  \* σ/fA and τ/fB tags (-1 junk, else the flag written by K1)
     ra, rb,    \* residue buffer tags (0 junk, l = modulus l, Zero = padding)
     w,         \* W plane tags (set of folded K positions, {-1} junk)
@@ -460,7 +523,7 @@ vars    == <<pc, done, retired, alpha0, beta0, flagA, flagB, aDirty, bDirty,
 inputs  == <<alpha0, beta0, flagA, flagB>>
 
 Zero     == -1                            \* ra/rb tag of zero padding
-ErrKinds == {"stale", "plane", "dup", "reuse", "oob", "readC", "readAB", "clobber"}
+ErrKinds == {"stale", "gamma", "plane", "dup", "reuse", "oob", "readC", "readAB", "clobber"}
 CTags    == {"orig", "zero", "betaC", "native", "crt"}
 
 Init ==
@@ -469,7 +532,7 @@ Init ==
     /\ pc = [st \in Streams |-> 1] /\ done = [st \in Streams |-> {}]
     /\ retired = {}
     /\ aDirty = [x \in RowsA |-> FALSE] /\ bDirty = [x \in ColsB |-> FALSE]
-    /\ vecV = FALSE
+    /\ vecV = IF VecResident THEN {"A", "B", "C"} ELSE {}   \* resident: built at plan creation
     /\ sfA = [x \in RowsA |-> -1] /\ sfB = [x \in ColsB |-> -1]
     /\ ra = [x \in RADom |-> 0] /\ rb = [x \in RBDom |-> 0]
     /\ w = [x \in WDom |-> {-1}]
@@ -498,26 +561,51 @@ PendingGemm(gi) == \E j \in DOMAIN Prog[alpha0] :
                       /\ j \notin retired
 Reuse(gi) == IF gi > 1 /\ PendingGemm(gi - 1) THEN {"reuse"} ELSE {}
 Stale(c)  == IF c THEN {"stale"} ELSE {}
+\* σ/τ as read by a pack or K5: junk is stale; K1a's γ read as σ is "gamma".
+SigmaRead(v) == (IF v = -1 THEN {"stale"} ELSE {}) \cup (IF v \in {2, 3} THEN {"gamma"} ELSE {})
+FlagOf(v)    == v \in {1, 3}          \* the flag is final from K1a (or K1) on
 \* Record the workspace accesses of a step: bounds and the touched regions.
 Access(S, es) == /\ err' = err \cup es \cup OOB(S)
                 /\ touched' = touched \cup Regs(S)
 
-VecStep ==
-    /\ vecV' = TRUE
-    /\ Access({<<"vec", Off("vec"), Bytes("vec")>>}, {})
+\* K0, CTA X ∈ {A, B, C}: generate tensor X's three scatter vectors (from the
+\* descriptor in the kernel argument; no input is read).
+VecSubsOf(X) == CASE X = "A" -> 1..3 [] X = "B" -> 4..6 [] X = "C" -> 7..9
+VecStep(X) ==
+    /\ vecV' = vecV \cup {X}
+    /\ Access(UNION {{AccVec(VecSubs[v][1] + x) : x \in 0..(VecSubs[v][2] - 1)}
+                        : v \in VecSubsOf(X)}, {})
     /\ UNCHANGED <<sfA, sfB, ra, rb, w, cw, cval, aDirty, bDirty>>
 
-\* K1: scan row ī of A_λ (or column j̄ of B_λ), write σ and the flag.
-ScaleStep(t) ==
+\* K1 (one launch) and K1a: scan row ī of A_λ (or column j̄ of B_λ), write the
+\* flag and σ (K1: tag = flag) or γ (K1a: tag = 2 + flag) into sA/fA.
+ScanStep(t, gammaOnly) ==
+    LET lam == t[2]  x == t[3]  base == IF gammaOnly THEN 2 ELSE 0 IN
+    IF t[1] = "a"
+    THEN /\ sfA' = [sfA EXCEPT ![<<lam, x>>] = base + IF flagA[<<lam, x>>] THEN 1 ELSE 0]
+         /\ Access(VecA(lam, x) \cup {AccSA(lam, x), AccFA(lam, x)},
+                   ReadAB \cup Stale("A" \notin vecV) \cup ClobA(lam, x))
+         /\ UNCHANGED <<vecV, sfB, ra, rb, w, cw, cval, aDirty, bDirty>>
+    ELSE /\ sfB' = [sfB EXCEPT ![<<lam, x>>] = base + IF flagB[<<lam, x>>] THEN 1 ELSE 0]
+         /\ Access(VecB(lam, x) \cup {AccSB(lam, x), AccFB(lam, x)},
+                   ReadAB \cup Stale("B" \notin vecV) \cup ClobB(lam, x))
+         /\ UNCHANGED <<vecV, sfA, ra, rb, w, cw, cval, aDirty, bDirty>>
+
+\* K1b: re-read row ī of A_λ (or column j̄ of B_λ) and its γ from sA (sB),
+\* write σ over γ (the flag is unchanged). Reading anything but γ (junk, or
+\* σ already written over it) is stale.
+SigmaStep(t) ==
     LET lam == t[2]  x == t[3] IN
     IF t[1] = "a"
-    THEN /\ sfA' = [sfA EXCEPT ![<<lam, x>>] = IF flagA[<<lam, x>>] THEN 1 ELSE 0]
-         /\ Access(VecA(lam, x) \cup {AccSA(lam, x), AccFA(lam, x)},
-                   ReadAB \cup Stale(~vecV) \cup ClobA(lam, x))
+    THEN /\ sfA' = [sfA EXCEPT ![<<lam, x>>] = IF FlagOf(@) THEN 1 ELSE 0]
+         /\ Access(VecA(lam, x) \cup {AccSA(lam, x)},
+                   ReadAB \cup ClobA(lam, x)
+                   \cup Stale("A" \notin vecV \/ sfA[<<lam, x>>] \notin {2, 3}))
          /\ UNCHANGED <<vecV, sfB, ra, rb, w, cw, cval, aDirty, bDirty>>
-    ELSE /\ sfB' = [sfB EXCEPT ![<<lam, x>>] = IF flagB[<<lam, x>>] THEN 1 ELSE 0]
-         /\ Access(VecB(lam, x) \cup {AccSB(lam, x), AccFB(lam, x)},
-                   ReadAB \cup Stale(~vecV) \cup ClobB(lam, x))
+    ELSE /\ sfB' = [sfB EXCEPT ![<<lam, x>>] = IF FlagOf(@) THEN 1 ELSE 0]
+         /\ Access(VecB(lam, x) \cup {AccSB(lam, x)},
+                   ReadAB \cup ClobB(lam, x)
+                   \cup Stale("B" \notin vecV \/ sfB[<<lam, x>>] \notin {2, 3}))
          /\ UNCHANGED <<vecV, sfA, ra, rb, w, cw, cval, aDirty, bDirty>>
 
 \* Positions a pack writes: real ones (h < k, residues) and padding (zeros).
@@ -538,7 +626,7 @@ PackAStep(gi, t) ==
     /\ Access(VecA(lam, i) \cup {AccSA(lam, i)}
               \cup {AccRA(s, lam, i, h) : s \in 0..(sz - 1), h \in RealHs \cup pad},
               ReadAB \cup Reuse(gi) \cup ClobA(lam, i)
-              \cup Stale(~vecV \/ sfA[<<lam, i>>] = -1))
+              \cup Stale("A" \notin vecV) \cup SigmaRead(sfA[<<lam, i>>]))
     /\ UNCHANGED <<vecV, sfA, sfB, rb, w, cw, cval, aDirty, bDirty>>
 
 \* K3: same for column j̄ of B_λ; CTAs j̄ ∈ n..n̂-1 write zero rows.
@@ -557,7 +645,7 @@ PackBStep(gi, t) ==
               \cup (IF real THEN VecB(lam, j) \cup {AccSB(lam, j)} ELSE {}),
               Reuse(gi)
               \cup (IF real THEN ReadAB \cup ClobB(lam, j)
-                                 \cup Stale(~vecV \/ sfB[<<lam, j>>] = -1)
+                                 \cup Stale("B" \notin vecV) \cup SigmaRead(sfB[<<lam, j>>])
                     ELSE {}))
     /\ UNCHANGED <<vecV, sfA, sfB, ra, w, cw, cval, aDirty, bDirty>>
 
@@ -610,11 +698,11 @@ WriteC(e, tag) ==
 
 TrivialStep(e) ==
     /\ WriteC(e, IF beta0 THEN "zero" ELSE "betaC")
-    /\ Access(VecC(e[1], e[2], e[3]), CReadErr(e) \cup Stale(~vecV))
+    /\ Access(VecC(e[1], e[2], e[3]), CReadErr(e) \cup Stale("C" \notin vecV))
 
 CrtStep(e) ==
     LET lam == e[1]  i == e[2]  j == e[3]
-        flag == sfA[<<lam, i>>] = 1 \/ (Bug # "ignoreFB" /\ sfB[<<lam, j>>] = 1)
+        flag == FlagOf(sfA[<<lam, i>>]) \/ (Bug # "ignoreFB" /\ FlagOf(sfB[<<lam, j>>]))
         acc  == VecC(lam, i, j) \cup {AccFA(lam, i), AccFB(lam, j)}
                 \cup (IF flag THEN VecA(lam, i) \cup VecB(lam, j)
                       ELSE {AccSA(lam, i), AccSB(lam, j)} \cup {AccW(l, lam, i, j) : l \in Ls})
@@ -622,21 +710,27 @@ CrtStep(e) ==
     /\ WriteC(e, IF flag THEN "native" ELSE "crt")
     /\ Access(acc,
               CReadErr(e)
-              \cup Stale(~vecV \/ sfA[<<lam, i>>] = -1 \/ sfB[<<lam, j>>] = -1)
+              \cup Stale("C" \notin vecV \/ sfA[<<lam, i>>] = -1 \/ sfB[<<lam, j>>] = -1)
               \cup (IF flag THEN ReadAB \cup ClobA(lam, i) \cup ClobB(lam, j)
-                    ELSE IF \E l \in Ls : w[<<l, lam, i, j>>] # KHs THEN {"plane"}
-                    ELSE {}))
+                                 \cup Stale("A" \notin vecV \/ "B" \notin vecV)
+                    ELSE (IF sfA[<<lam, i>>] \in {2, 3} \/ sfB[<<lam, j>>] \in {2, 3}
+                          THEN {"gamma"} ELSE {})
+                         \cup (IF \E l \in Ls : w[<<l, lam, i, j>>] # KHs THEN {"plane"}
+                               ELSE {})))
 
 DirectStep(e) ==
     LET lam == e[1]  i == e[2]  j == e[3] IN
     /\ WriteC(e, "native")
     /\ Access(VecA(lam, i) \cup VecB(lam, j) \cup VecC(lam, i, j),
-              CReadErr(e) \cup ReadAB \cup Stale(~vecV)
+              CReadErr(e) \cup ReadAB \cup Stale(vecV # {"A", "B", "C"})
               \cup ClobA(lam, i) \cup ClobB(lam, j))
 
 Body(kr, t) ==
-    CASE kr.kind = "vec"    -> VecStep
-      [] kr.kind = "scale"  -> ScaleStep(t)
+    CASE kr.kind = "vec"    -> VecStep(t)
+      [] kr.kind = "scale"  -> ScanStep(t, FALSE)
+      [] kr.kind = "gamma"  -> ScanStep(t, TRUE)
+      [] kr.kind = "sigma"  -> SigmaStep(t)
+      [] kr.kind = "k1merged" -> IF t[1] = "g" THEN ScanStep(Tail(t), TRUE) ELSE SigmaStep(Tail(t))
       [] kr.kind = "packA"  -> PackAStep(kr.gi, t)
       [] kr.kind = "packB"  -> PackBStep(kr.gi, t)
       [] kr.kind = "gemm"   -> GemmStep(kr, t)
@@ -689,13 +783,13 @@ Expected(e) ==
 (* Invariants and properties *)
 
 TypeOK ==
-    /\ vecV \in BOOLEAN
-    /\ sfA \in [RowsA -> -1..1] /\ sfB \in [ColsB -> -1..1]
+    /\ vecV \subseteq {"A", "B", "C"}
+    /\ sfA \in [RowsA -> -1..3] /\ sfB \in [ColsB -> -1..3]
     /\ ra \in [RADom -> Zero..N] /\ rb \in [RBDom -> Zero..N]
     /\ \A x \in WDom : w[x] \subseteq {-1} \cup KHs
     /\ aDirty \in [RowsA -> BOOLEAN] /\ bDirty \in [ColsB -> BOOLEAN]
     /\ cw \in [Elems -> Nat] /\ cval \in [Elems -> CTags]
-    /\ touched \subseteq Active
+    /\ touched \subseteq Active \cup {"pvec"}
     /\ err \subseteq ErrKinds
 
 \* §4 "No stale reads": every read (vec, σ/flags, RA/RB chunk slices,
@@ -703,6 +797,10 @@ TypeOK ==
 \* call / group / chunk, never junk or a later group's residues; a K-padding
 \* product always has a zero operand.
 NoStaleRead == "stale" \notin err
+
+\* §4 K1 split: σ/τ are final before any pack or K5 reads them (sA/sB hold
+\* K1a's γ until K1b retires; nothing but K1b reads γ).
+SigmaFinalAtUse == "gamma" \notin err
 
 \* §4 "Residue buffers are reused across groups only after their GEMMs
 \* retire": no pack CTA of group G+1 runs while a GEMM of group G is unretired.
@@ -755,6 +853,15 @@ AccessesSafe == "oob" \notin err
 \* region the formula allocates (with LayoutExact: no byte is allocated for
 \* nothing except alignment padding).
 RegionsUsed == (AllDone /\ ~alpha0) => {r \in Active : Bytes(r) > 0} \subseteq touched
+
+\* v1.2 resident vectors: the plan's device buffer (what imd_plan_device_bytes
+\* reports) is exactly the nine vectors, gap-free (8 bytes per entry), and
+\* none for a generate plan. Constant-level.
+PlanBytesExact ==
+    /\ ~VecResident => PlanBytes = 0
+    /\ (VecResident /\ ~Empty) =>
+          /\ NCells("vec") * 8 = PlanBytes
+          /\ ByteSet("vec") = 0..(PlanBytes - 1)
 
 \* §4a layout facts. These are constant-level: TLC evaluates them once before
 \* the search and reports a failure as "The invariant of X is equal to FALSE".
@@ -815,7 +922,8 @@ DispatchByDescriptor ==
     /\ \A a \in BOOLEAN :
          LET kinds == {Prog[a][i].kind : i \in DOMAIN Prog[a]} IN
          /\ ("direct" \in kinds) <=> (~Empty /\ (Direct \/ KEmpty))
-         /\ "direct" \in kinds => kinds \cap {"scale", "packA", "packB", "gemm", "crt"} = {}
+         /\ "direct" \in kinds => kinds \cap {"scale", "gamma", "sigma", "k1merged", "packA",
+                                              "packB", "gemm", "crt"} = {}
     /\ WorkspaceSize = SumSeq([i \in DOMAIN Regions |-> Align(Bytes(Regions[i]))])
 
 \* §4 launch limits: each batched launch has gridDim.z <= MaxZ, and the

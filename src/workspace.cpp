@@ -52,6 +52,9 @@ std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s) {
     for (const auto& x : bytes)
       if (!x) return std::nullopt;
   }
+  // v1.2 IMD_VEC_RESIDENT: the vectors are plan memory; still sized above, so an
+  // overflowing vec is INVALID_VALUE in both modes (the plan would need those bytes).
+  if (s.vec_resident) bytes[static_cast<int>(Region::vec)] = std::nullopt;
 
   uint64_t off = 0;
   for (int r = 0; r < static_cast<int>(Region::count); ++r) {

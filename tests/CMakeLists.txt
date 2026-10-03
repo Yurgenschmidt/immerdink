@@ -33,6 +33,20 @@ target_include_directories(test_mod_exhaustive PRIVATE "${PROJECT_SOURCE_DIR}/sr
 target_link_libraries(test_mod_exhaustive PRIVATE imd_constants imd_warnings Threads::Threads)
 add_test(NAME mod_exhaustive_cpu COMMAND test_mod_exhaustive)
 
+# DESIGN v1.2 §6: concurrent host threads (shared and own plans, both vec modes, own streams
+# and workspaces), bit-identical to a sequential run.
+add_executable(test_threads test_threads.cpp)
+target_link_libraries(test_threads PRIVATE immerdink CUDA::cudart Threads::Threads imd_warnings)
+add_test(NAME threads COMMAND test_threads)
+set_tests_properties(threads PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+
+# DESIGN v1.2 §6: imd_contract captured into a CUDA graph (global capture mode) and replayed,
+# bit-exact, in each vec_mode.
+add_executable(test_graph test_graph.cpp)
+target_link_libraries(test_graph PRIVATE immerdink CUDA::cudart imd_warnings)
+add_test(NAME graph_capture COMMAND test_graph)
+set_tests_properties(graph_capture PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+
 # LD_PRELOAD counter of CUDA runtime allocations: imd_contract must allocate nothing (M3).
 add_library(imd_alloc_shim SHARED alloc_shim.c)
 target_include_directories(imd_alloc_shim PRIVATE ${CUDAToolkit_INCLUDE_DIRS})

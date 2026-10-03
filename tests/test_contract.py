@@ -177,64 +177,96 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
     if expect_kind is not None and kind != expect_kind:
         raise Fail(f"{name}: oracle dispatch {kind}, expected {expect_kind}")
 
-    # library
+    # library, in both scatter-vector modes (DESIGN v1.2 vec_mode): each bit-exact vs the
+    # oracle, stage-checked, and the two C buffers identical bit for bit (NaN payloads too)
     tA = hz.make_tensor(A.extent, A.stride, A.label)
     tB = hz.make_tensor(B.extent, B.stride, B.label)
     tC = hz.make_tensor(Cd.extent, Cd.stride, Cd.label)
-    st, ws_bytes = lib.workspace_size(tA, tB, tC, N, g, RND[rounding], MODE[mode])
-    if st != "SUCCESS":
-        raise Fail(f"{name}: imd_workspace_size {st}")
     gg = N if g in (0, None) else g
     pmode = params.DIRECT if mode == o.DIRECT else params.EMULATE
-    want_ws = 0 if view.empty_output() else params.workspace_size(view.m, view.n, view.k, view.b,
-                                                                   N, gg, pmode)
-    if ws_bytes != want_ws:
-        raise Fail(f"{name}: workspace {ws_bytes} != params {want_ws}")
-    if ws_bytes > MAX_WORKSPACE:
-        raise Fail(f"{name}: workspace {ws_bytes} > {MAX_WORKSPACE} (test guard)")
-    st, plan = lib.plan_create(tA, tB, tC, N, g, RND[rounding], MODE[mode])
-    if st != "SUCCESS":
-        raise Fail(f"{name}: imd_plan_create {st}")
-    dA, dB, dC = cuda.malloc(bufA.nbytes), cuda.malloc(bufB.nbytes), cuda.malloc(bufC.nbytes)
-    dW = cuda.malloc(ws_bytes + 2 * GUARD)
-    try:
-        cuda.upload(dA, bufA)
-        cuda.upload(dB, bufB)
-        cuda.upload(dC, bufC)
-        cuda.memset(dW, 0xA5, ws_bytes + 2 * GUARD)   # poison: every byte read must be written
-        pA = (dA.value or 0) + 8 * baseA
-        pB = (dB.value or 0) + 8 * baseB
-        pC = (dC.value or 0) + 8 * baseC
-        pW = dW.value + GUARD
-        allocs = lib.alloc_count()
-        t0 = time.time()
-        st = lib.contract(plan, alpha, pA, pB, beta, pC, pW, ws_bytes)
+    results = {}
+    t_gpu = 0.0
+    for vec, pvec in ((hz.VEC_GENERATE, params.VEC_GENERATE), (hz.VEC_RESIDENT, params.VEC_RESIDENT)):
+        vname = f"{name} [{pvec}]"
+        st, ws_bytes = lib.workspace_size(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec)
         if st != "SUCCESS":
-            raise Fail(f"{name}: imd_contract {st}")
-        cuda.sync()
-        t_gpu = time.time() - t0
-        if allocs is not None and lib.alloc_count() != allocs:
-            raise Fail(f"{name}: imd_contract allocated ({lib.alloc_count() - allocs} calls)")
-        got = np.empty_like(bufC)
-        cuda.download(got, dC)
-        wsg = np.empty(ws_bytes + 2 * GUARD, dtype=np.uint8)
-        cuda.download(wsg, dW)
-        if (wsg[:GUARD] != 0xA5).any() or (wsg[GUARD + ws_bytes:] != 0xA5).any():
-            raise Fail(f"{name}: bytes outside [ws, ws + workspace_size) were written")
-        ws = wsg[GUARD:GUARD + max(ws_bytes, 1)]
-    finally:
-        for p in (dA, dB, dC, dW):
-            cuda.free(p)
-        lib.plan_destroy(plan)
-
-    if kind == "GEMM":
-        check_stages(name, view, trace, ws, N, gg)
-    bad = bit_mismatches(got, want)
-    if len(bad):
-        i = bad[0]
-        raise Fail(f"{name}: {len(bad)}/{got.size} C elements differ; first at {i}: "
-                   f"gpu {got[i]!r} ({got.view(np.uint64)[i]:#018x}) oracle {want[i]!r} "
-                   f"({want.view(np.uint64)[i]:#018x})")
+            raise Fail(f"{vname}: imd_workspace_size {st}")
+        want_ws = 0 if view.empty_output() else params.workspace_size(view.m, view.n, view.k, view.b,
+                                                                       N, gg, pmode, pvec)
+        if ws_bytes != want_ws:
+            raise Fail(f"{vname}: workspace {ws_bytes} != params {want_ws}")
+        if ws_bytes > MAX_WORKSPACE:
+            raise Fail(f"{vname}: workspace {ws_bytes} > {MAX_WORKSPACE} (test guard)")
+        allocs0 = lib.alloc_count()
+        st, plan = lib.plan_create(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec)
+        if st != "SUCCESS":
+            raise Fail(f"{vname}: imd_plan_create {st}")
+        # CUDA allocations of plan creation (shim): one device allocation for resident
+        # vectors, none otherwise (no pinned memory in v1.2). The resident count also proves
+        # the shim interposes the library's runtime calls.
+        if allocs0 is not None:
+            want_allocs = 1 if (pvec == params.VEC_RESIDENT and not view.empty_output()) else 0
+            if lib.alloc_count() - allocs0 != want_allocs:
+                raise Fail(f"{vname}: imd_plan_create made {lib.alloc_count() - allocs0} CUDA "
+                           f"allocations, expected {want_allocs}")
+        dA, dB, dC = cuda.malloc(bufA.nbytes), cuda.malloc(bufB.nbytes), cuda.malloc(bufC.nbytes)
+        dW = cuda.malloc(ws_bytes + 2 * GUARD)
+        try:
+            st, dev_bytes = lib.plan_device_bytes(plan)
+            want_dev = params.plan_device_bytes(view.m, view.n, view.k, view.b, pvec)
+            if st != "SUCCESS" or dev_bytes != want_dev:
+                raise Fail(f"{vname}: imd_plan_device_bytes {st} {dev_bytes} != params {want_dev}")
+            plan_vec = None
+            if lib.has_test_hooks:
+                addr, cnt = lib.plan_vec(plan)
+                if (addr is not None) != (want_dev > 0) or (addr and 8 * cnt != want_dev):
+                    raise Fail(f"{vname}: resident vectors {addr} x {cnt} vs {want_dev} bytes")
+                if addr:
+                    plan_vec = np.empty(cnt, dtype=np.int64)
+                    cuda.download_raw(plan_vec, addr)
+            cuda.upload(dA, bufA)
+            cuda.upload(dB, bufB)
+            cuda.upload(dC, bufC)
+            cuda.memset(dW, 0xA5, ws_bytes + 2 * GUARD)   # poison: every byte read must be written
+            pA = (dA.value or 0) + 8 * baseA
+            pB = (dB.value or 0) + 8 * baseB
+            pC = (dC.value or 0) + 8 * baseC
+            pW = dW.value + GUARD
+            allocs = lib.alloc_count()
+            t0 = time.time()
+            st = lib.contract(plan, alpha, pA, pB, beta, pC, pW, ws_bytes)
+            if st != "SUCCESS":
+                raise Fail(f"{vname}: imd_contract {st}")
+            cuda.sync()
+            t_gpu += time.time() - t0
+            if allocs is not None and lib.alloc_count() != allocs:
+                raise Fail(f"{vname}: imd_contract allocated ({lib.alloc_count() - allocs} calls)")
+            got = np.empty_like(bufC)
+            cuda.download(got, dC)
+            wsg = np.empty(ws_bytes + 2 * GUARD, dtype=np.uint8)
+            cuda.download(wsg, dW)
+            if (wsg[:GUARD] != 0xA5).any() or (wsg[GUARD + ws_bytes:] != 0xA5).any():
+                raise Fail(f"{vname}: bytes outside [ws, ws + workspace_size) were written")
+            ws = wsg[GUARD:GUARD + max(ws_bytes, 1)]
+        finally:
+            for p in (dA, dB, dC, dW):
+                cuda.free(p)
+            lib.plan_destroy(plan)
+        if plan_vec is not None and not np.array_equal(plan_vec, np.array(view.vec_region(), np.int64)):
+            raise Fail(f"{vname}: resident scatter vectors differ from the oracle's")
+        if kind == "GEMM":
+            check_stages(vname, view, trace, ws, N, gg, pvec)
+        bad = bit_mismatches(got, want)
+        if len(bad):
+            i = bad[0]
+            raise Fail(f"{vname}: {len(bad)}/{got.size} C elements differ; first at {i}: "
+                       f"gpu {got[i]!r} ({got.view(np.uint64)[i]:#018x}) oracle {want[i]!r} "
+                       f"({want.view(np.uint64)[i]:#018x})")
+        results[pvec] = got
+    if not np.array_equal(results[params.VEC_GENERATE].view(np.uint64),
+                          results[params.VEC_RESIDENT].view(np.uint64)):
+        raise Fail(f"{name}: C differs between vec modes GENERATE and RESIDENT")
+    got = results[params.VEC_GENERATE]
     STATS["cases"] += 1
     STATS["elements"] += got.size
     STATS["kinds"][kind] = STATS["kinds"].get(kind, 0) + 1
@@ -245,11 +277,12 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
     return got
 
 
-def check_stages(name, view, trace, ws, N, g):
-    """Compare every workspace region with the oracle's intermediates (see module doc)."""
+def check_stages(name, view, trace, ws, N, g, vec=params.VEC_GENERATE):
+    """Compare every workspace region with the oracle's intermediates (see module doc). With
+    vec = RESIDENT there is no vec region (run_case checks the plan's copy instead)."""
     m, n, k, b = view.m, view.n, view.k, view.b
     kh, nh = -(-k // 16) * 16, -(-n // 16) * 16
-    regs = {r: (s, e) for r, s, e in params.region_offsets(m, n, k, b, N, g, params.EMULATE)}
+    regs = {r: (s, e) for r, s, e in params.region_offsets(m, n, k, b, N, g, params.EMULATE, vec)}
 
     def reg(r, dtype, shape):
         s, e = regs[r]
@@ -260,8 +293,9 @@ def check_stages(name, view, trace, ws, N, g):
             raise Fail(f"{name}: stage {what} differs from the oracle")
 
     bt = trace["batches"]
-    need(np.array_equal(reg("vec", np.int64, (-1,)), np.array(view.vec_region(), np.int64)),
-         "K0 vec (scatter vectors)")
+    if "vec" in regs:
+        need(np.array_equal(reg("vec", np.int64, (-1,)), np.array(view.vec_region(), np.int64)),
+             "K0 vec (scatter vectors)")
     need(np.array_equal(reg("sA", np.int16, (b, m)), np.array([t["sigma"] for t in bt])), "K1 sigma")
     need(np.array_equal(reg("sB", np.int16, (b, n)), np.array([t["tau"] for t in bt])), "K1 tau")
     need(np.array_equal(reg("fA", np.uint8, (b, m)), np.array([t["fA"] for t in bt], np.uint8)),
