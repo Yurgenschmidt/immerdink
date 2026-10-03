@@ -17,8 +17,8 @@ and measured but not adopted) and the §6 thread and lifetime rules that follow 
 (§4, chosen at plan time; same results, same workspace) and reports the launch structure in
 the host API (§6a); changed text is marked **[v1.4]**. v1.5 adds a small set of K4 tile
 configurations chosen per plan (§4; bit-identical results, same launches and workspace), the
-optional plan-time autotuning option `k4_tune` (§6) and the choice in the host API (§6a);
-changed text is marked **[v1.5]**. The change lists are at the end.
+optional plan-time autotuning option `k4_tune` (§6) and the choice in the host API (§6a), and
+takes the fused launch KF up to k̂ ≤ 1024 (§4); changed text is marked **[v1.5]**. The change lists are at the end.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -718,7 +718,8 @@ const char*  imd_status_string(imd_status_t);
 - **`imd_plan_device_bytes`** reports the device bytes the plan owns, exactly §4a's "plan
   device bytes" (the bytes requested from `cudaMalloc`; the driver's allocation granularity
   is not included). With the workspace and the user tensors this is all the device memory
-  immerdink uses (MEMORY_MODEL §3).
+  immerdink uses (MEMORY_MODEL §3), except **[v1.5]** the `k4_tune_bytes` (§6a) a plan
+  creation with `k4_tune` on allocates and frees before it returns.
 - **ALLOC_FAILED** covers host allocation failure in plan creation and, with
   `IMD_VEC_RESIDENT`, the plan's device allocation (and **[v1.5]** with `k4_tune`, its
   temporary allocation); any other CUDA failure, including plan creation's device-property
