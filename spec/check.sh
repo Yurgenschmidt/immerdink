@@ -18,11 +18,20 @@
 # Model checking is a pass/fail correctness check (CPU contention cannot change
 # its result), so it is never gated on a quiet machine (user decision,
 # 2026-10-02; CHECK_QUIET is ignored). Knobs:
-#   TLC_JOBS     models run concurrently (default: nproc/4, at least 1)
+#   TLC_JOBS     models run concurrently (default: nproc/4, at least 1). Clamped
+#                to what fits in memory: each job is budgeted 2*TLC_HEAP + 512 MiB
+#                (heap + off-heap fingerprint set) against 80% of the smaller of
+#                the immerdink memory cap and MemAvailable.
+#   TLC_HEAP     JVM heap per model, MiB or with g/m suffix (default 2g); the
+#                off-heap fingerprint set gets the same. Raise for a big model.
 #   TLC_WORKERS  TLC worker threads per model (default 1; raise for big models)
 #   TLC_TIMEOUT  seconds per model before it is reported as TIMEOUT (default 900)
+# The whole run sits inside tools/memcap.sh's shared memory budget. Without a
+# heap cap each JVM defaulted to 1/4 of RAM, and TLC_JOBS=16 crashed the machine
+# (2026-10-03).
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"; cd "$here"
+grep -q "/immerdink.slice/" /proc/self/cgroup 2>/dev/null || exec "$here/../tools/memcap.sh" "$here/check.sh" "$@"
 JAR="${TLA2TOOLS:-$(ls -d "$HOME"/.vscode/extensions/tlaplus.vscode-ide-*/tools/tla2tools.jar 2>/dev/null | tail -1)}"
 [ -f "$JAR" ] || { echo "tla2tools.jar not found; set TLA2TOOLS" >&2; exit 2; }
 
@@ -30,6 +39,17 @@ shopt -s nullglob
 cfgs=( MC_${1:-*}__${2:-*}.cfg )
 [ ${#cfgs[@]} -gt 0 ] || { echo "no models match MC_${1:-*}__${2:-*}.cfg" >&2; exit 2; }
 jobs_max="${TLC_JOBS:-$(( $(nproc) / 4 > 0 ? $(nproc) / 4 : 1 ))}"
+heap="${TLC_HEAP:-2g}"
+case "$heap" in *[gG]) heap_mb=$(( ${heap%[gG]} * 1024 ));; *[mM]) heap_mb=${heap%[mM]};; *) heap_mb=$heap;; esac
+avail_mb=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1024 ))
+cap_file="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | xargs dirname)/memory.max"
+cap_raw="$(cat "$cap_file" 2>/dev/null || echo max)"
+[ "$cap_raw" != max ] && [ $(( cap_raw / 1048576 )) -lt "$avail_mb" ] && avail_mb=$(( cap_raw / 1048576 ))
+mem_jobs=$(( avail_mb * 8 / 10 / (2 * heap_mb + 512) )); [ "$mem_jobs" -ge 1 ] || mem_jobs=1
+if [ "$jobs_max" -gt "$mem_jobs" ]; then
+  echo "check.sh: TLC_JOBS=$jobs_max does not fit in ${avail_mb} MiB at TLC_HEAP=$heap; using $mem_jobs" >&2
+  jobs_max=$mem_jobs
+fi
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
 run_one() {  # cfg -> writes $tmp/<base>.verdict
@@ -37,7 +57,7 @@ run_one() {  # cfg -> writes $tmp/<base>.verdict
   module="${base%%__*}"; kind="${base#*__}"
   dl="-deadlock"; grep -q '^\\\* CHECK_DEADLOCK' "$cfg" && dl=""
   t0=$SECONDS
-  out="$(timeout "${TLC_TIMEOUT:-900}" java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers "${TLC_WORKERS:-1}" $dl \
+  out="$(timeout "${TLC_TIMEOUT:-900}" java -Xmx"${heap_mb}m" -XX:MaxDirectMemorySize="${heap_mb}m" -XX:+UseParallelGC -XX:ParallelGCThreads=2 -cp "$JAR" tlc2.TLC -workers "${TLC_WORKERS:-1}" $dl \
          -noGenerateSpecTE -metadir "$tmp/meta-$base" -config "$cfg" "$module.tla" 2>&1)"
   local rc=$?
   dt=$((SECONDS - t0))
