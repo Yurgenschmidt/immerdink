@@ -1,0 +1,22 @@
+# M4 baseline sweep: one case per line, run by bench/run_sweep.sh (one gated process per case).
+# name | einsum spec (row-major operands) | extents | methods | N list | cuBLAS emu variants | extra args
+#
+# Square matrices, TN layout (A = [i][k], B = [j][k]: k fastest in both, the int8 TN layout).
+sq1024  | ik,jk->ij | i=1024,j=1024,k=1024   | dgemm,emu,int8,gemmul8,imd    | 8,12,14,16,20 | dyn,fix47,fix55,fix63 |
+sq2048  | ik,jk->ij | i=2048,j=2048,k=2048   | dgemm,emu,int8,gemmul8,imd    | 8,12,14,16,20 | dyn,fix47,fix55,fix63 |
+sq4096  | ik,jk->ij | i=4096,j=4096,k=4096   | dgemm,emu,int8,gemmul8,imd    | 8,12,14,16,20 | dyn,fix47,fix55,fix63 |
+sq8192  | ik,jk->ij | i=8192,j=8192,k=8192   | bw,dgemm,emu,int8,gemmul8,imd | 8,12,14,16,20 | dyn,fix47,fix55,fix63 | --max-seconds 6
+# 16384^3: user data 6 GiB; immerdink N=14 needs 10.5 GiB of workspace, so only N in {8,14}.
+sq16384 | ik,jk->ij | i=16384,j=16384,k=16384 | dgemm,emu,int8,gemmul8,imd   | 8,14          | dyn,fix55             | --reps 3 --warmup 1 --max-seconds 1 --emu-ws-mib 4096
+# Rectangular.
+r_lowk  | ik,jk->ij | i=8192,j=8192,k=1024   | dgemm,emu,int8,gemmul8,imd    | 8,14,20       | dyn                   |
+r_bigk  | ik,jk->ij | i=2048,j=2048,k=32768  | dgemm,emu,int8,gemmul8,imd    | 8,14,20       | dyn                   |
+r_skinny| ik,jk->ij | i=16384,j=512,k=4096   | dgemm,emu,int8,gemmul8,imd    | 8,14,20       | dyn                   |
+r_mm    | ik,jk->ij | i=1000,j=64,k=50000    | dgemm,emu,int8,gemmul8,imd    | 8,14,20       | dyn                   |
+# Tensor cases (GEMM views of about 4096^3). Matrix-only baselines get a "perm+" variant.
+t_nn      | ik,kj->ij      | i=4096,j=4096,k=4096               | dgemm,emu,int8,gemmul8,cutensor,imd | 8,14,20 | dyn |
+t_batch   | lik,ljk->lij   | i=1024,j=1024,k=1024,l=16          | dgemm,emu,int8,gemmul8,cutensor,imd | 8,14,20 | dyn |
+t_ikl     | ikl,kjl->ijl   | i=1024,j=1024,k=1024,l=16          | dgemm,emu,int8,gemmul8,cutensor,imd | 8,14,20 | dyn |
+t_df      | acQ,bdQ->acbd  | a=64,b=64,c=64,d=64,Q=2048         | dgemm,emu,int8,gemmul8,cutensor,imd | 8,14,20 | dyn |
+t_cc      | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128  | dgemm,emu,int8,gemmul8,cutensor,imd | 8,14,20 | dyn |
+t_permout | abk,kcd->cadb  | a=64,b=64,c=64,d=64,k=4096         | dgemm,emu,int8,gemmul8,cutensor,imd | 8,14,20 | dyn |
