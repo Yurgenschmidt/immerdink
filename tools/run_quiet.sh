@@ -24,4 +24,15 @@ if [ "${QUIET_GATE:-0}" = 1 ]; then
   done
   "$here/quiet_check.sh" > "${QUIET_LOG:-/dev/null}" 2>&1 || true   # record conditions
 fi
+# GPU work on this box is shared with other projects (ehrenfest): every gated run also
+# takes the machine-wide advisory GPU lock, IMMERDINK_GPU_LOCK (default: ehrenfest's
+# _wip/gpu.lock if present, else $XDG_RUNTIME_DIR/gpu.lock; "none" disables).
+gpu_lock="${IMMERDINK_GPU_LOCK:-}"
+if [ -z "$gpu_lock" ]; then
+  gpu_lock="/home/ef/repos/ehrenfest-ipdps/_wip/gpu.lock"
+  [ -d "$(dirname "$gpu_lock")" ] || gpu_lock="${XDG_RUNTIME_DIR:-/tmp}/gpu.lock"
+fi
+if [ "$gpu_lock" != none ] && [ "${QUIET_GATE:-0}" = 1 ]; then
+  exec flock "$gpu_lock" "$here/memcap.sh" "$@"
+fi
 "$here/memcap.sh" "$@"
