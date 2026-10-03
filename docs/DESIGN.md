@@ -70,10 +70,11 @@ The canonical orders are a fixed function of the descriptors (§5 step 8).
 | `T` | `⌊√H⌋`, the per-side norm budget. `T² ≤ H < (T+1)²`. |
 | `K_c` | `131071 = ⌊(2³¹−1)/128²⌋`. It is tight: `128²·(K_c+1) > 2³¹−1`. CUTLASS 2.x int8 MMA is `.satfinite` ([CUT] `mma_sm80.h`), so overflow **saturates silently**. **Every modulus, including p = 256, must be K-chunked.** The wraparound exemption [G8] relies on with cuBLAS does not apply here. **[spec: OzakiCRT ChunkFits, neg_chunk, neg_order]** |
 | `K_c'` | `131056 = ⌊K_c/16⌋·16`, the chunk length used. Numerically any chunk length ≤ K_c is exact. The multiple of 16 is only there to keep CUTLASS pointers 16-byte aligned. |
-| `L_w` | Width of the **unsigned** CRT word, `32·L32` with `L32` minimal such that `2P ≤ 2^{L_w}`. `L32` = 2 for N ≤ 7, 3 for N ≤ 12, 4 for N ≤ 16, 5 for N ≤ 20. The bound is exact: the reachable peak needs every bit. |
+| `L_w` | Width of the **unsigned** CRT word, `32·L32` with `L32` minimal such that `2P ≤ 2^{L_w}`. `L32` = 1 for N ≤ 3, 2 for N ≤ 7, 3 for N ≤ 12, 4 for N ≤ 16, 5 for N ≤ 20. The bound is exact: the reachable peak needs every bit. |
 
 All constants are generated and checked by `spec/params.py` in exact integer arithmetic.
-It is the only producer of the device constant tables (`--json`). We use no
+It is the only producer of the device constant tables (`--emit-header`, which writes
+`include/immerdink/detail/constants.hpp`; `--json` for tooling). We use no
 floating-point constants. [G8]'s N=2 `log2P` entry is mis-rounded.
 
 ---
@@ -194,7 +195,7 @@ Why we deviate:
 ### 3.6 CRT reconstruction (exact, multi-word) — **[deviation from D10 as first stated]**
 ```
 x ← 0                                        (unsigned L_w-bit word: L32 little-endian u32 limbs)
-for l = 1..N:  y ← (q_l·W_l) mod p_l         (16-bit value, exact constant-divisor reduction)
+for l = 1..N:  y ← (q_l·W_l) mod p_l         (16-bit value; same umulhi64(⌈2⁶⁴/p⌉) reduction as §3.5)
                x ← x + M_l·y                 (one fused carry chain: t = x_k + M_l,k·y + carry in u64)
                if x ≥ P: x ← x − P           (invariant x < P; peak < 2P ≤ 2^{L_w})
 z ← (x ≤ H) ? x : x − P                      (z ∈ [H+1−P, H] = [−P/2, P/2−1])
@@ -383,8 +384,10 @@ Lowering, in order **[spec: IndexMap]**:
      |s_B|, position).
    - K by (|s_big|, |s_other|, position), where "big" = A if m ≥ n, else B.
    - "Position" is the first occurrence in `A.labels ++ B.labels ++ C.labels`.
-   - **Coalescing:** if C's smallest-|stride| label is in I, swap the operand roles (compute
-     Cᵀ = BᵀAᵀ: A↔B, I↔J) so that j̄ is C's fastest axis.
+   - **Coalescing:** among C's modes with extent > 1, if the smallest-|stride| one is in I,
+     swap the operand roles (compute Cᵀ = BᵀAᵀ: A↔B, I↔J) so that j̄ is C's fastest axis.
+     The swap happens **before** §4a sizing: §4a's m and n are post-swap. That matters
+     because only n is padded to n̂. The smallest |stride| is unique whenever rule 4 holds.
 9. **Fusion (after step 8):** within each group, in canonical order, merge consecutive
    labels g, g′ iff `s_X(g′) = s_X(g)·e(g)` for **every** tensor X that carries the group.
    - That includes operands that carry it with stride 0 from step 6.
@@ -401,8 +404,8 @@ this precedence order; the first failing check wins:
 | 2 | repeated label in C | NOT_SUPPORTED |
 | 3 | label only in C with extent > 1 | NOT_SUPPORTED |
 | 4 | non-empty C fails the **sorted-\|stride\| rule**: over C's modes with extent > 1, sorted by \|stride\|, each \|s₍t₎\| > Σ_{u<t} \|s₍u₎\|(e₍u₎−1) (sufficient for injectivity) | INVALID_VALUE |
-| 5 | overflow: extent products or spans exceed int64; m or n̂ > 2³¹−1; workspace total exceeds uint64 | INVALID_VALUE |
-| 6 | C ∩ A or C ∩ B (byte intervals; checked even when k = 0, conservatively); workspace ∩ A, B or C | ALIASING (execute time) |
+| 5 | overflow: extent products or spans exceed int64; workspace total exceeds uint64; in EMULATE mode with a non-empty output, m or n̂ > 2³¹−1 (CUTLASS limit; not applied to DIRECT) | INVALID_VALUE |
+| 6 | C ∩ A or C ∩ B (byte intervals; checked even when k = 0, conservatively); workspace ∩ A, B or C, using the bytes actually used, `[ws, ws + workspace_size)` | ALIASING (execute time) |
 | 7 | A, B or C not 8-byte aligned; workspace not 256-byte aligned | MISALIGNED (execute time) |
 
 Allowed:
@@ -451,12 +454,25 @@ imd_status_t imd_plan_create(imd_handle_t, const imd_tensor_t* A, const imd_tens
                              const imd_tensor_t* C, const imd_options_t*, imd_plan_t*);
 imd_status_t imd_contract(imd_plan_t, double alpha, const double* A, const double* B,
                           double beta, double* C, void* ws, size_t ws_bytes, cudaStream_t);
+imd_status_t imd_create(imd_handle_t*);           /* lifecycle */
+imd_status_t imd_destroy(imd_handle_t);
+imd_status_t imd_plan_destroy(imd_plan_t);
+const char*  imd_status_string(imd_status_t);
 ```
 
 - `imd_workspace_size` is a **pure host function**: no GPU, no allocation, and exactly
   §4a.
 - Statuses: SUCCESS, INVALID_VALUE, NOT_SUPPORTED, ALIASING, INSUFFICIENT_WORKSPACE,
-  MISALIGNED, CUDA_ERROR.
+  MISALIGNED, ALLOC_FAILED (host allocation in plan creation), CUDA_ERROR.
+- `imd_plan_create` reports the §5 statuses and the RN acceptance rule (§3.2: κ ≥ T →
+  NOT_SUPPORTED). That rule applies only when the emulated GEMM would run;
+  `imd_workspace_size` is exactly §4a and never applies it.
+- `imd_contract` checks, in order:
+  1. null pointers → INVALID_VALUE;
+  2. an empty output → SUCCESS with nothing touched;
+  3. ALIASING (§5 row 6);
+  4. MISALIGNED;
+  5. `ws_bytes < workspace_size` → INSUFFICIENT_WORKSPACE.
 - `imd_contract` does no host synchronization and no allocation, and has no hidden mode
   switches.
 - A workspace belongs to at most **one** in-flight `imd_contract` at a time.
