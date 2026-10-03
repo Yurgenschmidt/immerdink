@@ -23,6 +23,7 @@
 #include "device/constants.cuh"
 #include "kernels/numerics.cuh"
 #include "plan.hpp"
+#include "profile.hpp"
 
 namespace imd::detail {
 namespace {
@@ -123,22 +124,38 @@ __global__ void __launch_bounds__(kThreads) k1_scale(ScaleArgs a) {
 // ---- K2 / K3: gather, §3.3 quantization and §3.4 residues -------------------------------
 //
 // A tiled gather-transpose (TBLIS style). The operand's rows are enumerated as
-// rho = r + rows * lambda (index_map.hpp pack_pivot); a tile is kTileRows rows
-// rho = lo + radix * d, d in [d0, d0 + kTileRows), by kTileK consecutive k-bar.
+// rho = r + rows * lambda (index_map.hpp pack_pivot); a tile is th rows
+// rho = lo + radix * d, d in [d0, d0 + th), by tk = 4096 / th consecutive k-bar.
 //   1. row info: the gather base v_bat[lambda] + v_row[r], sigma, the output row; v_k[h];
 //   2. read: raw binary64 bits into shared memory. A warp reads along d (along_rows: X's
 //      smallest-|stride| mode is the row / batch mode at `radix`) or along k-bar, so global
 //      reads are coalesced along that mode whichever axis of X is fastest;
 //   3. write: each thread converts 16 consecutive k-bar of one row and stores them as one
 //      16-byte vector per modulus of the group, K-contiguous; h in [k, k_hat) is zero.
+// Tile shape: th = 64 when reading along k-bar; along rows th = the power of two >= D (the
+// number of rows along the pivot), clamped to [8, 64], so a short pivot mode (e.g. a
+// stride-1 batch label of extent 16) does not leave most tile rows empty (NOTES-M2M3 #6):
+// the tile is wider in k-bar instead. Shared memory holds row dl, k-bar hl at
+// dl * pitch + hl + hl / 16 (one pad word per 16: the 16-wide conversion reads of a warp
+// hit distinct banks; pitch is odd, so the along-d reads do too).
 // The tile is generic in what it emits: `PackEmitter` converts 16 values for one modulus
 // (an Ozaki-I slice mode would emit slices here and reuse the gather unchanged).
 // B rows n..n_hat-1 (zero) are written by k23_zero_rows.
 
-constexpr int kTileRows = 64;  // d per tile
-constexpr int kTileK = 64;     // k-bar per tile; kTileRows * kTileK / 16 == kThreads
-constexpr int kVec = 16;       // int8 per 16-byte store
-static_assert(kTileRows * (kTileK / kVec) == kThreads, "one 16-byte chunk per thread");
+constexpr int kTileElems = 4096;  // th * tk; kTileElems / 16 == kThreads
+constexpr int kTileRowsMax = 64, kTileRowsMin = 8;
+constexpr int kTileKMax = kTileElems / kTileRowsMin;  // 512
+constexpr int kVec = 16;          // int8 per 16-byte store
+constexpr int kTileSmem = kTileElems + kTileElems / kVec + kTileRowsMax;  // padded words
+static_assert(kTileElems / kVec == kThreads, "one 16-byte chunk per thread");
+
+// log2 of the pack tile height (see above).
+inline int pack_tile_lg_rows(bool along_rows, int64_t D) {
+  if (!along_rows) return 6;
+  int lg = 3;
+  while (lg < 6 && (int64_t{1} << lg) < D) ++lg;
+  return lg;
+}
 
 struct PackArgs {
   Operand op;
@@ -149,48 +166,65 @@ struct PackArgs {
   int8_t* R;          // [s][lambda][rows_pad][k_hat]
   int64_t radix;      // rho = lo + radix * d
   bool along_rows;    // read phase: warp lanes along d (else along k-bar)
+  int lg_th;          // tile height th = 2^lg_th rows, tk = kTileElems / th k-bar
 };
 
 // §3.3 + §3.4 for one row's 16 consecutive k-bar: quantize once, then residues per modulus.
+// The residue of |a'| = mu 2^eps is ((mu mod p) (2^eps mod p)) mod p; mu mod p by byte
+// weights and dp4a (device/modp.hpp mod_p_bytes), the rare eps > 0 factor by the pow2_mod
+// table, then the sign and SMod. Same congruence class as §3.4 `residue`, so the same int8.
 struct PackEmitter {
-  uint64_t mu[kVec];
+  uint32_t lo[kVec], hi[kVec];  // mu = hi 2^32 + lo < 2^54
   int eps[kVec];
-  bool neg[kVec];
+  uint32_t neg = 0, has_eps = 0;  // bit e: a'_e < 0 / eps_e > 0
 
   __device__ __forceinline__ void load(const uint64_t* bits, int sigma, bool trunc) {
 #pragma unroll
     for (int e = 0; e < kVec; ++e) {
-      quantize(bits[e], sigma, trunc, &mu[e], &eps[e]);  // non-finite / zero -> mu = 0
-      neg[e] = (bits[e] & kSignBit) != 0;
+      uint64_t mu;
+      quantize(bits[e], sigma, trunc, &mu, &eps[e]);  // non-finite / zero -> mu = 0, eps = 0
+      lo[e] = static_cast<uint32_t>(mu);
+      hi[e] = static_cast<uint32_t>(mu >> 32);
+      neg |= static_cast<uint32_t>((bits[e] & kSignBit) != 0) << e;
+      has_eps |= static_cast<uint32_t>(eps[e] != 0) << e;
     }
   }
   __device__ __forceinline__ uint4 emit(int l) const {
+    const uint32_t p = c_tables.moduli[l], half = (p + 1) / 2;
+    const uint64_t magic = c_tables.epi_magic[l];
+    const uint32_t wlo = imd::device::c_byte_weights.lo[l], whi = imd::device::c_byte_weights.hi[l];
     uint32_t w[4] = {0, 0, 0, 0};
 #pragma unroll
     for (int e = 0; e < kVec; ++e) {
-      const int8_t r = mu[e] == 0 ? int8_t{0} : residue(mu[e], neg[e], eps[e], l);
-      w[e / 4] |= static_cast<uint32_t>(static_cast<uint8_t>(r)) << (8 * (e % 4));
+      uint32_t r = imd::device::mod_p_bytes(lo[e], hi[e], wlo, whi, p, magic);
+      if ((has_eps >> e) & 1u)
+        r = imd::device::mod_p_small(r * c_tables.pow2_mod[l][eps[e]], p, magic);
+      if (((neg >> e) & 1u) && r != 0) r = p - r;
+      const uint32_t s = r >= half ? r - p : r;  // SMod as an int8 bit pattern (low byte)
+      w[e / 4] |= (s & 255u) << (8 * (e % 4));
     }
     return make_uint4(w[0], w[1], w[2], w[3]);
   }
 };
 
 __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
-  __shared__ uint64_t tile[kTileRows][kTileK + 1];  // +1: conflict-free column access
-  __shared__ int64_t s_base[kTileRows];             // v_bat[lambda] + v_row[r]
-  __shared__ int64_t s_out[kTileRows];              // (lambda rows_pad + r) k_hat
-  __shared__ int s_sigma[kTileRows];
-  __shared__ bool s_valid[kTileRows];
-  __shared__ int64_t s_vk[kTileK];
+  __shared__ uint64_t tile[kTileSmem];
+  __shared__ int64_t s_base[kTileRowsMax];  // v_bat[lambda] + v_row[r]
+  __shared__ int64_t s_out[kTileRowsMax];   // (lambda rows_pad + r) k_hat
+  __shared__ int s_sigma[kTileRowsMax];
+  __shared__ bool s_valid[kTileRowsMax];
+  __shared__ int64_t s_vk[kTileKMax];
   const int tid = threadIdx.x;
+  const int lg_th = a.lg_th, th = 1 << lg_th, lg_tk = 12 - lg_th, tk = 1 << lg_tk;
+  const int pitch = tk + tk / kVec + 1;
   const int64_t rows = a.op.rows, D = a.b * rows / a.radix;
-  const int64_t n_d = (D + kTileRows - 1) / kTileRows, n_h = (a.k_hat + kTileK - 1) / kTileK;
+  const int64_t n_d = (D + th - 1) >> lg_th, n_h = (a.k_hat + tk - 1) >> lg_tk;
   const int64_t tiles = a.radix * n_d * n_h, plane = a.b * a.rows_pad * a.k_hat;
   for (int64_t t = blockIdx.x; t < tiles; t += gridDim.x) {
     const int64_t ht = t % n_h, rest = t / n_h, dt = rest % n_d, lo = rest / n_d;
-    const int64_t h0 = ht * kTileK, d0 = dt * kTileRows;
+    const int64_t h0 = ht << lg_tk, d0 = dt << lg_th;
     // 1. row and column info
-    if (tid < kTileRows) {
+    if (tid < th) {
       const int64_t d = d0 + tid;
       const bool valid = d < D;
       s_valid[tid] = valid;
@@ -200,29 +234,30 @@ __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
         s_out[tid] = (lam * a.rows_pad + r) * a.k_hat;
         s_sigma[tid] = a.sigma[rho];
       }
-    } else if (tid < kTileRows + kTileK) {
-      const int64_t h = h0 + (tid - kTileRows);
-      s_vk[tid - kTileRows] = h < a.k ? a.op.v_k[h] : 0;
+    }
+    for (int hl = tid; hl < tk; hl += kThreads) {
+      const int64_t h = h0 + hl;
+      s_vk[hl] = h < a.k ? a.op.v_k[h] : 0;
     }
     __syncthreads();
     // 2. coalesced read into shared memory (zero outside the operand)
     const int64_t h_end = a.k - h0;  // valid k-bar in this tile: hl < h_end
-    if (a.along_rows) {
-      const int dl = tid % kTileRows;
-      for (int hl = tid / kTileRows; hl < kTileK; hl += kThreads / kTileRows)
-        tile[dl][hl] = s_valid[dl] && hl < h_end ? to_bits(a.op.X[s_base[dl] + s_vk[hl]]) : 0;
-    } else {
-      const int hl = tid % kTileK;
-      for (int dl = tid / kTileK; dl < kTileRows; dl += kThreads / kTileK)
-        tile[dl][hl] = s_valid[dl] && hl < h_end ? to_bits(a.op.X[s_base[dl] + s_vk[hl]]) : 0;
+#pragma unroll 4
+    for (int it = 0; it < kTileElems / kThreads; ++it) {
+      const int q = tid + it * kThreads;
+      const int dl = a.along_rows ? (q & (th - 1)) : (q >> lg_tk);
+      const int hl = a.along_rows ? (q >> lg_th) : (q & (tk - 1));
+      tile[dl * pitch + hl + hl / kVec] =
+          s_valid[dl] && hl < h_end ? to_bits(a.op.X[s_base[dl] + s_vk[hl]]) : 0;
     }
     __syncthreads();
     // 3. convert and store 16 K-contiguous int8 per modulus
-    const int dl = tid / (kTileK / kVec), hl = (tid % (kTileK / kVec)) * kVec;
+    const int dl = tid >> (lg_tk - 4), hl = (tid & ((tk >> 4) - 1)) * kVec;
     if (s_valid[dl] && h0 + hl < a.k_hat) {  // k_hat is a multiple of 16
       uint64_t bits[kVec];
+      const uint64_t* src = tile + dl * pitch + hl + hl / kVec;
 #pragma unroll
-      for (int e = 0; e < kVec; ++e) bits[e] = tile[dl][hl + e];
+      for (int e = 0; e < kVec; ++e) bits[e] = src[e];
       PackEmitter em;
       em.load(bits, s_sigma[dl], a.trunc);
       int8_t* dst = a.R + s_out[dl] + h0 + hl;
@@ -331,9 +366,11 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
   if (p.path == Path::kNoop) return IMD_STATUS_SUCCESS;
   // K0: scatter vectors -> ws.vec (pinned source: truly asynchronous)
   int64_t* vec = region<int64_t>(ws, p, Region::vec);
+  IMD_PROF(stream, "begin");
   if (cudaMemcpyAsync(vec, p.vec_host, static_cast<size_t>(p.vec_count) * sizeof(int64_t),
                       cudaMemcpyHostToDevice, stream) != cudaSuccess)
     return IMD_STATUS_CUDA_ERROR;
+  IMD_PROF(stream, "K0 vec");
   const VecOffsets vo = vec_offsets(p);
 
   OutArgs out{};
@@ -351,10 +388,12 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
 
   if (alpha == 0.0 || p.k == 0) {  // §3.7 beta-only mode: K1-K4 are not launched
     k5_beta_only<<<out_blocks, kThreads, 0, stream>>>(out);
+    IMD_PROF(stream, "K5 beta-only");
     return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
   }
   if (p.path == Path::kDirect) {
     k_direct<<<out_blocks, kThreads, 0, stream>>>(out);
+    IMD_PROF(stream, "DIRECT");
     return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
   }
 
@@ -375,8 +414,10 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
   for (int w = 0; w < 4; ++w) sa.rhs[w] = p.rhs[w];
   sa.op = opA, sa.sigma = sA, sa.flag = fA;
   k1_scale<<<blocks_for(p.b * p.m, 1), kThreads, 0, stream>>>(sa);
+  IMD_PROF(stream, "K1 scale A");
   sa.op = opB, sa.sigma = sB, sa.flag = fB;
   k1_scale<<<blocks_for(p.b * p.n, 1), kThreads, 0, stream>>>(sa);
+  IMD_PROF(stream, "K1 scale B");
   if (cudaPeekAtLastError() != cudaSuccess) return IMD_STATUS_CUDA_ERROR;
 
   // K2 / K3 / K4 per residue group
@@ -392,13 +433,15 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
       pa.radix = p.pack_radix[x];
       pa.along_rows = p.pack_along_rows[x];
       const int64_t D = p.b * pa.op.rows / pa.radix;
-      const int64_t tiles =
-          pa.radix * ((D + kTileRows - 1) / kTileRows) * ((p.k_hat + kTileK - 1) / kTileK);
+      pa.lg_th = pack_tile_lg_rows(pa.along_rows, D);
+      const int64_t th = int64_t{1} << pa.lg_th, tk = kTileElems / th;
+      const int64_t tiles = pa.radix * ((D + th - 1) / th) * ((p.k_hat + tk - 1) / tk);
       k23_pack<<<blocks_for(tiles, 1), kThreads, 0, stream>>>(pa);
       if (pa.rows_pad > pa.op.rows)
         k23_zero_rows<<<blocks_for(gsize * p.b * (pa.rows_pad - pa.op.rows) * p.k_hat / kVec),
                         kThreads, 0, stream>>>(pa.R, pa.op.rows, pa.rows_pad, p.b, p.k_hat,
                                                gsize);
+      IMD_PROF(stream, x == 0 ? "K2 pack A" : "K3 pack B");
     }
     if (cudaPeekAtLastError() != cudaSuccess) return IMD_STATUS_CUDA_ERROR;
     if (const imd_status_t st = k4_group(RA, RB, W, p.m, p.n_hat, p.k_hat, p.b, g0, gsize, stream);
@@ -416,6 +459,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
     case 5: k5_crt<5><<<out_blocks, kThreads, 0, stream>>>(out); break;
     default: return IMD_STATUS_CUDA_ERROR;  // unreachable: L32 in 1..5 for N in 2..20
   }
+  IMD_PROF(stream, "K5 crt");
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
 

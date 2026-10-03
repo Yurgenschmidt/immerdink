@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "device/modp.hpp"
+#include "device/residue.hpp"
 #include "immerdink/detail/constants.hpp"
 
 namespace {
@@ -79,7 +80,48 @@ int main() {
   std::printf("epilogue v mod p: %llu reachable values of 20 moduli (%u threads), %llu mismatches\n",
               static_cast<unsigned long long>(g_done.load()), nthreads,
               static_cast<unsigned long long>(g_bad.load()));
-  const bool ok = small_bad == 0 && g_bad == 0 && g_done == total;
+  // §3.4 pack residue by byte weights (mod_p_bytes, M4): (1) every byte weight equals
+  // 2^(8i) mod p (computed here by repeated doubling); (2) the reduction of the weighted
+  // byte sum, exhaustively over its whole range [0, 7 * 255^2]; (3) end to end against
+  // mu % p on edge values and 2^20 pseudo-random mu < 2^54 per modulus.
+  uint64_t bytes_bad = 0;
+  {
+    const imd::device::ByteWeights& bw = imd::device::kByteWeights;
+    for (int l = 0; l < c::kNMax; ++l) {
+      const uint32_t p = c::kTables.moduli[l];
+      const uint64_t magic = c::kTables.epi_magic[l];
+      uint32_t pw = 1 % p;
+      for (int i = 0; i < 8; ++i) {
+        const uint32_t w = i < 4 ? (bw.lo[l] >> (8 * i)) & 255u
+                                 : (i < 7 ? (bw.hi[l] >> (8 * (i - 4))) & 255u : 0u);
+        bytes_bad += i < 7 ? w != pw : w != 0;
+        for (int d = 0; d < 8; ++d) pw = (2 * pw) % p;
+      }
+      if (p != 256u)
+        for (uint32_t s = 0; s <= 7u * 255u * 255u; ++s)
+          bytes_bad += s - p * static_cast<uint32_t>(imd::device::umulhi64(magic, s)) != s % p;
+      uint64_t x = 0x9E3779B97F4A7C15ull ^ static_cast<uint64_t>(l);
+      const uint64_t edges[] = {0, 1, 255, 256, 0xFFFFFFFFull, 1ull << 32, (1ull << 53) - 1,
+                                1ull << 53, (1ull << 54) - 1};
+      for (int t = 0; t < (1 << 20) + 9; ++t) {
+        uint64_t mu;
+        if (t < 9) {
+          mu = edges[t];
+        } else {
+          x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+          mu = x >> (10 + (x & 31));  // < 2^54, spread over bit lengths
+        }
+        const uint32_t r = imd::device::mod_p_bytes(static_cast<uint32_t>(mu),
+                                                    static_cast<uint32_t>(mu >> 32), bw.lo[l],
+                                                    bw.hi[l], p, magic);
+        bytes_bad += r != mu % p;
+      }
+    }
+  }
+  std::printf("pack residue by byte weights: weights, reduction over [0, 7*255^2], 2^20 mu per "
+              "modulus: %llu mismatches\n",
+              static_cast<unsigned long long>(bytes_bad));
+  const bool ok = small_bad == 0 && g_bad == 0 && g_done == total && bytes_bad == 0;
   std::printf("%s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }

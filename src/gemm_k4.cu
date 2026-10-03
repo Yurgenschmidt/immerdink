@@ -16,6 +16,7 @@
 #include "immerdink/detail/constants.hpp"
 #include "kernels/mod_epilogue.cuh"  // also brings in the Sm80 EVT visitors
 #include "plan.hpp"
+#include "profile.hpp"
 
 namespace imd::detail {
 namespace {
@@ -28,6 +29,11 @@ using Warp = cutlass::gemm::GemmShape<64, 64, 64>;
 using Inst = cutlass::gemm::GemmShape<16, 8, 32>;
 constexpr int kStages = 3;
 constexpr int kEVTStages = 1;
+// Identity swizzle with up to 8 N tiles per M step (CUTLASS picks log_tile from the tiled
+// shape): a wave of 128 CTAs covers ~16 x 8 tiles instead of 128 x 1, so the A and B
+// panels it streams stay in L2 at large k (16384^3: 1 GB less DRAM traffic per modulus).
+// The tile offset's k() is still blockIdx.z = the batch index that VisitorModP reads.
+constexpr int kSwizzle = 8;
 constexpr int kAlign = 16;  // int8 / u8 elements per 128-bit access
 constexpr auto kRound = cutlass::FloatRoundStyle::round_toward_zero;
 
@@ -48,7 +54,7 @@ using GemmFor = cutlass::gemm::device::GemmUniversalAdapter<
         int8_t, cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone, kAlign,
         uint8_t, cutlass::layout::RowMajor, kAlign, int32_t, int32_t,
         cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, TB, Warp, Inst, EVT,
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<kSwizzle>, kStages,
         cutlass::arch::OpMultiplyAddSaturate, kEVTStages>::GemmKernel>;
 using GemmStore = GemmFor<EVTStore>;
 using GemmAdd = GemmFor<EVTAdd>;
@@ -106,6 +112,7 @@ imd_status_t k4_group(const int8_t* RA, const int8_t* RB, uint8_t* W, int64_t m,
                             stream);
         }
         if (!ok) return IMD_STATUS_CUDA_ERROR;
+        IMD_PROF(stream, k0 == 0 ? "K4 gemm store" : "K4 gemm add");
       }
     }
   }
