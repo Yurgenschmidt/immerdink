@@ -90,4 +90,9 @@ struct PackPivot {
 };
 PackPivot pack_pivot(const Lowered& lw, int X);
 
+// K5 thread mapping (NOTES-M2M3 #4): true iff C's smallest-|stride| mode is a batch (L)
+// mode rather than a J mode (after the §5 step 8 swap it is never in I). Canonical orders
+// put each group's smallest |s_C| first, so the first fused modes are compared.
+bool k5_batch_fastest(const Lowered& lw);
+
 }  // namespace imd::detail

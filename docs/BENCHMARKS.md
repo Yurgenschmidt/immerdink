@@ -1,10 +1,8 @@
 # Benchmarks
 
-M4 benchmark harness and the first baseline sweep.
-
-> **Status: starting point, not a result.** immerdink here is the **M1 library,
-> before any M4 optimization** (commit `e4d8845` = dev `c1b0bba` + the bench). The
-> numbers set the baselines that M4 work is measured against.
+M4 benchmark harness, the M4 sweep (after the M4 kernel work, commit `b29b464`) and the
+first baseline sweep (the M1 library, commit `e4d8845`) it is compared with. What changed
+and why, step by step with per-phase times: [NOTES-M4.md](NOTES-M4.md).
 
 ## What is measured
 
@@ -32,7 +30,7 @@ JSON line (`bench/results/*.jsonl`). Every record also carries:
 | `int8` | cuBLASLt int8 TN GEMM with int32 out, on the GEMM view with k padded to 16. This is the time of **one** modulus' GEMM; ×N is the GEMM-phase roofline at that N |
 | `gemmul8 N=…` | GEMMul8 6a9eff8 (v3.5.2), INT8 backend, fast mode, FP64. It has no batched API, so batched cases make one call per batch |
 | `cutensor` | cuTENSOR 2.8 FP64 contraction (`CUTENSOR_COMPUTE_DESC_64F`) on the original layouts |
-| `imd N=…` | immerdink `imd_plan_create` once, then `imd_contract` timed. Settings: RN, g = N, β = 0, workspace from `imd_workspace_size` |
+| `imd N=…` | immerdink `imd_plan_create` once, then `imd_contract` timed. Settings: RN, g = N, β = 0, workspace from `imd_workspace_size`. Then `--phase-reps` (5) more calls with the library's per-phase event marks on (`phases` in the record; see "Per-phase timing") |
 | `perm+X` | for a matrix-only method X on a case that isn't already a GEMM view: cuTENSOR permutes A and B in, X runs, and C is permuted out, all timed together. Plain `X` on those cases times the GEMM on pre-permuted operands |
 | `bw` | D2D `cudaMemcpy` of A: achievable DRAM bandwidth |
 
@@ -62,7 +60,7 @@ that case runs only N ∈ {8, 14}.
 ```sh
 tools/get_gemmul8.sh        # once: clone GEMMul8 @ 6a9eff8 into bench/_deps/ (git-ignored), build (-j ≤ 4, memcap)
 bench/run_sweep.sh          # build bench + libimmerdink (bench/build.sh), then every case of bench/sweep_m4.txt
-python3 bench/summarize.py bench/results/<run>.jsonl     # the tables below
+python3 bench/summarize.py bench/results/<run>.jsonl [--before <older run>.jsonl]   # the tables below
 ```
 
 - `CASES='sq8192|t_cc' bench/run_sweep.sh` runs a subset.
@@ -85,7 +83,241 @@ Builds (`bench/build.sh`, `tools/get_gemmul8.sh`) run under `nice`, inside
 `tools/memcap.sh`, with at most 4 jobs. They hold the same lock, so they never overlap a
 timed run.
 
+## M4 sweep (2026-10-03, after the M4 kernel work)
+
+Same machine, driver, libraries, cases and settings as the baseline below. Commit
+`b29b464`, env `immerdink`; every case passed the quiet gate. Raw data:
+`bench/results/m4-after-b29b464.jsonl`. Accuracy columns are unchanged from the baseline
+to the printed digit: the results are bit-identical (the M4 changes are kernel-internal
+and the test suite checks bitwise equality with the oracle).
+
+### All cases (N = 14 for the Ozaki-II methods)
+
+| case | spec | m×n×k | method | median ms | spread % | TFLOPS-eq | max normwise err | max rel err |
+|---|---|---|---|---|---|---|---|---|
+| sq1024 | `ik,jk->ij` | 1024×1024×1024 | dgemm | 1.79 | 0.3 | 1.20 | 1.3e-16 | 2.0e-14 |
+|  |  |  | emu dyn | 0.435 | 0.5 | 4.93 | 9.1e-18 | 1.6e-16 |
+|  |  |  | emu fix55 | 0.2 | 1.5 | 10.75 | 1.3e-17 | 8.5e-15 |
+|  |  |  | int8 | 0.0143 | 14.3 | 150 TOPS (×14: 0.201 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 0.183 | 1.7 | 11.75 | 1.3e-16 | 1.2e-13 |
+|  |  |  | imd N=14 | 0.234 | 35.4 | 9.16 | 9.0e-17 | 3.2e-14 |
+| sq2048 | `ik,jk->ij` | 2048×2048×2048 | dgemm | 15.1 | 4.5 | 1.14 | 1.7e-16 | 1.1e-13 |
+|  |  |  | emu dyn | 2.04 | 0.8 | 8.44 | 6.4e-18 | 1.8e-16 |
+|  |  |  | emu fix55 | 1.14 | 1.3 | 15.01 | 8.5e-18 | 2.0e-14 |
+|  |  |  | int8 | 0.0532 | 11.5 | 323 TOPS (×14: 0.745 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 0.965 | 1.0 | 17.80 | 1.6e-16 | 4.5e-13 |
+|  |  |  | imd N=14 | 0.971 | 6.3 | 17.70 | 7.8e-17 | 3.6e-13 |
+| sq4096 | `ik,jk->ij` | 4096×4096×4096 | dgemm | 109 | 0.0 | 1.26 | 1.5e-16 | 1.1e-13 |
+|  |  |  | emu dyn | 10.4 | 0.4 | 13.19 | 4.9e-18 | 2.0e-16 |
+|  |  |  | emu fix55 | 6.65 | 1.7 | 20.66 | 7.7e-18 | 1.8e-14 |
+|  |  |  | int8 | 0.253 | 2.8 | 542 TOPS (×14: 3.55 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 5.94 | 1.2 | 23.13 | 1.5e-16 | 6.0e-14 |
+|  |  |  | imd N=14 | 5 | 2.1 | 27.46 | 7.1e-17 | 2.2e-13 |
+| sq8192 | `ik,jk->ij` | 8192×8192×8192 | bw (D2D copy) | 1.17 | 0.4 | 917 GB/s | | |
+|  |  |  | dgemm | 871 | 0.0 | 1.26 | 2.0e-16 | 2.0e-13 |
+|  |  |  | emu dyn | 63.9 | 5.0 | 17.22 | 3.5e-18 | 1.8e-16 |
+|  |  |  | emu fix55 | 45 | 6.2 | 24.43 | 4.8e-18 | 1.2e-14 |
+|  |  |  | int8 | 1.78 | 0.7 | 616 TOPS (×14: 25 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 35.3 | 0.3 | 31.15 | 1.5e-16 | 3.4e-13 |
+|  |  |  | imd N=14 | 31.4 | 1.5 | 35.05 | 5.6e-17 | 1.5e-13 |
+| sq16384 | `ik,jk->ij` | 16384×16384×16384 | dgemm | 6968 | 0.0 | 1.26 | 1.7e-16 | 2.0e-13 |
+|  |  |  | emu dyn | 479 | 4.5 | 18.35 | 3.4e-18 | 1.9e-16 |
+|  |  |  | emu fix55 | 318 | 4.0 | 27.68 | 3.6e-18 | 4.2e-14 |
+|  |  |  | int8 | 13.6 | 0.3 | 646 TOPS (×14: 191 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 242 | 2.5 | 36.34 | 1.3e-16 | 4.9e-13 |
+|  |  |  | imd N=14 | 234 | 10.6 | 37.58 | 6.7e-17 | 2.7e-13 |
+| r_lowk | `ik,jk->ij` | 8192×8192×1024 | dgemm | 109 | 0.3 | 1.26 | 1.6e-16 | 6.1e-14 |
+|  |  |  | emu dyn | 12.1 | 3.6 | 11.32 | 1.0e-17 | 1.9e-16 |
+|  |  |  | int8 | 0.407 | 3.0 | 338 TOPS (×14: 5.69 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 11.9 | 2.9 | 11.55 | 1.5e-16 | 1.7e-13 |
+|  |  |  | imd N=14 | 6.94 | 3.3 | 19.82 | 8.3e-17 | 2.3e-13 |
+| r_bigk | `ik,jk->ij` | 2048×2048×32768 | dgemm | 218 | 0.0 | 1.26 | 4.7e-17 | 1.1e-12 |
+|  |  |  | emu dyn | 31.4 | 2.4 | 8.76 | 1.6e-18 | 1.6e-16 |
+|  |  |  | int8 | 0.711 | 1.0 | 387 TOPS (×14: 9.96 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 11 | 0.5 | 24.94 | 1.3e-16 | 1.2e-12 |
+|  |  |  | imd N=14 | 11.6 | 2.6 | 23.65 | 7.3e-17 | 4.8e-13 |
+| r_skinny | `ik,jk->ij` | 16384×512×4096 | dgemm | 54.5 | 0.0 | 1.26 | 1.6e-16 | 4.8e-13 |
+|  |  |  | emu dyn | 12.9 | 0.3 | 5.31 | 5.7e-18 | 1.7e-16 |
+|  |  |  | int8 | 0.142 | 9.4 | 483 TOPS (×14: 1.99 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 4.51 | 3.2 | 15.25 | 2.1e-16 | 1.3e-12 |
+|  |  |  | imd N=14 | 4.44 | 4.3 | 15.47 | 7.9e-17 | 3.2e-13 |
+| r_mm | `ik,jk->ij` | 1000×64×50000 | dgemm | 5.97 | 0.1 | 1.07 | 5.0e-17 | 2.6e-13 |
+|  |  |  | emu dyn | 11.4 | 0.7 | 0.56 | 1.3e-18 | 1.9e-16 |
+|  |  |  | int8 | 0.173 | 3.0 | 37 TOPS (×14: 2.42 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 3.1 | 3.0 | 2.06 | 1.1e-16 | 7.1e-13 |
+|  |  |  | imd N=14 | 3.19 | 2.9 | 2.01 | 4.5e-17 | 3.0e-13 |
+| t_nn | `ik,kj->ij` | 4096×4096×4096 | dgemm | 109 | 0.0 | 1.26 | 1.5e-16 | 9.2e-14 |
+|  |  |  | emu dyn | 10.4 | 0.2 | 13.18 | 4.4e-18 | 1.6e-16 |
+|  |  |  | int8 | 0.251 | 2.4 | 548 TOPS (×14: 3.51 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 6.12 | 0.4 | 22.47 | 1.9e-16 | 3.3e-13 |
+|  |  |  | cutensor | 109 | 0.0 | 1.26 | 1.5e-16 | 9.2e-14 |
+|  |  |  | imd N=14 | 5.11 | 2.1 | 26.88 | 5.9e-17 | 4.9e-13 |
+| t_batch | `lik,ljk->lij` | 1024×1024×1024 b=16 | dgemm | 28.4 | 10.6 | 1.21 | 2.0e-16 | 4.4e-14 |
+|  |  |  | emu dyn | 6.86 | 0.6 | 5.01 | 9.2e-18 | 1.7e-16 |
+|  |  |  | int8 | 0.124 | 7.4 | 277 TOPS (×14: 1.73 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 2.78 | 2.3 | 12.36 | 1.4e-16 | 7.9e-14 |
+|  |  |  | cutensor | 27.4 | 0.5 | 1.25 | 2.0e-16 | 4.4e-14 |
+|  |  |  | imd N=14 | 2.77 | 1.4 | 12.38 | 7.4e-17 | 4.0e-14 |
+| t_ikl | `ikl,kjl->ijl` | 1024×1024×1024 b=16 | dgemm | 27.3 | 1.0 | 1.26 | 2.1e-16 | 2.8e-13 |
+|  |  |  | perm+dgemm | 28.1 | 0.0 | 1.22 | 2.1e-16 | 2.8e-13 |
+|  |  |  | emu dyn | 6.86 | 0.7 | 5.01 | 1.0e-17 | 1.7e-16 |
+|  |  |  | perm+emu dyn | 7.76 | 0.5 | 4.43 | 1.0e-17 | 1.7e-16 |
+|  |  |  | int8 | 0.123 | 12.4 | 278 TOPS (×14: 1.73 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 2.79 | 2.2 | 12.33 | 1.9e-16 | 4.8e-13 |
+|  |  |  | perm+gemmul8 N=14 | 3.69 | 2.1 | 9.32 | 1.9e-16 | 4.8e-13 |
+|  |  |  | cutensor | 28.3 | 0.2 | 1.22 | 2.1e-16 | 2.8e-13 |
+|  |  |  | imd N=14 | 2.91 | 1.3 | 11.80 | 9.3e-17 | 5.3e-13 |
+| t_df | `acQ,bdQ->acbd` | 4096×4096×2048 | dgemm | 54.5 | 11.0 | 1.26 | 1.3e-16 | 2.3e-13 |
+|  |  |  | emu dyn | 5.62 | 0.3 | 12.24 | 7.1e-18 | 2.1e-16 |
+|  |  |  | int8 | 0.145 | 7.7 | 473 TOPS (×14: 2.04 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 4.02 | 0.3 | 17.09 | 1.4e-16 | 2.5e-13 |
+|  |  |  | cutensor | 54.7 | 0.1 | 1.26 | 1.3e-16 | 2.3e-13 |
+|  |  |  | imd N=14 | 2.96 | 3.2 | 23.25 | 7.6e-17 | 7.9e-13 |
+| t_cc | `kjbc,kiac->abij` | 4096×4096×4096 | dgemm | 109 | 4.8 | 1.26 | 1.2e-16 | 4.0e-13 |
+|  |  |  | perm+dgemm | 110 | 0.3 | 1.25 | 1.2e-16 | 4.0e-13 |
+|  |  |  | emu dyn | 10.4 | 0.1 | 13.17 | 4.4e-18 | 1.8e-16 |
+|  |  |  | perm+emu dyn | 11.3 | 0.2 | 12.13 | 4.4e-18 | 1.8e-16 |
+|  |  |  | int8 | 0.255 | 4.0 | 539 TOPS (×14: 3.57 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 5.94 | 0.5 | 23.12 | 1.4e-16 | 4.2e-13 |
+|  |  |  | perm+gemmul8 N=14 | 6.86 | 0.5 | 20.05 | 1.4e-16 | 4.2e-13 |
+|  |  |  | cutensor | 110 | 0.0 | 1.25 | 1.0e-16 | 2.9e-14 |
+|  |  |  | imd N=14 | 5.01 | 2.0 | 27.45 | 7.0e-17 | 2.1e-13 |
+| t_permout | `abk,kcd->cadb` | 4096×4096×4096 | dgemm | 109 | 0.0 | 1.26 | 1.1e-16 | 1.0e-13 |
+|  |  |  | perm+dgemm | 109 | 0.0 | 1.26 | 1.1e-16 | 1.0e-13 |
+|  |  |  | emu dyn | 10.4 | 0.6 | 13.19 | 5.7e-18 | 2.0e-16 |
+|  |  |  | perm+emu dyn | 10.8 | 0.2 | 12.76 | 5.7e-18 | 2.0e-16 |
+|  |  |  | int8 | 0.249 | 2.5 | 552 TOPS (×14: 3.48 ms) | — | — |
+|  |  |  | gemmul8 N=14 | 6.12 | 0.5 | 22.45 | 1.7e-16 | 1.8e-13 |
+|  |  |  | perm+gemmul8 N=14 | 6.42 | 0.3 | 21.42 | 1.7e-16 | 1.8e-13 |
+|  |  |  | cutensor | 110 | 0.0 | 1.25 | 1.1e-16 | 1.0e-13 |
+|  |  |  | imd N=14 | 5.12 | 0.6 | 26.86 | 6.1e-17 | 6.2e-14 |
+
+### N sweep
+
+| case | method | N | median ms | TFLOPS-eq | max normwise err |
+|---|---|---|---|---|---|
+| sq4096 | dgemm | — | 109 | 1.26 | 1.5e-16 |
+| sq4096 | emu | dyn | 10.4 | 13.19 | 4.9e-18 |
+| sq4096 | emu | fix47 | 6.09 | 22.56 | 1.7e-15 |
+| sq4096 | emu | fix55 | 6.65 | 20.66 | 7.7e-18 |
+| sq4096 | emu | fix63 | 8.03 | 17.13 | 4.9e-18 |
+| sq4096 | gemmul8 | 8 | 3.46 | 39.69 | 1.7e-09 |
+| sq4096 | gemmul8 | 12 | 5.06 | 27.18 | 2.7e-14 |
+| sq4096 | gemmul8 | 14 | 5.94 | 23.13 | 1.5e-16 |
+| sq4096 | gemmul8 | 16 | 6.68 | 20.57 | 3.2e-18 |
+| sq4096 | gemmul8 | 20 | 8.27 | 16.61 | 3.2e-18 |
+| sq4096 | imd | 8 | 3.38 | 40.69 | 8.1e-10 |
+| sq4096 | imd | 12 | 4.41 | 31.15 | 1.1e-14 |
+| sq4096 | imd | 14 | 5 | 27.46 | 7.1e-17 |
+| sq4096 | imd | 16 | 5.87 | 23.43 | 3.2e-18 |
+| sq4096 | imd | 20 | 7.28 | 18.87 | 3.2e-18 |
+| sq8192 | dgemm | — | 871 | 1.26 | 2.0e-16 |
+| sq8192 | emu | dyn | 63.9 | 17.22 | 3.5e-18 |
+| sq8192 | emu | fix47 | 40.7 | 27.04 | 1.2e-15 |
+| sq8192 | emu | fix55 | 45 | 24.43 | 4.8e-18 |
+| sq8192 | emu | fix63 | 52.5 | 20.95 | 3.5e-18 |
+| sq8192 | gemmul8 | 8 | 20.7 | 53.08 | 1.1e-09 |
+| sq8192 | gemmul8 | 12 | 30.2 | 36.35 | 4.0e-14 |
+| sq8192 | gemmul8 | 14 | 35.3 | 31.15 | 1.5e-16 |
+| sq8192 | gemmul8 | 16 | 40 | 27.46 | 1.6e-18 |
+| sq8192 | gemmul8 | 20 | 49.3 | 22.29 | 1.6e-18 |
+| sq8192 | imd | 8 | 20.2 | 54.36 | 5.5e-10 |
+| sq8192 | imd | 12 | 28.1 | 39.11 | 1.7e-14 |
+| sq8192 | imd | 14 | 31.4 | 35.05 | 5.6e-17 |
+| sq8192 | imd | 16 | 39.1 | 28.15 | 1.6e-18 |
+| sq8192 | imd | 20 | 46.5 | 23.66 | 1.6e-18 |
+
+### immerdink phase lower bounds (MEMORY_MODEL §4, N = 14, ms)
+
+| case | N | K1 scale | K2/K3 pack | K4 GEMM | K5 CRT | Σ lower bound | N × cuBLASLt int8 | measured imd | Σ LB / measured |
+|---|---|---|---|---|---|---|---|---|---|
+| sq1024 | 14 | 0.0166 | 0.0458 | 0.0455 | 0.0229 | 0.131 | 0.201 | 0.234 | 56 % |
+| sq2048 | 14 | 0.0666 | 0.183 | 0.364 | 0.0915 | 0.705 | 0.745 | 0.971 | 73 % |
+| sq4096 | 14 | 0.266 | 0.732 | 2.91 | 0.366 | 4.28 | 3.55 | 5 | 85 % |
+| sq8192 | 14 | 1.07 | 2.93 | 23.3 | 1.46 | 28.8 | 25 | 31.4 | 92 % |
+| sq16384 | 14 | 4.26 | 11.7 | 186 | 5.86 | 208 | 191 | 234 | 89 % |
+| r_lowk | 14 | 0.133 | 0.366 | 2.91 | 1.46 | 4.88 | 5.69 | 6.94 | 70 % |
+| r_bigk | 14 | 1.07 | 2.93 | 5.83 | 0.0915 | 9.91 | 9.96 | 11.6 | 85 % |
+| r_skinny | 14 | 0.549 | 1.51 | 1.46 | 0.183 | 3.7 | 1.99 | 4.44 | 83 % |
+| r_mm | 14 | 0.422 | 1.16 | 0.74 | 0.0014 | 2.32 | 2.42 | 3.19 | 73 % |
+| t_nn | 14 | 0.266 | 0.732 | 2.91 | 0.366 | 4.28 | 3.51 | 5.11 | 84 % |
+| t_batch | 14 | 0.266 | 0.732 | 0.728 | 0.366 | 2.09 | 1.73 | 2.77 | 75 % |
+| t_ikl | 14 | 0.266 | 0.732 | 0.728 | 0.366 | 2.09 | 1.73 | 2.91 | 72 % |
+| t_df | 14 | 0.133 | 0.366 | 1.46 | 0.366 | 2.32 | 2.04 | 2.96 | 79 % |
+| t_cc | 14 | 0.266 | 0.732 | 2.91 | 0.366 | 4.28 | 3.57 | 5.01 | 85 % |
+| t_permout | 14 | 0.266 | 0.732 | 2.91 | 0.366 | 4.28 | 3.48 | 5.12 | 84 % |
+
+### immerdink measured phases (event marks, N = 14): ms (§4 lower bound as % of it)
+
+| case | K0 vec | K1 scale | K2/K3 pack | K4 GEMM | K5 CRT | Σ phases | Σ LB (excl. K0) / Σ |
+|---|---|---|---|---|---|---|---|
+| sq1024 | 0.0515 (3 %) | 0.0448 (37 %) | 0.0512 (89 %) | 0.0829 (55 %) | 0.041 (56 %) | 0.268 | 49 % |
+| sq2048 | 0.0947 (3 %) | 0.131 (51 %) | 0.207 (89 %) | 0.46 (79 %) | 0.128 (72 %) | 1.03 | 69 % |
+| sq4096 | 0.101 (6 %) | 0.362 (73 %) | 0.836 (88 %) | 3.25 (90 %) | 0.474 (77 %) | 5.03 | 85 % |
+| sq8192 | 0.161 (8 %) | 1.31 (81 %) | 3.39 (86 %) | 25.9 (90 %) | 1.96 (75 %) | 32.8 | 88 % |
+| sq16384 | 0.409 (6 %) | 6.38 (67 %) | 13.8 (85 %) | 213 (87 %) | 8.09 (72 %) | 242 | 86 % |
+| r_lowk | 0.127 (7 %) | 0.199 (67 %) | 0.424 (86 %) | 4.41 (66 %) | 1.86 (79 %) | 7.01 | 70 % |
+| r_bigk | 0.261 (7 %) | 1.93 (55 %) | 3.37 (87 %) | 5.99 (97 %) | 0.127 (72 %) | 11.7 | 85 % |
+| r_skinny | 0.136 (8 %) | 0.657 (84 %) | 1.69 (89 %) | 1.71 (85 %) | 0.242 (76 %) | 4.45 | 83 % |
+| r_mm | 0.347 (7 %) | 0.661 (64 %) | 1.36 (86 %) | 0.914 (81 %) | 0.0113 (12 %) | 3.29 | 71 % |
+| t_nn | 0.101 (6 %) | 0.488 (55 %) | 0.831 (88 %) | 3.24 (90 %) | 0.47 (78 %) | 5.13 | 83 % |
+| t_batch | 0.0281 (6 %) | 0.348 (77 %) | 0.831 (88 %) | 1.12 (65 %) | 0.466 (79 %) | 2.8 | 75 % |
+| t_ikl | 0.0271 (6 %) | 0.446 (60 %) | 0.856 (86 %) | 1.12 (65 %) | 0.475 (77 %) | 2.93 | 72 % |
+| t_df | 0.0905 (6 %) | 0.204 (65 %) | 0.42 (87 %) | 1.79 (81 %) | 0.469 (78 %) | 2.97 | 78 % |
+| t_cc | 0.101 (6 %) | 0.366 (73 %) | 0.834 (88 %) | 3.25 (90 %) | 0.469 (78 %) | 5.02 | 85 % |
+| t_permout | 0.0734 (8 %) | 0.494 (54 %) | 0.836 (88 %) | 3.24 (90 %) | 0.47 (78 %) | 5.13 | 83 % |
+
+### Before / after (N = 14; before: bench/results/m4-baseline-e4d8845.jsonl)
+
+| case | m×n×k | imd before ms | imd after ms | speedup | TFLOPS-eq after | GEMMul8 ms (before / after run) | imd / GEMMul8 |
+|---|---|---|---|---|---|---|---|
+| sq1024 | 1024×1024×1024 | 0.266 | 0.234 | 1.14× | 9.16 | 0.175 / 0.183 | 1.28 |
+| sq2048 | 2048×2048×2048 | 1.23 | 0.971 | 1.26× | 17.70 | 0.965 / 0.965 | 1.01 |
+| sq4096 | 4096×4096×4096 | 6.38 | 5 | 1.27× | 27.46 | 5.98 / 5.94 | 0.84 |
+| sq8192 | 8192×8192×8192 | 39.9 | 31.4 | 1.27× | 35.05 | 36.9 / 35.3 | 0.89 |
+| sq16384 | 16384×16384×16384 | 380 | 234 | 1.63× | 37.58 | 259 / 242 | 0.97 |
+| r_lowk | 8192×8192×1024 | 8.87 | 6.94 | 1.28× | 19.82 | 11.9 / 11.9 | 0.58 |
+| r_bigk | 2048×2048×32768 | 16.2 | 11.6 | 1.39× | 23.65 | 11 / 11 | 1.05 |
+| r_skinny | 16384×512×4096 | 6.92 | 4.44 | 1.56× | 15.47 | 4.5 / 4.51 | 0.99 |
+| r_mm | 1000×64×50000 | 4.89 | 3.19 | 1.54× | 2.01 | 3.1 / 3.1 | 1.03 |
+| t_nn | 4096×4096×4096 | 6.57 | 5.11 | 1.29× | 26.88 | 6.12 / 6.12 | 0.84 |
+| t_batch | 1024×1024×1024 b=16 | 4.07 | 2.77 | 1.47× | 12.38 | 2.75 / 2.78 | 1.00 |
+| t_ikl | 1024×1024×1024 b=16 | 10.9 | 2.91 | 3.76× | 11.80 | 2.76 / 2.79 | 1.04 |
+| t_df | 4096×4096×2048 | 3.68 | 2.96 | 1.24× | 23.25 | 4.02 / 4.02 | 0.74 |
+| t_cc | 4096×4096×4096 | 6.21 | 5.01 | 1.24× | 27.45 | 5.96 / 5.94 | 0.84 |
+| t_permout | 4096×4096×4096 | 6.59 | 5.12 | 1.29× | 26.86 | 6.11 / 6.12 | 0.84 |
+
+### M4 exit targets
+
+| target | result |
+|---|---|
+| sq8192, N = 14 ≥ GEMMul8 on this box (29.8 TFLOPS-eq in the baseline run) | **35.05** TFLOPS-eq (31.4 ms); GEMMul8 31.15 in the same run |
+| sq16384: close most of the gap to GEMMul8 (baseline 380 vs 259 ms) | **234 ms** (37.6 TFLOPS-eq); GEMMul8 242 ms in the same run |
+| permuted contractions within 15 % of the matrix case at equal m, n, k | `t_cc` 27.45 and `t_permout` 26.86 vs `sq4096` 27.46 TFLOPS-eq (0 %, −2 %); `t_nn` 26.88 (−2 %); `t_ikl` 11.80 vs `t_batch` 12.38 (−4.7 %, was −63 %) |
+| each phase as % of its MEMORY_MODEL §4 bound | the measured-phase table above; also in every `imd` record |
+
+### Observations (M4)
+
+- **Every case is faster**, 1.14–3.76×; 10 of 15 now beat GEMMul8 N = 14 (which is at
+  about 2× immerdink's normwise error), the rest are within 1–5 % (GEMMul8 timed on pre-permuted operands) except `sq1024` (1.28×).
+- **Large squares** are at 88–92 % of the summed §4 bound. K4 (the int8 GEMMs) runs at
+  ≈ 600 TOPS, the cuBLASLt int8 rate; the pack is at 85–89 %, K5 at 72–78 %, K1 at
+  67–81 %.
+- **`t_ikl`** (batch label stride-1 in all three tensors) went from 10.9 to 2.91 ms, now
+  within 5 % of the batch-outermost `t_batch` and faster than `perm+gemmul8` (3.69 ms).
+- **Where the rest goes** (see NOTES-M4 "Remaining gaps"): K4 at small k (60–66 % at
+  k = 1024: the mod-p epilogue is not overlapped with the main loop), K1 on very long
+  rows (55 % on r_bigk), and the fixed per-call costs that dominate `sq1024`: K0's
+  small H2D copy (0.03–0.4 ms, slowed by the PCIe link's idle power state) and ten
+  launches. NOTES-M4 has the design proposals for K0 and K1.
+- The 4090 runs the large cases at its 450 W power cap (`clocks_event_reasons` 0x4), so
+  run-to-run differences of a few % in K4 (and in GEMMul8: 259 → 242 ms at 16384³ between
+  the two sweeps) are noise.
+
 ## First baseline sweep (2026-10-03)
+
+> The M1 library before any M4 optimization (commit `e4d8845` = dev `c1b0bba` + the
+> bench). Its observations below describe that state.
 
 RTX 4090 (128 SMs; max clocks 3120/10501 MHz; driver 595.91.07; CUDA runtime 13.4;
 cuBLAS 13.8.0; cuTENSOR 2.8.0). Env `immerdink`, commit `e4d8845`. Every case passed
@@ -288,20 +520,16 @@ library's own int8 rate.
 - **cuTENSOR FP64** equals cuBLAS DGEMM (≈ 1.25 TFLOPS) on every tensor case. On the
   4090 the native FP64 baseline is 1/64 rate either way.
 
-## Phase breakdown: what is missing
+## Per-phase timing
 
-The C API has no timing hooks, so the phase table compares the whole call with the sum
-of the §4 lower bounds. M4 wants:
-1. **Per-kernel event timing.** An opt-in `IMD_PROFILE` env var, or an
-   `imd_contract_profiled` taking an `imd_profile_t*`, that records cudaEvents between
-   K0/K1/K2-3/K4/K5 and returns per-phase ms. This gives the "% of §4 bound" exit metric
-   per phase directly, without Nsight.
-2. NVTX ranges per kernel, so `nsys` can attribute time without source changes.
-3. Achieved bytes per phase from the plan (`params.workspace_size`-style formulas,
-   exposed), so the bench can print achieved GB/s per phase instead of re-deriving §4
-   in Python.
-4. Plan-time vs call-time separation is already there (only `imd_contract` is timed);
-   for small shapes, an option to skip the K0 H2D vector copy when the plan is reused.
+The library has opt-in phase marks (M4): built with `-DIMMERDINK_PROFILE=ON` (the bench
+build does this; production builds compile them out), `imd_bench` makes `--phase-reps`
+extra calls with marks on and records per phase the median time, its MEMORY_MODEL §4
+lower bound and the bound as % of the time (`phases` in the JSON record; the tables
+above come from `bench/summarize.py`). The phases are K0 vec, K1 scale A/B, K2 pack A,
+K3 pack B, K4 gemm (every GEMM launch), K5 crt, DIRECT and K5 beta-only. Still open:
+NVTX ranges for `nsys` (not available on this box), achieved bytes per phase exported by
+the library, and skipping K0 (NOTES-M4 proposal 1).
 
 ## Not covered yet
 

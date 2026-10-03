@@ -40,4 +40,40 @@ IMD_HD uint32_t mod_p_small(uint32_t n, uint32_t p, uint64_t magic) {
   return n - p * q;
 }
 
+// §3.6 y = n mod p for n < 2^16 with the 32-bit magic m32 = ceil(2^32/p): n m32 = (n 2^32 +
+// n e) / p with 0 <= e < p, and n e < 2^16 * 2^8 <= 2^32 / p for p <= 256, so
+// floor(n m32 / 2^32) = floor(n / p). p = 256: the low byte. (Exhaustive CPU test.)
+IMD_HD uint32_t mod_p_small32(uint32_t n, uint32_t p, uint32_t m32) {
+  if (p == 256u) return n & 255u;
+#if defined(__CUDA_ARCH__)
+  const uint32_t q = __umulhi(n, m32);
+#else
+  const auto q = static_cast<uint32_t>((uint64_t{n} * m32) >> 32);
+#endif
+  return n - p * q;
+}
+
+// §3.4 residue of a quantized magnitude mu < 2^56, by byte weights (DESIGN §3.4 allows any
+// exact reduction): mu = sum_i b_i 2^(8i), so mu = sum_i b_i w_i (mod p) with w_i = 2^(8i)
+// mod p. lo = bits 0..31 and hi = bits 32..63 of mu (hi < 2^24); wlo / whi pack w_0..w_3 /
+// w_4..w_6 (and 0) as u8 lanes. The dot product is < 7 * 255^2 < 2^19, and
+// umulhi64(ceil(2^64/p), s) = floor(s / p) exactly for every s < 2^32 and p <= 256
+// (s ceil(2^64/p) = (s 2^64 + s e) / p with 0 <= e < p and s e < 2^64), so the result is
+// the non-negative residue mu mod p. p = 256: the low byte.
+IMD_HD uint32_t dot_bytes(uint32_t x, uint32_t w) {
+#if defined(__CUDA_ARCH__)
+  return __dp4a(x, w, 0u);
+#else
+  uint32_t s = 0;
+  for (int i = 0; i < 4; ++i) s += ((x >> (8 * i)) & 255u) * ((w >> (8 * i)) & 255u);
+  return s;
+#endif
+}
+IMD_HD uint32_t mod_p_bytes(uint32_t lo, uint32_t hi, uint32_t wlo, uint32_t whi, uint32_t p,
+                            uint64_t magic) {
+  if (p == 256u) return lo & 255u;
+  const uint32_t s = dot_bytes(lo, wlo) + dot_bytes(hi, whi);
+  return s - p * static_cast<uint32_t>(umulhi64(magic, s));
+}
+
 }  // namespace imd::device

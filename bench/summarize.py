@@ -151,10 +151,59 @@ def phase_table(recs, names, N):
         _ = bw
 
 
+PHASE_GROUPS = OrderedDict([("K0 vec", ["K0 vec"]), ("K1 scale", ["K1 scale A", "K1 scale B"]),
+                            ("K2/K3 pack", ["K2 pack A", "K3 pack B"]), ("K4 GEMM", ["K4 gemm"]),
+                            ("K5 CRT", ["K5 crt"])])
+
+
+def measured_phase_table(recs, names, N):
+    """Per-phase medians from imd_bench's event marks (field "phases"), each as ms and as the
+    MEMORY_MODEL §4 lower bound's share of it (100 % = at the bound)."""
+    print("| case | " + " | ".join(PHASE_GROUPS) + " | Σ phases | Σ LB (excl. K0) / Σ |")
+    print("|---|" + "---|" * (len(PHASE_GROUPS) + 2))
+    for name, rs in cases(recs).items():
+        if name not in names:
+            continue
+        for r in rs:
+            if r["method"] != "imd" or r.get("status") != "ok" or r["N"] != N or "phases" not in r:
+                continue
+            ph, cells = r["phases"], []
+            for _, tags in PHASE_GROUPS.items():
+                t = sum(ph[x]["ms"] for x in tags if x in ph)
+                lb = sum(ph[x]["lb_ms"] for x in tags if x in ph and ph[x].get("lb_ms") is not None)
+                cells.append(f"{t:.3g} ({100 * lb / t:.0f} %)" if t > 0 else "—")
+            print(f"| {name} | " + " | ".join(cells) + f" | {r['phase_total_ms']:.3g} | "
+                  f"{100 * r['phase_lb_ms'] / r['phase_total_ms']:.0f} % |")
+
+
+def before_after(before, after, N):
+    """immerdink at N, before vs after, with GEMMul8 (after run) for reference."""
+    def pick(recs, method):
+        out = {}
+        for r in recs:
+            if r.get("status") == "ok" and r["method"] == method and r["N"] == N:
+                out.setdefault(r["case"], r)
+        return out
+    b, a, g = pick(before, "imd"), pick(after, "imd"), pick(after, "gemmul8")
+    gb = pick(before, "gemmul8")
+    print(f"| case | m×n×k | imd before ms | imd after ms | speedup | TFLOPS-eq after | "
+          f"GEMMul8 ms (before / after run) | imd / GEMMul8 |")
+    print("|---|---|---|---|---|---|---|---|")
+    for name, r in a.items():
+        rb = b.get(name)
+        gg = g.get(name)
+        gbb = gb.get(name)
+        print(f"| {name} | {shape(r)} | {ms(rb['median_s']) if rb else '—'} | {ms(r['median_s'])} | "
+              f"{(rb['median_s'] / r['median_s']) if rb else float('nan'):.2f}× | {tf(r['tflops_eq'])} | "
+              f"{ms(gbb['median_s']) if gbb else '—'} / {ms(gg['median_s']) if gg else '—'} | "
+              f"{(r['median_s'] / gg['median_s']) if gg else float('nan'):.2f} |")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("jsonl")
     ap.add_argument("--N", type=int, default=14)
+    ap.add_argument("--before", help="an earlier run's JSONL: adds a before/after table")
     ap.add_argument("--sweep-cases", default="sq4096,sq8192")
     ap.add_argument("--phase-cases", default="sq1024,sq2048,sq4096,sq8192,sq16384,r_lowk,r_bigk,"
                     "r_skinny,r_mm,t_nn,t_batch,t_ikl,t_df,t_cc,t_permout")
@@ -176,6 +225,12 @@ def main():
     nsweep(recs, a.sweep_cases.split(","))
     print(f"\n### immerdink phase lower bounds (MEMORY_MODEL §4, N = {a.N}, ms)\n")
     phase_table(recs, a.phase_cases.split(","), a.N)
+    if any("phases" in r for r in recs):
+        print(f"\n### immerdink measured phases (event marks, N = {a.N}): ms (§4 lower bound as % of it)\n")
+        measured_phase_table(recs, a.phase_cases.split(","), a.N)
+    if a.before:
+        print(f"\n### Before / after (N = {a.N}; before: {a.before})\n")
+        before_after(load(a.before), recs, a.N)
 
 
 if __name__ == "__main__":

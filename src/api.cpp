@@ -13,6 +13,9 @@
 #include "index_map.hpp"
 #include "plan.hpp"
 #include "workspace.hpp"
+#if defined(IMMERDINK_PROFILE) && IMMERDINK_PROFILE
+#  include "profile_hooks.h"
+#endif
 
 struct imd_handle_st {
   int device = 0;
@@ -269,6 +272,7 @@ imd_status_t imd_plan_create(imd_handle_t handle, const imd_tensor_t* A, const i
         e.pack_along_rows[x] = pv.along_rows;
         e.pack_radix[x] = pv.radix;
       }
+      e.k5_batch_fast = imd::detail::k5_batch_fastest(lw);
     }
     if (e.path != imd::detail::Path::kNoop) {
       // §5 step 10: scatter vectors in pinned host memory (K0 copies them asynchronously).
@@ -337,6 +341,17 @@ imd_status_t imd_contract(imd_plan_t plan, double alpha, const double* A, const 
     return IMD_STATUS_CUDA_ERROR;
   }
 }
+
+#if defined(IMMERDINK_PROFILE) && IMMERDINK_PROFILE
+// Benchmark-only (src/profile_hooks.h): the plan's post-swap GEMM view.
+IMD_API int imd_prof_plan_dims(imd_plan_t plan, int64_t* out) {
+  if (plan == nullptr || out == nullptr) return 1;
+  const imd::detail::ExecPlan& e = plan->exec;
+  const int64_t v[7] = {e.m, e.n, e.k, e.b, e.n_hat, e.k_hat, static_cast<int64_t>(e.path)};
+  for (int i = 0; i < 7; ++i) out[i] = v[i];
+  return 0;
+}
+#endif
 
 const char* imd_status_string(imd_status_t status) {
   switch (status) {

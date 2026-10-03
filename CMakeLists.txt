@@ -22,7 +22,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(IMMERDINK_WERROR "Treat warnings in immerdink's own code as errors" OFF)
-option(IMMERDINK_BUILD_TESTS "Build the tests" ON)
+option(IMMERDINK_BUILD_TESTS "Build the tests (and the test-only hooks of src/test_hooks.cpp)" ON)
+option(IMMERDINK_PROFILE "Benchmark-only per-phase event timing hooks (src/profile.hpp)" OFF)
 set(IMMERDINK_CUTLASS_DIR "${PROJECT_SOURCE_DIR}/third_party/cutlass"
     CACHE PATH "CUTLASS v4.8.0 source tree (default: the git submodule)")
 
@@ -83,7 +84,17 @@ set_target_properties(imd_core PROPERTIES CXX_VISIBILITY_PRESET hidden
 
 # The library: C ABI (api.cpp), K0-K5 + DIRECT kernels (contract.cu), K4 CUTLASS GEMM
 # (gemm_k4.cu).
-add_library(immerdink SHARED src/api.cpp src/contract.cu src/gemm_k4.cu src/test_hooks.cpp)
+# Test-only hooks (src/test_hooks.cpp: launch-limit override, lowering dump) are built only
+# with IMMERDINK_BUILD_TESTS=ON, and the benchmark phase marks (src/profile.cpp) only with
+# IMMERDINK_PROFILE=ON; a production build exports neither.
+add_library(immerdink SHARED src/api.cpp src/contract.cu src/gemm_k4.cu)
+if(IMMERDINK_BUILD_TESTS)
+  target_sources(immerdink PRIVATE src/test_hooks.cpp)
+endif()
+if(IMMERDINK_PROFILE)
+  target_sources(immerdink PRIVATE src/profile.cpp)
+  target_compile_definitions(immerdink PRIVATE IMMERDINK_PROFILE=1)
+endif()
 target_include_directories(immerdink PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 target_link_libraries(immerdink PUBLIC CUDA::cudart PRIVATE imd_core imd_cutlass imd_warnings)

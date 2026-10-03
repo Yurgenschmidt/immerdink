@@ -132,6 +132,17 @@ Work order, by expected payoff:
    scatter vectors lazily (the full-list version needed tens of GB on a legal 2^31-row
    descriptor); TLA+ models for the n̂ grid split and the κ ≥ T scope.
 
+**Status (2026-10-03):** exit targets met; see `docs/NOTES-M4.md` (what changed, per-phase
+log, A/B of K4 tiles, design proposals) and `docs/BENCHMARKS.md` ("M4 sweep"): sq8192 N = 14
+at 35.05 TFLOPS-eq (GEMMul8 31.15 in the same run), sq16384 234 ms (GEMMul8 242), permuted
+cases within 0–5 % of the matrix case at equal m, n, k (t_ikl 2.91 vs t_batch 2.77 ms),
+per-phase % of the §4 bound reported by `imd_bench`. Items 1, 4, 5 done; item 3: A/B of
+tiles and stages found no gain on the benchmark shapes (one config kept, swizzle 8 added);
+item 2 not changed (K4 is at the cuBLASLt int8 rate for k ≥ 4096; at k = 1024 the
+un-overlapped mod-p epilogue is the remaining K4 gap); item 6: test hooks gated, the oracle and
+TLA+ follow-ups still open. Not done: K0 on the device and a two-launch K1 (DESIGN
+changes, proposed in NOTES-M4), CUTLASS operators cached per plan.
+
 **Baselines**, all run under `run_bench.sh`, reporting median and spread plus machine
 conditions:
 - native DGEMM (cuBLAS, `CUBLAS_COMPUTE_64F_PEDANTIC`, so env vars can't turn it into
