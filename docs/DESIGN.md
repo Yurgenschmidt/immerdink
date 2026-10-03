@@ -1,4 +1,4 @@
-# immerdink — design (v1.1)
+# immerdink — design (v1.2)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -10,7 +10,10 @@ This is the single source of truth for *what* v1 computes and *how*.
 - **[deviation]** marks a departure from published Ozaki-II, with the reason.
 
 v1.1 folds in the corrections found by the spec phase: adversarial review plus mutation
-testing of every artifact. The changes from v1 are listed at the end.
+testing of every artifact. v1.2 changes three execution details after M4 (K0 generated on
+the device, K1 in two launches, GEMM parameters built at plan creation) and the §6 thread
+and lifetime rules that follow from them; changed text is marked **[v1.2]**. Both change
+lists are at the end.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -271,9 +274,12 @@ Typical errors are smaller. Choosing N is the caller's job, guided by
 ## 4. Execution pipeline (one stream, in order)
 
 ```
-plan time:  IndexMap lowering → scatter vectors, canonical orders, chunking, launch split
-K0 vec      cudaMemcpyAsync: plan's pinned scatter vectors → ws.vec        (same stream)
-K1 scale    A rows, B cols: flags + σ, τ (int16)       v1: two passes per row (γ, then S)
+plan time:  IndexMap lowering → fused-mode descriptor, canonical orders, chunking, launch
+            split; K4 GEMM parameters (CUTLASS device properties, occupancy, smem attribute)
+K0 vec      kernel: generate the scatter vectors → ws.vec from the fused-mode descriptor
+            (a kernel argument, by value)                                        [v1.2]
+K1a gamma   A rows, B cols: flags → fA, fB; γ (int16) → sA, sB (scratch)          [v1.2]
+K1b sigma   A rows, B cols: read γ back, S; σ, τ (int16) overwrite γ in sA, sB    [v1.2]
 for each residue group G (g moduli; ⌈N/g⌉ groups):
   K2 pack   A → A'_l[λ][ī][k̂]  for l ∈ G   (gather via scatter vectors, smem transpose,
   K3 pack   B → B'_l[λ][j̄][k̂]  for l ∈ G    K-contiguous int8, zero padding)  re-read A, B
@@ -282,6 +288,30 @@ for each residue group G (g moduli; ⌈N/g⌉ groups):
 K5 crt      per (λ,ī,j̄): flagged ? native dot (reads A, B) : exact CRT; unscale; α/β; scatter
 ```
 If `α = 0` or `k = 0`, only K0 and K5 (β-only) run.
+
+**K0 [v1.2].**
+- The scatter vectors are a pure function of the fused modes of §5 step 9 (per class I, J,
+  K, L: extent and the stride in each tensor that carries it). The plan keeps that
+  descriptor (O(rank)); K0 receives it **by value** as its kernel argument and writes
+  exactly the §4a vec contents of §5 step 10, one thread per entry.
+- No PCIe copy, no pinned host buffer and no plan-owned device memory: the workspace stays
+  the only device memory a call uses, and no GPU work reads plan memory (§6 lifetime).
+- At most 62 fused modes per class (each has extent ≥ 2 and the class's extent product fits
+  int64), so the argument is bounded.
+
+**K1 in two launches [v1.2].**
+- K1a reads every A row and B column once: the flags into fA/fB and the row exponent γ
+  (§3.2 step 2, int16; zero rows marked) into sA/sB, used as **scratch**.
+- K1b reads them again with γ from sA/sB, computes S and overwrites γ with σ (τ).
+- Rules **[spec: Pipeline neg_k1_merged, neg_k1_no_sigma, neg_k1_sigma_row_split,
+  neg_k1_pack_waits_gamma]**:
+  - K1b starts after K1a retires (a kernel boundary; in one launch an S-pass CTA can read
+    γ before it is written);
+  - each row / column is owned by **one** K1b CTA, which reads its γ before it writes σ over
+    it (two CTAs sharing a row would read σ as γ);
+  - nothing but K1b reads γ: the packs and K5 read σ only after K1b retires (with a second
+    stream, the packs' event edge is from K1b, not K1a).
+- No extra workspace: γ ∈ [−1074, 1023] fits the int16 σ slots.
 
 **Per-batch modulus in K4.**
 - One batched launch covers several moduli. A plain `VisitorScalarBroadcast` cannot
@@ -300,7 +330,10 @@ Properties checked by **[spec: Pipeline]**:
 - **Exactly once.** Every C element is written exactly once, by K5, after all N planes are
   final (each plane is tagged with the K positions folded in: `PlanesFinalAtCRT`).
 - **No stale reads.**
-  - No buffer is read before it is written for the current group or chunk.
+  - No buffer is read before it is written for the current group or chunk (the scatter
+    vectors per tensor, as K0's CTAs write them).
+  - σ/τ are final before a pack or K5 reads them; K1b reads γ, never junk or σ
+    (`SigmaFinalAtUse`) **[v1.2]**.
   - Residue buffers are reused only after the group's GEMMs retire.
   - Chunks partition `[0,k̂)`.
 - **Exact layout.** Regions are disjoint, 256-aligned, gap-free per region, and equal to
@@ -311,7 +344,7 @@ Properties checked by **[spec: Pipeline]**:
   time → ALIASING.
 - **Streams.**
   - Two streams without events produce a hazard.
-  - Safe two-stream operation needs three event edges: K1 → pack (RAW), pack(G) → gemm(G)
+  - Safe two-stream operation needs three event edges: K1b → pack (RAW), pack(G) → gemm(G)
     (RAW), and last gemm(G) → pack(G+1) (WAR). With single-buffered RA/RB those edges
     serialize everything anyway.
   - So v1 is single-stream.
@@ -353,12 +386,12 @@ Properties checked by **[spec: Pipeline]**:
 align(x) = ⌈x⌉₂₅₆      k̂ = ⌈k⌉₁₆      n̂ = ⌈n⌉₁₆      g ∈ [1, N]
 
 region      bytes                       contents
-sA          2·b·m                       int16 shifts σ  (A rows)
-sB          2·b·n                       int16 shifts τ  (B cols)
+sA          2·b·m                       int16 shifts σ  (A rows; γ between K1a and K1b)
+sB          2·b·n                       int16 shifts τ  (B cols; γ between K1a and K1b)
 fA          1·b·m                       u8 non-finite flags (A rows)
 fB          1·b·n                       u8 non-finite flags (B cols)
 vec         8·(2m + 2n + 2k + 3b)       int64 scatter vectors (A: row,k,batch; B: k,col,batch;
-                                        C: row,col,batch)
+                                        C: row,col,batch), written by K0
 RA          g·b·m·k̂                     int8 residues of A for one group
 RB          g·b·n̂·k̂                     int8 residues of B for one group
 W           N·b·m·n̂                     u8 modular products, all N planes
@@ -492,16 +525,47 @@ const char*  imd_status_string(imd_status_t);
   switches. (Tested: an LD_PRELOAD shim counts CUDA allocations; guard zones around the
   workspace.)
 - Test-only hooks (launch-limit overrides, lowering dump) are not part of the production
-  library: they are built only with `IMMERDINK_BUILD_TESTS=ON` (M4 moves them; until then
-  they are exported but unused in production).
+  library: they are built only with `IMMERDINK_BUILD_TESTS=ON`. The launch-limit override
+  applies to plans created after it (the K4 launch split is fixed at plan creation)
+  **[v1.2]**; the hooks are not thread-safe.
 - A workspace belongs to at most **one** in-flight `imd_contract` at a time.
-- **Lifetime:** a plan must outlive every in-flight `imd_contract` that uses it, because
-  K0 copies asynchronously from the plan's pinned buffer.
-- **ALLOC_FAILED** covers pinned or host allocation failure in plan creation; any other
-  CUDA failure is CUDA_ERROR.
-- **Threads:** v1 does not support concurrent first calls from several host threads
-  (CUTLASS caches device properties in unsynchronized statics). M4 caches the GEMM
-  operators in the handle, which fixes this.
+- **Lifetime [v1.2]:** a plan may be destroyed as soon as every `imd_contract` that uses it
+  has **returned**; the GPU work already enqueued reads no plan memory (K0's descriptor and
+  K4's parameters are kernel arguments, copied at launch). (v1.1 required the plan to
+  outlive the GPU work, because K0 copied from the plan's pinned buffer; a plan-owned
+  device copy of the vectors would need that rule too.) The handle must outlive every
+  `imd_plan_create` that uses it. **[spec: HostAPI pos_shared_plan, neg_witness_early_destroy,
+  neg_pinned_early_destroy, neg_plandevice_early_destroy]**
+- **ALLOC_FAILED** covers host allocation failure in plan creation; any CUDA failure,
+  including plan creation's device-property and kernel-attribute calls, is CUDA_ERROR.
+  **[v1.2: no pinned allocation any more]**
+- **Threads [v1.2] [spec: HostAPI]:**
+  - `imd_plan_create` does all host-side GEMM setup: it reads the SM count and the K4
+    kernels' occupancy, sets their dynamic shared-memory attribute (CUDA runtime calls,
+    thread-safe), and stores the parameters of every K4 launch shape in the plan.
+    `imd_contract` copies them, patches this call's pointers and launches; it never calls
+    CUTLASS's operator initialization and writes no plan or process-global host state.
+  - Hence any number of threads may call `imd_workspace_size`, `imd_plan_create` and
+    `imd_contract` concurrently, on distinct plans or on **one shared plan**, on any
+    streams, provided:
+    1. every in-flight `imd_contract` has its own workspace. Two concurrent calls on one
+       workspace are unsafe even on one stream: their launches interleave on it
+       (`neg_ws_shared_same_stream`). Calls ordered on the host (one thread, or
+       externally synchronized) on one stream may reuse a workspace;
+    2. no in-flight call writes memory another in-flight call reads or writes (its C vs
+       the other's A, B, C), as for any stream-ordered library;
+    3. a plan is not destroyed while a call that uses it is running on another thread;
+    4. the calling thread's current device is the one the plan was created on.
+  - Each rule is shown necessary by a negative model: a parameter cache filled by the
+    first `imd_contract` races (`neg_lazy_cache`); one mutable operator per plan lets a call
+    launch another call's arguments (`neg_shared_op`); lazily initialized process-global
+    state races even with a plan per thread (`neg_global_lazy`).
+  - (v1.1 said concurrent first calls were unsupported because CUTLASS caches device
+    properties in unsynchronized statics. CUTLASS v4.8.0 declares them `thread_local`
+    (`CUTLASS_THREAD_LOCAL`), so that race did not occur (`pos_v11`); v1.2 no longer
+    depends on it.)
+  - Not thread-safe: the test hooks and the benchmark-only phase marks
+    (`IMMERDINK_PROFILE`).
 - Callers tile I/J/L themselves, since sub-views are valid inputs. Tiling over I/J/L leaves
   results bitwise unchanged; tiling over K by the caller does change them. The library
   handles K chunking and the batch-launch split internally.
@@ -551,3 +615,17 @@ const char*  imd_status_string(imd_status_t);
 - **§5.** The fusion rule was rewritten (the old one was unsound) and moved after ordering.
   Fully specified the canonical orders and the coalescing role swap; added status
   precedence, the empty-C exemption, and C-only extent 0.
+
+## Changes v1.1 → v1.2 (after M4; docs/NOTES-M4.md "v1.2")
+
+- **§4 K0.** A kernel generates the scatter vectors from the fused-mode descriptor (a
+  kernel argument) instead of copying them from the plan's pinned buffer: no per-call PCIe
+  copy, no pinned or device memory in the plan. §4a is unchanged (same vec region, same
+  contents). **[spec: Pipeline neg_k0_no_c; HostAPI]**
+- **§4 K1.** Two launches: K1a (flags, γ into sA/sB as scratch) and K1b (S, σ over γ),
+  with the rules that make the scratch reuse safe. §4a sizes unchanged.
+  **[spec: Pipeline K1Split, SigmaFinalAtUse, neg_k1_*]**
+- **§4 GEMM setup / §6.** K4's parameters are built at plan creation and only copied by
+  `imd_contract`. The thread-safety rules are stated precisely; the plan lifetime rule is
+  relaxed to "until every call using it has returned". ALLOC_FAILED no longer covers a
+  pinned allocation. The public API is unchanged. **[spec: HostAPI]**
