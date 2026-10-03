@@ -182,7 +182,7 @@ void check_null_arguments() {
   const int64_t e[2] = {3, 4}, eb[2] = {4, 4}, s[2] = {4, 1};
   const int32_t li[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
   const imd_tensor_t A{2, e, s, li}, B{2, eb, s, lb}, C{2, e, s, lc};
-  const imd_options_t o{9, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE};
+  const imd_options_t o{9, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
   size_t bytes = 0;
   Case c;
   c.name = "null_arguments";

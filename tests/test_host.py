@@ -52,13 +52,15 @@ class CT(C.Structure):
 
 class CO(C.Structure):
     _fields_ = [("N", C.c_int32), ("g", C.c_int32), ("rnd", C.c_int32), ("mode", C.c_int32),
-                ("vec", C.c_int32)]
+                ("vec", C.c_int32), ("k4_tune", C.c_int32)]
 
 
 LOWERING_FIELDS = ["status", "lowered", "dispatch", "swapped", "num_moduli", "residue_group",
                    "num_groups", "m", "n", "k", "b", "n_hat", "k_hat", "vec_entries",
                    "k_chunks", "gemm_launches", "kappa", "workspace_bytes",
-                   "plan_device_bytes", "plan_host_bytes", "fused", "kernel_launches"]
+                   "plan_device_bytes", "plan_host_bytes", "fused", "kernel_launches",
+                   "sm_count", "k4_config", "k4_tune_bytes"]
+V1, V2, V3 = 136, 152, 168   # sizeof(imd_lowering_t) per host API version (DESIGN §6a)
 
 
 class Direct:
@@ -95,21 +97,27 @@ class Direct:
         st = self.lib.imd_plan_bytes(*self._args(descs, opts), C.byref(d), C.byref(h))
         return st, d.value, h.value
 
-    def lowering(self, descs, opts, size=152):
-        """imd_lowering into a raw struct of `size` bytes (152: version 2; 136: a version-1
-        caller, whose struct must come back with the v1 fields only)."""
+    def lowering(self, descs, opts, size=V3, sm_count=0):
+        """imd_lowering into a raw struct of `size` bytes (168: version 3; 152 / 136: a
+        version-2 / -1 caller, whose struct must come back with its fields only). sm_count:
+        the v3 input field (written only into a version-3 struct)."""
         raw = (C.c_uint8 * (size + 16))(*([0xEE] * (size + 16)))
         C.c_uint32.from_buffer(raw, 0).value = size
+        if size >= V3:
+            C.c_int32.from_buffer(raw, V2).value = sm_count
         st = self.lib.imd_lowering(*self._args(descs, opts), raw)
         if any(raw[i] != 0xEE for i in range(size, size + 16)):
             raise Fail("imd_lowering wrote past struct_size")
         i32 = [C.c_int32.from_buffer(raw, 4 * i).value for i in range(8)]
         i64 = [C.c_int64.from_buffer(raw, 32 + 8 * i).value for i in range(9)]
         u64 = [C.c_uint64.from_buffer(raw, 104 + 8 * i).value for i in range(4)]
-        v2 = []
-        if size >= 152:
+        v2, v3 = [], []
+        if size >= V2:
             v2 = [C.c_int32.from_buffer(raw, 136).value, C.c_int64.from_buffer(raw, 144).value]
-        return st, dict(zip(LOWERING_FIELDS, i32[1:] + i64 + u64 + v2))
+        if size >= V3:
+            v3 = [C.c_int32.from_buffer(raw, 152).value, C.c_int32.from_buffer(raw, 156).value,
+                  C.c_uint64.from_buffer(raw, 160).value]
+        return st, dict(zip(LOWERING_FIELDS, i32[1:] + i64 + u64 + v2 + v3))
 
 
 # ---------------------------------------------------------------------------------------
@@ -157,10 +165,10 @@ def spec_expect(descs, N, g, rnd, mode, vec):
         exp.update(num_groups=len(groups), k_chunks=chunks,
                    gemm_launches=sum(chunks * -(-len(grp) * b // 65535) * nparts
                                      for grp in groups))
-    # v1.4 (DESIGN §4, §6a): the fused launch KF iff EMULATE and k_hat <= 512; kernel
+    # v1.4 (DESIGN §4, §6a): the fused launch KF iff EMULATE and k_hat <= 1024; kernel
     # launches per call with alpha != 0.
     k0 = 0 if vec == "RESIDENT" else 1
-    fused = dispatch == "EMULATE" and k_hat <= 512
+    fused = dispatch == "EMULATE" and k_hat <= 1024   # 512 until v1.5 (A3)
     if dispatch == "NOOP":
         launches = 0
     elif dispatch != "EMULATE":
@@ -170,7 +178,59 @@ def spec_expect(descs, N, g, rnd, mode, vec):
         launches = ((1 if fused else k0 + 2) + (exp["num_groups"] - fused) * per_group
                     + exp["gemm_launches"] + 1)
     exp.update(fused=int(fused), kernel_launches=launches)
+    # v1.5 (DESIGN §4, §6 k4_tune, §6a): the K4 rule for the reference 128 SMs and the
+    # autotuning scratch bytes (both only with the emulated GEMM).
+    emu = dispatch == "EMULATE"
+    exp.update(sm_count=128,
+               k4_config=spec_k4_config(m, n_hat, k_hat, b, N, gg, 128) if emu else 0,
+               k4_tune_bytes=spec_k4_tune_bytes(m, n_hat, k_hat, b, gg) if emu else 0)
     return status, exp
+
+
+def spec_k4_tune_bytes(m, n_hat, k_hat, b, g):
+    """Group 1's RA, RB and W planes, each 256-aligned; 0 above 256 MiB (DESIGN v1.5 §6)."""
+    regs = [g * b * m * k_hat, g * b * n_hat * k_hat, g * b * m * n_hat]
+    total = sum(params.align_up(r, 256) for r in regs)
+    return 0 if total > 256 << 20 else total
+
+
+# DESIGN v1.5 §4 "K4 configurations": (tile_m, tile_n, CTAs per SM) and the model constants
+# (round_ns, mac_fs by concurrency q = 1..CTAs per SM), transcribed from the DESIGN table.
+K4_TILES = [(128, 256, 1), (128, 128, 2), (64, 128, 2), (64, 64, 3)]
+K4_COSTS = [(2716, (418,)), (2550, (453, 456)), (1424, (505, 612)), (1333, (944, 1088, 802))]
+K4_MARGIN = 50   # permille
+SAT = (1 << 127) - 1
+
+
+def spec_k4_estimate(c, m, n_hat, k_hat, gb, sms):
+    """The estimate in fs: the busiest SM's j tiles in full rounds of `occ` concurrent CTAs
+    and one round of the rest; every intermediate clamped at 2^127 - 1 (as the C++ does)."""
+    tm, tn, occ = K4_TILES[c]
+    rnd_ns, mac_fs = K4_COSTS[c]
+    tiles = min(min(-(-m // tm) * -(-n_hat // tn), SAT) * gb, SAT)
+    j = -(-tiles // sms)
+    tile_macs = min(tm * tn * k_hat, SAT)
+
+    def round_fs(q):
+        return min(min(rnd_ns * 1000000, SAT) + min(min(tile_macs * q, SAT) * mac_fs[q - 1], SAT),
+                   SAT)
+
+    full, rest = divmod(j, occ)
+    est = min(full * round_fs(occ), SAT) if full else 0
+    return min(est + round_fs(rest), SAT) if rest else est
+
+
+def spec_k4_config(m, n_hat, k_hat, b, N, g, sms):
+    """DESIGN v1.5 §4 "K4 configurations": the selection rule, written independently of
+    src/host/k4_config.cpp."""
+    sms = sms if sms > 0 else 128
+    gb = min(g, N) * b
+    est = [spec_k4_estimate(c, m, n_hat, k_hat, gb, sms) for c in range(4)]
+    best, best_est = 0, est[0]
+    for c in range(1, 4):
+        if min(est[c] * 1000, SAT) < min(est[0] * (1000 - K4_MARGIN), SAT) and est[c] < best_est:
+            best, best_est = c, est[c]
+    return best
 
 
 # ---------------------------------------------------------------------------------------
@@ -230,9 +290,16 @@ def check_case(direct, descs, opts, what):
 
     # Python wrapper == direct C, for every query; a version-1 caller gets the same v1 fields.
     st_c, low_c = direct.lowering(descs, co)
-    st_1, low_1 = direct.lowering(descs, co, size=136)
+    st_1, low_1 = direct.lowering(descs, co, size=V1)
+    st_2, low_2 = direct.lowering(descs, co, size=V2)
     if st_1 != st_c or any(low_1[f] != low_c[f] for f in low_1):
-        raise Fail(f"{what}: a version-1 imd_lowering_t differs from version 2")
+        raise Fail(f"{what}: a version-1 imd_lowering_t differs from version 3")
+    if st_2 != st_c or any(low_2[f] != low_c[f] for f in low_2):
+        raise Fail(f"{what}: a version-2 imd_lowering_t differs from version 3")
+    # v1.5: k4_tune changes no host query; sm_count is the rule's input.
+    st_t, low_t = direct.lowering(descs, co[:5] + (1,))
+    if st_t != st_c or low_t != low_c:
+        raise Fail(f"{what}: imd_lowering differs with k4_tune = ON")
     lw = host.lowering(descs, **kw)
     if lw.status != STATUS[st_c]:
         raise Fail(f"{what}: wrapper status {lw.status}, C {STATUS[st_c]}")
@@ -272,9 +339,16 @@ def check_case(direct, descs, opts, what):
         raise Fail(f"{what}: lowered = 0")
     for f in ("m", "n", "k", "b", "n_hat", "k_hat", "kappa", "workspace_bytes", "num_moduli",
               "residue_group", "vec_entries", "num_groups", "k_chunks", "gemm_launches",
-              "fused", "kernel_launches"):
+              "fused", "kernel_launches", "sm_count", "k4_config", "k4_tune_bytes"):
         if low_c[f] != exp[f]:
             raise Fail(f"{what}: {f} = {low_c[f]}, spec {exp[f]}")
+    if exp["dispatch"] == "EMULATE":   # the rule for other devices (sm_count is an input)
+        for sms in (16, 46, 82, 132, 170):
+            st_s, low_s = direct.lowering(descs, co, sm_count=sms)
+            want = spec_k4_config(exp["m"], exp["n_hat"], exp["k_hat"], exp["b"], N,
+                                  exp["residue_group"], sms)
+            if st_s != st_c or low_s["sm_count"] != sms or low_s["k4_config"] != want:
+                raise Fail(f"{what}: sm_count {sms}: k4_config {low_s['k4_config']}, spec {want}")
     if bool(low_c["swapped"]) != exp["swapped"] or host.DISPATCH[low_c["dispatch"]] != exp["dispatch"]:
         raise Fail(f"{what}: swap / dispatch differ from the spec")
     regs = [(host.REGIONS[r], o, o + nb) for r, (o, nb) in enumerate(lay) if nb]
@@ -371,12 +445,12 @@ def suite_plan(args):
     hdl = C.c_void_p()
     assert lib.lib.imd_create(C.byref(hdl)) == 0
     rng = random.Random(20261005)
-    n_plans, n_k4 = 0, 0
+    n_plans, n_k4, n_tuned = 0, 0, 0
     path_of = {0: "NOOP", 1: "EMULATE", 2: "DIRECT"}  # imd::detail::Path order (k = 0: SCALE)
 
-    def one(descs, opts, what):
-        nonlocal n_plans, n_k4
-        co = c_opts(*opts)
+    def one(descs, opts, what, tune=0):
+        nonlocal n_plans, n_k4, n_tuned
+        co = c_opts(*opts) + (tune,)
         st, low = direct.lowering(descs, co)
         T = [harness.make_tensor(*d) for d in descs]
         plan = C.c_void_p()
@@ -395,8 +469,20 @@ def suite_plan(args):
             path, sw, m, n, k, b, nh, kh, N, g, total = v[:11]
             regs = [(v[11 + 2 * r], v[12 + 2 * r]) for r in range(8)]
             dev, store, add, launches, hbytes, fused, kernels = v[27:34]
+            cfg, k4p_cfg, sms = v[34:37]
             _, ltot, lay = direct.layout(descs, co)
             _, pdev, phost = direct.plan_bytes(descs, co)
+            # v1.5: the plan runs the rule's K4 configuration for its device's SM count (any
+            # configuration with k4_tune), and holds that configuration's parameters.
+            _, low_s = direct.lowering(descs, co, sm_count=sms)
+            if path == 1 and k > 0:
+                ok = cfg == k4p_cfg and 0 <= cfg < 4 and (tune or cfg == low_s["k4_config"])
+                n_tuned += bool(tune and low_s["k4_tune_bytes"])
+            else:
+                ok = cfg == k4p_cfg == -1
+            if not ok or (sms and low_s["sm_count"] != sms):   # a NOOP plan reads no SM count
+                raise Fail(f"{what}: plan K4 configuration {cfg} / {k4p_cfg} on {sms} SMs, "
+                           f"host query {low_s['k4_config']} (k4_tune {tune})")
             dsz = C.c_size_t(0)
             assert lib.lib.imd_plan_device_bytes(plan, C.byref(dsz)) == 0
             got = dict(dispatch="SCALE" if k == 0 and path else path_of[path], swapped=sw, m=m, n=n, k=k, b=b, n_hat=nh,
@@ -417,7 +503,8 @@ def suite_plan(args):
 
     for t in range(args.cases):
         descs = random_descs(rng)
-        one(descs, random_opts(rng), f"random[{t}]")
+        # v1.5: every 8th plan with k4_tune (its sizes must still equal the host queries).
+        one(descs, random_opts(rng), f"random[{t}]", tune=int(t % 8 == 7))
     for t in range(max(1, args.cases // 40)):
         descs = random_descs(rng, legal_bias=1.0)
         N = rng.randint(2, 20)
@@ -433,7 +520,8 @@ def suite_plan(args):
             one(descs, (20, g, TRUNC, "EMULATE", "GENERATE"), f"big {m},{n},{k},{b} g={g}")
     lib.lib.imd_destroy(hdl)
     if args.verbose:
-        print(f"  ok  {n_plans} plans ({n_k4} emulated) sized exactly as the host queries say")
+        print(f"  ok  {n_plans} plans ({n_k4} emulated, {n_tuned} autotuned) sized exactly as the "
+              f"host queries say, K4 configurations as the rule says")
 
 
 def main():

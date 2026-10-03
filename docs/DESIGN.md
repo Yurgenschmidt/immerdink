@@ -1,4 +1,4 @@
-# immerdink — design (v1.4)
+# immerdink — design (v1.5)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -15,7 +15,10 @@ device or plan-resident, GEMM parameters built at plan creation; a K1 split was 
 and measured but not adopted) and the §6 thread and lifetime rules that follow from them; changed text is marked **[v1.2]**. v1.3 adds
 §6a, the CUDA-free host query API (no semantic change). v1.4 adds the fused small-k launch KF
 (§4, chosen at plan time; same results, same workspace) and reports the launch structure in
-the host API (§6a); changed text is marked **[v1.4]**. The change lists are at the end.
+the host API (§6a); changed text is marked **[v1.4]**. v1.5 adds a small set of K4 tile
+configurations chosen per plan (§4; bit-identical results, same launches and workspace), the
+optional plan-time autotuning option `k4_tune` (§6) and the choice in the host API (§6a), and
+takes the fused launch KF up to k̂ ≤ 1024 (§4); changed text is marked **[v1.5]**. The change lists are at the end.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -277,7 +280,8 @@ Typical errors are smaller. Choosing N is the caller's job, guided by
 
 ```
 plan time:  IndexMap lowering → fused-mode descriptor, canonical orders, chunking, launch
-            split; K4 GEMM parameters (CUTLASS device properties, occupancy, smem attribute)
+            split; K4 configuration (rule, or timed with k4_tune) [v1.5] and its GEMM
+            parameters (CUTLASS device properties, occupancy, smem attribute)
 K0 vec      kernel: generate the scatter vectors → ws.vec from the fused-mode descriptor
             (a kernel argument, by value); not launched with IMD_VEC_RESIDENT      [v1.2]
 K1 scale    A rows, B cols: flags + σ, τ (int16)       one launch, two passes per row (γ, then S)
@@ -292,7 +296,7 @@ K5 crt      per (λ,ī,j̄): flagged ? native dot (reads A, B) : exact CRT; unsc
 If `α = 0` or `k = 0`, only K0 and K5 (β-only) run.
 
 **[v1.4] Fused path KF (plan-time choice).** When the emulated GEMM runs and
-`k̂ ≤ 512` (`fused`; a pure function of the lowering, reported by `imd_lowering`, §6a), one
+`k̂ ≤ 1024` (**[v1.5]**; 512 in v1.4) (`fused`; a pure function of the lowering, reported by `imd_lowering`, §6a), one
 launch **KF** replaces K0, K1 and group 1's K2/K3; then group 1's K4 launches, groups 2.. as
 above (K2, K3, K4, reading the σ/τ and vectors KF stored), and K5:
 ```
@@ -315,11 +319,15 @@ Rules **[spec: Pipeline Fused, MParts; pos_fused_*, neg_fused_*]**:
   after the previous group's GEMMs retire, as before (`neg_fused_all_groups`).
 - Exactly the §4a workspace and the same bits in every region (σ, flags, vec, RA, RB, W) as
   the unfused sequence; `α = 0` / `k = 0` calls run K0 + the β kernel as before.
-- Why k̂ ≤ 512: a tile of 4096 (or, for small operands, 1024) FP64 holds `th` whole rows
-  (tk = pow2 ≥ k̂, `th·tk` = the tile), so a block owns its rows; their per-row K1
-  reductions are warp shuffles plus, for rows spread over 2–4 warps, a shared-memory
+- Why k̂ ≤ 1024: a tile of 4096 (or, for small operands, 1024) FP64 holds `th` whole rows
+  (tk = pow2 ≥ k̂, `th·tk` = the tile; th ≥ 1), so a block owns its rows; their per-row K1
+  reductions are warp shuffles plus, for rows spread over 2–8 warps, a shared-memory
   combine. The point is fewer, fuller launches for small problems (docs/NOTES-A1.md): K1 and
-  the packs no longer read the operands separately and K0's launch disappears.
+  the packs no longer read the operands separately and K0's launch disappears. **[v1.5]**
+  1024 instead of 512 (A3, docs/NOTES-A3.md: sq1024-class shapes): tk = 1024 is the largest
+  row a 4096-value tile holds 4 of, with KF's per-row offsets (8 KB) inside the 48 KB of
+  static shared memory. The threshold is a launch-shape property only: Pipeline's `Fused`
+  model has no k̂ in it (a KF CTA owns whole rows for any k̂), so the spec is unchanged.
 
 **[v1.4] Moduli parts.** A pack launch (K2/K3 and KF) with fewer tiles than about two per
 SM splits the group's slots over `gridDim.y` block rows: part y of a row writes the slots
@@ -412,6 +420,10 @@ Properties checked by **[spec: Pipeline]**:
   The last launch may end in a partial N tile; CUTLASS predicates columns past n̂, and
   the threadblock N (128 or 256 today) must be a multiple of 16 so every launch's B and W
   pointers stay 16-byte aligned. **[spec: Pipeline pos_ysplit*, neg_ysplit_*, neg_ytile_misaligned]**
+  **[v1.5]** The split is in units of 65535 × 256 columns for every K4 configuration (a
+  multiple of every tile width and of 16), so the launches do not depend on the
+  configuration; a launch of a 64- or 128-wide configuration has more than 65535 N tiles
+  only when n̂ > 65535·256, which the persistent kernel handles (it has no grid limit).
 - `m, n̂ ≤ 2³¹−1` (`GemmCoord` is int), and the per-launch K is ≤ K_c'.
 - `lda = ldb = k̂` and `ldc = n̂`. The batch strides are int64, so k̂ itself may exceed 2³¹.
 
@@ -431,11 +443,59 @@ Properties checked by **[spec: Pipeline]**:
   memory, no barriers. (Until A2: CUTLASS `GemmUniversal` with an `Sm80EVT` epilogue —
   compute node, `VisitorAuxLoad<u8>`, `VisitorAuxStore<u8>` — kept in
   `kernels/mod_epilogue.cuh` and still tested against the same reference.)
-- One tile: 128×256×64, 3 stages, 8 warps of 64×64 (72 KB smem, 1 CTA/SM). The menu
-  below was measured (M4, A2) and is not instantiated: 256×128×64 s3 and 128×256×64 s4
-  within noise; 128×128×64 s3 (2 CTAs/SM) L2-bandwidth-bound.
-  Menu (99 KB of smem): 256×128×64 s3 or 128×256×64 s3; 128×128×64 s3–5;
-  64×128×64 s6; 64×64×64 s6–10.
+- **K4 configurations [v1.5]** (A3, docs/NOTES-A3.md). Until v1.4 one tile, 128×256×64,
+  served every shape; it leaves most SMs idle when a group has few tiles (s128: 8 CTAs on
+  128 SMs; r_mm, n̂ = 64: 3/4 of every tile is padding and half the SMs idle). v1.5
+  instantiates a small table, `host/k4_config.hpp kK4Configs` (`IMD_K4_*`):
+
+  | id | tile (M×N×K) | warps (warp tile) | stages | smem | CTAs/SM |
+  |---|---|---|---|---|---|
+  | `IMD_K4_128x256` | 128×256×64 | 8 (64×64) | 3 | 72 KB | 1 |
+  | `IMD_K4_128x128` | 128×128×64 | 4 (64×64) | 3 | 48 KB | 2 |
+  | `IMD_K4_64x128` | 64×128×64 | 4 (32×64) | 4 | 48 KB | 2 |
+  | `IMD_K4_64x64` | 64×64×64 | 2 (32×64) | 4 | 32 KB | 3 |
+
+  - Every entry is the same K4Gemm (persistent CTAs, swizzle-8 tile order, register
+    epilogue with the in-quad transpose, which needs 64-column warp tiles) around the same
+    CUTLASS main loop and MMA; only the tile → CTA mapping differs. Each W element is the
+    same exact §3.5 reduction of the same int32 sum (the K order inside a chunk does not
+    matter: integer addition is exact below K_c', cert_kc), so **every configuration
+    gives bit-identical W** (tested: every configuration on the contract suites and on
+    `cutlass_mod_epilogue`).
+  - Same launches (host/k4_launches.hpp, all splits as above), same workspace, same kernel
+    sequence: no spec change (Pipeline does not model tiles). The plan's K4 parameter
+    sets have one size whatever the configuration, so the plan host bytes (§6a) do not
+    depend on it.
+  - **Selection (plan time, deterministic).** `k4_select` in libimmerdink_host — the one
+    implementation; libimmerdink calls it with the device's SM count at plan creation and
+    `imd_lowering` reports it (§6a `k4_config`, for a given `sm_count`) — is a pure function
+    of (m, n̂, k̂, b, N, g, SMs): it estimates each configuration's K4 time from its tile
+    count and picks the smallest estimate (rule and constants below), fitted on the A3
+    measurements (RTX 4090, 128 SMs).
+    - Per configuration c (tile tm×tn, o CTAs/SM): tiles = ⌈m/tm⌉·⌈n̂/tn⌉·g·b (one
+      group's launch); the busiest SM gets j = ⌈tiles/SMs⌉, run as ⌊j/o⌋ rounds of o
+      concurrent CTAs and, if r = j mod o > 0, one round of r. A round of q CTAs costs
+      `round_ns + q·tm·tn·k̂·mac_fs[q]`; est_c = the sum, in femtoseconds, computed in
+      unsigned 128-bit integers clamped at 2¹²⁷−1 after every operation.
+    - Constants (`kK4Costs`, least squares in relative error on nsys K4 kernel times of
+      every configuration on 84 (shape, N) cases):
+
+      | c | round_ns | mac_fs[1] | mac_fs[2] | mac_fs[3] |
+      |---|---|---|---|---|
+      | 128×256 | 2716 | 418 | | |
+      | 128×128 | 2550 | 453 | 456 | |
+      | 64×128 | 1424 | 505 | 612 | |
+      | 64×64 | 1333 | 944 | 1088 | 802 |
+    - Choice: 128×256 unless another configuration's estimate is below 95 % of 128×256's
+      (`kK4MarginPermille` = 50: model error); then the smallest estimate (ties: lower id).
+      On the 84 fitted cases the rule's K4 total is 4.1 % below always-128×256 and 0.4 %
+      above the per-case best, and it never picks a configuration slower than 128×256
+      (NOTES-A3 §3).
+  - **Autotuning (optional plan option `k4_tune`, default off; §6).** The plan times every
+    configuration once on its device and keeps the fastest. Not the default: plan creation
+    then runs kernels and allocates temporarily, and timing on a shared GPU is noisy.
+  - Measured and not in the table: 256×128×64 (within noise of 128×256, M4/A2), 4 stages
+    of 128×256 (1–3 % slower, A2), 32-row warp tiles at 128×128 (register-limited).
 - cuBLASLt (int32 out) is used only as a test oracle and baseline.
 
 **DIRECT path.**
@@ -568,6 +628,8 @@ typedef struct { int32_t num_moduli;      /* N, 2..20                        */
                  int32_t mode;            /* IMD_EMULATE | IMD_DIRECT         */
                  int32_t vec_mode;        /* [v1.2] IMD_VEC_GENERATE (0, default)
                                              | IMD_VEC_RESIDENT                */
+                 int32_t k4_tune;         /* [v1.5] IMD_K4_TUNE_OFF (0, default)
+                                             | IMD_K4_TUNE_ON                  */
                } imd_options_t;
 
 imd_status_t imd_workspace_size(const imd_tensor_t* A, const imd_tensor_t* B,
@@ -589,6 +651,31 @@ const char*  imd_status_string(imd_status_t);
   the missing initializer), but callers built against the v1.1 header must be rebuilt
   (the struct size changed). An unknown `vec_mode` is
   INVALID_VALUE (in `imd_workspace_size` too, which depends on it).
+- **[v1.5] `k4_tune` (plan-time autotuning of the K4 configuration, §4; optional, not
+  decided as a default).** The struct grows to 24 bytes, as in v1.2: zero is the default
+  (off), callers must be rebuilt, an unknown value is INVALID_VALUE in every function that
+  takes options. Off: the plan runs `k4_select`'s configuration for the device's SM count
+  (the `imd_lowering` `k4_config` for that `sm_count`). On, for a plan with the emulated
+  GEMM and `k4_tune_bytes > 0` (§6a; 0 above 256 MiB, where the rule is kept):
+  `imd_plan_create` allocates `k4_tune_bytes` of device memory (group 1's RA, RB and W
+  planes, one allocation), zeroes it and times group 1's K4 launches in every configuration
+  on `cudaStreamPerThread`: one warm-up run each, which sizes a batch of back-to-back runs
+  of about 0.1 ms (1–32 runs), then three rounds of one batch per configuration,
+  interleaved; the minimum per run counts. It frees the memory and keeps the fastest
+  configuration (the rule's unless another is strictly faster). It reads no user data and
+  writes nothing the plan keeps but the choice. (A single timed run per configuration, the
+  first version, picked 10–30 % slower configurations for small problems: NOTES-A3 §5.)
+  - Results are bit-identical whatever the choice (§4), so tuning changes speed only;
+    the choice itself may differ between plans (timing noise).
+  - Costs: plan creation synchronizes `cudaStreamPerThread`, and `cudaMalloc`/`cudaFree`
+    may synchronize the device; plan creation time grows by the allocation, the zeroing
+    and about 4 × (0.1 ms or one run) of group 1's K4 launches per configuration
+    (NOTES-A3 §5 measures it).
+    Not capturable (as plan creation never was).
+  - Statuses: the temporary allocation failing is ALLOC_FAILED, a launch or timing error
+    CUDA_ERROR; the plan is not created in either case.
+  - Thread safety is unchanged: the temporary memory is private to the call; concurrent
+    tuned plan creations only perturb each other's timings.
 
 - `imd_workspace_size` is a **pure host function**: no GPU, no allocation, and exactly
   §4a. **[v1.3]** It and the other host queries (§4a table, plan bytes, lowering summary)
@@ -614,7 +701,9 @@ const char*  imd_status_string(imd_status_t);
 - Test-only hooks (launch-limit overrides, lowering dump) are not part of the production
   library: they are built only with `IMMERDINK_BUILD_TESTS=ON`. The launch-limit override
   applies to plans created after it (the K4 launch split is fixed at plan creation)
-  **[v1.2]**; the hooks are not thread-safe.
+  **[v1.2]**; the hooks are not thread-safe. **[v1.5]** A hook (and a benchmark-only
+  profiling hook) forces the K4 configuration of later plans, for the invariance tests and
+  the A3 measurements.
 - A workspace belongs to at most **one** in-flight `imd_contract` at a time.
 - **Lifetime [v1.2]:**
   - `IMD_VEC_GENERATE`: a plan may be destroyed as soon as every `imd_contract` that uses
@@ -629,15 +718,17 @@ const char*  imd_status_string(imd_status_t);
 - **`imd_plan_device_bytes`** reports the device bytes the plan owns, exactly §4a's "plan
   device bytes" (the bytes requested from `cudaMalloc`; the driver's allocation granularity
   is not included). With the workspace and the user tensors this is all the device memory
-  immerdink uses (MEMORY_MODEL §3).
+  immerdink uses (MEMORY_MODEL §3), except **[v1.5]** the `k4_tune_bytes` (§6a) a plan
+  creation with `k4_tune` on allocates and frees before it returns.
 - **ALLOC_FAILED** covers host allocation failure in plan creation and, with
-  `IMD_VEC_RESIDENT`, the plan's device allocation; any other CUDA failure, including plan
-  creation's device-property and kernel-attribute calls, is CUDA_ERROR. **[v1.2: no
-  pinned allocation any more]**
+  `IMD_VEC_RESIDENT`, the plan's device allocation (and **[v1.5]** with `k4_tune`, its
+  temporary allocation); any other CUDA failure, including plan creation's device-property
+  and kernel-attribute calls, is CUDA_ERROR. **[v1.2: no pinned allocation any more]**
 - **Threads [v1.2] [spec: HostAPI]:**
   - `imd_plan_create` does all host-side GEMM setup: it reads the SM count and the K4
     kernels' occupancy, sets their dynamic shared-memory attribute (CUDA runtime calls,
-    thread-safe), and stores the parameters of every K4 launch shape in the plan.
+    thread-safe), and stores the parameters of every K4 launch shape in the plan
+    (**[v1.5]** of the plan's K4 configuration, which is fixed at creation).
     `imd_contract` copies them, patches this call's pointers and launches; it never calls
     CUTLASS's operator initialization and writes no plan or process-global host state.
   - Hence any number of threads may call `imd_workspace_size`, `imd_plan_create` and
@@ -724,15 +815,19 @@ imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
                           const imd_tensor_t* C, const imd_options_t*, imd_lowering_t* out);
 const char*  imd_status_string(imd_status_t);
 
-typedef struct {               /* 136 bytes in version 1, 152 in version 2 [v1.4] */
+typedef struct {               /* 136 bytes in version 1, 152 in v2 [v1.4], 168 in v3 [v1.5] */
   uint32_t struct_size;        /* in: sizeof(imd_lowering_t) as the caller compiled it  */
   int32_t  status, lowered, dispatch, swapped, num_moduli, residue_group, num_groups;
   int64_t  m, n, k, b, n_hat, k_hat, vec_entries, k_chunks, gemm_launches;
   uint64_t kappa, workspace_bytes, plan_device_bytes, plan_host_bytes;
   int32_t  fused, reserved;    /* version 2 [v1.4] */
   int64_t  kernel_launches;    /* version 2 [v1.4] */
+  int32_t  sm_count;           /* version 3 [v1.5]: in (0 = 128) and out */
+  int32_t  k4_config;          /* version 3: IMD_K4_* of the rule (§4) */
+  uint64_t k4_tune_bytes;      /* version 3: temporary bytes of a k4_tune plan creation */
 } imd_lowering_t;
 enum { IMD_DISPATCH_NOOP, IMD_DISPATCH_EMULATE, IMD_DISPATCH_DIRECT, IMD_DISPATCH_SCALE };
+enum { IMD_K4_128x256, IMD_K4_128x128, IMD_K4_64x128, IMD_K4_64x64, IMD_K4_CONFIG_COUNT };
 ```
 
 Semantics:
@@ -769,7 +864,7 @@ Semantics:
   status is NOT_SUPPORTED (κ ≥ T), so a caller sees why. `plan_device_bytes` and
   `plan_host_bytes` are valid only on SUCCESS. With `lowered = 0` every field except
   `struct_size`, `status` and `lowered` is 0.
-  - **[v1.4] Version 2** appends `fused` (1 iff EMULATE with k̂ ≤ 512: the §4 KF launch) and
+  - **[v1.4] Version 2** appends `fused` (1 iff EMULATE with k̂ ≤ 1024 (512 before v1.5): the §4 KF launch) and
     `kernel_launches`, the kernel launches of one `imd_contract` with α ≠ 0: NOOP 0; DIRECT
     and SCALE `v + 1`; EMULATE `(fused ? 1 : v + 2) + (⌈N/g⌉ − fused)·(2 + [n̂ > n]) +
     gemm_launches + 1`, with `v` = 1 for `IMD_VEC_GENERATE` (K0), 0 for resident vectors (a
@@ -777,6 +872,21 @@ Semantics:
     `k_chunks`. A version-1 caller (struct_size 136) gets exactly the version-1 fields.
     Tested: the LD_PRELOAD shim counts `cudaLaunchKernel` during every test call and
     compares it with the plan, and the plan with the host query.
+  - **[v1.5] Version 3** appends `sm_count`, `k4_config` and `k4_tune_bytes`, valid
+    whenever `lowered = 1`. `sm_count` is also an **input** (read only when
+    `struct_size ≥ 168`): the SM count of the device the caller will run on; 0 means 128
+    (the RTX 4090 the rule was fitted on); negative → INVALID_VALUE with nothing written.
+    The library writes back the count it used. `k4_config` is `k4_select` (§4) for that
+    count on EMULATE (`IMD_K4_128x256` otherwise): exactly the configuration
+    `imd_plan_create` uses on a device with that many SMs and `k4_tune` off.
+    `k4_tune_bytes` = Σ align₂₅₆ of g·b·m·k̂ (RA), g·b·n̂·k̂ (RB) and g·b·m·n̂ (group 1's W
+    planes) on EMULATE when that sum is ≤ 256 MiB, else 0: the device memory a `k4_tune`
+    plan creation allocates temporarily (0: no tuning would run), reported whatever this
+    call's `k4_tune` (the option changes no host query). A version-2 caller gets exactly
+    the version-2 fields. Tested: `host_c_api`, `host_python` (against an independent
+    Python transcription of the rule for several SM counts), `host_vs_plan` (every real
+    plan runs the rule's configuration for its device's SM count; tuned plans have the
+    same sizes).
   - `dispatch`: NOOP (b·m·n = 0), EMULATE (K0–K5; EMULATE mode, k ≥ 2), DIRECT (K0 + the
     native kernel; DIRECT mode or K-empty), SCALE (k = 0: K0 + the β kernel, §3.7). A call
     with α = 0 also runs only K0 and the β kernel; that is per call, not per plan.
@@ -788,7 +898,8 @@ Semantics:
   libimmerdink). They read the descriptor arrays only during the call.
 - The K4 launch structure used for `k_chunks`, `gemm_launches` and the host bytes is the
   production one (K_c' chunks, 65535 batches, 65535 N-tiles of 256); the test-only
-  launch-limit hook changes only libimmerdink's plans.
+  launch-limit hook changes only libimmerdink's plans. **[v1.5]** It does not depend on
+  the K4 configuration, and neither do the plan host bytes (one parameter-set size).
 
 **The workspace/speed knob is g only.** Callers query sizes for each g ∈ [1, N] and choose;
 there is no budget option (BENCHMARKS "Residue-group size g" gives the speed side).
@@ -914,3 +1025,21 @@ tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH).
 - **§6a.** `IMD_HOST_API_VERSION` 2: `imd_lowering_t` grows to 152 bytes with `fused` and
   `kernel_launches` (appended; version-1 callers unaffected). libimmerdink_host stays the one
   implementation of the choice (`fused_path`) and the count (`plan_launches`).
+
+## Changes v1.4 → v1.5 (shape-dependent K4 configurations, docs/NOTES-A3.md)
+
+- **§4 K4 configurations.** Four K4Gemm instantiations (128×256, 128×128, 64×128, 64×64
+  threadblock tiles); a plan runs one, chosen at plan time by `k4_select` (libimmerdink_host)
+  from the GEMM view, N, g and the SM count. Same §3.5 arithmetic, bit-identical W, same
+  launches, workspace and kernel sequence: no cert, spec or Apalache change.
+- **§6 `k4_tune`** (optional, default off): plan-time autotuning over the configurations,
+  with temporary device memory of `k4_tune_bytes`. `imd_options_t` grows to 24 bytes
+  (rebuild, as in v1.2). Plan creation already runs device work with `IMD_VEC_RESIDENT`
+  (K0 into plan memory, then a wait); tuning adds launches into private temporary memory
+  that no call reads, so the HostAPI and Pipeline models are unchanged.
+- **§6a.** `IMD_HOST_API_VERSION` 3: `imd_lowering_t` grows to 168 bytes with `sm_count`
+  (input and output), `k4_config` and `k4_tune_bytes` (appended; version-1/2 callers
+  unaffected). libimmerdink_host stays the one implementation of the choice.
+- **§4 KF for k̂ ≤ 1024** (was 512): plans with 512 < k̂ ≤ 1024 take the fused launch
+  (`fused` = 1, `kernel_launches` accordingly). Same outputs and workspace; Pipeline's
+  `Fused` is k̂-independent, so no spec change.

@@ -80,7 +80,8 @@ target_include_directories(imd_constants INTERFACE "${PROJECT_SOURCE_DIR}/includ
 # libimmerdink links it and sizes its plans with it. Its internal C++ entry points
 # (IMD_HOST_INTERNAL, src/host/export.hpp) are exported for libimmerdink and the tests only.
 add_library(immerdink_host SHARED
-  src/host/index_map.cpp src/host/workspace.cpp src/host/analysis.cpp src/host/host_api.cpp)
+  src/host/index_map.cpp src/host/workspace.cpp src/host/analysis.cpp src/host/k4_config.cpp
+  src/host/host_api.cpp)
 target_include_directories(immerdink_host PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 target_link_libraries(immerdink_host PRIVATE imd_constants imd_warnings)
@@ -109,11 +110,12 @@ target_compile_options(imd_cutlass INTERFACE
 
 # --- Library -----------------------------------------------------------------------------
 # The library: C ABI (api.cpp), K0-K5 + DIRECT kernels (contract.cu), K4 CUTLASS GEMM
-# (gemm_k4.cu).
+# (gemm_k4.cu, one K4Gemm instantiation per configuration in src/k4/).
 # Test-only hooks (src/test_hooks.cpp: launch-limit override, lowering dump) are built only
 # with IMMERDINK_BUILD_TESTS=ON, and the benchmark phase marks (src/profile.cpp) only with
 # IMMERDINK_PROFILE=ON; a production build exports neither.
-add_library(immerdink SHARED src/api.cpp src/contract.cu src/gemm_k4.cu)
+add_library(immerdink SHARED src/api.cpp src/contract.cu src/gemm_k4.cu
+  src/k4/k4_cfg0.cu src/k4/k4_cfg1.cu src/k4/k4_cfg2.cu src/k4/k4_cfg3.cu)
 if(IMMERDINK_BUILD_TESTS)
   target_sources(immerdink PRIVATE src/test_hooks.cpp)
 endif()

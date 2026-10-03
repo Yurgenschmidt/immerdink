@@ -15,7 +15,8 @@ bool options_ok(const imd_options_t& o) {
   return o.num_moduli >= c::kNMin && o.num_moduli <= c::kNMax && o.residue_group >= 0 &&
          o.residue_group <= o.num_moduli && (o.rounding == IMD_RN || o.rounding == IMD_TRUNC) &&
          (o.mode == IMD_EMULATE || o.mode == IMD_DIRECT) &&
-         (o.vec_mode == IMD_VEC_GENERATE || o.vec_mode == IMD_VEC_RESIDENT);
+         (o.vec_mode == IMD_VEC_GENERATE || o.vec_mode == IMD_VEC_RESIDENT) &&
+         (o.k4_tune == IMD_K4_TUNE_OFF || o.k4_tune == IMD_K4_TUNE_ON);
 }
 
 // Little-endian multi-word unsigned integers for the plan-time constants of §3.2.

@@ -9,6 +9,7 @@
 #include "export.hpp"
 #include "immerdink/immerdink_host.h"
 #include "index_map.hpp"
+#include "k4_config.hpp"
 #include "k4_launches.hpp"
 #include "plan_data.hpp"
 #include "workspace.hpp"
@@ -35,7 +36,7 @@ inline bool emulates(const ExecPlan& e) { return e.path == Path::kGemm && e.k >=
 // v1.4 (DESIGN §4 "KF"): the fused scale-and-pack launch is used iff the emulated GEMM runs
 // and one pack tile row covers all of k_hat (k_hat <= kFusedKHatMax: a block owns whole
 // rows). A pure function of the lowering: deterministic at plan time.
-constexpr int64_t kFusedKHatMax = 512;
+constexpr int64_t kFusedKHatMax = 1024;  // 512 until A3 (DESIGN v1.5)
 inline bool fused_path(const ExecPlan& e) { return emulates(e) && e.k_hat <= kFusedKHatMax; }
 
 // Kernel launches of one imd_contract with alpha != 0 (DESIGN §4, §6a kernel_launches):
@@ -76,7 +77,7 @@ IMD_HOST_INTERNAL uint64_t plan_host_bytes(const imd_tensor_t& A, const imd_tens
 
 // sizeof(K4Plan) and of one std::map entry of its store-mod / add-mod kernel parameter
 // maps, for this build (gemm_k4.cu static_asserts these against the real types).
-constexpr uint64_t kK4PlanBytes = 176;
+constexpr uint64_t kK4PlanBytes = 184;
 constexpr uint64_t kK4StoreEntryBytes = 280;
 constexpr uint64_t kK4AddEntryBytes = 280;
 

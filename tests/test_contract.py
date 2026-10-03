@@ -39,7 +39,8 @@ import harness as hz  # noqa: E402
 
 RND = {"RN": hz.RN, "TRUNC": hz.TRUNC}
 MODE = {o.EMULATE: hz.EMULATE, o.DIRECT: hz.DIRECT}
-STATS = {"cases": 0, "elements": 0, "stage_bytes": 0, "kinds": {}}
+STATS = {"cases": 0, "elements": 0, "stage_bytes": 0, "kinds": {}, "k4": {}}
+K4_CONFIGS = 4   # IMD_K4_CONFIG_COUNT (DESIGN v1.5 §4)
 
 
 class Fail(Exception):
@@ -128,6 +129,15 @@ def scatter(T, desc, fill):
 # One case
 # ---------------------------------------------------------------------------------------
 
+def k4_tune_bytes(view, N, g):
+    """DESIGN v1.5 §6 k4_tune: group 1's RA, RB and W planes, each 256-aligned, in one
+    temporary allocation; 0 (no tuning) above 256 MiB."""
+    kh, nh, gb = -(-view.k // 16) * 16, -(-view.n // 16) * 16, min(g, N) * view.b
+    regs = [gb * view.m * kh, gb * nh * kh, gb * view.m * nh]
+    total = sum(-(-r // 256) * 256 for r in regs)
+    return 0 if max(regs) > 256 << 20 or total > 256 << 20 else total
+
+
 def bit_mismatches(got, want):
     gb, wb = got.view(np.uint64), want.view(np.uint64)
     return np.nonzero((gb != wb) & ~(np.isnan(got) & np.isnan(want)))[0]
@@ -191,11 +201,18 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
     # fmode 1: the plan-time rule, but without the small-problem launch variants (K5 one
     # element per thread, KF four values per thread).
     fmodes = (-1, 0, 1) if lib.has_test_hooks else (-1,)
-    runs = [(vec, pvec, fm) for vec, pvec in ((hz.VEC_GENERATE, params.VEC_GENERATE),
-                                             (hz.VEC_RESIDENT, params.VEC_RESIDENT))
+    # v1.5 (DESIGN §4 "K4 configurations"): k4 -1 is the plan-time rule; with the test hooks
+    # every emulated case also runs once in each K4 configuration (forced) and once with the
+    # k4_tune plan option: all bit-exact vs the oracle and bit-identical to each other.
+    runs = [(vec, pvec, fm, -1) for vec, pvec in ((hz.VEC_GENERATE, params.VEC_GENERATE),
+                                                 (hz.VEC_RESIDENT, params.VEC_RESIDENT))
             for fm in fmodes]
-    for vec, pvec, fmode in runs:
-        vname = f"{name} [{pvec}{ {-1: '', 0: ', unfused', 1: ', large launches'}[fmode]}]"
+    if lib.has_test_hooks and kind == "GEMM":
+        runs += [(hz.VEC_GENERATE, params.VEC_GENERATE, -1, c)
+                 for c in list(range(K4_CONFIGS)) + ["tune"]]
+    for vec, pvec, fmode, k4 in runs:
+        vname = f"{name} [{pvec}{ {-1: '', 0: ', unfused', 1: ', large launches'}[fmode]}" \
+                f"{'' if k4 == -1 else f', K4 {k4}'}]"
         st, ws_bytes = lib.workspace_size(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec)
         if st != "SUCCESS":
             raise Fail(f"{vname}: imd_workspace_size {st}")
@@ -208,21 +225,34 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
         allocs0 = lib.alloc_count()
         if lib.has_test_hooks:
             lib.set_fused(0 if fmode == 0 else -1)
+            lib.set_k4_config(k4 if isinstance(k4, int) else -1)
         try:
-            st, plan = lib.plan_create(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec)
+            st, plan = lib.plan_create(tA, tB, tC, N, g, RND[rounding], MODE[mode], vec,
+                                       k4_tune=1 if k4 == "tune" else 0)
         finally:
             if lib.has_test_hooks:
                 lib.set_fused(-1)
+                lib.set_k4_config(-1)
         if st != "SUCCESS":
             raise Fail(f"{vname}: imd_plan_create {st}")
         # CUDA allocations of plan creation (shim): one device allocation for resident
         # vectors, none otherwise (no pinned memory in v1.2). The resident count also proves
-        # the shim interposes the library's runtime calls.
+        # the shim interposes the library's runtime calls. v1.5: k4_tune makes one temporary
+        # allocation of k4_tune_bytes (freed before imd_plan_create returns) when nonzero.
         if allocs0 is not None:
             want_allocs = 1 if (pvec == params.VEC_RESIDENT and not view.empty_output()) else 0
+            if k4 == "tune" and k4_tune_bytes(view, N, gg) > 0:
+                want_allocs += 1
             if lib.alloc_count() - allocs0 != want_allocs:
                 raise Fail(f"{vname}: imd_plan_create made {lib.alloc_count() - allocs0} CUDA "
                            f"allocations, expected {want_allocs}")
+        if lib.has_test_hooks and kind == "GEMM":
+            cfg, k4p_cfg, _ = lib.plan_k4(plan)
+            if cfg != k4p_cfg or not 0 <= cfg < K4_CONFIGS or (isinstance(k4, int) and k4 >= 0
+                                                              and cfg != k4):
+                lib.plan_destroy(plan)
+                raise Fail(f"{vname}: plan K4 configuration {cfg} / {k4p_cfg}, wanted {k4}")
+            STATS["k4"][cfg] = STATS["k4"].get(cfg, 0) + 1
         dA, dB, dC = cuda.malloc(bufA.nbytes), cuda.malloc(bufB.nbytes), cuda.malloc(bufC.nbytes)
         dW = cuda.malloc(ws_bytes + 2 * GUARD)
         try:
@@ -295,11 +325,11 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
             raise Fail(f"{vname}: {len(bad)}/{got.size} C elements differ; first at {i}: "
                        f"gpu {got[i]!r} ({got.view(np.uint64)[i]:#018x}) oracle {want[i]!r} "
                        f"({want.view(np.uint64)[i]:#018x})")
-        results[(pvec, fmode)] = got
-    got = results[(params.VEC_GENERATE, -1)]
+        results[(pvec, fmode, k4)] = got
+    got = results[(params.VEC_GENERATE, -1, -1)]
     for key, other in results.items():
         if not np.array_equal(got.view(np.uint64), other.view(np.uint64)):
-            raise Fail(f"{name}: C differs between runs {(params.VEC_GENERATE, -1)} and {key}")
+            raise Fail(f"{name}: C differs between runs {(params.VEC_GENERATE, -1, -1)} and {key}")
     STATS["cases"] += 1
     STATS["elements"] += got.size
     STATS["kinds"][kind] = STATS["kinds"].get(kind, 0) + 1
@@ -542,6 +572,27 @@ def suite_bigk(lib, cuda, verbose):
     TA, TB = gen(rng, (170, k), "phi"), gen(rng, (k, 1), "uniform")
     run_case(lib, cuda, "long rows (170x1, k=32768, N=3 RN)", A, B, C, TA, TB,
              np.zeros((170, 1)), 1.0, 0.0, 3, 0, "RN", rng=rng, expect_kind="GEMM", verbose=verbose)
+    # A3: rows too long for two per SM in L2 (2 x 128 x 8 k > 64 MiB): one 1024-thread block
+    # per SM, grid-strided over more rows than blocks; pass 2 forward (128 x 320 KB fit).
+    k = 40000
+    A, B, C = matrix(rng, 130, 1, k, a_kfast=True, b_kfast=True)
+    TA, TB = gen(rng, (130, k), "wide"), gen(rng, (k, 1), "uniform")
+    run_case(lib, cuda, "longer rows (130x1, k=40000, N=2 TRUNC)", A, B, C, TA, TB,
+             np.zeros((130, 1)), 1.0, 0.0, 2, 0, "TRUNC", rng=rng, expect_kind="GEMM",
+             verbose=verbose)
+    # ... and rows in flight beyond 64 MiB (60 x 1.2 MB): pass 2 backwards; two K-chunks.
+    k = 150000
+    A, B, C = matrix(rng, 60, 1, k, a_kfast=True, b_kfast=True)
+    TA, TB = gen(rng, (60, k), "phi"), gen(rng, (k, 1), "uniform")
+    TA[7, 1234] = math.nan
+    global MAX_HOST_BUFFER
+    saved, MAX_HOST_BUFFER = MAX_HOST_BUFFER, 80 << 20   # 72 MB of A: more than the budget
+    try:
+        run_case(lib, cuda, "very long rows (60x1, k=150000, N=3 TRUNC)", A, B, C, TA, TB,
+                 np.zeros((60, 1)), 1.0, 0.0, 3, 0, "TRUNC", rng=rng, expect_kind="GEMM",
+                 verbose=verbose)
+    finally:
+        MAX_HOST_BUFFER = saved
 
 
 def suite_api(lib, cuda, verbose):
@@ -654,7 +705,8 @@ def main():
     print(f"{STATS['cases']} contractions bit-exact vs spec/oracle.py "
           f"({STATS['elements']} C elements; dispatch {STATS['kinds']}; "
           f"{STATS['stage_bytes']} workspace bytes stage-checked; {STATS.get('fused', 0)} runs "
-          f"on the fused path) in {time.time() - t0:.1f}s")
+          f"on the fused path; K4 configurations run {dict(sorted(STATS['k4'].items()))}) "
+          f"in {time.time() - t0:.1f}s")
     return 0
 
 

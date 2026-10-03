@@ -1,0 +1,19 @@
+# A3: the k4_tune plan option against the rule (--k4 rule,tune,rule: the rule timed before and
+# after the tuned plan in the same process), on the cases whose group 1 fits the 256 MiB
+# tuning limit. Plan-creation time is in each record (plan_create_ms). Format as sweep_m4.txt.
+s128     | ik,jk->ij | i=128,j=128,k=128      | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+s256     | ik,jk->ij | i=256,j=256,k=256      | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+x384     | ik,jk->ij | i=384,j=384,k=384      | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+s512     | ik,jk->ij | i=512,j=512,k=512      | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+x768     | ik,jk->ij | i=768,j=768,k=768      | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+s_lowk   | ik,jk->ij | i=2048,j=2048,k=64     | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+s_batch  | lik,ljk->lij | i=64,j=64,k=64,l=256 | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+s_cc8    | kjbc,kiac->abij | i=8,j=8,k=8,a=64,b=64,c=64     | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+s_cc16   | kjbc,kiac->abij | i=16,j=16,k=16,a=96,b=96,c=96  | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+s_df     | acQ,bdQ->acbd | a=32,b=32,c=32,d=32,Q=256      | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+x1k_256  | ik,jk->ij | i=1024,j=1024,k=256    | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+sq1024   | ik,jk->ij | i=1024,j=1024,k=1024   | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+x1280_1k | ik,jk->ij | i=1280,j=1280,k=1024   | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+x256_8k  | ik,jk->ij | i=256,j=256,k=8192     | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 30
+sq2048   | ik,jk->ij | i=2048,j=2048,k=2048   | gemmul8,imd | 8,14 | dyn | --k4 rule,tune,rule --reps 20
+t_df     | acQ,bdQ->acbd  | a=64,b=64,c=64,d=64,Q=2048 | gemmul8,imd | 8 | dyn | --k4 rule,tune,rule --reps 10

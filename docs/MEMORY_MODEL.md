@@ -124,6 +124,7 @@ It is the code libimmerdink runs at plan creation, so the answers are what the k
 | the §3 region table (offset, bytes per region) | `imd_workspace_layout` | `workspace_layout` |
 | plan device bytes `D_plan`, plan host payload | `imd_plan_bytes` | `plan_bytes` |
 | GEMM view, dispatch, groups, K4 launches, all sizes, plan-time status | `imd_lowering` | `lowering` |
+| K4 configuration for an SM count; temporary bytes of a `k4_tune` plan creation (DESIGN v1.5) | `imd_lowering` (`sm_count` in, `k4_config`, `k4_tune_bytes`) | `lowering(..., sm_count=)` |
 | workspace for every g = 1..N | (loop over g) | `g_tradeoff`, `python3 -m immerdink.host` |
 
 The **g trade-off** for a CC-shaped contraction (o = 40, v = 200; N = 14):

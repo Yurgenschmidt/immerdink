@@ -14,6 +14,11 @@
 //       of group 1 run as separate launches). Results must not change. Returns 0, or 1 for
 //       another mode.
 //
+//   imd_test_set_k4_config(config)
+//       config -1: plans created afterwards run the K4 configuration of the plan-time rule
+//       (or k4_tune's; production); 0 .. IMD_K4_CONFIG_COUNT - 1: that configuration
+//       (DESIGN v1.5 §4). Results must not change. Returns 0, or 1 for another value.
+//
 //   imd_test_set_k5_one_elem(per_sm)
 //       K5 (j-bar fastest) takes one element per thread while b m n <= per_sm x SMs, else
 //       4 per thread with warp-transposed stores. per_sm -1 restores the production value;
@@ -41,8 +46,9 @@
 //       K4 launches of one call; and its host payload, counted from the live containers:
 //       sizeof(imd_plan_st) + descriptor copies + lowering tables + K0 descriptor + K4Plan
 //       with its map entries; then (v1.4) whether it takes the fused path and its kernel
-//       launches per imd_contract with alpha != 0. Returns 0, or 1 for a null argument;
-//       *count as above.
+//       launches per imd_contract with alpha != 0; then (v1.5) its K4 configuration, the
+//       configuration of its K4 parameters (both -1 without K4) and its SM count. Returns 0,
+//       or 1 for a null argument; *count as above.
 #include <cstdint>
 #include <vector>
 
@@ -69,6 +75,12 @@ IMD_API int imd_test_set_limits(int64_t k_chunk, int64_t max_batch, int64_t max_
 IMD_API int imd_test_set_fused(int mode) {
   if (mode != -1 && mode != 0) return 1;
   imd::detail::fused_override() = mode;
+  return 0;
+}
+
+IMD_API int imd_test_set_k4_config(int config) {
+  if (config < -1 || config >= IMD_K4_CONFIG_COUNT) return 1;
+  imd::detail::k4_config_override() = config;
   return 0;
 }
 
@@ -149,6 +161,11 @@ IMD_API int imd_test_plan_sizes(imd_plan_t plan, int64_t* out, int64_t cap, int6
   v.push_back(static_cast<int64_t>(host));
   v.push_back(e.fused ? 1 : 0);
   v.push_back(imd::detail::plan_launches(e, e.fused, e.vec_resident, k4.launches));
+  // v1.5: the K4 configuration the plan runs (-1 without K4), its K4Plan's, and the SMs the
+  // rule was evaluated for.
+  v.push_back(e.k4 ? e.k4_config : -1);
+  v.push_back(e.k4 ? k4.config : -1);
+  v.push_back(e.sms);
   *count = static_cast<int64_t>(v.size());
   if (out != nullptr && *count <= cap)
     for (size_t i = 0; i < v.size(); ++i) out[i] = v[i];
