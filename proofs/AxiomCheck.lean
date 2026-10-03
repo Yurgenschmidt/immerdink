@@ -49,3 +49,13 @@ open Immerdink
 #print axioms Scaling.abs_rne_sub
 #print axioms Scaling.abs_truncZ_le
 #print axioms Scaling.abs_truncZ_sub_lt
+
+-- L3 (Error.lean)
+#print axioms Error.l1_form
+#print axioms Error.normwise_core
+#print axioms Error.normwise_rn
+#print axioms Error.normwise_trunc
+#print axioms Error.end_to_end_rn
+#print axioms Error.end_to_end_trunc
+#print axioms Error.zero_row
+#print axioms Error.q_zero_rn
