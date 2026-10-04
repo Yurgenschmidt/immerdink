@@ -684,3 +684,44 @@ Now: `tools/run_quiet.sh` waits up to 300 s for raw GPU utilization ≤ 1 %, and
 with `attempts` and `contaminated`. **For clean numbers, minimize the Claude desktop window
 (or switch to another workspace) while a sweep runs**: an active, streaming conversation
 keeps the GPU busy, and every attempt will be flagged.
+
+## Clean re-run in bench mode (2026-10-04, `compare-clean-bb6b568.jsonl`, `d1-clean-bb6b568.jsonl`)
+
+Console-only (no display server; no other GPU clients; persistence mode on; PCIe gen4 x16
+after the reboot); warm-up and retries as above. Ratio = immerdink TFLOPS-eq / GEMMul8's
+(permute + GEMMul8 where a permute is needed), same process.
+
+| case | N = 8 | N = 14 | | case | N = 8 | N = 14 |
+|---|---|---|---|---|---|---|
+| sq1024 | 1.06 | 1.19 | | r_lowk | 1.86 | 2.06 |
+| sq2048 | 1.23 | 1.29 | | r_bigk | 1.06 | 1.07 |
+| sq4096 | 1.31 | 1.38 | | r_skinny | 1.19 | 1.26 |
+| sq8192 | 1.16 | 1.17 | | r_mm | 1.05 | 1.12 |
+| sq16384 | — | 1.09 | | t_nn | 1.30 | 1.36 |
+| s_lowk | 2.82 | 2.76 | | t_batch | 1.13 | 1.25 |
+| s_cc16 | 1.25 | 1.42 | | t_ikl | 1.58 | 1.54 |
+| s_df | 1.26 | 1.46 | | t_df | 1.51 | 1.65 |
+| s_perm | 1.42 | 1.52 | | t_cc | 1.65 | 1.58 |
+| s_cc8 | 1.37 | 2.85 | | t_permout | 1.41 | 1.45 |
+| s128 / s256 / s512 | 1.40 / 0.90 / 0.92 | ≥ 1.2 (GEMMul8 bimodal at N = 14) | | | | |
+
+- Medium and large cases agree with the D4 sweep within ~3 %, so desktop time-slicing
+  mostly hit small cases and individual phases (K5) rather than the whole-call ratios there.
+- 36 of 106 records still exceed the 5 % spread threshold even with no desktop: tiny shapes
+  (20–110 µs) from launch and clock jitter, plus a few medium cases at 5–6 % (r_lowk, r_mm).
+  In bench mode "contaminated" therefore means "noisier than 5 %", not "time-sliced".
+- **Below GEMMul8 only s256 and s512 at N = 8** (0.90 / 0.92×): roadmap A5.
+
+**D1 packed reuse (clean):** one `imd_pack` + R contractions vs R plain calls; all
+bit-identical.
+
+| case (pack) | pack / call | R = 4 | R = 16 | per-call saving | workspace (GiB) |
+|---|---|---|---|---|---|
+| sq4096 (A or B), N = 8 / 14 | 12 / 10 % | 1.10 / 1.08 | 1.12 / 1.10 | 11 / 10 % | 0.38 → 0.25 / 0.66 → 0.44 |
+| sq8192 (A), N = 8 / 14 | 7 / 6 % | 1.04 / 1.04 | 1.08 / 1.05 | 7 / 6 % | 1.50 → 1.00 / 2.63 → 1.75 |
+| t_cc (A or B), N = 8 / 14 | 13 / 10 % | 1.10 / 1.08 | 1.13 / 1.10 | 12 / 10 % | 0.38 → 0.25 / 0.66 → 0.44 |
+| t_df (A or B), N = 8 / 14 | 12 / 9 % | 1.09 / 1.07 | 1.11 / 1.09 | 10 / 8 % | 0.25 → 0.19 / 0.44 → 0.33 |
+| r_skinny (A), N = 8 / 14 | 53 / 46 % | 1.63 / 1.55 | **1.97 / 1.78** | 52 / 46 % | 0.58 → 0.08 / 1.01 → 0.14 |
+| r_skinny (B), N = 8 / 14 | 3 / 2 % | 1.02 / 1.01 | 1.02 / 1.02 | 2 % | ≈ unchanged |
+
+R = 1 breaks even (1.00×) everywhere: a pack costs what the fused scale+pack it replaces costs.
