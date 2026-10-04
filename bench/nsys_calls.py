@@ -6,7 +6,7 @@
 The bench times each call as  cudaEventRecord(e0); run(); cudaEventRecord(e1);
 cudaEventSynchronize(e1)  on an idle GPU. For every such window this collects the launches
 (kernels and memsets, by correlation id) and reports, as medians over the windows of each
-method (imd if any immerdink kernel ran, else gemmul8), in µs:
+method (imd if any immerdink kernel ran, else other, e.g. the bw copy), in µs:
   host    host time inside run()            (e1 record start - e0 record end)
   pre     host time before the first launch (first launch API start - e0 record end)
   lat0    e0 record end -> first kernel start on the GPU
@@ -69,7 +69,7 @@ def main():
         i = j + 2
         if not ks:
             continue
-        method = "imd" if any(k[2].startswith(IMD) for k in ks) else "gemmul8"
+        method = "imd" if any(k[2].startswith(IMD) for k in ks) else "other"
         span = ks[-1][1] - ks[0][0]
         kern = sum(k[1] - k[0] for k in ks)
         w = dict(host=(e1[0] - e0[1]) / 1e3, pre=(launches[0][0] - e0[1]) / 1e3,

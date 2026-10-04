@@ -29,14 +29,13 @@ export LD_LIBRARY_PATH="$env_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 logdir="$(mktemp -d "${TMPDIR:-/tmp}/imd-bench.XXXXXX")"
 echo "sweep $sweep -> $out (commit $commit, env $BENCH_ENV)"
 
-while IFS='|' read -r name spec ext methods Ns emu extra; do
+while IFS='|' read -r name spec ext methods Ns extra; do
   name="$(echo "$name" | xargs)"
   case "$name" in ''|'#'*) continue ;; esac
   if [ -n "${CASES:-}" ] && ! echo "$name" | grep -Eq "$CASES"; then continue; fi
   args=(--name "$name" --spec "$(echo "$spec" | xargs)" --ext "$(echo "$ext" | xargs)"
         --methods "$(echo "$methods" | xargs)" --out "$out")
   [ -n "$(echo "$Ns" | xargs)" ] && args+=(--N "$(echo "$Ns" | xargs)")
-  [ -n "$(echo "$emu" | xargs)" ] && args+=(--emu "$(echo "$emu" | xargs)")
   # shellcheck disable=SC2206
   args+=($extra)
   echo "== $name $(date -Is)"

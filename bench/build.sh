@@ -7,7 +7,6 @@
 #   IMMERDINK_BENCH_BUILD  build directory (default <repo>/build/bench)
 #   IMMERDINK_CUTLASS_DIR  CUTLASS v4.8.0 checkout (default: the third_party/cutlass submodule)
 #   IMMERDINK_LIBRARY      link this prebuilt libimmerdink.so instead of building one
-#   GEMMUL8_DIR            optional GEMMul8 build (default bench/_deps/GEMMul8; fetched by the evaluation workspace's tools)
 # The build is CPU-heavy: it runs under nice and takes the machine-wide benchmark lock,
 # so it never overlaps a gated timing run; it runs inside tools/memcap.sh with at most 4 jobs.
 set -euo pipefail
@@ -25,7 +24,6 @@ cfg=(-S "$here" -B "$build" -G Ninja
      -DPython3_EXECUTABLE="$env_dir/bin/python3")
 [ -n "${IMMERDINK_CUTLASS_DIR:-}" ] && cfg+=(-DIMMERDINK_CUTLASS_DIR="$IMMERDINK_CUTLASS_DIR")
 [ -n "${IMMERDINK_LIBRARY:-}" ] && cfg+=(-DIMMERDINK_LIBRARY="$IMMERDINK_LIBRARY")
-[ -n "${GEMMUL8_DIR:-}" ] && cfg+=(-DGEMMUL8_DIR="$GEMMUL8_DIR")
 
 exec 9>"${TLC_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/immerdink-tlc.lock}"
 flock 9

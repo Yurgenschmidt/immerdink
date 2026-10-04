@@ -1,50 +1,44 @@
-// imd_bench: time one FP64 contraction case with immerdink and the M4 baselines.
+// imd_bench: time one FP64 contraction case with immerdink.
 //
 //   imd_bench --name sq4096 --spec ik,jk->ij --ext i=4096,j=4096,k=4096 \
-//             --methods dgemm,emu,int8,gemmul8,cutensor,imd --N 8,14,20 [options]
+//             --methods imd,bw --N 8,14,20 [options]
 //
 // Run it through bench/run_sweep.sh (which goes through tools/run_bench.sh); see
-// docs/BENCHMARKS.md. Every operand is dense row-major in its label order (last label
+// docs/BENCHMARKING.md. Every operand is dense row-major in its label order (last label
 // fastest). One JSON object per (method, variant) is appended to --out (default stdout).
+// immerdink only: comparisons with other libraries live in a separate evaluation workspace.
 //
 // Methods
-//   dgemm     cuBLAS FP64 GEMM, CUBLAS_COMPUTE_64F_PEDANTIC (never emulated)
-//   emu       cuBLAS FP64 fixed-point emulation, CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT,
-//             strategy EAGER; variants from --emu (dyn | fix<bits>)
-//   int8      cuBLASLt int8 TN GEMM with int32 output on the GEMM view (m, n, k^, b):
-//             the time of ONE modulus' GEMM (the GEMM-phase roofline is N times it)
-//   gemmul8   GEMMul8 INT8 fast mode, one call per batch, N from --N
-//   cutensor  cuTENSOR FP64 contraction on the original layouts
 //   imd       immerdink imd_plan_create + imd_contract, N from --N. With a library built
 //             by this project (IMMERDINK_PROFILE=ON), --phase-reps more calls are made with
 //             per-phase event marks and the record gets "phases": per phase the median
 //             time, its MEMORY_MODEL §4 lower bound and the time as % of that bound
 //             (the timed whole-call loop runs with the marks switched off)
-//   bw        device-to-device copy of A (achievable DRAM bandwidth)
 //   packed    v1.7 (DESIGN §6b, D1): the caller's A or B (--pack A,B) packed once with
 //             imd_pack (imd_pack_desc_for: bit-identical C) and reused by R contractions
 //             (--reuse 1,4,16): R x imd_contract vs imd_pack + R x imd_contract_packed,
 //             interleaved per repetition, plus imd_pack / imd_contract / imd_contract_packed
 //             alone; workspaces and pack bytes
-// Matrix-only methods (dgemm, emu, gemmul8) need the GEMM view: A = [L][I|K], B = [L][J|K],
-// C = [L][I][J] (either I/K or J/K order). If a case is not in that layout the method is
-// timed twice: on pre-permuted operands ("gemm-view") and as "perm+<method>", which
-// permutes A and B in, runs the GEMM and permutes C out (cuTENSOR permutations).
+//   duel      two immerdink configurations (--duel-a, --duel-b) timed INTERLEAVED, call by
+//             call, in one process (docs/BENCHMARKING.md "Tiny shapes", NOTES-A5 §1.2): both
+//             sides see the same GPU clock / DVFS / host-core state. A side is "default" or
+//             a comma list of N=<n>, vec=generate|resident, g=<g> (0 = N),
+//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule); unset keys keep the plan
+//             defaults, N defaults to the --N value. Defaults: A = default (the K4 rule),
+//             B = k4=tune (the plan-time K4 autotune); when both pick the same K4
+//             configuration (k4_config in both records) the run is an A/A resolution check.
+//             Records duel-a and duel-b; duel-b carries ratio_median = median over pairs of
+//             t_a / t_b (> 1: B faster), its p10 / p90, and whether the two C are bit-identical
+//   bw        device-to-device copy of A (achievable DRAM bandwidth; a hardware reference)
 //
 // Accuracy: for --samples output elements (all of them if C is smaller), the reference
 // is a double-double (Dot2) dot product computed on the device; the host holds only the
 // samples (no operand copies), so host RSS is small for every shape. Reported: max |c - r| / |r| and the
 // normwise max |c - r| / (||a_i||_2 ||b_j||_2) of DESIGN §3.8.
-#include <cublasLt.h>
-#include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include <cutensor.h>
 #include <sys/resource.h>
 #include <immerdink/immerdink.h>
 
-#ifdef IMD_BENCH_GEMMUL8
-#include <gemmul8.hpp>
-#endif
 #ifdef IMD_BENCH_PROFILE
 #include "profile_hooks.h"  // src/: per-phase event marks (libimmerdink built with IMMERDINK_PROFILE)
 #endif
@@ -76,18 +70,6 @@ struct Failure : std::runtime_error {
   do {                                                                                       \
     cudaError_t e_ = (x);                                                                    \
     if (e_ != cudaSuccess) throw Failure(std::string(#x) + ": " + cudaGetErrorString(e_));   \
-  } while (0)
-#define CB(x)                                                                                \
-  do {                                                                                       \
-    cublasStatus_t s_ = (x);                                                                 \
-    if (s_ != CUBLAS_STATUS_SUCCESS)                                                         \
-      throw Failure(std::string(#x) + ": " + cublasGetStatusName(s_));                       \
-  } while (0)
-#define CT(x)                                                                                \
-  do {                                                                                       \
-    cutensorStatus_t s_ = (x);                                                               \
-    if (s_ != CUTENSOR_STATUS_SUCCESS)                                                       \
-      throw Failure(std::string(#x) + ": " + cutensorGetErrorString(s_));                    \
   } while (0)
 #define CI(x)                                                                                \
   do {                                                                                       \
@@ -198,11 +180,6 @@ __global__ void k_fill(double* p, size_t n, uint64_t seed, double phi) {
     double g = sqrt(-2.0 * log(u1)) * cospi(2.0 * u2);
     p[i] = (u - 0.5) * exp(phi * g);
   }
-}
-__global__ void k_fill_i8(int8_t* p, size_t n, uint64_t seed) {
-  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
-       i += size_t(gridDim.x) * blockDim.x)
-    p[i] = int8_t(splitmix64(seed ^ i) & 0xff);
 }
 
 // ----------------------------------------------------------------------- the contraction ---
@@ -511,26 +488,66 @@ Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& 
   return T;
 }
 
+// A side of method duel: one immerdink configuration. k4: -1 the plan-time rule, -2 the
+// k4_tune plan option, >= 0 a forced configuration; k5: 0 the launch rule, 1 / 2 / 4
+// elements per thread. Forced k4 / k5 go through the benchmark hooks (profiling build).
+struct DuelSide {
+  int N = 14, vec = IMD_VEC_GENERATE, g = 0, k4 = -1, k5 = 0;
+  std::string describe() const {
+    std::string d = "N=" + std::to_string(N) + " g=" + ((g == 0 || g >= N) ? "N" : std::to_string(g));
+    d += vec == IMD_VEC_RESIDENT ? " vec=resident" : " vec=generate";
+    d += k4 == -1 ? " k4=rule" : k4 == -2 ? " k4=tune" : " k4=" + std::to_string(k4);
+    d += k5 == 0 ? " k5=rule" : " k5=" + std::to_string(k5);
+    return d;
+  }
+};
+
+// "default" (the plan defaults at --N) or a comma list of key=value overrides.
+DuelSide parse_duel_side(const std::string& spec, int N) {
+  DuelSide d;
+  d.N = N;
+  if (spec.empty() || spec == "default") return d;
+  for (auto& kv : split(spec, ',')) {
+    const auto eq = kv.find('=');
+    if (eq == std::string::npos) throw Failure("bad duel side entry '" + kv + "' (key=value)");
+    const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+    if (k == "N") d.N = std::stoi(v);
+    else if (k == "vec" && (v == "generate" || v == "resident"))
+      d.vec = v == "resident" ? IMD_VEC_RESIDENT : IMD_VEC_GENERATE;
+    else if (k == "g") d.g = std::stoi(v);
+    else if (k == "k4") d.k4 = v == "rule" ? -1 : v == "tune" ? -2 : std::stoi(v);
+    else if (k == "k5" && (v == "0" || v == "1" || v == "2" || v == "4")) d.k5 = std::stoi(v);
+    else throw Failure("bad duel side entry '" + kv + "' (N=, vec=generate|resident, g=, "
+                       "k4=rule|tune|0..3, k5=0|1|2|4)");
+  }
+  return d;
+}
+
+// Number of elements whose bit patterns differ (method duel: are the two sides' C identical).
+__global__ void k_count_diff(const unsigned long long* x, const unsigned long long* y, size_t n,
+                             unsigned long long* count) {
+  unsigned long long local = 0;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    local += x[i] != y[i];
+  if (local) atomicAdd(count, local);
+}
+
 // --------------------------------------------------------------------- the bench context ---
 struct Bench {
   Case c;
   Options o;
   cudaStream_t s = nullptr;
-  cublasHandle_t blas = nullptr;
-  cublasLtHandle_t lt = nullptr;
-  cutensorHandle_t tens = nullptr;
   imd_handle_t imd = nullptr;
   DevBuf dA, dB, dC;
   Reference R;  // sampled reference (host memory O(samples); operands stay on the device)
   Json meta;     // fields common to every record
   FILE* out = stdout;
 
-  // GEMM view: canonical labels and whether each operand needs a permutation.
+  // GEMM view (a case descriptor in every record): canonical labels, and which operands a
+  // matrix-only library would have to permute to reach it.
   std::string cA, cB, cC;  // labels of the GEMM-view operands
   bool needA = false, needB = false, needC = false;
-  bool opA_kfast = true, opB_kfast = true;  // A = [L][I][K] (k fastest) or [L][K][I]
-  DevBuf pA, pB, pC;                        // permuted operands (only when needed)
-  cutensorPlan_t permA = nullptr, permB = nullptr, permC = nullptr;
 
   void emit(Json j) {
     Json rec = meta;
@@ -597,10 +614,6 @@ struct Bench {
   // ------------------------------------------------------------------------ setup ---
   void setup() {
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-    CB(cublasCreate(&blas));
-    CB(cublasSetStream(blas, s));
-    CB(cublasLtCreate(&lt));
-    CT(cutensorCreate(&tens));
     CI(imd_create(&imd));
 
     dA = DevBuf(c.A.size * 8);
@@ -613,29 +626,21 @@ struct Bench {
     R = make_reference(c, dA.as<double>(), dB.as<double>(), o.samples, o.seed, s);
 
     // GEMM view. A: L ++ (I ++ K | K ++ I); B: L ++ (J ++ K | K ++ J); C: L ++ I ++ J.
-    auto pick = [&](const std::string& have, const std::string& X, bool& kfast) {
-      if (have == c.L + X + c.K) { kfast = true; return have; }
-      if (have == c.L + c.K + X) { kfast = false; return have; }
-      kfast = true;
-      return c.L + X + c.K;
+    auto pick = [&](const std::string& have, const std::string& X) {
+      return (have == c.L + X + c.K || have == c.L + c.K + X) ? have : c.L + X + c.K;
     };
-    cA = pick(c.A.labels, c.I, opA_kfast);
-    cB = pick(c.B.labels, c.J, opB_kfast);
+    cA = pick(c.A.labels, c.I);
+    cB = pick(c.B.labels, c.J);
     cC = c.L + c.I + c.J;
     needA = cA != c.A.labels;
     needB = cB != c.B.labels;
     needC = cC != c.C.labels;
-    if (needA) { pA = DevBuf(dA.bytes); permA = make_perm(c.A, cA); }
-    if (needB) { pB = DevBuf(dB.bytes); permB = make_perm(c.B, cB); }
-    if (needC) { pC = DevBuf(dC.bytes); permC = make_perm(make_operand(cC, c.ext), c.C.labels); }
 
     cudaDeviceProp p{};
     CU(cudaGetDeviceProperties(&p, 0));
     int drv = 0, rt = 0;
     cudaDriverGetVersion(&drv);
     cudaRuntimeGetVersion(&rt);
-    int cbv = 0;
-    cublasGetVersion(blas, &cbv);
     std::string extstr;
     for (auto& [k, v] : c.ext) extstr += (extstr.empty() ? "" : ",") + std::string(1, k) + "=" + std::to_string(v);
     meta.str("case", c.name).str("spec", c.spec).str("ext", extstr);
@@ -645,246 +650,13 @@ struct Bench {
     meta.num("phi", o.phi).integer("seed", (long long)o.seed);
     meta.str("gpu", p.name).integer("sm_count", p.multiProcessorCount);
     meta.str("driver", sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null"));
-    meta.integer("cuda_driver_api", drv).integer("cuda_runtime", rt).integer("cublas", cbv);
-    meta.integer("cutensor", (long long)cutensorGetVersion());
+    meta.integer("cuda_driver_api", drv).integer("cuda_runtime", rt);
     meta.str("gpu_max_clocks", sh("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem "
                                   "--format=csv,noheader 2>/dev/null"));
     meta.str("commit", getenv_or("BENCH_COMMIT", "unknown"));
     meta.str("env", getenv_or("BENCH_ENV", "unknown"));
     const char* ql = std::getenv("QUIET_LOG");
     meta.str("conditions", ql ? read_file(ql) : "not recorded (not run via tools/run_bench.sh)");
-  }
-
-  cutensorPlan_t make_perm(const Operand& src, const std::string& dst_labels) {
-    Operand dst = make_operand(dst_labels, c.ext);
-    cutensorTensorDescriptor_t ds, dd;
-    CT(cutensorCreateTensorDescriptor(tens, &ds, uint32_t(src.labels.size()), src.extent.data(),
-                                      src.stride.data(), CUTENSOR_R_64F, 256));
-    CT(cutensorCreateTensorDescriptor(tens, &dd, uint32_t(dst.labels.size()), dst.extent.data(),
-                                      dst.stride.data(), CUTENSOR_R_64F, 256));
-    std::vector<int32_t> ms(src.labels.begin(), src.labels.end()), md(dst.labels.begin(), dst.labels.end());
-    cutensorOperationDescriptor_t op;
-    CT(cutensorCreatePermutation(tens, &op, ds, ms.data(), CUTENSOR_OP_IDENTITY, dd, md.data(),
-                                 CUTENSOR_COMPUTE_DESC_64F));
-    cutensorPlanPreference_t pref;
-    CT(cutensorCreatePlanPreference(tens, &pref, CUTENSOR_ALGO_DEFAULT, CUTENSOR_JIT_MODE_NONE));
-    cutensorPlan_t plan;
-    CT(cutensorCreatePlan(tens, &plan, op, pref, 0));
-    cutensorDestroyPlanPreference(pref);
-    cutensorDestroyOperationDescriptor(op);
-    cutensorDestroyTensorDescriptor(ds);
-    cutensorDestroyTensorDescriptor(dd);
-    return plan;
-  }
-  void permute(cutensorPlan_t plan, const void* src, void* dst) {
-    const double one = 1.0;
-    CT(cutensorPermute(tens, plan, &one, src, dst, s));
-  }
-
-  // The matrix-only methods: `gemm(A, B, C)` on the GEMM view (row-major, see header).
-  void run_gemm_family(const std::string& method, const std::string& variant, int N,
-                       const std::function<void(const double*, const double*, double*)>& gemm,
-                       size_t ws_bytes, Json extra = {}) {
-    const double* a = needA ? pA.as<double>() : dA.as<double>();
-    const double* bb = needB ? pB.as<double>() : dB.as<double>();
-    double* cc = needC ? pC.as<double>() : dC.as<double>();
-    if (needA) permute(permA, dA.p, pA.p);
-    if (needB) permute(permB, dB.p, pB.p);
-    poison_C();
-    Timing T = time_it([&] { gemm(a, bb, cc); }, s, o);
-    if (needC) permute(permC, cc, dC.p);
-    Accuracy acc = result_accuracy();
-    if (!(needA || needB || needC)) {
-      record(method, variant, N, T, &acc, flops(), ws_bytes, extra);
-      return;
-    }
-    Json e1 = extra;
-    e1.str("layout", "gemm-view (operands pre-permuted, permutations not timed)");
-    record(method, variant, N, T, &acc, flops(), ws_bytes, e1);
-    poison_C();
-    Timing P = time_it([&] {
-      if (needA) permute(permA, dA.p, pA.p);
-      if (needB) permute(permB, dB.p, pB.p);
-      gemm(a, bb, cc);
-      if (needC) permute(permC, cc, dC.p);
-    }, s, o);
-    acc = result_accuracy();
-    Json e2 = extra;
-    e2.str("layout", "original (explicit cuTENSOR permutations + GEMM, timed together)");
-    record("perm+" + method, variant, N, P, &acc, flops(), ws_bytes, e2);
-  }
-
-  // Column-major call computing C^T (n x m) = op(B) * op(A), see the header comment.
-  struct BlasArgs {
-    cublasOperation_t ta, tb;  // for the cuBLAS "A" (= our B) and "B" (= our A)
-    int64_t lda, ldb, ldc, sa, sb, sc;
-  };
-  BlasArgs blas_args() const {
-    BlasArgs g;
-    g.ta = opB_kfast ? CUBLAS_OP_T : CUBLAS_OP_N;
-    g.lda = opB_kfast ? c.k : c.n;
-    g.tb = opA_kfast ? CUBLAS_OP_N : CUBLAS_OP_T;
-    g.ldb = opA_kfast ? c.k : c.m;
-    g.ldc = c.n;
-    g.sa = c.n * c.k;
-    g.sb = c.m * c.k;
-    g.sc = c.m * c.n;
-    return g;
-  }
-
-  void run_cublas(cublasHandle_t h, const std::string& method, cublasComputeType_t ct,
-                  const std::string& variant) {
-    BlasArgs g = blas_args();
-    const double one = 1.0, zero = 0.0;
-    auto gemm = [&, g](const double* a, const double* bb, double* cc) {
-      if (c.b == 1)
-        CB(cublasGemmEx(h, g.ta, g.tb, int(c.n), int(c.m), int(c.k), &one, bb, CUDA_R_64F,
-                        int(g.lda), a, CUDA_R_64F, int(g.ldb), &zero, cc, CUDA_R_64F, int(g.ldc),
-                        ct, CUBLAS_GEMM_DEFAULT));
-      else
-        CB(cublasGemmStridedBatchedEx(h, g.ta, g.tb, int(c.n), int(c.m), int(c.k), &one, bb,
-                                      CUDA_R_64F, int(g.lda), g.sa, a, CUDA_R_64F, int(g.ldb),
-                                      g.sb, &zero, cc, CUDA_R_64F, int(g.ldc), g.sc, int(c.b), ct,
-                                      CUBLAS_GEMM_DEFAULT));
-    };
-    run_gemm_family(method, variant, 0, gemm, 0);
-  }
-
-  void method_dgemm() {
-    CB(cublasSetMathMode(blas, CUBLAS_PEDANTIC_MATH));
-    run_cublas(blas, "dgemm", CUBLAS_COMPUTE_64F_PEDANTIC, "CUBLAS_COMPUTE_64F_PEDANTIC");
-    CB(cublasSetMathMode(blas, CUBLAS_DEFAULT_MATH));
-  }
-
-  void method_emu(const std::string& variant, size_t ws_limit) {
-    // A handle of its own, so the emulation settings and workspace never leak into dgemm.
-    cublasHandle_t eh;
-    CB(cublasCreate(&eh));
-    std::unique_ptr<cublasContext, cublasStatus_t (*)(cublasHandle_t)> guard(eh, cublasDestroy);
-    CB(cublasSetStream(eh, s));
-    DevBuf ws(ws_limit);  // the emulated path takes its scratch from the handle workspace
-    CB(cublasSetWorkspace(eh, ws.p, ws.bytes));
-    CB(cublasSetEmulationStrategy(eh, CUBLAS_EMULATION_STRATEGY_EAGER));
-    if (variant == "dyn") {
-      CB(cublasSetFixedPointEmulationMantissaControl(eh, CUDA_EMULATION_MANTISSA_CONTROL_DYNAMIC));
-    } else if (variant.rfind("fix", 0) == 0) {
-      CB(cublasSetFixedPointEmulationMantissaControl(eh, CUDA_EMULATION_MANTISSA_CONTROL_FIXED));
-      CB(cublasSetFixedPointEmulationMaxMantissaBitCount(eh, std::stoi(variant.substr(3))));
-    } else {
-      throw Failure("unknown --emu variant " + variant);
-    }
-    int maxbits = -1, offset = 0;
-    cudaEmulationMantissaControl mc{};
-    cublasGetFixedPointEmulationMaxMantissaBitCount(eh, &maxbits);
-    cublasGetFixedPointEmulationMantissaBitOffset(eh, &offset);
-    cublasGetFixedPointEmulationMantissaControl(eh, &mc);
-    std::string v = variant + " (control=" + (mc == CUDA_EMULATION_MANTISSA_CONTROL_FIXED ? "FIXED" : "DYNAMIC") +
-                    ", max_bits=" + std::to_string(maxbits) + ", offset=" + std::to_string(offset) +
-                    ", strategy=EAGER, ws=" + std::to_string(ws.bytes >> 20) + "MiB)";
-    run_cublas(eh, "emu", CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT, v);
-    CU(cudaStreamSynchronize(s));
-  }
-
-  void method_int8() {
-    const int64_t kh = (c.k + 15) / 16 * 16;
-    DevBuf a8(size_t(c.b * c.m * kh)), b8(size_t(c.b * c.n * kh)), c32(size_t(c.b * c.m * c.n) * 4);
-    k_fill_i8<<<1024, 256, 0, s>>>(a8.as<int8_t>(), a8.bytes, 11);
-    k_fill_i8<<<1024, 256, 0, s>>>(b8.as<int8_t>(), b8.bytes, 12);
-    cublasLtMatmulDesc_t op;
-    CB(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32I, CUDA_R_32I));
-    cublasOperation_t T = CUBLAS_OP_T, Nn = CUBLAS_OP_N;
-    CB(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &T, sizeof T));
-    CB(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &Nn, sizeof Nn));
-    cublasLtMatrixLayout_t la, lb, lc;  // la = our B (k^ x n), lb = our A (k^ x m), lc = C^T
-    CB(cublasLtMatrixLayoutCreate(&la, CUDA_R_8I, uint64_t(kh), uint64_t(c.n), kh));
-    CB(cublasLtMatrixLayoutCreate(&lb, CUDA_R_8I, uint64_t(kh), uint64_t(c.m), kh));
-    CB(cublasLtMatrixLayoutCreate(&lc, CUDA_R_32I, uint64_t(c.n), uint64_t(c.m), c.n));
-    int32_t bc = int32_t(c.b);
-    int64_t sa = c.n * kh, sb = c.m * kh, sc = c.m * c.n;
-    for (auto [l, st] : {std::pair{la, sa}, std::pair{lb, sb}, std::pair{lc, sc}}) {
-      CB(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &bc, sizeof bc));
-      CB(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &st, sizeof st));
-    }
-    size_t wsb = size_t(64) << 20;
-    DevBuf ws(wsb);
-    cublasLtMatmulPreference_t pref;
-    CB(cublasLtMatmulPreferenceCreate(&pref));
-    CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsb, sizeof wsb));
-    cublasLtMatmulHeuristicResult_t h{};
-    int found = 0;
-    CB(cublasLtMatmulAlgoGetHeuristic(lt, op, la, lb, lc, lc, pref, 1, &h, &found));
-    if (!found) throw Failure("cuBLASLt: no int8 algorithm");
-    const int32_t one = 1, zero = 0;
-    Timing Tm = time_it([&] {
-      CB(cublasLtMatmul(lt, op, &one, b8.p, la, a8.p, lb, &zero, c32.p, lc, c32.p, lc, &h.algo,
-                        ws.p, wsb, s));
-    }, s, o);
-    double ops = 2.0 * double(c.m) * double(c.n) * double(kh) * double(c.b);
-    Json e;
-    e.num("int8_tops", ops / Tm.median() / 1e12).integer("k_hat", kh);
-    e.str("layout", "GEMM view, int8 TN, int32 out; time of ONE modulus' GEMM");
-    record("int8", "cublasLt int8 TN int32-out", 1, Tm, nullptr, NAN, wsb, e);
-    cublasLtMatmulPreferenceDestroy(pref);
-    cublasLtMatrixLayoutDestroy(la);
-    cublasLtMatrixLayoutDestroy(lb);
-    cublasLtMatrixLayoutDestroy(lc);
-    cublasLtMatmulDescDestroy(op);
-  }
-
-  void method_gemmul8(int N) {
-#ifdef IMD_BENCH_GEMMUL8
-    BlasArgs g = blas_args();
-    size_t wsb = gemmul8::workSize<false, gemmul8::Backend::INT8, gemmul8::Func::gemm>(
-        size_t(c.n), size_t(c.m), size_t(c.k), N);
-    DevBuf ws(wsb);
-    const double one = 1.0, zero = 0.0;
-    auto gemm = [&, g](const double* a, const double* bb, double* cc) {
-      for (int64_t l = 0; l < c.b; ++l)
-        gemmul8::gemm<double, gemmul8::Backend::INT8, double, double>(
-            blas, g.ta, g.tb, size_t(c.n), size_t(c.m), size_t(c.k), &one, bb + l * g.sa,
-            size_t(g.lda), a + l * g.sb, size_t(g.ldb), &zero, cc + l * g.sc, size_t(g.ldc), N,
-            true, ws.p);
-    };
-    Json e;
-    if (c.b > 1) e.str("note", "one GEMMul8 call per batch (no batched API)");
-    run_gemm_family("gemmul8", "INT8 fastmode", N, gemm, wsb, e);
-#else
-    record_error("gemmul8", "INT8 fastmode", N, "built without GEMMul8 (tools/get_gemmul8.sh)");
-#endif
-  }
-
-  void method_cutensor() {
-    auto desc = [&](const Operand& x) {
-      cutensorTensorDescriptor_t d;
-      CT(cutensorCreateTensorDescriptor(tens, &d, uint32_t(x.labels.size()), x.extent.data(),
-                                        x.stride.data(), CUTENSOR_R_64F, 256));
-      return d;
-    };
-    auto da = desc(c.A), db = desc(c.B), dc = desc(c.C);
-    std::vector<int32_t> ma(c.A.labels.begin(), c.A.labels.end()), mb(c.B.labels.begin(), c.B.labels.end()),
-        mc(c.C.labels.begin(), c.C.labels.end());
-    cutensorOperationDescriptor_t op;
-    CT(cutensorCreateContraction(tens, &op, da, ma.data(), CUTENSOR_OP_IDENTITY, db, mb.data(),
-                                 CUTENSOR_OP_IDENTITY, dc, mc.data(), CUTENSOR_OP_IDENTITY, dc,
-                                 mc.data(), CUTENSOR_COMPUTE_DESC_64F));
-    cutensorPlanPreference_t pref;
-    CT(cutensorCreatePlanPreference(tens, &pref, CUTENSOR_ALGO_DEFAULT, CUTENSOR_JIT_MODE_NONE));
-    uint64_t wsb = 0;
-    CT(cutensorEstimateWorkspaceSize(tens, op, pref, CUTENSOR_WORKSPACE_DEFAULT, &wsb));
-    cutensorPlan_t plan;
-    CT(cutensorCreatePlan(tens, &plan, op, pref, wsb));
-    DevBuf ws(wsb);
-    const double one = 1.0, zero = 0.0;
-    poison_C();
-    Timing T = time_it([&] {
-      CT(cutensorContract(tens, plan, &one, dA.p, dB.p, &zero, dC.p, dC.p, ws.p, wsb, s));
-    }, s, o);
-    Accuracy acc = result_accuracy();
-    record("cutensor", "CUTENSOR_COMPUTE_DESC_64F", 0, T, &acc, flops(), wsb);
-    cutensorDestroyPlan(plan);
-    cutensorDestroyPlanPreference(pref);
-    cutensorDestroyOperationDescriptor(op);
-    for (auto d : {da, db, dc}) cutensorDestroyTensorDescriptor(d);
   }
 
   // k4: -1 the plan-time rule, -2 the k4_tune plan option, >= 0 a forced configuration
@@ -950,94 +722,152 @@ struct Bench {
     record("imd", vs, N, T, &acc, flops(), wsb, extra);
   }
 
-  // A5: imd and (perm+)GEMMul8 timed INTERLEAVED in one process, call by call (the same
-  // GPU clock / DVFS / host-core state for both: tiny calls drift between states that last
-  // ms to s, docs/NOTES-A5.md §1). Each rep times one GEMMul8 call (with the operand and
-  // output permutations when the GEMM view needs them: the fair comparison) and then one
-  // imd call, each its own event pair after an idle GPU, alternating which goes first.
-  // Records "duel-gemmul8" and "duel-imd" (medians as usual) with, on the imd record,
-  // ratio_median = median over reps of t_gemmul8 / t_imd (pairs run ~0.1 ms apart).
-  void method_duel(int N) {
-#ifdef IMD_BENCH_GEMMUL8
+  // Method duel: two immerdink configurations timed INTERLEAVED in one process, call by
+  // call, so both see the same GPU clock / DVFS / host-core state (tiny calls drift between
+  // performance states that last ms to s, docs/NOTES-A5.md §1.2; a sequential comparison of
+  // two processes or two blocks of calls samples different states). Each rep times one call
+  // of each side, each its own event pair after an idle GPU, alternating which goes first.
+  // Side A writes C, side B a second C buffer of the same size; afterwards both are checked
+  // against the reference and compared bit for bit. Records "duel-a" and "duel-b" (medians
+  // as usual); duel-b also carries ratio_median = median over reps of t_a / t_b (> 1: B
+  // faster) with p10 / p90. A = B measures the case's own resolution (ratio ~1 and its spread).
+  struct DuelPlan {
+    DuelSide cfg;
+    std::vector<int32_t> la, lb, lc;
+    imd_plan_t plan = nullptr;
+    size_t wsb = 0, plan_dev = 0;
+    DevBuf ws;
+    imd_lowering_t low{};
+    int32_t k4_run = -1;
+    double create_ms = 0;
+    ~DuelPlan() {
+      if (plan) { cudaDeviceSynchronize(); imd_plan_destroy(plan); }  // a resident plan outlives its work
+    }
+  };
+
+  std::unique_ptr<DuelPlan> make_duel_plan(const DuelSide& d) {
+    auto P = std::make_unique<DuelPlan>();
+    P->cfg = d;
+#ifndef IMD_BENCH_PROFILE
+    if (d.k4 >= 0 || d.k5 != 0) throw Failure("duel k4=<config> / k5=<elems> need the profiling build");
+#endif
     auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
       lab.assign(x.labels.begin(), x.labels.end());
       return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
     };
-    std::vector<int32_t> la, lb, lc;
-    imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
-    imd_options_t opt{N, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
-    size_t wsb = 0;
-    CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
-    imd_plan_t plan = nullptr;
-    CI(imd_plan_create(imd, &A, &B, &C, &opt, &plan));
-    std::unique_ptr<imd_plan_st, imd_status_t (*)(imd_plan_t)> guard(plan, imd_plan_destroy);
-    DevBuf ws(wsb);
-    BlasArgs g = blas_args();
-    const size_t gwsb = gemmul8::workSize<false, gemmul8::Backend::INT8, gemmul8::Func::gemm>(
-        size_t(c.n), size_t(c.m), size_t(c.k), N);
-    DevBuf gws(gwsb);
-    const double one = 1.0, zero = 0.0;
-    const double* a = needA ? pA.as<double>() : dA.as<double>();
-    const double* bb = needB ? pB.as<double>() : dB.as<double>();
-    double* cc = needC ? pC.as<double>() : dC.as<double>();
-    auto run_g8 = [&] {
-      if (needA) permute(permA, dA.p, pA.p);
-      if (needB) permute(permB, dB.p, pB.p);
-      for (int64_t l = 0; l < c.b; ++l)
-        gemmul8::gemm<double, gemmul8::Backend::INT8, double, double>(
-            blas, g.ta, g.tb, size_t(c.n), size_t(c.m), size_t(c.k), &one, bb + l * g.sa,
-            size_t(g.lda), a + l * g.sb, size_t(g.ldb), &zero, cc + l * g.sc, size_t(g.ldc), N,
-            true, gws.p);
-      if (needC) permute(permC, cc, dC.p);
+    imd_tensor_t A = t(c.A, P->la), B = t(c.B, P->lb), C = t(c.C, P->lc);
+    imd_options_t opt{d.N, d.g, IMD_RN, IMD_EMULATE, d.vec, d.k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF};
+    CI(imd_workspace_size(&A, &B, &C, &opt, &P->wsb));
+    P->low.struct_size = sizeof P->low;
+    imd_lowering(&A, &B, &C, &opt, &P->low);
+#ifdef IMD_BENCH_PROFILE
+    if (imd_prof_set_k4_config(d.k4 >= 0 ? d.k4 : -1) != 0) throw Failure("imd_prof_set_k4_config");
+#endif
+    const auto c0 = std::chrono::steady_clock::now();
+    const imd_status_t pst = imd_plan_create(imd, &A, &B, &C, &opt, &P->plan);
+    P->create_ms = 1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+#ifdef IMD_BENCH_PROFILE
+    imd_prof_set_k4_config(-1);
+#endif
+    CI(pst);
+    CI(imd_plan_device_bytes(P->plan, &P->plan_dev));
+#ifdef IMD_BENCH_PROFILE
+    imd_prof_plan_k4(P->plan, &P->k4_run);
+#endif
+    P->ws = DevBuf(P->wsb);
+    return P;
+  }
+
+  void method_duel(int N, const std::string& spec_a, const std::string& spec_b) {
+    auto pa = make_duel_plan(parse_duel_side(spec_a, N));
+    auto pb = make_duel_plan(parse_duel_side(spec_b, N));
+    DevBuf dC2(dC.bytes);
+    const bool k5_hook = pa->cfg.k5 != 0 || pb->cfg.k5 != 0;
+    auto set_k5 = [&](const DuelPlan& p) {
+#ifdef IMD_BENCH_PROFILE
+      if (k5_hook && imd_prof_set_k5_elems(p.cfg.k5) != 0) throw Failure("imd_prof_set_k5_elems");
+#else
+      (void)p;
+#endif
     };
-    auto run_imd = [&] {
-      CI(imd_contract(plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
+    auto call = [&](const DuelPlan& p, double* C) {
+      CI(imd_contract(p.plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, C, p.ws.p, p.wsb, s));
     };
-    for (int w = 0; w < std::max(o.warmup, 20); ++w) { run_g8(); run_imd(); }
+    double* Ca = dC.as<double>();
+    double* Cb = dC2.as<double>();
+    for (int w = 0; w < std::max(o.warmup, 20); ++w) {
+      set_k5(*pa); call(*pa, Ca);
+      set_k5(*pb); call(*pb, Cb);
+    }
     CU(cudaStreamSynchronize(s));
+    CU(cudaGetLastError());
     cudaEvent_t e0, e1;
     CU(cudaEventCreate(&e0));
     CU(cudaEventCreate(&e1));
-    auto once = [&](const std::function<void()>& f) {
+    auto once = [&](const DuelPlan& p, double* C) {
+      set_k5(p);  // host-side switch, outside the timed window
       CU(cudaEventRecord(e0, s));
-      f();
+      call(p, C);
       CU(cudaEventRecord(e1, s));
       CU(cudaEventSynchronize(e1));
       float ms = 0;
       CU(cudaEventElapsedTime(&ms, e0, e1));
-      return ms * 1e-3;
+      return double(ms) * 1e-3;
     };
-    Timing TG, TI;
+    Timing TA, TB;
     std::vector<double> ratio;
     double total = 0;
     for (int r = 0; r < o.reps; ++r) {
-      double tg, ti;
-      if (r % 2 == 0) { tg = once(run_g8); ti = once(run_imd); }
-      else { ti = once(run_imd); tg = once(run_g8); }
-      TG.t.push_back(tg);
-      TI.t.push_back(ti);
-      ratio.push_back(tg / ti);
-      total += tg + ti;
+      double ta, tb;
+      if (r % 2 == 0) { ta = once(*pa, Ca); tb = once(*pb, Cb); }
+      else { tb = once(*pb, Cb); ta = once(*pa, Ca); }
+      TA.t.push_back(ta);
+      TB.t.push_back(tb);
+      ratio.push_back(ta / tb);
+      total += ta + tb;
       if (r + 1 >= o.min_reps && total > o.max_seconds) break;
     }
+    CU(cudaGetLastError());
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
     std::sort(ratio.begin(), ratio.end());
     const size_t n = ratio.size();
     const double rmed = n % 2 ? ratio[n / 2] : 0.5 * (ratio[n / 2 - 1] + ratio[n / 2]);
-    const bool perm = needA || needB || needC;
-    poison_C();
-    run_imd();
-    Accuracy acc = result_accuracy();
-    Json eg, ei;
-    eg.str("layout", perm ? "original (permutations + GEMMul8, timed together)" : "gemm-view");
-    ei.num("ratio_median", rmed).num("ratio_p10", ratio[n / 10]).num("ratio_p90", ratio[(9 * n) / 10]);
-    record("duel-gemmul8", perm ? "perm+INT8 fastmode, interleaved" : "INT8 fastmode, interleaved",
-           N, TG, nullptr, flops(), gwsb, eg);
-    record("duel-imd", "RN g=N, interleaved", N, TI, &acc, flops(), wsb, ei);
-#else
-    record_error("duel-imd", "", N, "built without GEMMul8 (tools/get_gemmul8.sh)");
+    // Accuracy of each side from one fresh call into a poisoned C, then bit identity.
+    CU(cudaMemset(Ca, 0xff, dC.bytes));
+    CU(cudaMemset(Cb, 0xff, dC2.bytes));
+    set_k5(*pa); call(*pa, Ca);
+    set_k5(*pb); call(*pb, Cb);
+#ifdef IMD_BENCH_PROFILE
+    if (k5_hook) imd_prof_set_k5_elems(0);
 #endif
+    CU(cudaStreamSynchronize(s));
+    const Accuracy acc_a = check(R, Ca, s), acc_b = check(R, Cb, s);
+    DevBuf cnt(sizeof(unsigned long long));
+    CU(cudaMemsetAsync(cnt.p, 0, cnt.bytes, s));
+    k_count_diff<<<1024, 256, 0, s>>>(reinterpret_cast<const unsigned long long*>(Ca),
+                                      reinterpret_cast<const unsigned long long*>(Cb), c.C.size,
+                                      cnt.as<unsigned long long>());
+    unsigned long long differ = 0;
+    CU(cudaMemcpyAsync(&differ, cnt.p, sizeof differ, cudaMemcpyDeviceToHost, s));
+    CU(cudaStreamSynchronize(s));
+    CU(cudaGetLastError());
+    auto side_extra = [&](const DuelPlan& p, const char* which) {
+      Json e;
+      e.str("duel_side", which).str("duel_config", p.cfg.describe());
+      e.integer("plan_device_bytes", (long long)p.plan_dev).num("plan_create_ms", p.create_ms);
+      e.integer("g", (long long)((p.cfg.g == 0 || p.cfg.g >= p.cfg.N) ? p.cfg.N : p.cfg.g));
+      e.integer("k4_rule", p.low.k4_config).integer("k4_config", p.k4_run);
+      e.integer("kernel_launches", p.low.kernel_launches);
+      e.integer("fused", p.low.fused).integer("fused_large", p.low.fused_large);
+      return e;
+    };
+    Json ea = side_extra(*pa, "a"), eb = side_extra(*pb, "b");
+    eb.str("duel_vs", pa->cfg.describe());
+    eb.num("ratio_median", rmed).num("ratio_p10", ratio[n / 10]).num("ratio_p90", ratio[(9 * n) / 10]);
+    eb.raw("bit_identical", differ == 0 ? "true" : "false").integer("elements_differing", (long long)differ);
+    record("duel-a", pa->cfg.describe() + ", interleaved", pa->cfg.N, TA, &acc_a, flops(), pa->wsb, ea);
+    record("duel-b", pb->cfg.describe() + ", interleaved", pb->cfg.N, TB, &acc_b, flops(), pb->wsb, eb);
   }
 
   // v1.7 (DESIGN §6b, ROADMAP D1): one operand packed once (imd_pack_desc_for: the plain
@@ -1272,26 +1102,42 @@ struct Bench {
 void usage() {
   fprintf(stderr,
           "usage: imd_bench --name NAME --spec 'ab,bc->ac' --ext a=..,b=..,c=.. [--methods LIST]\n"
-          "  [--N 8,14,20] [--emu dyn,fix55] [--emu-ws-mib 2048] [--reps 10] [--warmup 2]\n"
+          "  [--N 8,14,20] [--reps 10] [--warmup 2]\n"
           "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--phase-reps 5]\n"
-          "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)] [--k4 rule,tune,0,1,2,3]\n"
+          "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)] [--k4 rule,tune,0,1,2,3] (method imd)\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
-          "  methods: dgemm,emu,int8,gemmul8,cutensor,imd,bw,packed,duel (duel: imd vs (perm+)GEMMul8 interleaved)\n"
+          "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
+          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4)\n"
+          "  methods: imd,packed,duel,bw (default imd)\n"
           "  [--out file.jsonl]\n");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::map<std::string, std::string> a{{"methods", "dgemm,emu,int8,gemmul8,cutensor,imd"},
+  std::map<std::string, std::string> a{{"methods", "imd"},
                                        {"N", "14"},
-                                       {"emu", "dyn"},
-                                       {"emu-ws-mib", "2048"}};
+                                       {"duel-a", "default"},
+                                       {"duel-b", "k4=tune"}};
+  static const char* const kKeys[] = {"name", "spec", "ext", "methods", "N", "reps", "warmup",
+                                      "max-seconds", "samples", "phi", "seed", "phase-reps",
+                                      "vec", "g", "k4", "pack", "reuse", "duel-a", "duel-b", "out"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
-    a[k.substr(2)] = argv[++i];
+    k = k.substr(2);
+    if (std::find(std::begin(kKeys), std::end(kKeys), k) == std::end(kKeys)) {
+      fprintf(stderr, "unknown option --%s\n", k.c_str());
+      usage();
+      return 2;
+    }
+    a[k] = argv[++i];
   }
+  for (auto& m : split(a["methods"], ','))
+    if (m != "imd" && m != "packed" && m != "duel" && m != "bw") {
+      fprintf(stderr, "unknown method %s (immerdink only: imd, packed, duel, bw)\n", m.c_str());
+      return 2;
+    }
   if (!a.count("name") || !a.count("spec") || !a.count("ext")) { usage(); return 2; }
   Bench B;
   try {
@@ -1341,21 +1187,15 @@ int main(int argc, char** argv) {
       }
       cudaDeviceSynchronize();
     };
-    if (m == "dgemm") guarded(m, "", 0, [&] { B.method_dgemm(); });
-    else if (m == "emu")
-      for (auto& v : split(a["emu"], ','))
-        guarded(m, v, 0, [&] { B.method_emu(v, size_t(std::stoll(a["emu-ws-mib"])) << 20); });
-    else if (m == "int8") guarded(m, "", 1, [&] { B.method_int8(); });
-    else if (m == "gemmul8") for (int N : Ns) guarded(m, "", N, [&] { B.method_gemmul8(N); });
-    else if (m == "cutensor") guarded(m, "", 0, [&] { B.method_cutensor(); });
-    else if (m == "imd") {  // braces: the else-if chain below must not bind to the inner if
+    if (m == "imd") {  // braces: the else-if chain below must not bind to the inner if
       for (int N : Ns)
         for (int v : B.o.vec_modes)
           for (int g : B.o.groups)
             for (int k4 : B.o.k4)
               if (g <= N) guarded(m, "", N, [&] { B.method_imd(N, v, g, k4); });
     } else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
-    else if (m == "duel") for (int N : Ns) guarded(m, "", N, [&] { B.method_duel(N); });
+    else if (m == "duel")
+      for (int N : Ns) guarded(m, "", N, [&] { B.method_duel(N, a["duel-a"], a["duel-b"]); });
     else if (m == "packed") {  // v1.7 (D1): --pack A,B --reuse 1,4,16
       std::vector<int> reuse;
       for (auto& v : split(a.count("reuse") ? a["reuse"] : "1,4,16", ',')) reuse.push_back(std::stoi(v));
@@ -1363,7 +1203,6 @@ int main(int argc, char** argv) {
         for (auto& w : split(a.count("pack") ? a["pack"] : "A", ','))
           guarded(m, "pack " + w, N, [&] { B.method_packed(N, w == "B" ? 1 : 0, reuse); });
     }
-    else { fprintf(stderr, "unknown method %s\n", m.c_str()); return 2; }
   }
   if (B.out != stdout) fclose(B.out);
   return 0;

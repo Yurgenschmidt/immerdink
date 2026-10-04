@@ -12,7 +12,6 @@ proofs/.lake/
 # CMake build tree, agent worktrees
 build/
 .claude/
-bench/_deps/
 bench/accuracy/__pycache__/
 
 # Benchmark output stays local; comparison campaigns live in the evaluation workspace
