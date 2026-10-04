@@ -23,8 +23,44 @@ if [ "$warm" != 0 ]; then
     --reps 1000 --warmup 1 --max-seconds "$warm" --phase-reps 0 --out /dev/null >/dev/null 2>&1 || true
 fi
 
-"$bench" "$@"
-rc=$?
+# Desktop renderers (the Claude app, gnome-shell) time-slice the GPU in ~2.2 ms slices when
+# they have work queued, costing a running kernel 0.4-0.5 ms per switch (docs/NOTES-K5-bimodal.md).
+# A clean run's timed-loop spread is small (<= ~2.3 % on medium/large shapes); a contaminated
+# one is >= ~8.7 %. So each case runs into a scratch file and is retried (up to
+# BENCH_RETRIES, default 3) while any record's spread_pct exceeds BENCH_MAX_SPREAD (default 5);
+# the attempt with the smallest worst spread is kept, and every record gets "attempts" and
+# "contaminated" (true if even the best attempt is above the threshold). Tiny shapes (tens of
+# µs) can stay above it from jitter alone; read their flag with that in mind.
+max_spread="${BENCH_MAX_SPREAD:-5}"; retries="${BENCH_RETRIES:-3}"
+if [ -z "$out" ]; then "$bench" "$@"; exit $?; fi
+tmpd="$(mktemp -d)"; best=""; best_w=""; rc=0
+for ((a = 1; a <= retries; a++)); do
+  f="$tmpd/a$a.jsonl"; newargs=()
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    if [ "${args[$i]}" = --out ]; then newargs+=(--out "$f"); i=$((i + 1)); else newargs+=("${args[$i]}"); fi
+  done
+  "$bench" "${newargs[@]}"; rc=$?
+  w="$(python3 -c 'import json,sys
+m=0.0
+for l in open(sys.argv[1]):
+    d=json.loads(l)
+    if d.get("status")=="ok" and "spread_pct" in d: m=max(m,float(d["spread_pct"]))
+print(m)' "$f" 2>/dev/null || echo 999)"
+  if [ -z "$best" ] || python3 -c "import sys; sys.exit(0 if float('$w') < float('$best_w') else 1)"; then best="$f"; best_w="$w"; fi
+  python3 -c "import sys; sys.exit(0 if float('$w') <= float('$max_spread') else 1)" && break
+  echo "warm_run: $name attempt $a worst spread ${w}% > ${max_spread}%; retrying" >&2
+done
+attempts=$(( a > retries ? retries : a ))
+python3 - "$best" "$out" "$attempts" "$best_w" "$max_spread" <<'PY'
+import json, sys
+src, dst, attempts, worst, lim = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])
+with open(dst, "a") as o:
+    for l in open(src):
+        d = json.loads(l)
+        d["attempts"] = attempts; d["contaminated"] = worst > lim
+        o.write(json.dumps(d) + "\n")
+PY
+rm -rf "$tmpd"
 
 if [ -n "$out" ] && command -v nvidia-smi >/dev/null; then
   q=clocks.sm,clocks.max.sm,power.draw,temperature.gpu,pstate,clocks_event_reasons.active,clocks_event_reasons.applications_clocks_setting,clocks_event_reasons.sw_power_cap,clocks_event_reasons.sw_thermal_slowdown,clocks_event_reasons.hw_slowdown

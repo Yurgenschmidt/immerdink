@@ -670,3 +670,17 @@ divided by 16, the pack subtracted.
 - Workspace saved per contraction: the operand's sX, fX, RX (`g/N` of the pack; all of it at
   g = N, here): 25–33 % for square / CC / DF shapes, 86 % for r_skinny's A; the caller keeps
   the pack (`N·b·r·k̂` bytes) instead. Details and per-phase marks: [NOTES-D1.md](NOTES-D1.md).
+
+## Desktop GPU time-slicing (2026-10-03, docs/NOTES-K5-bimodal.md)
+
+The "bimodal K5" was the GPU being time-sliced with desktop renderers (the Claude desktop
+app, gnome-shell) whenever they draw: ~2.2 ms slices, 0.4–0.5 ms lost per switch, landing in
+whichever kernel is running (K4 before D4, K5 after). Clean medium/large runs have timed-loop
+spread ≤ ~2.3 %; contaminated ones ≥ ~8.7 %. Runs since the clock-weighted quiet gate
+(fddc944) could be contaminated, including the A3/D4/D1 sweeps. Same-process ratios
+against GEMMul8 are only partly protected (both libraries get switched, but at random).
+Now: `tools/run_quiet.sh` waits up to 300 s for raw GPU utilization ≤ 1 %, and
+`bench/warm_run.sh` retries a case up to 3× while its spread is > 5 % and marks every record
+with `attempts` and `contaminated`. **For clean numbers, minimize the Claude desktop window
+(or switch to another workspace) while a sweep runs**: an active, streaming conversation
+keeps the GPU busy, and every attempt will be flagged.
