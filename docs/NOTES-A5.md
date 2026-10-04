@@ -163,8 +163,8 @@ Tests: every contract suite bit-exact (the forced-KL runs now also take K5's 2-p
 mapping, the unfused ones the 4-per-thread one), and a new suite `contract_every_n` runs a
 matrix and a batch-fastest case for every N in 2..20 (each through every fused mode, K4
 configuration and K5 mapping of `run_case`), since K5 is now a separate kernel per N.
-Build: 2 × 19 j̄-fastest + 19 λ-fastest K5 instantiations instead of 3 × 5; `contract.cu`
-compiles in about the same wall time as before on 4 jobs (the CUTLASS K4 units dominate).
+Build: 3 × 19 j̄-fastest + 19 λ-fastest K5 instantiations instead of 3 × 5; `contract.cu`
+compiles in 16 s instead of 6.5 s (one job; it builds in parallel with the CUTLASS K4 units).
 
 Not done, with the numbers that say why:
 - **K4 selection rule**: at s256 / s512 the rule already picks the per-case best of A3
@@ -259,3 +259,91 @@ The s128 before process shows the effect of §1.2 itself: 0.89× with 300 calls 
 process, 1.20× interleaved. After: every small case at N = 8 is ≥ 1.14× GEMMul8 in this
 sequential measurement too (s512 1.14×, sq1024 1.17×), with margins larger than the state
 error of the clean sweep (≈ 10 % on s256 / s512).
+
+ncu after (s512, N = 8, same settings as §1.3): K5 `k5_crt_n<8,2>` 512 × 256 threads, 40
+registers, 0.67 waves, **417 instructions per output** (was 780, 46 registers, 1.6 waves);
+KF 8.37 M warp instructions (was 9.36 M: 2 044 per thread, still one wave at 64 registers).
+
+### 3.4 Full comparison sweep (`bench/sweep_compare.txt`, `bench/run_ab.sh`, `AFTER_METHODS=gemmul8,imd`, the sweep's own 10 timed calls)
+
+`bench/results/a5-compare-{before-b6b7e05,after-efbb01e}.jsonl`. As in §3.3, each side runs
+GEMMul8 then imd in its own quiet-gated process; "vs G8" is same-process.
+
+| case | N | G8 µs (b / a) | imd before | imd after | after / before | before vs G8 | **after vs G8** |
+|---|---|---|---|---|---|---|---|
+| s128 | 8 | 17.1 / 17.4 | 20.6 | 16.3 | 0.791 | 0.83 | **1.07** |
+| s128 | 14 | 255.4 / 259.8 | 16.1 | 44.8 | 2.779 | 15.85 | **5.80** |
+| s256 | 8 | 19.5 / 19.5 | 21.2 | 14.3 | 0.675 | 0.92 | **1.36** |
+| s256 | 14 | 93.3 / 93.1 | 20.9 | 17.4 | 0.833 | 4.47 | **5.35** |
+| s512 | 8 | 30.7 / 33.8 | 33.7 | 27.6 | 0.819 | 0.91 | **1.22** |
+| s512 | 14 | 253.2 / 136.9 | 39.0 | 40.7 | 1.044 | 6.49 | **3.36** |
+| s_lowk | 8 | 302.1 / 301.7 | 103.7 | 94.2 | 0.908 | 2.91 | **3.20** |
+| s_lowk | 14 | 483.2 / 495.9 | 184.8 | 167.9 | 0.909 | 2.62 | **2.95** |
+| s_batch | 8 | 4030.5 / 4030.5 | 66.6 | 58.4 | 0.877 | 60.55 | **69.03** |
+| s_batch | 14 | 6869.5 / 6871.5 | 113.3 | 93.5 | 0.825 | 60.62 | **73.50** |
+| s_cc8 (perm) | 8 | 42.0 / 46.0 | 32.8 | 28.6 | 0.874 | 1.28 | **1.61** |
+| s_cc8 (perm) | 14 | 298.0 / 101.8 | 50.9 | 40.8 | 0.800 | 5.85 | **2.50** |
+| s_cc16 (perm) | 8 | 351.2 / 365.2 | 278.9 | 285.3 | 1.023 | 1.26 | **1.28** |
+| s_cc16 (perm) | 14 | 548.8 / 578.6 | 408.0 | 396.3 | 0.971 | 1.35 | **1.46** |
+| s_df | 8 | 65.5 / 61.4 | 59.3 | 39.9 | 0.674 | 1.11 | **1.54** |
+| s_df | 14 | 107.0 / 99.2 | 73.7 | 59.2 | 0.802 | 1.45 | **1.68** |
+| s_perm (perm) | 8 | 77.9 / 77.1 | 50.2 | 46.1 | 0.919 | 1.55 | **1.67** |
+| s_perm (perm) | 14 | 122.2 / 120.4 | 77.1 | 70.5 | 0.914 | 1.58 | **1.71** |
+| sq1024 | 8 | 93.5 / 93.6 | 92.2 | 79.6 | 0.864 | 1.01 | **1.18** |
+| sq1024 | 14 | 176.2 / 259.4 | 149.9 | 129.1 | 0.861 | 1.18 | **2.01** |
+| sq2048 | 8 | 582.2 / 583.0 | 476.8 | 467.9 | 0.981 | 1.22 | **1.25** |
+| sq2048 | 14 | 959.9 / 966.1 | 751.2 | 733.1 | 0.976 | 1.28 | **1.32** |
+| sq4096 | 8 | 3469.5 / 3471.1 | 2654.6 | 2647.1 | 0.997 | 1.31 | **1.31** |
+| sq4096 | 14 | 5973.2 / 5978.1 | 4353.4 | 4303.2 | 0.988 | 1.37 | **1.39** |
+| sq8192 | 8 | 20881.8 / 20902.3 | 17937.9 | 17964.2 | 1.001 | 1.16 | **1.16** |
+| sq8192 | 14 | 35895.5 / 35694.2 | 30717.6 | 30481.9 | 0.992 | 1.17 | **1.17** |
+| sq16384 | 14 | 244313.0 / 245042.0 | 224820.0 | 222691.0 | 0.991 | 1.09 | **1.10** |
+| r_lowk | 8 | 6681.1 / 6684.5 | 3612.7 | 3586.6 | 0.993 | 1.85 | **1.86** |
+| r_lowk | 14 | 11898.8 / 11901.4 | 5695.2 | 5472.4 | 0.961 | 2.09 | **2.17** |
+| r_bigk | 8 | 7253.6 / 7252.3 | 6862.9 | 6550.9 | 0.955 | 1.06 | **1.11** |
+| r_bigk | 14 | 11121.9 / 11128.2 | 10457.1 | 10109.5 | 0.967 | 1.06 | **1.10** |
+| r_skinny | 8 | 2810.1 / 2810.2 | 2368.9 | 2305.9 | 0.973 | 1.19 | **1.22** |
+| r_skinny | 14 | 4511.6 / 4512.0 | 3590.0 | 3538.4 | 0.986 | 1.26 | **1.28** |
+| r_mm | 8 | 2119.9 / 2128.3 | 2015.5 | 1883.6 | 0.935 | 1.05 | **1.13** |
+| r_mm | 14 | 3099.1 / 3108.9 | 2779.1 | 2627.6 | 0.945 | 1.12 | **1.18** |
+| t_nn | 8 | 3634.7 / 3632.5 | 2818.5 | 2764.5 | 0.981 | 1.29 | **1.31** |
+| t_nn | 14 | 6158.8 / 6170.9 | 4551.3 | 4426.0 | 0.972 | 1.35 | **1.39** |
+| t_batch | 8 | 1737.7 / 1738.9 | 1561.7 | 1468.4 | 0.940 | 1.11 | **1.18** |
+| t_batch | 14 | 2747.5 / 2750.5 | 2223.6 | 2134.4 | 0.960 | 1.24 | **1.29** |
+| t_ikl (perm) | 8 | 2634.4 / 2633.3 | 1678.4 | 1584.9 | 0.944 | 1.57 | **1.66** |
+| t_ikl (perm) | 14 | 3651.8 / 3646.5 | 2377.0 | 2237.9 | 0.941 | 1.54 | **1.63** |
+| t_df | 8 | 2307.4 / 2303.9 | 1528.3 | 1523.1 | 0.997 | 1.51 | **1.51** |
+| t_df | 14 | 4041.7 / 4035.1 | 2464.1 | 2442.2 | 0.991 | 1.64 | **1.65** |
+| t_cc (perm) | 8 | 4378.0 / 4380.5 | 2673.2 | 2659.9 | 0.995 | 1.64 | **1.65** |
+| t_cc (perm) | 14 | 6896.7 / 6896.6 | 4449.2 | 4321.2 | 0.971 | 1.55 | **1.60** |
+| t_permout (perm) | 8 | 3929.1 / 3928.6 | 2820.6 | 2757.5 | 0.978 | 1.39 | **1.42** |
+| t_permout (perm) | 14 | 6465.0 / 6465.3 | 4561.4 | 4427.3 | 0.971 | 1.42 | **1.46** |
+
+- **No regression**: after / before 0.935–1.001 on every medium and large case (sq8192 N = 8 1.001;
+  K5 per N and the cheaper pack residues and §3.2 terms help the large shapes by 1–6 %:
+  r_bigk 0.955–0.967, r_mm 0.935–0.945, t_batch 0.940–0.960, t_ikl 0.941–0.944, r_lowk
+  N = 14 0.961, t_nn / t_cc / t_permout N = 14 0.971–0.972); vs GEMMul8 ≥ 1.07× everywhere.
+- Three small records with after / before > 1 are performance states of §1.2, not the
+  code: s128 N = 14 (44.8 µs in a slow state for all 10 calls, min 43.1; the 300-call A/B
+  of §3.3 has 20.2 → 16.4), s512 N = 14 and s_cc16 N = 8 (the after process in the 2535 MHz
+  clock state, `gpu_after`; GEMMul8 in the same process is slower too, so the same-process
+  ratios rise: s_cc16 1.26 → 1.28×). A re-run of those cases
+  (`bench/results/a5-recheck-{before-b6b7e05,after-efbb01e}.jsonl`): s128 N = 14 21.6 → 13.5
+  µs, s512 N = 14 49.5 → 36.7 µs, s_cc16 N = 8 273.4 → 285.9 µs with GEMMul8 347 → 374 µs in
+  the same processes (1.27 → 1.31×; nsys span 291.9 → 262.6 µs, §3.1); s512 N = 8 there:
+  0.94 → 1.03× (10 calls).
+- GEMMul8 at N = 14 is bimodal on the smallest shapes as before (s128 255 µs, s512 253 /
+  137 µs, sq1024 259 µs in single processes), so those ratios mean little.
+
+## 4. Where it stands
+
+- **All small cases ≥ 1× GEMMul8 at N = 8 and N = 14** in every measurement made here:
+  interleaved 1.09–1.70× (N = 8), sequential 300-call A/B 1.14–1.70×, the 10-call sweep
+  1.03–1.67× (s512 1.03× in the noisiest re-run, 1.22× in the main one).
+- What is left per call at s512, N = 8 (nsys): KF 11.2 + K4 7.5 + K5 6.5 + gaps 1.3 + ~3
+  launch latency ≈ 30 µs against GEMMul8's 37 µs. The 3 µs launch latency and ~0.65 µs per
+  kernel boundary are the same for both libraries; imd has 3 launches to GEMMul8's 6.
+- The measurement itself (§1.2) is now the largest uncertainty for tiny calls: a 20–40 µs
+  call moves by ±10–20 % between per-process states (host core type under `powersave`, GPU
+  DVFS). For paper-grade small-shape numbers use `--methods duel` (interleaved) or pin the
+  bench to a P-core and lock clocks (root).

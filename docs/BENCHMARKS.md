@@ -710,7 +710,7 @@ after the reboot); warm-up and retries as above. Ratio = immerdink TFLOPS-eq / G
 - 36 of 106 records still exceed the 5 % spread threshold even with no desktop: tiny shapes
   (20–110 µs) from launch and clock jitter, plus a few medium cases at 5–6 % (r_lowk, r_mm).
   In bench mode "contaminated" therefore means "noisier than 5 %", not "time-sliced".
-- **Below GEMMul8 only s256 and s512 at N = 8** (0.90 / 0.92×): roadmap A5.
+- **Below GEMMul8 only s256 and s512 at N = 8** (0.90 / 0.92×): roadmap A5 — a measurement-state artifact of 10-call sequential timing (docs/NOTES-A5.md §1.2); after A5 ≥ 1.14× (next section).
 
 **D1 packed reuse (clean):** one `imd_pack` + R contractions vs R plain calls; all
 bit-identical.
@@ -725,3 +725,36 @@ bit-identical.
 | r_skinny (B), N = 8 / 14 | 3 / 2 % | 1.02 / 1.01 | 1.02 / 1.02 | 2 % | ≈ unchanged |
 
 R = 1 breaks even (1.00×) everywhere: a pack costs what the fused scale+pack it replaces costs.
+
+## A5: small-shape polish (2026-10-04, `a5-small-*`, `a5-compare-*`, docs/NOTES-A5.md)
+
+Bench mode as above. Before = `b6b7e05`, after = `efbb01e` (K5 per N with 1/2/4 outputs
+per thread, pack residues with the 32-bit magic, §3.2 term in 64-bit words; bit-identical).
+Same-session A/B by `bench/run_ab.sh` with `AFTER_METHODS=gemmul8,imd` (each side runs
+GEMMul8 and imd in its own process; ratios same-process, perm + GEMMul8 where a permute is
+needed); summaries by `bench/ab_ratio.py`.
+
+**Small family, 300 timed calls** (`bench/sweep_a5.txt`; vs GEMMul8 before → after):
+
+| case | N = 8 | N = 14 | | case | N = 8 | N = 14 |
+|---|---|---|---|---|---|---|
+| s128 | 0.89 → **1.23** | 1.41 → **1.91** | | s_cc16 | 1.25 → **1.30** | 1.36 → **1.44** |
+| s256 | 1.15 → **1.31** | 1.48 → **1.63** | | s_df | 1.36 → **1.50** | 1.48 → **1.59** |
+| s512 | 1.03 → **1.14** | 1.15 → **1.40** | | s_perm | 1.42 → **1.70** | 1.54 → **1.78** |
+| s_cc8 | 1.85¹ → **1.37** | 1.47 → **1.56** | | sq1024 | 1.06 → **1.17** | 1.18 → **1.36** |
+
+¹ GEMMul8 in a slow state in that process (66 µs vs 41 µs).
+
+**Interleaved** (`imd_bench --methods duel --reps 400`: GEMMul8 and imd alternate call by
+call in one process, median of the per-pair ratios; the robust small-shape measure, NOTES-A5
+§1.2), N = 8 before → after: s128 1.20 → 1.30, s256 1.18 → 1.30, s512 1.04 → 1.20, s_cc8 1.35
+→ 1.53, s_cc16 1.24 → 1.29, s_df 1.39 → 1.53, s_perm 1.55 → 1.70, sq1024 1.01 → 1.09; N = 14
+1.11–2.00 → 1.25–2.12.
+
+**Full `bench/sweep_compare.txt` (10 calls)**: after / before 0.93–1.00 on every medium and
+large case (r_bigk 0.955–0.967, r_mm 0.935–0.945, t_batch / t_ikl 0.94–0.96, the rest
+0.97–1.00); vs GEMMul8 after: sq1024–sq16384 1.10–1.39 (sq1024 N = 8 1.18), r_lowk 1.86 /
+2.17, r_bigk 1.11 / 1.10, r_skinny 1.22 / 1.28, r_mm 1.13 / 1.18, t_* 1.18–1.66, s_* 1.07–3.2
+at N = 8 (s_batch 69×). Small records with after / before > 1 in this 10-call run (s128 / s512 at N = 14,
+s_cc16 at N = 8) are per-process clock states; their re-run and the 300-call A/B above show
+the gain (NOTES-A5 §3.4).
