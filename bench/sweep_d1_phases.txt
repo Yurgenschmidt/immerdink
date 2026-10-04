@@ -1,5 +1,0 @@
-# D1 per-phase event marks (profiling build): one plain call, one packed call and imd_pack,
-# after the timed loops of method packed (docs/NOTES-D1.md). Format as sweep_m4.txt.
-sq4096   | ik,jk->ij       | i=4096,j=4096,k=4096              | packed | 14 | | --pack A --reuse 1,16 --reps 3 --phase-reps 5
-t_cc     | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128  | packed | 14 | | --pack A --reuse 1,16 --reps 3 --phase-reps 5
-r_skinny | ik,jk->ij       | i=16384,j=512,k=4096              | packed | 8,14 | | --pack A,B --reuse 1,16 --reps 3 --phase-reps 5

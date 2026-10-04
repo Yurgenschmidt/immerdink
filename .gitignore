@@ -14,3 +14,7 @@ build/
 .claude/
 bench/_deps/
 bench/accuracy/__pycache__/
+
+# Benchmark output stays local; comparison campaigns live in the evaluation workspace
+bench/results/
+bench/accuracy/results/

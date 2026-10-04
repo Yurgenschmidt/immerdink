@@ -16,7 +16,7 @@ endif()
 
 set(IMMERDINK_LIBRARY "" CACHE FILEPATH "prebuilt libimmerdink.so (empty: build from ..)")
 set(GEMMUL8_DIR "${CMAKE_CURRENT_SOURCE_DIR}/_deps/GEMMul8"
-    CACHE PATH "GEMMul8 checkout built by tools/get_gemmul8.sh")
+    CACHE PATH "optional GEMMul8 build (comparison baselines live in the evaluation workspace)")
 
 find_package(CUDAToolkit REQUIRED)
 find_library(CUTENSOR_LIB cutensor HINTS "${CUDAToolkit_LIBRARY_DIR}" "${CUDAToolkit_LIBRARY_ROOT}/lib"
@@ -60,5 +60,5 @@ if(EXISTS "${GEMMUL8_DIR}/lib/libgemmul8.a")
   target_link_libraries(imd_bench PRIVATE "${GEMMUL8_DIR}/lib/libgemmul8.a" CUDA::cuda_driver
                         "${NVML_LIB}" ${CMAKE_DL_LIBS})
 else()
-  message(STATUS "GEMMul8 not built (tools/get_gemmul8.sh): the gemmul8 method is disabled")
+  message(STATUS "GEMMul8 not found: the gemmul8 method is disabled")
 endif()

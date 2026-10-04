@@ -7,7 +7,7 @@
 #   IMMERDINK_BENCH_BUILD  build directory (default <repo>/build/bench)
 #   IMMERDINK_CUTLASS_DIR  CUTLASS v4.8.0 checkout (default: the third_party/cutlass submodule)
 #   IMMERDINK_LIBRARY      link this prebuilt libimmerdink.so instead of building one
-#   GEMMUL8_DIR            GEMMul8 built by tools/get_gemmul8.sh (default bench/_deps/GEMMul8)
+#   GEMMUL8_DIR            optional GEMMul8 build (default bench/_deps/GEMMul8; fetched by the evaluation workspace's tools)
 # The build is CPU-heavy: it runs under nice and takes the machine-wide benchmark lock,
 # so it never overlaps a gated timing run; it runs inside tools/memcap.sh with at most 4 jobs.
 set -euo pipefail

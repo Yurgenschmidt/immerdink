@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize imd_bench JSON lines as the Markdown tables of docs/BENCHMARKS.md.
+"""Summarize imd_bench JSON lines as the Markdown tables (see docs/BENCHMARKING.md).
 
     python3 bench/summarize.py bench/results/<run>.jsonl [--N 14]
 

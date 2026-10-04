@@ -133,7 +133,7 @@ Work order, by expected payoff:
    descriptor); TLA+ models for the n̂ grid split and the κ ≥ T scope.
 
 **Status (2026-10-03):** exit targets met; see `docs/NOTES-M4.md` (what changed, per-phase
-log, A/B of K4 tiles, design proposals) and `docs/BENCHMARKS.md` ("M4 sweep"): sq8192 N = 14
+log, A/B of K4 tiles, design proposals) and `docs/BENCHMARKS.md (now in the evaluation workspace, legacy/)` ("M4 sweep"): sq8192 N = 14
 at 35.05 TFLOPS-eq (GEMMul8 31.15 in the same run), sq16384 234 ms (GEMMul8 242), permuted
 cases within 0–5 % of the matrix case at equal m, n, k (t_ikl 2.91 vs t_batch 2.77 ms),
 per-phase % of the §4 bound reported by `imd_bench`. Items 1, 4, 5 done; item 3: A/B of

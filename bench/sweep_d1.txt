@@ -1,9 +1,0 @@
-# D1 packed operands (DESIGN v1.7 §6b, docs/NOTES-D1.md): one operand packed once with
-# imd_pack (imd_pack_desc_for orders: bit-identical C) and reused by R = 1, 4, 16 contractions,
-# vs R plain imd_contract calls, interleaved per repetition in one process (method packed).
-# Format as sweep_m4.txt.
-sq4096   | ik,jk->ij       | i=4096,j=4096,k=4096              | packed | 8,14 | | --pack A,B --reuse 1,4,16 --reps 5 --max-seconds 60
-sq8192   | ik,jk->ij       | i=8192,j=8192,k=8192              | packed | 8,14 | | --pack A --reuse 1,4,16 --reps 3 --warmup 1 --max-seconds 60
-t_cc     | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128  | packed | 8,14 | | --pack A,B --reuse 1,4,16 --reps 5 --max-seconds 60
-t_df     | acQ,bdQ->acbd   | a=64,b=64,c=64,d=64,Q=2048        | packed | 8,14 | | --pack A,B --reuse 1,4,16 --reps 5 --max-seconds 60
-r_skinny | ik,jk->ij       | i=16384,j=512,k=4096              | packed | 8,14 | | --pack A,B --reuse 1,4,16 --reps 5 --max-seconds 60

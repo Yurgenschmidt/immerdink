@@ -2,7 +2,7 @@
 # Run a benchmark sweep: every case is one imd_bench process, run through
 # tools/run_bench.sh (machine-wide lock + wait for a quiet machine + QUIET_LOG).
 #   bench/run_sweep.sh [sweep file] [results.jsonl]
-# Defaults: bench/sweep_m4.txt, bench/results/<date>-<commit>.jsonl. Builds first
+# Defaults: bench/sweep_imd.txt, bench/results/<date>-<commit>.jsonl. Builds first
 # (bench/build.sh). Only cases whose name matches $CASES (a grep -E regex) run, if set.
 # If the machine never gets quiet (run_bench.sh exit 3), the sweep stops there and says so;
 # it never bypasses the gate.
@@ -13,7 +13,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
 env_dir="${IMMERDINK_ENV:-$HOME/miniforge3/envs/immerdink}"
 build="${IMMERDINK_BENCH_BUILD:-$root/build/bench}"
-sweep="${1:-$here/sweep_m4.txt}"
+sweep="${1:-$here/sweep_imd.txt}"
 commit="$(git -C "$root" rev-parse --short HEAD)"
 git -C "$root" diff --quiet HEAD -- src include bench CMakeLists.txt || commit="$commit-dirty"
 out="${2:-$here/results/$(date +%Y%m%d-%H%M)-$commit.jsonl}"

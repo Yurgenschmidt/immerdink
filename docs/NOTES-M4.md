@@ -72,7 +72,7 @@ medians of the profiled calls.
 
 Steps: 1 = `d537234`, 2 = `c0840d8` + `7c4948f`, 3 = `2ef197c`, 4 = `73bf69a`,
 5 = `5618296`, 6 = `b29b464`. The final sweep (all methods, all cases, commit `b29b464`)
-is in docs/BENCHMARKS.md ("M4 sweep") with the before/after table and the measured
+is in docs/BENCHMARKS.md (now in the evaluation workspace, legacy/) ("M4 sweep") with the before/after table and the measured
 per-phase table.
 
 K4 moves by a few % between runs with no K4 change (the card runs these at its 450 W
