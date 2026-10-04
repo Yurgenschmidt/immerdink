@@ -23,14 +23,14 @@ first.
 
 ## Open items needing Eric
 
-1. **D1 §6b.11 clarification:** a missing pack handle is PACK_MISMATCH; a missing packed
+1. **DONE 2026-10-04 (accepted)** — D1 §6b.11 clarification: a missing pack handle is PACK_MISMATCH; a missing packed
    buffer is INVALID_VALUE only when it would be read. Implemented that way; awaiting OK.
-2. **`k4_tune`** (plan-time autotune, default off, no measured gain): keep, remove, or leave.
+2. **DONE 2026-10-04 (keep optional, default off)** — `k4_tune` (plan-time autotune, default off, no measured gain): keep, remove, or leave.
 3. **DONE 2026-10-04 (bench mode, docs/BENCHMARKS.md "Clean re-run")** — clean benchmark re-run: the A3/D4/D1 sweeps were partly contaminated by desktop GPU
    time-slicing (docs/NOTES-K5-bimodal.md). Re-run `bench/sweep_compare.txt` (and
    `bench/sweep_d1.txt`) once the 4090 has no desktop on it, ideally with persistence mode on
    (`sudo nvidia-smi -pm 1`). Records now carry `attempts` and `contaminated`.
-4. **GPU clock locking** for paper-grade small-shape numbers (`sudo nvidia-smi -lgc`): optional.
+4. **Decided 2026-10-04: not now** (revisit for a paper or sub-percent tiny-shape numbers) — GPU clock locking for paper-grade small-shape numbers (`sudo nvidia-smi -lgc`): optional.
 
 ## Machine notes
 

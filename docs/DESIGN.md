@@ -1474,6 +1474,8 @@ operands, non-finite inputs]**
 
 ### 6b.11 Implementation notes (v1.7)
 
+**Resolved (Eric, 2026-10-04):** the null-pointer reading below is accepted as implemented: a missing or mismatched pack handle is PACK_MISMATCH; a missing packed buffer is INVALID_VALUE only when the call would read it.
+
 What §6b left to the implementation, as implemented (libimmerdink_host `src/host/pack.cpp`,
 `analysis.cpp analyze_packed`; libimmerdink `src/api.cpp`, `src/contract.cu`; the oracle
 `spec/oracle.py` transcribes the same choices and the tests compare every one).
