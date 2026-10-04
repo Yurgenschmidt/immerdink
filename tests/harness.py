@@ -139,6 +139,8 @@ class Library:
             self.lib.imd_test_set_k4_config.restype = C.c_int
             self.lib.imd_test_set_k5_one_elem.argtypes = [C.c_int64]
             self.lib.imd_test_set_k5_one_elem.restype = C.c_int
+            self.lib.imd_test_set_k5_elems.argtypes = [C.c_int]
+            self.lib.imd_test_set_k5_elems.restype = C.c_int
             self.lib.imd_test_plan_sizes.argtypes = [C.c_void_p, C.POINTER(C.c_int64), C.c_int64,
                                                      C.POINTER(C.c_int64)]
             self.lib.imd_test_plan_sizes.restype = C.c_int
@@ -168,6 +170,21 @@ class Library:
     def set_k5_one_elem(self, per_sm=-1):
         """K5 one element per thread while b m n <= per_sm x SMs (-1 production, 0 never)."""
         assert self.lib.imd_test_set_k5_one_elem(per_sm) == 0
+
+    def set_k5_elems(self, elems=0):
+        """A5: K5 (j-bar fastest) with 1, 2 or 4 elements per thread; 0 the launch rule."""
+        assert self.lib.imd_test_set_k5_elems(elems) == 0
+
+    def set_k5_mapping(self, fmode):
+        """The K5 mapping of a test run with fused mode `fmode` (test_contract, test_packed):
+        the launch rule for -1 (production), 4 per thread for 0 and 1, 2 per thread for the
+        forced-KL runs 2 and 3 (A5), so every mapping is checked on every emulated case."""
+        self.set_k5_one_elem(0 if fmode >= 0 else -1)
+        self.set_k5_elems(2 if fmode in (2, 3) else 0)
+
+    def reset_k5_mapping(self):
+        self.set_k5_one_elem(-1)
+        self.set_k5_elems(0)
 
     def set_k4_config(self, config=-1):
         """v1.5 K4 configuration of plans created afterwards: -1 the rule (or k4_tune's

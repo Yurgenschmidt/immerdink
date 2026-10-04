@@ -97,6 +97,13 @@ IMD_API int imd_test_set_k5_one_elem(int64_t per_sm) {
   return 0;
 }
 
+// A5: K5 (j-bar fastest) with 1, 2 or 4 elements per thread; 0 restores the launch rule.
+IMD_API int imd_test_set_k5_elems(int elems) {
+  if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
+  imd::detail::k5_elems_override() = elems;
+  return 0;
+}
+
 IMD_API int imd_test_plan_vec(imd_plan_t plan, const int64_t** dev, int64_t* count) {
   const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
   if (e == nullptr || dev == nullptr || count == nullptr) return 1;

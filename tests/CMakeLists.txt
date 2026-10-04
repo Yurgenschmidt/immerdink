@@ -112,7 +112,7 @@ if(Python3_FOUND)
   # contract_highrank (operand ranks 6-12) has hard size guards; run it alone with
   # `tools/test.sh -R contract_highrank`, or skip it with `-E contract_highrank`.
   set(shim "$<TARGET_FILE:imd_alloc_shim>")
-  foreach(suite api stages e2e tensor bigk replay)
+  foreach(suite api stages e2e tensor bigk replay every_n)
     add_test(NAME contract_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                      --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)

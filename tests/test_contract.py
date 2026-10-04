@@ -282,13 +282,13 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
             allocs = lib.alloc_count()
             launches0 = lib.launch_count()
             t0 = time.time()
-            if lib.has_test_hooks:   # the unfused runs also take K5's 4-per-thread mapping
-                lib.set_k5_one_elem(0 if fmode >= 0 else -1)
+            if lib.has_test_hooks:   # the unfused runs also take K5's 4- (KL: 2-) per-thread mapping
+                lib.set_k5_mapping(fmode)
             try:
                 st = lib.contract(plan, alpha, pA, pB, beta, pC, pW, ws_bytes)
             finally:
                 if lib.has_test_hooks:
-                    lib.set_k5_one_elem(-1)
+                    lib.reset_k5_mapping()
             if st != "SUCCESS":
                 raise Fail(f"{vname}: imd_contract {st}")
             # v1.4: the kernel launches of the call are what the plan (and libimmerdink_host's
@@ -429,6 +429,35 @@ def suite_stages(lib, cuda, verbose):
             inject(rng, TB, 0.03)
         run_case(lib, cuda, f"stages[{t}]", A, B, C, TA, TB, gen(rng, (m, n), "uniform"),
                  1.0, 0.0, N, 0, rounding, rng=rng, expect_kind="GEMM", verbose=verbose)
+
+
+def suite_every_n(lib, cuda, verbose):
+    """A5: K5 is one kernel per N (src/contract.cu k5_crt_n, k5_crt_bfast<N>), so every N in
+    [kNMin, kNMax] runs here: a matrix (C j-bar fastest) and a batched case with C's batch
+    label fastest (K5's lambda-fastest kernel), with zero rows and non-finite entries; the
+    usual runs of run_case add K5's other per-thread mappings (4 and, forced KL, 2)."""
+    rng = random.Random(909)
+    for N in range(params.N_MIN, params.N_MAX + 1):
+        rounding = ("RN", "TRUNC")[N % 2]
+        m, n = rng.randint(3, 40), rng.randint(3, 40)
+        k = rng.choice((5, 16, 33, 129))
+        A, B, C = matrix(rng, m, n, k, c_jfast=True)
+        kind = ("phi", "wide", "uniform", "ints")[N % 4]
+        TA, TB = gen(rng, (m, k), kind), gen(rng, (k, n), kind)
+        TA[rng.randrange(m)] = 0.0
+        inject(rng, TB, 0.02)
+        run_case(lib, cuda, f"every_n[N={N}]", A, B, C, TA, TB, gen(rng, (m, n), "uniform"),
+                 (1.0, -0.75)[N % 2], (0.0, 0.5)[N % 3 == 0], N, 0, rounding, rng=rng,
+                 expect_kind="GEMM", verbose=verbose)
+        mb, nb, kb, b = rng.randint(2, 9), rng.randint(2, 9), rng.choice((3, 17)), rng.randint(3, 6)
+        A = o.Desc([mb, kb, b], layout(rng, [mb, kb, b]), [I, K, L])
+        B = o.Desc([kb, nb, b], layout(rng, [kb, nb, b]), [K, J, L])
+        C = o.Desc([mb, nb, b], layout(rng, [mb, nb, b], order=[2, 1, 0]), [I, J, L])  # l fastest
+        TA, TB = gen(rng, A.extent, kind), gen(rng, B.extent, kind)
+        inject(rng, TA, 0.02)
+        run_case(lib, cuda, f"every_n[N={N}, batch fastest]", A, B, C, TA, TB,
+                 gen(rng, C.extent, "uniform"), 1.0, 0.0, N, 0, rounding, rng=rng,
+                 expect_kind="GEMM", verbose=verbose)
 
 
 def suite_e2e(lib, cuda, verbose):
@@ -689,7 +718,7 @@ def suite_replay(lib, cuda, verbose):
 
 
 SUITES = {"api": suite_api, "replay": suite_replay, "stages": suite_stages, "e2e": suite_e2e, "tensor": suite_tensor,
-          "bigk": suite_bigk}
+          "bigk": suite_bigk, "every_n": suite_every_n}
 
 
 def main():

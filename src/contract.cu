@@ -341,18 +341,19 @@ struct PackEmitterT {
   // modulus, p = 256 included (its weights are 1, 0, ..., so the dot product is the low byte,
   // and with magic 2^56 = 2^64 / 256 the quotient is 0: the same value as mod_p_bytes' mask).
   // The rare eps > 0 factor is applied only when some element of this thread has one.
+  // A5: the byte-weighted sum is reduced with the 32-bit magic (mod_p_bytes32: one
+  // multiply-high, p = 256 included), and the sign is applied after SMod: SMod(-r mod p) =
+  // -SMod(r) for odd p (symmetric range), and for p = 256 both give the byte (-r) & 255 (the
+  // one asymmetric value, r = 128, is the byte 0x80 either way). Same int8 bytes as before.
   __device__ __forceinline__ void emit(int l, uint32_t (&w)[E / 4]) const {
     const uint32_t p = c_tables.moduli[l], half = (p + 1) / 2;
-    const uint64_t magic = c_tables.epi_magic[l];
-    const uint64_t magic_all = p == 256u ? uint64_t{1} << 56 : magic;
+    const uint32_t m32 = imd::device::c_magic32.m[l];
     const uint32_t wlo = imd::device::c_byte_weights.lo[l], whi = imd::device::c_byte_weights.hi[l];
     uint32_t r[E];
 #pragma unroll
-    for (int e = 0; e < E; ++e) {
-      const uint32_t s = imd::device::dot_bytes(lo[e], wlo) + imd::device::dot_bytes(hi[e], whi);
-      r[e] = s - p * static_cast<uint32_t>(imd::device::umulhi64(magic_all, s));
-    }
+    for (int e = 0; e < E; ++e) r[e] = imd::device::mod_p_bytes32(lo[e], hi[e], wlo, whi, p, m32);
     if (has_eps != 0) {
+      const uint64_t magic = c_tables.epi_magic[l];
 #pragma unroll
       for (int e = 0; e < E; ++e)
         if ((has_eps >> e) & 1u)
@@ -362,9 +363,10 @@ struct PackEmitterT {
     for (int q = 0; q < E / 4; ++q) w[q] = 0;
 #pragma unroll
     for (int e = 0; e < E; ++e) {
-      const uint32_t v = ((neg >> e) & 1u) && r[e] != 0 ? p - r[e] : r[e];
-      const uint32_t sm = v >= half ? v - p : v;  // SMod as an int8 bit pattern (low byte)
-      w[e / 4] |= (sm & 255u) << (8 * (e % 4));
+      const int32_t u = r[e] >= half ? static_cast<int32_t>(r[e]) - static_cast<int32_t>(p)
+                                     : static_cast<int32_t>(r[e]);  // SMod(r)
+      const int32_t sm = (neg >> e) & 1u ? -u : u;  // as an int8 bit pattern (low byte)
+      w[e / 4] |= (static_cast<uint32_t>(sm) & 255u) << (8 * (e % 4));
     }
   }
   // Store the residues for modulus l at dst (aligned to E bytes).
@@ -509,39 +511,62 @@ constexpr bool k5_max_n_ok() {
 }
 static_assert(k5_max_n_ok(), "k5_max_n must cover every N of its limb count");
 
-// K5 core: the D values of the E consecutive j-bar j0..j0+E-1 of row (lambda, i), E = 4 or
-// 1. For E = 4, j0 is a multiple of 4, so each plane's 4 bytes are one aligned u32 load
-// (n_hat is a multiple of 16). Elements with j >= n are not computed (D[e] unspecified).
-// Every index into x / D / wv is static after unrolling (no local memory).
-template <int L, int E>
-__device__ __forceinline__ void k5_elems(const OutArgs& a, int64_t lam, int64_t i, int64_t j0,
-                                         double (&D)[E]) {
-  static_assert(E == 1 || E == 4, "K5 takes 1 or 4 consecutive j-bar per thread");
+// ---- K5, one kernel per N (A5, docs/NOTES-A5.md §2) ---------------------------------------
+// The §3.6 running CRT (numerics.cuh crt_step) with N a template parameter: the plane loop,
+// the plane addresses and every constant of a step (p_l, q_l, the 32-bit magic, M_l, P, H)
+// are compile-time, so a step is its arithmetic only (no runtime-indexed constant loads, no
+// per-step branches on l < N or p = 256, no predicated addresses for unused planes). Until
+// A5 one kernel per limb count L took N as an argument (780 instructions per output at N = 8
+// against ~120 for the steps themselves). Same integers in the same order as crt_step /
+// crt_finish / round_scaled: bit-identical.
+template <int N, int L, int l>
+__device__ __forceinline__ void crt_step_n(uint32_t (&x)[L], uint32_t Wl) {
+  constexpr uint32_t p = imd::constants::kTables.moduli[l];
+  constexpr uint32_t q = imd::constants::kTables.q[N][l];
+  constexpr uint32_t m32 = imd::device::kMagic32.m[l];
+  const uint32_t y = imd::device::mod_p_small32(q * Wl, p, m32);
+  uint32_t M[L], P[L];  // constant-bank operands: every index is compile-time after unrolling
+#pragma unroll
+  for (int w = 0; w < L; ++w) {
+    M[w] = c_tables.M[N][l][w];
+    P[w] = c_tables.P[N][w];
+  }
+  crt_mac_sub<L>(x, M, y, P);
+}
+// Planes l .. N-1 for E elements (interleaved: E independent chains per step).
+template <int N, int L, int E, int l = 0>
+__device__ __forceinline__ void crt_planes_n(uint32_t (&x)[E][L], const uint32_t (&wv)[N]) {
+  if constexpr (l < N) {
+#pragma unroll
+    for (int e = 0; e < E; ++e) crt_step_n<N, L, l>(x[e], (wv[l] >> (8 * e)) & 255u);
+    crt_planes_n<N, L, E, l + 1>(x, wv);
+  }
+}
+
+// K5 core: the D values of the E consecutive j-bar j0..j0+E-1 of row (lambda, i), E = 1, 2
+// or 4. j0 is a multiple of E, so each plane's E bytes are one aligned load (n_hat is a
+// multiple of 16). Elements with j >= n are not computed (D[e] unspecified). Every index into
+// x / D / wv is static after unrolling (no local memory).
+template <int N, int E>
+__device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_t i, int64_t j0,
+                                           double (&D)[E]) {
+  static_assert(E == 1 || E == 2 || E == 4, "K5 takes 1, 2 or 4 consecutive j-bar per thread");
+  constexpr int L = imd::constants::kTables.L32[N];
   const int64_t plane = a.b * a.m * a.n_hat, row = lam * a.m + i;
   const uint8_t* W = a.W + row * a.n_hat + j0;
+  uint32_t wv[N];
+#pragma unroll
+  for (int l = 0; l < N; ++l) {
+    if constexpr (E == 4) wv[l] = __ldg(reinterpret_cast<const uint32_t*>(W + l * plane));
+    else if constexpr (E == 2) wv[l] = __ldg(reinterpret_cast<const uint16_t*>(W + l * plane));
+    else wv[l] = __ldg(W + l * plane);
+  }
   uint32_t x[E][L];
 #pragma unroll
   for (int e = 0; e < E; ++e)
 #pragma unroll
     for (int w = 0; w < L; ++w) x[e][w] = 0;
-  // All N plane loads are issued before the CRT chain (N <= kMaxN for this L), so their
-  // latencies overlap instead of serializing with the arithmetic.
-  constexpr int kMaxN = k5_max_n(L);
-  uint32_t wv[kMaxN];
-#pragma unroll
-  for (int l = 0; l < kMaxN; ++l) {
-    if constexpr (E == 4)
-      wv[l] = l < a.N ? __ldg(reinterpret_cast<const uint32_t*>(W + l * plane)) : 0u;
-    else
-      wv[l] = l < a.N ? uint32_t{__ldg(W + l * plane)} : 0u;
-  }
-#pragma unroll
-  for (int l = 0; l < kMaxN; ++l) {
-    if (l < a.N) {
-#pragma unroll
-      for (int e = 0; e < E; ++e) crt_step<L>(x[e], (wv[l] >> (8 * e)) & 255u, l, a.N);
-    }
-  }
+  crt_planes_n<N, L, E>(x, wv);
   const bool fa = a.fA[row] != 0;
   const int sa = a.sA[row];
 #pragma unroll
@@ -553,7 +578,7 @@ __device__ __forceinline__ void k5_elems(const OutArgs& a, int64_t lam, int64_t 
       } else {
         uint32_t mag[L];
         bool neg;
-        crt_finish<L>(x[e], a.N, mag, &neg);
+        crt_finish<L>(x[e], N, mag, &neg);
         D[e] = round_scaled<L>(mag, neg, -(sa + int{a.sB[lam * a.n + j]}));
       }
     }
@@ -567,16 +592,15 @@ __device__ __forceinline__ void k5_elems(const OutArgs& a, int64_t lam, int64_t 
 // that store r of lane writes slot lane + 32 r (consecutive lanes, consecutive j-bar: C
 // stores and c_col loads are coalesced along C's fastest label). Each element is still
 // written exactly once with the same value; only the thread that writes it changes.
-// Shared slot of result s (= 4 item + e of the warp's 32 items): s + s / 16, which makes
+// E = 2: each thread stores its own two elements. Shared slot of result s (= 4 item + e of the warp's 32 items): s + s / 16, which makes
 // both the writes (stride 4 per lane) and the reads (stride 1) bank-conflict free.
 constexpr int kK5WarpSlots = 128 + 8;
-template <int L, int E>
-__global__ void __launch_bounds__(kThreads) k5_crt(OutArgs a) {
+template <int N, int E>
+__global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
   __shared__ double sD[E == 4 ? (kThreads / 32) * kK5WarpSlots : 1];
   const int64_t ng = (a.n + E - 1) / E, total = a.b * a.m * ng;
   const int lane = threadIdx.x & 31;
   double* wD = sD + (E == 4 ? (threadIdx.x / 32) * kK5WarpSlots : 0);
-  // Block-uniform loop: every lane of a warp takes part in each iteration's shuffles.
   for (int64_t base = blockIdx.x * int64_t{blockDim.x}; base < total;
        base += int64_t{gridDim.x} * blockDim.x) {
     const int64_t idx = base + threadIdx.x;
@@ -589,11 +613,15 @@ __global__ void __launch_bounds__(kThreads) k5_crt(OutArgs a) {
       int64_t t, i, lam;
       divmod(idx, ng, &t, &jg);
       divmod(t, a.m, &lam, &i);
-      k5_elems<L, E>(a, lam, i, E * jg, D);
+      k5_elems_n<N, E>(a, lam, i, E * jg, D);
       cbase = a.c_bat[lam] + a.c_row[i];
     }
-    if constexpr (E == 1) {
-      if (live) store_out(a, cbase + a.c_col[jg], D[0]);
+    if constexpr (E != 4) {
+      if (live) {
+#pragma unroll
+        for (int e = 0; e < E; ++e)
+          if (E * jg + e < a.n) store_out(a, cbase + a.c_col[E * jg + e], D[e]);
+      }
     } else {
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
@@ -618,7 +646,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt(OutArgs a) {
 // tile of TL lambda x TJ j-bar of one row i (TL * TJ = 1024). It computes with j-bar
 // fastest (coalesced W reads), stages D in shared memory and writes C with lambda fastest
 // (coalesced C writes). TL = 2^lg_tl in [2, 32].
-template <int L>
+template <int N>
 __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
   constexpr int kTile = 1024;
   __shared__ double sD[kTile + 32];
@@ -634,7 +662,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
       const int64_t lam = lam0 + ll, j0 = j00 + 4 * jq;
       if (lam < a.b && j0 < a.n) {
         double D[4] = {0, 0, 0, 0};
-        k5_elems<L, 4>(a, lam, i, j0, D);
+        k5_elems_n<N, 4>(a, lam, i, j0, D);
 #pragma unroll
         for (int e = 0; e < 4; ++e) sD[ll * pitch + 4 * jq + e] = D[e];
       }
@@ -671,24 +699,44 @@ __global__ void __launch_bounds__(kThreads) k5_beta_only(OutArgs a) {
   }
 }
 
-// K5 j-bar fastest: one element per thread while b m n <= this many per SM (a launch choice;
-// the results do not depend on it). The test hook imd_test_set_k5_one_elem changes it.
+// K5 j-bar fastest, elements per thread (a launch choice; the results do not depend on it):
+// 1 while b m n <= k5_one_elem_per_sm() / 2 per SM, 2 while b m n <= 8 k5_one_elem_per_sm()
+// per SM, else 4 (A5, NOTES-A5 §2: nsys K5 times, 1 / 2 / 4 per thread, 16 K to 16 M
+// outputs). The test hooks: imd_test_set_k5_one_elem (0: always 4) and imd_test_set_k5_elems
+// (force 1, 2 or 4).
 constexpr int64_t kK5OneElemPerSm = 2048;
 
-template <int L>
+template <int N>
 void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
   if (p.k5_batch_fast) {
     int lg_tl = 1;
     while (lg_tl < 5 && (int64_t{1} << lg_tl) < p.b) ++lg_tl;
     const int64_t tl = int64_t{1} << lg_tl, tj = 1024 / tl;
     const int64_t tiles = p.m * ((p.b + tl - 1) / tl) * ((p.n + tj - 1) / tj);
-    k5_crt_bfast<L><<<blocks_for(tiles, 1), kThreads, 0, stream>>>(out, lg_tl);
-  } else if (p.b * p.m * p.n <= k5_one_elem_per_sm() * p.sms) {
-    // Few elements: one per thread (4x the threads of the quad mapping, a shorter chain each).
-    k5_crt<L, 1><<<blocks_for(p.b * p.m * p.n), kThreads, 0, stream>>>(out);
-  } else {
-    k5_crt<L, 4><<<blocks_for(p.b * p.m * ((p.n + 3) / 4)), kThreads, 0, stream>>>(out);
+    k5_crt_bfast<N><<<blocks_for(tiles, 1), kThreads, 0, stream>>>(out, lg_tl);
+    return;
   }
+  const int64_t mn = p.b * p.m * p.n, per_sm = k5_one_elem_per_sm();
+  const int e = k5_elems_override() > 0 ? k5_elems_override()
+                : mn <= per_sm / 2 * p.sms ? 1
+                : mn <= 8 * per_sm * p.sms ? 2 : 4;
+  if (e == 1)
+    k5_crt_n<N, 1><<<blocks_for(mn), kThreads, 0, stream>>>(out);
+  else if (e == 2)
+    k5_crt_n<N, 2><<<blocks_for(p.b * p.m * ((p.n + 1) / 2)), kThreads, 0, stream>>>(out);
+  else
+    k5_crt_n<N, 4><<<blocks_for(p.b * p.m * ((p.n + 3) / 4)), kThreads, 0, stream>>>(out);
+}
+
+// K5 for the plan's N: the run-time N picks its kernel (false: N outside [kNMin, kNMax]).
+template <int N = imd::constants::kNMin>
+bool launch_k5_for(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
+  if (p.N == N) {
+    launch_k5<N>(p, out, stream);
+    return true;
+  }
+  if constexpr (N < imd::constants::kNMax) return launch_k5_for<N + 1>(p, out, stream);
+  else return false;
 }
 
 // ---- K0: §5 step 10 scatter vectors from the fused-mode descriptor (DESIGN v1.2 §4) -------
@@ -1306,6 +1354,11 @@ int64_t& k5_one_elem_per_sm() {
   return v;
 }
 
+int& k5_elems_override() {
+  static int v = 0;  // only the test and benchmark hooks change it
+  return v;
+}
+
 imd_status_t k0_generate(const ExecPlan& p, int64_t* vec, cudaStream_t stream) {
   if (p.vec_count == 0) return IMD_STATUS_SUCCESS;
   if (p.vec_desc.modes.size() <= static_cast<size_t>(kK0SmallModes))
@@ -1453,14 +1506,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
 
   // K5
   out.sA = sA, out.sB = sB, out.fA = fA, out.fB = fB, out.W = W;
-  switch (imd::constants::kTables.L32[p.N]) {
-    case 1: launch_k5<1>(p, out, stream); break;
-    case 2: launch_k5<2>(p, out, stream); break;
-    case 3: launch_k5<3>(p, out, stream); break;
-    case 4: launch_k5<4>(p, out, stream); break;
-    case 5: launch_k5<5>(p, out, stream); break;
-    default: return IMD_STATUS_CUDA_ERROR;  // unreachable: L32 in 1..5 for N in 2..20
-  }
+  if (!launch_k5_for(p, out, stream)) return IMD_STATUS_CUDA_ERROR;  // unreachable: N in 2..20
   IMD_PROF(stream, "K5 crt");
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }

@@ -416,9 +416,10 @@ only (no SM count, no data), so `imd_lowering` reports the plan's choice exactly
 **[v1.4] Moduli parts.** A pack launch (K2/K3 and KF) with fewer tiles than about two per
 SM splits the group's slots over `gridDim.y` block rows: part y of a row writes the slots
 `[y·|G|/ny, (y+1)·|G|/ny)` and re-reads its tile. Disjoint outputs, same values
-**[spec: Pipeline MParts, pos_pack_parts]**. K5 takes one or four j̄ per thread (a launch
-choice; with four, a warp's results are transposed through shared memory so C stores are
-coalesced). Neither changes any result.
+**[spec: Pipeline MParts, pos_pack_parts]**. K5 takes one, two (A5) or four j̄ per thread
+(a launch choice by the output count; with four, a warp's results are transposed through
+shared memory so C stores are coalesced), and is compiled once per N (A5: the §3.6 constants
+and the plane loop are compile-time). Neither changes any result.
 
 **K0 and the scatter vectors [v1.2].** The plan option `vec_mode` chooses where the
 vectors live; both modes give bitwise identical results.
@@ -1698,3 +1699,16 @@ What §6b left to the implementation, as implemented (libimmerdink_host `src/hos
   Ordering (RAW/WAR on the packed buffer and the FP64 operand) is the caller's. **[spec:
   PackedOperand (new): 11 pos / 17 neg]**. §1, §4, §4a, §5, §6, §6a are unchanged until
   approval; §6 "Reserved" points here. Open questions: §6b.10.
+
+## A5 (kernel-internal; no semantic, layout, API or spec change)
+
+Small-shape polish (docs/NOTES-A5.md). Same kernel sequence, launches, workspace, plan bytes
+and host API; every value the same integer (bit-identical, tested on every contract suite).
+- **§4 K5.** One kernel per N in [2, 20] (instead of one per limb count with N as an
+  argument): the §3.6 plane loop and constants are compile-time. K5 j̄-fastest takes 1, 2 or 4
+  j̄ per thread by the output count (b·m·n ≤ 1024·SMs: 1; ≤ 16384·SMs: 2; else 4); the
+  λ-fastest kernel is per N too.
+- **§3.4 packs (KF, KL, K2/K3).** The byte-weighted residue sum s < 7·255² is reduced with the
+  32-bit magic ⌈2³²/p⌉ (2²⁴ for p = 256, exact: s·e < 2³² for e < p ≤ 256; exhaustive CPU test)
+  instead of the 64-bit one, and the sign is applied after SMod (SMod(−r mod p) = −SMod(r) for
+  odd p; for p = 256 both give the byte (−r) mod 256). Same int8 residues.
