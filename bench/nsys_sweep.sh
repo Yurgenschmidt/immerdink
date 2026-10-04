@@ -8,7 +8,7 @@ set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 bench="$1"; sweep="$2"; out="$3"; shift 3
 mkdir -p "$out"
-while IFS='|' read -r name spec ext methods Ns _emu extra; do
+while IFS='|' read -r name spec ext methods Ns extra; do
   name="$(echo "$name" | xargs)"
   case "$name" in ''|'#'*) continue ;; esac
   if [ -n "${CASES:-}" ] && ! echo "$name" | grep -Eq "$CASES"; then continue; fi

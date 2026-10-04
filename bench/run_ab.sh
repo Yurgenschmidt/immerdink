@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Same-session A/B of two imd_bench builds, interleaved per case (the A1/A2/A3 comparisons):
-# for every case of a sweep file, the "before" binary runs the case's methods (e.g. gemmul8 and
-# imd), then the "after" binary runs only imd, each as its own quiet-gated process
-# (tools/run_bench.sh: machine-wide lock, quiet machine, GPU lock).
+# Same-session A/B of two imd_bench builds (before / after a change to immerdink),
+# interleaved per case: for every case of a sweep file, the "before" binary runs the case,
+# then the "after" binary runs it, each as its own quiet-gated process (tools/run_bench.sh:
+# machine-wide lock, quiet machine, GPU lock; bench/warm_run.sh: warm-up, retries).
 #   bench/run_ab.sh <before imd_bench> <after imd_bench> <sweep file> <before.jsonl> <after.jsonl>
-# Extra imd_bench arguments for the after binary only: $AFTER_ARGS (e.g. "--k4 rule,tune").
-# AFTER_METHODS (default imd): the after binary's methods. Use the case's methods (e.g.
-# "gemmul8,imd") for small cases: the GPU clock state depends on what ran before in the
-# process (A3: the before process at 2820 MHz after GEMMul8, an imd-only one at 2535 MHz).
+# Methods: the case's (sweep file column 4) on both sides; AFTER_METHODS overrides them for the
+# after binary only. Extra imd_bench arguments for the after binary only: $AFTER_ARGS
+# (e.g. "--k4 rule,tune"). Summarize with bench/ab_ratio.py before.jsonl after.jsonl.
+# Tiny calls (<~100 us) move +-10-20 % between per-process performance states (NOTES-A5
+# §1.2), so a cross-process A/B there needs many timed calls (e.g. --reps 300 in the sweep's
+# extra args) and repeated runs; within one build, compare configurations with
+# `imd_bench --methods duel` instead.
 # CASES (grep -E regex) selects cases; BEFORE_COMMIT / AFTER_COMMIT label the records.
 # Stops (exit 3) if the machine never gets quiet.
 set -uo pipefail
@@ -18,13 +21,12 @@ env_dir="${IMMERDINK_ENV:-$HOME/miniforge3/envs/immerdink}"
 export QUIET_GPU_IGNORE="${QUIET_GPU_IGNORE:-gnome-remote-desktop-daemon|Xorg|gnome-shell|claude-desktop --type=gpu-process}"
 export LD_LIBRARY_PATH="$env_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 mkdir -p "$(dirname "$out_b")" "$(dirname "$out_a")"
-while IFS='|' read -r name spec ext methods Ns emu extra; do
+while IFS='|' read -r name spec ext methods Ns extra; do
   name="$(echo "$name" | xargs)"
   case "$name" in ''|'#'*) continue ;; esac
   if [ -n "${CASES:-}" ] && ! echo "$name" | grep -Eq "$CASES"; then continue; fi
   common=(--name "$name" --spec "$(echo "$spec" | xargs)" --ext "$(echo "$ext" | xargs)")
   [ -n "$(echo "$Ns" | xargs)" ] && common+=(--N "$(echo "$Ns" | xargs)")
-  [ -n "$(echo "$emu" | xargs)" ] && common+=(--emu "$(echo "$emu" | xargs)")
   # shellcheck disable=SC2206
   common+=($extra)
   echo "== $name $(date -Is)"
@@ -32,7 +34,7 @@ while IFS='|' read -r name spec ext methods Ns emu extra; do
     if [ "$side" = before ]; then
       bin="$before"; out="$out_b"; m="$(echo "$methods" | xargs)"; more=()
     else
-      bin="$after"; out="$out_a"; m="${AFTER_METHODS:-imd}"
+      bin="$after"; out="$out_a"; m="${AFTER_METHODS:-$(echo "$methods" | xargs)}"
       # shellcheck disable=SC2206
       more=(${AFTER_ARGS:-})
     fi

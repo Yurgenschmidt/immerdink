@@ -19,6 +19,10 @@ New tools (this work):
 - `imd_bench --methods duel`: imd and GEMMul8 (with the permutations when the GEMM view
   needs them, i.e. perm + GEMMul8, the fair comparison) timed **interleaved, call by call,
   in one process**; reports both medians and the median of the per-pair ratios.
+  *(Since 2026-10-04 the bench in this repository is immerdink-only: its `duel` interleaves
+  two immerdink configurations the same way (`--duel-a`, `--duel-b`; docs/BENCHMARKING.md
+  "Tiny shapes"). The imd-vs-GEMMul8 duel used below is in the evaluation workspace's copy
+  of the bench (as of `db8bfbd`).)*
 - `IMD_BENCH_TIMES=1`: every timed call's event time on stderr (`IMD_BENCH_CLOCK=1` adds an
   SM-clock probe after each call; its 4 µs window turned out too short to be useful).
 - `bench/sweep_a5.txt`: the small family.
@@ -345,5 +349,6 @@ GEMMul8 then imd in its own quiet-gated process; "vs G8" is same-process.
   kernel boundary are the same for both libraries; imd has 3 launches to GEMMul8's 6.
 - The measurement itself (§1.2) is now the largest uncertainty for tiny calls: a 20–40 µs
   call moves by ±10–20 % between per-process states (host core type under `powersave`, GPU
-  DVFS). For paper-grade small-shape numbers use `--methods duel` (interleaved) or pin the
-  bench to a P-core and lock clocks (root).
+  DVFS). For paper-grade small-shape numbers use an interleaved duel (`--methods duel`:
+  here two immerdink configurations, in the evaluation workspace imd against another
+  library; docs/BENCHMARKING.md) or pin the bench to a P-core and lock clocks (root).

@@ -3,16 +3,17 @@
 
     python3 bench/summarize.py bench/results/<run>.jsonl [--N 14]
 
-Tables: (1) every case at the headline N, (2) the N sweep of the emulated methods,
-(3) immerdink phase lower bounds (MEMORY_MODEL §4) against the measured whole call.
+Tables: (1) every case at the headline N, (2) the N sweep of imd, (3) immerdink phase lower
+bounds (MEMORY_MODEL §4) against the measured whole call, (4) measured phases (event marks),
+(5) duel (interleaved configurations) and packed (operand reuse) records, if any, and
+(6) before / after of imd with --before.
 """
 import argparse
 import json
 import math
 from collections import OrderedDict
 
-# RTX 4090 datasheet peaks (boost clock): 1008 GB/s GDDR6X, 660.6 dense INT8 TOPS,
-# 1.29 FP64 TFLOPS (1/64 rate).
+# RTX 4090 datasheet peaks (boost clock): 1008 GB/s GDDR6X, 660.6 dense INT8 TOPS.
 PEAK_BW = 1008e9
 PEAK_INT8 = 660.6e12
 KCHUNK = 131056
@@ -41,18 +42,21 @@ def tf(x):
 
 
 def label(r):
-    m = r["method"]
-    if m in ("gemmul8", "perm+gemmul8", "imd"):
-        return f"{m} N={r['N']}"
-    if m in ("emu", "perm+emu"):
-        return f"{m} {r['variant'].split()[0]}"
+    m = r.get("method", "—")
+    if m == "imd":
+        v = r["variant"].replace("RN g=N", "").strip()
+        return f"imd N={r['N']}" + (f" {v}" if v else "")
+    if m in ("packed", "duel-a", "duel-b"):
+        return f"{m} {r['variant'].replace(', interleaved', '')}"
     return m
 
 
 def cases(recs):
+    """Records by case. bench/warm_run.sh's clock_state lines (no method, no status) are skipped."""
     out = OrderedDict()
     for r in recs:
-        out.setdefault(r["case"], []).append(r)
+        if "method" in r or "status" in r:
+            out.setdefault(r["case"], []).append(r)
     return out
 
 
@@ -72,9 +76,7 @@ def headline(recs, N):
             continue
         first = True
         for r in ok:
-            if r["method"] in ("gemmul8", "perm+gemmul8", "imd") and r["N"] != N:
-                continue
-            if r["method"] in ("emu", "perm+emu") and not r["variant"].startswith(("dyn", "fix55")):
+            if r["method"] != "bw" and r["N"] != N:
                 continue
             if r["method"] == "bw":
                 extra = f"{r['gbps']:.0f} GB/s"
@@ -83,10 +85,7 @@ def headline(recs, N):
                       f"{r['spread_pct']:.1f} | {extra} | | |")
                 first = False
                 continue
-            if r["method"] == "int8":
-                t = f"{r['int8_tops']:.0f} TOPS (×{N}: {ms(N * r['median_s'])} ms)"
-            else:
-                t = tf(r.get("tflops_eq"))
+            t = tf(r.get("tflops_eq"))
             print(f"| {name if first else ''} | {('`' + r['spec'] + '`') if first else ''} | "
                   f"{shape(r) if first else ''} | {label(r)} | {ms(r['median_s'])} | "
                   f"{r['spread_pct']:.1f} | {t} | {err(r.get('max_normerr'))} | "
@@ -104,11 +103,10 @@ def nsweep(recs, names):
     for name, rs in cases(recs).items():
         if name not in names:
             continue
-        rows = [r for r in rs if r.get("status") == "ok" and r["method"] in ("gemmul8", "imd", "emu", "dgemm")]
-        rows.sort(key=lambda r: (r["method"], r["N"], r["variant"]))
+        rows = [r for r in rs if r.get("status") == "ok" and r["method"] == "imd"]
+        rows.sort(key=lambda r: (r["N"], r["variant"]))
         for r in rows:
-            n = r["N"] if r["method"] in ("gemmul8", "imd") else (r["variant"].split()[0] if r["method"] == "emu" else "—")
-            print(f"| {name} | {r['method']} | {n} | {ms(r['median_s'])} | {tf(r['tflops_eq'])} | "
+            print(f"| {name} | {label(r)} | {r['N']} | {ms(r['median_s'])} | {tf(r['tflops_eq'])} | "
                   f"{err(r.get('max_normerr'))} |")
 
 
@@ -129,13 +127,11 @@ def phases(m, n, k, b, N):
 
 def phase_table(recs, names, N):
     print("| case | N | K1 scale | K2/K3 pack | K4 GEMM | K5 CRT | Σ lower bound | "
-          "N × cuBLASLt int8 | measured imd | Σ LB / measured |")
-    print("|---|---|---|---|---|---|---|---|---|---|")
+          "measured imd | Σ LB / measured |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for name, rs in cases(recs).items():
         if name not in names:
             continue
-        i8 = next((r for r in rs if r["method"] == "int8" and r.get("status") == "ok"), None)
-        bw = next((r for r in rs if r["method"] == "bw" and r.get("status") == "ok"), None)
         for r in rs:
             if r["method"] != "imd" or r.get("status") != "ok" or r["N"] != N:
                 continue
@@ -147,8 +143,7 @@ def phase_table(recs, names, N):
                 cells.append(ms(t))
             meas = r["median_s"]
             print(f"| {name} | {N} | " + " | ".join(cells) + f" | {ms(tot)} | "
-                  f"{ms(N * i8['median_s']) if i8 else '—'} | {ms(meas)} | {100 * tot / meas:.0f} % |")
-        _ = bw
+                  f"{ms(meas)} | {100 * tot / meas:.0f} % |")
 
 
 PHASE_GROUPS = OrderedDict([("K0 vec", ["K0 vec"]), ("K1 scale", ["K1 scale A", "K1 scale B"]),
@@ -177,27 +172,57 @@ def measured_phase_table(recs, names, N):
                   f"{100 * r['phase_lb_ms'] / r['phase_total_ms']:.0f} % |")
 
 
+def duel_table(recs):
+    """method duel: two immerdink configurations interleaved call by call in one process."""
+    print("| case | N | A | B | A µs | B µs | t_a / t_b [p10, p90] | bit-identical | "
+          "K4 config A / B | plan bytes A / B | launches A / B |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
+    last_a = {}
+    for r in recs:
+        if r.get("status") != "ok":
+            continue
+        if r.get("method") == "duel-a":
+            last_a[r["case"]] = r
+        elif r.get("method") == "duel-b" and r["case"] in last_a:
+            ra = last_a.pop(r["case"])
+            print(f"| {r['case']} | {r['N']} | {ra['duel_config']} | {r['duel_config']} | "
+                  f"{ra['median_s'] * 1e6:.1f} | {r['median_s'] * 1e6:.1f} | "
+                  f"{r['ratio_median']:.3f} [{r['ratio_p10']:.3f}, {r['ratio_p90']:.3f}] | "
+                  f"{'yes' if r.get('bit_identical') else 'no'} | "
+                  f"{ra['k4_config']} / {r['k4_config']} | "
+                  f"{ra['plan_device_bytes']} / {r['plan_device_bytes']} | "
+                  f"{ra['kernel_launches']} / {r['kernel_launches']} |")
+
+
+def packed_table(recs):
+    """method packed: R x imd_contract vs imd_pack + R x imd_contract_packed (interleaved)."""
+    print("| case | N | pack | R | plain R ms | packed R ms | speedup | pack / contract | "
+          "bit-identical |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for r in recs:
+        if r.get("status") != "ok" or r.get("method") != "packed":
+            continue
+        print(f"| {r['case']} | {r['N']} | {r['pack']} | {r['R']} | {r['plain_R_ms']:.3g} | "
+              f"{r['packed_R_ms']:.3g} | {r['speedup_R']:.2f}× | {r['pack_vs_contract']:.2f} | "
+              f"{'yes' if r.get('bit_identical') else 'no'} |")
+
+
 def before_after(before, after, N):
-    """immerdink at N, before vs after, with GEMMul8 (after run) for reference."""
-    def pick(recs, method):
+    """imd at N (default configuration), before vs after."""
+    def pick(recs):
         out = {}
         for r in recs:
-            if r.get("status") == "ok" and r["method"] == method and r["N"] == N:
+            if (r.get("status") == "ok" and r["method"] == "imd" and r["N"] == N
+                    and r["variant"] == "RN g=N"):
                 out.setdefault(r["case"], r)
         return out
-    b, a, g = pick(before, "imd"), pick(after, "imd"), pick(after, "gemmul8")
-    gb = pick(before, "gemmul8")
-    print(f"| case | m×n×k | imd before ms | imd after ms | speedup | TFLOPS-eq after | "
-          f"GEMMul8 ms (before / after run) | imd / GEMMul8 |")
-    print("|---|---|---|---|---|---|---|---|")
+    b, a = pick(before), pick(after)
+    print("| case | m×n×k | imd before ms | imd after ms | speedup | TFLOPS-eq after |")
+    print("|---|---|---|---|---|---|")
     for name, r in a.items():
         rb = b.get(name)
-        gg = g.get(name)
-        gbb = gb.get(name)
         print(f"| {name} | {shape(r)} | {ms(rb['median_s']) if rb else '—'} | {ms(r['median_s'])} | "
-              f"{(rb['median_s'] / r['median_s']) if rb else float('nan'):.2f}× | {tf(r['tflops_eq'])} | "
-              f"{ms(gbb['median_s']) if gbb else '—'} / {ms(gg['median_s']) if gg else '—'} | "
-              f"{(r['median_s'] / gg['median_s']) if gg else float('nan'):.2f} |")
+              f"{(rb['median_s'] / r['median_s']) if rb else float('nan'):.2f}× | {tf(r['tflops_eq'])} |")
 
 
 def main():
@@ -212,7 +237,7 @@ def main():
     recs = load(a.jsonl)
     meta = next((r for r in recs if r.get("status") == "ok"), {})
     print(f"<!-- {a.jsonl}: commit {meta.get('commit')}, env {meta.get('env')}, {meta.get('gpu')}, "
-          f"driver {meta.get('driver')}, cuBLAS {meta.get('cublas')}, cuTENSOR {meta.get('cutensor')} -->")
+          f"driver {meta.get('driver')}, CUDA runtime {meta.get('cuda_runtime')} -->")
     rss = [(r["host_maxrss_mib"], r["case"]) for r in recs if r.get("host_maxrss_mib") is not None]
     if rss:
         print(f"<!-- peak host RSS of any bench process: {max(rss)[0]:.0f} MiB (case {max(rss)[1]}) -->")
@@ -220,7 +245,7 @@ def main():
     if cg:
         print(f"<!-- peak cgroup (memcap scope) memory of any bench process: {max(cg)[0]:.0f} MiB "
               f"(case {max(cg)[1]}) -->")
-    print(f"\n### All cases (N = {a.N} for the Ozaki-II methods)\n")
+    print(f"\n### All cases (N = {a.N})\n")
     headline(recs, a.N)
     print("\n### N sweep\n")
     nsweep(recs, a.sweep_cases.split(","))
@@ -229,6 +254,12 @@ def main():
     if any("phases" in r for r in recs):
         print(f"\n### immerdink measured phases (event marks, N = {a.N}): ms (§4 lower bound as % of it)\n")
         measured_phase_table(recs, a.phase_cases.split(","), a.N)
+    if any(r.get("method") == "duel-b" for r in recs):
+        print("\n### Duel (interleaved configurations; t_a / t_b > 1: B faster)\n")
+        duel_table(recs)
+    if any(r.get("method") == "packed" for r in recs):
+        print("\n### Packed operand reuse\n")
+        packed_table(recs)
     if a.before:
         print(f"\n### Before / after (N = {a.N}; before: {a.before})\n")
         before_after(load(a.before), recs, a.N)
