@@ -452,6 +452,18 @@ struct Options {
   std::string out;
 };
 
+// A5 diagnostic (IMD_BENCH_CLOCK=1): the SM clock right after each timed call, measured by
+// one warp spinning ~4 µs of %globaltimer and counting clock64 cycles (outside the timed
+// window; it adds ~5 µs of GPU work between calls).
+__global__ void k_clock_probe(unsigned long long* out) {
+  unsigned long long t0, t1, c0, c1;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  c0 = clock64();
+  do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1)); } while (t1 - t0 < 4000);
+  c1 = clock64();
+  if (threadIdx.x == 0) { out[0] = c1 - c0; out[1] = t1 - t0; }
+}
+
 Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& o) {
   for (int w = 0; w < o.warmup; ++w) run();
   CU(cudaStreamSynchronize(s));
@@ -461,6 +473,11 @@ Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& 
   CU(cudaEventCreate(&e1));
   Timing T;
   double total = 0;
+  const char* clk_env = getenv("IMD_BENCH_CLOCK");
+  const bool clk = clk_env && *clk_env == '1';
+  unsigned long long* clk_buf = nullptr;
+  std::vector<double> mhz;
+  if (clk) CU(cudaHostAlloc(&clk_buf, 2 * sizeof(unsigned long long), cudaHostAllocMapped));
   for (int r = 0; r < o.reps; ++r) {
     CU(cudaEventRecord(e0, s));
     run();
@@ -469,12 +486,28 @@ Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& 
     float ms = 0;
     CU(cudaEventElapsedTime(&ms, e0, e1));
     T.t.push_back(ms * 1e-3);
+    if (clk) {
+      k_clock_probe<<<1, 32, 0, s>>>(clk_buf);
+      CU(cudaStreamSynchronize(s));
+      mhz.push_back(1e3 * double(clk_buf[0]) / double(clk_buf[1]));
+    }
     total += ms * 1e-3;
     if (r + 1 >= o.min_reps && total > o.max_seconds) break;
   }
   CU(cudaGetLastError());
   cudaEventDestroy(e0);
   cudaEventDestroy(e1);
+  if (const char* v = getenv("IMD_BENCH_TIMES"); v && *v == '1') {  // A5: every timed call, µs
+    fprintf(stderr, "  times_us:");
+    for (double t : T.t) fprintf(stderr, " %.1f", t * 1e6);
+    fprintf(stderr, "\n");
+  }
+  if (clk) {
+    fprintf(stderr, "  sm_mhz:");
+    for (double m : mhz) fprintf(stderr, " %.0f", m);
+    fprintf(stderr, "\n");
+    cudaFreeHost(clk_buf);
+  }
   return T;
 }
 
@@ -917,6 +950,96 @@ struct Bench {
     record("imd", vs, N, T, &acc, flops(), wsb, extra);
   }
 
+  // A5: imd and (perm+)GEMMul8 timed INTERLEAVED in one process, call by call (the same
+  // GPU clock / DVFS / host-core state for both: tiny calls drift between states that last
+  // ms to s, docs/NOTES-A5.md §1). Each rep times one GEMMul8 call (with the operand and
+  // output permutations when the GEMM view needs them: the fair comparison) and then one
+  // imd call, each its own event pair after an idle GPU, alternating which goes first.
+  // Records "duel-gemmul8" and "duel-imd" (medians as usual) with, on the imd record,
+  // ratio_median = median over reps of t_gemmul8 / t_imd (pairs run ~0.1 ms apart).
+  void method_duel(int N) {
+#ifdef IMD_BENCH_GEMMUL8
+    auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
+      lab.assign(x.labels.begin(), x.labels.end());
+      return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
+    };
+    std::vector<int32_t> la, lb, lc;
+    imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
+    imd_options_t opt{N, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    size_t wsb = 0;
+    CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
+    imd_plan_t plan = nullptr;
+    CI(imd_plan_create(imd, &A, &B, &C, &opt, &plan));
+    std::unique_ptr<imd_plan_st, imd_status_t (*)(imd_plan_t)> guard(plan, imd_plan_destroy);
+    DevBuf ws(wsb);
+    BlasArgs g = blas_args();
+    const size_t gwsb = gemmul8::workSize<false, gemmul8::Backend::INT8, gemmul8::Func::gemm>(
+        size_t(c.n), size_t(c.m), size_t(c.k), N);
+    DevBuf gws(gwsb);
+    const double one = 1.0, zero = 0.0;
+    const double* a = needA ? pA.as<double>() : dA.as<double>();
+    const double* bb = needB ? pB.as<double>() : dB.as<double>();
+    double* cc = needC ? pC.as<double>() : dC.as<double>();
+    auto run_g8 = [&] {
+      if (needA) permute(permA, dA.p, pA.p);
+      if (needB) permute(permB, dB.p, pB.p);
+      for (int64_t l = 0; l < c.b; ++l)
+        gemmul8::gemm<double, gemmul8::Backend::INT8, double, double>(
+            blas, g.ta, g.tb, size_t(c.n), size_t(c.m), size_t(c.k), &one, bb + l * g.sa,
+            size_t(g.lda), a + l * g.sb, size_t(g.ldb), &zero, cc + l * g.sc, size_t(g.ldc), N,
+            true, gws.p);
+      if (needC) permute(permC, cc, dC.p);
+    };
+    auto run_imd = [&] {
+      CI(imd_contract(plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
+    };
+    for (int w = 0; w < std::max(o.warmup, 20); ++w) { run_g8(); run_imd(); }
+    CU(cudaStreamSynchronize(s));
+    cudaEvent_t e0, e1;
+    CU(cudaEventCreate(&e0));
+    CU(cudaEventCreate(&e1));
+    auto once = [&](const std::function<void()>& f) {
+      CU(cudaEventRecord(e0, s));
+      f();
+      CU(cudaEventRecord(e1, s));
+      CU(cudaEventSynchronize(e1));
+      float ms = 0;
+      CU(cudaEventElapsedTime(&ms, e0, e1));
+      return ms * 1e-3;
+    };
+    Timing TG, TI;
+    std::vector<double> ratio;
+    double total = 0;
+    for (int r = 0; r < o.reps; ++r) {
+      double tg, ti;
+      if (r % 2 == 0) { tg = once(run_g8); ti = once(run_imd); }
+      else { ti = once(run_imd); tg = once(run_g8); }
+      TG.t.push_back(tg);
+      TI.t.push_back(ti);
+      ratio.push_back(tg / ti);
+      total += tg + ti;
+      if (r + 1 >= o.min_reps && total > o.max_seconds) break;
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    std::sort(ratio.begin(), ratio.end());
+    const size_t n = ratio.size();
+    const double rmed = n % 2 ? ratio[n / 2] : 0.5 * (ratio[n / 2 - 1] + ratio[n / 2]);
+    const bool perm = needA || needB || needC;
+    poison_C();
+    run_imd();
+    Accuracy acc = result_accuracy();
+    Json eg, ei;
+    eg.str("layout", perm ? "original (permutations + GEMMul8, timed together)" : "gemm-view");
+    ei.num("ratio_median", rmed).num("ratio_p10", ratio[n / 10]).num("ratio_p90", ratio[(9 * n) / 10]);
+    record("duel-gemmul8", perm ? "perm+INT8 fastmode, interleaved" : "INT8 fastmode, interleaved",
+           N, TG, nullptr, flops(), gwsb, eg);
+    record("duel-imd", "RN g=N, interleaved", N, TI, &acc, flops(), wsb, ei);
+#else
+    record_error("duel-imd", "", N, "built without GEMMul8 (tools/get_gemmul8.sh)");
+#endif
+  }
+
   // v1.7 (DESIGN §6b, ROADMAP D1): one operand packed once (imd_pack_desc_for: the plain
   // call's orders, so C is bit-identical) and reused by R contractions. `which`: 0 = the
   // caller's A, 1 = B. Per R in --reuse, interleaved in each repetition (same clock state):
@@ -1153,6 +1276,7 @@ void usage() {
           "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--phase-reps 5]\n"
           "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)] [--k4 rule,tune,0,1,2,3]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
+          "  methods: dgemm,emu,int8,gemmul8,cutensor,imd,bw,packed,duel (duel: imd vs (perm+)GEMMul8 interleaved)\n"
           "  [--out file.jsonl]\n");
 }
 
@@ -1231,6 +1355,7 @@ int main(int argc, char** argv) {
             for (int k4 : B.o.k4)
               if (g <= N) guarded(m, "", N, [&] { B.method_imd(N, v, g, k4); });
     } else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
+    else if (m == "duel") for (int N : Ns) guarded(m, "", N, [&] { B.method_duel(N); });
     else if (m == "packed") {  // v1.7 (D1): --pack A,B --reuse 1,4,16
       std::vector<int> reuse;
       for (auto& v : split(a.count("reuse") ? a["reuse"] : "1,4,16", ',')) reuse.push_back(std::stoi(v));

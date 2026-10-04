@@ -1,0 +1,10 @@
+# A5 small-shape family (docs/NOTES-A5.md): the cases where fixed per-call cost matters.
+# Same format as sweep_compare.txt; bench/run_ab.sh / bench/nsys_sweep.sh.
+s128    | ik,jk->ij | i=128,j=128,k=128      | gemmul8,imd | 8,14 | dyn |
+s256    | ik,jk->ij | i=256,j=256,k=256      | gemmul8,imd | 8,14 | dyn |
+s512    | ik,jk->ij | i=512,j=512,k=512      | gemmul8,imd | 8,14 | dyn |
+s_cc8   | kjbc,kiac->abij | i=8,j=8,k=8,a=64,b=64,c=64     | gemmul8,imd | 8,14 | dyn |
+s_cc16  | kjbc,kiac->abij | i=16,j=16,k=16,a=96,b=96,c=96  | gemmul8,imd | 8,14 | dyn |
+s_df    | acQ,bdQ->acbd | a=32,b=32,c=32,d=32,Q=256      | gemmul8,imd | 8,14 | dyn |
+s_perm  | abk,kcd->cadb | a=32,b=32,c=32,d=32,k=256      | gemmul8,imd | 8,14 | dyn |
+sq1024  | ik,jk->ij | i=1024,j=1024,k=1024   | gemmul8,imd | 8,14 | dyn |

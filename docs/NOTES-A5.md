@@ -1,0 +1,151 @@
+# A5 notes: small-shape polish
+
+ROADMAP A5. The clean bench-mode sweep (`bench/results/compare-clean-bb6b568.jsonl`, dev
+`b6b7e05` = `bb6b568` + docs) left two cases below GEMMul8: s256 (256³) at 0.90× and s512
+(512³) at 0.92×, both at N = 8. Goal: ≥ 1.0× there and on the small family (s128, s_cc8,
+s_df, s_perm, s_cc16, sq1024) without regressing anything else. Measure first (§1), then fix
+by measured payoff (§2), then before/after (§3).
+
+Machine: bench mode (console only, no display server, no other GPU clients, persistence
+mode on, PCIe gen4 x16 under load), RTX 4090 at its 450 W cap, i9-13900K (8 P-cores =
+CPUs 0–15, 16 E-cores = CPUs 16–31, `powersave` governor with HWP). Every timing through
+`tools/run_bench.sh` (quiet gate, machine lock, GPU lock).
+
+New tools (this work):
+- `bench/nsys_case.sh` / `bench/nsys_sweep.sh`: nsys 2026.5.1 (`-t cuda --gpuctxsw=true`)
+  of one case or a sweep file, one process per (case, N); `bench/nsys_calls.py` turns the
+  sqlite export into a per-call breakdown of the bench's timed calls (host time, launch
+  latency, GPU span, per-kernel medians, gaps, context switches).
+- `imd_bench --methods duel`: imd and GEMMul8 (with the permutations when the GEMM view
+  needs them, i.e. perm + GEMMul8, the fair comparison) timed **interleaved, call by call,
+  in one process**; reports both medians and the median of the per-pair ratios.
+- `IMD_BENCH_TIMES=1`: every timed call's event time on stderr (`IMD_BENCH_CLOCK=1` adds an
+  SM-clock probe after each call; its 4 µs window turned out too short to be useful).
+- `bench/sweep_a5.txt`: the small family.
+
+## 1. Where the time goes (dev `b6b7e05`, before any change)
+
+### 1.1 Per-kernel GPU time (nsys, 300 timed calls per method, median of the last 295)
+
+`bench/nsys_sweep.sh build/bench/imd_bench bench/sweep_a5.txt build/nsys/base --reps 300`
+(GEMMul8 and imd in one process per (case, N), N = 8 and 14). µs. "wall" ≈ the bench's
+event time (e0 record → last kernel end; nsys adds ~1 µs of host overhead per API call, so
+host-heavy callers look worse under nsys); "lat0" = e0 record → first kernel start (the
+launch latency of a call on an idle GPU); "span" = first kernel start → last kernel end =
+kernels + gaps.
+
+| case | N | method | launches | host | lat0 | span | kernels | gaps | per kernel |
+|---|---|---|---|---|---|---|---|---|---|
+| s128 | 8 | GEMMul8 | 6 | 17.3 | 3.1 | 18.1 | 14.7 | 3.5 | scale 2.6 + 2.5, GEMM 3.4 + 3.4, mod 1.5, undo 1.3 |
+| s128 | 8 | imd | 3 | 10.1 | 4.5 | 14.1 | 12.8 | 1.3 | KF 6.0, K4 2.8 (64×64), K5 4.0 |
+| s256 | 8 | GEMMul8 | 6 | 17.4 | 3.1 | 20.8 | 17.5 | 3.3 | scale 3.7 + 3.7, GEMM 3.4 + 3.5, mod 1.5, undo 1.7 |
+| s256 | 8 | imd | 3 | 5.9 | 3.0 | 16.5 | 15.3 | 1.3 | KF 7.1, K4 3.6 (64×64), K5 4.6 |
+| s512 | 8 | GEMMul8 | 6 | 16.9 | 3.1 | 33.2 | 29.8 | 3.3 | scale 5.8 + 5.8, GEMM 6.4 + 6.4, mod 2.3, undo 3.1 |
+| s512 | 8 | imd | 3 | 5.9 | 3.0 | 30.8 | 29.4 | 1.3 | KF 12.5, K4 7.5 (128×128), **K5 9.4** |
+| s512 | 14 | GEMMul8 | 10 | 30.7 | 3.1 | 52.6 | 46.6 | 6.0 | |
+| s512 | 14 | imd | 3 | 5.9 | 3.0 | 41.0 | 39.6 | 1.3 | KF 15.3, K4 11.5 (128×256), K5 12.9 |
+| s_cc8 | 8 | perm+GEMMul8 | 9 | 22.9 | 3.3 | 43.9 | 38.6 | 5.3 | 3 permutes 8.7 + the s512 kernels |
+| s_cc8 | 8 | imd | 3 | 5.8 | 3.0 | 31.2 | 29.9 | 1.3 | KF 13.0, K4 7.4, K5 9.4 |
+| s_df | 8 | GEMMul8 | 6 | 17.5 | 3.1 | 67.7 | 64.3 | 3.3 | |
+| s_df | 8 | imd | 3 | 6.0 | 3.1 | 47.8 | 46.4 | 1.3 | KF 12.5, K4 15.0, K5 18.9 |
+| s_perm | 8 | perm+GEMMul8 | 8 | 20.9 | 3.0 | 75.5 | 70.8 | 4.7 | |
+| s_perm | 8 | imd | 3 | 6.0 | 3.1 | 48.2 | 46.9 | 1.3 | KF 13.0, K4 15.0, K5 18.9 |
+| s_cc16 | 8 | perm+GEMMul8 | 9 | 22.6 | 3.4 | 365.0 | 359.6 | 5.4 | |
+| s_cc16 | 8 | imd | 5 | 9.6 | 3.1 | 291.9 | 289.1 | 2.8 | K0 1.8, KL 68.2 + 64.2, K4 116.8, K5 38.1 |
+| sq1024 | 8 | GEMMul8 | 6 | 17.3 | 3.1 | 102.9 | 99.6 | 3.3 | scale 12.3 + 12.3, GEMM 30.7 + 30.5, mod 5.8, undo 8.0 |
+| sq1024 | 8 | imd | 3 | 6.0 | 3.1 | 96.3 | 95.0 | 1.4 | KF 40.8, K4 35.4, K5 18.8 |
+
+(N = 14: imd's span is below GEMMul8's on every case, by 1.2–1.9×; full table in
+`build/nsys/base/*.txt`, not committed.)
+
+What this says:
+- **On the GPU, imd is already ahead on every small case at N = 8**, s512 included (span
+  30.8 vs 33.2 µs) and s256 by 1.26× (16.5 vs 20.8 µs). The launch latency (lat0 ≈ 3 µs)
+  is the same for both; the gaps are 0.6–0.7 µs per kernel boundary for both, so imd's 3
+  launches cost 1.3 µs of gaps against GEMMul8's 3.3 µs (6 launches).
+- **The host is not the bottleneck** (as in NOTES-A1): imd_contract spends 0.3 µs before
+  its first launch and ~6 µs in total (nsys-inflated) while its GPU span is 14–96 µs.
+  GEMMul8's host time is larger (17 µs for 6 launches under nsys) but also below its span.
+- **The closest margins are s512 (7 %) and sq1024 (7 %) at N = 8**, and there K5 stands
+  out: 9.4 µs for 262 144 outputs at s512, where GEMMul8's whole reconstruction (mod +
+  undo) takes 5.4 µs; KF 12.5 µs does both operands' scaling and 8 residues (GEMMul8's two
+  scaling kernels: 11.6 µs); K4 (7.5 µs, 128×128, the per-case best of A3) is half of
+  GEMMul8's two INT8 GEMMs + mod (15.1 µs).
+
+### 1.2 Why the sweep said 0.90× / 0.92×: the measurement, not the kernels
+
+The clean sweep times 10 calls per method (after 2 warm-up calls), GEMMul8 first, then imd,
+in one process. Per-call event times (`IMD_BENCH_TIMES=1`) show that tiny calls drift
+between **performance states that last from milliseconds to seconds**, and a 10-call
+median samples one of them:
+
+- s256 imd, N = 8, consecutive calls of one process: 47 43 43 43 42 42 41 41 … 40 54 **18
+  18 18 18** 68 **17 17 17 …** µs (the state flipped after ~16 calls); another process:
+  17.4 µs throughout; another: 20.5–21.5 µs throughout.
+- GEMMul8 itself: s512 at N = 14 runs 196 µs per call for 16 calls, then 51 µs; across
+  processes 50, 90, 250 or 56 µs (the "bimodal GEMMul8 at N = 14" of NOTES-A1/A3); s256 at
+  N = 8 19.5 µs in most processes and 29.7 µs in some.
+- Pinning the bench to one core: on a P-core (CPU 2) s256 imd 17.4–18.4 µs, GEMMul8
+  21.5 µs; on an E-core (CPU 20) imd 18.4–19.3 µs, **GEMMul8 29.5 µs** (its 6 launches and
+  cuBLAS host work become host-bound on an E-core). The unpinned bench thread migrates
+  between core types, so this alone moves the ratio by up to 1.5×.
+- Under nsys (host calls slower, GPU never idle as long) the states did not appear: every
+  kernel's duration was stable to ±1 % over 300 calls.
+- Longer warm-up (300 calls instead of 2) did not remove the states (s256 imd 17.2 and
+  20.5 µs in two processes with the same settings; GEMMul8 N = 14 56–260 µs).
+
+The causes are outside the kernels (host core type and frequency under `powersave`, GPU
+DVFS and PCIe link power states: at idle the link is at gen1, SM 210 MHz, memory 405 MHz),
+and they cannot be locked without root (`nvidia-smi -lgc`, governor). A sequential
+"GEMMul8 then imd" measurement of a 20 µs call therefore has a ±20 % state error that a
+10-call median does not average out. **Interleaving the two methods call by call** puts
+both in the same state; the per-pair ratio is stable (p10–p90 within ±3–6 % on most
+cases):
+
+`imd_bench --methods duel --reps 400` (`build/nsys/duel-base1.jsonl`; µs medians; ratio =
+median over pairs of t(GEMMul8) / t(imd), > 1: imd faster; permuted cases against
+perm + GEMMul8):
+
+| case | N | GEMMul8 | imd | ratio [p10, p90] |
+|---|---|---|---|---|
+| s128 | 8 | 17.4 | 14.3 | 1.20 [1.13, 1.23] |
+| s256 | 8 | 19.7 | 16.6 | 1.18 [1.13, 1.24] |
+| s512 | 8 | 30.7 | 29.6 | **1.04** [1.02, 1.07] |
+| s_cc8 | 8 | 39.9 | 29.7 | 1.35 [1.31, 1.39] |
+| s_cc16 | 8 | 341.0 | 274.4 | 1.24 [1.23, 1.26] |
+| s_df | 8 | 62.1 | 44.4 | 1.39 [1.36, 1.42] |
+| s_perm | 8 | 69.0 | 44.8 | 1.55 [1.52, 1.57] |
+| sq1024 | 8 | 94.1 | 94.3 | **1.01** [0.93, 1.07] |
+| s128 | 14 | 29.3 | 16.1 | 2.00 [1.78, 4.31] |
+| s256 | 14 | 31.1 | 18.5 | 1.67 [1.60, 3.54] |
+| s512 | 14 | 47.9 | 38.9 | 1.25 [1.22, 2.08] |
+| s_cc8 | 14 | 57.3 | 38.9 | 1.48 [1.44, 1.53] |
+| s_cc16 | 14 | 545.8 | 398.0 | 1.38 [1.36, 1.39] |
+| s_df | 14 | 98.4 | 66.6 | 1.48 [1.44, 1.52] |
+| s_perm | 14 | 107.5 | 66.6 | 1.60 [1.56, 1.64] |
+| sq1024 | 14 | 170.8 | 154.5 | 1.11 [1.08, 1.15] |
+
+So in a like-for-like measurement imd is at or above GEMMul8 on the whole small family
+before any change; the two thin margins are **s512 (1.04×) and sq1024 (1.01×) at N = 8**,
+where a state flip can still push a sequential measurement below 1. Those are what §2
+works on: K5 first (9.4 µs at s512, 18.8 µs at sq1024; GEMMul8 reconstructs in 5.4 /
+13.8 µs), then KF.
+
+### 1.3 K5 and KF at s512, N = 8 (ncu 2026.3.1, `--set full`, clock locked by ncu at ~2.45 GHz)
+
+| kernel | grid × block | regs | occupancy (theor. / achieved) | waves | warp instr | instr / thread | cycles per issued instr | IPC |
+|---|---|---|---|---|---|---|---|---|
+| KF `kf_scale_pack<8,4>` | 512 × 256 | 64 | 67 / 56 % | 1.0 | 9.36 M | 2 285 (571 per value) | 13.6 | 1.97 |
+| K4 128×128 | 128 × 128 | 250 | 17 / 8 % | 0.5 | 1.45 M | | 7.2 | 0.56 |
+| K5 `k5_crt<3,1>` | 1 024 × 256 | 46 | 83 / 67 % | **1.6** | 6.39 M | **780 per output** | 15.5 | 2.04 |
+
+- **K5 is latency-bound with a long per-element chain and 1.6 waves.** 780 instructions per
+  output at N = 8 (3 limbs) of which the §3.6 CRT steps are only ~120: the kernel is
+  generic in N, so it computes 64-bit addresses for all 12 planes its limb count allows
+  (predicated: ~150 instructions), loads every constant of a step with a runtime-indexed
+  `LDC` (N is a kernel argument), branches per step on `l < N` and on p = 256, and does two
+  32-bit divisions per element for the index split. 46 registers allow 5 blocks of 256 per
+  SM, so 1 024 blocks take 1.6 waves.
+- **KF is latency-bound too** (one wave, 2 285 instructions per thread): a third in the
+  residue emit (8 moduli × 4 values), a quarter of the stall samples on the tile's global
+  loads, the rest in the §3.2 K1 integers (u128 squares, shuffles, the 256-bit compare).
