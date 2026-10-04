@@ -411,6 +411,12 @@ IMD_API int imd_prof_set_k4_config(int32_t config) {
   imd::detail::k4_config_override() = config;
   return 0;
 }
+// Benchmark-only (A5): K5's elements per thread for later calls (1, 2, 4; 0: the rule).
+IMD_API int imd_prof_set_k5_elems(int32_t elems) {
+  if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
+  imd::detail::k5_elems_override() = elems;
+  return 0;
+}
 #endif
 
 }  // extern "C"

@@ -89,6 +89,9 @@ int& fused_override();
 // K5's one-element-per-thread limit (contract.cu; elements per SM), read by imd_contract;
 // changed only by the test hook imd_test_set_k5_one_elem (not thread-safe, like the hooks).
 int64_t& k5_one_elem_per_sm();
+// A5: K5's elements per thread forced to 1, 2 or 4 (0: the launch rule), read by
+// imd_contract; changed only by the hooks imd_test_set_k5_elems / imd_prof_set_k5_elems.
+int& k5_elems_override();
 
 // The execution data of a plan (api.cpp), for the test hooks; nullptr for a null plan.
 const ExecPlan* exec_of(imd_plan_t plan);

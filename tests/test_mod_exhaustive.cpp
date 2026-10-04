@@ -105,6 +105,10 @@ int main() {
       if (p != 256u)
         for (uint32_t s = 0; s <= 7u * 255u * 255u; ++s)
           bytes_bad += s - p * static_cast<uint32_t>(imd::device::umulhi64(magic, s)) != s % p;
+      // A5: the 32-bit magic of mod_p_bytes32, every p (2^24 for 256), the same range.
+      const uint32_t m32 = imd::device::kMagic32.m[l];
+      for (uint32_t s = 0; s <= 7u * 255u * 255u; ++s)
+        bytes_bad += s - p * static_cast<uint32_t>((uint64_t{s} * m32) >> 32) != s % p;
       uint64_t x = 0x9E3779B97F4A7C15ull ^ static_cast<uint64_t>(l);
       const uint64_t edges[] = {0, 1, 255, 256, 0xFFFFFFFFull, 1ull << 32, (1ull << 53) - 1,
                                 1ull << 53, (1ull << 54) - 1};
@@ -120,6 +124,9 @@ int main() {
                                                     static_cast<uint32_t>(mu >> 32), bw.lo[l],
                                                     bw.hi[l], p, magic);
         bytes_bad += r != mu % p;
+        bytes_bad += imd::device::mod_p_bytes32(static_cast<uint32_t>(mu),
+                                                static_cast<uint32_t>(mu >> 32), bw.lo[l],
+                                                bw.hi[l], p, m32) != mu % p;
       }
     }
   }

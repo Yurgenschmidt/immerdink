@@ -25,14 +25,16 @@ constexpr ByteWeights make_byte_weights(const imd::constants::Tables& t) {
 }
 
 // ceil(2^32 / p_l) for mod_p_small32, from epi_magic = ceil(2^64 / p_l):
-// ceil(ceil(2^64/p) / 2^32) = ceil(2^32/p). 0 for p = 256 (reduced by mask).
+// ceil(ceil(2^64/p) / 2^32) = ceil(2^32/p). For p = 256 it is 2^24 = 2^32 / 256 exactly, so
+// umulhi(n, 2^24) = n >> 8 = floor(n / 256) for every n < 2^32: mod_p_small32 reduces p = 256
+// by its mask, mod_p_bytes32 (A5) by the same multiply-high as the other moduli.
 struct Magic32 {
   uint32_t m[imd::constants::kNMax];
 };
 constexpr Magic32 make_magic32(const imd::constants::Tables& t) {
   Magic32 r{};
   for (int l = 0; l < imd::constants::kNMax; ++l)
-    r.m[l] = t.moduli[l] == 256u ? 0u
+    r.m[l] = t.moduli[l] == 256u ? (1u << 24)
                                  : static_cast<uint32_t>((t.epi_magic[l] >> 32) +
                                                          ((t.epi_magic[l] & 0xFFFFFFFFull) != 0));
   return r;

@@ -18,10 +18,10 @@ first.
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
 - **D3 gate (Eric, 2026-10-04):** D3 begins with a design/theory discussion with Eric to narrow
   the questions. Do not start D3 agents or specs before that.
-- **Roadmap done:** A1, A2, A3, A4, D1, D4 part 1. Next by Eric's priority: D3 (packed
+- **Roadmap done:** A1, A2, A3, A4, A5 (2026-10-04, docs/NOTES-A5.md), D1, D4 part 1. Next by Eric's priority: D3 (packed
   symmetric contractions; design preference: one generic kernel, else split; TLA+ first),
   then B2 (performance model that ehrenfest can call), B1, then C1 after Ozaki-II is polished.
-  A5 (small-shape polish) is low priority but kept. SE items are parked.
+  SE items are parked. For tiny-call timings use `imd_bench --methods duel` (NOTES-A5 §1.2).
 
 ## Open items needing Eric
 

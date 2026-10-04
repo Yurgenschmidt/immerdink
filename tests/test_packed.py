@@ -242,13 +242,13 @@ def run_packed_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, 
                 opB = hz.Operand(pB, dPs[1].value + GUARD if dPs[1] else None, pbs[1], handles[1])
                 allocs, launches0 = lib.alloc_count(), lib.launch_count()
                 if lib.has_test_hooks:
-                    lib.set_k5_one_elem(0 if fmode >= 0 else -1)
+                    lib.set_k5_mapping(fmode)
                 try:
                     st = lib.contract_packed(plan, alpha, opA, opB, beta, pC, dW.value + GUARD,
                                              ws_bytes)
                 finally:
                     if lib.has_test_hooks:
-                        lib.set_k5_one_elem(-1)
+                        lib.reset_k5_mapping()
                 if st != "SUCCESS":
                     raise Fail(f"{vname}: imd_contract_packed {st}")
                 if launches0 is not None and lib.has_test_hooks:

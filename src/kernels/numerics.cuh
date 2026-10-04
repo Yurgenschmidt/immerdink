@@ -62,6 +62,41 @@ __device__ __forceinline__ u128 square_term(uint64_t b, int gamma) {
   return (sq & ((static_cast<u128>(1) << s) - 1)) != 0 ? q + 1 : q;
 }
 
+// A5: the same term with the significand normalized to 53 bits, in two 64-bit words (the
+// generic 128-bit shifts above are ~70 instructions per value; KF, KL and K1 run this once
+// per operand element). m' = m 2^z in [2^52, 2^53) (z > 0 only for subnormals) has
+// ilogb(x) = e' + 52 for e' = e - z, so the same real number m^2 2^t = m'^2 / 2^s with
+// s = 2(gamma - ilogb(x)) + 104 - F >= 104 - F = 44. m'^2 < 2^106: s >= 106 gives 1 (0 <
+// value < 1); otherwise the value is < 2^(106 - 44) = 2^62 and the result is
+// floor(m'^2 / 2^s) + (remainder != 0) from hi:lo = m'^2. Equal to square_term for every
+// finite nonzero x with ilogb(x) <= gamma (GPU test: tests/test_device_constants.cu).
+static_assert(imd::constants::kF >= 0 && imd::constants::kF <= 61,
+              "square_term_n: s >= 104 - F >= 43 and results below 2^(F + 2) <= 2^63");
+__device__ __forceinline__ uint64_t square_term_n(uint64_t b, int gamma) {
+  const int E = static_cast<int>((b >> 52) & 0x7FF);
+  const uint64_t f = b & kFracMask;
+  uint64_t m;
+  int il;  // ilogb(x)
+  if (E != 0) {
+    m = f | (uint64_t{1} << 52);
+    il = E - 1023;
+  } else {  // subnormal, f != 0: bitlen(f) = 64 - lz
+    const int lz = __clzll(static_cast<long long>(f));
+    m = f << (lz - 11);
+    il = -1075 + (64 - lz);
+  }
+  const int s = 2 * (gamma - il) + 104 - imd::constants::kF;
+  if (s >= 106) return 1;
+  const uint64_t lo = m * m, hi = __umul64hi(m, m);
+  if (s < 64) {
+    const uint64_t q = (hi << (64 - s)) | (lo >> s);
+    return q + ((lo << (64 - s)) != 0 ? 1 : 0);
+  }
+  const int r = s - 64;
+  const uint64_t q = hi >> r;
+  return q + ((lo != 0 || (r != 0 && (hi << (64 - r)) != 0)) ? 1 : 0);
+}
+
 __device__ __forceinline__ int bitlen128(u128 x) {
   const auto hi = static_cast<uint64_t>(x >> 64), lo = static_cast<uint64_t>(x);
   if (hi != 0) return 128 - __clzll(static_cast<long long>(hi));

@@ -108,4 +108,21 @@ IMD_HD uint32_t mod_p_bytes(uint32_t lo, uint32_t hi, uint32_t wlo, uint32_t whi
   return s - p * static_cast<uint32_t>(umulhi64(magic, s));
 }
 
+// A5: the same residue with the 32-bit magic m32 = ceil(2^32/p) (Magic32: 2^24 for p = 256),
+// one multiply-high instead of the 64-bit one, branch-free for every p. Exact for s < 2^24:
+// s m32 = (s 2^32 + s e) / p with 0 <= e < p <= 256 (e = 0 for p = 256), and s e < 2^24 2^8
+// = 2^32, so floor(s m32 / 2^32) = floor(s / p) (as for mod_p_small32); here s < 7 * 255^2
+// < 2^19. For p = 256 the weights are 1, 0, ... so s = lo & 255 and the quotient is 0.
+// (Exhaustive over [0, 7 * 255^2] and end to end: tests/test_mod_exhaustive.cpp.)
+IMD_HD uint32_t mod_p_bytes32(uint32_t lo, uint32_t hi, uint32_t wlo, uint32_t whi, uint32_t p,
+                              uint32_t m32) {
+  const uint32_t s = dot_bytes(lo, wlo) + dot_bytes(hi, whi);
+#if defined(__CUDA_ARCH__)
+  const uint32_t q = __umulhi(s, m32);
+#else
+  const auto q = static_cast<uint32_t>((uint64_t{s} * m32) >> 32);
+#endif
+  return s - p * q;
+}
+
 }  // namespace imd::device
