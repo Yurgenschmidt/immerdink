@@ -1121,6 +1121,278 @@ def test_tensor():
     RESULTS["tensor"] = f"{checked} random lowerings ({swapped} swapped, {diag} diagonal, {fused} fusions)"
 
 
+# ---------------------------------------------------------------------------------------
+# (10) packed operands (DESIGN v1.7 §6b, D1)
+# ---------------------------------------------------------------------------------------
+
+def tensor_for(desc, rng, bad=0.0):
+    """o.Tensor holding random values for every element of desc (negative strides: base),
+    with Inf / NaN / zeros sprinkled at rate `bad`."""
+    lo = sum(min(0, s * (e - 1)) for e, s in zip(desc.extent, desc.stride)) if not desc.empty() else 0
+    hi = sum(max(0, s * (e - 1)) for e, s in zip(desc.extent, desc.stride)) if not desc.empty() else 0
+    buf = []
+    for _ in range(hi - lo + 1):
+        x = rng.uniform(-1, 1) * 2.0 ** rng.randint(-20, 20)
+        if rng.random() < bad:
+            x = rng.choice((math.inf, -math.inf, math.nan, 0.0))
+        buf.append(x)
+    return o.Tensor(buf, -lo, desc)
+
+
+def check_pack_bytes(data, pv, view, trace, role):
+    """Every byte of a pack against the in-line run (same orders): sigma, flags and every
+    plane's residues equal the trace; K padding, the tail and the alignment gaps are 0."""
+    assert len(data) == pv.pack_bytes
+    rows = view.m if role == "A" else view.n
+    assert (pv.b, pv.r, pv.k) == (view.b, rows, view.k)
+    so, fo, ro = pv.regs["sig"][0], pv.regs["flag"][0], pv.regs["res"][0]
+    defined = set()
+    plane = pv.b * pv.r * pv.k_hat
+    for lam, t in enumerate(trace["batches"]):
+        sig, flg = (t["sigma"], t["fA"]) if role == "A" else (t["tau"], t["fB"])
+        R = t["RA"] if role == "A" else t["RB"]
+        for rho in range(rows):
+            idx = lam * pv.r + rho
+            assert int.from_bytes(data[so + 2 * idx:so + 2 * idx + 2], "little", signed=True) == sig[rho]
+            assert data[fo + idx] == (1 if flg[rho] else 0)
+            defined |= {so + 2 * idx, so + 2 * idx + 1, fo + idx}
+            for l in range(pv.N):
+                base = ro + l * plane + idx * pv.k_hat
+                got = [x - 256 if x > 127 else x for x in data[base:base + pv.k]]
+                assert got == R[l][rho], (l, lam, rho)
+                defined |= set(range(base, base + pv.k))
+    assert all(data[p] == 0 for p in range(len(data)) if p not in defined), "padding / tail / gaps"
+
+
+def test_packed():
+    import params as pp
+    rng = random.Random(1061)
+    # §6b.4 layout: the oracle's transcription == params.py (cert_pack_layout)
+    for N in (2, 9, 20):
+        for b in (0, 1, 3):
+            for r in (0, 1, 17, 32):
+                for k in (0, 1, 5, 16, 131057):
+                    regs, total = o.pack_layout(b, r, k, N)
+                    pregs, ptotal = pp.pack_layout(b, r, k, N)
+                    assert total == ptotal and {nm: (off, nb) for nm, off, nb in pregs} == regs
+                    assert o.pack_ws_bytes(b, r, k) == pp.pack_ws_bytes(b, r, k)
+    stats = {"cases": 0, "packs": 0, "both": 0, "auto": 0, "swapped_role_b": 0, "flagged": 0,
+             "orders_differ": 0, "mismatch_classes": 0, "skipped_k_empty": 0}
+    # Random contractions: for each caller operand X, the imd_pack_desc_for pack (v1.5's
+    # orders) and an AUTO pack (X's stride order); bytes vs the in-line run; packed
+    # contractions bit-exact vs the unpacked run in the adopted order (and vs the plain run).
+    for it in range(260):
+        A, B, C = rand_desc_triple(rng)
+        try:
+            v = o.lower(A, B, C)
+        except (o.InvalidValue, o.NotSupported):
+            continue
+        if v.empty_output() or v.k < 2:
+            continue
+        N = rng.choice((2, 3, 5, 9, 14))
+        rnd = rng.choice(("RN", "TRUNC"))
+        g = rng.randint(1, N)
+        bad = 0.15 if rng.random() < 0.3 else 0.0
+        TA, TB, TC = tensor_for(A, rng, bad), tensor_for(B, rng, bad), tensor_for(C, rng)
+        alpha, beta = rng.choice(((1.0, 0.0), (-0.75, 1.25)))
+        plain = o.contract_tensor(TA, TB, TC, alpha, beta, N, rnd, g)
+        packs = [None, None]
+        for x, (Xd, Tx) in enumerate(((A, TA), (B, TB))):
+            role = ("A", "B")[x] if not v.swapped else ("B", "A")[x]
+            partner_only = any(lab not in Xd.label for lab in v.order["K"])
+            pd = o.pack_desc_for(A, B, C, o.EMULATE, x, N, rnd)
+            try:
+                pv = o.pack_lower(pd)
+            except o.NotSupported:          # X has no K label left (all partner-only)
+                stats["skipped_k_empty"] += 1
+                continue
+            data = o.pack(Tx, pd)
+            pk = o.PackedOperand(pd, data)
+            if partner_only:                # §6b.10 #10: PACK_MISMATCH (CLASSES)
+                try:
+                    o.contract_tensor(TA, TB, TC, alpha, beta, N, rnd, g,
+                                      packs=(pk, None) if x == 0 else (None, pk))
+                    raise AssertionError("partner-only K label accepted")
+                except o.PackMismatch as e:
+                    assert e.reason == o.MISMATCH_CLASSES
+                stats["mismatch_classes"] += 1
+                continue
+            t = {}
+            got = o.contract_tensor(TA, TB, TC, alpha, beta, N, rnd, g, trace=t,
+                                    packs=(pk, None) if x == 0 else (None, pk))
+            assert all(same_bits(p, q) for p, q in zip(got, plain)), "desc_for pack != plain"
+            ti = {}
+            o.contract_tensor(TA, TB, TC, alpha, beta, N, rnd, g, trace=ti)
+            check_pack_bytes(data, pv, ti["view"], ti, role)
+            packs[x] = pk
+            stats["packs"] += 1
+            stats["swapped_role_b"] += role == "B"
+            stats["flagged"] += any(any(bt["fA"]) or any(bt["fB"]) for bt in ti["batches"])
+            # AUTO pack: X's own stride order; == the unpacked run in the adopted order
+            K = [lab for lab in dict.fromkeys(Xd.label) if lab not in C.label]
+            Lb = [lab for lab in dict.fromkeys(Xd.label)
+                  if lab in C.label and lab in (B if x == 0 else A).label]
+            pa = o.PackDesc(Xd, N, rnd, o.ORDER_AUTO, K, Lb)
+            da = o.pack(Tx, pa)
+            ta = {}
+            ga = o.contract_tensor(TA, TB, TC, alpha, beta, N, rnd, g, trace=ta,
+                                   packs=(o.PackedOperand(pa, da), None) if x == 0
+                                   else (None, o.PackedOperand(pa, da)))
+            orders = ta["packed"]["orders"]
+            tr = {}
+            ref = o.contract_tensor(TA, TB, TC, alpha, beta, N, rnd, g, orders=orders, trace=tr)
+            assert all(same_bits(p, q) for p, q in zip(ga, ref)), "AUTO pack != adopted-order run"
+            check_pack_bytes(da, o.pack_lower(pa), tr["view"], tr, role)
+            if bad == 0.0:     # unflagged: the order does not matter (EmulatedOrderFree)
+                assert all(same_bits(p, q) for p, q in zip(ga, plain))
+            stats["orders_differ"] += any(orders[c] != v.order[c] for c in orders)
+            stats["auto"] += 1
+        if packs[0] is not None and packs[1] is not None:
+            got = o.contract_tensor(TA, TB, TC, alpha, beta, N, rnd, g, packs=tuple(packs))
+            assert all(same_bits(p, q) for p, q in zip(got, plain)), "both packed != plain"
+            stats["both"] += 1
+        stats["cases"] += 1
+    assert stats["cases"] > 60 and stats["both"] > 20 and stats["swapped_role_b"] > 10 and \
+        stats["flagged"] > 5 and stats["orders_differ"] > 5 and stats["mismatch_classes"] > 3, stats
+
+    # One pack reused across contractions: different partners, C layouts (swap: role B),
+    # batch L and N row widths; each equals the unpacked run in the adopted order.
+    i, j, kk, l, jj = 1, 2, 3, 4, 5
+    X = o.Desc([5, 7, 3], [21, 3, 1], [i, kk, l])                    # X[i, k, l], l fastest
+    TX = tensor_for(X, rng, 0.1)
+    pdX = o.PackDesc(X, 9, "RN", o.ORDER_AUTO, [kk], [l])
+    dX = o.pack(TX, pdX)
+    pkX = o.PackedOperand(pdX, dX)
+    partners = [(o.Desc([7, 4, 3], [12, 3, 1], [kk, j, l]), o.Desc([5, 4, 3], [12, 3, 1], [i, j, l])),
+                (o.Desc([7, 4, 3], [1, 21, 7], [kk, j, l]), o.Desc([5, 4, 3], [1, 15, 5], [i, j, l])),
+                (o.Desc([3, 7, 9], [63, 9, 1], [l, kk, jj]), o.Desc([3, 9, 5], [45, 5, 1], [l, jj, i])),
+                (o.Desc([2, 7, 3], [21, 3, 1], [j, kk, l]), o.Desc([3, 5, 2], [1, 3, 15], [l, i, j]))]
+    roles = set()
+    for Bd, Cd in partners:
+        TB, TC = tensor_for(Bd, rng), tensor_for(Cd, rng)
+        t = {}
+        got = o.contract_tensor(TX, TB, TC, 1.0, 0.0, 9, "RN", 3, trace=t, packs=(pkX, None))
+        ref = o.contract_tensor(TX, TB, TC, 1.0, 0.0, 9, "RN", 3, orders=t["packed"]["orders"])
+        assert all(same_bits(p, q) for p, q in zip(got, ref))
+        roles.add(t["packed"]["roles"][0])
+        # X as the caller's B of the same contraction (operands exchanged)
+        got = o.contract_tensor(TB, TX, TC, 1.0, 0.0, 9, "RN", 3, trace=t, packs=(None, pkX))
+        ref = o.contract_tensor(TB, TX, TC, 1.0, 0.0, 9, "RN", 3, orders=t["packed"]["orders"])
+        assert all(same_bits(p, q) for p, q in zip(got, ref))
+        roles.add(t["packed"]["roles"][1])
+    assert roles == {"A", "B"}, roles
+    # the same tensor under renamed labels has the same key (label-free) and is accepted
+    Xr = o.Desc([5, 7, 3], [21, 3, 1], [11, 13, 14])
+    assert o.pack_lower(o.PackDesc(Xr, 9, "RN", o.ORDER_AUTO, [13], [14])).key == o.pack_lower(pdX).key
+
+    # A7 through a pack: the native path of a flagged output follows the ADOPTED K order.
+    # Products p(k1, k2) = X Y: p(1,0) = p(1,1) = 2 MAX, p(0,1) = -Inf, p(0,0) = 0. k1
+    # fastest (X's AUTO order): 0, Inf, -Inf -> NaN; k2 fastest (the plan's own order: B is
+    # big, k2 is fastest in Y): 0, -Inf, ... -> -Inf.
+    k1, k2 = 6, 7
+    MAX = 1.7976931348623157e308
+    Xa = o.Desc([2, 2], [1, 2], [k1, k2])            # X[k1, k2]: k1 fastest
+    Ya = o.Desc([2, 2, 4], [8, 1, 24], [k1, k2, j])  # Y[k1, k2, j]: k2 fastest in Y
+    Ca = o.Desc([4], [1], [j])
+    xa = [0.0, MAX, -math.inf, MAX]
+    ya = [0.0] * 96
+    for jx in range(4):
+        for a1 in range(2):
+            for a2 in range(2):
+                ya[a1 * 8 + a2 + jx * 24] = ((1.0, 1.0), (2.0, 2.0))[a1][a2]
+    TXa, TYa, TCa = o.Tensor(xa, 0, Xa), o.Tensor(ya, 0, Ya), o.Tensor([0.0] * 4, 0, Ca)
+    pa = o.PackDesc(Xa, 2, "RN", o.ORDER_AUTO, [k1, k2], [])
+    pka = o.PackedOperand(pa, o.pack(TXa, pa))
+    t = {}
+    got = o.contract_tensor(TXa, TYa, TCa, 1.0, 0.0, 2, packs=(pka, None), trace=t)
+    plain = o.contract_tensor(TXa, TYa, TCa, 1.0, 0.0, 2)
+    ref = o.contract_tensor(TXa, TYa, TCa, 1.0, 0.0, 2, orders=t["packed"]["orders"])
+    assert t["packed"]["orders"]["K"] == [k1, k2] and o.lower(Xa, Ya, Ca).order["K"] == [k2, k1]
+    assert all(same_bits(p, q) for p, q in zip(got, ref))
+    assert math.isnan(got[0]) and plain[0] == -math.inf, (got, plain)   # oracle A7 via the pack
+    # with imd_pack_desc_for (GIVEN, v1.5's orders) it is the plain contraction, bit for bit
+    pg = o.pack_desc_for(Xa, Ya, Ca, o.EMULATE, 0, 2)
+    got = o.contract_tensor(TXa, TYa, TCa, 1.0, 0.0, 2,
+                            packs=(o.PackedOperand(pg, o.pack(TXa, pg)), None))
+    assert all(same_bits(p, q) for p, q in zip(got, plain))
+
+    # PACK_MISMATCH reasons (§6b.5), in the plan-time order
+    Bd, Cd = partners[0]
+    TB, TC = tensor_for(Bd, rng), tensor_for(Cd, rng)
+
+    def reason(packs, N=9, rnd="RN", Ad=X, Bdd=Bd, Cdd=Cd):
+        try:
+            o.lower_packed(Ad, Bdd, Cdd, o.EMULATE, packs, N, rnd)
+            return 0
+        except o.PackMismatch as e:
+            return e.reason
+    assert reason((pdX, None)) == 0
+    assert reason((pdX, None), N=8) == o.MISMATCH_MODULI
+    assert reason((pdX, None), rnd="TRUNC") == o.MISMATCH_ROUNDING
+    # a label batch in the plan but a row in the pack; a partner-only K label; another rank
+    assert reason((o.PackDesc(X, 9, "RN", o.ORDER_AUTO, [kk], []), None)) == o.MISMATCH_CLASSES
+    Bpo = o.Desc([7, 4, 3, 2], [24, 6, 2, 1], [kk, j, l, 9])        # label 9 only in B: K
+    assert reason((pdX, None), Bdd=Bpo) == o.MISMATCH_CLASSES
+    X1 = o.Desc([5, 7, 3, 1], [21, 3, 1, 1], [i, kk, l, 8])
+    assert reason((pdX, None), Ad=X1) == o.MISMATCH_CLASSES
+    # extents / strides of the plan's X differ from the pack's tensor
+    X6 = o.Desc([5, 7, 3], [21, 3, 1], [i, kk, l])
+    Xs = o.Desc([5, 7, 3], [1, 5, 35], [i, kk, l])
+    assert reason((o.PackDesc(Xs, 9, "RN", o.ORDER_GIVEN, [kk], [l], [i]), None), Ad=X6) == \
+        o.MISMATCH_STRIDES
+    Xe = o.Desc([6, 7, 3], [21, 3, 1], [i, kk, l])
+    Ce = o.Desc([6, 4, 3], [12, 3, 1], [i, j, l])
+    assert reason((pdX, None), Ad=Xe, Cdd=Ce) == o.MISMATCH_EXTENTS
+    # both packed, K orders differ (two K labels)
+    Xk = o.Desc([5, 7, 2], [14, 2, 1], [i, kk, jj])
+    Yk = o.Desc([7, 2, 4], [8, 4, 1], [kk, jj, j])
+    Ck = o.Desc([5, 4], [4, 1], [i, j])
+    p1 = o.PackDesc(Xk, 9, "RN", o.ORDER_GIVEN, [kk, jj], [], [i])
+    p2 = o.PackDesc(Yk, 9, "RN", o.ORDER_GIVEN, [jj, kk], [], [j])
+    p3 = o.PackDesc(Yk, 9, "RN", o.ORDER_GIVEN, [kk, jj], [], [j])
+    assert reason((p1, p2), Ad=Xk, Bdd=Yk, Cdd=Ck) == o.MISMATCH_ORDER
+    assert reason((p1, p3), Ad=Xk, Bdd=Yk, Cdd=Ck) == 0
+    # key digest: FNV-1a, equal keys -> equal digests
+    assert o.pack_lower(p1).digest == o.fnv1a64(o.pack_lower(p1).key)
+
+    # pack_lower statuses (§6b.3, §6b.5)
+    def st(pd):
+        try:
+            o.pack_lower(pd)
+            return "SUCCESS"
+        except o.InvalidValue:
+            return "INVALID_VALUE"
+        except o.NotSupported:
+            return "NOT_SUPPORTED"
+    assert st(o.PackDesc(X, 9, "RN", o.ORDER_AUTO, [kk, 99], [l])) == "INVALID_VALUE"
+    assert st(o.PackDesc(X, 9, "RN", o.ORDER_AUTO, [kk, kk], [l])) == "INVALID_VALUE"
+    assert st(o.PackDesc(X, 9, "RN", o.ORDER_AUTO, [kk], [kk])) == "INVALID_VALUE"
+    assert st(o.PackDesc(X, 9, "RN", o.ORDER_GIVEN, [kk], [l], [])) == "INVALID_VALUE"
+    assert st(o.PackDesc(X, 9, "RN", o.ORDER_AUTO, [kk], [l], [i])) == "INVALID_VALUE"
+    assert st(o.PackDesc(X, 21, "RN", o.ORDER_AUTO, [kk], [l])) == "INVALID_VALUE"
+    assert st(o.PackDesc(o.Desc([2, 3], [1, 2], [i, i]), 9, "RN", o.ORDER_AUTO, [i])) == "INVALID_VALUE"
+    assert st(o.PackDesc(X, 9, "RN", o.ORDER_AUTO, [], [l])) == "NOT_SUPPORTED"      # K empty
+    Xone = o.Desc([5, 1], [1, 5], [i, kk])
+    assert st(o.PackDesc(Xone, 9, "RN", o.ORDER_AUTO, [kk])) == "NOT_SUPPORTED"     # k = 1
+    big = o.Desc([32042], [1], [kk])                 # N = 2: T = 180, kappa(32042) = 180
+    assert st(o.PackDesc(big, 2, "RN", o.ORDER_AUTO, [kk])) == "NOT_SUPPORTED"
+    assert st(o.PackDesc(big, 2, "TRUNC", o.ORDER_AUTO, [kk])) == "SUCCESS"
+    assert st(o.PackDesc(o.Desc([32041], [1], [kk]), 2, "RN", o.ORDER_AUTO, [kk])) == "SUCCESS"
+    assert o.pack_lower(o.PackDesc(o.Desc([0, 4], [4, 1], [i, kk]), 9, "RN", o.ORDER_AUTO,
+                                   [kk])).pack_bytes == 0                          # b r = 0
+    # DIRECT mode, alpha = 0 and k = 0 calls with a matching pack ignore it (same C bits)
+    for mode, alpha in ((o.DIRECT, 1.0), (o.EMULATE, 0.0)):
+        got = o.contract_tensor(TX, TB, TC, alpha, 0.5, 9, mode=mode, packs=(pkX, None))
+        t = {}
+        o.contract_tensor(TX, TB, TC, alpha, 0.5, 9, mode=mode, packs=(pkX, None), trace=t)
+        ref = o.contract_tensor(TX, TB, TC, alpha, 0.5, 9, mode=mode, orders=t["packed"]["orders"])
+        assert all(same_bits(p, q) for p, q in zip(got, ref))
+    # g invariance of the packed path
+    outs = [o.contract_tensor(TX, TB, TC, 1.0, 0.0, 9, "RN", g, packs=(pkX, None)) for g in (1, 4, 9)]
+    assert all(all(same_bits(p, q) for p, q in zip(outs[0], x)) for x in outs[1:])
+    RESULTS["packed"] = ", ".join(f"{k} {v}" for k, v in stats.items())
+
+
 def check_fusion(v, g):
     """§5 step 9 on group g of view v: the fused modes split the canonical order into
     consecutive runs; each run is a chain (s_X(q) = s_X(p) e(p) for every tensor X), runs
@@ -1235,14 +1507,15 @@ def main():
                      ("edges (5)", test_edges), ("adversarial (A)", test_adversarial),
                      ("stats (6)", test_stats),
                      ("dgemm-like (7)", test_dgemm_like), ("tensor front end (8)", test_tensor),
-                     ("lazy lowering (9)", test_lazy_lower)):
+                     ("lazy lowering (9)", test_lazy_lower),
+                     ("packed operands (10)", test_packed)):
         t1 = time.time()
         fn()
         print(f"PASS  {name:24s} {time.time() - t1:7.1f}s", flush=True)
     hi, hi_rn, lo = sigma_extremes()
     print()
     print("moduli source:", o.MODULI_SOURCE)
-    for key in ("tensor", "params_crosscheck", "fma_checked", "crt_L128_N17_overflows", "neg_rn_without_kappa",
+    for key in ("tensor", "packed", "params_crosscheck", "fma_checked", "crt_L128_N17_overflows", "neg_rn_without_kappa",
                 "rn_boundary_N2_k32041", "sweep_runs", "determinism_runs"):
         print(f"{key}: {RESULTS[key]}")
     print(f"bound tightness: max |emul-exact|/l1-bound = {BOUND_STATS['l1_max_ratio']:.3f}; "

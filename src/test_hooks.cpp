@@ -51,7 +51,9 @@
 //       with its map entries; then (v1.4) whether it takes the fused path and its kernel
 //       launches per imd_contract with alpha != 0; then (v1.5) its K4 configuration, the
 //       configuration of its K4 parameters (both -1 without K4) and its SM count; then (v1.6)
-//       its fused_large bit mask (the operands KL scales and packs). Returns 0,
+//       its fused_large bit mask (the operands KL scales and packs); then (v1.7) its packed
+//       slots (bit 0 / 1: the caller's A / B) and the pack bytes of the post-swap A and B
+//       (0 for an in-line operand). The host payload includes the copied slot keys. Returns 0,
 //       or 1 for a null argument; *count as above.
 #include <cstdint>
 #include <vector>
@@ -162,6 +164,7 @@ IMD_API int imd_test_plan_sizes(imd_plan_t plan, int64_t* out, int64_t cap, int6
     host += lw.order[g].size() * sizeof(int32_t) + lw.fused[g].size() * sizeof(imd::detail::FusedMode);
   host += e.vec_desc.modes.size() * sizeof(imd::detail::VecMode);
   host += k4.bytes;
+  host += (plan->slot_key[0].size() + plan->slot_key[1].size()) * sizeof(int64_t);  // v1.7
   v.push_back(static_cast<int64_t>(host));
   v.push_back(e.fused ? 1 : 0);
   v.push_back(imd::detail::plan_launches(e, e.fused, e.fused_large, e.vec_resident, k4.launches));
@@ -172,6 +175,10 @@ IMD_API int imd_test_plan_sizes(imd_plan_t plan, int64_t* out, int64_t cap, int6
   v.push_back(e.sms);
   // v1.6: the operands of the fused large launch KL (bit 0: A, bit 1: B).
   v.push_back(e.fused_large);
+  // v1.7: the packed operands (bit 0 / 1: the caller's A / B) and their pack bytes.
+  v.push_back((plan->slot_key[0].empty() ? 0 : 1) | (plan->slot_key[1].empty() ? 0 : 2));
+  v.push_back(static_cast<int64_t>(e.pack_bytes[0]));
+  v.push_back(static_cast<int64_t>(e.pack_bytes[1]));
   *count = static_cast<int64_t>(v.size());
   if (out != nullptr && *count <= cap)
     for (size_t i = 0; i < v.size(); ++i) out[i] = v[i];

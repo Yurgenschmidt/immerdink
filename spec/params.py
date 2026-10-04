@@ -31,6 +31,8 @@ Map to docs/DESIGN.md (v1). Each certificate in CHECKS names its section.
   §3.8  error contract and worst-case guidance ..................... error_guidance()
   §4a   workspace layout ........................................... workspace_size(),
                                                                      region_offsets()
+  §6b.4 packed-operand byte layout (format 1, D1) .................. pack_layout(),
+                                                                     pack_ws_bytes()
 TLA+ models are scaled-down copies of the same rules; scaled_moduli() and
 scaled_constants() produce their parameters with the same greedy rule.
 """
@@ -423,13 +425,23 @@ def plan_device_bytes(m, n, k, b, vec=VEC_GENERATE):
     return 8 * (2 * m + 2 * n + 2 * k + 3 * b)
 
 
-def workspace_size(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE):
+def _check_packed(packed):
+    packed = frozenset(packed)
+    if not packed <= {"A", "B"}:
+        raise ValueError(f"packed={sorted(packed)}: post-swap roles A, B only")
+    return packed
+
+
+def workspace_size(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE, packed=()):
     """DESIGN §4a, transcribed literally as a closed form:
     sum of align(bytes) over sA sB fA fB vec RA RB W; 0 if b*m*n = 0;
     only align(vec) in DIRECT mode, when k = 0, or when K is empty (k = 1 after lowering:
     extent-1 labels are dropped, so k = 1 <=> K-empty, dispatched to DIRECT; DESIGN v1.1 §4/§4a).
-    v1.2: with vec = RESIDENT the vec term is 0 everywhere (the vectors are plan memory)."""
+    v1.2: with vec = RESIDENT the vec term is 0 everywhere (the vectors are plan memory).
+    v1.7 (§6b.6): `packed` = the POST-SWAP roles ("A", "B") read from packed operands; their
+    sX, fX and RX terms are 0 (the caller's packed buffer holds them)."""
     g = _check_shape(m, n, k, b, N, g, mode, vec)
+    packed = _check_packed(packed)
     if b * m * n == 0:
         return 0
     A = lambda x: align_up(x, REGION_ALIGN)  # noqa: E731
@@ -440,8 +452,9 @@ def workspace_size(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE):
         total = vec
     else:
         kh, nh = align_up(k, K_ALIGN), align_up(n, N_ALIGN)
-        total = (A(2 * b * m) + A(2 * b * n) + A(b * m) + A(b * n) + vec
-                 + A(g * b * m * kh) + A(g * b * nh * kh) + A(N * b * m * nh))
+        pa, pb = "A" not in packed, "B" not in packed      # 1: packed in-line (in the workspace)
+        total = (pa * A(2 * b * m) + pb * A(2 * b * n) + pa * A(b * m) + pb * A(b * n) + vec
+                 + pa * A(g * b * m * kh) + pb * A(g * b * nh * kh) + A(N * b * m * nh))
     if total > SIZE_T_MAX:
         raise OverflowError("workspace does not fit size_t")
     return total
@@ -460,16 +473,19 @@ _REGIONS = [
 ]
 
 
-def region_offsets(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE):
+def region_offsets(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE, packed=()):
     """[(name, start, end)] laid out in §4a order at 256-B-aligned offsets (no vec region
-    with vec = RESIDENT)."""
+    with vec = RESIDENT; v1.7: no sX, fX, RX for a packed post-swap role X in `packed`)."""
     g = _check_shape(m, n, k, b, N, g, mode, vec)
+    packed = _check_packed(packed)
     if b * m * n == 0:
         return []
     kh, nh = align_up(k, K_ALIGN), align_up(n, N_ALIGN)
     names = ["vec"] if (mode == DIRECT or k <= 1) else [r[0] for r in _REGIONS]
     if vec == VEC_RESIDENT:
         names = [x for x in names if x != "vec"]
+    for X in packed:
+        names = [x for x in names if x not in ("s" + X, "f" + X, "R" + X)]
     out, off = [], 0
     for name, f in _REGIONS:
         if name not in names:
@@ -478,6 +494,54 @@ def region_offsets(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE):
         out.append((name, off, off + nbytes))
         off = align_up(off + nbytes, REGION_ALIGN)
     return out
+
+
+# ---------------------------------------------------------------------------
+# §6b.4 packed operand, byte layout format 1 (DESIGN v1.7, D1)
+
+PACK_FORMAT = 1
+_PACK_REGIONS = ("sig", "flag", "res")
+
+
+def pack_layout(b, r, k, N):
+    """DESIGN §6b.4, format 1: [(name, offset, bytes)] of the regions sig (int16 sigma of row
+    (lambda, rho) at lambda r + rho), flag (u8, same index) and res (int8 residues of plane l,
+    row (lambda, rho), k-bar at l b r k_hat + (lambda r + rho) k_hat + k-bar, then a zeroed tail
+    of (ceil(r)_16 - r) k_hat bytes), in that order at 256-aligned offsets, and pack_bytes =
+    the sum of the aligned region sizes. ([], 0) if b r k = 0. OverflowError when a size or
+    the total exceeds uint64 (the library: INVALID_VALUE)."""
+    for name, v in (("b", b), ("r", r), ("k", k)):
+        if not isinstance(v, int) or v < 0:
+            raise ValueError(f"{name}={v} must be a nonnegative int")
+    if not (N_MIN <= N <= N_MAX):
+        raise ValueError(f"N={N}")
+    if b * r * k == 0:
+        return [], 0
+    kh = align_up(k, K_ALIGN)
+    sizes = {"sig": 2 * b * r, "flag": b * r,
+             "res": N * b * r * kh + (align_up(r, N_ALIGN) - r) * kh}
+    out, off = [], 0
+    for name in _PACK_REGIONS:
+        nbytes = sizes[name]
+        if nbytes > SIZE_T_MAX:
+            raise OverflowError(f"pack region {name} exceeds uint64")
+        out.append((name, off, nbytes))
+        off = align_up(off + nbytes, REGION_ALIGN)
+        if off > SIZE_T_MAX:
+            raise OverflowError("pack_bytes exceeds uint64")
+    return out, off
+
+
+def pack_ws_bytes(b, r, k):
+    """The workspace imd_pack needs (an implementation choice of D1, DESIGN §6b.5
+    pack_ws_bytes): the operand's scatter vectors, rows r, k-bar k and batches b as int64,
+    8 (r + k + b) aligned to 256; 0 for an empty pack (b r k = 0)."""
+    if b * r * k == 0:
+        return 0
+    v = 8 * (r + k + b)
+    if v > SIZE_T_MAX or align_up(v, REGION_ALIGN) > SIZE_T_MAX:
+        raise OverflowError("pack workspace exceeds uint64")
+    return align_up(v, REGION_ALIGN)
 
 
 # ---------------------------------------------------------------------------
@@ -1365,6 +1429,92 @@ def cert_workspace():
          "plan device bytes (GENERATE / empty)")
     ex = workspace_size(8192, 8192, 8192, 1, 14, 14)
     return f"{n_cases} shapes, {len(worked)} hand-computed examples; 8192^3 N=14: {ex / 2**30:.3f} GiB"
+
+
+@check("§6b.4 packed layout")
+def cert_pack_layout():
+    """DESIGN v1.7 §6b.4 (format 1) and §6b.6: pack_bytes = sum of the aligned regions sig,
+    flag, res (256-aligned, in order, gaps < 256); res = N b r k_hat + (ceil(r)_16 - r) k_hat;
+    every K4 operand pointer into a pack (plane l, batch lambda, row rho, K-chunk c, any
+    residue group) 16-byte aligned; the post-swap B role (n_hat = ceil(r)_16 rows per block,
+    batch stride r k_hat) reads only inside res; empty packs are 0 bytes; overflow past
+    uint64 raises (INVALID_VALUE); the packed workspace (§6b.6) is §4a without sX, fX, RX of
+    each packed role. Hand-computed examples."""
+    n_cases = 0
+    for N in (2, 9, 14, 20):
+        for b in (0, 1, 3, 7):
+            for r in (0, 1, 15, 16, 17, 33):
+                for k in (0, 1, 2, 15, 16, 17, 131056, 131057):
+                    regs, total = pack_layout(b, r, k, N)
+                    n_cases += 1
+                    if b * r * k == 0:
+                        need(regs == [] and total == 0 and pack_ws_bytes(b, r, k) == 0,
+                             "empty pack")
+                        continue
+                    kh, nh = ceil_div(k, 16) * 16, ceil_div(r, 16) * 16
+                    lit = {"sig": 2 * b * r, "flag": b * r,
+                           "res": N * b * r * kh + (nh - r) * kh}
+                    need([x[0] for x in regs] == ["sig", "flag", "res"], "region order")
+                    off = 0
+                    for name, start, nbytes in regs:
+                        need(nbytes == lit[name], f"{name} bytes")
+                        need(start == off and start % 256 == 0, f"{name} offset")
+                        off = ceil_div(start + nbytes, 256) * 256
+                    need(total == off and total - (regs[-1][1] + regs[-1][2]) < 256, "total")
+                    res0 = regs[2][1]
+                    # every 16-byte K4 access: plane l (any group start g0 = l), batch lambda,
+                    # row rho (role B: up to n_hat - 1), K-chunk c
+                    for l in sorted({0, 1 % N, N - 1}):
+                        for lam in sorted({0, b - 1}):
+                            for rho in sorted({0, r - 1, nh - 1}):
+                                for c in range(ceil_div(k, K_C_PRIME)):
+                                    a = res0 + l * b * r * kh + (lam * r + rho) * kh + c * K_C_PRIME
+                                    need(a % 16 == 0, "K4 pointer alignment")
+                    # role B: the last byte K4 can read (plane N-1, batch b-1, row n_hat-1,
+                    # k_hat-1) is inside res; the bound is tight (the tail is exactly needed)
+                    last = res0 + (N - 1) * b * r * kh + ((b - 1) * r + nh - 1) * kh + kh - 1
+                    need(last == res0 + lit["res"] - 1, "B-role reads end exactly at the tail")
+                    need(pack_ws_bytes(b, r, k) == ceil_div(8 * (r + k + b), 256) * 256, "pack ws")
+    # Hand-computed (DESIGN §6b.4 typed by hand):
+    #  (b=3, r=17, k=5, N=9): k^=16; sig 102 -> 256; flag 51 -> 256;
+    #   res 9*3*17*16 + (32-17)*16 = 7344 + 240 = 7584 -> 7680; total 8192
+    #  (1, 1, 1000, 14): k^=1008; sig 2 -> 256; flag 1 -> 256; res 14*1008 + 15*1008 = 29232
+    #   -> 29440; total 29952
+    #  (2, 32, 16, 2): sig 128 -> 256; flag 64 -> 256; res 2*2*32*16 = 2048; total 2560
+    worked = [((3, 17, 5, 9), 8192, [("sig", 0, 102), ("flag", 256, 51), ("res", 512, 7584)]),
+              ((1, 1, 1000, 14), 29952, [("sig", 0, 2), ("flag", 256, 1), ("res", 512, 29232)]),
+              ((2, 32, 16, 2), 2560, [("sig", 0, 128), ("flag", 256, 64), ("res", 512, 2048)]),
+              ((0, 5, 5, 8), 0, []), ((2, 3, 0, 8), 0, [])]
+    for args, want, regs_want in worked:
+        regs, total = pack_layout(*args)
+        need(total == want and regs == regs_want, f"pack worked example {args}: {regs} {total}")
+    need(pack_ws_bytes(3, 17, 5) == 256 and pack_ws_bytes(1, 1, 1000) == 8192, "pack ws examples")
+    # overflow: N b r k_hat beyond 2^64
+    for args in ((1, 2**40, 2**30, 20), (2**20, 2**20, 2**30, 2)):
+        try:
+            pack_layout(*args)
+            need(False, f"no overflow for {args}")
+        except OverflowError:
+            pass
+    # §6b.6 packed workspace: (17,33,5,3,N=9,g=2), cert_workspace's example (30720 bytes):
+    #  packed A: no sA (256), fA (256), RA (1792): 28416; sB 0 fB 256 vec 512 RB 1536 W 6144
+    #  packed B: no sB, fB, RB (4608): 25600; sA 0 fA 256 vec 512 RA 1536 W 3328
+    #  both: vec 0, W 1024: 23296
+    pw = [(("A",), 28416, [("sB", 0, 198), ("fB", 256, 355), ("vec", 512, 1464),
+                           ("RB", 1536, 6144), ("W", 6144, 28176)]),
+          (("B",), 25600, [("sA", 0, 102), ("fA", 256, 307), ("vec", 512, 1464),
+                           ("RA", 1536, 3168), ("W", 3328, 25360)]),
+          (("A", "B"), 23296, [("vec", 0, 952), ("W", 1024, 23056)])]
+    for packed, want, regs_want in pw:
+        need(workspace_size(17, 33, 5, 3, 9, 2, packed=packed) == want, f"packed ws {packed}")
+        need(region_offsets(17, 33, 5, 3, 9, 2, packed=packed) == regs_want,
+             f"packed offsets {packed}: {region_offsets(17, 33, 5, 3, 9, 2, packed=packed)}")
+    for packed in ((), ("A",), ("B",), ("A", "B")):   # DIRECT / k = 0 / K-empty: unchanged
+        for args in ((17, 33, 5, 3, 9, 2, DIRECT), (17, 33, 0, 3, 9, 0), (17, 33, 1, 3, 9, 0)):
+            need(workspace_size(*args, packed=packed) == workspace_size(*args), "vec-only rule")
+    ex = workspace_size(8192, 8192, 8192, 1, 14, 14, packed=("A", "B"))
+    return (f"{n_cases} (b, r, k, N) layouts, {len(worked) + len(pw)} hand-computed examples; "
+            f"8192^3 N=14 both packed: {ex / 2**30:.3f} GiB workspace")
 
 
 # DESIGN §4a table typed literally (independent of _REGIONS / workspace_size).

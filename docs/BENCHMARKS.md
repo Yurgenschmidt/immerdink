@@ -627,3 +627,46 @@ case, then a `{"case", "clock_state"}` line (SM clock, power, temperature, clock
 a `nvidia-smi -lgc` lock shows up as `applications_clocks_setting: Active`). Check: three
 separate runs of s512 all at 2805 MHz, timings within ~5 %. For publishable small-shape numbers,
 lock clocks (`sudo nvidia-smi -lgc <f>,<f>`, reset with `-rgc`); that is a manual, root step.
+
+## D1: packed operands (2026-10-03, `bench/results/d1-packed-323a21c.jsonl`)
+
+One operand packed once with `imd_pack` (`imd_pack_desc_for` orders, so C is bit-identical to
+the plain call: checked in every record) and reused by R contractions; `imd_bench --methods
+packed` times, per repetition and interleaved in one process, `R × imd_contract` against
+`imd_pack + R × imd_contract_packed` (same partner, same C), plus each call alone
+(`bench/sweep_d1.txt`, quiet-gated, `warm_run.sh`; clocks 2490–2805 MHz, power-capped in the
+long sequences). Ratio = plain / packed (> 1: packing wins); "per call" = the R = 16 sequence
+divided by 16, the pack subtracted.
+
+| case (m×n×k) | N | packed (role) | imd_pack ms | one call ms | pack / call | R = 1 | R = 4 | R = 16 | per call at R = 16: plain → packed ms | workspace plain → packed (pack) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sq4096 (4096×4096×4096) | 8 | A (A) | 0.322 | 2.730 | 0.12 | 0.94× | 1.12× | 1.14× | 3.098 → 2.700 (13 %) | 0.375 → 0.250 GiB (0.125) |
+| sq4096 | 8 | B (B) | 0.323 | 2.718 | 0.12 | 0.95× | 1.14× | 1.13× | 3.106 → 2.731 (12 %) | 0.375 → 0.250 GiB (0.125) |
+| sq4096 | 14 | A (A) | 0.438 | 4.916 | 0.09 | 0.98× | 1.04× | 1.07× | 5.049 → 4.680 (7 %) | 0.656 → 0.438 GiB (0.219) |
+| sq4096 | 14 | B (B) | 0.439 | 5.290 | 0.08 | 1.09× | 1.05× | 1.09× | 5.096 → 4.643 (9 %) | 0.656 → 0.438 GiB (0.219) |
+| sq8192 (8192×8192×8192) | 8 | A (A) | 1.224 | 19.980 | 0.06 | 1.01× | 1.06× | 1.09× | 20.596 → 18.848 (8 %) | 1.500 → 1.000 GiB (0.500) |
+| sq8192 | 14 | A (A) | 1.731 | 34.499 | 0.05 | 1.02× | 1.06× | 1.05× | 34.499 → 32.791 (5 %) | 2.625 → 1.750 GiB (0.875) |
+| t_cc (4096×4096×4096) | 8 | A (B) | 0.338 | 3.103 | 0.11 | 1.20× | 1.13× | 1.13× | 3.165 → 2.773 (12 %) | 0.375 → 0.250 GiB (0.125) |
+| t_cc | 8 | B (A) | 0.334 | 2.987 | 0.11 | 1.16× | 1.12× | 1.13× | 3.112 → 2.725 (12 %) | 0.375 → 0.250 GiB (0.125) |
+| t_cc | 14 | A (B) | 0.441 | 4.891 | 0.09 | 1.03× | 1.03× | 1.07× | 5.086 → 4.716 (7 %) | 0.656 → 0.438 GiB (0.219) |
+| t_cc | 14 | B (A) | 0.443 | 5.452 | 0.08 | 1.04× | 1.05× | 1.09× | 5.157 → 4.715 (9 %) | 0.656 → 0.438 GiB (0.219) |
+| t_df (4096×4096×2048) | 8 | A (A) | 0.171 | 1.521 | 0.11 | 1.00× | 1.14× | 1.13× | 1.821 → 1.601 (12 %) | 0.250 → 0.188 GiB (0.063) |
+| t_df | 8 | B (B) | 0.173 | 1.551 | 0.11 | 1.01× | 1.11× | 1.11× | 1.813 → 1.619 (11 %) | 0.250 → 0.188 GiB (0.063) |
+| t_df | 14 | A (A) | 0.227 | 2.576 | 0.09 | 0.98× | 1.05× | 1.08× | 2.862 → 2.632 (8 %) | 0.438 → 0.328 GiB (0.109) |
+| t_df | 14 | B (B) | 0.225 | 2.483 | 0.09 | 0.85× | 1.06× | 1.08× | 2.892 → 2.652 (8 %) | 0.438 → 0.328 GiB (0.109) |
+| r_skinny (16384×512×4096) | 8 | A (A) | 1.208 | 2.316 | 0.52 | 1.00× | 1.69× | **1.98×** | 2.596 → 1.236 (52 %) | 0.578 → 0.078 GiB (0.500) |
+| r_skinny | 8 | B (B) | 0.066 | 2.735 | 0.02 | 1.21× | 1.03× | 1.02× | 2.574 → 2.531 (2 %) | 0.578 → 0.563 GiB (0.016) |
+| r_skinny | 14 | A (A) | 1.685 | 4.073 | 0.41 | 1.08× | 1.51× | **1.79×** | 3.940 → 2.090 (47 %) | 1.012 → 0.137 GiB (0.875) |
+| r_skinny | 14 | B (B) | 0.070 | 3.730 | 0.02 | 1.01× | 1.00× | 1.02× | 4.103 → 4.033 (2 %) | 1.012 → 0.985 GiB (0.027) |
+
+- `imd_pack` costs about what the operand's KL launch costs in a call (it is KL with all N
+  planes): 5–12 % of a call for the square / CC / DF shapes, 41–52 % for r_skinny's large A
+  (whose KL dominates that call). So R = 1 is break-even (single calls: ±10–20 % noise).
+- With reuse each later call saves that operand's KL share: 5–13 % per call for square /
+  CC / DF shapes (more at N = 8, where the GEMM share is smaller), **47–52 % on r_skinny
+  when the large operand is packed** (1.79–1.98× at R = 16); packing the small operand of a
+  skinny shape saves ~2 %. Sustained sequences run power-capped (per call 3.1 ms vs 2.7 ms
+  single on sq4096 N = 8), the same for both sides.
+- Workspace saved per contraction: the operand's sX, fX, RX (`g/N` of the pack; all of it at
+  g = N, here): 25–33 % for square / CC / DF shapes, 86 % for r_skinny's A; the caller keeps
+  the pack (`N·b·r·k̂` bytes) instead. Details and per-phase marks: [NOTES-D1.md](NOTES-D1.md).

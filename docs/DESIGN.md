@@ -1,4 +1,4 @@
-# immerdink — design (v1.6)
+# immerdink — design (v1.7)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -21,8 +21,10 @@ optional plan-time autotuning option `k4_tune` (§6) and the choice in the host 
 takes the fused launch KF up to k̂ ≤ 1024 (§4); changed text is marked **[v1.5]**. v1.6 adds the
 per-operand fused scale-and-pack launch KL for k̂ > 1024 (§4, chosen at plan time; same results,
 same workspace, one DRAM read of the operand less) and reports it in the host API (§6a);
-changed text is marked **[v1.6]**. v1.7 (§6b, D1 packed operands) is an APPROVED design (Eric, 2026-10-03, all §6b.10
-recommendations), not yet implemented. The change lists are at the end.
+changed text is marked **[v1.6]**. v1.7 (§6b, D1 packed operands; design approved by Eric,
+2026-10-03, all §6b.10 recommendations) is implemented (host API version 5; §6b.11 lists the
+implementation choices and one clarification of §6b.5 to confirm). The change lists are at
+the end.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -849,10 +851,10 @@ const char*  imd_status_string(imd_status_t);
 - Callers tile I/J/L themselves, since sub-views are valid inputs. Tiling over I/J/L leaves
   results bitwise unchanged; tiling over K by the caller does change them. The library
   handles K chunking and the batch-launch split internally.
+- **[v1.7] Packed operands** `imd_pack` / `imd_plan_create_packed` / `imd_contract_packed`
+  (fast-mode σ depends only on the operand itself, so a pack is reusable across
+  contractions): §6b, implemented.
 - **Reserved, not v1** (the API and specs must not preclude these):
-  - a packed-operand API `imd_pack` / `imd_contract_packed`. Fast-mode σ depends only on
-    the operand itself, so packs are reusable across contractions with the same K labels,
-    N and rounding; **DRAFT design in §6b** (D1, for review);
   - complex values via the 2M method (2 GEMMs per modulus, moduli with √−1);
   - accurate-mode scaling, which is incompatible with independent packing.
   - adaptive precision, possibly via an Ozaki-I slice mode sharing this pipeline (PLAN, Later).
@@ -901,7 +903,7 @@ imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
 const char*  imd_status_string(imd_status_t);
 
 typedef struct {               /* 136 bytes in version 1, 152 in v2 [v1.4], 168 in v3 [v1.5],
-                                  176 in v4 [v1.6] */
+                                  176 in v4 [v1.6], 184 in v5 [v1.7] */
   uint32_t struct_size;        /* in: sizeof(imd_lowering_t) as the caller compiled it  */
   int32_t  status, lowered, dispatch, swapped, num_moduli, residue_group, num_groups;
   int64_t  m, n, k, b, n_hat, k_hat, vec_entries, k_chunks, gemm_launches;
@@ -913,6 +915,8 @@ typedef struct {               /* 136 bytes in version 1, 152 in v2 [v1.4], 168 
   uint64_t k4_tune_bytes;      /* version 3: temporary bytes of a k4_tune plan creation */
   int32_t  fused_large;        /* version 4 [v1.6]: bit 0 / bit 1: KL for the GEMM's A / B */
   int32_t  reserved4;          /* version 4: 0 */
+  int32_t  packed;             /* version 5 [v1.7]: bit 0 / 1: the caller's A / B packed (§6b) */
+  int32_t  pack_mismatch;      /* version 5: IMD_PACK_MISMATCH_* of a PACK_MISMATCH */
 } imd_lowering_t;
 enum { IMD_DISPATCH_NOOP, IMD_DISPATCH_EMULATE, IMD_DISPATCH_DIRECT, IMD_DISPATCH_SCALE };
 enum { IMD_K4_128x256, IMD_K4_128x128, IMD_K4_64x128, IMD_K4_64x64, IMD_K4_CONFIG_COUNT };
@@ -985,6 +989,9 @@ Semantics:
     version-3 fields (its `kernel_launches` is the v4 count, which is what the library
     launches). Tested: `host_c_api`, `host_python`, `host_vs_plan` (every real plan's choice
     and launch count equal the query), and the launch counts of every contract test call.
+  - **[v1.7] Version 5** appends `packed` and `pack_mismatch` (§6b.5): 0 from `imd_lowering`;
+    `imd_lowering_packed` fills them (and every other field for the packed plan). A
+    version-4 caller gets exactly the version-4 fields.
   - `dispatch`: NOOP (b·m·n = 0), EMULATE (K0–K5; EMULATE mode, k ≥ 2), DIRECT (K0 + the
     native kernel; DIRECT mode or K-empty), SCALE (k = 0: K0 + the β kernel, §3.7). A call
     with α = 0 also runs only K0 and the β kernel; that is per call, not per plan.
@@ -1034,10 +1041,11 @@ tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH).
 
 ---
 
-## 6b. Packed operands — **APPROVED design, not yet implemented** (ROADMAP D1) [v1.7]
+## 6b. Packed operands — **APPROVED design (2026-10-03), implemented in v1.7** (ROADMAP D1)
 
-Nothing in this section is implemented. It replaces the "Reserved, not v1" packed-operand
-bullet of §6 once approved. **Binding user decision:** an **explicit** packed-operand
+Implemented as written (host API version 5); §6b.11 lists the choices the design left to
+the implementation and one clarification of §6b.5. Measurements: docs/NOTES-D1.md,
+BENCHMARKS "D1". **Binding user decision:** an **explicit** packed-operand
 handle, not implicit plan-level caching; kernel level only (caller-owned device memory,
 the caller's stream, no allocation or synchronization in a call, capture-safe).
 **[spec: PackedOperand, 11 pos / 17 neg]**
@@ -1198,7 +1206,7 @@ pack_bytes = Σ align₂₅₆(region) in this order;  0 if b·r·k = 0
 ### 6b.5 API
 
 **Host library** (libimmerdink_host, CUDA-free, pure, thread-safe; `IMD_HOST_API_VERSION`
-4):
+5):
 ```c
 #define IMD_PACK_FORMAT 1
 enum { IMD_PACK_ORDER_AUTO = 0, IMD_PACK_ORDER_GIVEN = 1 };
@@ -1397,17 +1405,29 @@ configuration, `vec_mode` or KF. **[spec: PackedOperand SigmaEqual, WEqual, CEqu
 EmulatedOrderFree over N ∈ {2, 3}, RN and TRUNC, both roles, g ∈ 1..N, one or two packed
 operands, non-finite inputs]**
 
-### 6b.9 Not in this draft (implementation phase)
+### 6b.9 Implementation-phase spec items (done in v1.7)
 
-- IndexMap: lowering with adopted orders (EinsumPreserved for any order within a class;
-  the slot-key computation; PACK_MISMATCH's place in the status precedence).
-- Pipeline: a packed slot (no K1/K2/K3 for it; K4 reads the caller's buffer, B role at
-  stride r·k̂ with the tail; K5 reads σ and flags from it). Pipeline is being changed by
-  D4; packed slots go in after D4 lands.
-- HostAPI: the pack handle (immutable, destroy after return).
-- `params.py`: `cert_pack_layout` (§6b.4 bytes, overflow to uint64 → INVALID_VALUE);
-  oracle: `pack()` returning the §6b.4 bytes and `contract_tensor(..., packs=...)`, and
-  the bit-for-bit GPU test of every byte.
+- **IndexMap** (constants `Packing`, `PackEnum`; 28 pos / 42 neg): lowering with adopted
+  orders (every invariant, EinsumPreserved included, on the adopted lowering for any order
+  within a class), the slot key, `PackKeySound` (equal keys ⇒ the pack's §6b.4 image is the
+  plan's operand buffer, role B at batch stride r·k̂), `PackComplete` (a pack with the plan's
+  classes is accepted in any order), `DescForReproduces`, `PackNoOOB`, PACK_MISMATCH after §5
+  rows 1–5 and before κ ≥ T (`neg_pack_after_kappa`); negatives: fusion not redone,
+  lowering not adopted, plan not adopting, key fused over all carriers, key without strides,
+  v1 B-role stride, no tail.
+- **Pipeline** (constant `Packed`; 39 pos / 47 neg): a packed slot — no K1 / KL / K2 / K3
+  for it, KF on the in-line operand only, sX / fX / RX absent, K4 reads the pack (plane l at
+  l·b·r·k̂, batch stride r·k̂, the tail), K5 its σ / flags; negatives: the full workspace,
+  K1 or K3 still launched, K4 reading RX, K5 reading sB, the v1 B stride, no tail, the pack
+  still in flight (the caller's RAW).
+- **HostAPI** (constants `PackMode`, `NewHandle`, `ShareBuf`; 8 pos / 17 neg): the handle
+  read by imd_pack / imd_plan_create_packed / imd_contract_packed from several threads,
+  destroyed after return, a plan outliving it, a new handle with the same key;
+  negatives: a lazily filled handle cache, a plan keeping a pointer to the handle, a GPU
+  kernel reading it, two imd_pack into one buffer.
+- `params.py cert_pack_layout`; oracle `pack()`, `pack_desc_for`, `lower_packed`,
+  `contract_tensor(..., packs=...)`; the GPU test of every packed byte (tests/test_packed.py).
+- 284 TLC models, all as expected.
 
 ### 6b.10 Design questions — resolved: every recommendation (the first option of each) adopted by Eric, 2026-10-03
 
@@ -1451,6 +1471,78 @@ operands, non-finite inputs]**
 15. **Interaction with C1 (adaptive precision)**: N is in the key, so a pack serves one N.
     An Ozaki-I slice format (C1(c)) would be a new `IMD_PACK_FORMAT` where one pack serves
     every N′ ≤ N; out of scope here (recommended: keep N in the key for format 1).
+
+### 6b.11 Implementation notes (v1.7)
+
+What §6b left to the implementation, as implemented (libimmerdink_host `src/host/pack.cpp`,
+`analysis.cpp analyze_packed`; libimmerdink `src/api.cpp`, `src/contract.cu`; the oracle
+`spec/oracle.py` transcribes the same choices and the tests compare every one).
+
+- **Adoption by mode position.** The key is label-free, so a plan maps the pack's labels
+  onto its own operand's by **mode position** in X's descriptor (pack label at position p ↔
+  plan label at position p). The ranks must be equal and the map a bijection consistent at
+  every position (a repeated label repeats in both); otherwise PACK_MISMATCH `_CLASSES`. The
+  same tensor under renamed labels matches; a re-described tensor (another rank, extent-1
+  modes added) is rejected (the key is not complete, §6b.2: safe).
+- **Plan-time order** (imd_plan_create_packed, imd_lowering_packed): the argument checks and
+  §5 rows 1–5 of (A, B, C, options); for the host queries then each pack **descriptor's** own
+  status (imd_pack_layout's INVALID_VALUE / NOT_SUPPORTED: a handle is valid by
+  construction); then per packed operand, the caller's A first: `_FORMAT`, `_MODULI`,
+  `_ROUNDING`, `_CLASSES` (position map; a K label X does not carry is `_CLASSES` by the
+  §6b.10 #10 policy, checked explicitly: a pack with an equal stride-0 mode would otherwise
+  match, soundly); then, both packed, `_ORDER` (the mapped K or L orders differ); then the
+  plan adopts the orders (K and L from the packs, each packed operand's row class from its
+  pack; §5 step 9 fusion redone in them) and compares each slot key word for word:
+  `_EXTENTS` (b, r, k, a mode count or extent) or `_STRIDES`, the first differing word;
+  then §3.2 RN acceptance last. imd_workspace_size_packed / _layout_packed stop before the
+  RN rule. A plan whose C has an extent-0 C-only label (lowered to I, §5 step 7) has that
+  label in its I class: `_CLASSES` for a pack of the A side (empty output; conservative; the
+  IndexMap model makes the same choice, witness `pk_conly0`).
+- **Which checks are safety rules** (spec IndexMap): the key alone rejects every unsound
+  pack (`PackKeySound`). The `_ORDER` check is implied by the key (a policy and a reason
+  code: `pos_pack_order_policy`; it also rejects rare sound pairs whose K strides
+  coincide). The partner-only `_CLASSES` check is implied by the key except at k = 0, where
+  the slot key's (e, 0) mode fuses after an extent-0 mode and matches — harmless, a k = 0
+  plan never reads the pack (`pos_pack_partner_policy`, witness `pk_po0`); so §6b.2's "a
+  partner-only K label appears as a mode (e, 0) and mismatches" holds for k ≥ 1 only, and
+  the explicit check keeps the §6b.10 #10 rule for every k. With both packed, K and L are
+  adopted from either pack (equal after the `_ORDER` check).
+- **imd_lowering_packed with PACK_MISMATCH**: `lowered = 1`, the summary fields filled as
+  for NOT_SUPPORTED (the packed workspace of the packed roles, launches), plan bytes 0.
+- **imd_pack_layout**: with INVALID_VALUE only `struct_size` and `status` are written; with
+  NOT_SUPPORTED the sizes and the layout too (`key_digest` 0, as for any non-SUCCESS).
+  `key_digest` = FNV-1a over the key words as little-endian int64.
+- **imd_pack_desc_for**: `out->struct_size` is an input (≥ this version's size);
+  `capacity` ≥ the number of distinct labels of X (≤ X's rank), else INVALID_VALUE; lists
+  written K, then L, then R into `labels`. X's extent-1 labels (absent from the plan's
+  orders) are appended to their class by membership (not in C: K; in C and the partner: L;
+  else R). Statuses: the argument checks and §5 rows 1–5 (not the RN rule).
+- **pack_ws_bytes** = align₂₅₆(8·(r + k + b)) (0 for an empty pack): imd_pack keeps X's
+  row, k̄ and batch scatter vectors there. **imd_pack launches two kernels**: one writes the
+  vectors and every byte of the packed buffer KL does not (the two alignment gaps, the
+  tail and the last gap: no byte twice), then the v1.6 KL kernel on X as a one-operand view
+  (rows m = r, g = N: every plane is "group 1", rows_pad = r) writes σ, the flags and all N
+  planes with zero K padding (bit-identical to K1 + K2/K3 by v1.6). Reading along rows,
+  rows shorter than 512 k̄ get taller KL tiles (up to 64 rows; a launch choice).
+- **KF / KL with a packed operand**: KF's tiles and RB-row zeroing cover the in-line operand
+  only, `fused` = 0 when both are packed; `fused_large` has no bit of a packed operand (also
+  under the test hook). `kernel_launches` = (fused ? 1 : v + #in-line) + per group the
+  in-line operands' packs (B: + the zero-rows launch) except group 1's after KF / KL +
+  gemm_launches + 1; both packed: v + gemm_launches + 1.
+- **K4 on a pack**: the operand pointer of group g₀ is `res + g₀·b·r·k̂` with batch stride
+  `r·k̂` (both roles; for A it equals the workspace's m·k̂), passed per call.
+- **imd_pack_t** holds a copy of X's descriptor (the position map; X's byte interval for
+  imd_pack's ALIASING check), the pack lowering and key, and imd_pack's launch data; plans
+  copy only the key (`plan_host_bytes` + 8 per key word).
+- **Clarification of §6b.5 `imd_contract_packed` step 1 (to confirm).** Read literally,
+  "`packed` non-NULL iff the plan packs it" makes a NULL `packed` of a packed slot a
+  PACK_MISMATCH at step 1, so step 2's "plus `packed` when α ≠ 0, k ≠ 0, EMULATE and
+  `pack_bytes > 0`" could never fire. Implemented so that every rule of §6b.5 is reachable:
+  step 1 is "an **in-line** slot with `packed` or `pack` non-NULL, or a **packed** slot whose
+  `pack` is NULL or has another key → PACK_MISMATCH"; a packed slot's NULL `packed` is step
+  2's INVALID_VALUE when it would be read, and allowed when it is not (α = 0, k = 0, DIRECT,
+  an empty pack). Step 6's `packed_bytes < pack_bytes` applies to a non-NULL `packed`.
+  Tested (tests/test_packed.py suite api).
 
 ---
 
@@ -1583,9 +1675,16 @@ operands, non-finite inputs]**
   plan (and KL with 64-row tiles, so short rows span several chunks), for the bit-exactness
   tests.
 
-## v1.7 (D1 packed operands; design approved 2026-10-03, implementation pending)
+## v1.7 (D1 packed operands; design approved 2026-10-03, implemented 2026-10-03)
 
-- **§6b (new, DRAFT).** An explicit packed-operand handle (`imd_pack_create` / `imd_pack` /
+- **Implementation** (docs/NOTES-D1.md): libimmerdink_host `pack.cpp` / `analyze_packed`
+  (host API version 5), libimmerdink `imd_pack` (the KL kernel with g = N, one prep
+  launch), `imd_plan_create_packed`, `imd_contract_packed`; §6b.11 lists the
+  implementation choices and the clarification of §6b.5 step 1 to confirm. §6 points to
+  §6b; §6a gains version 5 of `imd_lowering_t`. **[spec: IndexMap adopted orders (+10 pos /
+  +8 neg), Pipeline packed slot (+9 / +8), HostAPI pack handle (+3 / +7); params
+  cert_pack_layout; oracle pack / lower_packed; 284 TLC models]**
+- **§6b (new).** An explicit packed-operand handle (`imd_pack_create` / `imd_pack` /
   `imd_plan_create_packed` / `imd_contract_packed`) and the CUDA-free sizing and
   compatibility queries (`imd_pack_layout`, `imd_pack_desc_for`, `imd_*_packed`,
   `imd_lowering_t` v5, `IMD_STATUS_PACK_MISMATCH`). The compatibility analysis: the packed

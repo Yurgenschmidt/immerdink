@@ -27,10 +27,13 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 4  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 5  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
-                                   4: imd_lowering_t fused_large (v1.6) */
+                                   4: imd_lowering_t fused_large (v1.6);
+                                   5: packed operands (§6b v1.7): IMD_STATUS_PACK_MISMATCH,
+                                      imd_pack_layout, imd_pack_desc_for, imd_*_packed,
+                                      imd_lowering_t packed, pack_mismatch */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -40,8 +43,12 @@ typedef enum {
   IMD_STATUS_INSUFFICIENT_WORKSPACE = 4,
   IMD_STATUS_MISALIGNED = 5,
   IMD_STATUS_CUDA_ERROR = 6,
-  IMD_STATUS_ALLOC_FAILED = 7 /* plan creation: host allocation, or the device allocation of
-                                 IMD_VEC_RESIDENT, failed; host queries: host allocation */
+  IMD_STATUS_ALLOC_FAILED = 7, /* plan creation: host allocation, or the device allocation of
+                                  IMD_VEC_RESIDENT, failed; host queries: host allocation */
+  IMD_STATUS_PACK_MISMATCH = 8 /* v1.7 (§6b): a packed operand does not fit the plan (its
+                                  compatibility key differs; imd_lowering_t pack_mismatch
+                                  says why), or packed pointers / handles that do not match
+                                  the plan's packed slots */
 } imd_status_t;
 
 /* Options: rounding (§3.3) and mode (§4 DIRECT path). */
@@ -188,6 +195,10 @@ typedef struct {
                               packed for group 1 by the fused large launch KL (k_hat > 1024,
                               EMULATE); 0 otherwise. kernel_launches counts it            */
   int32_t reserved4;       /* 0                                                         */
+  /* Version 5 (184 bytes; §6b v1.7). */
+  int32_t packed;          /* bit 0 / bit 1: the CALLER's A / B is read from a packed operand
+                              (imd_lowering_packed; 0 from imd_lowering)                    */
+  int32_t pack_mismatch;   /* 0, or the IMD_PACK_MISMATCH_* reason of a PACK_MISMATCH status */
 } imd_lowering_t;
 enum { IMD_FUSED_LARGE_A = 1, IMD_FUSED_LARGE_B = 2 };
 
@@ -198,6 +209,129 @@ enum { IMD_FUSED_LARGE_A = 1, IMD_FUSED_LARGE_B = 2 };
 IMD_API imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
                                   const imd_tensor_t* C, const imd_options_t* options,
                                   imd_lowering_t* out);
+
+/* ---- Packed operands (DESIGN v1.7 §6b, host API version 5) ------------------------------
+ *
+ * A packed operand X holds, per row, the shift sigma and the non-finite flag and the int8
+ * residues of ALL N moduli over the whole canonical K, in the §6b.4 byte layout (format 1):
+ *   sig   int16 sigma of row (lambda, rho) at index lambda r + rho
+ *   flag  u8 flag, same index
+ *   res   int8 residue of plane l, row (lambda, rho), k-bar at l b r k_hat + (lambda r + rho)
+ *         k_hat + k-bar; zero K padding; a zeroed tail of (ceil(r)_16 - r) k_hat bytes
+ * regions at 256-aligned offsets, every byte written (gaps 0). imd_pack (immerdink.h) writes
+ * it; plans built against it read it instead of scaling and packing X themselves. The pack
+ * fixes its canonical orders of K, L (batch) and R (X's rows); a plan adopts them.
+ * Compatibility: a key of int64 words (format, N, rounding, b, r, k, then per class L, R, K
+ * the fused modes (extent, stride in X) fused over X's strides alone), compared word for
+ * word. */
+#define IMD_PACK_FORMAT 1
+enum { IMD_PACK_ORDER_AUTO = 0, IMD_PACK_ORDER_GIVEN = 1 };
+/* imd_lowering_t.pack_mismatch: the first differing part, checked per packed operand (the
+ * caller's A, then B) in this order, then ORDER, then the keys' extents and strides. */
+enum {
+  IMD_PACK_MISMATCH_NONE = 0,
+  IMD_PACK_MISMATCH_FORMAT = 1,   /* another IMD_PACK_FORMAT                                  */
+  IMD_PACK_MISMATCH_MODULI = 2,   /* the pack's N != options.num_moduli                       */
+  IMD_PACK_MISMATCH_ROUNDING = 3, /* the pack's rounding != options.rounding                  */
+  IMD_PACK_MISMATCH_CLASSES = 4,  /* the pack's labels do not map onto X's by mode position, or
+                                     the plan's K / L / X-row classes differ from the pack's
+                                     (incl. a K label only in the partner)                    */
+  IMD_PACK_MISMATCH_EXTENTS = 5,  /* b, r, k or a fused mode's extent differs                 */
+  IMD_PACK_MISMATCH_STRIDES = 6,  /* a fused mode's stride in X differs                       */
+  IMD_PACK_MISMATCH_ORDER = 7     /* both operands packed and their K or L orders differ      */
+};
+
+/* What to pack (§6b.5). X's labels fall into K (contracted: not in C), L (batch: in C and in
+ * the partner) and R (rows: the rest). AUTO: K and L listed in any order, R the rest, each
+ * class ordered by (|stride| after the diagonal merge, first position in X's labels). GIVEN:
+ * every label of X listed once, each class in canonical order (first fastest). */
+typedef struct {
+  uint32_t struct_size;          /* sizeof(imd_pack_desc_t) as the caller compiled it        */
+  int32_t num_moduli;            /* N, 2..20 (no 0 = default: N is part of the key)          */
+  int32_t rounding;              /* IMD_RN | IMD_TRUNC                                       */
+  int32_t order;                 /* IMD_PACK_ORDER_AUTO | IMD_PACK_ORDER_GIVEN               */
+  const imd_tensor_t* tensor;    /* X: extents, strides (elements), labels                   */
+  int32_t num_contracted;        /* K                                                        */
+  const int32_t* contracted;
+  int32_t num_batch;             /* L                                                        */
+  const int32_t* batch;
+  int32_t num_rows;              /* GIVEN: R in order; AUTO: 0                               */
+  const int32_t* rows;           /* AUTO: NULL                                               */
+} imd_pack_desc_t;
+
+/* The pack's sizes and layout (§6b.4). */
+typedef struct {
+  uint32_t struct_size;          /* in: sizeof(imd_pack_layout_t) as the caller compiled it  */
+  int32_t status;                /* as returned                                              */
+  int32_t format;                /* IMD_PACK_FORMAT                                          */
+  int32_t num_moduli, rounding;  /* N, IMD_RN | IMD_TRUNC                                    */
+  int32_t reserved;              /* 0                                                        */
+  int64_t b, r, k, k_hat;        /* batches, rows, contraction length, ceil(k)_16            */
+  uint64_t kappa;                /* ceil(sqrt(k)) (0 for k = 0)                              */
+  imd_region_t sig, flag, res;   /* offsets and bytes in the packed buffer (0: empty pack)   */
+  uint64_t pack_bytes;           /* §6b.4 total: the packed buffer's bytes                   */
+  uint64_t pack_ws_bytes;        /* workspace imd_pack needs: 8 (r + k + b) aligned to 256
+                                    (X's scatter vectors), 0 for an empty pack              */
+  uint64_t key_digest;           /* FNV-1a of the key words: diagnostics only                */
+} imd_pack_layout_t;
+
+/* Which operands of a host query are packed: NULL member = that operand is packed in-line.
+ * A NULL imd_packing_t* = neither. */
+typedef struct {
+  const imd_pack_desc_t* A;
+  const imd_pack_desc_t* B;
+} imd_packing_t;
+
+/* Validate a pack descriptor and report its layout. SUCCESS; INVALID_VALUE (desc or out NULL,
+ * a struct_size below this version's, N / rounding / order out of range, a listed label not
+ * in X, listed twice or in two lists, GIVEN without every row label, AUTO with rows, a
+ * repeated label of X with two extents, a negative extent, span / extent product / pack size
+ * overflow); NOT_SUPPORTED (§6b.3: K empty after dropping extent-1 labels, or RN with k >= 2
+ * and kappa >= T). With INVALID_VALUE only struct_size and status are written; with
+ * NOT_SUPPORTED also the sizes and the layout (key_digest 0). A pack with b r k = 0 is valid
+ * and has 0 bytes. */
+IMD_API imd_status_t imd_pack_layout(const imd_pack_desc_t* desc, imd_pack_layout_t* out);
+
+/* GIVEN descriptor of operand `operand` (0 = the caller's A, 1 = B) with exactly the classes
+ * and canonical orders the unpacked plan of (A, B, C, options) uses: a pack made from it
+ * reproduces that contraction bit for bit (flagged outputs included). out->struct_size must
+ * be set (>= this version's size); out->tensor = A or B; the label lists are written to
+ * labels[0, capacity) (K, then L, then R; out's pointers point into it). X's extent-1 labels
+ * are listed after the canonical ones of their class (K: not in C; L: in C and the partner;
+ * R: the rest). Statuses: imd_workspace_size's (§5 rows 1-5); INVALID_VALUE for operand not
+ * 0 / 1, NULL out / labels with capacity > 0, or capacity below X's number of distinct
+ * labels. A label of the plan's K that X does not carry (partner-only) is not listed: such
+ * a plan rejects every pack of X (IMD_PACK_MISMATCH_CLASSES). */
+IMD_API imd_status_t imd_pack_desc_for(const imd_tensor_t* A, const imd_tensor_t* B,
+                                       const imd_tensor_t* C, const imd_options_t* options,
+                                       int32_t operand, imd_pack_desc_t* out, int32_t* labels,
+                                       int32_t capacity);
+
+/* §4a with the regions sX, fX, RX of each packed operand's POST-swap role at 0 bytes (same
+ * region order, bytes = 0 = absent). Statuses: imd_workspace_size's (§5 rows 1-5), then
+ * each pack descriptor's (imd_pack_layout: INVALID_VALUE / NOT_SUPPORTED), then
+ * PACK_MISMATCH (the plan-time compatibility check, no GPU needed). Never the §3.2 kappa
+ * rule of the plan. */
+IMD_API imd_status_t imd_workspace_size_packed(const imd_tensor_t* A, const imd_tensor_t* B,
+                                               const imd_tensor_t* C,
+                                               const imd_options_t* options,
+                                               const imd_packing_t* packing, size_t* bytes);
+IMD_API imd_status_t imd_workspace_layout_packed(const imd_tensor_t* A, const imd_tensor_t* B,
+                                                 const imd_tensor_t* C,
+                                                 const imd_options_t* options,
+                                                 const imd_packing_t* packing,
+                                                 imd_region_t* regions, int32_t capacity,
+                                                 int32_t* num_regions, size_t* total);
+
+/* imd_lowering of the packed plan (imd_plan_create_packed): the same statuses as
+ * imd_workspace_size_packed, then the §3.2 RN acceptance (kappa >= T -> NOT_SUPPORTED, last).
+ * workspace_bytes, fused, fused_large, kernel_launches and the plan bytes describe the packed
+ * plan (no K1 or pack launch for a packed operand; KF / KL work on the in-line operand only);
+ * version 5 adds packed (caller's operands) and pack_mismatch (the reason of PACK_MISMATCH,
+ * with lowered = 1 and the summary fields valid as for NOT_SUPPORTED). */
+IMD_API imd_status_t imd_lowering_packed(const imd_tensor_t* A, const imd_tensor_t* B,
+                                         const imd_tensor_t* C, const imd_options_t* options,
+                                         const imd_packing_t* packing, imd_lowering_t* out);
 
 /* Static, human-readable name of a status ("IMD_STATUS_SUCCESS", ...). */
 IMD_API const char* imd_status_string(imd_status_t status);

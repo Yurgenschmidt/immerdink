@@ -32,8 +32,9 @@ int main(void) {
   const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT, IMD_K4_TUNE_OFF};
 
   CHECK(imd_host_api_version() == IMD_HOST_API_VERSION);
-  CHECK(sizeof(imd_lowering_t) == 176 && IMD_HOST_API_VERSION >= 4);
+  CHECK(sizeof(imd_lowering_t) == 184 && IMD_HOST_API_VERSION >= 5);
   CHECK(sizeof(imd_options_t) == 24);
+  CHECK(sizeof(imd_pack_desc_t) == 72 && sizeof(imd_pack_layout_t) == 136);
 
   size_t bytes = 0;
   CHECK(imd_workspace_size(&A, &B, &C, &opt, &bytes) == IMD_STATUS_SUCCESS);
@@ -194,6 +195,98 @@ int main(void) {
   }
 
   CHECK(strcmp(imd_status_string(IMD_STATUS_NOT_SUPPORTED), "IMD_STATUS_NOT_SUPPORTED") == 0);
+
+  /* v1.7 (DESIGN §6b): packed operands of the same contraction. No swap (C's fastest label
+   * l is a batch label): A is the GEMM's A with K = {k}, L = {l}, R = {i}; B: K, L, R = {j}. */
+  {
+    imd_pack_desc_t pa, pb;
+    int32_t la[8], lb[8];
+    memset(&pa, 0, sizeof pa);
+    memset(&pb, 0, sizeof pb);
+    pa.struct_size = pb.struct_size = sizeof pa;
+    CHECK(imd_pack_desc_for(&A, &B, &C, &opt, 0, &pa, la, 8) == IMD_STATUS_SUCCESS);
+    CHECK(pa.tensor == &A && pa.num_moduli == 9 && pa.rounding == IMD_RN &&
+          pa.order == IMD_PACK_ORDER_GIVEN);
+    CHECK(pa.num_contracted == 1 && pa.contracted[0] == 3 && pa.num_batch == 1 &&
+          pa.batch[0] == 4 && pa.num_rows == 1 && pa.rows[0] == 1);
+    CHECK(imd_pack_desc_for(&A, &B, &C, &opt, 1, &pb, lb, 8) == IMD_STATUS_SUCCESS);
+    CHECK(pb.tensor == &B && pb.num_rows == 1 && pb.rows[0] == 2);
+    CHECK(imd_pack_desc_for(&A, &B, &C, &opt, 2, &pb, lb, 8) == IMD_STATUS_INVALID_VALUE);
+    CHECK(imd_pack_desc_for(&A, &B, &C, &opt, 0, &pb, lb, 2) == IMD_STATUS_INVALID_VALUE);
+
+    /* §6b.4 (params.py cert_pack_layout): b 3, r 17, k 5, N 9: sig 102, flag 51, res 7584 */
+    imd_pack_layout_t pl;
+    memset(&pl, 0, sizeof pl);
+    pl.struct_size = sizeof pl;
+    CHECK(imd_pack_layout(&pa, &pl) == IMD_STATUS_SUCCESS && pl.status == IMD_STATUS_SUCCESS);
+    CHECK(pl.format == IMD_PACK_FORMAT && pl.num_moduli == 9 && pl.rounding == IMD_RN);
+    CHECK(pl.b == 3 && pl.r == 17 && pl.k == 5 && pl.k_hat == 16 && pl.kappa == 3);
+    CHECK(pl.sig.offset == 0 && pl.sig.bytes == 102 && pl.flag.offset == 256 &&
+          pl.flag.bytes == 51 && pl.res.offset == 512 && pl.res.bytes == 7584);
+    CHECK(pl.pack_bytes == 8192 && pl.pack_ws_bytes == 256 && pl.key_digest != 0);
+    /* AUTO with the same classes: the same orders (one label per class), the same key */
+    {
+      const int32_t k1[1] = {3}, l1[1] = {4};
+      imd_pack_desc_t au = pa;
+      imd_pack_layout_t pl2;
+      au.order = IMD_PACK_ORDER_AUTO;
+      au.num_contracted = 1, au.contracted = k1, au.num_batch = 1, au.batch = l1;
+      au.num_rows = 0, au.rows = NULL;
+      memset(&pl2, 0, sizeof pl2);
+      pl2.struct_size = sizeof pl2;
+      CHECK(imd_pack_layout(&au, &pl2) == IMD_STATUS_SUCCESS && pl2.key_digest == pl.key_digest);
+      au.num_rows = 1, au.rows = l1; /* AUTO with rows */
+      CHECK(imd_pack_layout(&au, &pl2) == IMD_STATUS_INVALID_VALUE && pl2.status == 1 && pl2.b == 0);
+      au.num_rows = 0, au.rows = NULL;
+      au.batch = k1; /* label 3 listed twice */
+      CHECK(imd_pack_layout(&au, &pl2) == IMD_STATUS_INVALID_VALUE);
+      au.batch = l1, au.num_contracted = 0, au.contracted = NULL; /* K empty */
+      CHECK(imd_pack_layout(&au, &pl2) == IMD_STATUS_NOT_SUPPORTED && pl2.b == 3 && pl2.r == 85 &&
+            pl2.k == 1 && pl2.key_digest == 0);
+    }
+    /* §6b.6: the workspace without sX, fX, RX (cert_pack_layout: 28416, 25600, 23296) */
+    imd_packing_t pkA = {&pa, NULL}, pkB = {NULL, &pb}, pkAB = {&pa, &pb}, none = {NULL, NULL};
+    CHECK(imd_workspace_size_packed(&A, &B, &C, &opt, &pkA, &bytes) == 0 && bytes == 28416);
+    CHECK(imd_workspace_size_packed(&A, &B, &C, &opt, &pkB, &bytes) == 0 && bytes == 25600);
+    CHECK(imd_workspace_size_packed(&A, &B, &C, &opt, &pkAB, &bytes) == 0 && bytes == 23296);
+    CHECK(imd_workspace_size_packed(&A, &B, &C, &opt, &none, &bytes) == 0 && bytes == 30720);
+    CHECK(imd_workspace_size_packed(&A, &B, &C, &opt, NULL, &bytes) == 0 && bytes == 30720);
+    CHECK(imd_workspace_layout_packed(&A, &B, &C, &opt, &pkA, reg, IMD_REGION_COUNT, &nreg,
+                                      &total) == 0 && total == 28416);
+    CHECK(reg[IMD_REGION_SA].bytes == 0 && reg[IMD_REGION_FA].bytes == 0 &&
+          reg[IMD_REGION_RA].bytes == 0 && reg[IMD_REGION_SB].offset == 0 &&
+          reg[IMD_REGION_W].offset == 6144);
+    /* the packed plan: no pack launches for A in the 4 later groups (KF packs B only) */
+    imd_lowering_t lp, lu;
+    memset(&lp, 0, sizeof lp);
+    memset(&lu, 0, sizeof lu);
+    lp.struct_size = lu.struct_size = sizeof lp;
+    CHECK(imd_lowering(&A, &B, &C, &opt, &lu) == IMD_STATUS_SUCCESS && lu.packed == 0);
+    CHECK(imd_lowering_packed(&A, &B, &C, &opt, &pkA, &lp) == IMD_STATUS_SUCCESS);
+    CHECK(lp.packed == 1 && lp.pack_mismatch == 0 && lp.workspace_bytes == 28416 && lp.fused == 1);
+    CHECK(lp.kernel_launches == lu.kernel_launches - 4 && lp.plan_host_bytes > lu.plan_host_bytes);
+    CHECK(imd_lowering_packed(&A, &B, &C, &opt, &pkAB, &lp) == IMD_STATUS_SUCCESS);
+    CHECK(lp.packed == 3 && lp.fused == 0 && lp.fused_large == 0 &&
+          lp.kernel_launches == 1 + lp.gemm_launches + 1); /* K0, K4, K5 */
+    /* PACK_MISMATCH reasons: N, rounding (the summary stays valid, lowered = 1) */
+    {
+      imd_pack_desc_t bad = pa;
+      imd_packing_t pk = {&bad, NULL};
+      bad.num_moduli = 8;
+      CHECK(imd_lowering_packed(&A, &B, &C, &opt, &pk, &lp) == IMD_STATUS_PACK_MISMATCH);
+      CHECK(lp.status == IMD_STATUS_PACK_MISMATCH && lp.lowered == 1 && lp.m == 17 &&
+            lp.pack_mismatch == IMD_PACK_MISMATCH_MODULI && lp.plan_host_bytes == 0);
+      CHECK(imd_workspace_size_packed(&A, &B, &C, &opt, &pk, &bytes) == IMD_STATUS_PACK_MISMATCH);
+      bad.num_moduli = 9, bad.rounding = IMD_TRUNC;
+      CHECK(imd_lowering_packed(&A, &B, &C, &opt, &pk, &lp) == IMD_STATUS_PACK_MISMATCH &&
+            lp.pack_mismatch == IMD_PACK_MISMATCH_ROUNDING);
+      /* B's pack in A's slot: other classes (r 33 vs 17, j is not A's label) */
+      pk.A = &pb;
+      CHECK(imd_lowering_packed(&A, &B, &C, &opt, &pk, &lp) == IMD_STATUS_PACK_MISMATCH &&
+            lp.pack_mismatch == IMD_PACK_MISMATCH_CLASSES);
+    }
+    CHECK(strcmp(imd_status_string(IMD_STATUS_PACK_MISMATCH), "IMD_STATUS_PACK_MISMATCH") == 0);
+  }
   printf("host C API: %d failures\n", failures);
   return failures == 0 ? 0 : 1;
 }

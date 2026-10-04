@@ -127,6 +127,15 @@ if(Python3_FOUND)
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
   set_tests_properties(contract_highrank PROPERTIES TIMEOUT 300)
+  # DESIGN v1.7 §6b packed operands: imd_pack (every byte) and imd_contract_packed vs
+  # spec/oracle.py, bit for bit, with the allocation shim; reuse; statuses.
+  foreach(suite packed reuse api)
+    add_test(NAME packed_${suite}
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_packed.py"
+                     --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+    set_tests_properties(packed_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800
+                         ENVIRONMENT "LD_PRELOAD=${shim}")
+  endforeach()
 
   # libimmerdink's real plans vs libimmerdink_host's queries (DESIGN §6a): the plan's GEMM
   # view, workspace layout, device bytes, K4 parameter sets and launches, and host payload

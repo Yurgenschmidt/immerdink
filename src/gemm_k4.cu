@@ -91,10 +91,15 @@ static_assert(sizeof(decltype(K4Plan::add)::value_type) == kK4AddEntryBytes,
 
 namespace {
 
-// This call's parameters for launch L of group g0: operand, plane and modulus offsets.
+// This call's parameters for launch L of group g0: operand, plane and modulus offsets. The
+// operands' batch strides are RA's m k_hat and RB's n_hat k_hat, or (v1.7, a packed operand,
+// DESIGN §6b.4) those passed in: r k_hat (the B role of a pack reads n_hat rows of each block
+// from its start, the rows past n being the next block's or the tail).
 K4Call call_of(const K4Plan& k, const Launch& L, const int8_t* RA, const int8_t* RB, uint8_t* W,
-               int g0) {
-  const int64_t plane_a = k.m * k.k_hat, plane_b = k.n_hat * k.k_hat, plane_w = k.m * k.n_hat;
+               int g0, int64_t batch_a, int64_t batch_b) {
+  const int64_t plane_a = batch_a > 0 ? batch_a : k.m * k.k_hat;
+  const int64_t plane_b = batch_b > 0 ? batch_b : k.n_hat * k.k_hat;
+  const int64_t plane_w = k.m * k.n_hat;
   return K4Call{RA + L.z0 * plane_a + L.k0,
                 RB + L.z0 * plane_b + L.j0 * k.k_hat + L.k0,
                 W + (int64_t{g0} * k.b + L.z0) * plane_w + L.j0,
@@ -108,7 +113,8 @@ K4Call call_of(const K4Plan& k, const Launch& L, const int8_t* RA, const int8_t*
 
 // The launches of one group (prof: the bench's phase marks).
 bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
-               int gsize, cudaStream_t stream, bool prof) {
+               int gsize, cudaStream_t stream, bool prof, int64_t batch_a = 0,
+               int64_t batch_b = 0) {
   const K4Ops& ops = k4_ops(k.config);
   bool ok = true;
   k.for_each_launch(gsize, [&](const Launch& L) {
@@ -116,7 +122,8 @@ bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, 
     const ShapeKey key{L.kc, L.zc, L.nc};
     const auto& map = L.k0 == 0 ? k.store : k.add;
     const auto it = map.find(key);
-    ok = it != map.end() && ops.launch(it->second, L.k0 != 0, call_of(k, L, RA, RB, W, g0), stream);
+    ok = it != map.end() &&
+         ops.launch(it->second, L.k0 != 0, call_of(k, L, RA, RB, W, g0, batch_a, batch_b), stream);
     if (prof) IMD_PROF(stream, L.k0 == 0 ? "K4 gemm store" : "K4 gemm add");
   });
   return ok;
@@ -263,9 +270,10 @@ K4Footprint k4_footprint(const K4Plan& k, int N, int g) {
 }
 
 imd_status_t k4_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
-                      int gsize, cudaStream_t stream) {
-  return run_group(k, RA, RB, W, g0, gsize, stream, true) ? IMD_STATUS_SUCCESS
-                                                            : IMD_STATUS_CUDA_ERROR;
+                      int gsize, cudaStream_t stream, int64_t batch_a, int64_t batch_b) {
+  return run_group(k, RA, RB, W, g0, gsize, stream, true, batch_a, batch_b)
+             ? IMD_STATUS_SUCCESS
+             : IMD_STATUS_CUDA_ERROR;
 }
 
 }  // namespace imd::detail

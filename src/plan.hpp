@@ -9,6 +9,7 @@
 #include <cuda_runtime_api.h>
 
 #include "host/k4_launches.hpp"
+#include "host/pack.hpp"
 #include "host/plan_data.hpp"
 #include "immerdink/immerdink.h"
 
@@ -16,9 +17,23 @@ namespace imd::detail {
 
 // Enqueue K0-K5 (contract.cu). A and B are the GEMM's operands (already swapped by the
 // caller when p.swapped). Reads `p` only. Returns SUCCESS or CUDA_ERROR (launch errors
-// only; no sync).
+// only; no sync). v1.7 (DESIGN §6b): packed[x] is the packed buffer of the GEMM's operand x
+// (post-swap) when p.packed has bit x (read only: its sigma, flags and residues at
+// p.pack_off[x]); nullptr otherwise or when it is not read.
 imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, const double* B,
-                              double beta, double* C, void* ws, cudaStream_t stream);
+                              double beta, double* C, void* ws, cudaStream_t stream,
+                              const void* const* packed = nullptr);
+
+// imd_pack (contract.cu, DESIGN v1.7 §6b): the packed bytes of X on `stream`. `p` is the pack's
+// pack_exec (libimmerdink_host) with kl_lg_rows from pack_kl_lg_rows; `pl` its layout
+// (offsets, region bytes, total). Writes X's scatter vectors into `ws` (pack_ws_bytes), every
+// gap and the tail of `packed` with 0, then one KL launch: sigma, flags and all N residue
+// planes. SUCCESS or CUDA_ERROR (launch errors only; no sync, no allocation).
+imd_status_t enqueue_pack(const ExecPlan& p, const PackLayout& pl, const double* X, void* packed,
+                          void* ws, cudaStream_t stream);
+// The KL tile height of imd_pack (a launch choice): reading along rows, rows of fewer than
+// 512 k-bar get taller tiles (up to 64 rows: whole short rows side by side); -1 = KL's rule.
+int32_t pack_kl_lg_rows(const ExecPlan& p);
 
 // K0 (contract.cu): write the p.vec_count scatter vectors to `vec` from p.vec_desc, on
 // `stream`. Also builds the resident copy at plan creation. SUCCESS or CUDA_ERROR.
@@ -61,9 +76,11 @@ int& k4_config_override();
 // s < gsize, over RA [s][lambda][m][k_hat], RB [s][lambda][n_hat][k_hat] and the u8 planes
 // W [l][lambda][m][n_hat]. Splits the batch count (<= 65535 per launch) and n_hat
 // (gridDim.y <= 65535). Copies the prepared parameters, sets this call's pointers and
-// launches; reads `k4` only. Returns SUCCESS or CUDA_ERROR.
+// launches; reads `k4` only. Returns SUCCESS or CUDA_ERROR. batch_a / batch_b (v1.7, a packed
+// operand, DESIGN §6b.4): the operand's batch stride z -> z * batch (0: the workspace's
+// m k_hat / n_hat k_hat).
 imd_status_t k4_group(const K4Plan& k4, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
-                      int gsize, cudaStream_t stream);
+                      int gsize, cudaStream_t stream, int64_t batch_a = 0, int64_t batch_b = 0);
 
 // Test hook state (api.cpp; test_hooks.cpp imd_test_set_fused): -1 = the plan-time rule
 // (production), 0 = no fused launch (KF, KL), 2 / 3 = KL for both operands of every emulated
