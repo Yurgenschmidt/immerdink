@@ -130,14 +130,14 @@ __global__ void __launch_bounds__(T) k1_scale(ScaleArgs a) {
 #pragma unroll 4
         for (int64_t h = threadIdx.x + steps * blockDim.x; h >= 0; h -= blockDim.x) {
           const uint64_t bits = to_bits(X[a.op.v_k[h]]);
-          if (finite_nonzero(bits)) S += square_term(bits, gmax);
+          if (finite_nonzero(bits)) S += square_term_n(bits, gmax);
         }
       }
     } else if (gmax != INT_MIN) {
 #pragma unroll 4
       for (int64_t h = threadIdx.x; h < a.k; h += blockDim.x) {
         const uint64_t bits = to_bits(X[a.op.v_k[h]]);
-        if (finite_nonzero(bits)) S += square_term(bits, gmax);
+        if (finite_nonzero(bits)) S += square_term_n(bits, gmax);
       }
     }
     if (gmax != INT_MIN) {
@@ -260,7 +260,7 @@ __global__ void __launch_bounds__(T) k1_tiled(ScaleArgs a, int64_t radix, int lg
 #pragma unroll 4
       for (int64_t h = h_first; h < a.k; h += h_step) {
         const uint64_t bits = to_bits(X[a.op.v_k[h]]);
-        if (finite_nonzero(bits)) S += square_term(bits, gmax);
+        if (finite_nonzero(bits)) S += square_term_n(bits, gmax);
       }
     }
     s_sum[tid] = S;
@@ -948,7 +948,7 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
     if (gmax != INT_MIN) {
 #pragma unroll
       for (int e = 0; e < E; ++e)
-        if (finite_nonzero(bits[e])) S += square_term(bits[e], gmax);
+        if (finite_nonzero(bits[e])) S += square_term_n(bits[e], gmax);
     }
     for (int o = Gw / 2; o > 0; o /= 2) S += shfl_xor_u128(S, o);
     if (G > 32) {
@@ -1176,14 +1176,14 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     if (live) {
 #pragma unroll
       for (int e = 0; e < E; ++e)
-        if (finite_nonzero(r0[e])) S += square_term(r0[e], gmax);
+        if (finite_nonzero(r0[e])) S += square_term_n(r0[e], gmax);
     }
     if (nc > 1) {
       if (live) {  // chunk nc - 1, still in shared memory
 #pragma unroll
         for (int e = 0; e < E; ++e) {
           const uint64_t bits = mine[e];
-          if (finite_nonzero(bits)) S += square_term(bits, gmax);
+          if (finite_nonzero(bits)) S += square_term_n(bits, gmax);
         }
       }
       for (int64_t c = nc - 2; c >= 1; --c) {
@@ -1194,7 +1194,7 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
 #pragma unroll
           for (int e = 0; e < E; ++e) {
             const uint64_t bits = mine[e];
-            if (finite_nonzero(bits)) S += square_term(bits, gmax);
+            if (finite_nonzero(bits)) S += square_term_n(bits, gmax);
           }
         }
       }

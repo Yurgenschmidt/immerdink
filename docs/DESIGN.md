@@ -1712,3 +1712,7 @@ and host API; every value the same integer (bit-identical, tested on every contr
   32-bit magic ⌈2³²/p⌉ (2²⁴ for p = 256, exact: s·e < 2³² for e < p ≤ 256; exhaustive CPU test)
   instead of the 64-bit one, and the sign is applied after SMod (SMod(−r mod p) = −SMod(r) for
   odd p; for p = 256 both give the byte (−r) mod 256). Same int8 residues.
+- **§3.2 step 3 (K1, KF, KL).** The term ⌈m²·2ᵗ⌉ is computed with the significand normalized to
+  53 bits (m′ = m·2ᶻ, the same real number m′²/2ˢ with s = 2(γ − ilogb x) + 104 − F ≥ 44) in two
+  64-bit words instead of generic 128-bit shifts (`square_term_n`; equal to `square_term` on
+  2²⁸ sampled (x, γ) pairs including every shift branch and subnormals, GPU test).
