@@ -1,4 +1,4 @@
-# immerdink — design (v1.9)
+# immerdink — design (v1.10)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -26,6 +26,10 @@ changed text is marked **[v1.6]**. v1.7 (§6b, D1 packed operands; design approv
 implementation choices and one clarification of §6b.5 to confirm). v1.8 adds §6c, the
 performance model (ROADMAP B2: host API version 6; no semantic change). v1.9 adds §6d,
 the Python front end over the C ABI (ROADMAP B1; no semantic, layout or C API change).
+v1.10 extends §6c (host API version 7, calibration format 2): per-kernel wave and occupancy
+features from launch rules shared with the kernels, BURST / SUSTAINED clock regimes with a
+power-cap model, COLD / WARM cache state, prediction intervals and tie-aware ranking (no
+semantic, layout, launch or spec change).
 The change lists are at the end.
 
 Sources:
@@ -1821,7 +1825,7 @@ pointer, three reads), so CAI is preferred when both exist.
 
 ---
 
-## 6c. Performance model (ROADMAP B2) [v1.8]
+## 6c. Performance model (ROADMAP B2) [v1.8, v1.10]
 
 A CUDA-free prediction of what one `imd_contract` (or `imd_pack`) costs on a given GPU, per
 phase and in total, and a helper that ranks the configurations a caller may choose (N, g,
@@ -1883,6 +1887,11 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
 
 (x₅ is unused outside K4 and KF: room for one more feature per class in a later format.)
 
+**[v1.10] `chain` features** (format 2; every class but K4 and CALL, the free slot of each):
+K0 x₂, KL x₅, PACK x₄, K5 x₃, DIRECT x₃, BETA x₂ = the busiest SM's per-thread chain of the
+phase's launches, defined below ("Waves and occupancy"); KF's x₅ is the same definition. The
+K4 classes keep the round model (it already is a wave model).
+
 - **KF's per-thread chain** (`kf.chain`, added 2026-10-05 for N = 15–17 on mid-size shapes). KF
   launches B = tiles × parts blocks (the shared launch rules `kf_lg_tk`, `kf_operand_tiles`,
   `kf_small`, `pack_moduli_parts`: tiles of 4096 values with 16 per thread, or 1024 with 4 per
@@ -1894,6 +1903,41 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
   at N = 15, 576³ (E = 16, 288 blocks) takes 62 µs in KF and 448³ (E = 4) 20 µs; without the
   term KF at N = 15–17 on 576–960³ was predicted up to 45 % low.
 
+- **[v1.10] Waves and occupancy** (generalizes KF's chain to every kernel). Every launch rule
+  of the pipeline (grid, threads per CTA, values or outputs per thread, grid-stride) lives in
+  `src/host/analysis.hpp` and is called by both `contract.cu` and the model, so the model sees
+  the real launch shape: `launch_blocks` (the 256-thread grid of a grid-stride kernel, capped at
+  2²⁰ blocks), `kf_*` (KF), `kl_launch` (KL: tile height, threads 512 / 1024, values per thread
+  8 / 4, chunks per row; `pack_kl_lg_rows` for `imd_pack`), `pack_launch` (K2 / K3: tile
+  height, tiles, moduli parts), `k5_launch` (K5: λ-fastest tile, or 1 / 2 / 4 outputs per
+  thread). For a launch of B = Bx·By CTAs over `work` units with `r` CTAs resident per SM:
+  `waves = ⌈B / (S·r)⌉`, `per_block = ⌈work / Bx⌉` (grid-stride iterations of one CTA) and
+  **`chain = waves · per_block · u`**, `u` = the serial steps of one thread per work unit:
+
+  | kernel | work unit | u (steps per unit) |
+  |---|---|---|
+  | K0 `k0_vec`, `kp_prep`, BETA, DIRECT | 256 outputs (one per thread) | 1; DIRECT: k FMAs |
+  | KF | a tile | E · ⌈g/parts⌉ residues (× (1 + f)) |
+  | KL | a tile of th rows | nc · E · g residues (nc = chunks per row; × (1 + f)) |
+  | K2 / K3 `k23_pack` (per group launch, summed) | a tile | 16 · ⌈gᵢ/parts⌉ residues (× (1 + f)) |
+  | K5 j̄-fastest (E = 1 / 2 / 4) | 256 items of E outputs | E · N · L32 limb operations |
+  | K5 λ-fastest | a 1024-output tile | 4 · N · L32 |
+
+  A chain step is a thread's serial unit of work; for a grid much larger than one wave the
+  chain is proportional to the work (collinear with the op features), for small grids it is the
+  wave-quantized latency the byte and op features cannot see (one CTA too many is a second
+  wave). `r` (CTAs resident per SM) is **measured** at calibration time for every kernel and
+  variant (`cudaOccupancyMaxActiveBlocksPerMultiprocessor` at the launch's threads and shared
+  memory; with registers, static shared memory and threads from `cudaFuncGetAttributes`) and
+  stored in the calibration (format 2, `kernel.<name>` lines); a format-1 calibration gets
+  the built-in table of v1.8 (KF E = 16: 2, E = 4: 4, the others 2 by the shared memory of the
+  tile kernels; their chain parameters are 0 there, so a format-1 file predicts exactly as in
+  v1.8). K4's rounds use the configuration table's CTAs per SM (the plan-time rule's
+  constants; `imd_bench --methods occupancy` reports the measured K4 occupancy next to it, so a
+  difference is visible). The zero-rows launch of K3 counts as a launch only.
+  **Adoption rule:** a chain term replaces an ad-hoc one (KF's fixed r = 2 / 4) only if the
+  hold-out stays as good or better; otherwise the measured-r chain is fitted beside it and the
+  difference is reported (NOTES-B2).
 - **K4's partial K tile** (`mac_ktail`, found on the hold-out set). A K-chunk whose length is
   not a multiple of the 64-wide K tile (k̂ = 1008, 5008, 30000, 150000; every full chunk K_c' =
   131056) runs CUTLASS 2.x's predicated residue tile, and the whole chunk is measurably slower
@@ -1944,7 +1988,8 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
   chunks): the same round decomposition, one function used by both. The batch (≤ 65535)
   and n̂ splits are not modeled (they only cut a very large tile count in parts).
 - **K5 per N** (A5: one kernel per N): the N·L32 limb operations and the N·b·m·n̂ plane
-  bytes carry the N dependence; the j̄-per-thread choice is not a feature.
+  bytes carry the N dependence; [v1.10] the j̄-per-thread choice and the per-N occupancy enter
+  through K5's chain (`k5_launch`, `kernel.k5_n<N>_e<E>`).
 - **g**: the KF / KL group-1 terms use g_1 = g; groups 2..G are the PACK phase (one operand
   read per group); K4 is summed over groups (fewer, smaller launches as g shrinks).
 - **`vec_mode`**: RESIDENT removes K0 and KF's vec bytes (and the call term's launch).
@@ -1965,6 +2010,98 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
   (K4: `2·N·b·m·n̂·k̂` int8; DIRECT: `2bmnk` FP64) and `bound = max(bytes / peak_bw, ops /
   peak)` with the datasheet peaks stored in the calibration. `imd_bench`'s per-phase "% of
   bound" takes them from here (it had its own copy of the formulas, at g = N).
+
+#### [v1.10] Clock regimes: BURST and SUSTAINED
+
+The GPU's SM clock is not a constant. Short or isolated calls run at the boost clock (the 4090:
+2805 MHz in nearly every calibration record); long or back-to-back sequences of
+tensor-core-heavy calls hit the board power limit (450 W) and the clock settles lower (2300–2450
+MHz at 4096³, about 1950 MHz at 16384³). ehrenfest runs long repeated sequences. The model is
+split into a time model at a given clock and a clock model per regime.
+
+- **Time at clock f.** Each feature is either clock-bound (scales with the SM clock) or not:
+  DRAM bytes (every `byte` feature, K4's DRAM term), `launch` and the call term are not; every
+  other feature (op, op_eps, row, chain, l2byte, K4's round model) is. With the calibration's
+  reference clock `f_ref`: `t_p(f) = Σ_{clock-bound j} θ_j x_j · f_ref / f + Σ_{others} θ_j x_j`
+  (K4: `max(rounds · f_ref / f, DRAM term)`). The fit normalizes each record to `f_ref` by the
+  SM clock recorded with it (`sm_mhz_median` of the per-call clock probe, else the clock right
+  after the timed loop), so θ is the reference-clock cost (**adopted only if the hold-out is as
+  good or better than unnormalized**, NOTES-B2).
+- **Power at clock f** (an energy roofline): `P(f) = P_idle + [ (e_tc·O_tc + e_alu·O_alu) ·
+  (f/f_ref)^γ + e_byte·D ] / t(f)`, with O_tc = K4's int8 ops (its phase `ops`), O_alu = the
+  residue and CRT limb operations (the op features of KF, KL, PACK, K5) plus DIRECT's FP64
+  flops, D = the compulsory DRAM bytes (Σ phase `bytes`), γ = 2 (dynamic energy per operation
+  ∝ V², V ∝ f in the DVFS range; the fitter scans γ ∈ {1, 2, 3} and keeps the best). P(f) rises
+  monotonically with f (numerator up, t(f) down).
+- **Regimes.** `BURST`: f = f_ref. `SUSTAINED`: f = f_ref if P(f_ref) ≤ P_cap, else the f in
+  [f_min, f_ref] with P(f) = P_cap (bisection, deterministic), f_min if even that is above the
+  cap. An explicit `clock_mhz` in the request overrides both (e.g. a locked clock, or the
+  clock measured with a record: the validation's clock-conditioned mode). The prediction
+  reports the clock used and P(f). The power is the **call's own** average: in a sequence of
+  mixed calls the card settles on the mix's average power, so a heavy call between light ones
+  runs faster than its SUSTAINED estimate (a sequence-level solve is the caller's, from the
+  reported `power_w`; not modeled here).
+- **Calibration** (format 2 `power.*`): `f_ref` = the median SM clock of the uncapped
+  calibration records; `P_cap` = the enforced power limit (NVML), `f_min`; `P_idle`, e_tc,
+  e_alu, e_byte by non-negative least squares on **sustained windows**: `imd_bench --methods
+  sustained` runs one plan back-to-back for `--sustain-s` seconds (calls queued ahead, as a
+  sequence, after the warm-up) and records the mean time per call, the mean SM clock and the
+  mean board power (NVML instant power and clock, sampled every 20 ms; the energy counter is
+  never read, so nothing perturbs the window). Each window gives one linear equation in
+  (P_idle, e_tc, e_alu, e_byte) at its measured clock. A calibration without a power model
+  (format 1, or `power.cap_w = 0`) predicts SUSTAINED = BURST.
+- **Default: SUSTAINED** (design question for review: ehrenfest runs long sequences; for calls
+  below the cap both regimes coincide, so the default only changes the large, tensor-core-heavy
+  calls, which in a sequence do run at the capped clock).
+
+#### [v1.10] Cache state: COLD and WARM
+
+The calibration records are repeat calls of one plan on the same operands: at the start of a
+call, the L2 holds the end of the previous call's traffic (C, the W planes, the last residues),
+so the operands A and B are still resident only when the whole call footprint fits the L2
+(small calls). With the effective residency size `L_w` (format 2 `warm.l2_bytes`), the call's
+inputs `I` = 8·E of each in-line operand (+ 8bmn of C when β ≠ 0) and its footprint `F = I +
+workspace_bytes + 8bmn`:
+
+- `res_repeat = clamp(L_w − (F − I), 0, I)`: input bytes resident in the calibration's repeat
+  state (the most recent L_w bytes of traffic; A and B are the oldest);
+- **COLD** (`IMD_PERF_CACHE_COLD`, the default): `res = 0`, the inputs come from DRAM;
+- **WARM** (`IMD_PERF_CACHE_WARM`): `res = min(I, L_w)`, the inputs were just written or read
+  (e.g. C of the previous call is A of this one).
+
+Each reading phase (KF; KL A / KL B; K5 for C) gets `(res_repeat − res)·Δ` added in proportion to
+its share of I, with Δ = `warm.l2byte` the calibrated saving per byte served from L2 instead of
+DRAM (ns per byte; ≥ 0). The phase's `x₁` stays the compulsory DRAM bytes (no new feature: the
+phase layout is frozen); the prediction reports `warm_bytes` = res. Calibration: `imd_bench
+--l2 flush` (a 2 × L2 buffer written before each timed call, outside the timed window: COLD),
+the repeat calls (`--l2 repeat`, the default) and `--methods pair` (a square GEMM whose second
+call reads the first call's C as its A: WARM); Δ and L_w are fitted on the differences
+(a scan over L_w, least squares for Δ). **If the measured COLD / WARM difference is below a few
+% of the call on every measured shape, the calibration keeps Δ = 0 (COLD = WARM, the option
+stays as a reported no-op) and NOTES-B2 says so.** A format-1 calibration has Δ = 0.
+
+#### [v1.10] Prediction intervals and ties
+
+Per call and per phase the prediction carries a band `[p10, p90]` = the time times the 10th and
+90th percentiles of measured / predicted on the hold-out set: per size class of the
+**predicted** call time (< 100 µs, 100 µs – 1 ms, ≥ 1 ms) for the call, per kernel class for a
+phase (the CALL phase: zero width). `bench/perf_validate.py --bands` computes them from the
+hold-out residuals of the fitted calibration and writes them into it (format 2 `band.*`); it
+reports the coverage by **2-fold cross-validation over the hold-out cases** (bands from half
+the cases, coverage on the other half, both ways), so the coverage it prints is not in-sample.
+A calibration without bands (format 1) has zero-width bands. The bands describe the model's
+error on shapes like the hold-out's (BURST, the bench's repeat calls); the same ratios are
+applied in every regime and cache state (documented approximation).
+
+`imd_perf_rank` (v7 request, `order = IMD_PERF_ORDER_BAND`, the default of a v7-sized request):
+the best candidate is the feasible one with the smallest `time_s`; every feasible candidate
+whose `time_p10_s ≤ best.time_p90_s` is a **tie** (`tie = 1`, the best included); ties come
+first, ordered by `total_bytes` (the smaller footprint wins), then `time_s`, N, g, vec mode,
+packed; then the remaining feasible candidates by time, then the infeasible SUCCESS ones, then
+the others (as v6). `raw_rank` = the candidate's position in the v6 time order, so the raw order
+is always available; `order = IMD_PERF_ORDER_TIME` keeps the v6 order (and a v6-sized request
+always gets it). The accuracy-aware ranking (a later item) extends the request and the
+candidate by appended fields (`struct_size`, `candidate_size`), not by changing these.
 
 ### 6c.2 Calibration: data, fit, file, shipped table
 
@@ -1999,13 +2136,38 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
   Numbers are parsed and printed locale-independently (`std::from_chars` / `std::to_chars`,
   shortest round-trip form), so format → parse is bit-exact. No dependency, parseable by any
   C program.
+- **[v1.10] Data, continued.** The sweep's first line runs `imd_bench --methods occupancy`
+  (no timing: the measured CTAs per SM, registers, static shared memory and threads of every
+  kernel and variant, `cudaOccupancyMaxActiveBlocksPerMultiprocessor` /
+  `cudaFuncGetAttributes`, plus the K4 configurations' measured occupancy); every timed record
+  carries `sm_mhz_median`, the SM clock right after each timed call (the one-warp
+  `%globaltimer` / `clock64` probe, outside the timed window). `bench/sweep_sustained.txt`
+  (sustained windows, ≈ 4 min) feeds the power fit, `bench/sweep_cache.txt` (flush / repeat /
+  pair, ≈ 2 min) the cache fit; `tools/calibrate.sh` runs all three.
+- **File format 2** [v1.10] (written by v7; format 1 is still read). Format 1 plus, all
+  required:
+  - every v1.10 parameter (`k0.chain`, `kl.chain`, `pack.chain`, `k5.chain`, `direct.chain`,
+    `beta.chain`);
+  - `kernel.<name> = resident regs smem threads` for every kernel of `imd_perf_kernel_name`
+    (four integers; resident ≥ 1, the others ≥ 0);
+  - `power.clock_ref_mhz`, `power.clock_min_mhz`, `power.cap_w`, `power.idle_w`,
+    `power.tc_pj`, `power.alu_pj`, `power.byte_pj`, `power.gamma` (≥ 0; `power.cap_w = 0`:
+    no power model, `power.clock_ref_mhz = 0`: no clock scaling);
+  - `warm.l2_bytes`, `warm.l2byte` (≥ 0);
+  - `band.call_small`, `band.call_mid`, `band.call_large` and `band.<class>` for every class
+    = `p10 p90` (two numbers, 0 < p10 ≤ p90; `1 1`: no band).
+  A value of several numbers is separated by blanks. **Reading format 1** migrates: the new
+  parameters 0, the built-in occupancy table, no power model, Δ = 0, bands `1 1`; such a
+  calibration predicts exactly as host API 6 did (tested). `imd_perf_calib_format` writes the
+  calibration's own format (a migrated format-1 struct keeps `format = 1` and is written as
+  format 1), so format → parse stays bit-exact for both.
 - **Shipped table.** `src/host/calib/rtx4090_sm89.calib` (the 4090 at stock clocks, as
   shipped: no clock lock; its `clocks` line records the state) is embedded at configure time
   (CMake reads the file into a raw string literal: the file is the one source; editing it
   re-runs the configure step). `imd_perf_calib_default` parses that text; a NULL calibration
   pointer anywhere means the default.
 
-### 6c.3 API (host API version 6)
+### 6c.3 API (host API version 6; [v1.10] version 7)
 
 All functions are pure and thread-safe like §6a; a calibration is a **caller-owned plain
 struct** (no handle, no allocation, no lifetime rules), so nothing new needs a spec (6c.6).
@@ -2150,6 +2312,65 @@ a new struct and new function names);
 `imd_lowering_t` and everything existing are unchanged. The calibration file is versioned
 by `format` (a new feature set is a new format and a refit).
 
+**[v1.10] Host API version 7** (appended fields only; every v6 layout above is unchanged and a
+v6-sized struct gets v6 behavior except where noted):
+
+```c
+#define IMD_PERF_CALIB_FORMAT    2    /* written; format 1 is read too (migrated)          */
+#define IMD_PERF_KERNEL_CAPACITY 128
+enum { IMD_PERF_KERNEL_K0, IMD_PERF_KERNEL_KF16, IMD_PERF_KERNEL_KF4, IMD_PERF_KERNEL_KL8,
+       IMD_PERF_KERNEL_KL4, IMD_PERF_KERNEL_PACK, IMD_PERF_KERNEL_ZERO_ROWS,
+       IMD_PERF_KERNEL_DIRECT, IMD_PERF_KERNEL_BETA, IMD_PERF_KERNEL_PACK_PREP,
+       IMD_PERF_KERNEL_K4 = 10,             /* + IMD_K4_*                                   */
+       IMD_PERF_KERNEL_K5 = 14,             /* + 4 (N - 2) + v, v: 0 E = 1, 1 E = 2, 2 E = 4,
+                                               3 lambda-fastest                             */
+       IMD_PERF_KERNEL_COUNT = 90 };
+typedef struct { int32_t resident, regs, smem_bytes, threads; } imd_perf_kernel_t;
+const char* imd_perf_kernel_name(int32_t kernel);   /* "k0", "kf16", ..., "k5_n14_e4", "k5b_n14" */
+enum { IMD_PERF_BAND_SMALL, IMD_PERF_BAND_MID, IMD_PERF_BAND_LARGE };  /* < 100 us, < 1 ms, >= */
+enum { IMD_PERF_REGIME_DEFAULT = 0, IMD_PERF_REGIME_BURST = 1, IMD_PERF_REGIME_SUSTAINED = 2 };
+enum { IMD_PERF_CACHE_COLD = 0, IMD_PERF_CACHE_WARM = 1 };
+enum { IMD_PERF_ORDER_BAND = 0, IMD_PERF_ORDER_TIME = 1 };
+
+/* imd_perf_calib_t, appended (format 2):                                                    */
+  imd_perf_kernel_t kernel[IMD_PERF_KERNEL_CAPACITY];       /* measured occupancy           */
+  double clock_ref_mhz, clock_min_mhz, power_cap_w, power_idle_w;
+  double energy_tc_pj, energy_alu_pj, energy_byte_pj, energy_gamma;
+  double warm_l2_bytes, warm_l2byte_ns;
+  double band_call[3][2];                                    /* {p10, p90} per size class    */
+  double band_class[16][2];                                  /* per IMD_PERF_CLASS_*         */
+/* imd_perf_request_t, appended (v6: 24 bytes, v7: 40):                                      */
+  int32_t regime, cache;          /* IMD_PERF_REGIME_*, IMD_PERF_CACHE_*                    */
+  double  clock_mhz;              /* > 0: predict at this SM clock (overrides the regime)   */
+/* imd_perf_t, appended:                                                                      */
+  int32_t regime, cache;          /* the ones used (DEFAULT resolved)                        */
+  double  clock_mhz, power_w;     /* the SM clock assumed; the call's average power there (0:
+                                     no power model)                                         */
+  double  warm_bytes;             /* input bytes served from L2 (WARM)                       */
+  double  time_p10_s, time_p90_s;
+  double  phase_p10_s[IMD_PERF_MAX_PHASES], phase_p90_s[IMD_PERF_MAX_PHASES];
+/* imd_perf_rank_request_t, appended:                                                         */
+  int32_t regime, cache, order, reserved;   double clock_mhz;
+/* imd_perf_candidate_t, appended:                                                            */
+  double  time_p10_s, time_p90_s, clock_mhz, power_w;
+  int32_t tie, raw_rank;
+```
+- A request shorter than v7 (24 / 64 bytes) means regime DEFAULT, COLD, no clock override and,
+  for rank, the v6 time order. DEFAULT = SUSTAINED when the calibration has a power model,
+  else BURST. Invalid: an unknown regime, cache or order, `clock_mhz` < 0 or not finite.
+- A calibration struct shorter than v7 (passed by a v6 caller) is read as format 1 (its
+  appended fields absent: built-in occupancy, no power model, Δ = 0, no bands), whatever its
+  `format` field says. `calib_valid` for format 2: resident ≥ 1, every power / warm value ≥ 0
+  and finite, 0 < p10 ≤ p90 in every band.
+- `imd_perf_predict_pack` uses the request's regime, cache (its input is X: WARM serves X from
+  L2 up to L_w) and clock as `imd_perf_predict`.
+- Python (`host.py`): `predict(..., regime=, cache=, clock_mhz=)`, `Prediction.regime`,
+  `.cache`, `.clock_mhz`, `.power_w`, `.warm_bytes`, `.time_p10_s`, `.time_p90_s`, phases'
+  `p10_s` / `p90_s`; `rank(..., order=, regime=, cache=, clock_mhz=)`, `Candidate.tie`,
+  `.raw_rank`, `.time_p10_s`, `.time_p90_s`, `.clock_mhz`, `.power_w`; `Calibration.kernels`,
+  `.power`, `.warm`, `.bands`; `kernel_names()`.
+- `IMD_HOST_API_VERSION` 7. No change to plans, launches, results or footprints.
+
 ### 6c.4 Tests
 
 `host_c_api` (C): default calibration, format → parse round trip (bit-exact), every parse
@@ -2163,6 +2384,19 @@ bracket and the default ramp (exact log₂T), rank: every
 footprint equals `imd_workspace_size(_packed)` / `imd_plan_bytes` / `imd_pack_layout` exactly,
 the budget is respected, the order is as specified; `perf_calib_shipped`: the shipped file
 parses and its sm_count is 128. `host_cuda_free` unchanged (the model is plain C++).
+
+[v1.10] `host_perf` adds: the Python transcription of every chain feature (it re-implements the
+shared launch rules independently: KL, K2 / K3, K5 variants, grid caps) against the C features
+on the random descriptors; a format-1 calibration (the v6 shipped file, kept as a test vector)
+predicts bit-identically to the v6 formulas (chain parameters 0, no clock scaling) and round-
+trips as format 1; format-2 parse errors (a missing `kernel.` line, a band with p10 > p90,
+resident 0); BURST at `clock_mhz = f_ref` equals BURST; SUSTAINED ≤ BURST in speed (never
+faster) and = BURST when P(f_ref) ≤ cap; P(f_s) = cap within 1e-9 relative when capped; a
+larger clock never predicts a longer time; COLD ≥ WARM; bands contain the time and scale with
+it; rank: ties = the feasible candidates whose p10 ≤ the best's p90, ordered by total_bytes,
+`raw_rank` is a permutation reproducing the v6 order, `order = TIME` and a v6-sized request give
+the v6 order. `host_c_api`: the v7 sizes, v6-sized structs still accepted. The kernel-side launch
+refactor (rules moved to `analysis.hpp`) is covered by the existing bit-exact GPU tests.
 
 ### 6c.5 Validation (hold-out)
 
@@ -2178,6 +2412,17 @@ error distribution per size class. **Targets** (relative error of the total):
 | 100 µs – 1 ms | ≤ 10 % | ≤ 20 % |
 | < 100 µs | ≤ 15 % | ≤ 30 % |
 
+**[v1.10] Further targets.** (1) The table above holds for the time model evaluated at each
+record's measured clock (clock-conditioned; equal to BURST for the uncapped records) and stays
+met after the chain features; per-class phase errors are reported before / after (K3, K4 at
+k̂ mod 64 ≠ 0 named). (2) **SUSTAINED**: the predicted time of each sustained window vs its
+measured mean time per call, with the power model fitted leave-one-case-out (the window's own
+case excluded): the table's size-class targets, and the predicted settled clock within 5 %
+(median) of the measured. (3) **Intervals**: 80 % of hold-out calls inside their [p10, p90]
+band, between 70 % and 90 % per size class, by the 2-fold cross-validation above. (4) **Cache**:
+the measured COLD / repeat / WARM differences and the model's, per case (no target: an effect
+size; Δ = 0 if it is small).
+
 Tiny calls drift by 10–20 % between performance states (BENCHMARKING "Tiny shapes"), so
 their target is loose. If a target is missed: per-class residuals first; then the smallest
 physically motivated feature (e.g. tile-quantized bytes for grids below one wave, the K5
@@ -2192,6 +2437,10 @@ lifetime, no GPU, no effect on plans (the calibration is never read by plan crea
 checked: `Pipeline LayoutExact / PlanBytesExact`, `cert_workspace`, `cert_pack_layout`) and
 its feasibility test only compares them with a number; it creates no plan and changes no
 legality. HostAPI's rules (pure, thread-safe host queries) cover it as they cover §6a.
+[v1.10] Unchanged: the clock, power, cache and band terms are more pure arithmetic over the
+calibration; the launch rules that moved to `analysis.hpp` produce the same launches (a
+refactor of launch-shape arithmetic, covered by the bit-exact GPU tests), so no Pipeline action
+changes.
 
 ---
 
@@ -2391,3 +2640,19 @@ and host API; every value the same integer (bit-identical, tested on every contr
   caller's; RESIDENT plans live as long as any graph that captured them. No TLA+ change
   (§6d.8 says why). Tests: `python_device`. Reviewed 2026-10-05 (CAI stream "check" by
   default, `PlanCache.clear()` drops GENERATE plans, `freeze()`, pack use counts).
+
+## v1.10 (§6c fidelity follow-up: host API 7, calibration format 2; no semantic, layout, launch or spec change)
+
+- **§6c.1** Wave / occupancy `chain` features for K0, KL, PACK, K5, DIRECT and BETA (KF's chain
+  generalized) from the kernels' launch rules, now shared with `contract.cu` in
+  `src/host/analysis.hpp` (`launch_blocks`, `kl_launch`, `pack_kl_lg_rows`, `pack_launch`,
+  `k5_launch`); CTAs per SM measured at calibration time. Clock regimes (BURST, SUSTAINED with
+  a power-cap model), cache state (COLD, WARM), prediction intervals and tie-aware ranking.
+- **§6c.2** Calibration format 2 (occupancy table, power, warm and band keys); format 1 still
+  read, migrated to v6-identical predictions. New sweeps for sustained windows and cache state;
+  `imd_bench --methods occupancy | sustained | pair`, `--l2 flush | repeat`, per-call clock in
+  every record.
+- **§6c.3** Host API version 7: appended fields in the calibration, request, prediction, rank
+  request and candidate structs; `imd_perf_kernel_name`.
+- **§6c.4 / §6c.5** Tests and validation targets for the new features.
+
