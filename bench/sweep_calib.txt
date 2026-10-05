@@ -69,7 +69,8 @@ k_d576    | ik,jk->ij | i=576,j=576,k=576          | imd | 15,16 | --reps 200 --
 k_dr1     | ik,jk->ij | i=2048,j=512,k=640         | imd | 15,16 | --reps 100 --phase-reps 10 --max-seconds 1 --data dominant
 # --- (v1.10, b2-fidelity) small pack grids (K3 of narrow B: r_mm-like n, groups 2..) and the
 #     K4 partial K tile: k_hat around 768-1088 and 4864-5120 with k_hat mod 64 / 128 varied
-#     (800: 32 / 32, 784: 16 / 16, 832: 0 / 64, 896: 0 / 0, 1008: 48 / 112, 1040: 16 / 16), rows
+#     (k_hat mod 32 / 64 / 128: 784: 16 / 16 / 16, 800: 0 / 32 / 32, 832: 0 / 0 / 64, 896: 0 / 0 / 0,
+#     1008: 16 / 48 / 112, 1040: 16 / 16 / 16, 4880: 16, 4960: 0 / 32, 5008: 16), rows
 #     of A / B 2048 (multiples of 128) and 2000 (not)
 p_k3a     | ik,jk->ij | i=4096,j=96,k=8192         | imd | 8,14,16 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,2,5
 p_k3b     | ik,jk->ij | i=8192,j=192,k=3000        | imd | 8,16 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,3,7
@@ -89,6 +90,7 @@ t_r832    | ik,jk->ij | i=2000,j=2000,k=832        | imd | 8,16 | --reps 50 --ph
 t_k4864   | ik,jk->ij | i=2048,j=2048,k=4864       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
 t_k4880   | ik,jk->ij | i=2048,j=2048,k=4880       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
 t_k4928   | ik,jk->ij | i=2048,j=2048,k=4928       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
+t_k4960   | ik,jk->ij | i=2048,j=2048,k=4960       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
 t_k4992   | ik,jk->ij | i=2048,j=2048,k=4992       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
 t_k5008   | ik,jk->ij | i=2048,j=2048,k=5008       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
 t_k5056   | ik,jk->ij | i=2048,j=2048,k=5056       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1

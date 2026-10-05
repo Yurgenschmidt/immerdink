@@ -1880,7 +1880,7 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
 | `KF fused` | `fused` (§4) | KF | 1 | `Σ_x (8E_x + g·pad_x·k̂ + 3rows_x) + 8V·[GENERATE]` | `g·Σ_x E_x` residues | `Σ_x rows_x` | `f·x₂`; x₅ = the busiest SM's chain (below) |
 | `KL A`, `KL B` | `fused_large` bit of x | KL | 1 | `8E_x + g·pad_x·k̂ + 3rows_x` | `g·E_x` | `16·rows_x·max(0, k̂ − 2·tk_x)` L2 re-read | `f·x₂` |
 | `K2 pack A`, `K3 pack B` | groups of x not packed by KF / KL | PACK | launches (B: + the zero-rows launch per group if n̂ > n) | `Σ_groups (8E_x + g_i·pad_x·k̂)` | `Σ_groups g_i·E_x` | `f·x₂` | |
-| `K4 gemm` | EMULATE | K4[config] | rounds | MACs run at q = 1 | q = 2 | q = 3 | DRAM bytes beyond L2: `Σ_groups max(0, g_i·b·(m + n̂)·k̂ + g_i·b·m·n̂·(2·k_chunks − 1) − L2)`; x₅ = the busiest SM's MACs of K-chunks whose length is not a multiple of 64 (`mac_ktail`) |
+| `K4 gemm` | EMULATE | K4[config] | rounds | MACs run at q = 1 | q = 2 | q = 3 | DRAM bytes beyond L2: `Σ_groups max(0, g_i·b·(m + n̂)·k̂ + g_i·b·m·n̂·(2·k_chunks − 1) − L2)`; x₅ = the busiest SM's MACs of K-chunks whose length is not a multiple of 64 (`mac_ktail`; [v1.10] format 2: of 32, below) |
 | `K5 crt` | EMULATE | K5 | 1 | `N·b·m·n̂ + 3b(m+n) + 8bmn(1+β')` | `N·L32·b·m·n` limb operations | | |
 | `DIRECT` | DIRECT dispatch | DIRECT | 1 | `8b(mk + nk) + 8bmn(1+β')` | `2bmnk` FP64 flops | | |
 | `K5 beta-only` | SCALE dispatch or α = 0 | BETA | 1 | `8bmn(1+β')` | | | |
@@ -1947,6 +1947,14 @@ K4 classes keep the round model (it already is a wave model).
   (sq5000, 3000 × 700 × 5000: K4 24–29 % above the round model without the feature; with it the
   K4 hold-out p90 on ≥ 1 ms calls drops from 19 % to 18 % and the 64×128 class from 28 % to
   15 %). Tested criteria: k̂ mod 64 (adopted), 128, 256.
+  **[v1.10] Format 2 changes the criterion to k̂ mod 32 ≠ 0** (k̂ is a multiple of 16, so
+  k̂ mod 32 = 16): the int8 residue rows (k̂ bytes) are then not 32-byte aligned, every row
+  starts mid-sector and the K4 tile loads touch one more sector per row. It explains both the
+  slow k̂ = 1008 / 5008 / 30000 / 150000 (mod 32 = 16) and the not-slow k̂ = 800 (mod 32 = 0, mod 64
+  = 32, which the v1.8 term over-predicted by 26–35 %). Refit on the v1.8 data, hold-out:
+  100 µs – 1 ms max error 29.1 → 14.8 %, N = 15–17 100 µs – 1 ms median / p90 8.0 / 15.1 →
+  5.3 / 11.7 %; mod 128 was worse (≥ 1 ms median 3.9 %). The fine-k̂ sweep (NOTES-B2 §6)
+  separates the criteria. A format-1 calibration keeps mod 64 (v6-identical predictions).
 
 - **The eps path** (the `op_eps` features, reviewed 2026-10-05). The packs quantize an
   element to `μ·2^ε`; a residue costs one more modular multiply when ε > 0, i.e. |a'| ≥ 2⁵³

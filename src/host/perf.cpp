@@ -37,7 +37,8 @@ namespace c = imd::constants;
 constexpr int kP = IMD_PERF_MAX_PARAMS;
 constexpr int kK4ByteSlot = 4;  // K4 classes: t = max(sum_{j != 4} th_j x_j, th_4 x_4)
 constexpr int kK4TailSlot = 5;  // K4: the MACs of chunks with a partial 64-wide K tile
-constexpr int64_t kK4TileK = 64;
+constexpr int64_t kK4TileK = 64;    // format 1's partial-K-tile criterion
+constexpr int64_t kK4RowAlign = 32; // format 2's: residue rows of k_hat bytes, 32-byte sectors
 
 const char* const kClassNames[IMD_PERF_CLASS_COUNT] = {
     "k0", "kf", "kl", "pack", "k4_128x256", "k4_128x128", "k4_64x128", "k4_64x64",
@@ -420,6 +421,7 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     const int64_t ksz[2] = {chunk, last}, kcnt[2] = {kc.k_chunks - 1, 1};
     double x[kP] = {0, 0, 0, 0, 0, 0};
     const int occ = kK4Configs[cfg].ctas_per_sm;
+    const int64_t tail_mod = cal.format == 1 ? kK4TileK : kK4RowAlign;
     for (int i = 0; i < 2; ++i)
       for (int j = 0; j < 2; ++j) {
         if (gcnt[i] == 0 || kcnt[j] == 0) continue;
@@ -429,9 +431,13 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         x[0] += cnt * (full + (r.rest > 0 ? 1 : 0));
         x[occ] += cnt * full * occ * macs;
         if (r.rest > 0) x[r.rest] += cnt * r.rest * macs;
-        // A chunk whose length is not a multiple of the 64-wide K tile runs a predicated
-        // residue tile (CUTLASS 2.x MmaMultistage): its MACs again, at their extra cost.
-        if (ksz[j] % kK4TileK != 0) x[kK4TailSlot] += cnt * (full * occ + r.rest) * macs;
+        // The slow K-chunks (mac_ktail): format 1 (v1.8) took a chunk whose length is not a
+        // multiple of the 64-wide K tile (CUTLASS's predicated residue tile); format 2 (v1.10,
+        // NOTES-B2 §6) one whose rows are not 32-byte aligned (k_hat mod 32 = 16: every int8
+        // residue row starts mid-sector, so the k-tile loads touch one more sector), which
+        // explains k_hat = 1008 / 5008 (slow) and 800 (not slow) alike. Its MACs again, at
+        // their extra cost.
+        if (ksz[j] % tail_mod != 0) x[kK4TailSlot] += cnt * (full * occ + r.rest) * macs;
       }
     const double k4_bytes = N * b * (m + nh) * kh + N * b * m * nh * (2.0 * kc.k_chunks - 1);
     // The DRAM term: per group, its operand residues (just written by the packs) and its W

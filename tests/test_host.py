@@ -703,7 +703,7 @@ MODULI = [256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199, 
 K_C_PRIME = 131056
 
 
-def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks, l2):
+def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks, l2, tail_mod=64):
     """K4 features (rounds, MACs at q = 1..3 concurrent CTAs) over the groups and K-chunks,
     written from DESIGN §6c.1 independently of src/host/perf.cpp."""
     tm, tn, occ = K4_TILES[c]
@@ -720,7 +720,8 @@ def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks, l2):
             x[occ] += full * occ * tm * tn * kc
             if rest:
                 x[rest] += rest * tm * tn * kc
-            if kc % 64:  # a partial 64-wide K tile: the chunk's MACs again (mac_ktail)
+            if kc % tail_mod:  # format 1: a partial 64-wide K tile; format 2: rows not
+                # 32-byte aligned (v1.10): the chunk's MACs again (mac_ktail)
                 x[5] += (full * occ + rest) * tm * tn * kc
     for gs in groups:  # the DRAM term: a group's operands and W planes beyond L2
         x[4] += max(0, gs * b * (m + n_hat) * k_hat + gs * b * m * n_hat * (2 * k_chunks - 1)
@@ -760,7 +761,7 @@ def spec_kf_chain(rows, k_hat, g, sms, r16=2, r4=4):
                       (4 if small else 16) * -(-g // parts), r4 if small else r16, sms)
 
 
-def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128):
+def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod=64):
     """[(name, launches, x)] of one imd_contract (DESIGN §6c.1 table) from the lowering
     summary and the operands' read direction (along rows: KL tiles of 512). occ: kernel name ->
     CTAs per SM (the calibration's occupancy table); the chains assume radix 1 (operands read
@@ -829,7 +830,8 @@ def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128):
                                              wide * (N - g) * rows[x] * k, (1 + wide) * chain,
                                              0]))
     ph.append(("K4 gemm", lw.gemm_launches,
-               spec_k4_features(lw.k4_config, m, nh, kh, b, N, g, sms, lw.k_chunks, l2)))
+               spec_k4_features(lw.k4_config, m, nh, kh, b, N, g, sms, lw.k_chunks, l2,
+                                tail_mod)))
     mn = b * m * n
     e = 1 if mn <= 1024 * sms else 2 if mn <= 8 * 2048 * sms else 4
     work = b * m * -(-n // e)
@@ -1077,7 +1079,8 @@ def suite_perf(args):
                         raise Fail(f"{spec} {ext}: status {p.status} vs lowering {lw.status}")
                     if p.status != "SUCCESS":
                         continue
-                    want = spec_phases(lw, vec, along, cal.meta["l2_bytes"], occ=occ)
+                    want = spec_phases(lw, vec, along, cal.meta["l2_bytes"], occ=occ,
+                                       tail_mod=64 if cal.file_format == 1 else 32)
                     got = [(q.name, q.launches, list(q.x)) for q in p.phases]
                     if along != (False, False):  # the chains' transcription assumes radix 1
                         for ph in want + got:
