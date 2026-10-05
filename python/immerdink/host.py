@@ -64,8 +64,8 @@ PERF_REGIMES = {"DEFAULT": 0, "BURST": 1, "SUSTAINED": 2}
 PERF_CACHES = {"COLD": 0, "WARM": 1, "REPEAT": 2}
 PERF_ORDERS = {"BAND": 0, "TIME": 1}
 # The parameters new in calibration format 2 (absent from a format-1 file).
-FORMAT2_PARAMS = frozenset({"k0.chain", "kl.chain", "pack.chain", "k5.chain", "direct.chain",
-                            "beta.chain"})
+FORMAT2_PARAMS = frozenset({"k0.chain", "kl.chain", "pack.chain", "pack.wave", "k5.chain",
+                            "direct.chain", "beta.chain"})
 
 
 class ImmerdinkError(RuntimeError):

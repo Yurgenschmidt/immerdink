@@ -819,16 +819,17 @@ def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod
     for x, name in ((0, "K2 pack A"), (1, "K3 pack B")):
         if G > 1:
             per = 2 if (x == 1 and nh > n) else 1
-            chain = 0
+            chain = wave = 0
             for gs in sizes[1:]:  # group 1 is KF's / KL's
                 tiles = -(-rows[x] // 64) * -(-kh // 64)
                 parts = spec_parts(tiles, gs, sms)
                 chain += spec_chain(spec_launch_blocks(tiles, 1), parts, tiles,
                                     16 * -(-gs // parts), r("pack"), sms)
+                wave += spec_chain(spec_launch_blocks(tiles, 1), parts, tiles, 1, r("pack"), sms)
             ph.append((name, (G - 1) * per, [(G - 1) * per, (G - 1) * 8 * rows[x] * k
                                              + (N - g) * pad[x] * kh, (N - g) * rows[x] * k,
                                              wide * (N - g) * rows[x] * k, (1 + wide) * chain,
-                                             0]))
+                                             wave]))
     ph.append(("K4 gemm", lw.gemm_launches,
                spec_k4_features(lw.k4_config, m, nh, kh, b, N, g, sms, lw.k_chunks, l2,
                                 tail_mod)))
@@ -855,7 +856,7 @@ def close(a, b, rel=1e-12):
 # DESIGN v1.10 §6c.1: the feature slots whose time scales with the SM clock (an independent
 # transcription of "ops, chains, L2 traffic, K4's round model; not DRAM bytes, launches, call").
 SPEC_CLOCK_BOUND = {
-    "k0": (2,), "kf": (2, 3, 4, 5), "kl": (2, 3, 4, 5), "pack": (2, 3, 4), "k5": (2, 3),
+    "k0": (2,), "kf": (2, 3, 4, 5), "kl": (2, 3, 4, 5), "pack": (2, 3, 4), "k5": (2, 3),  # not pack.wave
     "direct": (2, 3), "beta": (2,), "call": ()}
 
 
@@ -1086,6 +1087,8 @@ def suite_perf(args):
                         for ph in want + got:
                             if ph[0] in CHAIN_SLOT and ph[0] != "KF fused":
                                 ph[2][CHAIN_SLOT[ph[0]]] = 0.0
+                                if ph[0] in ("K2 pack A", "K3 pack B"):
+                                    ph[2][5] = 0.0  # pack.wave
                     ok = len(want) == len(got) and all(
                         a[0] == b[0] and a[1] == b[1] and all(close(u, v) for u, v in zip(a[2], b[2]))
                         for a, b in zip(want, got))

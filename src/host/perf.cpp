@@ -48,7 +48,7 @@ const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
     {"launch", "byte", "chain", nullptr, nullptr, nullptr},          // k0
     {"launch", "byte", "op", "row", "op_eps", "chain"},              // kf
     {"launch", "byte", "op", "l2byte", "op_eps", "chain"},           // kl
-    {"launch", "byte", "op", "op_eps", "chain", nullptr},            // pack
+    {"launch", "byte", "op", "op_eps", "chain", "wave"},             // pack
     {"round", "mac1", nullptr, nullptr, "byte", "mac_ktail"},        // k4_128x256 (1 CTA per SM)
     {"round", "mac1", "mac2", nullptr, "byte", "mac_ktail"},         // k4_128x128 (2)
     {"round", "mac1", "mac2", nullptr, "byte", "mac_ktail"},         // k4_64x128  (2)
@@ -63,7 +63,7 @@ constexpr bool kFormat2Param[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, true, false, false, false},   // k0.chain
     {},                                          // kf (kf.chain is format 1)
     {false, false, false, false, false, true},   // kl.chain
-    {false, false, false, false, true, false},   // pack.chain
+    {false, false, false, false, true, true},    // pack.chain, pack.wave
     {}, {}, {}, {},
     {false, false, false, true, false, false},   // k5.chain
     {false, false, false, true, false, false},   // direct.chain
@@ -75,7 +75,7 @@ constexpr bool kClockBound[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, true, false, false, false},   // k0: chain
     {false, false, true, true, true, true},      // kf: op, row, op_eps, chain
     {false, false, true, true, true, true},      // kl: op, l2byte, op_eps, chain
-    {false, false, true, true, true, false},     // pack: op, op_eps, chain
+    {false, false, true, true, true, false},     // pack: op, op_eps, chain (not wave: memory)
     {true, true, true, true, false, true},       // k4: the round model, not the DRAM term
     {true, true, true, true, false, true},
     {true, true, true, true, false, true},
@@ -396,18 +396,21 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
       const double bytes = groups * 8 * rows[x] * k + moduli * pad[x] * kh;
       const int64_t per = 1 + ((x == 1 && e.n_hat > e.n) ? 1 : 0);
       // v1.10: the chain of each group's k23_pack launch (pack_launch, shared with contract.cu).
-      double chain = 0;
+      double chain = 0, wave = 0;
       for (int64_t gi = first_done ? 1 : 0; gi < G; ++gi) {
         const int gsize = static_cast<int>(std::min<int64_t>(e.g, e.N - gi * e.g));
         const PackLaunch L = pack_launch(e.pack_along_rows[x], e.b, x == 0 ? e.m : e.n,
                                          e.pack_radix[x], e.k_hat, gsize, sms);
         chain += chain_of(L.grid_x, L.parts, L.tiles, 16.0 * dbl((gsize + L.parts - 1) / L.parts),
                           resident_of(cal, IMD_PERF_KERNEL_PACK), sms);
+        // the tile loads of the busiest SM, in sequence (a memory-latency term: a grid of
+        // a few blocks per SM cannot hide DRAM latency)
+        wave += chain_of(L.grid_x, L.parts, L.tiles, 1.0, resident_of(cal, IMD_PERF_KERNEL_PACK), sms);
       }
       PerfPhase& p = add_phase(&P, x == 0 ? IMD_PERF_PHASE_PACK_A : IMD_PERF_PHASE_PACK_B,
                                IMD_PERF_CLASS_PACK, groups * per,
                                {static_cast<double>(groups * per), bytes, moduli * rows[x] * k, 0,
-                                chain},
+                                chain, wave},
                                bytes);
       set_eps(set_eps(p, 3, moduli * rows[x] * k, f), 4, chain, f);
     }

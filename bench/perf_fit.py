@@ -92,7 +92,7 @@ class Sample:
 # v1.10 (DESIGN §6c.1 "Clock regimes"): the feature slots whose time scales with the SM clock,
 # per class (perf.cpp kClockBound; host_perf checks the two agree through predictions).
 CLOCK_BOUND = {
-    "k0": (2,), "kf": (2, 3, 4, 5), "kl": (2, 3, 4, 5), "pack": (2, 3, 4),
+    "k0": (2,), "kf": (2, 3, 4, 5), "kl": (2, 3, 4, 5), "pack": (2, 3, 4),  # not wave (slot 5): memory latency
     "k4_128x256": (0, 1, 2, 3, 5), "k4_128x128": (0, 1, 2, 3, 5), "k4_64x128": (0, 1, 2, 3, 5),
     "k4_64x64": (0, 1, 2, 3, 5), "k5": (2, 3), "direct": (2, 3), "beta": (2,), "call": ()}
 

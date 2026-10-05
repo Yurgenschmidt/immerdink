@@ -363,7 +363,7 @@ enum {
   IMD_PERF_CLASS_KL = 2,         /* (kl) fused large launch, imd_pack: launch, byte, op,
                                     l2byte, op_eps, chain                                   */
   IMD_PERF_CLASS_PACK = 3,       /* (pack) K2 / K3, groups 2..: launch, byte, op, op_eps,
-                                    chain                                                   */
+                                    chain, wave (the tile loads in sequence)                 */
   IMD_PERF_CLASS_K4_128x256 = 4, /* (k4_128x256) K4: max(round model, byte): round, mac1,
                                     byte (slot 4), mac_ktail (slot 5, in the round model)   */
   IMD_PERF_CLASS_K4_128x128 = 5, /* (k4_128x128) round, mac1, mac2, byte, mac_ktail         */
