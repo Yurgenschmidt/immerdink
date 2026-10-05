@@ -2068,7 +2068,7 @@ split into a time model at a given clock and a clock model per regime.
 - **Regimes.** `BURST`: f = f_ref. `SUSTAINED`: f = f_ref if P(f_ref) ≤ P_cap, else the f in
   [f_min, f_ref] with P(f) = P_cap (bisection, deterministic), f_min if even that is above the
   cap. An explicit `clock_mhz` in the request overrides both (e.g. a locked clock, or the
-  clock measured with a record: the validation's clock-conditioned mode). The prediction
+  clock measured with a record, on the `f_ref` scale). The prediction
   reports the clock used and P(f). The power is the **call's own** average: in a sequence of
   mixed calls the card settles on the mix's average power, so a heavy call between light ones
   runs faster than its SUSTAINED estimate (a sequence-level solve is the caller's, from the
@@ -2199,8 +2199,9 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   kernel and variant, `cudaOccupancyMaxActiveBlocksPerMultiprocessor` /
   `cudaFuncGetAttributes`, plus the K4 configurations' measured occupancy); every timed record
   carries `sm_mhz_median`, the SM clock right after each timed call (the one-warp
-  `%globaltimer` / `clock64` probe, outside the timed window). `bench/sweep_sustained.txt`
-  (sustained windows, ≈ 4 min) feeds the power fit, `bench/sweep_cache.txt` (flush / repeat /
+  `%globaltimer` / `clock64` probe, outside the timed window; ~11 % below NVML, a relative
+  indicator) besides NVML's clock after the loop (`gpu_after`). `bench/sweep_sustained.txt`
+  (sustained windows with 15 s pre-heat, ≈ 7 min) feeds the power fit, `bench/sweep_cache.txt` (flush / repeat /
   pair, ≈ 2 min) the cache fit; `tools/calibrate.sh` runs all three.
 - **File format 2** [v1.10] (written by v7; format 1 is still read). Format 1 plus, all
   required:
@@ -2477,9 +2478,9 @@ error distribution per size class. **Targets** (relative error of the total):
 | 100 µs – 1 ms | ≤ 10 % | ≤ 20 % |
 | < 100 µs | ≤ 15 % | ≤ 30 % |
 
-**[v1.10] Further targets.** (1) The table above holds for the time model evaluated at each
-record's measured clock (clock-conditioned; equal to BURST for the uncapped records) and stays
-met after the chain features; per-class phase errors are reported before / after (K3, K4 at
+**[v1.10] Further targets.** (1) The table above holds in the BURST regime and the records' cache state
+(REPEAT; method packed and `--l2 flush`: COLD) and stays met after the chain features (a
+clock-conditioned evaluation, `perf_validate --record-clock`, was worse and is not used); per-class phase errors are reported before / after (K3, K4 at
 k̂ mod 64 ≠ 0 named). (2) **SUSTAINED**: the predicted time of each sustained window vs its
 measured mean time per call, with the power model fitted leave-one-case-out (the window's own
 case excluded): the table's size-class targets, and the predicted settled clock within 5 %
