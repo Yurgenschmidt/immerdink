@@ -11,7 +11,8 @@
 #include <limits>
 #include <new>
 
-#include "analysis.hpp"
+#include "analysis.hpp"  // kappa_at_least_T, ceil_sqrt_u64
+#include "index_map.hpp"  // lower, gemm_dims_ok
 #include "immerdink/detail/constants.hpp"
 
 namespace imd::detail {
@@ -21,7 +22,16 @@ namespace c = imd::constants;
 
 constexpr double kU = 0x1p-53;                  // unit roundoff
 constexpr double kInflate = 1.0 + 0x1p-40;      // covers the ~30 roundings below (each 2^-53)
-constexpr double kDefaultFailProb = 0x1p-20;
+constexpr double kDefaultFailProb = 0x1p-40;      // review 2026-10-05 (was 2^-20)
+// ABSOLUTE bounds can be subnormal, where the relative inflation is a no-op: an absolute term.
+// EMULATE: 2^-1075 covers a gradual underflow of D's single final rounding (|fl(y) - y| <=
+// u|y| + 2^-1075) and the remaining 2^-1071 - 2^-1075 the few subnormal roundings of the
+// computation (each <= 2^-1075). DIRECT adds (k + 16) 2^-1074 >= 2k 2^-1075: each of the k fmas
+// may underflow (<= 2^-1075 each) plus the computation.
+constexpr double kAbsTiny = 0x1p-1071;
+constexpr uint32_t kErrRequestV8Size = sizeof(imd_err_request_t);  // 64; later: appended fields
+constexpr uint32_t kErrV8Size = sizeof(imd_err_t);                 // 72
+static_assert(kErrRequestV8Size == 64 && kErrV8Size == 72, "v8 error structs");
 constexpr double kInf = std::numeric_limits<double>::infinity();
 
 // T(N) as a double (relative error a few 2^-53: the limbs summed from the top).
@@ -34,11 +44,14 @@ double T_of(int N) {
 bool finite_ge(double v, double lo) { return std::isfinite(v) && v >= lo; }
 
 // The metric composition of a per-(i, j) coefficient E (EMULATE: the final rounding adds
-// E u + u; DESIGN §6f.2).
+// E u + u; DESIGN §6f.2, PROOFS L3c). E (1 + u) is written E + E u: 1 + 2^-53 rounds to 1.0.
 double compose(const ErrReq& q, double E) {
-  const double n = E * (1 + kU) + kU;
+  const double n = E + E * kU + kU;
   switch (q.metric) {
-    case IMD_ERR_ELEMENTWISE: return E * q.cond * (1 + kU) + kU;
+    case IMD_ERR_ELEMENTWISE: {
+      const double Er = E * q.cond;
+      return Er + Er * kU + kU;
+    }
     case IMD_ERR_ABSOLUTE: return n * q.norm_product;
     default: return n;
   }
@@ -61,15 +74,8 @@ imd_status_t guarded(F&& f) {
   }
 }
 
-int32_t dispatch_of(const ExecPlan& e) {
-  return e.path == Path::kNoop ? IMD_DISPATCH_NOOP
-         : e.k == 0            ? IMD_DISPATCH_SCALE
-         : emulates(e)         ? IMD_DISPATCH_EMULATE
-                               : IMD_DISPATCH_DIRECT;
-}
-
 bool out_valid(const imd_err_t* out) {
-  return out != nullptr && out->struct_size >= sizeof(imd_err_t);
+  return out != nullptr && out->struct_size >= kErrV8Size;
 }
 
 void finish(imd_err_t& r, imd_err_t* out) {
@@ -90,7 +96,8 @@ void fill(imd_err_t* r, int N, int32_t rounding, int32_t dispatch, int64_t k, in
 bool err_request_valid(const imd_err_request_t* r, ErrReq* q) {
   *q = ErrReq{};
   if (r == nullptr) return true;
-  if (r->struct_size < sizeof(imd_err_request_t)) return false;
+  if (r->struct_size < kErrRequestV8Size) return false;
+  if (r->reserved != 0) return false;  // reserved for flags (e.g. an alpha rounding term)
   if (r->metric < IMD_ERR_NORMWISE || r->metric > IMD_ERR_ABSOLUTE) return false;
   if (!finite_ge(r->target, 0)) return false;
   if (r->metric == IMD_ERR_ELEMENTWISE && !finite_ge(r->cond, 1)) return false;
@@ -120,6 +127,8 @@ ErrOut err_compute(int N, int32_t rounding, int32_t dispatch, int64_t k, int64_t
     } else {
       o.unit_bound = ku / (1 - ku) * kInflate;
       o.bound = ku / (1 - ku) * scale_of(q) * kInflate;
+      if (q.metric == IMD_ERR_ABSOLUTE)
+        o.bound += (static_cast<double>(k) + 16) * 0x1p-1074;  // k < 2^52: exact
     }
     o.unit_typical = o.unit_bound, o.typical = o.bound;
   } else {
@@ -141,13 +150,15 @@ ErrOut err_compute(int N, int32_t rounding, int32_t dispatch, int64_t k, int64_t
       const double E = 2 * delta * (nu_a + nu_b) * s / d + second;
       o.unit_bound = E * kInflate;
       o.bound = compose(q, E) * kInflate;
+      if (q.metric == IMD_ERR_ABSOLUTE) o.bound += kAbsTiny;
       if (rn) {
         // Hoeffding + a union bound over the outputs (DESIGN §6f.2), capped at the bound.
         const double M = static_cast<double>(std::max<int64_t>(outputs, 1));
         const double p = q.fail_prob > 0 ? q.fail_prob : kDefaultFailProb;
         const double h = s / d * std::sqrt(8 * std::log(2 * M / p)) + second;
         o.unit_typical = std::min(o.unit_bound, h);
-        o.typical = std::min(o.bound, compose(q, o.unit_typical));
+        o.typical = std::min(o.bound, compose(q, o.unit_typical) +
+                                          (q.metric == IMD_ERR_ABSOLUTE ? kAbsTiny : 0.0));
       } else {
         o.unit_typical = o.unit_bound, o.typical = o.bound;
       }
@@ -196,20 +207,28 @@ imd_status_t imd_err_min_moduli(const imd_tensor_t* A, const imd_tensor_t* B, co
   std::memset(&r, 0, sizeof r);
   r.struct_size = out->struct_size;
   r.status = guarded([&] {
-    // One lowering at N = 20 (k, M and the dispatch do not depend on N, g or vec_mode; the
-    // §3.2 RN acceptance is the estimate's own +inf at small N).
-    imd_options_t o = *options;
-    o.num_moduli = c::kNMax, o.residue_group = 1;
-    Analysis an;
-    if (const imd_status_t st = analyze(A, B, C, &o, &an); st != IMD_STATUS_SUCCESS) return st;
-    ExecPlan e;
-    if (const imd_status_t st = plan_data(an, &e); st != IMD_STATUS_SUCCESS) return st;
-    const int32_t dispatch = dispatch_of(e);
-    const int64_t outputs = e.b * e.m * e.n;
+    // The lowering only (§5 rows 1-5 and the mode's GemmCoord rule; k, M and the dispatch do
+    // not depend on N, g or vec_mode). Not the workspace layout: it depends on N and g, and
+    // must not reject a shape that is valid at the N found. The §3.2 RN acceptance is the
+    // estimate's own +inf at small N.
+    const imd_options_t& o = *options;
+    if ((o.rounding != IMD_RN && o.rounding != IMD_TRUNC) ||
+        (o.mode != IMD_EMULATE && o.mode != IMD_DIRECT) || A == nullptr || B == nullptr ||
+        C == nullptr)
+      return IMD_STATUS_INVALID_VALUE;
+    Lowered lw;
+    if (const imd_status_t st = lower(*A, *B, *C, &lw); st != IMD_STATUS_SUCCESS) return st;
+    if (o.mode == IMD_EMULATE && !lw.empty_output() && lw.k >= 2 && !gemm_dims_ok(lw))
+      return IMD_STATUS_INVALID_VALUE;
+    const int32_t dispatch = lw.empty_output()                     ? IMD_DISPATCH_NOOP
+                             : lw.k == 0                           ? IMD_DISPATCH_SCALE
+                             : (o.mode == IMD_DIRECT || lw.k == 1) ? IMD_DISPATCH_DIRECT
+                                                                   : IMD_DISPATCH_EMULATE;
+    const int64_t outputs = lw.b * lw.m * lw.n;
     for (int N = lo; N <= hi; ++N) {
-      const ErrOut eo = err_compute(N, o.rounding, dispatch, e.k, outputs, q);
+      const ErrOut eo = err_compute(N, o.rounding, dispatch, lw.k, outputs, q);
       if (eo.err_status == IMD_ERR_MET || N == hi) {
-        fill(&r, N, o.rounding, dispatch, e.k, outputs, eo);
+        fill(&r, N, o.rounding, dispatch, lw.k, outputs, eo);
         if (eo.err_status == IMD_ERR_MET) return IMD_STATUS_SUCCESS;
         r.num_moduli = 0;
         return IMD_STATUS_NOT_SUPPORTED;

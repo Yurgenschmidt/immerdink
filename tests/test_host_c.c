@@ -549,12 +549,14 @@ int main(void) {
       CHECK(imd_err_estimate(14, IMD_RN, IMD_DISPATCH_EMULATE, 10000, 1000000, NULL, &er) ==
             IMD_STATUS_SUCCESS && er.status == 0 && er.err_status == IMD_ERR_UNCHECKED);
       CHECK(dabs(er.bound / 7.535111076066045e-15 - 1) < 1e-11 &&
-            dabs(er.typical / 6.702646867434198e-16 - 1) < 1e-11 && er.typical <= er.bound);
+            dabs(er.typical / 7.933485279084879e-16 - 1) < 1e-11 && er.typical <= er.bound);
       imd_err_request_t ar;
       memset(&ar, 0, sizeof ar);
       ar.struct_size = sizeof ar, ar.metric = IMD_ERR_ELEMENTWISE;  /* no cond: invalid */
       CHECK(imd_err_estimate(14, IMD_RN, IMD_DISPATCH_EMULATE, 100, 1, &ar, &er) == IMD_STATUS_INVALID_VALUE);
-      ar.cond = 1e6, ar.target = 1e-9;
+      ar.cond = 1e6, ar.target = 1e-9, ar.reserved = 1; /* reserved must be 0 */
+      CHECK(imd_err_estimate(14, IMD_RN, IMD_DISPATCH_EMULATE, 100, 1, &ar, &er) == IMD_STATUS_INVALID_VALUE);
+      ar.reserved = 0;
       CHECK(imd_err_estimate(14, IMD_RN, IMD_DISPATCH_EMULATE, 100, 1, &ar, &er) == IMD_STATUS_SUCCESS);
       CHECK(imd_err_estimate(1, IMD_RN, IMD_DISPATCH_EMULATE, 100, 1, &ar, &er) == IMD_STATUS_INVALID_VALUE);
       CHECK(imd_err_estimate(14, 7, IMD_DISPATCH_EMULATE, 100, 1, &ar, &er) == IMD_STATUS_INVALID_VALUE);

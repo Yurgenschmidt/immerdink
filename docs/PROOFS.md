@@ -133,6 +133,48 @@ Then take absolute values and sum. ∎
 3. The final rounding adds `|D − z2^{−σ−τ}| ≤ u|D|`, because RN to binary64 in the normal
    range satisfies `|fl(x) − x| ≤ u·|fl(x)|`. ∎
 
+**Claim L3c (accuracy-aware planning, DESIGN §6f.2).**
+
+**Notation.**
+- δ = ½ (RN) or 1 (TRUNC), and d = T − κ/2 (RN) or T (TRUNC). L1d gives 2^{−σ} < 2‖a‖s/d.
+- y = z·2^{−σ−τ}.
+- E = 2δ(ν_a + ν_b)s/d + 4δ²k s²/d².
+- 0 < ν_a, ν_b, with ‖a_i‖₁ ≤ ν_a‖a_i‖₂ for **every** row i and ‖b_j‖₁ ≤ ν_b‖b_j‖₂ for every
+  column j.
+
+Then for every (i, j), with x = Σ_h a_h b_h:
+
+1. |y − x| ≤ E‖a_i‖‖b_j‖.
+2. With |D − y| ≤ u|y|:
+   - NORMWISE: |D − x| ≤ (E(1+u) + u)‖a_i‖‖b_j‖;
+   - ELEMENTWISE, if ‖a_i‖‖b_j‖ ≤ ρ|x|: |D − x| ≤ (Eρ(1+u) + u)|x|;
+   - ABSOLUTE, if ‖a_i‖‖b_j‖ ≤ M̄: |D − x| ≤ (E(1+u) + u)M̄.
+
+   If D may be subnormal, the hypothesis becomes |D − y| ≤ u|y| + 2⁻¹⁰⁷⁵, and the ABSOLUTE
+   form gains + 2⁻¹⁰⁷⁵.
+3. DIRECT (`contract.cu`'s native path: acc = +0, acc = fma(a_h, b_h, acc), k steps) without
+   underflow: |D − x| ≤ γ_k Σ_h|a_h b_h| ≤ γ_k‖a‖‖b‖, with γ_k = ku/(1 − ku) and ku < 1. With
+   underflow, each step adds at most 2⁻¹⁰⁷⁵, and the bound gains k·2⁻¹⁰⁷⁵·(1 + γ_k) ≤ 2k·2⁻¹⁰⁷⁵
+   for ku ≤ ½.
+
+*Proof.*
+1. In L3a, ‖a‖₁ ≤ ν_a‖a‖ and ‖b‖₁ ≤ ν_b‖b‖ hold for the row and column at hand, because the
+   hypothesis is per row and column, so the scalar maximum is valid. Substitute 2^{−σ} and
+   2^{−τ} from L1d: the first term is ≤ δ·2s/d·(ν_a + ν_b)‖a‖‖b‖. The second is
+   ≤ kδ²·4‖a‖‖b‖s²/d². With ν = √k this is L3b.
+2. |D − x| ≤ |D − y| + |y − x| ≤ u|y| + |y − x| ≤ u|x| + (1+u)|y − x|.
+   - NORMWISE: |x| ≤ ‖a‖‖b‖ (Cauchy–Schwarz).
+   - ELEMENTWISE: divide by |x| and use ‖a‖‖b‖ ≤ ρ|x|.
+   - ABSOLUTE: |x| ≤ ‖a‖‖b‖ ≤ M̄.
+3. Standard recursive-summation analysis (Higham, Thm 3.1, with one rounding per fma): each
+   partial sum carries one factor (1 + θ), |θ| ≤ u, so
+   |fl − x| ≤ Σ_h |a_h b_h|·((1+u)^{k−h+1} − 1) ≤ γ_k Σ|a_h b_h|. Then Σ|a_h b_h| ≤ ‖a‖‖b‖ by
+   Cauchy–Schwarz. An underflowing step adds an absolute η ≤ 2⁻¹⁰⁷⁵, which is propagated by at
+   most (1 + γ_k). ∎
+
+Checked by `cert_error_estimate` (params.py) on emulated and native elements, including
+constant rows.
+
 ---
 
 ## L4. K-chunked accumulation with modular carry (DESIGN §3.5)

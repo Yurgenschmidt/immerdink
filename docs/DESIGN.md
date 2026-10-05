@@ -1711,6 +1711,10 @@ catch either:
 | ALLOC_FAILED | `AllocFailedError(ImmerdinkError, MemoryError)` |
 | PACK_MISMATCH | `PackMismatchError(ImmerdinkError, ValueError)` (plan creation: `.reason`, the `imd_lowering_packed` pack_mismatch name) |
 
+[v1.12] Exception: the host queries that return a plan-time status in `.status`
+(`host.predict`, `host.min_moduli` and their planner views) do not raise. `min_moduli` returns
+INVALID_VALUE (e.g. a request without a target) and the lowering's statuses in `.status`.
+
 Python-side argument errors (not CUDA memory, wrong dtype, shape or stride mismatch with the
 plan, readonly output, malformed spec) are plain TypeError / ValueError, raised before any C
 call.
@@ -2802,7 +2806,7 @@ immerdink never reads the data here (kernel scope). The caller passes an `imd_er
 | `norm_product` | an upper bound on `max ‖a_i‖₂‖b_j‖₂` (e.g. `max_i ‖a_i‖ · max_j ‖b_j‖`) | ABSOLUTE |
 | `l1_ratio_a`, `l1_ratio_b` | optional: upper bounds on `max_i ‖a_i‖₁ / ‖a_i‖₂` (and on the same ratio for the columns of B), in [1, √k]; 0 = unknown = √k | a tighter bound for decaying or sparse rows |
 | `basis` | which estimate must meet the target:<br>`IMD_ERR_BASIS_BOUND` (the default: the rigorous bound);<br>`IMD_ERR_BASIS_TYPICAL` (opt-in: the typical estimate) | `rank`, `imd_err_min_moduli` |
-| `fail_prob` | p, the typical estimate's failure probability per call; 0 = 2⁻²⁰ | TYPICAL |
+| `fail_prob` | p, the typical estimate's failure probability per call; 0 = 2⁻⁴⁰ (for a probability P per run of C calls, pass P/C) | TYPICAL |
 
 **From the lowering:**
 - k, the GEMM view's contracted length;
@@ -2831,8 +2835,9 @@ Notation:
 - u = 2⁻⁵³;
 - ν_a and ν_b are `l1_ratio_a` and `l1_ratio_b`, clamped to √k (0 means √k).
 
-**Rigorous bound (`err_bound`), EMULATE.** PROOFS L3a (the ℓ1 form of §3.8), with
-‖a‖₁ ≤ ν_a‖a‖₂ and L1d's 2⁻σ < 2‖a‖s/d:
+**Rigorous bound (`err_bound`), EMULATE.** PROOFS L3c: L3a (the ℓ1 form of §3.8) with
+‖a_i‖₁ ≤ ν_a‖a_i‖₂ for every row (so the scalar maximum the caller passes is valid) and L1d's
+2⁻σ < 2‖a‖s/d:
 
 ```
 E   = 2δ·(ν_a + ν_b)·s/d  +  4δ²·k·s²/d²            (relative to ‖a_i‖‖b_j‖)
@@ -2845,14 +2850,27 @@ E   = 2δ·(ν_a + ν_b)·s/d  +  4δ²·k·s²/d²            (relative to ‖a
 ```
 NORMWISE      E·(1+u) + u
 ELEMENTWISE   E·ρ·(1+u) + u
-ABSOLUTE      (E·(1+u) + u) · norm_product
+ABSOLUTE      (E·(1+u) + u) · norm_product  +  2⁻¹⁰⁷⁵
 ```
+
+**[review] Underflow.** An ABSOLUTE bound can be subnormal (a tiny `norm_product`). In that
+case the relative inflation of the C value (below) does nothing, so ABSOLUTE carries an
+absolute term:
+- in the specification, 2⁻¹⁰⁷⁵: RN to a subnormal satisfies |fl(y) − y| ≤ u|y| + 2⁻¹⁰⁷⁵, so
+  this ABSOLUTE bound also holds when D underflows gradually;
+- in C, 2⁻¹⁰⁷¹, which also covers the subnormal roundings of the computation.
 
 **Guaranteed under the §3.8 hypotheses:**
 - finite inputs;
-- no over- or underflow of D;
-- α = 1, β = 0 (the bound is on the product D; other α and β add §3.7's single roundings);
+- no overflow;
+- NORMWISE and ELEMENTWISE: no underflow of D;
 - the caller's statistics are true bounds.
+
+**[review] The bound is on the product D** (α = 1, β = 0). imd_contract writes
+C ← βC + RN(αD) (§3.7):
+- α ≠ 1 adds one rounding: a bound n becomes n·(1+u) + u in every metric. For ABSOLUTE, pass
+  |α|·norm_product.
+- β ≠ 0 adds the fma's u·|βC + αD|, which no statistic here expresses.
 
 It does not depend on the ε path (§6c), which is exact. It needs RN acceptance (κ < T);
 otherwise there is no bound (+∞), and plan creation rejects that configuration anyway.
@@ -2860,7 +2878,9 @@ otherwise there is no bound (+∞), and plan creation rejects that configuration
 **DIRECT dispatch** (DIRECT mode, K-empty) is the native FMA chain (§3.7).
 - Its bound is `γ_k = k·u / (1 − k·u)` relative to Σ|a_h b_h| ≤ ‖a‖‖b‖. The final rounding is
   already included.
-- NORMWISE γ_k, ELEMENTWISE γ_k·ρ, ABSOLUTE γ_k·norm_product.
+- NORMWISE γ_k, ELEMENTWISE γ_k·ρ, ABSOLUTE γ_k·norm_product + 2k·2⁻¹⁰⁷⁵ (each fma may
+  underflow; in C + (k + 16)·2⁻¹⁰⁷⁴). Proof: PROOFS L3c, for the chain of `contract.cu`'s
+  native path.
 - +∞ if k·u ≥ ½ (γ_k ≥ 1 there).
 
 NOOP and SCALE (no product, k = 0) give 0.
@@ -2886,16 +2906,23 @@ For TRUNC and DIRECT, `err_typical` = `err_bound`. TRUNC's errors are not zero-m
 follows the data (§3.3's same-sign bias).
 
 **Where the model fails:** rows with low-entropy mantissas, e.g. many equal entries that are not
-representable at the row's scale. Their quantization errors are equal and add coherently, up
-to the rigorous bound (√k / √(8 ln(2M/p)) above E_typ). This is measured in NOTES-B2 §7.
+representable at the row's scale, such as uniform superpositions (entries 1/√n) or repeated
+hopping constants. Their quantization errors are equal and add coherently, up to the rigorous
+bound. With ν = √k that is E/E_typ ≈ √(k / (2 ln(2M/p))) above E_typ. This is measured in
+NOTES-B2 §7.
 
 **No fitted constant.** The estimate was checked against the accuracy data instead:
-- it covers all 520 M5 runs (max observed / estimate 0.23 where the emulation error dominates,
+- it covers all 520 M5 runs (max observed / estimate 0.21 at p = 2⁻⁴⁰ where the emulation error dominates,
   N ≤ 13);
 - held-out coverage (φ = 0.5…4, scaled inputs, k = 64…10⁵, structured rows) is in NOTES-B2 §7.
 
-**In moduli:** at k = 10⁴ the rigorous bound is 2√k/T = 200/T, while E_typ ≈ 13/T at M = 10⁶.
-That is about one modulus cheaper. Observed errors are another 4× below E_typ (half a modulus).
+**In moduli:** at k = 10⁴ the rigorous bound is 2√k/T = 200/T, while E_typ ≈ 18.4/T at
+M = 10⁶ and p = 2⁻⁴⁰ (15.1/T at 2⁻²⁰).
+- That is about 0.9 modulus cheaper.
+- Observed errors are another ~5× below E_typ, about half a modulus.
+
+**[review] p** is the failure probability per call. For a probability P over a run of C calls,
+pass p = P/C (the cost grows as √ln).
 
 ### 6f.3 API (host API version 8)
 
@@ -2923,9 +2950,10 @@ imd_status_t imd_err_estimate(int32_t num_moduli, int32_t rounding, int32_t disp
                               int64_t outputs, const imd_err_request_t* req, imd_err_t* out);
 /* The smallest N in [n_lo, n_hi] (0, 0 = 2..20) whose estimate (req->basis) meets
    req->target > 0, for this contraction and options (rounding, mode; N, g, vec_mode ignored):
-   one lowering, then the estimate per N. SUCCESS: out at that N. NOT_SUPPORTED: no N in range
-   meets the target (out at n_hi, num_moduli 0). A plan-time status of the lowering
-   (INVALID_VALUE, ...) is returned as such. */
+   one lowering (not the workspace of any N), then the estimate per N. SUCCESS: out at that
+   N. NOT_SUPPORTED with err_status MISSED: no N in range meets the target (out at n_hi,
+   num_moduli 0). The lowering's own status (INVALID_VALUE, or NOT_SUPPORTED for e.g. a
+   repeated or broadcast C label, with out zeroed: err_status UNCHECKED) is returned as such. */
 imd_status_t imd_err_min_moduli(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
                                 const imd_options_t* options, int32_t n_lo, int32_t n_hi,
                                 const imd_err_request_t* req, imd_err_t* out);
@@ -2965,12 +2993,16 @@ target is **infeasible**: `feasible` = 0 and `infeasible` has `IMD_PERF_INFEASIB
   2. infeasible SUCCESS candidates (budget or accuracy), by time;
   3. the rest.
 - Ties are among the feasible candidates only.
-- So `rank(...)[0]`, when feasible, is **the cheapest configuration that meets the target**.
+- So `rank(...)[0]` is **the cheapest configuration that meets the target only if it is
+  `.feasible`**. Otherwise no candidate meets target and budget, and `[0]` is the fastest
+  infeasible SUCCESS candidate (or the first non-SUCCESS one).
   Every candidate also carries its estimates, so a caller can relax the target without
   re-ranking.
 - A v8 candidate reports the NORMWISE estimates even without `accuracy`. A candidate whose
   plan-time status is not SUCCESS has no plan: +∞, UNCHECKED, `infeasible` = `_STATUS`.
-- Requests and candidates shorter than v8 behave as v7.
+- Requests and candidates shorter than v8 behave as v7. A v8 request with v7-sized
+  candidates (`candidate_size` 168) still marks accuracy misses infeasible (`feasible` = 0, and
+  the order is the same); only the err fields are not written.
 
 **Minimal N on the hot path.** `imd_err_min_moduli` is one lowering (0.3–0.7 µs) plus at most
 19 closed-form evaluations, with no performance model.
@@ -3000,7 +3032,8 @@ target is **infeasible**: `feasible` = 0 and `infeasible` has `IMD_PERF_INFEASIB
 **`host_accuracy` (CPU):**
 - `imd_err_estimate` vs `params.error_estimate` on 20 000 random (N, k, rounding, dispatch,
   M, metric, statistics) cases: the rigorous bound lies in [exact, exact·(1 + 2⁻³⁹)], and the
-  typical estimate agrees to 1e−11 relative (it may take the min with the inflated E).
+  typical estimate agrees to 1e−11 relative (it may take the min with the inflated E); ABSOLUTE bounds
+  also within 2⁻¹⁰⁶⁷ absolute; 2000 subnormal-`norm_product` cases.
 - Invalid requests are rejected.
 - min_moduli equals a brute-force scan of `imd_err_estimate` (and of params), for both bases.
 - predict and rank:
@@ -3012,7 +3045,8 @@ target is **infeasible**: `feasible` = 0 and `infeasible` has `IMD_PERF_INFEASIB
 
 **`params.py --check`:** `cert_error_estimate` checks the composed bound (with ν, ρ,
 norm_product, and DIRECT's γ_k) against `emulate_element` / exact rationals on random rows, in
-both roundings.
+both roundings. [review] The rows include constant, non-representable rows and k up to 1200
+at N = 3–5.
 
 **`host_planner`:** Accuracy, min_moduli, and predict / rank with accuracy, vs host.py.
 

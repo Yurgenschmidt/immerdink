@@ -434,7 +434,7 @@ DESIGN §6f. This section holds the evidence and the open questions.
   DIRECT uses the native γ_k.
 - **Typical.** Hoeffding under the standard probabilistic model of RN quantization errors
   (independent, zero-mean, |e| ≤ ½), with a union bound over the M = b·m·n outputs at failure
-  probability p (default 2⁻²⁰). No fitted constants. TRUNC and DIRECT report the rigorous bound
+  probability p (default 2⁻⁴⁰, review). No fitted constants. TRUNC and DIRECT report the rigorous bound
   as their typical value.
 - **One implementation.** The math is in C (`src/host/accuracy.cpp`). `spec/params.py`
   (`error_estimate`, exact rational enclosure) is the reference, and `cert_error_estimate`
@@ -447,9 +447,10 @@ N = 8…20 × RN / TRUNC, with the maximum taken over a sampled grid of 4096 or 
 them, `host.err_estimate` gives:
 
 - rigorous: max measured / bound 0.908;
-- typical (RN), estimated over the grid's outputs: covers 260 / 260, with max measured /
-  estimate 0.91 overall and 0.23 where the emulation error dominates (N ≤ 13);
-- TRUNC's typical value is its bound.
+- typical (RN), estimated over the grid's outputs, with p = 2⁻⁴⁰ (the default after the
+  review): covers 260 / 260, with max measured / estimate 0.91 overall and 0.21 where the
+  emulation error dominates (N ≤ 13);
+- TRUNC's typical value is its bound, so its 260 / 260 is true by construction.
 
 The estimate has no fitted constant. This set was only checked; nothing was tuned on it.
 
@@ -479,23 +480,26 @@ Results:
 
 | family | cases | covered | max meas / typ | median | emulation regime: covered, max |
 |---|---|---|---|---|---|
-| φ = 0.5 | 29 | 29 | 0.23 | 0.15 | 23 / 23, 0.23 |
-| φ = 1 | 25 | 25 | 0.35 | 0.15 | 16 / 16, 0.20 |
-| φ = 2 | 27 | 27 | 0.34 | 0.15 | 16 / 16, 0.18 |
-| φ = 4 | 26 | 26 | 0.32 | 0.13 | 20 / 20, 0.20 |
-| scaled 2^±300 | 23 | 23 | 0.25 | 0.15 | 16 / 16, 0.25 |
-| uniform | 22 | 22 | 0.24 | 0.14 | 14 / 14, 0.24 |
-| same sign | 22 | 22 | 0.84 | 0.17 | 19 / 19, 0.20 |
-| decay_opp | 21 | 21 | 0.22 | 0.04 | 14 / 14, 0.22 |
-| outliers | 21 | 21 | 0.69 | 0.13 | 16 / 16, 0.15 |
-| **constant rows** | 20 | **1** | **25.5** | 6.0 | **0 / 19**, 25.5 |
+| φ = 0.5 | 29 | 29 | 0.18 | 0.12 | 23 / 23, 0.18 |
+| φ = 1 | 25 | 25 | 0.35 | 0.12 | 16 / 16, 0.16 |
+| φ = 2 | 27 | 27 | 0.34 | 0.12 | 16 / 16, 0.14 |
+| φ = 4 | 26 | 26 | 0.32 | 0.10 | 20 / 20, 0.15 |
+| scaled 2^±300 | 23 | 23 | 0.21 | 0.12 | 16 / 16, 0.19 |
+| uniform | 22 | 22 | 0.23 | 0.11 | 14 / 14, 0.19 |
+| same sign | 22 | 22 | 0.84 | 0.13 | 19 / 19, 0.16 |
+| decay_opp | 21 | 21 | 0.17 | 0.03 | 14 / 14, 0.17 |
+| outliers | 21 | 21 | 0.69 | 0.10 | 16 / 16, 0.12 |
+| **constant rows** | 20 | **2** | **19.6** | 4.7 | **1 / 19**, 19.6 |
+
+This is with p = 2⁻⁴⁰. With the first default, 2⁻²⁰, the constant rows were covered 1 / 20,
+with a maximum of 25.5, and every other row stayed covered.
 
   - On data with random mantissas the estimate covered **all 216 RN cases**. In the emulation
-    regime (154 cases) the maximum measured / estimate is 0.25, so the estimate is about 4×
+    regime (154 cases) the maximum measured / estimate is 0.19, so the estimate is about 5×
     above the observed maximum.
-  - It is a median 0.13× of the rigorous bound: about ¾ modulus at these k, and more at large
+  - It is a median 0.17× of the rigorous bound: about ⅔ modulus at these k, and more at large
     k (the bound grows as √k, the estimate as √ln M).
-  - Rows of equal, non-representable entries violate it by up to 25×, as designed. Their
+  - Rows of equal, non-representable entries violate it by up to 20×, as designed. Their
     errors add coherently and stay within the rigorous bound.
   - **So the typical estimate is reliable for data whose quantization errors behave
     randomly.** That is why it ships opt-in (`basis = TYPICAL`) and is labelled "not a
@@ -503,7 +507,8 @@ Results:
     uniform initial states) must use the rigorous bound.
 
 **GPU time:** about 11 s of contractions for the 300 cases plus 0.2 s for the quick run, under
-the shared GPU lock. The check phase runs on the CPU: 126 s, with the lock not held.
+the shared GPU lock. The check phase runs on the CPU (126 s, re-run after the review in 124 s
+on the same grids), with the lock not held.
 
 ### 7.3 Tests and cost
 
@@ -526,7 +531,44 @@ the shared GPU lock. The check phase runs on the CPU: 126 s, with the lock not h
   call: one lowering plus at most 19 closed forms). `bench/planner_overhead.py` and
   `imd_planner_floor` now include it.
 
-### 7.4 Design questions (for the reviewer; conservative choices taken)
+### 7.4 Design questions (reviewed 2026-10-05)
+
+**Rulings.** The independent reviewer accepted the design: the bound matches the proofs, and
+the ε path, g, the vec mode, packing and K4 were confirmed exact. Changes:
+- **Q4.** `fail_prob` defaults to **2⁻⁴⁰**, about 1.22× at M = 10⁶. For a probability P over a
+  run of C calls, pass p = P/C.
+- **Q5.** The bound stays on D. The α / β composition is documented: α ≠ 1 turns n into
+  n(1+u) + u, and ABSOLUTE also folds |α| into `norm_product`; β ≠ 0 adds u·|βC + αD|.
+- **Q6.** `rank(...)[0]` meets the target only if it is `.feasible`; otherwise it is the
+  fastest infeasible candidate. This is documented.
+- **Q7.** `min_moduli`'s two NOT_SUPPORTED cases are told apart by `err_status`: MISSED means
+  the target is unattainable; UNCHECKED means the lowering's own status (a repeated or
+  broadcast C label). Both are tested.
+- **Q11.** `reserved` ≠ 0 is INVALID_VALUE, so it can become flags (e.g. an α-rounding flag).
+- The other questions were accepted as proposed.
+
+**Must-fixes, all done:**
+- **Underflow.** The ABSOLUTE bound has an absolute term: 2⁻¹⁰⁷⁵ in the specification (it
+  also covers a gradual underflow of D) and 2⁻¹⁰⁷¹ in C. DIRECT ABSOLUTE has 2k·2⁻¹⁰⁷⁵
+  (in C, (k + 16)·2⁻¹⁰⁷⁴). `host_accuracy` draws subnormal norm products: 2000 cases, none
+  below the exact enclosure.
+- **PROOFS L3c:** the ℓ1/ℓ2 refinement, the per-metric composition, DIRECT's γ_k, and
+  underflow.
+- **Doc numbers:**
+  - E/E_typ = √(k / (2 ln(2M/p)));
+  - E_typ ≈ 18.4/T at M = 10⁶ and p = 2⁻⁴⁰.
+
+**Cheap fixes, also done:**
+- `compose` no longer multiplies by (1 + u), which rounds to 1.0;
+- the size constants are explicit;
+- `min_moduli` checks the lowering only, not N = 20's workspace;
+- `cert_error_estimate` includes constant rows and k = 600 and 1200 at N = 3–5;
+- the risk cases are named in the TYPICAL docstring;
+- §6d.4 says `min_moduli` does not raise;
+- the M5 TRUNC coverage is marked as true by construction;
+- a v8 request with v7-sized candidates still marks accuracy misses infeasible.
+
+**The questions as asked (conservative choices taken):**
 
 1. **The typical estimate comes from a model and is not fitted.** Hoeffding gives a
    probabilistic bound with stated assumptions.
@@ -539,7 +581,7 @@ the shared GPU lock. The check phase runs on the CPU: 126 s, with the lock not h
    probabilistic γ̃_k is possible but brings little.
 3. **The default basis is the rigorous bound.** The typical estimate is opt-in
    (`basis = TYPICAL`) and always reported.
-4. **`fail_prob` defaults to 2⁻²⁰ per call.** This is a union bound over every output of the
+4. **`fail_prob` defaulted to 2⁻²⁰ per call** (ruled: 2⁻⁴⁰). This is a union bound over every output of the
    call. A caller making 10⁹ calls should lower it; the cost is about √(ln) and grows slowly.
 5. **The bound is on the product D** (α = 1, β = 0). With other α and β, the §3.7 roundings of
    the epilogue (≤ u|αD| and one fma) are the caller's to add. Folding them in would need α,

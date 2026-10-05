@@ -47,11 +47,11 @@ first.
   - rank marks the candidates that miss the target as infeasible (`infeasible` bits).
 
   The rigorous bound has 0 violations in 300 held-out GPU cases. The typical estimate
-  (Hoeffding, RN, opt-in) is not valid for rows of equal entries. The bound math lives only in
+  (Hoeffding, RN, opt-in, default p = 2⁻⁴⁰) is not valid for rows of equal entries. Reviewed 2026-10-05 (rulings applied: NOTES-B2 §7.4). The bound math lives only in
   `src/host/accuracy.cpp`; `spec/params.py error_estimate` + `cert_error_estimate` are the
   reference. Python: `host.Accuracy`, `host.min_moduli`, `planner.Accuracy`,
   `Query.min_moduli`. Tests: `host_accuracy`, `accuracy_err_api_quick`; the full GPU check is
-  `bench/accuracy/err_api.py`. No TLA+ change. Design questions for the reviewer: NOTES-B2
+  `bench/accuracy/err_api.py`. No TLA+ change. Design questions and rulings: NOTES-B2
   §7.4.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,

@@ -37,6 +37,7 @@ from test_host import random_descs  # noqa: E402
 
 RN_TRUNC = ("RN", "TRUNC")
 INFLATE_TOL = 1 + Fraction(1, 2**39)
+ABS_TOL = Fraction(1, 2**1067)   # the C ABSOLUTE terms (2^-1071, (k + 16) 2^-1074) above params'
 
 
 class Fail(Exception):
@@ -72,15 +73,17 @@ def check_enclosed(c, enc, what):
         need(c == math.inf, f"{what}: C {c!r}, params: no bound")
         return
     lo, hi = enc
-    need(math.isfinite(c) and lo <= Fraction(c) <= hi * INFLATE_TOL,
-         f"{what}: C {c!r} outside [{float(lo)!r}, {float(hi * INFLATE_TOL)!r}]")
+    slack = ABS_TOL + (hi * 2 * 2**52 * Fraction(1, 2**1074) if hi < 2**-1000 else 0)
+    need(math.isfinite(c) and lo <= Fraction(c) <= hi * INFLATE_TOL + slack,
+         f"{what}: C {c!r} outside [{float(lo)!r}, {float(hi * INFLATE_TOL + slack)!r}]")
 
 
 def check_typical(c, ref, what):
     if math.isinf(ref) or ref == 0:
         need(c == ref, f"{what}: typical {c!r} vs {ref!r}")
-    else:
-        need(abs(c / ref - 1) <= 1e-11, f"{what}: typical {c!r} vs {ref!r}")
+    else:   # relative, or absolute in the subnormal range (the ABSOLUTE terms)
+        need(abs(c / ref - 1) <= 1e-11 or abs(c - ref) <= 2.0**-1060,
+             f"{what}: typical {c!r} vs {ref!r}")
 
 
 def random_acc(rng):
@@ -90,7 +93,9 @@ def random_acc(rng):
     metric = rng.choice(list(host.ERR_METRICS))
     bad = rng.random() < 0.08
     cond = rng.choice((1.0, 3.5, 1e3, 1e9)) if metric == "ELEMENTWISE" else 0.0
-    npd = 10.0**rng.uniform(-30, 30) if metric == "ABSOLUTE" else 0.0
+    # review: norm products down to the subnormal range (the bound's absolute term)
+    npd = (10.0**rng.uniform(-30, 30) if rng.random() < 0.7 else 10.0**rng.uniform(-322, -280)) \
+        if metric == "ABSOLUTE" else 0.0
     l1a = rng.choice((0.0, 0.0, 1.0, rng.uniform(1, 50), 1e12))
     l1b = rng.choice((0.0, 0.0, 1.0, rng.uniform(1, 50)))
     target = rng.choice((0.0, 0.0, 10.0**rng.uniform(-20, -2)))
@@ -158,6 +163,26 @@ def check_estimates(h, rng, cases, verbose):
     short = host.Accuracy(target=1e-9)
     short._c.struct_size = 56
     need(raw_estimate(h, 8, 10, "RN", "EMULATE", 1, short)[0] == 1, "short imd_err_request_t")
+    resv = host.Accuracy(target=1e-9)          # review: reserved must be 0 (future flags)
+    resv._c.reserved = 1
+    need(raw_estimate(h, 8, 10, "RN", "EMULATE", 1, resv)[0] == 1, "reserved != 0 accepted")
+    # review: subnormal ABSOLUTE bounds stay >= the exact bound (the absolute term)
+    n_sub = 0
+    for _ in range(2000):
+        N, rnd = rng.randint(2, 20), rng.choice(RN_TRUNC)
+        disp = rng.choice(("EMULATE", "EMULATE", "DIRECT"))
+        k = int(2**rng.uniform(1, 20))
+        acc = host.Accuracy(metric="ABSOLUTE", norm_product=10.0**rng.uniform(-323, -292))
+        if acc.norm_product <= 0:
+            continue
+        st, r = raw_estimate(h, N, k, rnd, disp, 1, acc)
+        ref = params_estimate(N, k, rnd, disp, 1, acc)
+        if ref is None or ref["bound"] is None:
+            continue
+        need(st == 0, f"subnormal case status {st}")
+        check_enclosed(r.bound, ref["bound"], f"subnormal ABSOLUTE N={N} k={k} {rnd} {disp} {acc}")
+        n_sub += 1
+    need(n_sub > 1000, "subnormal cases")
     if verbose:
         print(f"  imd_err_estimate: {cases} cases ({n_ok} valid, {n_inf} without a bound, "
               f"{n_inv} invalid requests) vs params.error_estimate")
@@ -221,8 +246,23 @@ def check_min_moduli(h, rng, cases, verbose):
                  f"{what}: {e} want none")
             none += 1
         need(e.k == lw.k and e.outputs == M and e.dispatch == lw.dispatch, what + " echo")
-    # a request without a target / an empty range: INVALID_VALUE
+    # review: the two NOT_SUPPORTED cases are told apart by err_status
     spec, ext = "ik,kj->ij", dict(i=8, j=8, k=100)
+    e = host.min_moduli(spec, ext, accuracy=host.Accuracy(target=1e-30), lib=h)
+    need(e.status == "NOT_SUPPORTED" and e.err_status == "MISSED" and e.num_moduli == 0 and
+         e.bound > 1e-30 and e.k == 100, f"unattainable target: {e}")
+    D = host.Desc
+    for descs in ((D((4, 5), (5, 1), (1, 2)), D((5, 4), (4, 1), (2, 3)), D((4, 4), (4, 1), (1, 1))),
+                  (D((4, 5), (5, 1), (1, 2)), D((5,), (1,), (2,)), D((4, 3), (3, 1), (1, 9)))):
+        e = host.min_moduli(descs, accuracy=host.Accuracy(target=1e-9), lib=h)
+        need(e.status == "NOT_SUPPORTED" and e.err_status == "UNCHECKED" and e.k == 0 and
+             e.bound == 0, f"lowering NOT_SUPPORTED (repeated / broadcast C label): {e}")
+    # review: only the lowering is checked, not N = 20's workspace (a huge GEMM fine at any N
+    # the target needs must not fail on a workspace size)
+    e = host.min_moduli("ik,kj->ij", dict(i=2**20, j=2**20, k=2**20),
+                        accuracy=host.Accuracy(target=1e-6), lib=h)
+    need(e.status == "SUCCESS", f"huge shape: {e}")
+    # a request without a target / an empty range: INVALID_VALUE
     for acc, rng_ in ((host.Accuracy(), (0, 0)), (host.Accuracy(target=1e-9), (12, 8)),
                       (host.Accuracy(target=1e-9), (1, 8)), (host.Accuracy(target=1e-9), (2, 21))):
         e = host.min_moduli(spec, ext, accuracy=acc, n_lo=rng_[0], n_hi=rng_[1], lib=h)

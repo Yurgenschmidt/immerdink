@@ -313,7 +313,8 @@ def error_guidance(N, k, rounding=RN):
 # §6f accuracy-aware planning: the reference of imd_err_estimate (libimmerdink_host)
 
 ERR_NORMWISE, ERR_ELEMENTWISE, ERR_ABSOLUTE = 0, 1, 2
-ERR_DEFAULT_FAIL_PROB = 2.0**-20
+ERR_DEFAULT_FAIL_PROB = 2.0**-40   # review 2026-10-05 (was 2^-20)
+ERR_UNDERFLOW = Fraction(1, 2**1075)  # RN to a subnormal: |fl(y) - y| <= u|y| + 2^-1075
 DISPATCHES = ("NOOP", "EMULATE", "DIRECT", "SCALE")   # IMD_DISPATCH_* order
 
 
@@ -338,13 +339,14 @@ def error_estimate(N, k, rounding, dispatch="EMULATE", outputs=1, metric=ERR_NOR
       EMULATE: E = 2 delta (nu_a + nu_b) s/d + 4 delta^2 k s^2/d^2   (PROOFS L3a + L1d)
                delta = 1/2, d = T - kappa/2 (RN; kappa >= T: None) | delta = 1, d = T (TRUNC)
                s = sqrt(1 + k 2^-F), nu = min(l1_ratio, sqrt k) (0: sqrt k)
-        NORMWISE E (1+u) + u;  ELEMENTWISE E rho (1+u) + u;  ABSOLUTE (E (1+u) + u) norm_product
+        NORMWISE E (1+u) + u;  ELEMENTWISE E rho (1+u) + u;
+        ABSOLUTE (E (1+u) + u) norm_product + 2^-1075 (a gradual underflow of D)
       DIRECT:  gamma_k = k u / (1 - k u) (None if k u >= 1/2): NORMWISE gamma_k,
-               ELEMENTWISE gamma_k rho, ABSOLUTE gamma_k norm_product
+               ELEMENTWISE gamma_k rho, ABSOLUTE gamma_k norm_product + 2k 2^-1075 (fma underflows)
       NOOP, SCALE, k = 0: 0.
     Typical (a float; NOT a guarantee): RN EMULATE only,
       E_typ = min(E, s/d sqrt(8 ln(2M/p)) + k s^2/d^2), M = max(outputs, 1), p = fail_prob
-      (0: 2^-20), composed per metric as E; otherwise the bound (its float hi)."""
+      (0: 2^-40), composed per metric as E; otherwise the bound (its float hi)."""
     if not N_MIN <= N <= N_MAX or rounding not in (RN, TRUNC) or dispatch not in DISPATCHES:
         raise ValueError("N, rounding or dispatch")
     if k < 0 or outputs < 0 or metric not in (ERR_NORMWISE, ERR_ELEMENTWISE, ERR_ABSOLUTE):
@@ -374,6 +376,8 @@ def error_estimate(N, k, rounding, dispatch="EMULATE", outputs=1, metric=ERR_NOR
             return out
         g = k * u / (1 - k * u)
         b = g * (rho if metric == ERR_ELEMENTWISE else npd if metric == ERR_ABSOLUTE else 1)
+        if metric == ERR_ABSOLUTE:
+            b += 2 * k * ERR_UNDERFLOW   # PROOFS L3c: k steps, each <= 2^-1075 (1 + gamma_k)
         out.update(unit_bound=(g, g), bound=(b, b), unit_typical=float(g), typical=float(b))
         return out
     T, kap = constants(N)["T"], kappa(k)
@@ -398,7 +402,7 @@ def error_estimate(N, k, rounding, dispatch="EMULATE", outputs=1, metric=ERR_NOR
             return E * (1 + u) + u
         if metric == ERR_ELEMENTWISE:
             return E * rho * (1 + u) + u
-        return (E * (1 + u) + u) * npd
+        return (E * (1 + u) + u) * npd + ERR_UNDERFLOW
 
     E = (unit(s_lo, rk_lo), unit(s_hi, rk_hi))
     out.update(unit_bound=E, bound=(compose(E[0]), compose(E[1])))
@@ -1445,12 +1449,28 @@ def cert_error_estimate():
                     r = emulate_element(a, b, N, rnd, chunk=4)
                     _check_composed(N, k, rnd, "EMULATE", a, b, r["D"])
                     n += 1
+    # review 2026-10-05: larger k at small N, where the bound is closest to the error, and
+    # constant non-representable rows (their quantization errors add coherently)
+    for N in (3, 4, 5):
+        for rnd in (RN, TRUNC):
+            for k in (600, 1200):
+                for fam in ("const", "const_neg", "rand"):
+                    if fam == "rand":
+                        a, b = _rand_row(rng, k, -20, 20), _rand_row(rng, k, -20, 20)
+                    else:
+                        va, vb = 0.1 * (1 + rng.random()), 0.3 * (1 + rng.random())
+                        a = [va] * k
+                        b = [vb if fam == "const" else -vb] * k
+                    r = emulate_element(a, b, N, rnd, chunk=257)
+                    _check_composed(N, k, rnd, "EMULATE", a, b, r["D"])
+                    n += 1
     for k in (1, 2, 7, 64):            # DIRECT: the native chain
         for _ in range(40):
             a, b = _rand_row(rng, k, -60, 60), _rand_row(rng, k, -60, 60)
             _check_composed(8, k, RN, "DIRECT", a, b, _native_fma_dot(a, b))
             n += 1
-    return f"{n} elements (EMULATE N in 3..20 both roundings, DIRECT), 3 metrics each"
+    return (f"{n} elements (EMULATE N in 3..20 both roundings, k up to 1200 at N = 3..5 with "
+            "constant rows; DIRECT), 3 metrics each")
 
 
 def _check_composed(N, k, rnd, dispatch, a, b, D):

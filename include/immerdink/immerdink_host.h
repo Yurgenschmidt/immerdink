@@ -702,7 +702,14 @@ IMD_API imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B,
  *   ABSOLUTE    |D - x|                     <= (E (1 + u) + u) norm_product
  *   DIRECT dispatch: gamma_k = k u / (1 - k u) in place of E (1 + u) + u (times rho /
  *   norm_product); NOOP / SCALE / k = 0: 0.
- * Guaranteed for finite inputs without over/underflow when the statistics are true bounds.
+ * ABSOLUTE also adds 2^-1075 (EMULATE: a gradual underflow of D) or 2k 2^-1075 (DIRECT: the
+ * fma chain's underflows); in C a little more (the subnormal rounding of the computation).
+ * Guaranteed for finite inputs when the statistics are true bounds; NORMWISE / ELEMENTWISE
+ * also need D (DIRECT: every partial sum) outside the subnormal range (PROOFS L3c).
+ * The bound is on the product D. imd_contract writes C = beta C + RN(alpha D) (§3.7):
+ *   alpha != 1 adds one rounding: a bound n becomes n (1 + u) + u per metric (ABSOLUTE: pass
+ *     |alpha| times the norm_product);
+ *   beta != 0 adds u |beta C + alpha D| (the fma), which no statistic here expresses.
  * The TYPICAL estimate (RN EMULATE only; NOT a guarantee) replaces E by
  *   min(E, s / d sqrt(8 ln(2 M / p)) + k s^2 / d^2), M = outputs, p = fail_prob:
  * Hoeffding's bound under independent zero-mean quantization errors, exceeded with
@@ -721,8 +728,8 @@ typedef struct imd_err_request_s {
   double l1_ratio_a;     /* 0 (unknown: sqrt k) or >= 1: upper bound on ||a_i||_1/||a_i||_2  */
   double l1_ratio_b;     /* the same for the columns b_j of B                               */
   int32_t basis;         /* IMD_ERR_BASIS_BOUND (default) / TYPICAL: what meets the target  */
-  int32_t reserved;      /* 0                                                               */
-  double fail_prob;      /* TYPICAL: p in (0, 1); 0: 2^-20                                  */
+  int32_t reserved;      /* must be 0 (INVALID_VALUE otherwise): reserved for flags     */
+  double fail_prob;      /* TYPICAL: p in (0, 1); 0: 2^-40                                  */
 } imd_err_request_t;
 
 typedef struct {
@@ -751,9 +758,12 @@ IMD_API imd_status_t imd_err_estimate(int32_t num_moduli, int32_t rounding, int3
 /* The smallest N in [n_lo, n_hi] (0 / 0: 2 / 20) whose estimate (request->basis) is <=
  * request->target (> 0), for this contraction with options' rounding and mode (N, g and
  * vec_mode do not matter): one lowering, then the closed form per N. SUCCESS: out at that N.
- * NOT_SUPPORTED: no N in the range meets the target (out at n_hi, num_moduli 0). The
- * lowering's own status (INVALID_VALUE, ...) is returned as such; INVALID_VALUE for a bad
- * request or range. DIRECT dispatch: N does not matter; the answer is n_lo if met. */
+ * NOT_SUPPORTED with out->err_status MISSED: no N in the range meets the target (out at
+ * n_hi, num_moduli 0). The lowering's own status (§5: INVALID_VALUE, or NOT_SUPPORTED for e.g.
+ * a repeated or broadcast C label) is returned as such, with out zeroed (err_status
+ * UNCHECKED): so err_status tells the two NOT_SUPPORTED cases apart. INVALID_VALUE for a bad
+ * request or range. Only the lowering is checked, not the workspace of any N. DIRECT
+ * dispatch: N does not matter; the answer is n_lo if met. */
 IMD_API imd_status_t imd_err_min_moduli(const imd_tensor_t* A, const imd_tensor_t* B,
                                         const imd_tensor_t* C, const imd_options_t* options,
                                         int32_t n_lo, int32_t n_hi,

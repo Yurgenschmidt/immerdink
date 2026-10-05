@@ -106,7 +106,7 @@ feasible candidate is the cheapest one that meets it:
 ```python
 acc = planner.Accuracy(target=1e-12)              # normwise |D - x| / (|a_i| |b_j|): needs no stats
 n = q.min_moduli(acc).num_moduli                  # smallest N whose rigorous bound meets it (~1.5 µs)
-best = q.rank([n, n + 1], accuracy=acc)[0]        # the cheapest configuration that meets it
+best = q.rank([n, n + 1], accuracy=acc)[0]        # the cheapest one meeting it if best.feasible
 acc_el = planner.Accuracy(metric="ELEMENTWISE", target=1e-10, cond=1e4)   # cond >= |a||b| / |x|
 q.min_moduli(planner.Accuracy(target=1e-12, basis="TYPICAL"))  # typical estimate, not a guarantee
 host.err_estimate(14, k=4096, outputs=2**20)      # the bounds from scalars (imd_err_estimate)

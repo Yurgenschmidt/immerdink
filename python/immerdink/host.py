@@ -812,11 +812,18 @@ class Accuracy:
         (needs norm_product >= max ||a_i|| ||b_j||);
       target > 0: rank / min_moduli keep the configurations whose estimate (basis "BOUND":
         the rigorous bound, the default; "TYPICAL": the typical estimate, not a guarantee)
-        is <= target; 0: estimates reported only;
+        is <= target; 0: estimates reported only. TYPICAL assumes quantization errors that
+        behave randomly; it fails (up to ~sqrt(k) / sqrt(2 ln(2M/p)) too low) on rows of
+        many equal values not representable at the row's scale, e.g. uniform superpositions
+        (entries 1/sqrt(n)) or repeated hopping constants: use "BOUND" for such operands;
       l1_ratio_a / l1_ratio_b: optional upper bounds (>= 1) on max ||a_i||_1 / ||a_i||_2
         (tighter bounds for decaying or sparse rows; 0 = unknown);
-      fail_prob: the typical estimate's failure probability per call (0: 2^-20).
-    Immutable and hashable; the C struct is built once (planner.py passes it by pointer)."""
+      fail_prob: the typical estimate's failure probability per call (0: 2^-40; for a probability P over C calls of a run pass P / C).
+    The bounds are on the product D (alpha = 1, beta = 0). For C = beta C + RN(alpha D):
+    alpha != 1 turns a bound n into n (1 + u) + u (u = 2^-53; ABSOLUTE: pass |alpha| times
+    the norm_product); beta != 0 adds u |beta C + alpha D|, which these statistics cannot
+    express. Immutable and hashable; the C struct is built once (planner.py passes it by
+    pointer)."""
     metric: str = "NORMWISE"
     target: float = 0.0
     cond: float = 0.0
@@ -892,7 +899,10 @@ def min_moduli(spec, extents=None, *, accuracy, strides=None, rounding="RN", mod
                n_lo=0, n_hi=0, lib=None):
     """imd_err_min_moduli: the smallest N in [n_lo, n_hi] (0, 0: 2..20) whose estimate meets
     accuracy.target for this contraction (status "SUCCESS"), else num_moduli 0 and status
-    "NOT_SUPPORTED"; a plan-time or argument status is returned in .status (with zeros)."""
+    "NOT_SUPPORTED" with err_status "MISSED" (unattainable in the range). A plan-time status
+    of the lowering (e.g. "NOT_SUPPORTED" for a repeated C label: err_status "UNCHECKED") or
+    an argument error ("INVALID_VALUE", e.g. no target) is returned in .status with zeros;
+    nothing raises (as predict)."""
     h, call = _prep(spec, extents, strides, 20, 1, rounding, mode, "GENERATE", lib)
     r = _Err()
     r.struct_size = C.sizeof(_Err)

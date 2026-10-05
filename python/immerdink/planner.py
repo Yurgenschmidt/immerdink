@@ -16,7 +16,8 @@ recomputed here.
     q.rank([8, 14], budget=2**30)[0]  # imd_perf_rank (one C call), best candidate
     acc = planner.Accuracy(target=1e-12)                      # DESIGN v1.12 §6f, built once
     n = q.min_moduli(acc).num_moduli  # imd_err_min_moduli: cheapest N for the target, ~1 µs
-    q.rank([n, n + 1], accuracy=acc)[0]   # the cheapest configuration that meets the target
+    best = q.rank([n, n + 1], accuracy=acc)[0]  # meets the target only if best.feasible
+                                   # (else: the fastest infeasible candidate)
     q.lowering(14).k4_config, q.plan_bytes(14), q.pack_desc_for(0, 14)
 
     pl = planner.Planner(memo=planner.Memo(4096))   # one Query per contraction, cached
