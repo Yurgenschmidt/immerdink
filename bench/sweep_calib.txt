@@ -2,7 +2,7 @@
 # times (--phase-reps, the IMMERDINK_PROFILE build) of shapes chosen to cover every kernel class of
 # the model, every K4 configuration (forced with --k4), several N, residue groups g < N, the
 # resident vector mode, packed operands (imd_pack) and the DIRECT kernel. Its shapes are disjoint
-# from the hold-out set (bench/sweep_perf_validate.txt). About 10 min of GPU time on an RTX 4090.
+# from the hold-out set (bench/sweep_perf_validate.txt). About 12 min of GPU time on an RTX 4090.
 # name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
 # --- fused small path KF (k_hat <= 1024)
 c_s64     | ik,jk->ij | i=64,j=64,k=64             | imd | 8,14,20 | --reps 300 --phase-reps 30 --max-seconds 1 --k4 rule,3

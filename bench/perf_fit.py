@@ -18,9 +18,10 @@ classes the roofline max(round model, DRAM term) with a scan over the DRAM rate 
 one rate for the four configurations). Then the call term: sign-free least squares of
 (t_timed - the C model's phases) / t_timed on (1, kernel_launches), where the phases are
 re-predicted by the C library with the fitted parameters (the C does the sum / max). BETA (not
-measured by the sweep) takes K5's launch and byte parameters. Records with --data dominant
-(one dominant entry per row) are predicted with eps fraction min(1, 512 / k); the others with
-the typical-data default. Datasheet peaks: the RTX 4090's, else --peak-dram / --peak-int8 /
+measured by the sweep) takes K5's launch and byte parameters. The effective L2 of the K4
+DRAM term is scanned (a fraction of the recorded L2; --no-l2-scan keeps the nominal size).
+Records with --data dominant (one dominant entry per row) are predicted with their eps fraction
+(record_eps: about 512 / k); the others with the typical-data default. Datasheet peaks: the RTX 4090's, else --peak-dram / --peak-int8 /
 --peak-fp64 are required. numpy only.
 """
 
@@ -28,6 +29,7 @@ import argparse
 import datetime
 import itertools
 import json
+import math
 import os
 import statistics
 import sys
@@ -74,13 +76,24 @@ class Sample:
         self.again = again            # calib -> host.Prediction (the C model, that calibration)
 
 
-def record_eps(rec, ext):
+MODULI = [256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199, 197, 193, 191,
+          181, 179, 173]  # DESIGN §2
+
+
+def record_eps(rec, ext, lib=None):
     """The eps fraction of a record's data: None (the typical-data default) for the normal
-    generator; for one dominant entry per row, the tiles holding it: min(1, 512 / k)."""
+    generator. With one dominant entry per row (2^20 x the others), the tile holding it is on the
+    eps path (512 / k of the tiles) and the others are about 2^-20 T: on the path too once
+    log2 T - 20 - 53 reaches the ramp of the default (DESIGN §6c.1; N = 20 here)."""
     if rec.get("data") != "dominant":
         return None
-    lw = host.lowering(rec["spec"], ext, N=int(rec.get("N", 8)))
-    return min(1.0, 512.0 / max(lw.k, 1))
+    N = int(rec.get("N", 8))
+    lt = math.log2(math.isqrt((math.prod(MODULI[:N]) - 1) // 2))
+    if lt < 53:
+        return 0.0
+    lw = host.lowering(rec["spec"], ext, N=N, lib=lib)
+    others = min(1.0, max(0.0, (lt - 20 - 53 + 2.5) / 1.5))
+    return max(others, min(1.0, 512.0 / max(lw.k, 1)))
 
 
 def samples_from_records(records, lib=None, seed=None):
@@ -96,7 +109,7 @@ def samples_from_records(records, lib=None, seed=None):
         ext = parse_ext(ext)
         if meth == "imd" and "phases" in r:
             o = variant_options(r)
-            eps = record_eps(r, ext)
+            eps = record_eps(r, ext, lib)
 
             def again(calib, spec=spec, ext=ext, o=o, eps=eps):
                 return host.predict(spec, ext, N=o["N"], g=o["g"], vec_mode=o["vec_mode"],
@@ -113,7 +126,7 @@ def samples_from_records(records, lib=None, seed=None):
             N = int(r["N"])
             pk = host.pack_desc_for(spec, ext, operand=which, N=N, lib=lib)
             packing = (pk, None) if which == 0 else (None, pk)
-            eps = record_eps(r, ext)
+            eps = record_eps(r, ext, lib)
             fns = {"plain_": lambda c, spec=spec, ext=ext, N=N, eps=eps: host.predict(
                        spec, ext, N=N, eps_fraction=eps, calib=c, lib=lib),
                    "packed_": lambda c, spec=spec, ext=ext, N=N, packing=packing, eps=eps:
@@ -180,7 +193,7 @@ def phase_rows(samples):
     return rows
 
 
-K4_BYTE = 4  # K4 classes: t = max(sum of the round-model terms j < 4, the DRAM term j = 4)
+K4_BYTE = 4  # K4 classes: t = max(sum of the round-model terms j != 4, the DRAM term j = 4)
 
 
 def is_k4(cls):
@@ -192,7 +205,7 @@ def predicted_ns(params, names, cls, x):
     the terms, for K4 the max of the round model and the DRAM term."""
     terms = [params.get(f"{cls}.{n}", 0.0) * x[j] if n else 0.0 for j, n in enumerate(names[cls])]
     if is_k4(cls):
-        return max(sum(terms[:K4_BYTE]), terms[K4_BYTE])
+        return max(sum(terms) - terms[K4_BYTE], terms[K4_BYTE])
     return sum(terms)
 
 
@@ -301,6 +314,22 @@ def fit(samples, seed, lib=None, verbose=True, worst=0, k4_shared_dram=False):
     return params
 
 
+def k4_error(samples, lib, shared):
+    """Sum over the K4 classes of the fitted relative squared error (the L2 scan's criterion)."""
+    names = host.param_names(lib)
+    rows = phase_rows(samples)
+    tot = 0.0
+    for cls in host.PERF_CLASSES[4:8]:
+        data = rows.get(cls, [])
+        if not data:
+            continue
+        used = [j for j, n in enumerate(names[cls]) if n]
+        X = np.array([d[0][used] for d in data])
+        t = np.array([d[1] for d in data])
+        tot += fit_k4(X, t, used.index(K4_BYTE))[1]
+    return tot
+
+
 def clock_summary(records):
     clocks = sorted({int(r["gpu_after"].split()[0]) for r in records
                      if r.get("status") == "ok" and r.get("gpu_after", "").split()[:1]
@@ -331,6 +360,8 @@ def main(argv=None):
     ap.add_argument("--peak-fp64", type=float, default=None, help="datasheet FP64 flops/s")
     ap.add_argument("--k4-shared-dram", action="store_true",
                     help="one DRAM rate for the four K4 configurations")
+    ap.add_argument("--no-l2-scan", action="store_true",
+                    help="use the nominal L2 (no scan of the effective L2 fraction)")
     a = ap.parse_args(argv)
     records = []
     for f in a.records:
@@ -366,6 +397,23 @@ def main(argv=None):
     samples = samples_from_records(records, a.lib, seed)
     if not samples:
         sys.exit("no usable records (profiling build, method imd / packed, status ok)")
+    if not a.no_l2_scan:
+        # The effective L2 of K4's DRAM term: the measured device's L2 is shared with W, the
+        # other operand and the packs' traffic, so a group's working set streams from DRAM well
+        # before it reaches the nominal size. Scan a fraction of the nominal L2 and keep the one
+        # with the smallest K4 error (the K4 features are the only ones that depend on it).
+        best = None
+        for frac in (0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0):
+            m2 = dict(meta, l2_bytes=max(frac * l2, 1.0))  # l2_bytes > 0
+            sd = host.Calibration.from_values(m2, host.Calibration.default(a.lib).params, a.lib)
+            sm = samples_from_records(records, a.lib, sd)
+            err = k4_error(sm, a.lib, a.k4_shared_dram)
+            print(f"  effective L2 {frac:.2f} x {l2 / 2**20:.0f} MiB: K4 relative SSE {err:.3f}")
+            if best is None or err < best[0] - 1e-9:
+                best = (err, frac, sd, sm)
+        _, frac, seed, samples = best
+        meta["l2_bytes"] = max(frac * l2, 1.0)
+        print(f"effective L2: {frac:.2f} of the nominal {l2 / 2**20:.0f} MiB")
     params = fit(samples, seed, a.lib, worst=a.worst, k4_shared_dram=a.k4_shared_dram)
     meta["notes"] = (a.notes or f"fit on {len(samples)} calls ({len(ok)} records) by "
                      f"bench/perf_fit.py")[:127]

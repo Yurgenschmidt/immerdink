@@ -343,7 +343,7 @@ IMD_API const char* imd_status_string(imd_status_t status);
  * configurations a caller may choose (N, g, vec_mode, packed operands) inside a device-memory
  * budget, each with its exact footprint. Each phase time is linear in calibrated per-kernel
  * parameters:  t_p = sum_j param[class(p) * IMD_PERF_MAX_PARAMS + j] * x[p][j]  (ns; for the
- * K4 classes the max of the round-model terms j < 4 and the DRAM term j = 4), over
+ * K4 classes the max of the round-model terms j != 4 and the DRAM term j = 4), over
  * features x computed exactly from the plan's lowering (the table in §6c.1). A calibration is
  * a caller-owned plain struct (no handle, no allocation); NULL = the shipped one (RTX 4090,
  * sm_89). The calibration is read only by these functions, never by plan creation. */
@@ -360,10 +360,10 @@ enum {
                                     l2byte, op_eps                                          */
   IMD_PERF_CLASS_PACK = 3,       /* (pack) K2 / K3, groups 2..: launch, byte, op, op_eps    */
   IMD_PERF_CLASS_K4_128x256 = 4, /* (k4_128x256) K4: max(round model, byte): round, mac1,
-                                    byte (slot 4)                                           */
-  IMD_PERF_CLASS_K4_128x128 = 5, /* (k4_128x128) round, mac1, mac2, byte                    */
-  IMD_PERF_CLASS_K4_64x128 = 6,  /* (k4_64x128)  round, mac1, mac2, byte                    */
-  IMD_PERF_CLASS_K4_64x64 = 7,   /* (k4_64x64)   round, mac1, mac2, mac3, byte              */
+                                    byte (slot 4), mac_ktail (slot 5, in the round model)   */
+  IMD_PERF_CLASS_K4_128x128 = 5, /* (k4_128x128) round, mac1, mac2, byte, mac_ktail         */
+  IMD_PERF_CLASS_K4_64x128 = 6,  /* (k4_64x128)  round, mac1, mac2, byte, mac_ktail         */
+  IMD_PERF_CLASS_K4_64x64 = 7,   /* (k4_64x64)   round, mac1, mac2, mac3, byte, mac_ktail   */
   IMD_PERF_CLASS_K5 = 8,         /* (k5) CRT: launch, byte, op                              */
   IMD_PERF_CLASS_DIRECT = 9,     /* (direct) native FP64: launch, byte, flop                */
   IMD_PERF_CLASS_BETA = 10,      /* (beta) C <- beta C: launch, byte                        */
@@ -453,7 +453,7 @@ typedef struct {
 } imd_perf_request_t;
 
 /* One phase: its features x (the model is sum_j param[cls * 6 + j] x[j]; K4: the max of the
- * terms j < 4 and the term j = 4; the op_eps features already carry the eps fraction), its
+ * terms j != 4 and the term j = 4; the op_eps features already carry the eps fraction), its
  * predicted time, and its MEMORY_MODEL §4 lower bound: bound_s = max(bytes / peak DRAM,
  * ops / peak). It has no struct_size: its layout (96 bytes) and IMD_PERF_MAX_PHASES are
  * FROZEN for host API version 6; a change would be a new struct and function names. */
@@ -479,7 +479,8 @@ typedef struct {
   double bound_s;        /* sum of the phase bounds                                         */
   double flops_eq;       /* 2 b m n k (imd_pack: 0)                                         */
   double tflops_eq;      /* flops_eq / time_s / 1e12 (0 when time_s is 0)                   */
-  double eps_s;          /* time of the eps-path terms at fraction 1 (the bracket above)    */
+  double eps_s;          /* time of the eps-path terms at fraction 1 (the bracket above);
+                            0 when T < 2^53 (no eps path)                                   */
   double eps_fraction;   /* the eps fraction used (the default estimate or the request's)  */
   int64_t kernel_launches;
   uint64_t workspace_bytes;   /* imd_workspace_size(_packed) (exact)                        */

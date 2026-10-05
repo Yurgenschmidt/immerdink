@@ -33,7 +33,9 @@ namespace c = imd::constants;
 #pragma GCC diagnostic pop
 
 constexpr int kP = IMD_PERF_MAX_PARAMS;
-constexpr int kK4ByteSlot = 4;  // K4 classes: t = max(sum_{j < 4} th_j x_j, th_4 x_4)
+constexpr int kK4ByteSlot = 4;  // K4 classes: t = max(sum_{j != 4} th_j x_j, th_4 x_4)
+constexpr int kK4TailSlot = 5;  // K4: the MACs of chunks with a partial 64-wide K tile
+constexpr int64_t kK4TileK = 64;
 
 const char* const kClassNames[IMD_PERF_CLASS_COUNT] = {
     "k0", "kf", "kl", "pack", "k4_128x256", "k4_128x128", "k4_64x128", "k4_64x64",
@@ -44,10 +46,10 @@ const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
     {"launch", "byte", "op", "row", "op_eps", nullptr},              // kf
     {"launch", "byte", "op", "l2byte", "op_eps", nullptr},           // kl
     {"launch", "byte", "op", "op_eps", nullptr, nullptr},            // pack
-    {"round", "mac1", nullptr, nullptr, "byte", nullptr},            // k4_128x256 (1 CTA per SM)
-    {"round", "mac1", "mac2", nullptr, "byte", nullptr},             // k4_128x128 (2)
-    {"round", "mac1", "mac2", nullptr, "byte", nullptr},             // k4_64x128  (2)
-    {"round", "mac1", "mac2", "mac3", "byte", nullptr},              // k4_64x64   (3)
+    {"round", "mac1", nullptr, nullptr, "byte", "mac_ktail"},        // k4_128x256 (1 CTA per SM)
+    {"round", "mac1", "mac2", nullptr, "byte", "mac_ktail"},         // k4_128x128 (2)
+    {"round", "mac1", "mac2", nullptr, "byte", "mac_ktail"},         // k4_64x128  (2)
+    {"round", "mac1", "mac2", "mac3", "byte", "mac_ktail"},          // k4_64x64   (3)
     {"launch", "byte", "op", nullptr, nullptr, nullptr},             // k5
     {"launch", "byte", "flop", nullptr, nullptr, nullptr},           // direct
     {"launch", "byte", nullptr, nullptr, nullptr, nullptr},          // beta
@@ -167,6 +169,7 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     const bool inl[2] = {!(e.packed & 1), !(e.packed & 2)};
     const double f = perf_eps_fraction(e.N, k, eps);
     P.eps_fraction = f;
+    P.eps_possible = perf_log2_T(e.N) >= 53;
     if (!fused) k0();
     if (fused) {  // KF: K0 + K1 + group 1's packs of the in-line operands
       double bytes = resident ? 0 : 8 * V, ops = 0, r = 0;
@@ -208,7 +211,7 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     const int64_t gsz[2] = {e.g, e.N % e.g}, gcnt[2] = {e.N / e.g, e.N % e.g ? 1 : 0};
     const int64_t last = e.k_hat - (kc.k_chunks - 1) * chunk;
     const int64_t ksz[2] = {chunk, last}, kcnt[2] = {kc.k_chunks - 1, 1};
-    double x[4] = {0, 0, 0, 0};
+    double x[kP] = {0, 0, 0, 0, 0, 0};
     const int occ = kK4Configs[cfg].ctas_per_sm;
     for (int i = 0; i < 2; ++i)
       for (int j = 0; j < 2; ++j) {
@@ -219,6 +222,9 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         x[0] += cnt * (full + (r.rest > 0 ? 1 : 0));
         x[occ] += cnt * full * occ * macs;
         if (r.rest > 0) x[r.rest] += cnt * r.rest * macs;
+        // A chunk whose length is not a multiple of the 64-wide K tile runs a predicated
+        // residue tile (CUTLASS 2.x MmaMultistage): its MACs again, at their extra cost.
+        if (ksz[j] % kK4TileK != 0) x[kK4TailSlot] += cnt * (full * occ + r.rest) * macs;
       }
     const double k4_bytes = N * b * (m + nh) * kh + N * b * m * nh * (2.0 * kc.k_chunks - 1);
     // The DRAM term: per group, its operand residues (just written by the packs) and its W
@@ -231,7 +237,7 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     }
     const double k4_ops = 2 * N * b * m * nh * kh;
     add_phase(&P, IMD_PERF_PHASE_K4, IMD_PERF_CLASS_K4_128x256 + cfg, kc.launches,
-              {x[0], x[1], x[2], x[3], dram}, k4_bytes, k4_ops, 1);
+              {x[0], x[1], x[2], x[3], dram, x[kK4TailSlot]}, k4_bytes, k4_ops, 1);
     // K5: the N planes, sigma / tau and the flags read, C written (and read if beta != 0).
     const double k5_bytes = N * b * m * nh + 3 * b * (m + n) + out_bytes;
     add_phase(&P, IMD_PERF_PHASE_K5, IMD_PERF_CLASS_K5, 1,
@@ -256,6 +262,7 @@ void perf_pack_phases(const PackLowered& pl, double eps, PerfPhases* out) {
   const double prep = 8 * (r + k + b) + zeros;
   add_phase(&P, IMD_PERF_PHASE_PACK_PREP, IMD_PERF_CLASS_K0, 1, {1, prep}, prep);
   P.eps_fraction = perf_eps_fraction(pl.N, k, eps);
+  P.eps_possible = perf_log2_T(pl.N) >= 53;
   add_kl(&P, IMD_PERF_PHASE_PACK_KL, b * r, b * r, k, kh, N, e.pack_along_rows[0], pl.k_hat,
          P.eps_fraction);
   P.launches = 2;
@@ -267,7 +274,8 @@ double perf_phase_seconds(const imd_perf_calib_t& cal, const PerfPhase& p) {
   if (p.cls >= IMD_PERF_CLASS_K4_128x256 && p.cls <= IMD_PERF_CLASS_K4_64x64) {
     // K4: a roofline, max(the A3 round model, the DRAM term).
     double rounds = 0;
-    for (int j = 0; j < 4; ++j) rounds += th[j] * p.x[j];
+    for (int j = 0; j < kP; ++j)
+      if (j != kK4ByteSlot) rounds += th[j] * p.x[j];
     return std::max(rounds, th[kK4ByteSlot] * p.x[kK4ByteSlot]) * 1e-9;
   }
   double ns = 0;
@@ -482,7 +490,8 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, imd_perf_
   double t = 0, bound = 0, eps_s = 0;
   for (int i = 0; i < P.n; ++i) {
     const PerfPhase& p = P.ph[i];
-    if (p.eps_slot >= 0) eps_s += cal.param[p.cls * kP + p.eps_slot] * p.eps_ops * 1e-9;
+    if (p.eps_slot >= 0 && P.eps_possible)
+      eps_s += cal.param[p.cls * kP + p.eps_slot] * p.eps_ops * 1e-9;
     imd_perf_phase_t& o = r->phase[i];
     o.phase = p.phase, o.cls = p.cls, o.launches = p.launches;
     o.time_s = perf_phase_seconds(cal, p);

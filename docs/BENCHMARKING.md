@@ -109,9 +109,11 @@ tools/calibrate.sh [-o my_gpu.calib] [--validate]
 - It builds the profiling `imd_bench`, runs `bench/sweep_calib.txt` through
   `bench/run_sweep.sh` (quiet gate, GPU lock, warm-up: the usual rules above), and fits the
   parameters with `bench/perf_fit.py` (numpy only): per kernel class a non-negative
-  least-squares fit in relative error of the phase times, then the per-call term on the timed
-  medians. About 10 minutes of GPU time on an RTX 4090; it never changes clocks (the file's
-  `clocks` line records the state it ran in).
+  least-squares fit in relative error of the phase times (K4: a DRAM-rate and an effective-L2
+  scan), then the per-call term on the timed medians. About 12 minutes of GPU time on an
+  RTX 4090; it never changes clocks (the file's `clocks` line records the state it ran in).
+  The records carry the GPU's SM count and L2 size; for a GPU other than the RTX 4090 pass its
+  datasheet peaks (`perf_fit.py --peak-dram --peak-int8 --peak-fp64`).
 - `--validate` also runs the hold-out sweep `bench/sweep_perf_validate.txt` (shapes disjoint
   from the fit set) and prints `bench/perf_validate.py`'s error table against the DESIGN §6c.5
   targets; `--per-call` and `--phases` show every call and every phase.

@@ -30,6 +30,7 @@ struct PerfPhases {
   int32_t k4_config = IMD_K4_128x256;  // the K4 configuration of the K4 phase
   int64_t launches = 0;                // kernel launches of the call
   double eps_fraction = 0;             // the eps-path fraction the features carry
+  bool eps_possible = false;           // T >= 2^53: the eps path exists (else eps_s = 0)
 };
 
 // The phases of one imd_contract of a SUCCESS plan (analysis `an`, plan data `e`), in launch

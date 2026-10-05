@@ -700,11 +700,10 @@ def suite_host(args):
 L32 = [0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]  # §2: CRT limbs per N
 MODULI = [256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199, 197, 193, 191,
           181, 179, 173]  # DESIGN §2
-L2_4090 = 72 * 2**20
 K_C_PRIME = 131056
 
 
-def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks):
+def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks, l2):
     """K4 features (rounds, MACs at q = 1..3 concurrent CTAs) over the groups and K-chunks,
     written from DESIGN §6c.1 independently of src/host/perf.cpp."""
     tm, tn, occ = K4_TILES[c]
@@ -721,13 +720,15 @@ def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks):
             x[occ] += full * occ * tm * tn * kc
             if rest:
                 x[rest] += rest * tm * tn * kc
+            if kc % 64:  # a partial 64-wide K tile: the chunk's MACs again (mac_ktail)
+                x[5] += (full * occ + rest) * tm * tn * kc
     for gs in groups:  # the DRAM term: a group's operands and W planes beyond L2
         x[4] += max(0, gs * b * (m + n_hat) * k_hat + gs * b * m * n_hat * (2 * k_chunks - 1)
-                    - L2_4090)
+                    - l2)
     return x
 
 
-def spec_phases(lw, vec, along_rows, beta=False):
+def spec_phases(lw, vec, along_rows, l2, beta=False):
     """[(name, launches, x)] of one imd_contract (DESIGN §6c.1 table) from the lowering
     summary and the operands' read direction (along rows: KL tiles of 512)."""
     m, n, k, b, nh, kh = lw.m, lw.n, lw.k, lw.b, lw.n_hat, lw.k_hat
@@ -770,7 +771,7 @@ def spec_phases(lw, vec, along_rows, beta=False):
                                              + (N - g) * pad[x] * kh, (N - g) * rows[x] * k,
                                              wide * (N - g) * rows[x] * k, 0, 0]))
     ph.append(("K4 gemm", lw.gemm_launches,
-               spec_k4_features(lw.k4_config, m, nh, kh, b, N, g, 128, lw.k_chunks)))
+               spec_k4_features(lw.k4_config, m, nh, kh, b, N, g, 128, lw.k_chunks, l2)))
     ph.append(("K5 crt", 1, [1, N * b * m * nh + 3 * b * (m + n) + outb, N * L32[N] * b * m * n,
                              0, 0, 0]))
     return ph + [("call", 0, [1, lw.kernel_launches, 0, 0, 0, 0])]
@@ -832,7 +833,7 @@ def suite_perf(args):
                         raise Fail(f"{spec} {ext}: status {p.status} vs lowering {lw.status}")
                     if p.status != "SUCCESS":
                         continue
-                    want = spec_phases(lw, vec, along)
+                    want = spec_phases(lw, vec, along, cal.meta["l2_bytes"])
                     got = [(q.name, q.launches, list(q.x)) for q in p.phases]
                     ok = len(want) == len(got) and all(
                         a[0] == b[0] and a[1] == b[1] and all(close(u, v) for u, v in zip(a[2], b[2]))

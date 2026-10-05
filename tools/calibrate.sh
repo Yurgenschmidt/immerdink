@@ -3,13 +3,15 @@
 #   tools/calibrate.sh [-o out.calib] [--validate] [--results DIR]
 # 1. builds the profiling imd_bench (bench/build.sh, via bench/run_sweep.sh);
 # 2. runs the calibration sweep bench/sweep_calib.txt through bench/run_sweep.sh (quiet gate,
-#    shared GPU lock, warm-up; ~10 min of GPU time on an RTX 4090) into DIR/calib-<stamp>.jsonl;
+#    shared GPU lock, warm-up; ~12 min of GPU time on an RTX 4090) into DIR/calib-<stamp>.jsonl;
 # 3. fits the parameters (bench/perf_fit.py, numpy) and writes the calibration file
 #    (default: DIR/<gpu>.calib); load it with imd_perf_calib_load / host.Calibration.load, or
 #    copy it over src/host/calib/rtx4090_sm89.calib to change the shipped one;
 # 4. with --validate: runs the hold-out sweep bench/sweep_perf_validate.txt and prints the
 #    error distribution against the §6c.5 targets (bench/perf_validate.py).
-# Environment: as bench/run_sweep.sh (IMMERDINK_ENV, IMMERDINK_CUTLASS_DIR, BENCH_RETRIES, ...).
+# Environment: as bench/run_sweep.sh (IMMERDINK_ENV, IMMERDINK_CUTLASS_DIR, BENCH_RETRIES, ...);
+# PERF_FIT_ARGS: extra bench/perf_fit.py arguments (a GPU other than the RTX 4090 needs its
+# datasheet peaks: PERF_FIT_ARGS="--peak-dram 1.0e12 --peak-int8 6.6e14 --peak-fp64 1.3e12").
 # Results default to bench/results/ (git-ignored). Never changes GPU clocks.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -35,7 +37,8 @@ data="$results/calib-$stamp.jsonl"
 "$root/bench/run_sweep.sh" "$root/bench/sweep_calib.txt" "$data" || exit $?
 [ -n "$out" ] || out="$results/$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 |
                                  tr ' ' '_' | tr -cd 'A-Za-z0-9_-')-$stamp.calib"
-"$py" "$root/bench/perf_fit.py" "$data" -o "$out" --lib "$hostlib" || exit $?
+# shellcheck disable=SC2086
+"$py" "$root/bench/perf_fit.py" "$data" -o "$out" --lib "$hostlib" ${PERF_FIT_ARGS:-} || exit $?
 echo "calibration: $out"
 if [ "$validate" = 1 ]; then
   vdata="$results/validate-$stamp.jsonl"

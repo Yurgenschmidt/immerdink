@@ -447,7 +447,7 @@ int main(void) {
       if (i > 0) CHECK(cand[i - 1].time_s <= c->time_s);
       const imd_options_t o = {c->num_moduli, c->residue_group, IMD_RN, IMD_EMULATE, c->vec_mode,
                                IMD_K4_TUNE_OFF};
-      size_t ws = 0, dev = 0;
+      size_t ws = 0, pdev = 0;
       if (c->packed == 0) {
         CHECK(imd_workspace_size(&A, &B, &C, &o, &ws) == 0 && ws == c->workspace_bytes);
         CHECK(c->pack_bytes == 0 && c->pack_s == 0 && c->time_s == c->contract_s);
@@ -457,7 +457,7 @@ int main(void) {
         CHECK(c->pack_bytes == pl.pack_bytes && c->pack_ws_bytes == pl.pack_ws_bytes);
         CHECK(c->time_s == c->contract_s + c->pack_s / 4);
       }
-      CHECK(imd_plan_bytes(&A, &B, &C, &o, &dev, NULL) == 0 && dev == c->plan_device_bytes);
+      CHECK(imd_plan_bytes(&A, &B, &C, &o, &pdev, NULL) == 0 && pdev == c->plan_device_bytes);
       CHECK(c->total_bytes == c->workspace_bytes + c->plan_device_bytes + c->pack_bytes +
                                   c->pack_ws_bytes);
     }

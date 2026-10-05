@@ -1844,7 +1844,7 @@ calibration file cannot change a result, a launch or a footprint.
 
 ```
 t_p = Σ_j θ[class(p), j] · x[p, j]        (ns; θ ≥ 0 except the call term; j < 6)
-K4:   t_p = max(Σ_{j<4} θ_j x_j, θ_4 x_4)  (the A3 round model, or the DRAM term)
+K4:   t_p = max(Σ_{j≠4} θ_j x_j, θ_4 x_4)  (the A3 round model, or the DRAM term)
 ```
 
 The features `x` are exact functions of the plan's lowering (the `ExecPlan` that
@@ -1873,7 +1873,7 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
 | `KF fused` | `fused` (§4) | KF | 1 | `Σ_x (8E_x + g·pad_x·k̂ + 3rows_x) + 8V·[GENERATE]` | `g·Σ_x E_x` residues | `Σ_x rows_x` | `f·x₂` |
 | `KL A`, `KL B` | `fused_large` bit of x | KL | 1 | `8E_x + g·pad_x·k̂ + 3rows_x` | `g·E_x` | `16·rows_x·max(0, k̂ − 2·tk_x)` L2 re-read | `f·x₂` |
 | `K2 pack A`, `K3 pack B` | groups of x not packed by KF / KL | PACK | launches (B: + the zero-rows launch per group if n̂ > n) | `Σ_groups (8E_x + g_i·pad_x·k̂)` | `Σ_groups g_i·E_x` | `f·x₂` | |
-| `K4 gemm` | EMULATE | K4[config] | rounds | MACs run at q = 1 | q = 2 | q = 3 | DRAM bytes beyond L2: `Σ_groups max(0, g_i·b·(m + n̂)·k̂ + g_i·b·m·n̂·(2·k_chunks − 1) − L2)` |
+| `K4 gemm` | EMULATE | K4[config] | rounds | MACs run at q = 1 | q = 2 | q = 3 | DRAM bytes beyond L2: `Σ_groups max(0, g_i·b·(m + n̂)·k̂ + g_i·b·m·n̂·(2·k_chunks − 1) − L2)`; x₅ = the busiest SM's MACs of K-chunks whose length is not a multiple of 64 (`mac_ktail`) |
 | `K5 crt` | EMULATE | K5 | 1 | `N·b·m·n̂ + 3b(m+n) + 8bmn(1+β')` | `N·L32·b·m·n` limb operations | | |
 | `DIRECT` | DIRECT dispatch | DIRECT | 1 | `8b(mk + nk) + 8bmn(1+β')` | `2bmnk` FP64 flops | | |
 | `K5 beta-only` | SCALE dispatch or α = 0 | BETA | 1 | `8bmn(1+β')` | | | |
@@ -1881,7 +1881,14 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
 | `pack prep` (imd_pack) | every non-empty pack | K0 | 1 | `8(r+k+b)` + the zeroed gaps and tail | | | |
 | `pack KL` (imd_pack) | every non-empty pack | KL | as KL with g = N, rows = pad = b·r, x the pack's one-operand view (`pack_exec`) | | | | |
 
-(x₅ is unused: room for one more feature per class in a later format.)
+(x₅ is unused outside K4: room for one more feature per class in a later format.)
+
+- **K4's partial K tile** (`mac_ktail`, found on the hold-out set). A K-chunk whose length is
+  not a multiple of the 64-wide K tile (k̂ = 1008, 5008, 30000, 150000; every full chunk K_c' =
+  131056) runs CUTLASS 2.x's predicated residue tile, and the whole chunk is measurably slower
+  (sq5000, 3000 × 700 × 5000: K4 24–29 % above the round model without the feature; with it the
+  K4 hold-out p90 on ≥ 1 ms calls drops from 19 % to 18 % and the 64×128 class from 28 % to
+  15 %). Tested criteria: k̂ mod 64 (adopted), 128, 256.
 
 - **The eps path** (the `op_eps` features, reviewed 2026-10-05). The packs quantize an
   element to `μ·2^ε`; a residue costs one more modular multiply when ε > 0, i.e. |a'| ≥ 2⁵³
@@ -1906,7 +1913,12 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
 - **K4's DRAM term.** The operands of a group were just written by the packs and stay in L2
   while the group's operands and W planes fit; beyond that K4 streams them from DRAM
   (measured memory-bound: r_mm-like n̂ = 64–128 with long k, skinny m ≫ n). The calibration
-  holds the L2 size (`l2_bytes`, 72 MiB on the 4090).
+  holds an **effective** L2 (`l2_bytes`), fitted: the L2 is shared with W, the other operand
+  and the packs' traffic, so the working set streams from DRAM well before the nominal size
+  (on the 4090 the fit picks 0.4 × 72 MiB; with the nominal 72 MiB the memory-bound g < N
+  points were up to 48 % low). The DRAM rate is per configuration: the three larger tiles
+  agree (one rate), 64×64 is slower per byte, consistent with its narrower tiles re-reading
+  the operands more often (NOTES-B2).
 
 - **KL's tile** (`tk_x`): 4096 FP64 along k̄, 512 when the operand is read along rows
   (`pack_along_rows`, §4 KL "th · tk = 4096"); rows of more than two tiles re-read the middle
@@ -1950,15 +1962,18 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
   variant the timed median of `imd_contract` and the median per-phase times of
   `--phase-reps` profiled calls (`phases`), packed cases (`imd_pack` phases) and DIRECT. The
   fit set covers every class: KF and KL shapes, every K4 configuration (forced with `--k4`),
-  N from 4 to 20, g < N (PACK), RESIDENT, packed operands, K-empty and DIRECT. ≈ 10 min of
+  N from 4 to 20, g < N (PACK), RESIDENT, packed operands, K-empty and DIRECT. ≈ 12 min of
   GPU time on the 4090. Its shapes are disjoint from the hold-out set (6c.5).
 - **Fit** (`bench/perf_fit.py`, numpy only). The fitter gets every feature vector from
   `imd_perf_predict` through `host.py` (no feature formula in Python). Per class, θ minimizes
   the relative error `Σ ((θ·x − t)/t)²` over that class's measured phases, subject to θ ≥ 0
   (exact NNLS by enumerating the active sets of ≤ 5 parameters); for K4, a scan over the DRAM
   rate (bandwidths 0.1–2 TB/s, or none): the round model is fitted on the phases the DRAM term
-  does not explain, and the rate with the smallest relative error of the max wins. Then the
-  call term:
+  does not explain, and the rate with the smallest relative error of the max wins; around it a
+  scan of the effective L2 (0–1 × the recorded L2 size) keeps the fraction with the smallest K4
+  error. Features are computed under a seed calibration of the measured device (the records'
+  `sm_count` and `l2_bytes`), never the shipped one. Then the call term (with the C library
+  doing the sum / max of the fitted phases):
   ordinary least squares of `(t_timed − Σ_p t̂_p) / t_timed` on (1, kernel_launches). Classes
   the sweep cannot exercise get documented stand-ins: BETA takes K5's launch and byte
   parameters. The fitter prints per-class residuals and writes the file.
@@ -2130,7 +2145,10 @@ by `format` (a new feature set is a new format and a refit).
 error with its line, predict / rank smoke and footprint equality. `host_python`: the same
 from Python plus an **independent Python transcription of the features** on random
 descriptors (as for `k4_select`), K4 features × A3 constants = `k4_estimate`, monotonicity
-(doubling m, n or k never lowers the predicted time at fixed configuration), rank: every
+against the shipped (fitted) calibration and a synthetic one with a large eps-path cost
+(doubling m, n or k never lowers the predicted time at fixed configuration and fixed eps
+fraction; with the default fraction never below the time without the eps terms), the eps
+bracket and the default ramp (exact log₂T), rank: every
 footprint equals `imd_workspace_size(_packed)` / `imd_plan_bytes` / `imd_pack_layout` exactly,
 the budget is respected, the order is as specified; `perf_calib_shipped`: the shipped file
 parses and its sm_count is 128. `host_cuda_free` unchanged (the model is plain C++).
