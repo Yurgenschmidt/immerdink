@@ -2857,7 +2857,7 @@ otherwise there is no bound (+∞), and plan creation rejects that configuration
 - Its bound is `γ_k = k·u / (1 − k·u)` relative to Σ|a_h b_h| ≤ ‖a‖‖b‖. The final rounding is
   already included.
 - NORMWISE γ_k, ELEMENTWISE γ_k·ρ, ABSOLUTE γ_k·norm_product.
-- +∞ if k·u ≥ 1.
+- +∞ if k·u ≥ ½ (γ_k ≥ 1 there).
 
 NOOP and SCALE (no product, k = 0) give 0.
 

@@ -310,6 +310,111 @@ def error_guidance(N, k, rounding=RN):
 
 
 # ---------------------------------------------------------------------------
+# §6f accuracy-aware planning: the reference of imd_err_estimate (libimmerdink_host)
+
+ERR_NORMWISE, ERR_ELEMENTWISE, ERR_ABSOLUTE = 0, 1, 2
+ERR_DEFAULT_FAIL_PROB = 2.0**-20
+DISPATCHES = ("NOOP", "EMULATE", "DIRECT", "SCALE")   # IMD_DISPATCH_* order
+
+
+def sqrt_enclosure(x, bits=100):
+    """(lo, hi) rationals with lo <= sqrt(x) <= hi and hi - lo <= 2^-bits (x >= 0 rational)."""
+    x = Fraction(x)
+    if x < 0:
+        raise ValueError("sqrt of a negative number")
+    num, den = x.numerator, x.denominator
+    r = math.isqrt(num * den * 4**bits)          # sqrt(x) = sqrt(num den 4^bits) / (den 2^bits)
+    scale = den * 2**bits
+    return Fraction(r, scale), Fraction(r + 1, scale)
+
+
+def error_estimate(N, k, rounding, dispatch="EMULATE", outputs=1, metric=ERR_NORMWISE, *,
+                   cond=0.0, norm_product=0.0, l1_ratio_a=0.0, l1_ratio_b=0.0,
+                   fail_prob=0.0, target=0.0):
+    """DESIGN §6f.2: the rigorous bound and the typical estimate of one configuration.
+
+    Rigorous (exact rationals; square roots by enclosures): returns 'bound' and 'unit_bound'
+    as (lo, hi) with lo <= the exact real value <= hi (hi - lo tiny), or None for +inf.
+      EMULATE: E = 2 delta (nu_a + nu_b) s/d + 4 delta^2 k s^2/d^2   (PROOFS L3a + L1d)
+               delta = 1/2, d = T - kappa/2 (RN; kappa >= T: None) | delta = 1, d = T (TRUNC)
+               s = sqrt(1 + k 2^-F), nu = min(l1_ratio, sqrt k) (0: sqrt k)
+        NORMWISE E (1+u) + u;  ELEMENTWISE E rho (1+u) + u;  ABSOLUTE (E (1+u) + u) norm_product
+      DIRECT:  gamma_k = k u / (1 - k u) (None if k u >= 1/2): NORMWISE gamma_k,
+               ELEMENTWISE gamma_k rho, ABSOLUTE gamma_k norm_product
+      NOOP, SCALE, k = 0: 0.
+    Typical (a float; NOT a guarantee): RN EMULATE only,
+      E_typ = min(E, s/d sqrt(8 ln(2M/p)) + k s^2/d^2), M = max(outputs, 1), p = fail_prob
+      (0: 2^-20), composed per metric as E; otherwise the bound (its float hi)."""
+    if not N_MIN <= N <= N_MAX or rounding not in (RN, TRUNC) or dispatch not in DISPATCHES:
+        raise ValueError("N, rounding or dispatch")
+    if k < 0 or outputs < 0 or metric not in (ERR_NORMWISE, ERR_ELEMENTWISE, ERR_ABSOLUTE):
+        raise ValueError("k, outputs or metric")
+    for v in (l1_ratio_a, l1_ratio_b):
+        if not (v == 0 or (math.isfinite(v) and v >= 1)):
+            raise ValueError("l1_ratio must be 0 or >= 1")
+    if metric == ERR_ELEMENTWISE and not (math.isfinite(cond) and cond >= 1):
+        raise ValueError("ELEMENTWISE needs cond >= 1")
+    if metric == ERR_ABSOLUTE and not (math.isfinite(norm_product) and norm_product > 0):
+        raise ValueError("ABSOLUTE needs norm_product > 0")
+    if not (math.isfinite(target) and target >= 0):
+        raise ValueError("target must be finite and >= 0 (0: none)")
+    if not (fail_prob == 0 or 0 < fail_prob < 1):
+        raise ValueError("fail_prob must be 0 or in (0, 1)")
+    u = UNIT_ROUNDOFF
+    out = {"N": N, "k": k, "rounding": rounding, "dispatch": dispatch, "outputs": outputs,
+           "metric": metric}
+    zero = (Fraction(0), Fraction(0))
+    if dispatch in ("NOOP", "SCALE") or k == 0:
+        out.update(unit_bound=zero, bound=zero, unit_typical=0.0, typical=0.0)
+        return out
+    rho, npd = Fraction(cond), Fraction(norm_product)
+    if dispatch == "DIRECT":
+        if 2 * k * u >= 1:          # gamma_k >= 1 there: no bound (as the C)
+            out.update(unit_bound=None, bound=None, unit_typical=math.inf, typical=math.inf)
+            return out
+        g = k * u / (1 - k * u)
+        b = g * (rho if metric == ERR_ELEMENTWISE else npd if metric == ERR_ABSOLUTE else 1)
+        out.update(unit_bound=(g, g), bound=(b, b), unit_typical=float(g), typical=float(b))
+        return out
+    T, kap = constants(N)["T"], kappa(k)
+    if rounding == RN and kap >= T:
+        out.update(unit_bound=None, bound=None, unit_typical=math.inf, typical=math.inf)
+        return out
+    delta = Fraction(1, 2) if rounding == RN else Fraction(1)
+    d = Fraction(2 * T - kap, 2) if rounding == RN else Fraction(T)
+    s2 = 1 + Fraction(k, 2**F_BITS)
+    s_lo, s_hi = sqrt_enclosure(s2)
+    rk_lo, rk_hi = sqrt_enclosure(k)
+
+    def nu(v, rk):
+        return rk if v == 0 else min(Fraction(v), rk)
+
+    def unit(s, rk):
+        return 2 * delta * (nu(l1_ratio_a, rk) + nu(l1_ratio_b, rk)) * s / d + \
+            4 * delta**2 * k * s2 / d**2
+
+    def compose(E):
+        if metric == ERR_NORMWISE:
+            return E * (1 + u) + u
+        if metric == ERR_ELEMENTWISE:
+            return E * rho * (1 + u) + u
+        return (E * (1 + u) + u) * npd
+
+    E = (unit(s_lo, rk_lo), unit(s_hi, rk_hi))
+    out.update(unit_bound=E, bound=(compose(E[0]), compose(E[1])))
+    if rounding == RN:
+        M = max(outputs, 1)
+        p = fail_prob if fail_prob > 0 else ERR_DEFAULT_FAIL_PROB
+        s, df = math.sqrt(float(s2)), float(d)
+        e_typ = min(float(E[1]), s / df * math.sqrt(8 * math.log(2 * M / p)) +
+                    k * float(s2) / (df * df))
+        out.update(unit_typical=e_typ, typical=float(compose(Fraction(e_typ))))
+    else:
+        out.update(unit_typical=float(E[1]), typical=float(out["bound"][1]))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # §3.5 epilogue input range and a proven division-free reduction
 
 
@@ -1302,6 +1407,79 @@ def cert_guidance_table():
     # informational: at k=2^17, N=16 guidance exceeds u (DESIGN wording)
     g = error_guidance(16, 2**17)["guidance"]
     return f"table OK; N=16 k=2^17 guidance {g:.2e} = {g / u:.2f}u"
+
+
+def _native_fma_dot(a, b):
+    """§3.7 native path in exact arithmetic: acc = +0; acc = RN(a_h b_h + acc) in order
+    (float(Fraction) is correctly rounded)."""
+    acc = 0.0
+    for x, y in zip(a, b):
+        acc = float(Fraction(x) * Fraction(y) + Fraction(acc))
+    return acc
+
+
+@check("§6f composed error bound (rigorous estimate of imd_err_estimate)")
+def cert_error_estimate():
+    """error_estimate's rigorous bound holds on emulated elements (emulate_element, both
+    roundings) and on the native FMA chain (DIRECT), for every metric, with the TRUE
+    statistics as the caller's: nu = ||a||_1/||a||_2 (an upper rational), rho =
+    ||a|| ||b|| / |x| and norm_product = ||a|| ||b|| (upper rationals). The check uses the
+    bound's LOWER enclosure, in exact rationals. Also: with nu = 0 (sqrt k) the unit bound is
+    error_guidance's term1 + term2; the enclosures are ordered and tight (<= 2^-80 relative)."""
+    rng = random.Random(61)
+    n = 0
+    for N in (3, 6, 8, 14, 20):
+        T = constants(N)["T"]
+        for rnd in (RN, TRUNC):
+            for k in (2, 5, 16, 33):
+                if rnd == RN and kappa(k) >= T:
+                    continue
+                eg = error_guidance(N, k, rnd)
+                e0 = error_estimate(N, k, rnd)["unit_bound"]
+                ref = Fraction(eg["term1"]) + Fraction(eg["term2"])
+                need(abs(e0[0] - ref) <= ref / 2**40 and e0[0] <= e0[1] <= e0[0] * (1 + Fraction(1, 2**80)),
+                     f"N={N} {rnd} k={k}: unit bound vs error_guidance / enclosure")
+                for _ in range(12):
+                    a = _rand_row(rng, k, -60, 60)
+                    b = _rand_row(rng, k, -60, 60)
+                    r = emulate_element(a, b, N, rnd, chunk=4)
+                    _check_composed(N, k, rnd, "EMULATE", a, b, r["D"])
+                    n += 1
+    for k in (1, 2, 7, 64):            # DIRECT: the native chain
+        for _ in range(40):
+            a, b = _rand_row(rng, k, -60, 60), _rand_row(rng, k, -60, 60)
+            _check_composed(8, k, RN, "DIRECT", a, b, _native_fma_dot(a, b))
+            n += 1
+    return f"{n} elements (EMULATE N in 3..20 both roundings, DIRECT), 3 metrics each"
+
+
+def _check_composed(N, k, rnd, dispatch, a, b, D):
+    exact = sum(Fraction(x) * Fraction(y) for x, y in zip(a, b))
+    err = abs(Fraction(D) - exact)
+    na2 = sum(Fraction(v)**2 for v in a)
+    nb2 = sum(Fraction(v)**2 for v in b)
+    if na2 == 0 or nb2 == 0:
+        need(err == 0, "zero row: exact zero")
+        return
+    na_lo = sqrt_enclosure(na2)[0]
+    nb_lo = sqrt_enclosure(nb2)[0]
+    nu_a = float(sum(abs(Fraction(v)) for v in a) / na_lo)   # >= the true ratio (rounded up below)
+    nu_b = float(sum(abs(Fraction(v)) for v in b) / nb_lo)
+    nu_a, nu_b = math.nextafter(nu_a, math.inf), math.nextafter(nu_b, math.inf)
+    nab_hi = sqrt_enclosure(na2 * nb2)[1]
+    npd = math.nextafter(float(nab_hi), math.inf)
+    for nus in ((0.0, 0.0), (max(nu_a, 1.0), max(nu_b, 1.0))):
+        kw = dict(l1_ratio_a=nus[0], l1_ratio_b=nus[1])
+        bn = error_estimate(N, k, rnd, dispatch, 1, ERR_NORMWISE, **kw)["bound"][0]
+        need(err * err <= bn * bn * na2 * nb2, f"N={N} {rnd} {dispatch} k={k}: NORMWISE")
+        ba = error_estimate(N, k, rnd, dispatch, 1, ERR_ABSOLUTE, norm_product=npd, **kw)["bound"][0]
+        need(err <= ba, f"N={N} {rnd} {dispatch} k={k}: ABSOLUTE")
+        if exact != 0:
+            rho = math.nextafter(float(nab_hi / abs(exact)), math.inf)
+            if math.isfinite(rho):
+                be = error_estimate(N, k, rnd, dispatch, 1, ERR_ELEMENTWISE, cond=max(rho, 1.0),
+                                    **kw)["bound"][0]
+                need(err <= be * abs(exact), f"N={N} {rnd} {dispatch} k={k}: ELEMENTWISE")
 
 
 @check("§2-§3.6 scaled TLA+ parameters")

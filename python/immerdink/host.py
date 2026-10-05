@@ -34,9 +34,11 @@ from dataclasses import dataclass
 __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "workspace_size",
            "workspace_layout", "plan_bytes", "lowering", "g_tradeoff", "PackSpec", "pack_layout",
            "pack_desc_for", "REGIONS", "STATUS", "PACK_MISMATCH", "Calibration", "predict",
-           "predict_pack", "rank", "param_names", "PERF_CLASSES", "PERF_PHASES"]
+           "predict_pack", "rank", "param_names", "PERF_CLASSES", "PERF_PHASES", "Accuracy",
+           "ErrEstimate", "err_estimate", "min_moduli", "ERR_METRICS", "ERR_BASES",
+           "ERR_STATUS", "INFEASIBLE"]
 
-API_VERSION = 7  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+API_VERSION = 8  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
 
 STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT_WORKSPACE",
           "MISALIGNED", "CUDA_ERROR", "ALLOC_FAILED", "PACK_MISMATCH"]
@@ -63,6 +65,11 @@ _PERF_KERNEL_CAPACITY, _PERF_KERNEL_COUNT, _PERF_CLASS_CAPACITY = 128, 90, 16
 PERF_REGIMES = {"DEFAULT": 0, "BURST": 1, "SUSTAINED": 2}
 PERF_CACHES = {"COLD": 0, "WARM": 1, "REPEAT": 2}
 PERF_ORDERS = {"TIME": 0, "TIES_BY_FOOTPRINT": 1}
+# v8 (DESIGN v1.12 §6f): accuracy-aware planning
+ERR_METRICS = {"NORMWISE": 0, "ELEMENTWISE": 1, "ABSOLUTE": 2}
+ERR_BASES = {"BOUND": 0, "TYPICAL": 1}
+ERR_STATUS = ["UNCHECKED", "MET", "MISSED"]
+INFEASIBLE = {"STATUS": 1, "BUDGET": 2, "ACCURACY": 4}  # imd_perf_candidate_t.infeasible bits
 # The parameters new in calibration format 2 (absent from a format-1 file).
 FORMAT2_PARAMS = frozenset({"k0.chain", "kl.wave", "pack.chain", "pack.wave", "k5.chain",
                             "k5.dram",
@@ -150,10 +157,26 @@ class _PerfCalib(C.Structure):
                 ("tie_ratio", C.c_double)]
 
 
+class _ErrRequest(C.Structure):  # v8 (DESIGN §6f)
+    _fields_ = [("struct_size", C.c_uint32), ("metric", C.c_int32), ("target", C.c_double),
+                ("cond", C.c_double), ("norm_product", C.c_double),
+                ("l1_ratio_a", C.c_double), ("l1_ratio_b", C.c_double),
+                ("basis", C.c_int32), ("reserved", C.c_int32), ("fail_prob", C.c_double)]
+
+
+class _Err(C.Structure):  # v8 (DESIGN §6f)
+    _fields_ = [("struct_size", C.c_uint32), ("status", C.c_int32), ("num_moduli", C.c_int32),
+                ("rounding", C.c_int32), ("dispatch", C.c_int32), ("err_status", C.c_int32),
+                ("k", C.c_int64), ("outputs", C.c_int64), ("bound", C.c_double),
+                ("typical", C.c_double), ("unit_bound", C.c_double),
+                ("unit_typical", C.c_double)]
+
+
 class _PerfRequest(C.Structure):
     _fields_ = [("struct_size", C.c_uint32), ("flags", C.c_int32), ("k4_config", C.c_int32),
                 ("reserved", C.c_int32), ("eps_fraction", C.c_double),
-                ("regime", C.c_int32), ("cache", C.c_int32), ("clock_mhz", C.c_double)]  # v7
+                ("regime", C.c_int32), ("cache", C.c_int32), ("clock_mhz", C.c_double),  # v7
+                ("accuracy", C.POINTER(_ErrRequest))]  # v8
 
 
 class _PerfPhase(C.Structure):
@@ -176,7 +199,10 @@ class _Perf(C.Structure):
                 ("power_w", C.c_double), ("warm_bytes", C.c_double),
                 ("time_lo_s", C.c_double), ("time_hi_s", C.c_double),
                 ("phase_lo_s", C.c_double * _PERF_MAX_PHASES),
-                ("phase_hi_s", C.c_double * _PERF_MAX_PHASES)]
+                ("phase_hi_s", C.c_double * _PERF_MAX_PHASES),
+                # v8
+                ("err_bound", C.c_double), ("err_typical", C.c_double),
+                ("err_status", C.c_int32), ("err_metric", C.c_int32)]
 
 
 class _RankRequest(C.Structure):
@@ -187,7 +213,8 @@ class _RankRequest(C.Structure):
                 ("flags", C.c_int32), ("budget_bytes", C.c_uint64),
                 ("eps_fraction", C.c_double),
                 ("regime", C.c_int32), ("cache", C.c_int32), ("order", C.c_int32),
-                ("reserved", C.c_int32), ("clock_mhz", C.c_double)]  # v7
+                ("reserved", C.c_int32), ("clock_mhz", C.c_double),  # v7
+                ("accuracy", C.POINTER(_ErrRequest))]  # v8
 
 
 class _Candidate(C.Structure):
@@ -201,15 +228,18 @@ class _Candidate(C.Structure):
                 ("total_bytes", C.c_uint64), ("kernel_launches", C.c_int64),
                 ("time_lo_s", C.c_double), ("time_hi_s", C.c_double),  # v7
                 ("clock_mhz", C.c_double), ("power_w", C.c_double),
-                ("tie", C.c_int32), ("raw_rank", C.c_int32)]
+                ("tie", C.c_int32), ("raw_rank", C.c_int32),
+                ("err_bound", C.c_double), ("err_typical", C.c_double),  # v8
+                ("err_status", C.c_int32), ("infeasible", C.c_int32)]
 
 
 assert C.sizeof(_Lowering) == 184  # version 5 (DESIGN §6b v1.7)
 assert C.sizeof(_Options) == 24
 assert C.sizeof(_PackDesc) == 72 and C.sizeof(_PackLayout) == 136
-assert C.sizeof(_PerfCalib) == 3672 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1952
-assert C.sizeof(_RankRequest) == 88 and C.sizeof(_Candidate) == 168
-assert C.sizeof(_PerfRequest) == 40
+assert C.sizeof(_PerfCalib) == 3672 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1976
+assert C.sizeof(_RankRequest) == 96 and C.sizeof(_Candidate) == 192
+assert C.sizeof(_PerfRequest) == 48
+assert C.sizeof(_ErrRequest) == 64 and C.sizeof(_Err) == 72
 
 
 # ------------------------------------------------------------------------------------------
@@ -287,6 +317,11 @@ class HostLibrary:
             "imd_perf_rank": (C.c_int, [T, T, T, O, C.POINTER(_RankRequest),
                                         C.POINTER(_PerfCalib), C.POINTER(_Candidate), C.c_int32,
                                         C.POINTER(C.c_int32)]),
+            # v8 (DESIGN §6f): accuracy-aware planning
+            "imd_err_estimate": (C.c_int, [C.c_int32, C.c_int32, C.c_int32, C.c_int64,
+                                           C.c_int64, C.POINTER(_ErrRequest), C.POINTER(_Err)]),
+            "imd_err_min_moduli": (C.c_int, [T, T, T, O, C.c_int32, C.c_int32,
+                                             C.POINTER(_ErrRequest), C.POINTER(_Err)]),
         }
         for name, (res, args) in sig.items():
             f = getattr(lib, name)
@@ -763,6 +798,109 @@ def param_names(lib=None):
     return out
 
 
+# ------------------------------------------------------------------------------------------
+# Accuracy-aware planning (DESIGN v1.12 §6f): marshalling only; the bounds are the C library's
+
+@dataclass(frozen=True)
+class Accuracy:
+    """imd_err_request_t: the error metric, the target and the caller's operand statistics.
+
+    Per output x_ij = sum_h a_ih b_hj of the GEMM view (a_i: A's fiber over the contracted
+    labels, b_j: B's), D the emulated product:
+      metric "NORMWISE" |D - x| / (||a_i||_2 ||b_j||_2) (needs nothing), "ELEMENTWISE"
+        |D - x| / |x| (needs cond = rho >= max ||a_i|| ||b_j|| / |x_ij|), "ABSOLUTE" |D - x|
+        (needs norm_product >= max ||a_i|| ||b_j||);
+      target > 0: rank / min_moduli keep the configurations whose estimate (basis "BOUND":
+        the rigorous bound, the default; "TYPICAL": the typical estimate, not a guarantee)
+        is <= target; 0: estimates reported only;
+      l1_ratio_a / l1_ratio_b: optional upper bounds (>= 1) on max ||a_i||_1 / ||a_i||_2
+        (tighter bounds for decaying or sparse rows; 0 = unknown);
+      fail_prob: the typical estimate's failure probability per call (0: 2^-20).
+    Immutable and hashable; the C struct is built once (planner.py passes it by pointer)."""
+    metric: str = "NORMWISE"
+    target: float = 0.0
+    cond: float = 0.0
+    norm_product: float = 0.0
+    l1_ratio_a: float = 0.0
+    l1_ratio_b: float = 0.0
+    basis: str = "BOUND"
+    fail_prob: float = 0.0
+
+    def __post_init__(self):
+        if self.metric not in ERR_METRICS:
+            raise ValueError(f"metric must be one of {sorted(ERR_METRICS)}, got {self.metric!r}")
+        if self.basis not in ERR_BASES:
+            raise ValueError(f"basis must be one of {sorted(ERR_BASES)}, got {self.basis!r}")
+        c = _ErrRequest(C.sizeof(_ErrRequest), ERR_METRICS[self.metric], float(self.target),
+                        float(self.cond), float(self.norm_product), float(self.l1_ratio_a),
+                        float(self.l1_ratio_b), ERR_BASES[self.basis], 0, float(self.fail_prob))
+        object.__setattr__(self, "_c", c)                 # not a dataclass field: no eq / hash
+        object.__setattr__(self, "_ptr", C.pointer(c))
+
+
+def _accuracy_ptr(accuracy):
+    if accuracy is None:
+        return None
+    if isinstance(accuracy, Accuracy):
+        return accuracy._ptr
+    raise TypeError("accuracy must be a host.Accuracy or None")
+
+
+@dataclass(frozen=True)
+class ErrEstimate:
+    """imd_err_t: the error estimates of one configuration (DESIGN §6f.2), in the request's
+    metric. bound: rigorous (inf: none); typical: probabilistic (RN EMULATE; else = bound);
+    unit_*: the coefficient of ||a_i|| ||b_j|| before the metric. min_moduli: num_moduli is
+    the answer (0 and status "NOT_SUPPORTED": no N in the range meets the target)."""
+    status: str
+    num_moduli: int
+    rounding: str
+    dispatch: str
+    err_status: str      # "UNCHECKED" (no target), "MET", "MISSED"
+    k: int
+    outputs: int
+    bound: float
+    typical: float
+    unit_bound: float
+    unit_typical: float
+
+
+_ROUNDING_NAME = {v: k for k, v in _ROUNDING.items()}
+
+
+def _err_estimate(r, st):
+    return ErrEstimate(STATUS[st], r.num_moduli, _ROUNDING_NAME.get(r.rounding, "RN"),
+                       DISPATCH[r.dispatch], ERR_STATUS[r.err_status], r.k, r.outputs, r.bound,
+                       r.typical, r.unit_bound, r.unit_typical)
+
+
+def err_estimate(N, k, *, rounding="RN", dispatch="EMULATE", outputs=1, accuracy=None,
+                 lib=None):
+    """imd_err_estimate: the error estimates of N moduli at contracted length k with `outputs`
+    outputs (the typical estimate's union bound), from scalars; a bad argument raises."""
+    h = load(lib) if not isinstance(lib, HostLibrary) else lib
+    r = _Err()
+    r.struct_size = C.sizeof(_Err)
+    st = h.lib.imd_err_estimate(int(N), _ROUNDING[rounding], DISPATCH.index(dispatch), int(k),
+                                int(outputs), _accuracy_ptr(accuracy), C.byref(r))
+    if st != 0:
+        raise ImmerdinkError(st, "imd_err_estimate")
+    return _err_estimate(r, st)
+
+
+def min_moduli(spec, extents=None, *, accuracy, strides=None, rounding="RN", mode="EMULATE",
+               n_lo=0, n_hi=0, lib=None):
+    """imd_err_min_moduli: the smallest N in [n_lo, n_hi] (0, 0: 2..20) whose estimate meets
+    accuracy.target for this contraction (status "SUCCESS"), else num_moduli 0 and status
+    "NOT_SUPPORTED"; a plan-time or argument status is returned in .status (with zeros)."""
+    h, call = _prep(spec, extents, strides, 20, 1, rounding, mode, "GENERATE", lib)
+    r = _Err()
+    r.struct_size = C.sizeof(_Err)
+    st = h.lib.imd_err_min_moduli(*call.args(), int(n_lo), int(n_hi), _accuracy_ptr(accuracy),
+                                  C.byref(r))
+    return _err_estimate(r, st)
+
+
 @dataclass(frozen=True)
 class PhasePrediction:
     """imd_perf_phase_t: one phase's predicted time, its features and its §4 bound."""
@@ -805,6 +943,10 @@ class Prediction:
     warm_bytes: float = 0.0
     time_lo_s: float = 0.0
     time_hi_s: float = 0.0
+    err_bound: float = 0.0        # v8 (DESIGN §6f): rigorous error bound and typical estimate
+    err_typical: float = 0.0      # in the request's metric (NORMWISE without accuracy=),
+    err_status: str = "UNCHECKED"  # "MET" / "MISSED" with a target; imd_perf_predict_pack: 0
+    err_metric: str = "NORMWISE"
 
     def phase(self, name):
         """The PhasePrediction with this name, or None."""
@@ -831,7 +973,11 @@ def _prediction(r, st):
                       r.kernel_launches, r.workspace_bytes, r.plan_device_bytes, r.pack_bytes,
                       r.pack_ws_bytes, phases, reg.get(r.regime, "BURST"),
                       cac.get(r.cache, "COLD"), r.clock_mhz, r.power_w, r.warm_bytes,
-                      r.time_lo_s, r.time_hi_s)
+                      r.time_lo_s, r.time_hi_s, r.err_bound, r.err_typical,
+                      ERR_STATUS[r.err_status], _ERR_METRIC_NAME[r.err_metric])
+
+
+_ERR_METRIC_NAME = {v: k for k, v in ERR_METRICS.items()}
 
 
 def _eps(eps_fraction):
@@ -840,20 +986,22 @@ def _eps(eps_fraction):
 
 def predict(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",
             vec_mode="GENERATE", packing=None, beta=False, alpha_zero=False, k4_config=None,
-            eps_fraction=None, regime="DEFAULT", cache="COLD", clock_mhz=0.0, calib=None,
-            lib=None):
+            eps_fraction=None, regime="DEFAULT", cache="COLD", clock_mhz=0.0, accuracy=None,
+            calib=None, lib=None):
     """imd_perf_predict: the predicted imd_contract (DESIGN §6c). A plan-time status is
     returned in .status (with zeros); a bad argument raises. packing = (PackSpec or None,
     PackSpec or None): the packed plan. beta: C is read (beta != 0); alpha_zero: the beta-only
     call; k4_config: force an IMD_K4_* configuration (None: the plan-time rule); eps_fraction:
     the fraction of pack work on the eps path (None: the typical-data default; see
     immerdink_host.h). v7: regime "DEFAULT" / "BURST" / "SUSTAINED", cache "COLD" / "WARM" /
-    "REPEAT", clock_mhz > 0: predict at that SM clock."""
+    "REPEAT", clock_mhz > 0: predict at that SM clock. v8: accuracy (an Accuracy): err_bound /
+    err_typical in its metric and err_status against its target (None: NORMWISE, no target)."""
     h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing)
     flags = (_PERF_BETA_NONZERO if beta else 0) | (_PERF_ALPHA_ZERO if alpha_zero else 0)
     req = _PerfRequest(C.sizeof(_PerfRequest), flags,
                        -1 if k4_config is None else int(k4_config), 0, _eps(eps_fraction),
-                       PERF_REGIMES[regime], PERF_CACHES[cache], float(clock_mhz))
+                       PERF_REGIMES[regime], PERF_CACHES[cache], float(clock_mhz),
+                       _accuracy_ptr(accuracy))
     r = _Perf()
     r.struct_size = C.sizeof(_Perf)
     pk = C.byref(call.packing) if packing is not None else None
@@ -903,18 +1051,24 @@ class Candidate:
     power_w: float = 0.0
     tie: bool = False
     raw_rank: int = 0
+    err_bound: float = 0.0   # v8 (DESIGN §6f): the error estimates in the request's metric
+    err_typical: float = 0.0  # (NORMWISE without accuracy=; inf when status != SUCCESS),
+    err_status: str = "UNCHECKED"  # against its target, and why it is infeasible
+    infeasible: int = 0      # INFEASIBLE bits: STATUS 1, BUDGET 2, ACCURACY 4
 
 
 def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",),
          packs=("NONE",), reuse=1, budget=0, beta=False, rounding="RN", mode="EMULATE",
          eps_fraction=None, order="TIME", regime="DEFAULT", cache="COLD", clock_mhz=0.0,
-         calib=None, lib=None):
+         accuracy=None, calib=None, lib=None):
     """imd_perf_rank: the candidates N x g x vec mode x packs ranked by predicted time inside a
     device-memory budget (bytes; 0 = none). N: an int or a list of admissible N; g: None
     (every g in 1..N) or a list; packs: any of "NONE", "A", "B", "AB". v7: order "TIME" (the
     default) or "TIES_BY_FOOTPRINT" (the candidates within the calibration's tie ratio of the
     best first, by footprint; Candidate.tie is set in either order), regime / cache / clock_mhz
-    as predict."""
+    as predict. v8: accuracy (an Accuracy with a target): the candidates whose estimate misses
+    the target are infeasible (infeasible bit ACCURACY), so the first candidate, if feasible,
+    is the cheapest configuration that meets the target."""
     Ns = [int(N)] if hasattr(N, "__index__") else [int(x) for x in N]
     gs = [] if g is None else ([int(g)] if isinstance(g, int) else [int(x) for x in g])
     h, call = _prep(spec, extents, strides, Ns[0], 0, rounding, mode, "GENERATE", lib)
@@ -927,7 +1081,7 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
                        sum(_PERF_PACK[p] for p in set(packs)), int(reuse),
                        _PERF_BETA_NONZERO if beta else 0, int(budget), _eps(eps_fraction),
                        PERF_REGIMES[regime], PERF_CACHES[cache], PERF_ORDERS[order], 0,
-                       float(clock_mhz))
+                       float(clock_mhz), _accuracy_ptr(accuracy))
     count = C.c_int32(0)
     st = h.lib.imd_perf_rank(*call.args(), C.byref(req), _calib_arg(calib), None, 0,
                              C.byref(count))
@@ -945,7 +1099,8 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
                       c.tflops_eq, c.eps_s, c.eps_fraction, c.workspace_bytes,
                       c.plan_device_bytes, c.pack_bytes,
                       c.pack_ws_bytes, c.total_bytes, c.kernel_launches, c.time_lo_s,
-                      c.time_hi_s, c.clock_mhz, c.power_w, bool(c.tie), c.raw_rank)
+                      c.time_hi_s, c.clock_mhz, c.power_w, bool(c.tie), c.raw_rank,
+                      c.err_bound, c.err_typical, ERR_STATUS[c.err_status], c.infeasible)
             for c in out[:count.value]]
 
 

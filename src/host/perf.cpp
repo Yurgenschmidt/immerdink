@@ -18,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include "accuracy.hpp"
 #include "analysis.hpp"
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink_host.h"
@@ -102,8 +103,13 @@ constexpr uint32_t kCalibV7Size = sizeof(imd_perf_calib_t);
 constexpr uint32_t kRequestV1Size = offsetof(imd_perf_request_t, regime);
 constexpr uint32_t kPerfV1Size = offsetof(imd_perf_t, regime);
 constexpr uint32_t kRankRequestV1Size = offsetof(imd_perf_rank_request_t, regime);
-constexpr uint32_t kRankRequestV7Size = sizeof(imd_perf_rank_request_t);
+constexpr uint32_t kRankRequestV7Size = offsetof(imd_perf_rank_request_t, accuracy);
+constexpr uint32_t kRankRequestV8Size = sizeof(imd_perf_rank_request_t);
+constexpr uint32_t kRequestV7Size = offsetof(imd_perf_request_t, accuracy);
+constexpr uint32_t kRequestV8Size = sizeof(imd_perf_request_t);
 constexpr uint32_t kCandidateV1Size = offsetof(imd_perf_candidate_t, time_lo_s);
+constexpr uint32_t kCandidateV7Size = offsetof(imd_perf_candidate_t, err_bound);
+constexpr uint32_t kPerfV7Size = offsetof(imd_perf_t, err_bound);
 static_assert(sizeof(imd_perf_phase_t) == 96, "imd_perf_phase_t v1 layout changed");
 static_assert(kCalibV1Size == 1232, "imd_perf_calib_t v1 layout changed");
 static_assert(kPerfV1Size == 1648, "imd_perf_t v1 layout changed");
@@ -111,10 +117,15 @@ static_assert(kCandidateV1Size == 128, "imd_perf_candidate_t v1 layout changed")
 static_assert(kRankRequestV1Size == 64, "imd_perf_rank_request_t v1 layout changed");
 static_assert(kRequestV1Size == 24, "imd_perf_request_t v1 layout changed");
 static_assert(sizeof(imd_perf_calib_t) == 1232 + 16 * 128 + 8 * 10 + 8 * 6 + 8 * 32 + 8, "v7 calib");
-static_assert(sizeof(imd_perf_request_t) == 40, "v7 request");
-static_assert(sizeof(imd_perf_t) == 1648 + 8 + 8 * 5 + 16 * 16, "v7 prediction");
-static_assert(sizeof(imd_perf_rank_request_t) == 88, "v7 rank request");
-static_assert(sizeof(imd_perf_candidate_t) == 168, "v7 candidate");
+static_assert(kRequestV7Size == 40, "v7 request");
+static_assert(kPerfV7Size == 1648 + 8 + 8 * 5 + 16 * 16, "v7 prediction");
+static_assert(kRankRequestV7Size == 88, "v7 rank request");
+static_assert(kCandidateV7Size == 168, "v7 candidate");
+// v8 (DESIGN §6f): appended accuracy pointer / error fields only.
+static_assert(kRequestV8Size == 48 && kRankRequestV8Size == 96, "v8 requests");
+static_assert(sizeof(imd_perf_t) == kPerfV7Size + 24, "v8 prediction");
+static_assert(sizeof(imd_perf_candidate_t) == 192, "v8 candidate");
+static_assert(sizeof(imd_err_request_t) == 64 && sizeof(imd_err_t) == 72, "v8 error structs");
 
 template <class F>
 imd_status_t guarded(F&& f) {
@@ -938,6 +949,7 @@ imd_status_t resolve_calib(const imd_perf_calib_t* in, imd_perf_calib_t* scratch
 struct Req {
   int32_t flags = 0, k4 = -1, regime = IMD_PERF_REGIME_DEFAULT, cache = IMD_PERF_CACHE_COLD;
   double eps = -1, clock = 0;
+  ErrReq err;  // v8 (§6f): the accuracy request (default: NORMWISE, no target)
 };
 
 // The time of every phase at clock scale s = f_eff / f (no cache term), and its sum. The power
@@ -1076,6 +1088,11 @@ imd_status_t predict_contract(const imd_tensor_t* A, const imd_tensor_t* B, cons
   r->flops_eq = 2.0 * static_cast<double>(e.b) * static_cast<double>(e.m) *
                 static_cast<double>(e.n) * static_cast<double>(e.k);
   fill_prediction(cal, P, q, r);
+  // v8 (§6f): the error estimates of this configuration (the same function as
+  // imd_err_estimate); written only into a v8-sized imd_perf_t (finish copies struct_size).
+  const ErrOut eo = err_compute(e.N, options->rounding, r->dispatch, e.k, e.b * e.m * e.n, q.err);
+  r->err_bound = eo.bound, r->err_typical = eo.typical;
+  r->err_status = eo.err_status, r->err_metric = q.err.metric;
   return IMD_STATUS_SUCCESS;
 }
 
@@ -1108,10 +1125,12 @@ bool request_valid(const imd_perf_request_t* req, Req* q) {
   if (req->k4_config < -1 || req->k4_config >= IMD_K4_CONFIG_COUNT) return false;
   if (!eps_valid(req->eps_fraction)) return false;
   q->flags = req->flags, q->k4 = req->k4_config, q->eps = req->eps_fraction;
-  if (req->struct_size >= sizeof(imd_perf_request_t)) {
+  if (req->struct_size >= kRequestV7Size) {
     if (!v7_valid(req->regime, req->cache, req->clock_mhz)) return false;
     q->regime = req->regime, q->cache = req->cache, q->clock = req->clock_mhz;
   }
+  if (req->struct_size >= kRequestV8Size && !err_request_valid(req->accuracy, &q->err))
+    return false;
   return true;
 }
 
@@ -1293,6 +1312,9 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
     q.regime = req->regime, q.cache = req->cache, q.clock = req->clock_mhz;
     order = req->order;
   }
+  // v8 (§6f): the accuracy request; a target > 0 adds IMD_PERF_INFEASIBLE_ACCURACY.
+  if (req->struct_size >= kRankRequestV8Size && !err_request_valid(req->accuracy, &q.err))
+    return IMD_STATUS_INVALID_VALUE;
   for (int32_t i = 0; i < req->num_moduli_count; ++i)
     if (req->num_moduli[i] < 2 || req->num_moduli[i] > c::kNMax) return IMD_STATUS_INVALID_VALUE;
   for (int32_t i = 0; i < req->residue_group_count; ++i)
@@ -1383,12 +1405,21 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
               const bool fits = add_u64(c.workspace_bytes, c.plan_device_bytes, &total) &&
                                 add_u64(total, pack_bytes, &total) && add_u64(total, pack_ws, &total);
               c.total_bytes = fits ? total : UINT64_MAX;
-              c.feasible = req->budget_bytes == 0 || c.total_bytes <= req->budget_bytes;
+              if (!(req->budget_bytes == 0 || c.total_bytes <= req->budget_bytes))
+                c.infeasible |= IMD_PERF_INFEASIBLE_BUDGET;
               c.kernel_launches = pr.kernel_launches;
               c.time_lo_s = pr.time_lo_s + pack_lo / req->reuse;
               c.time_hi_s = pr.time_hi_s + pack_hi / req->reuse;
               c.clock_mhz = pr.clock_mhz, c.power_w = pr.power_w;
+              // v8 (§6f): the contract's estimates (predict_contract, the request's accuracy)
+              c.err_bound = pr.err_bound, c.err_typical = pr.err_typical;
+              c.err_status = pr.err_status;
+              if (pr.err_status == IMD_ERR_MISSED) c.infeasible |= IMD_PERF_INFEASIBLE_ACCURACY;
+            } else {
+              c.infeasible = IMD_PERF_INFEASIBLE_STATUS;
+              c.err_bound = c.err_typical = std::numeric_limits<double>::infinity();  // no plan
             }
+            c.feasible = c.infeasible == 0 ? 1 : 0;
             cands.push_back(cd);
           }
         }

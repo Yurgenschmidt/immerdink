@@ -37,6 +37,11 @@ if(Python3_FOUND)
   add_test(NAME host_planner
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_planner.py"
                    --host-lib "$<TARGET_FILE:immerdink_host>" -v)
+  # DESIGN v1.12 §6f: accuracy-aware planning (imd_err_*, predict / rank err fields) vs
+  # spec/params.py error_estimate (exact rational enclosure). CPU only.
+  add_test(NAME host_accuracy
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_accuracy.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" -v)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files

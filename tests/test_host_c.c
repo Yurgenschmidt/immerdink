@@ -8,6 +8,8 @@
 
 #include "immerdink/immerdink_host.h"
 
+static double dabs(double x) { return x < 0 ? -x : x; }
+
 #ifdef CUDART_VERSION
 #  error "immerdink_host.h must not pull in a CUDA header"
 #endif
@@ -292,10 +294,15 @@ int main(void) {
   /* ---- v1.8 (DESIGN §6c): the performance model ---------------------------------------- */
   {
     CHECK(IMD_HOST_API_VERSION >= 7);
-    /* v7 sizes (v6: 1232, 96, 1648, 128, 64, 24; the v6 prefixes are unchanged) */
+    /* v8 sizes (v7: 3672, 1952, 168, 88, 40; v6: 1232, 96, 1648, 128, 64, 24; the older
+     * prefixes are unchanged) */
     CHECK(sizeof(imd_perf_calib_t) == 3672 && sizeof(imd_perf_phase_t) == 96 &&
-          sizeof(imd_perf_t) == 1952 && sizeof(imd_perf_candidate_t) == 168 &&
-          sizeof(imd_perf_rank_request_t) == 88 && sizeof(imd_perf_request_t) == 40);
+          sizeof(imd_perf_t) == 1976 && sizeof(imd_perf_candidate_t) == 192 &&
+          sizeof(imd_perf_rank_request_t) == 96 && sizeof(imd_perf_request_t) == 48);
+    CHECK(offsetof(imd_perf_t, err_bound) == 1952 && offsetof(imd_perf_candidate_t, err_bound) == 168 &&
+          offsetof(imd_perf_rank_request_t, accuracy) == 88 &&
+          offsetof(imd_perf_request_t, accuracy) == 40);
+    CHECK(sizeof(imd_err_request_t) == 64 && sizeof(imd_err_t) == 72);
     CHECK(offsetof(imd_perf_calib_t, kernel) == 1232 && offsetof(imd_perf_t, regime) == 1648 &&
           offsetof(imd_perf_candidate_t, time_lo_s) == 128 &&
           offsetof(imd_perf_rank_request_t, regime) == 64 &&
@@ -397,7 +404,7 @@ int main(void) {
       CHECK(pr.flops_eq == 2.0 * 17 * 33 * 5 * 3);
     }
     {
-      imd_perf_request_t rq = {sizeof rq, IMD_PERF_ALPHA_ZERO, -1, 0, -1.0, 0, 0, 0.0};
+      imd_perf_request_t rq = {sizeof rq, IMD_PERF_ALPHA_ZERO, -1, 0, -1.0, 0, 0, 0.0, NULL};
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_SUCCESS);
       CHECK(pr.num_phases == 3 && pr.phase[0].phase == IMD_PERF_PHASE_K0 &&
             pr.phase[1].phase == IMD_PERF_PHASE_BETA && pr.kernel_launches == 2);
@@ -438,13 +445,13 @@ int main(void) {
               memcmp(&c6, &c6b, 1232) == 0);
         memset(&p6, 0, sizeof p6);
         p6.struct_size = 1648;
-        imd_perf_request_t r6 = {24, 0, -1, 0, -1.0, 99, 99, -5.0};  /* v7 fields ignored */
+        imd_perf_request_t r6 = {24, 0, -1, 0, -1.0, 99, 99, -5.0, NULL};  /* v7 fields ignored */
         CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r6, &c6, &p6) == IMD_STATUS_SUCCESS &&
               p6.time_s > 0 && p6.regime == 0 && p6.time_lo_s == 0);
         memset(&p7, 0, sizeof p7);
         p7.struct_size = sizeof p7;
         imd_perf_request_t r7 = {sizeof r7, 0, -1, 0, -1.0, IMD_PERF_REGIME_BURST,
-                                 IMD_PERF_CACHE_COLD, 0.0};
+                                 IMD_PERF_CACHE_COLD, 0.0, NULL};
         CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r7, &c6, &p7) == IMD_STATUS_SUCCESS &&
               p7.time_s == p6.time_s && p7.time_lo_s == p7.time_s);
         r7.regime = 7;
@@ -532,6 +539,66 @@ int main(void) {
     CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, cand, 64, &nc) == IMD_STATUS_INVALID_VALUE);
     rr.reuse = 1, rr.num_moduli_count = 0;
     CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, cand, 64, &nc) == IMD_STATUS_INVALID_VALUE);
+
+    /* ---- v8 (DESIGN §6f): accuracy-aware planning ---------------------------------------- */
+    {
+      imd_err_t er;
+      memset(&er, 0, sizeof er);
+      er.struct_size = sizeof er;
+      /* N = 14, RN, k = 10^4, M = 10^6, NORMWISE (spec/params.py error_estimate) */
+      CHECK(imd_err_estimate(14, IMD_RN, IMD_DISPATCH_EMULATE, 10000, 1000000, NULL, &er) ==
+            IMD_STATUS_SUCCESS && er.status == 0 && er.err_status == IMD_ERR_UNCHECKED);
+      CHECK(dabs(er.bound / 7.535111076066045e-15 - 1) < 1e-11 &&
+            dabs(er.typical / 6.702646867434198e-16 - 1) < 1e-11 && er.typical <= er.bound);
+      imd_err_request_t ar;
+      memset(&ar, 0, sizeof ar);
+      ar.struct_size = sizeof ar, ar.metric = IMD_ERR_ELEMENTWISE;  /* no cond: invalid */
+      CHECK(imd_err_estimate(14, IMD_RN, IMD_DISPATCH_EMULATE, 100, 1, &ar, &er) == IMD_STATUS_INVALID_VALUE);
+      ar.cond = 1e6, ar.target = 1e-9;
+      CHECK(imd_err_estimate(14, IMD_RN, IMD_DISPATCH_EMULATE, 100, 1, &ar, &er) == IMD_STATUS_SUCCESS);
+      CHECK(imd_err_estimate(1, IMD_RN, IMD_DISPATCH_EMULATE, 100, 1, &ar, &er) == IMD_STATUS_INVALID_VALUE);
+      CHECK(imd_err_estimate(14, 7, IMD_DISPATCH_EMULATE, 100, 1, &ar, &er) == IMD_STATUS_INVALID_VALUE);
+      /* DIRECT: gamma_k; NOOP: 0 */
+      CHECK(imd_err_estimate(9, IMD_RN, IMD_DISPATCH_DIRECT, 4, 1, NULL, &er) == 0 &&
+            er.bound >= 4 * 0x1p-53 && er.bound < 4.01 * 0x1p-53 && er.typical == er.bound);
+      CHECK(imd_err_estimate(9, IMD_RN, IMD_DISPATCH_NOOP, 4, 0, NULL, &er) == 0 && er.bound == 0);
+      /* min_moduli on this contraction == a scan of imd_err_estimate */
+      imd_lowering_t lw8;
+      memset(&lw8, 0, sizeof lw8);
+      lw8.struct_size = sizeof lw8;
+      CHECK(imd_lowering(&A, &B, &C, &opt, &lw8) == IMD_STATUS_SUCCESS);
+      memset(&ar, 0, sizeof ar);
+      ar.struct_size = sizeof ar, ar.target = 1e-12;
+      int32_t want = 0;
+      for (int32_t n = 2; n <= 20 && want == 0; ++n) {
+        CHECK(imd_err_estimate(n, IMD_RN, lw8.dispatch, lw8.k, lw8.b * lw8.m * lw8.n, &ar, &er) == 0);
+        if (er.bound <= 1e-12) want = n;
+      }
+      CHECK(want > 2 && imd_err_min_moduli(&A, &B, &C, &opt, 0, 0, &ar, &er) == IMD_STATUS_SUCCESS &&
+            er.num_moduli == want && er.bound <= 1e-12 && er.err_status == IMD_ERR_MET);
+      CHECK(imd_err_min_moduli(&A, &B, &C, &opt, 2, want - 1, &ar, &er) == IMD_STATUS_NOT_SUPPORTED &&
+            er.num_moduli == 0 && er.bound > 1e-12);
+      ar.target = 0;  /* min_moduli needs a target */
+      CHECK(imd_err_min_moduli(&A, &B, &C, &opt, 0, 0, &ar, &er) == IMD_STATUS_INVALID_VALUE);
+      /* predict: the v8 fields; rank: candidates missing the target are infeasible */
+      ar.target = 1e-12;
+      imd_perf_request_t rq8 = {sizeof rq8, 0, -1, 0, -1.0, 0, 0, 0.0, &ar};
+      CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq8, NULL, &pr) == IMD_STATUS_SUCCESS &&
+            pr.err_status == (opt.num_moduli >= want ? IMD_ERR_MET : IMD_ERR_MISSED));
+      const int32_t Ns8[3] = {want - 1, want, want + 1};
+      const int32_t gs8[1] = {1};
+      rr.num_moduli_count = 3, rr.num_moduli = Ns8, rr.budget_bytes = 0, rr.accuracy = &ar;
+      rr.residue_group_count = 1, rr.residue_groups = gs8; /* 3 N x 2 vec x 2 packs = 12 */
+      CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, cand, 64, &nc) == IMD_STATUS_SUCCESS);
+      CHECK(cand[0].feasible && cand[0].num_moduli >= want);
+      for (int i = 0; i < nc; ++i)
+        CHECK(cand[i].feasible == (cand[i].num_moduli >= want) &&
+              (cand[i].infeasible == 0) == (cand[i].num_moduli >= want) &&
+              (cand[i].num_moduli >= want || cand[i].infeasible == IMD_PERF_INFEASIBLE_ACCURACY));
+      rr.struct_size = 88; /* a v7-sized request: no accuracy, all feasible */
+      CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, cand, 64, &nc) == IMD_STATUS_SUCCESS);
+      for (int i = 0; i < nc; ++i) CHECK(cand[i].feasible == 1);
+    }
   }
   printf("host C API: %d failures\n", failures);
   return failures == 0 ? 0 : 1;
