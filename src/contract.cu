@@ -37,7 +37,6 @@ using imd::device::c_tables;
 using namespace imd::kernels;
 
 constexpr int kThreads = kLaunchThreads;            // host/analysis.hpp (shared launch rules)
-constexpr int64_t kMaxBlocks = kLaunchMaxBlocks;    // grid-stride loops beyond this
 
 // v1.10: host/analysis.hpp launch_blocks is the one rule (the performance model uses it too).
 unsigned blocks_for(int64_t work, int per_block = kThreads) {

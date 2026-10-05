@@ -477,7 +477,7 @@ def check_pack_layout(p, what):
     want_regs = {n: (o, nb) for n, o, nb in regs} or {n: (0, 0) for n in ("sig", "flag", "res")}
     if lay.regions != want_regs or lay.pack_bytes != total or \
             lay.pack_ws_bytes != params.pack_ws_bytes(lay.b, lay.r, lay.k) or \
-            lay.k_hat != params.align_up(lay.k, 16) or lay.file_format != 1:
+            lay.k_hat != params.align_up(lay.k, 16) or lay.format != 1:
         raise Fail(f"{what}: pack layout {lay} vs params {regs} {total}")
     if want_st == "SUCCESS":
         if (lay.b, lay.r, lay.k, lay.kappa) != (pv.b, pv.r, pv.k, pv.kappa) or \
