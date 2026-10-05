@@ -287,6 +287,194 @@ int main(void) {
     }
     CHECK(strcmp(imd_status_string(IMD_STATUS_PACK_MISMATCH), "IMD_STATUS_PACK_MISMATCH") == 0);
   }
+
+  /* ---- v1.8 (DESIGN §6c): the performance model ---------------------------------------- */
+  {
+    CHECK(IMD_HOST_API_VERSION >= 6);
+    CHECK(sizeof(imd_perf_calib_t) == 1232 && sizeof(imd_perf_phase_t) == 96 &&
+          sizeof(imd_perf_t) == 1632 && sizeof(imd_perf_candidate_t) == 112 &&
+          sizeof(imd_perf_rank_request_t) == 56 && sizeof(imd_perf_request_t) == 16);
+    static imd_perf_calib_t cal, back;
+    memset(&cal, 0, sizeof cal);
+    cal.struct_size = sizeof cal;
+    CHECK(imd_perf_calib_default(&cal) == IMD_STATUS_SUCCESS);
+    CHECK(cal.format == IMD_PERF_CALIB_FORMAT && cal.sm_count == 128 && cal.gpu[0] != '\0');
+    CHECK(cal.peak_dram_bytes_per_s > 0 && cal.peak_int8_ops_per_s > 0);
+    /* format -> parse: bit-exact */
+    static char text[16384];
+    size_t len = 0;
+    CHECK(imd_perf_calib_format(&cal, text, sizeof text, &len) == IMD_STATUS_SUCCESS);
+    CHECK(len > 0 && len < sizeof text && strlen(text) == len);
+    {
+      size_t need = 0;
+      char small[8];
+      CHECK(imd_perf_calib_format(&cal, small, sizeof small, &need) ==
+                IMD_STATUS_INSUFFICIENT_WORKSPACE && need == len);
+    }
+    memset(&back, 0x5a, sizeof back);
+    back.struct_size = sizeof back;
+    int32_t line = -1;
+    CHECK(imd_perf_calib_parse(text, len, &back, &line) == IMD_STATUS_SUCCESS && line == 0);
+    CHECK(memcmp(back.param, cal.param, sizeof cal.param) == 0);
+    CHECK(strcmp(back.gpu, cal.gpu) == 0 && strcmp(back.clocks, cal.clocks) == 0);
+    CHECK(back.sm_count == cal.sm_count &&
+          memcmp(&back.peak_dram_bytes_per_s, &cal.peak_dram_bytes_per_s, 4 * sizeof(double)) == 0);
+    /* parse errors, with their lines */
+    {
+      static char bad[16600];
+      int n;
+      n = snprintf(bad, sizeof bad, "%sbogus.key = 1\n", text); /* unknown key: last line */
+      int32_t lines = 0;
+      for (size_t i = 0; i < len; ++i) lines += text[i] == '\n';
+      CHECK(imd_perf_calib_parse(bad, (size_t)n, &back, &line) == IMD_STATUS_INVALID_VALUE &&
+            line == lines + 1);
+      n = snprintf(bad, sizeof bad, "%sk5.byte = 1\n", text); /* repeated key */
+      CHECK(imd_perf_calib_parse(bad, (size_t)n, &back, &line) == IMD_STATUS_INVALID_VALUE &&
+            line == lines + 1);
+      n = snprintf(bad, sizeof bad, "%s", text);
+      char* p = strstr(bad, "k5.byte = ");
+      CHECK(p != NULL);
+      if (p) { p[0] = '#'; } /* a missing parameter: line 0 */
+      CHECK(imd_perf_calib_parse(bad, (size_t)n, &back, &line) == IMD_STATUS_INVALID_VALUE &&
+            line == 0);
+      n = snprintf(bad, sizeof bad, "%s", text);
+      p = strstr(bad, "format = 1");
+      if (p) p[9] = '2'; /* another format */
+      CHECK(imd_perf_calib_parse(bad, (size_t)n, &back, &line) == IMD_STATUS_INVALID_VALUE &&
+            line > 0);
+      const char* bad_values[] = {"kl.byte = -1\n", "kl.byte = 1x\n", "kl.byte = nan\n",
+                                  "kl.byte\n"};
+      for (int i = 0; i < 4; ++i) {
+        n = snprintf(bad, sizeof bad, "%s%s", bad_values[i], text);
+        CHECK(imd_perf_calib_parse(bad, (size_t)n, &back, &line) == IMD_STATUS_INVALID_VALUE &&
+              line == 1);
+      }
+      /* the call term is a signed correction; '#' after a number is a comment */
+      n = snprintf(bad, sizeof bad, "%s", text);
+      p = strstr(bad, "call.launch = ");
+      if (p) { p[0] = '#'; }
+      n = snprintf(bad + n, sizeof bad - (size_t)n, "call.launch = -2.5  # ns\n") + n;
+      CHECK(imd_perf_calib_parse(bad, (size_t)n, &back, &line) == IMD_STATUS_SUCCESS &&
+            back.param[IMD_PERF_CLASS_CALL * IMD_PERF_MAX_PARAMS + 1] == -2.5);
+      CHECK(imd_perf_calib_load("/nonexistent/x.calib", &back, &line) == IMD_STATUS_INVALID_VALUE &&
+            line == 0);
+    }
+    CHECK(strcmp(imd_perf_class_name(IMD_PERF_CLASS_KL), "kl") == 0);
+    CHECK(strcmp(imd_perf_param_name(IMD_PERF_CLASS_K4_64x64, 3), "mac3") == 0);
+    CHECK(strcmp(imd_perf_param_name(IMD_PERF_CLASS_K4_64x64, 4), "byte") == 0);
+    CHECK(imd_perf_param_name(IMD_PERF_CLASS_K4_128x256, 2) == NULL);
+    CHECK(strcmp(imd_perf_phase_name(IMD_PERF_PHASE_PACK_B), "K3 pack B") == 0);
+    CHECK(imd_perf_phase_name(IMD_PERF_PHASE_COUNT) == NULL && imd_perf_class_name(-1) == NULL);
+
+    /* predict: KF, the later groups' packs, K4, K5, the call term */
+    static imd_perf_t pr;
+    memset(&pr, 0, sizeof pr);
+    pr.struct_size = sizeof pr;
+    imd_lowering_t lw2;
+    memset(&lw2, 0, sizeof lw2);
+    lw2.struct_size = sizeof lw2;
+    CHECK(imd_lowering(&A, &B, &C, &opt, &lw2) == IMD_STATUS_SUCCESS);
+    CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, NULL, NULL, &pr) == IMD_STATUS_SUCCESS);
+    CHECK(pr.status == IMD_STATUS_SUCCESS && pr.dispatch == IMD_DISPATCH_EMULATE);
+    CHECK(pr.num_phases == 6 && pr.phase[0].phase == IMD_PERF_PHASE_KF &&
+          pr.phase[1].phase == IMD_PERF_PHASE_PACK_A && pr.phase[2].phase == IMD_PERF_PHASE_PACK_B &&
+          pr.phase[3].phase == IMD_PERF_PHASE_K4 && pr.phase[4].phase == IMD_PERF_PHASE_K5 &&
+          pr.phase[5].phase == IMD_PERF_PHASE_CALL);
+    CHECK(pr.phase[1].launches == 4 && pr.phase[2].launches == 8); /* B: + zero rows (48 > 33) */
+    CHECK(pr.kernel_launches == lw2.kernel_launches && pr.k4_config == lw2.k4_config);
+    CHECK(pr.workspace_bytes == 30720 && pr.plan_device_bytes == 0 && pr.sm_count == 128);
+    {
+      double sum = 0;
+      for (int i = 0; i < pr.num_phases; ++i) sum += pr.phase[i].time_s;
+      CHECK(pr.time_s > 0 && sum == pr.time_s);
+      CHECK(pr.flops_eq == 2.0 * 17 * 33 * 5 * 3);
+    }
+    {
+      imd_perf_request_t rq = {sizeof rq, IMD_PERF_ALPHA_ZERO, -1, 0};
+      CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_SUCCESS);
+      CHECK(pr.num_phases == 3 && pr.phase[0].phase == IMD_PERF_PHASE_K0 &&
+            pr.phase[1].phase == IMD_PERF_PHASE_BETA && pr.kernel_launches == 2);
+      rq.flags = 4;
+      CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
+      rq.flags = 0, rq.k4_config = IMD_K4_CONFIG_COUNT;
+      CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
+      back = cal;
+      back.format = 2;
+      CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, NULL, &back, &pr) == IMD_STATUS_INVALID_VALUE);
+      pr.struct_size = 100;
+      CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, NULL, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
+      pr.struct_size = sizeof pr;
+    }
+
+    /* predict_pack: imd_pack of A (prep, KL with every plane, the call term) */
+    imd_pack_desc_t pa2;
+    int32_t labs[3];
+    memset(&pa2, 0, sizeof pa2);
+    pa2.struct_size = sizeof pa2;
+    CHECK(imd_pack_desc_for(&A, &B, &C, &opt, 0, &pa2, labs, 3) == IMD_STATUS_SUCCESS);
+    imd_pack_layout_t pl;
+    memset(&pl, 0, sizeof pl);
+    pl.struct_size = sizeof pl;
+    CHECK(imd_pack_layout(&pa2, &pl) == IMD_STATUS_SUCCESS);
+    CHECK(imd_perf_predict_pack(&pa2, NULL, &pr) == IMD_STATUS_SUCCESS);
+    CHECK(pr.num_phases == 3 && pr.phase[0].phase == IMD_PERF_PHASE_PACK_PREP &&
+          pr.phase[1].phase == IMD_PERF_PHASE_PACK_KL && pr.pack_bytes == pl.pack_bytes &&
+          pr.pack_ws_bytes == pl.pack_ws_bytes && pr.time_s > 0);
+
+    /* rank: N = 9, every g, both vec modes, A packed or not: 36 candidates, all SUCCESS */
+    const int32_t Ns[1] = {9};
+    imd_perf_rank_request_t rr;
+    memset(&rr, 0, sizeof rr);
+    rr.struct_size = sizeof rr, rr.candidate_size = sizeof(imd_perf_candidate_t);
+    rr.num_moduli_count = 1, rr.num_moduli = Ns;
+    rr.vec_modes = IMD_PERF_VEC_GENERATE | IMD_PERF_VEC_RESIDENT;
+    rr.pack_modes = IMD_PERF_PACK_NONE | IMD_PERF_PACK_A;
+    rr.reuse = 4;
+    static imd_perf_candidate_t cand[64];
+    int32_t nc = 0;
+    CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, NULL, 0, &nc) == IMD_STATUS_SUCCESS && nc == 36);
+    CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, cand, 64, &nc) == IMD_STATUS_SUCCESS && nc == 36);
+    for (int i = 0; i < nc; ++i) {
+      const imd_perf_candidate_t* c = &cand[i];
+      CHECK(c->status == IMD_STATUS_SUCCESS && c->feasible == 1);
+      if (i > 0) CHECK(cand[i - 1].time_s <= c->time_s);
+      const imd_options_t o = {c->num_moduli, c->residue_group, IMD_RN, IMD_EMULATE, c->vec_mode,
+                               IMD_K4_TUNE_OFF};
+      size_t ws = 0, dev = 0;
+      if (c->packed == 0) {
+        CHECK(imd_workspace_size(&A, &B, &C, &o, &ws) == 0 && ws == c->workspace_bytes);
+        CHECK(c->pack_bytes == 0 && c->pack_s == 0 && c->time_s == c->contract_s);
+      } else {
+        const imd_packing_t pk = {&pa2, NULL};
+        CHECK(imd_workspace_size_packed(&A, &B, &C, &o, &pk, &ws) == 0 && ws == c->workspace_bytes);
+        CHECK(c->pack_bytes == pl.pack_bytes && c->pack_ws_bytes == pl.pack_ws_bytes);
+        CHECK(c->time_s == c->contract_s + c->pack_s / 4);
+      }
+      CHECK(imd_plan_bytes(&A, &B, &C, &o, &dev, NULL) == 0 && dev == c->plan_device_bytes);
+      CHECK(c->total_bytes == c->workspace_bytes + c->plan_device_bytes + c->pack_bytes +
+                                  c->pack_ws_bytes);
+    }
+    /* a budget: the feasible ones first, every one within it */
+    rr.budget_bytes = 28000; /* g = 1 unpacked fits (27648 B; resident 26624 + 952) */
+    CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, cand, 64, &nc) == IMD_STATUS_SUCCESS);
+    {
+      int seen_infeasible = 0, feasible = 0;
+      for (int i = 0; i < nc; ++i) {
+        if (cand[i].feasible) {
+          CHECK(!seen_infeasible && cand[i].total_bytes <= 28000);
+          ++feasible;
+        } else {
+          seen_infeasible = 1;
+          CHECK(cand[i].total_bytes > 28000);
+        }
+      }
+      CHECK(feasible > 0 && feasible < nc);
+    }
+    rr.reuse = 0;
+    CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, cand, 64, &nc) == IMD_STATUS_INVALID_VALUE);
+    rr.reuse = 1, rr.num_moduli_count = 0;
+    CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, cand, 64, &nc) == IMD_STATUS_INVALID_VALUE);
+  }
   printf("host C API: %d failures\n", failures);
   return failures == 0 ? 0 : 1;
 }

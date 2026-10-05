@@ -1,0 +1,43 @@
+# B2 performance-model calibration sweep (DESIGN §6c; tools/calibrate.sh). The FIT set: per-phase
+# times (--phase-reps, the IMMERDINK_PROFILE build) of shapes chosen to cover every kernel class of
+# the model, every K4 configuration (forced with --k4), several N, residue groups g < N, the
+# resident vector mode, packed operands (imd_pack) and the DIRECT kernel. Its shapes are disjoint
+# from the hold-out set (bench/sweep_perf_validate.txt). About 10 min of GPU time on an RTX 4090.
+# name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
+# --- fused small path KF (k_hat <= 1024)
+c_s64     | ik,jk->ij | i=64,j=64,k=64             | imd | 8,14,20 | --reps 300 --phase-reps 30 --max-seconds 1 --k4 rule,3
+c_s128    | ik,jk->ij | i=128,j=128,k=128          | imd | 8,14,20 | --reps 300 --phase-reps 30 --max-seconds 1 --g 0,2 --k4 rule,1,2,3
+c_s192    | ik,jk->ij | i=192,j=192,k=192          | imd | 4,8,11,14,17,20 | --reps 300 --phase-reps 30 --max-seconds 1
+c_s384    | ik,jk->ij | i=384,j=384,k=384          | imd | 8,14,20 | --reps 300 --phase-reps 20 --max-seconds 1 --k4 rule,0,1,2,3
+c_s768    | ik,jk->ij | i=768,j=768,k=768          | imd | 8,14,20 | --reps 200 --phase-reps 20 --max-seconds 1 --g 0,3 --vec generate,resident
+c_s1000   | ik,jk->ij | i=1000,j=1000,k=1000       | imd | 8,14,20 | --reps 100 --phase-reps 10 --max-seconds 1 --g 0,4
+c_rkf1    | ik,jk->ij | i=4096,j=256,k=512         | imd | 8,14,20 | --reps 100 --phase-reps 10 --max-seconds 1 --k4 rule,0,1,2,3
+c_rkf2    | ik,jk->ij | i=256,j=3000,k=1000        | imd | 8,14 | --reps 100 --phase-reps 10 --max-seconds 1 --k4 rule,1,2
+c_rkf3    | ik,jk->ij | i=6144,j=6144,k=768        | imd | 8,14,20 | --reps 20 --phase-reps 5 --max-seconds 1
+c_bkf1    | lik,ljk->lij | l=32,i=256,j=256,k=256  | imd | 8,14,20 | --reps 100 --phase-reps 10 --max-seconds 1 --k4 rule,1
+c_bkf2    | ikl,kjl->ijl | i=512,j=512,k=128,l=8   | imd | 8,14 | --reps 100 --phase-reps 10 --max-seconds 1
+c_tcc8    | kjbc,kiac->abij | i=8,j=8,k=8,a=64,b=64,c=64 | imd | 8,14,20 | --reps 100 --phase-reps 10 --max-seconds 1
+# --- fused large path KL (k_hat > 1024)
+c_sq2048  | ik,jk->ij | i=2048,j=2048,k=2048       | imd | 4,8,11,14,17,20 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,5
+c_sq3072  | ik,jk->ij | i=3072,j=3072,k=3072       | imd | 8,14,20 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1,2 --vec generate,resident
+c_sq6144  | ik,jk->ij | i=6144,j=6144,k=6144       | imd | 8,14,20 | --reps 10 --phase-reps 3 --max-seconds 2 --g 0,7
+c_rbigk2  | ik,jk->ij | i=1024,j=1024,k=65536      | imd | 8,14,20 | --reps 20 --phase-reps 5 --max-seconds 1
+c_rbigk3  | ik,jk->ij | i=3072,j=3072,k=16384      | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 2
+c_rskin2  | ik,jk->ij | i=32768,j=256,k=2048       | imd | 8,14,20 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1,2,3
+c_rmm2    | ik,jk->ij | i=2000,j=128,k=30000       | imd | 8,14,20 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,2,3
+c_rkl1    | ik,jk->ij | i=8192,j=8192,k=2048       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 2
+c_rkl2    | ik,jk->ij | i=256,j=256,k=150000       | imd | 8,14 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,3
+c_tdf2    | acQ,bdQ->acbd | a=48,b=48,c=48,d=48,Q=3072 | imd | 8,14,20 | --reps 20 --phase-reps 5 --max-seconds 1
+c_tcc2    | kjbc,kiac->abij | i=24,j=24,k=24,a=96,b=96,c=96 | imd | 8,14,20 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,4
+c_tperm2  | abk,kcd->cadb | a=48,b=48,c=48,d=48,k=6144 | imd | 8,14 | --reps 20 --phase-reps 5 --max-seconds 1
+c_tikl2   | ikl,kjl->ijl | i=512,j=512,k=2048,l=8  | imd | 8,14 | --reps 20 --phase-reps 5 --max-seconds 1
+c_bkl     | lik,ljk->lij | l=16,i=512,j=512,k=4096 | imd | 8,14 | --reps 20 --phase-reps 5 --max-seconds 1
+# --- packed operands (imd_pack phases, packed contracts)
+c_pk2048  | ik,jk->ij | i=2048,j=2048,k=3000       | packed | 8,14 | --reps 10 --phase-reps 5 --max-seconds 1 --pack A,B --reuse 1
+c_pk512   | ik,jk->ij | i=512,j=640,k=512          | packed | 8,14 | --reps 100 --phase-reps 10 --max-seconds 1 --pack A,B --reuse 1
+c_pkmm    | ik,jk->ij | i=1500,j=96,k=40000        | packed | 8,14 | --reps 10 --phase-reps 5 --max-seconds 1 --pack A,B --reuse 1
+# --- DIRECT (K-empty, mode DIRECT)
+c_outer1  | i,j->ij | i=2048,j=2048                | imd | 8 | --reps 100 --phase-reps 10 --max-seconds 1
+c_outer2  | i,j->ij | i=8192,j=4096                | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1
+c_dir1    | ik,jk->ij | i=512,j=512,k=512          | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --mode direct
+c_dir2    | ik,jk->ij | i=1024,j=768,k=128         | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --mode direct

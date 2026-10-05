@@ -28,6 +28,10 @@ if(Python3_FOUND)
   add_test(NAME host_python
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_host.py"
                    --host-lib "$<TARGET_FILE:immerdink_host>" --suite host -v)
+  # DESIGN v1.8 §6c: the performance model (calibration, features, rank). CPU only.
+  add_test(NAME host_perf
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_host.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" --suite perf -v)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files

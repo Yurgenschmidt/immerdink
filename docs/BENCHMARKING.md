@@ -19,7 +19,7 @@ Every record carries:
 
 | method | what it times |
 |---|---|
-| `imd` (default) | `imd_plan_create` once, then `imd_contract`. Per N in `--N`, and per `--vec`, `--g` and `--k4` value. `--phase-reps` extra calls with the library's per-phase event marks fill `phases` (built with `IMMERDINK_PROFILE`, which the bench enables). |
+| `imd` (default) | `imd_plan_create` once, then `imd_contract`. Per N in `--N`, and per `--vec`, `--g` and `--k4` value (`--mode direct`: the DIRECT kernel). `--phase-reps` extra calls with the library's per-phase event marks fill `phases` (built with `IMMERDINK_PROFILE`, which the bench enables). |
 | `packed` | D1 operand reuse: R × `imd_contract` against `imd_pack` + R × `imd_contract_packed` (`--pack A,B`, `--reuse 1,4,16`), interleaved per repetition; the packed C is checked bit for bit against the plain one. |
 | `duel` | Two immerdink configurations interleaved call by call in one process (`--duel-a`, `--duel-b`; see "Tiny shapes" below). |
 | `bw` | A device-to-device copy of A: the achievable DRAM bandwidth, a hardware reference. |
@@ -94,6 +94,32 @@ python3 bench/ab_ratio.py <before.jsonl> <after.jsonl>
     GPU counters must be enabled for all users);
   - `bench/clocklog.sh` logs clocks during a run;
   - `bench/k5bimodal/` holds the context-switch analysis tools.
+
+## Calibrating the performance model (DESIGN §6c)
+
+The performance model in `libimmerdink_host` (`imd_perf_predict`, `imd_perf_rank`; Python
+`host.predict`, `host.rank`) needs one calibration per GPU. The RTX 4090 calibration ships
+with the library (`src/host/calib/rtx4090_sm89.calib`, embedded at build time). For another
+GPU, or after a kernel change that moves the per-phase times:
+
+```sh
+tools/calibrate.sh [-o my_gpu.calib] [--validate]
+```
+
+- It builds the profiling `imd_bench`, runs `bench/sweep_calib.txt` through
+  `bench/run_sweep.sh` (quiet gate, GPU lock, warm-up: the usual rules above), and fits the
+  parameters with `bench/perf_fit.py` (numpy only): per kernel class a non-negative
+  least-squares fit in relative error of the phase times, then the per-call term on the timed
+  medians. About 10 minutes of GPU time on an RTX 4090; it never changes clocks (the file's
+  `clocks` line records the state it ran in).
+- `--validate` also runs the hold-out sweep `bench/sweep_perf_validate.txt` (shapes disjoint
+  from the fit set) and prints `bench/perf_validate.py`'s error table against the DESIGN §6c.5
+  targets; `--per-call` and `--phases` show every call and every phase.
+- Use a calibration file with `imd_perf_calib_load` (C) or `host.Calibration.load(path)`
+  (Python), passed to every predict / rank call; replacing the shipped file and rebuilding
+  changes the default. The datasheet peaks in the file (`peak_*`) only scale the reported
+  bounds; edit them for another GPU.
+- Results of past calibrations: docs/NOTES-B2.md.
 
 ## Getting clean numbers
 

@@ -13,6 +13,10 @@ Suites:
         oracle.Plan.groups()), workspace bytes and regions (params.workspace_size /
         region_offsets), plan device bytes (params.plan_device_bytes). Plus the einsum front
         end and g_tradeoff.
+  perf  CPU only. The performance model (DESIGN v1.8 §6c): the shipped calibration, format /
+        parse round trips, every phase's features == an independent transcription of the
+        §6c.1 table, K4 features x the A3 constants == the k4_select estimate, monotonicity,
+        statuses, packed predictions, and imd_perf_rank's exact footprints, budget and order.
   plan  GPU. imd_plan_create on random descriptors (also K-chunked, batch-split and
         n-hat-split shapes): the plan's GEMM view, workspace layout, device bytes, K4
         parameter sets and launches, and host payload (test hook imd_test_plan_sizes) ==
@@ -691,6 +695,268 @@ def suite_host(args):
 
 
 # ---------------------------------------------------------------------------------------
+# Suite perf (DESIGN v1.8 §6c): the performance model, CPU only
+
+L32 = [0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]  # §2: CRT limbs per N
+EPS_MAX = [0, 0, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 46, 50, 54, 58, 62, 65, 69, 73, 77]
+L2_4090 = 72 * 2**20
+K_C_PRIME = 131056
+
+
+def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks):
+    """K4 features (rounds, MACs at q = 1..3 concurrent CTAs) over the groups and K-chunks,
+    written from DESIGN §6c.1 independently of src/host/perf.cpp."""
+    tm, tn, occ = K4_TILES[c]
+    x = [0.0] * 6
+    groups = [g] * (N // g) + ([N % g] if N % g else [])
+    last = k_hat - (k_chunks - 1) * K_C_PRIME
+    chunks = [K_C_PRIME] * (k_chunks - 1) + [last]
+    for gs in groups:
+        for kc in chunks:
+            tiles = -(-m // tm) * -(-n_hat // tn) * gs * b
+            j = -(-tiles // sms)
+            full, rest = divmod(j, occ)
+            x[0] += full + (1 if rest else 0)
+            x[occ] += full * occ * tm * tn * kc
+            if rest:
+                x[rest] += rest * tm * tn * kc
+    for gs in groups:  # the DRAM term: a group's operands and W planes beyond L2
+        x[4] += max(0, gs * b * (m + n_hat) * k_hat + gs * b * m * n_hat * (2 * k_chunks - 1)
+                    - L2_4090)
+    return x
+
+
+def spec_phases(lw, vec, along_rows, beta=False):
+    """[(name, launches, x)] of one imd_contract (DESIGN §6c.1 table) from the lowering
+    summary and the operands' read direction (along rows: KL tiles of 512)."""
+    m, n, k, b, nh, kh = lw.m, lw.n, lw.k, lw.b, lw.n_hat, lw.k_hat
+    N, g = lw.num_moduli, lw.residue_group
+    V = lw.vec_entries
+    res = vec == "RESIDENT"
+    outb = 8 * b * m * n * (2 if beta else 1)
+    ph = []
+    if lw.dispatch in ("DIRECT", "SCALE"):
+        if not res:
+            ph.append(("K0 vec", 1, [1, 8 * V, 0, 0, 0, 0]))
+        if lw.dispatch == "SCALE":
+            ph.append(("K5 beta-only", 1, [1, outb, 0, 0, 0, 0]))
+        else:
+            ph.append(("DIRECT", 1, [1, 8 * b * (m * k + n * k) + outb, 2 * b * m * n * k, 0,
+                                     0, 0]))
+        return ph + [("call", 0, [1, lw.kernel_launches, 0, 0, 0, 0])]
+    rows, pad = [b * m, b * n], [b * m, b * nh]
+    wide = 1 if EPS_MAX[N] + 0.5 - 0.5 * math.log2(k) >= 53 else 0  # typical eps > 0
+    if not lw.fused and not res:
+        ph.append(("K0 vec", 1, [1, 8 * V, 0, 0, 0, 0]))
+    if lw.fused:
+        byts = (0 if res else 8 * V) + sum(8 * rows[x] * k + g * pad[x] * kh + 3 * rows[x]
+                                           for x in (0, 1))
+        ops = g * (rows[0] + rows[1]) * k
+        ph.append(("KF fused", 1, [1, byts, ops, rows[0] + rows[1], wide * ops, 0]))
+    else:
+        for x, name in ((0, "KL A"), (1, "KL B")):
+            tk = 512 if along_rows[x] else 4096 if kh > 2048 else 1 << max(6, (kh - 1).bit_length())
+            ph.append((name, 1, [1, 8 * rows[x] * k + g * pad[x] * kh + 3 * rows[x],
+                                 g * rows[x] * k, 16 * rows[x] * max(0, kh - 2 * tk),
+                                 wide * g * rows[x] * k, 0]))
+    G = lw.num_groups
+    for x, name in ((0, "K2 pack A"), (1, "K3 pack B")):
+        if G > 1:
+            per = 2 if (x == 1 and nh > n) else 1
+            ph.append((name, (G - 1) * per, [(G - 1) * per, (G - 1) * 8 * rows[x] * k
+                                             + (N - g) * pad[x] * kh, (N - g) * rows[x] * k,
+                                             wide * (N - g) * rows[x] * k, 0, 0]))
+    ph.append(("K4 gemm", lw.gemm_launches,
+               spec_k4_features(lw.k4_config, m, nh, kh, b, N, g, 128, lw.k_chunks)))
+    ph.append(("K5 crt", 1, [1, N * b * m * nh + 3 * b * (m + n) + outb, N * L32[N] * b * m * n,
+                             0, 0, 0]))
+    return ph + [("call", 0, [1, lw.kernel_launches, 0, 0, 0, 0])]
+
+
+def close(a, b, rel=1e-12):
+    return abs(a - b) <= rel * max(abs(a), abs(b), 1.0)
+
+
+def suite_perf(args):
+    host.load(args.host_lib)
+    os.environ["IMMERDINK_HOST_LIB"] = args.host_lib
+    # --- calibration: shipped file == default; format -> parse is bit-exact ---------------
+    cal = host.Calibration.default()
+    shipped = host.Calibration.load(os.path.join(ROOT, "src/host/calib/rtx4090_sm89.calib"))
+    if cal.params != shipped.params or cal.meta != shipped.meta:
+        raise Fail("the shipped calibration file differs from imd_perf_calib_default")
+    if cal.meta["sm_count"] != 128 or "4090" not in cal.meta["gpu"]:
+        raise Fail(f"shipped calibration: {cal.meta}")
+    again = host.Calibration.parse(cal.format())
+    if again.params != cal.params or again.meta != cal.meta or again.format() != cal.format():
+        raise Fail("format -> parse round trip")
+    names = host.param_names()
+    if sorted(cal.params) != sorted(f"{c}.{n}" for c, ns in names.items() for n in ns if n):
+        raise Fail("params keys")
+    rng = random.Random(6)
+    vals = {k: rng.choice((0.0, rng.random() * 10 ** rng.randint(-6, 4))) for k in cal.params}
+    vals["call.launch"] = -1.5
+    cv = host.Calibration.from_values(cal.meta, vals)
+    if cv.params != vals or host.Calibration.parse(cv.format()).params != vals:
+        raise Fail("from_values / round trip of arbitrary values")
+    for bad in ("format = 1\n", cal.format().replace("k5.op =", "k5.ops ="),
+                cal.format() + "gpu = again\n", cal.format().replace("kl.byte = ", "kl.byte = -")):
+        try:
+            host.Calibration.parse(bad)
+            raise Fail(f"accepted an invalid calibration: {bad[-40:]!r}")
+        except ValueError:
+            pass
+    # --- features == the independent transcription; K4 == the A3 estimate ----------------
+    cases = [  # spec, extents, along_rows (A, B) of the post-swap operands
+        ("ik,jk->ij", dict(i=64, j=64, k=64), (False, False)),
+        ("ik,jk->ij", dict(i=300, j=200, k=1000), (False, False)),
+        ("ik,jk->ij", dict(i=2048, j=1000, k=3000), (False, False)),
+        ("ik,jk->ij", dict(i=1000, j=64, k=50000), (False, False)),
+        ("ki,kj->ij", dict(i=512, j=384, k=5000), (True, True)),
+        ("ik,jk->ij", dict(i=5, j=7, k=300000), (False, False)),
+        ("lik,ljk->lij", dict(l=6, i=100, j=60, k=1500), (False, False)),
+        ("ikl,kjl->ijl", dict(i=128, j=96, k=2500, l=4), (True, True)),
+        ("i,j->ij", dict(i=300, j=200), (False, False)),
+    ]
+    n_feat = 0
+    for spec, ext, along in cases:
+        for N, g in ((8, 0), (14, 4), (20, 7), (3, 1)):
+            for vec in ("GENERATE", "RESIDENT"):
+                for mode in ("EMULATE", "DIRECT"):
+                    lw = host.lowering(spec, ext, N=N, g=g, vec_mode=vec, mode=mode)
+                    p = host.predict(spec, ext, N=N, g=g, vec_mode=vec, mode=mode)
+                    if p.status != lw.status:
+                        raise Fail(f"{spec} {ext}: status {p.status} vs lowering {lw.status}")
+                    if p.status != "SUCCESS":
+                        continue
+                    want = spec_phases(lw, vec, along)
+                    got = [(q.name, q.launches, list(q.x)) for q in p.phases]
+                    ok = len(want) == len(got) and all(
+                        a[0] == b[0] and a[1] == b[1] and all(close(u, v) for u, v in zip(a[2], b[2]))
+                        for a, b in zip(want, got))
+                    if not ok:
+                        raise Fail(f"features {spec} {ext} N={N} g={g} {vec} {mode}:\n  "
+                                   f"got  {got}\n  want {want}")
+                    if p.kernel_launches != lw.kernel_launches or p.k4_config != lw.k4_config or \
+                            p.workspace_bytes != lw.workspace_bytes or \
+                            p.plan_device_bytes != lw.plan_device_bytes:
+                        raise Fail(f"summary {spec} {ext}: {p} vs {lw}")
+                    if not close(p.time_s, sum(q.time_s for q in p.phases)):
+                        raise Fail("time_s != sum of phases")
+                    if not close(p.tflops_eq, p.flops_eq / p.time_s * 1e-12):
+                        raise Fail("tflops_eq")
+                    n_feat += 1
+    # K4 features x the A3 constants == the k4_select estimate (one chunk; G equal groups)
+    a3 = {"k4_128x256.round": 2716, "k4_128x256.mac1": 418e-6,
+          "k4_128x128.round": 2550, "k4_128x128.mac1": 453e-6, "k4_128x128.mac2": 456e-6,
+          "k4_64x128.round": 1424, "k4_64x128.mac1": 505e-6, "k4_64x128.mac2": 612e-6,
+          "k4_64x64.round": 1333, "k4_64x64.mac1": 944e-6, "k4_64x64.mac2": 1088e-6,
+          "k4_64x64.mac3": 802e-6}
+    for (m, n, k, b) in ((64, 64, 64, 1), (1000, 64, 50000, 1), (4096, 4096, 4096, 1),
+                         (300, 200, 1000, 7), (16384, 512, 4096, 1)):
+        spec, ext = "lik,ljk->lij", dict(l=b, i=m, j=n, k=k)
+        lw = host.lowering(spec, ext, N=14, g=7)
+        for c in range(4):
+            p = host.predict(spec, ext, N=14, g=7, k4_config=c)
+            q = p.phase("K4 gemm")
+            ns = sum(a3.get(f"{q.cls}.{nm}", 0.0) * x for nm, x in zip(names[q.cls][:4], q.x) if nm)
+            est = 2 * spec_k4_estimate(c, lw.m, lw.n_hat, lw.k_hat, 7 * lw.b, 128) / 1e6
+            if q.cls != host.PERF_CLASSES[4 + c] or not close(ns, est, 1e-9):
+                raise Fail(f"K4 {m},{n},{k},{b} config {c}: {ns} ns vs A3 estimate {est} ns")
+    # --- monotonicity: a bigger shape never takes less time (same K4 configuration, path) -
+    mono = 0
+    for t in range(200):
+        # n a multiple of 16: doubling n then keeps n_hat = n (no zero-rows launch appears or
+        # disappears; one launch less can be a real saving)
+        m, n = rng.randint(1, 4000), 16 * rng.randint(1, 250)
+        k = rng.choice((rng.randint(2, 1000), rng.randint(1100, 60000)))
+        N = rng.randint(2, 20)
+        g = rng.randint(1, N)
+        base = host.predict("ik,jk->ij", dict(i=m, j=n, k=k), N=N, g=g)
+        if base.status != "SUCCESS":
+            continue
+        for ext in (dict(i=2 * m, j=n, k=k), dict(i=m, j=2 * n, k=k)) + \
+                ((dict(i=m, j=n, k=2 * k),) if k > 1024 else ()):
+            big = host.predict("ik,jk->ij", ext, N=N, g=g, k4_config=base.k4_config)
+            if big.status == "SUCCESS" and big.time_s < base.time_s:
+                raise Fail(f"monotonicity: {ext} N={N} g={g}: {big.time_s} < {base.time_s} "
+                           f"({m},{n},{k})")
+            mono += 1
+        more_n = host.predict("ik,jk->ij", dict(i=m, j=n, k=k), N=min(N + 1, 20), g=0)
+        same = host.predict("ik,jk->ij", dict(i=m, j=n, k=k), N=N, g=0, k4_config=more_n.k4_config)
+        if more_n.status == same.status == "SUCCESS" and more_n.time_s < same.time_s:
+            raise Fail(f"monotonicity in N: {m},{n},{k} N={N}")
+    # --- statuses: kappa >= T (N = 2, T = 180) gives the plan-time status and no time -------
+    p = host.predict("ik,jk->ij", dict(i=3, j=5, k=180 * 180), N=2)
+    if p.status != "NOT_SUPPORTED" or p.time_s != 0 or p.phases:
+        raise Fail(f"kappa >= T: {p}")
+    p = host.predict("ik,jk->ij", dict(i=3, j=0, k=5), N=8)
+    if p.status != "SUCCESS" or p.time_s != 0 or p.phases or p.dispatch != "NOOP":
+        raise Fail(f"empty output: {p}")
+    if host.predict("ik,jk->ij", dict(i=3, j=5, k=7), N=8, k4_config=9).status != "INVALID_VALUE":
+        raise Fail("k4_config 9 accepted")
+    # --- packed predictions: no KF / KL share or pack launches for a packed operand --------
+    spec, ext = "ik,jk->ij", dict(i=2048, j=1000, k=3000)
+    pa = host.pack_desc_for(spec, ext, operand=0, N=14)
+    p = host.predict(spec, ext, N=14, packing=(pa, None))
+    if p.phase("KL A") is not None or p.phase("KL B") is None or p.phase("K2 pack A"):
+        raise Fail(f"packed A: {[q.name for q in p.phases]}")
+    pp = host.predict_pack(pa)
+    lay = host.pack_layout(pa)
+    if [q.name for q in pp.phases] != ["pack prep", "pack KL", "call"] or \
+            pp.pack_bytes != lay.pack_bytes or pp.pack_ws_bytes != lay.pack_ws_bytes:
+        raise Fail(f"predict_pack: {pp}")
+    # --- rank: exact footprints, budget, order --------------------------------------------
+    n_rank = 0
+    for spec, ext in (("ik,jk->ij", dict(i=2048, j=1000, k=3000)),
+                      ("kjbc,kiac->abij", dict(a=24, b=20, c=16, i=12, j=10, k=8)),
+                      ("lik,ljk->lij", dict(l=6, i=100, j=60, k=1500))):
+        Ns = [8, 14]
+        allc = host.rank(spec, ext, N=Ns, vec_modes=("GENERATE", "RESIDENT"),
+                         packs=("NONE", "A", "B", "AB"), reuse=3)
+        if len(allc) != sum(N for N in Ns) * 2 * 4:
+            raise Fail(f"rank: {len(allc)} candidates")
+        foot = sorted(c.total_bytes for c in allc if c.status == "SUCCESS")
+        budget = foot[len(foot) // 3]
+        ranked = host.rank(spec, ext, N=Ns, vec_modes=("GENERATE", "RESIDENT"),
+                           packs=("NONE", "A", "B", "AB"), reuse=3, budget=budget)
+        seen_bad = False
+        for i, c in enumerate(ranked):
+            pk = [host.pack_desc_for(spec, ext, operand=x, N=c.num_moduli)
+                  if c.packed in (("A", "AB"), ("B", "AB"))[x] else None for x in (0, 1)]
+            kw = dict(N=c.num_moduli, g=c.residue_group, vec_mode=c.vec_mode)
+            if c.status != "SUCCESS":
+                seen_bad = True
+                continue
+            if seen_bad:
+                raise Fail("rank: a SUCCESS candidate after a failed one")
+            ws = host.workspace_size(spec, ext, packing=tuple(pk) if any(pk) else None, **kw)
+            dev, _ = host.plan_bytes(spec, ext, **kw)
+            pb = sum(host.pack_layout(x).pack_bytes for x in pk if x)
+            pw = sum(host.pack_layout(x).pack_ws_bytes for x in pk if x)
+            if (c.workspace_bytes, c.plan_device_bytes, c.pack_bytes, c.pack_ws_bytes,
+                    c.total_bytes) != (ws, dev, pb, pw, ws + dev + pb + pw):
+                raise Fail(f"rank footprint {c} vs {(ws, dev, pb, pw)}")
+            if c.feasible != (c.total_bytes <= budget):
+                raise Fail(f"rank feasibility {c}")
+            ps = sum(host.predict_pack(x).time_s for x in pk if x)
+            pc = host.predict(spec, ext, packing=tuple(pk) if any(pk) else None, **kw).time_s
+            if not (close(c.contract_s, pc) and close(c.pack_s, ps) and
+                    close(c.time_s, pc + ps / 3)):
+                raise Fail(f"rank times {c}: contract {pc}, pack {ps}")
+            if i > 0 and ranked[i - 1].status == "SUCCESS":
+                prev = ranked[i - 1]
+                if prev.feasible < c.feasible or (prev.feasible == c.feasible and
+                                                  prev.time_s > c.time_s):
+                    raise Fail(f"rank order: {prev} before {c}")
+            n_rank += 1
+    if args.verbose:
+        print(f"  ok  calibration round trip, {n_feat} feature transcriptions, K4 == A3 "
+              f"estimate, {mono} monotonicity pairs, statuses, packed, {n_rank} ranked "
+              f"candidates with exact footprints")
+
+
+# ---------------------------------------------------------------------------------------
 # Suite plan (GPU)
 
 def suite_plan(args):
@@ -878,14 +1144,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--host-lib", required=True)
     ap.add_argument("--lib", help="libimmerdink.so (suite plan)")
-    ap.add_argument("--suite", choices=("host", "plan"), required=True)
+    ap.add_argument("--suite", choices=("host", "perf", "plan"), required=True)
     ap.add_argument("--cases", type=int, default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     if args.cases is None:
         args.cases = 4000 if args.suite == "host" else 400
     try:
-        (suite_host if args.suite == "host" else suite_plan)(args)
+        {"host": suite_host, "perf": suite_perf, "plan": suite_plan}[args.suite](args)
     except Fail as e:
         print(f"FAIL {e}")
         return 1

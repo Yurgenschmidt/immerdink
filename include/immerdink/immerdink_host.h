@@ -27,13 +27,14 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 5  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 6  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
                                    5: packed operands (§6b v1.7): IMD_STATUS_PACK_MISMATCH,
                                       imd_pack_layout, imd_pack_desc_for, imd_*_packed,
-                                      imd_lowering_t packed, pack_mismatch */
+                                      imd_lowering_t packed, pack_mismatch;
+                                   6: the performance model (§6c v1.8): imd_perf_* */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -335,6 +336,198 @@ IMD_API imd_status_t imd_lowering_packed(const imd_tensor_t* A, const imd_tensor
 
 /* Static, human-readable name of a status ("IMD_STATUS_SUCCESS", ...). */
 IMD_API const char* imd_status_string(imd_status_t status);
+
+/* ---- Performance model (DESIGN v1.8 §6c, host API version 6) ------------------------------
+ *
+ * Predicted time of one imd_contract (imd_pack) per phase and in total, and a ranking of the
+ * configurations a caller may choose (N, g, vec_mode, packed operands) inside a device-memory
+ * budget, each with its exact footprint. Each phase time is linear in calibrated per-kernel
+ * parameters:  t_p = sum_j param[class(p) * IMD_PERF_MAX_PARAMS + j] * x[p][j]  (ns; for the
+ * K4 classes the max of the round-model terms j < 4 and the DRAM term j = 4), over
+ * features x computed exactly from the plan's lowering (the table in §6c.1). A calibration is
+ * a caller-owned plain struct (no handle, no allocation); NULL = the shipped one (RTX 4090,
+ * sm_89). The calibration is read only by these functions, never by plan creation. */
+#define IMD_PERF_CALIB_FORMAT 1     /* the calibration file format these functions read     */
+#define IMD_PERF_MAX_PARAMS 6       /* parameters (features) per class                       */
+#define IMD_PERF_PARAM_CAPACITY 96  /* imd_perf_calib_t.param slots: class * 6 + j            */
+#define IMD_PERF_MAX_PHASES 16      /* imd_perf_t.phase capacity                              */
+
+/* Kernel classes (one parameter set each; file key prefix in parentheses). */
+enum {
+  IMD_PERF_CLASS_K0 = 0,         /* (k0) K0 vectors, imd_pack's prep: launch, byte          */
+  IMD_PERF_CLASS_KF = 1,         /* (kf) fused small launch: launch, byte, op, row, op_eps  */
+  IMD_PERF_CLASS_KL = 2,         /* (kl) fused large launch, imd_pack: launch, byte, op,
+                                    l2byte, op_eps                                          */
+  IMD_PERF_CLASS_PACK = 3,       /* (pack) K2 / K3, groups 2..: launch, byte, op, op_eps    */
+  IMD_PERF_CLASS_K4_128x256 = 4, /* (k4_128x256) K4: max(round model, byte): round, mac1,
+                                    byte (slot 4)                                           */
+  IMD_PERF_CLASS_K4_128x128 = 5, /* (k4_128x128) round, mac1, mac2, byte                    */
+  IMD_PERF_CLASS_K4_64x128 = 6,  /* (k4_64x128)  round, mac1, mac2, byte                    */
+  IMD_PERF_CLASS_K4_64x64 = 7,   /* (k4_64x64)   round, mac1, mac2, mac3, byte              */
+  IMD_PERF_CLASS_K5 = 8,         /* (k5) CRT: launch, byte, op                              */
+  IMD_PERF_CLASS_DIRECT = 9,     /* (direct) native FP64: launch, byte, flop                */
+  IMD_PERF_CLASS_BETA = 10,      /* (beta) C <- beta C: launch, byte                        */
+  IMD_PERF_CLASS_CALL = 11,      /* (call) per-call correction: call, launch (may be < 0)   */
+  IMD_PERF_CLASS_COUNT = 12
+};
+/* Phases (imd_perf_phase_name: the tags of imd_bench's per-phase profile). */
+enum {
+  IMD_PERF_PHASE_K0 = 0,         /* "K0 vec"        */
+  IMD_PERF_PHASE_KF = 1,         /* "KF fused"      */
+  IMD_PERF_PHASE_KL_A = 2,       /* "KL A"          */
+  IMD_PERF_PHASE_KL_B = 3,       /* "KL B"          */
+  IMD_PERF_PHASE_PACK_A = 4,     /* "K2 pack A"     */
+  IMD_PERF_PHASE_PACK_B = 5,     /* "K3 pack B"     */
+  IMD_PERF_PHASE_K4 = 6,         /* "K4 gemm"       */
+  IMD_PERF_PHASE_K5 = 7,         /* "K5 crt"        */
+  IMD_PERF_PHASE_DIRECT = 8,     /* "DIRECT"        */
+  IMD_PERF_PHASE_BETA = 9,       /* "K5 beta-only"  */
+  IMD_PERF_PHASE_CALL = 10,      /* "call"          */
+  IMD_PERF_PHASE_PACK_PREP = 11, /* "pack prep"     */
+  IMD_PERF_PHASE_PACK_KL = 12,   /* "pack KL"       */
+  IMD_PERF_PHASE_COUNT = 13
+};
+/* imd_perf_request_t.flags, imd_perf_rank_request_t.flags */
+enum { IMD_PERF_BETA_NONZERO = 1, IMD_PERF_ALPHA_ZERO = 2 };
+
+/* A calibration (§6c.2): the GPU it describes, the datasheet peaks of the bounds and the
+ * parameters (ns per feature unit). Strings are NUL-terminated. */
+typedef struct {
+  uint32_t struct_size;           /* sizeof(imd_perf_calib_t) as the caller compiled it     */
+  int32_t format;                 /* IMD_PERF_CALIB_FORMAT                                  */
+  int32_t sm_count;               /* SMs of the calibrated GPU (the K4 rule and round model) */
+  int32_t reserved;               /* 0                                                      */
+  double peak_dram_bytes_per_s;   /* datasheet DRAM bandwidth                               */
+  double peak_int8_ops_per_s;     /* datasheet dense int8 tensor-core ops                   */
+  double peak_fp64_flops_per_s;   /* datasheet FP64 flops                                   */
+  double l2_bytes;                /* L2 cache bytes: the K4 DRAM term counts a group's operand
+                                     and plane bytes beyond it (§6c.1)                      */
+  char gpu[64], date[32], version[64], clocks[128], notes[128];
+  double param[IMD_PERF_PARAM_CAPACITY]; /* param[class * IMD_PERF_MAX_PARAMS + j]; 0 unused */
+} imd_perf_calib_t;
+
+/* The shipped calibration (RTX 4090, sm_89). out->struct_size must be set; SUCCESS. */
+IMD_API imd_status_t imd_perf_calib_default(imd_perf_calib_t* out);
+/* Parse calibration text (format 1: "key = value" lines, '#' comments; every parameter
+ * required, no unknown or repeated key). INVALID_VALUE with *error_line = the 1-based line
+ * (0: not tied to a line, e.g. a missing key); error_line may be NULL. */
+IMD_API imd_status_t imd_perf_calib_parse(const char* text, size_t length, imd_perf_calib_t* out,
+                                          int32_t* error_line);
+/* imd_perf_calib_parse of a file's contents; an unreadable file is INVALID_VALUE, line 0. */
+IMD_API imd_status_t imd_perf_calib_load(const char* path, imd_perf_calib_t* out,
+                                         int32_t* error_line);
+/* The canonical text of a calibration (every key; numbers in the shortest round-trip form,
+ * so parse(format(c)) == c bit for bit). *length = its length without the NUL, always;
+ * INSUFFICIENT_WORKSPACE if capacity <= *length (nothing useful written). */
+IMD_API imd_status_t imd_perf_calib_format(const imd_perf_calib_t* calib, char* buf,
+                                           size_t capacity, size_t* length);
+/* Static names: a class's key prefix ("k0", ..., "call"), a parameter's name ("launch",
+ * "byte", "op", "row", "l2byte", "round", "mac1".. "mac3", "flop", "call"; NULL for a slot
+ * the class does not use) and a phase's name; NULL out of range. */
+IMD_API const char* imd_perf_class_name(int32_t cls);
+IMD_API const char* imd_perf_param_name(int32_t cls, int32_t j);
+IMD_API const char* imd_perf_phase_name(int32_t phase);
+
+/* What to predict beyond the options. NULL = flags 0, k4_config -1. */
+typedef struct {
+  uint32_t struct_size;  /* sizeof(imd_perf_request_t)                                      */
+  int32_t flags;         /* IMD_PERF_BETA_NONZERO (C is read), IMD_PERF_ALPHA_ZERO          */
+  int32_t k4_config;     /* -1: the plan-time rule for the calibration's sm_count; else IMD_K4_* */
+  int32_t reserved;      /* 0                                                               */
+} imd_perf_request_t;
+
+/* One phase: its features x (the model is sum_j param[cls * 6 + j] x[j]; K4: the max of the
+ * terms j < 4 and the term j = 4), its predicted time,
+ * and its MEMORY_MODEL §4 lower bound: bound_s = max(bytes / peak DRAM, ops / peak). */
+typedef struct {
+  int32_t phase;         /* IMD_PERF_PHASE_*                                                */
+  int32_t cls;           /* IMD_PERF_CLASS_*                                                */
+  int64_t launches;      /* kernel launches of the phase (0 for the call term)              */
+  double time_s;         /* predicted                                                       */
+  double bytes;          /* compulsory DRAM bytes                                           */
+  double ops;            /* int8 ops (K4), FP64 flops (DIRECT), else 0                      */
+  double bound_s;
+  double x[IMD_PERF_MAX_PARAMS];
+} imd_perf_phase_t;
+
+typedef struct {
+  uint32_t struct_size;  /* in: sizeof(imd_perf_t) as compiled by the caller                */
+  int32_t status;        /* as returned; the fields below are filled only on SUCCESS        */
+  int32_t dispatch;      /* IMD_DISPATCH_* (imd_perf_predict_pack: IMD_DISPATCH_EMULATE)    */
+  int32_t k4_config;     /* the K4 configuration predicted (IMD_K4_128x256 without K4)      */
+  int32_t sm_count;      /* the calibration's                                               */
+  int32_t num_phases;    /* entries of phase[] in launch order (the call term last)         */
+  double time_s;         /* predicted time: the sum of the phases                           */
+  double bound_s;        /* sum of the phase bounds                                         */
+  double flops_eq;       /* 2 b m n k (imd_pack: 0)                                         */
+  double tflops_eq;      /* flops_eq / time_s / 1e12 (0 when time_s is 0)                   */
+  int64_t kernel_launches;
+  uint64_t workspace_bytes;   /* imd_workspace_size(_packed) (exact)                        */
+  uint64_t plan_device_bytes; /* imd_plan_bytes (exact)                                     */
+  uint64_t pack_bytes;        /* imd_perf_predict_pack: imd_pack_layout's (else 0)          */
+  uint64_t pack_ws_bytes;     /* imd_perf_predict_pack: imd_pack's workspace (else 0)       */
+  imd_perf_phase_t phase[IMD_PERF_MAX_PHASES];
+} imd_perf_t;
+
+/* Predicted imd_contract (packing != NULL: imd_contract_packed of that packed plan). Returns
+ * the plan-time status (imd_lowering / imd_lowering_packed), INVALID_VALUE for out NULL,
+ * a struct_size below version 1's, a request with an unknown flag or K4 configuration, or a
+ * calibration of another format / with sm_count < 1. */
+IMD_API imd_status_t imd_perf_predict(const imd_tensor_t* A, const imd_tensor_t* B,
+                                      const imd_tensor_t* C, const imd_options_t* options,
+                                      const imd_packing_t* packing,
+                                      const imd_perf_request_t* request,
+                                      const imd_perf_calib_t* calib, imd_perf_t* out);
+/* Predicted imd_pack of a pack descriptor (imd_pack_layout's status). */
+IMD_API imd_status_t imd_perf_predict_pack(const imd_pack_desc_t* desc,
+                                           const imd_perf_calib_t* calib, imd_perf_t* out);
+
+/* Ranking (§6c.3). Masks: */
+enum { IMD_PERF_VEC_GENERATE = 1, IMD_PERF_VEC_RESIDENT = 2 };
+enum { IMD_PERF_PACK_NONE = 1, IMD_PERF_PACK_A = 2, IMD_PERF_PACK_B = 4, IMD_PERF_PACK_AB = 8 };
+typedef struct {
+  uint32_t struct_size;          /* sizeof(imd_perf_rank_request_t)                          */
+  uint32_t candidate_size;       /* sizeof(imd_perf_candidate_t) as compiled by the caller   */
+  int32_t num_moduli_count;      /* >= 1                                                     */
+  int32_t residue_group_count;   /* 0: every g in 1..N                                       */
+  const int32_t* num_moduli;     /* N values, 2..20                                          */
+  const int32_t* residue_groups; /* g values >= 1 (values > N are skipped for that N)        */
+  int32_t vec_modes;             /* IMD_PERF_VEC_* mask; 0 = GENERATE                        */
+  int32_t pack_modes;            /* IMD_PERF_PACK_* mask (the caller's operands); 0 = NONE   */
+  int32_t reuse;                 /* contractions per imd_pack (amortization), >= 1           */
+  int32_t flags;                 /* IMD_PERF_BETA_NONZERO                                    */
+  uint64_t budget_bytes;         /* device memory for total_bytes; 0 = no budget             */
+} imd_perf_rank_request_t;
+
+typedef struct {
+  int32_t num_moduli, residue_group, vec_mode; /* the candidate (g normalized to [1, N])      */
+  int32_t packed;            /* bit 0 / bit 1: the caller's A / B packed (imd_pack_desc_for) */
+  int32_t status;            /* plan-time status (imd_lowering / imd_lowering_packed)        */
+  int32_t feasible;          /* 1: SUCCESS and total_bytes <= budget                         */
+  int32_t k4_config;         /* predicted K4 configuration                                   */
+  int32_t dispatch;          /* IMD_DISPATCH_*                                               */
+  double time_s;             /* the rank key: contract_s + pack_s / reuse                    */
+  double contract_s;         /* imd_perf_predict                                             */
+  double pack_s;             /* sum of imd_perf_predict_pack over the packed operands        */
+  double tflops_eq;          /* 2 b m n k / time_s / 1e12                                    */
+  uint64_t workspace_bytes;  /* imd_workspace_size(_packed)                                  */
+  uint64_t plan_device_bytes;/* imd_plan_bytes                                               */
+  uint64_t pack_bytes;       /* sum of imd_pack_layout pack_bytes                            */
+  uint64_t pack_ws_bytes;    /* sum of imd_pack_layout pack_ws_bytes                         */
+  uint64_t total_bytes;      /* the four above (separate buffers)                            */
+  int64_t kernel_launches;   /* per imd_contract                                             */
+} imd_perf_candidate_t;
+
+/* Every candidate of N x g x vec mode x pack mode (base gives rounding, mode, k4_tune), ranked:
+ * feasible by time_s, then infeasible SUCCESS ones by time_s, then the others in enumeration
+ * order (ties: total_bytes, N, g, vec_mode, packed). Writes min(capacity, n) candidates of
+ * candidate_size bytes each and *num_candidates = n. INVALID_VALUE for a bad request or
+ * argument; else SUCCESS with each candidate's own status. */
+IMD_API imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B,
+                                   const imd_tensor_t* C, const imd_options_t* base,
+                                   const imd_perf_rank_request_t* request,
+                                   const imd_perf_calib_t* calib, imd_perf_candidate_t* out,
+                                   int32_t capacity, int32_t* num_candidates);
 
 #ifdef __cplusplus
 } /* extern "C" */

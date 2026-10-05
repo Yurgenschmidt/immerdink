@@ -1572,7 +1572,8 @@ calibration file cannot change a result, a launch or a footprint.
 `t_call = Σ_phases t_p + t_call-term`, each term **linear in calibrated parameters**:
 
 ```
-t_p = Σ_j θ[class(p), j] · x[p, j]        (ns; θ ≥ 0 except the call term; j < 4)
+t_p = Σ_j θ[class(p), j] · x[p, j]        (ns; θ ≥ 0 except the call term; j < 6)
+K4:   t_p = max(Σ_{j<4} θ_j x_j, θ_4 x_4)  (the A3 round model, or the DRAM term)
 ```
 
 The features `x` are exact functions of the plan's lowering (the `ExecPlan` that
@@ -1581,30 +1582,48 @@ roles, groups, K-chunks, K4 configuration), computed by the host library only. T
 `θ` are per **kernel class** and physically meaningful: ns per launch (launch + fixed
 latency + the bandwidth ramp of a small grid), ns per DRAM byte (1 / effective bandwidth),
 ns per residue or CRT operation (1 / effective instruction throughput), ns per byte re-read
-from L2, and for K4 the A3 round model (ns per round, ns per MAC at q concurrent CTAs). A
-phase's time is a sum of terms, not a max: a roofline with no overlap, made accurate by the
-fit (each kernel's terms are fitted on that kernel's own measurements). Linear parameters
-make the fit a small non-negative least-squares problem with no optimizer, deterministic
+from L2, and for K4 the A3 round model (ns per round, ns per MAC at q concurrent CTAs) and ns
+per DRAM byte beyond L2. A phase's time is a sum of terms (no overlap, made accurate by the
+fit: each kernel's terms are fitted on that kernel's own measurements), except K4, which is
+the roofline max of its compute (round) model and its DRAM term: K4 is either, and a sum
+would charge every compute-bound GEMM for its reads. Linear parameters make each fit a small
+non-negative least-squares problem (K4: one more scan over the DRAM rate), deterministic
 and reproducible.
 
 Notation (post-swap view, §1.1): `rows_A = b·m`, `rows_B = b·n`, padded rows `pad_A = b·m`,
 `pad_B = b·n̂`, elements `E_x = rows_x·k`, `V` = `vec_entries`, `G = ⌈N/g⌉` groups of sizes
-`g_1 = g, …, g_G = N − (G−1)·g`, `L32(N)` = CRT limbs (§2), β' = [β ≠ 0]. Only **in-line**
-operands x (not packed, §6b) have scale and pack phases.
+`g_1 = g, …, g_G = N − (G−1)·g`, `L32(N)` = CRT limbs (§2), β' = [β ≠ 0], `w(N, k)` = 1 if
+`eps_max(N) + ½ − ½·log₂k ≥ 53` else 0 (below), `L2` = the calibration's `l2_bytes`. Only
+**in-line** operands x (not packed, §6b) have scale and pack phases.
 
-| phase (bench tag) | when | class | x₀ | x₁ | x₂ | x₃ |
-|---|---|---|---|---|---|---|
-| `K0 vec` | `IMD_VEC_GENERATE`, no KF (any dispatch but NOOP) | K0 | 1 | `8V` written | | |
-| `KF fused` | `fused` (§4) | KF | 1 | `Σ_x (8E_x + g·pad_x·k̂ + 3rows_x) + 8V·[GENERATE]` | `g·Σ_x E_x` residues | `Σ_x rows_x` |
-| `KL A`, `KL B` | `fused_large` bit of x | KL | 1 | `8E_x + g·pad_x·k̂ + 3rows_x` | `g·E_x` | `16·rows_x·max(0, k̂ − 2·tk_x)` L2 re-read |
-| `K2 pack A`, `K3 pack B` | groups of x not packed by KF / KL | PACK | launches (B: + the zero-rows launch per group if n̂ > n) | `Σ_groups (8E_x + g_i·pad_x·k̂)` | `Σ_groups g_i·E_x` | |
-| `K4 gemm` | EMULATE | K4[config] | rounds | MACs run at q = 1 | q = 2 | q = 3 |
-| `K5 crt` | EMULATE | K5 | 1 | `N·b·m·n̂ + 3b(m+n) + 8bmn(1+β')` | `N·L32·b·m·n` limb operations | |
-| `DIRECT` | DIRECT dispatch | DIRECT | 1 | `8b(mk + nk) + 8bmn(1+β')` | `2bmnk` FP64 flops | |
-| `K5 beta-only` | SCALE dispatch or α = 0 | BETA | 1 | `8bmn(1+β')` | | |
-| `call` | every non-NOOP call | CALL | 1 | `kernel_launches` | | |
-| `pack prep` (imd_pack) | every non-empty pack | K0 | 1 | `8(r+k+b)` + the zeroed gaps and tail | | |
-| `pack KL` (imd_pack) | every non-empty pack | KL | as KL with g = N, rows = pad = b·r, x the pack's one-operand view (`pack_exec`) | | | |
+| phase (bench tag) | when | class | x₀ | x₁ | x₂ | x₃ | x₄ |
+|---|---|---|---|---|---|---|---|
+| `K0 vec` | `IMD_VEC_GENERATE`, no KF (any dispatch but NOOP) | K0 | 1 | `8V` written | | | |
+| `KF fused` | `fused` (§4) | KF | 1 | `Σ_x (8E_x + g·pad_x·k̂ + 3rows_x) + 8V·[GENERATE]` | `g·Σ_x E_x` residues | `Σ_x rows_x` | `w·x₂` |
+| `KL A`, `KL B` | `fused_large` bit of x | KL | 1 | `8E_x + g·pad_x·k̂ + 3rows_x` | `g·E_x` | `16·rows_x·max(0, k̂ − 2·tk_x)` L2 re-read | `w·x₂` |
+| `K2 pack A`, `K3 pack B` | groups of x not packed by KF / KL | PACK | launches (B: + the zero-rows launch per group if n̂ > n) | `Σ_groups (8E_x + g_i·pad_x·k̂)` | `Σ_groups g_i·E_x` | `w·x₂` | |
+| `K4 gemm` | EMULATE | K4[config] | rounds | MACs run at q = 1 | q = 2 | q = 3 | DRAM bytes beyond L2: `Σ_groups max(0, g_i·b·(m + n̂)·k̂ + g_i·b·m·n̂·(2·k_chunks − 1) − L2)` |
+| `K5 crt` | EMULATE | K5 | 1 | `N·b·m·n̂ + 3b(m+n) + 8bmn(1+β')` | `N·L32·b·m·n` limb operations | | |
+| `DIRECT` | DIRECT dispatch | DIRECT | 1 | `8b(mk + nk) + 8bmn(1+β')` | `2bmnk` FP64 flops | | |
+| `K5 beta-only` | SCALE dispatch or α = 0 | BETA | 1 | `8bmn(1+β')` | | | |
+| `call` | every non-NOOP call | CALL | 1 | `kernel_launches` | | | |
+| `pack prep` (imd_pack) | every non-empty pack | K0 | 1 | `8(r+k+b)` + the zeroed gaps and tail | | | |
+| `pack KL` (imd_pack) | every non-empty pack | KL | as KL with g = N, rows = pad = b·r, x the pack's one-operand view (`pack_exec`) | | | | |
+
+(x₅ is unused: room for one more feature per class in a later format.)
+
+- **The eps > 0 regime** (`w`, the `op_eps` features). The packs quantize an element to
+  `μ·2^ε`; a residue costs one more modular multiply when ε > 0 (§3.4, the "rare" path of the
+  pack emitter). A row is scaled so that its norm is about T, so a typical element is about
+  `T/√k`; when that is ≥ 2⁵³ most elements have ε > 0. T < 2^(eps_max+1) with eps_max = 54 /
+  62 / 65 / 77 at N = 14 / 16 / 17 / 20, so the regime starts at N ≈ 16–17 for k in the
+  thousands: measured, KL / KF cost per residue jumps there (sq2048: N = 14 → 17 +45 % for
+  3 more moduli; with g = 5, +11 % for the same work). `w` is a property of typical data
+  (rows of comparable entries), not of the plan; heavy-tailed rows are in the cheap regime.
+- **K4's DRAM term.** The operands of a group were just written by the packs and stay in L2
+  while the group's operands and W planes fit; beyond that K4 streams them from DRAM
+  (measured memory-bound: r_mm-like n̂ = 64–128 with long k, skinny m ≫ n). The calibration
+  holds the L2 size (`l2_bytes`, 72 MiB on the 4090).
 
 - **KL's tile** (`tk_x`): 4096 FP64 along k̄, 512 when the operand is read along rows
   (`pack_along_rows`, §4 KL "th · tk = 4096"); rows of more than two tiles re-read the middle
@@ -1653,14 +1672,18 @@ operands x (not packed, §6b) have scale and pack phases.
 - **Fit** (`bench/perf_fit.py`, numpy only). The fitter gets every feature vector from
   `imd_perf_predict` through `host.py` (no feature formula in Python). Per class, θ minimizes
   the relative error `Σ ((θ·x − t)/t)²` over that class's measured phases, subject to θ ≥ 0
-  (exact NNLS by enumerating the ≤ 15 active sets of ≤ 4 parameters). Then the call term:
+  (exact NNLS by enumerating the active sets of ≤ 5 parameters); for K4, a scan over the DRAM
+  rate (bandwidths 0.1–2 TB/s, or none): the round model is fitted on the phases the DRAM term
+  does not explain, and the rate with the smallest relative error of the max wins. Then the
+  call term:
   ordinary least squares of `(t_timed − Σ_p t̂_p) / t_timed` on (1, kernel_launches). Classes
   the sweep cannot exercise get documented stand-ins: BETA takes K5's launch and byte
   parameters. The fitter prints per-class residuals and writes the file.
 - **File format 1** (`*.calib`): UTF-8 text, one `key = value` per line, `#` comments and
   blank lines ignored, keys unique, values to the end of the line (trimmed). Required:
-  `format = 1`, `gpu`, `sm_count`, the three peaks and **every** parameter
-  (`<class>.<feature>`, ns per feature unit, e.g. `kl.byte`, `k4_64x64.mac2`); optional
+  `format = 1`, `gpu`, `sm_count`, the three peaks, `l2_bytes` and **every** parameter
+  (`<class>.<feature>`, ns per feature unit, e.g. `kl.byte`, `kl.op_eps`, `k4_64x64.mac2`,
+  `k4_64x64.byte`); optional
   metadata `date`, `version` (immerdink commit / host API), `clocks` (clock and power state
   of the calibration run), `notes`. Unknown keys, duplicates, a missing key, a malformed or
   negative-where-forbidden number, or another `format` → INVALID_VALUE with the line number.
@@ -1680,8 +1703,8 @@ struct** (no handle, no allocation, no lifetime rules), so nothing new needs a s
 
 ```c
 #define IMD_PERF_CALIB_FORMAT   1
-#define IMD_PERF_MAX_PARAMS     4    /* parameters per class */
-#define IMD_PERF_PARAM_CAPACITY 64   /* param slots: class·4 + j (12 classes used) */
+#define IMD_PERF_MAX_PARAMS     6    /* parameters per class (5 used) */
+#define IMD_PERF_PARAM_CAPACITY 96   /* param slots: class·6 + j (12 classes used) */
 #define IMD_PERF_MAX_PHASES     16
 enum { IMD_PERF_CLASS_K0, IMD_PERF_CLASS_KF, IMD_PERF_CLASS_KL, IMD_PERF_CLASS_PACK,
        IMD_PERF_CLASS_K4_128x256, IMD_PERF_CLASS_K4_128x128, IMD_PERF_CLASS_K4_64x128,
@@ -1695,7 +1718,7 @@ enum { IMD_PERF_BETA_NONZERO = 1, IMD_PERF_ALPHA_ZERO = 2 };          /* request
 
 typedef struct {
   uint32_t struct_size;  int32_t format, sm_count, reserved;
-  double   peak_dram_bytes_per_s, peak_int8_ops_per_s, peak_fp64_flops_per_s;
+  double   peak_dram_bytes_per_s, peak_int8_ops_per_s, peak_fp64_flops_per_s, l2_bytes;
   char     gpu[64], date[32], version[64], clocks[128], notes[128];   /* NUL-terminated */
   double   param[IMD_PERF_PARAM_CAPACITY];                            /* ns per unit */
 } imd_perf_calib_t;
@@ -1758,8 +1781,9 @@ enum { IMD_PERF_PACK_NONE = 1, IMD_PERF_PACK_A = 2, IMD_PERF_PACK_B = 4,
        IMD_PERF_PACK_AB = 8 };                                              /* pack_modes */
 typedef struct {
   uint32_t struct_size, candidate_size;    /* sizeof as compiled by the caller            */
-  int32_t num_moduli_count;     const int32_t* num_moduli;     /* N values (2..20), ≥ 1  */
-  int32_t residue_group_count;  const int32_t* residue_groups; /* 0: every g in 1..N     */
+  int32_t num_moduli_count, residue_group_count;  /* ≥ 1; 0: every g in 1..N               */
+  const int32_t* num_moduli;               /* N values (2..20)                             */
+  const int32_t* residue_groups;           /* g values ≥ 1 (> N: skipped for that N)       */
   int32_t vec_modes, pack_modes;   /* masks; 0 = GENERATE / NONE only                    */
   int32_t reuse;                   /* contractions per pack, ≥ 1                        */
   int32_t flags;                   /* IMD_PERF_BETA_NONZERO                             */

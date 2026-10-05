@@ -1279,14 +1279,8 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
   }
   // Tile: along rows 8 rows side by side (64-byte segments); along k-bar tk = pow2 >= k_hat,
   // at most the whole tile (th = 1). The test hook forces 64-row tiles (many chunks per row).
-  int lg_th = 3;
-  if (p.kl_lg_rows >= 0) {
-    lg_th = p.kl_lg_rows;
-  } else if (!a.along_rows) {
-    int lg_tk = 6;
-    while (lg_tk < 12 && (int64_t{1} << lg_tk) < p.k_hat) ++lg_tk;
-    lg_th = 12 - lg_tk;
-  }
+  // (host/analysis.hpp kl_tile_lg_k: the one rule, also used by the performance model.)
+  const int lg_th = p.kl_lg_rows >= 0 ? p.kl_lg_rows : 12 - kl_tile_lg_k(a.along_rows != 0, p.k_hat);
   a.lg_th = lg_th;
   const int64_t th = int64_t{1} << lg_th, tk = kTileElems / th;
   const int64_t nc = (p.k_hat + tk - 1) / tk;

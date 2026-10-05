@@ -58,6 +58,19 @@ constexpr K4Cost kK4Costs[kK4ConfigCount] = {
 // (1000 - margin) / 1000 of 128x256's (model error and measurement noise).
 constexpr int64_t kK4MarginPermille = 50;
 
+// The round decomposition of the model above for one launch of configuration c over gb = g b
+// batches: the busiest SM runs `full` rounds of ctas_per_sm concurrent CTAs, then (rest > 0)
+// one round of `rest` CTAs; every CTA does tile_macs = tile_m tile_n k_hat MACs. Saturating
+// unsigned 128-bit integers. Shared by k4_estimate_fs and the performance model (DESIGN §6c,
+// perf.cpp: the same decomposition with calibrated constants).
+struct K4Rounds {
+  u128 full = 0;
+  int32_t rest = 0;
+  u128 tile_macs = 0;
+};
+IMD_HOST_INTERNAL K4Rounds k4_rounds(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb,
+                                     int32_t sms);
+
 // The estimate above in femtoseconds, computed in saturating unsigned 128-bit integers
 // (clamped at 2^127 - 1 after every operation). gb = g b.
 IMD_HOST_INTERNAL u128 k4_estimate_fs(int c, int64_t m, int64_t n_hat, int64_t k_hat,
