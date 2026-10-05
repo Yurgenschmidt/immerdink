@@ -1,12 +1,11 @@
 # A3 notes: shape-dependent K4 tile selection
 
 ROADMAP A3: K4 runs one configuration (128×256×64, 3 stages, 8 warps of 64×64, 1 CTA/SM)
-for every m:n:k. Where immerdink trails GEMMul8 in the same-session sweep
-(`bench/results/compare-b2c45cd.jsonl`, N = 8): s128 / s256 / s512 0.84–0.86×, sq1024
-0.94×, r_skinny (16384×512×4096) 0.94×, r_bigk (2048²×32768) 0.98×, r_mm (1000×64×50000)
-0.81×; at N = 14 ≥ 1× nearly everywhere (r_mm 0.99×). This file has the measurements first
-(dev `fa77ec0`, before any change), then the design, the changes and the before/after
-numbers.
+for every m:n:k. The shapes this suits worst in the same-session sweep
+(`bench/results/compare-b2c45cd.jsonl`, N = 8) are the small ones (s128 / s256 / s512,
+sq1024) and the skinny or long-k ones: r_skinny (16384×512×4096), r_bigk (2048²×32768),
+r_mm (1000×64×50000). This file has the measurements first (dev `fa77ec0`, before any
+change), then the design, the changes and the before/after numbers.
 
 Tooling as in NOTES-A2: every profile and timing through `tools/run_bench.sh` (quiet gate,
 memcap, the shared GPU lock). ncu 2026.3.1 (counters enabled) on the first K4 launch of a
@@ -73,12 +72,12 @@ What this says, per shape class:
 | r_mm | K3 pack B | 0.080 | 0.051 | 64 % |
 | r_mm | K4 gemm | 0.664 | 0.423 | **64 %** |
 | r_mm | K5 crt | 0.014 | 0.001 | 7 % |
-| r_mm | whole call | 2.635 (GEMMul8 2.144) | | 0.81× |
+| r_mm | whole call | 2.635 | | |
 | r_skinny | K1 scale A | 0.635 | 0.533 | 84 % |
 | r_skinny | K2 pack A | 1.226 | 1.065 | 87 % |
 | r_skinny | K4 gemm | 0.932 | 0.832 | 89 % |
 | r_skinny | K5 crt | 0.135 | 0.133 | 99 % |
-| r_skinny | whole call | 2.989 (GEMMul8 2.812) | | 0.94× |
+| r_skinny | whole call | 2.989 | | |
 
 (nsys of the same build agrees: r_mm K1 A 862 µs, K4 660 µs; r_skinny K4 926 µs.)
 
@@ -92,11 +91,11 @@ What this says, per shape class:
   second pass backwards, so the most recently read part of a row (the part still in L2) is
   re-read first; S and γ are exact and order-independent (u128 sum, max), so the results
   do not change.
-- **r_skinny: neither K4 nor anything cheap.** Every phase is at 84–99 % of its bound; the
-  gap to GEMMul8 (~6 %) is the sum of K1 A (84 %) and the pack of A (87 %) streaming the
-  537 MB operand three times (K1 two passes, one mostly from L2; the pack). Closing it needs
-  fewer passes over A (K1 fused into the pack for long rows: ROADMAP D4-type fusion, a
-  kernel-sequence change), not tile selection.
+- **r_skinny: neither K4 nor anything cheap.** Every phase is at 84–99 % of its bound; what
+  is left is mostly K1 A (84 %) and the pack of A (87 %) streaming the 537 MB operand three
+  times (K1 two passes, one mostly from L2; the pack). Closing it needs fewer passes over A
+  (K1 fused into the pack for long rows: ROADMAP D4-type fusion, a kernel-sequence change),
+  not tile selection.
 
 ## 2. Design (DESIGN v1.5 §4, §6, §6a)
 
@@ -309,92 +308,89 @@ at x2k_1k it is even, and the whole-call differences there and at r_lowk are wit
 
 ## 5. Results
 
-### Whole call vs GEMMul8 (same session, `bench/sweep_compare.txt`, N = 8 and 14)
+### Whole call (same session, `bench/sweep_compare.txt`, N = 8 and 14)
 
 Before = dev `fa77ec0` (`build/bench-base`), after = `d3c9a78` (every change above but the
 batched autotune timing of `ae2ac92`, which affects only `k4_tune` plans), interleaved per
-case by `bench/run_ab.sh`, each side in its own quiet-gated process running **GEMMul8 and
-then imd** (`AFTER_METHODS=gemmul8,imd`): `bench/results/a3-{before-fa77ec0,after-d3c9a78}.jsonl`.
-"vs G8" divides by the GEMMul8 time of the **same process** (two values in the G8 column
-when they differ: before / after process). K4 phase ms (and % of its §4 bound) from the
-bench's phase marks.
+case by `bench/run_ab.sh`, each side in its own quiet-gated process running **another
+library's calls first, then imd** (as in the comparison sweeps):
+`bench/results/a3-{before-fa77ec0,after-d3c9a78}.jsonl`. Whole call µs; K4 phase ms (and %
+of its §4 bound) from the bench's phase marks.
 
 **Measurement caveat (found here).** The card's boost clock settles per process in one of
 two states, about 2535 or 2820 MHz (`gpu_after` in the records); an imd-only process tends to
-stay at the lower one, a process that ran GEMMul8 first at the higher. A first A/B run with
-an imd-only "after" side (`a3-run1-*.jsonl`) therefore showed s_perm / s_cc8 at N = 14
+stay at the lower one, a process that ran another library's calls first at the higher. A
+first A/B run with an imd-only "after" side (`a3-run1-*.jsonl`) therefore showed s_perm / s_cc8 at N = 14
 10–14 % slower although their kernels were faster in nsys (s_cc8 N = 14: KF + K4 + K5 39.8 →
-35.9 µs). Same-process ratios against GEMMul8 remove most of it; whole-call after/before
-ratios of small cases still carry ±5 % from it (the reverse-order recheck,
+35.9 µs). Ratios against a reference timed in the same process remove most of it; whole-call
+after/before ratios of small cases still carry ±5 % from it (the reverse-order recheck,
 `a3-recheck-rev-*.jsonl`, measured the after build first: s_lowk N = 8 0.94, s_perm 0.97 /
-1.01, sq8192 0.99, sq16384 1.01, s_cc16 1.05 / 1.03 with the same-process GEMMul8 ratio
-unchanged at 0.91–0.92 / 1.10–1.11).
+1.01, sq8192 0.99, sq16384 1.01, s_cc16 1.05 / 1.03).
 
-| case | N | G8 µs | before µs | after µs | after/before | before vs G8 | after vs G8 | after TF-eq | K4 cfg | K4 gemm b→a |
-|---|---|---|---|---|---|---|---|---|---|---|
-| s128 | 8 | 20.5 / 18.4 | 23.6 | 17.4 | 0.739 | 0.87 | **1.06** | 0.24 | 64x64 | 0.008192 (5 %) → 0.007168 (5 %) |
-| s128 | 14 | 46.6 / 31.7 | 20.5 | 20.0 | 0.975 | 2.27 | **1.59** | 0.21 | 64x64 | 0.008192 (8 %) → 0.006144 (11 %) |
-| s256 | 8 | 20.5 / 22.5 | 25.1 | 22.5 | 0.898 | 0.82 | **1.00** | 1.49 | 64x64 | 0.01126 (14 %) → 0.006144 (25 %) |
-| s256 | 14 | 96.8 / 88.6 | 27.6 | 22.5 | 0.815 | 3.50 | **3.93** | 1.49 | 64x128 | 0.01434 (19 %) → 0.007168 (38 %) |
-| s512 | 8 | 33.8 / 34.8 | 39.9 | 31.2 | 0.782 | 0.85 | **1.11** | 8.59 | 128x128 | 0.01331 (47 %) → 0.009216 (68 %) |
-| s512 | 14 | 52.2 / 251.4 | 42.5 | 43.0 | 1.012 | 1.23 | **5.85** | 6.24 | 128x256 | 0.01434 (76 %) → 0.01434 (76 %) |
-| s_lowk | 8 | 303.1 / 304.6 | 103.4 | 109.1 | 1.054 | 2.93 | **2.79** | 4.92 | 128x256 | 0.03174 (111 %) → 0.03174 (111 %) |
-| s_lowk | 14 | 513.0 / 511.5 | 175.1 | 186.4 | 1.064 | 2.93 | **2.74** | 2.88 | 128x256 | 0.0553 (112 %) → 0.05427 (114 %) |
-| s_batch | 8 | 4450.8 / 4447.7 | 99.3 | 74.8 | 0.753 | 44.81 | **59.50** | 1.80 | 64x64 | 0.04608 (54 %) → 0.01434 (174 %) |
-| s_batch | 14 | 7561.2 / 7556.1 | 173.1 | 122.9 | 0.710 | 43.69 | **61.49** | 1.09 | 64x64 | 0.07987 (55 %) → 0.0215 (203 %) |
-| s_cc8 | 8 | 34.8 | 41.0 | 33.8 | 0.825 | 0.85 | **1.03** | 7.94 | 128x128 | 0.01331 (47 %) → 0.01024 (61 %) |
-| s_cc8 | 14 | 70.7 / 93.2 | 47.1 | 44.0 | 0.935 | 1.50 | **2.12** | 6.10 | 128x256 | 0.01434 (76 %) → 0.01434 (76 %) |
-| s_cc16 | 8 | 267.8 / 286.2 | 299.0 | 314.9 | 1.053 | 0.90 | **0.91** | 23.02 | 128x256 | 0.1126 (78 %) → 0.1198 (73 %) |
-| s_cc16 | 14 | 461.3 / 490.0 | 418.3 | 444.4 | 1.062 | 1.10 | **1.10** | 16.31 | 128x256 | 0.1792 (86 %) → 0.1874 (82 %) |
-| s_df | 8 | 68.6 / 66.6 | 60.4 | 52.2 | 0.864 | 1.14 | **1.27** | 10.28 | 128x256 | 0.01741 (72 %) → 0.01741 (72 %) |
-| s_df | 14 | 112.6 / 105.5 | 82.9 | 72.7 | 0.877 | 1.36 | **1.45** | 7.38 | 128x128 | 0.0297 (74 %) → 0.02458 (89 %) |
-| s_perm | 8 | 65.5 / 69.6 | 51.2 | 51.2 | 1.000 | 1.28 | **1.36** | 10.49 | 128x256 | 0.01741 (72 %) → 0.01741 (72 %) |
-| s_perm | 14 | 110.6 / 111.1 | 76.8 | 78.8 | 1.027 | 1.44 | **1.41** | 6.81 | 128x128 | 0.02867 (76 %) → 0.0256 (85 %) |
-| sq1024 | 8 | 95.7 / 103.9 | 102.4 | 99.8 | 0.975 | 0.94 | **1.04** | 21.51 | 128x256 | 0.03686 (71 %) → 0.03789 (69 %) |
-| sq1024 | 14 | 187.4 / 190.5 | 176.1 | 170.0 | 0.965 | 1.06 | **1.12** | 12.63 | 128x256 | 0.06349 (72 %) → 0.07066 (64 %) |
-| sq2048 | 8 | 601.1 / 598.0 | 576.5 | 580.6 | 1.007 | 1.04 | **1.03** | 29.59 | 128x256 | 0.2406 (86 %) → 0.2386 (87 %) |
-| sq2048 | 14 | 992.3 / 989.7 | 855.6 | 847.9 | 0.991 | 1.16 | **1.17** | 20.26 | 128x256 | 0.4198 (87 %) → 0.4157 (88 %) |
-| sq4096 | 8 | 3524.1 / 3462.1 | 3035.1 | 2986.5 | 0.984 | 1.16 | **1.16** | 46.02 | 128x256 | 1.762 (94 %) → 1.741 (96 %) |
-| sq4096 | 14 | 6084.6 / 5967.4 | 4696.1 | 4664.3 | 0.993 | 1.30 | **1.28** | 29.47 | 128x256 | 3.074 (95 %) → 3.063 (95 %) |
-| sq8192 | 8 | 20903.4 / 20853.8 | 18718.2 | 19043.8 | 1.017 | 1.12 | **1.10** | 57.74 | 128x256 | 14.02 (95 %) → 14.12 (94 %) |
-| sq8192 | 14 | 35604.0 / 35607.0 | 31160.8 | 31446.5 | 1.009 | 1.14 | **1.13** | 34.96 | 128x256 | 25.89 (90 %) → 26.07 (89 %) |
-| sq16384 | 14 | 244396.0 / 244681.0 | 231805.0 | 239242.0 | 1.032 | 1.05 | **1.02** | 36.77 | 128x256 | 215.8 (86 %) → 215.3 (87 %) |
-| r_lowk | 8 | 6720.5 / 6730.8 | 3723.3 | 3624.4 | 0.973 | 1.81 | **1.86** | 37.92 | 128x256 | 1.953 (85 %) → 1.973 (84 %) |
-| r_lowk | 14 | 11994.6 | 5676.5 | 5569.0 | 0.981 | 2.11 | **2.15** | 24.68 | 128x256 | 3.422 (85 %) → 3.422 (85 %) |
-| r_bigk | 8 | 7242.2 / 7262.7 | 7465.0 | 7485.9 | 1.003 | 0.97 | **0.97** | 36.72 | 128x256 | 3.41 (98 %) → 3.411 (98 %) |
-| r_bigk | 14 | 11086.3 / 11092.0 | 11001.9 | 11019.8 | 1.002 | 1.01 | **1.01** | 24.94 | 128x256 | 5.981 (97 %) → 5.971 (98 %) |
-| r_skinny | 8 | 2816.0 / 2810.9 | 2998.8 | 2987.0 | 0.996 | 0.94 | **0.94** | 23.01 | 128x256 | 0.9349 (89 %) → 0.9329 (89 %) |
-| r_skinny | 14 | 4510.7 / 4516.3 | 4174.3 | 4168.7 | 0.999 | 1.08 | **1.08** | 16.48 | 128x256 | 1.617 (90 %) → 1.618 (90 %) |
-| r_mm | 8 | 2146.3 | 2637.3 | 2246.7 | 0.852 | 0.81 | **0.96** | 2.85 | 64x64 | 0.6625 (64 %) → 0.5263 (80 %) |
-| r_mm | 14 | 3157.5 | 3201.0 | 2906.6 | 0.908 | 0.99 | **1.09** | 2.20 | 128x128 | 0.9073 (82 %) → 0.897 (82 %) |
-| t_nn | 8 | 3617.8 / 3616.3 | 3100.7 | 3088.9 | 0.996 | 1.17 | **1.17** | 44.49 | 128x256 | 1.736 (96 %) → 1.741 (96 %) |
-| t_nn | 14 | 6131.7 / 6136.8 | 4745.7 | 4746.2 | 1.000 | 1.29 | **1.29** | 28.96 | 128x256 | 3.037 (96 %) → 3.039 (96 %) |
-| t_batch | 8 | 1887.7 / 1887.2 | 1776.6 | 1601.0 | 0.901 | 1.06 | **1.18** | 21.46 | 128x256 | 0.5192 (80 %) → 0.5181 (80 %) |
-| t_batch | 14 | 2963.5 / 2951.7 | 2499.1 | 2279.9 | 0.912 | 1.19 | **1.29** | 15.07 | 128x256 | 0.9011 (81 %) → 0.9011 (81 %) |
-| t_ikl | 8 | 1742.3 / 1887.7 | 1864.2 | 1714.2 | 0.920 | 0.93 | **1.10** | 20.04 | 128x256 | 0.5233 (80 %) → 0.5233 (80 %) |
-| t_ikl | 14 | 2761.2 / 2967.0 | 2578.4 | 2370.6 | 0.919 | 1.07 | **1.25** | 14.49 | 128x256 | 0.9032 (81 %) → 0.9021 (81 %) |
-| t_df | 8 | 2294.3 / 2298.9 | 1701.9 | 1702.9 | 1.001 | 1.35 | **1.35** | 40.35 | 128x256 | 0.9083 (92 %) → 0.9083 (92 %) |
-| t_df | 14 | 4031.5 / 4026.9 | 2606.6 | 2604.0 | 0.999 | 1.55 | **1.55** | 26.39 | 128x256 | 1.591 (92 %) → 1.589 (92 %) |
-| t_cc | 8 | 3461.6 / 3522.6 | 2986.5 | 3030.5 | 1.015 | 1.16 | **1.16** | 45.35 | 128x256 | 1.738 (96 %) → 1.752 (95 %) |
-| t_cc | 14 | 5974.0 / 6070.8 | 4652.0 | 4637.7 | 0.997 | 1.28 | **1.31** | 29.64 | 128x256 | 3.048 (96 %) → 3.04 (96 %) |
-| t_permout | 8 | 3627.0 / 3671.6 | 3117.6 | 3114.0 | 0.999 | 1.16 | **1.18** | 44.14 | 128x256 | 1.744 (95 %) → 1.741 (96 %) |
-| t_permout | 14 | 6145.5 / 6217.7 | 4746.8 | 4753.4 | 1.001 | 1.29 | **1.31** | 28.91 | 128x256 | 3.036 (96 %) → 3.041 (96 %) |
+| case | N | before µs | after µs | after/before | after TF-eq | K4 cfg | K4 gemm b→a |
+|---|---|---|---|---|---|---|---|
+| s128 | 8 | 23.6 | 17.4 | 0.739 | 0.24 | 64x64 | 0.008192 (5 %) → 0.007168 (5 %) |
+| s128 | 14 | 20.5 | 20.0 | 0.975 | 0.21 | 64x64 | 0.008192 (8 %) → 0.006144 (11 %) |
+| s256 | 8 | 25.1 | 22.5 | 0.898 | 1.49 | 64x64 | 0.01126 (14 %) → 0.006144 (25 %) |
+| s256 | 14 | 27.6 | 22.5 | 0.815 | 1.49 | 64x128 | 0.01434 (19 %) → 0.007168 (38 %) |
+| s512 | 8 | 39.9 | 31.2 | 0.782 | 8.59 | 128x128 | 0.01331 (47 %) → 0.009216 (68 %) |
+| s512 | 14 | 42.5 | 43.0 | 1.012 | 6.24 | 128x256 | 0.01434 (76 %) → 0.01434 (76 %) |
+| s_lowk | 8 | 103.4 | 109.1 | 1.054 | 4.92 | 128x256 | 0.03174 (111 %) → 0.03174 (111 %) |
+| s_lowk | 14 | 175.1 | 186.4 | 1.064 | 2.88 | 128x256 | 0.0553 (112 %) → 0.05427 (114 %) |
+| s_batch | 8 | 99.3 | 74.8 | 0.753 | 1.80 | 64x64 | 0.04608 (54 %) → 0.01434 (174 %) |
+| s_batch | 14 | 173.1 | 122.9 | 0.710 | 1.09 | 64x64 | 0.07987 (55 %) → 0.0215 (203 %) |
+| s_cc8 | 8 | 41.0 | 33.8 | 0.825 | 7.94 | 128x128 | 0.01331 (47 %) → 0.01024 (61 %) |
+| s_cc8 | 14 | 47.1 | 44.0 | 0.935 | 6.10 | 128x256 | 0.01434 (76 %) → 0.01434 (76 %) |
+| s_cc16 | 8 | 299.0 | 314.9 | 1.053 | 23.02 | 128x256 | 0.1126 (78 %) → 0.1198 (73 %) |
+| s_cc16 | 14 | 418.3 | 444.4 | 1.062 | 16.31 | 128x256 | 0.1792 (86 %) → 0.1874 (82 %) |
+| s_df | 8 | 60.4 | 52.2 | 0.864 | 10.28 | 128x256 | 0.01741 (72 %) → 0.01741 (72 %) |
+| s_df | 14 | 82.9 | 72.7 | 0.877 | 7.38 | 128x128 | 0.0297 (74 %) → 0.02458 (89 %) |
+| s_perm | 8 | 51.2 | 51.2 | 1.000 | 10.49 | 128x256 | 0.01741 (72 %) → 0.01741 (72 %) |
+| s_perm | 14 | 76.8 | 78.8 | 1.027 | 6.81 | 128x128 | 0.02867 (76 %) → 0.0256 (85 %) |
+| sq1024 | 8 | 102.4 | 99.8 | 0.975 | 21.51 | 128x256 | 0.03686 (71 %) → 0.03789 (69 %) |
+| sq1024 | 14 | 176.1 | 170.0 | 0.965 | 12.63 | 128x256 | 0.06349 (72 %) → 0.07066 (64 %) |
+| sq2048 | 8 | 576.5 | 580.6 | 1.007 | 29.59 | 128x256 | 0.2406 (86 %) → 0.2386 (87 %) |
+| sq2048 | 14 | 855.6 | 847.9 | 0.991 | 20.26 | 128x256 | 0.4198 (87 %) → 0.4157 (88 %) |
+| sq4096 | 8 | 3035.1 | 2986.5 | 0.984 | 46.02 | 128x256 | 1.762 (94 %) → 1.741 (96 %) |
+| sq4096 | 14 | 4696.1 | 4664.3 | 0.993 | 29.47 | 128x256 | 3.074 (95 %) → 3.063 (95 %) |
+| sq8192 | 8 | 18718.2 | 19043.8 | 1.017 | 57.74 | 128x256 | 14.02 (95 %) → 14.12 (94 %) |
+| sq8192 | 14 | 31160.8 | 31446.5 | 1.009 | 34.96 | 128x256 | 25.89 (90 %) → 26.07 (89 %) |
+| sq16384 | 14 | 231805.0 | 239242.0 | 1.032 | 36.77 | 128x256 | 215.8 (86 %) → 215.3 (87 %) |
+| r_lowk | 8 | 3723.3 | 3624.4 | 0.973 | 37.92 | 128x256 | 1.953 (85 %) → 1.973 (84 %) |
+| r_lowk | 14 | 5676.5 | 5569.0 | 0.981 | 24.68 | 128x256 | 3.422 (85 %) → 3.422 (85 %) |
+| r_bigk | 8 | 7465.0 | 7485.9 | 1.003 | 36.72 | 128x256 | 3.41 (98 %) → 3.411 (98 %) |
+| r_bigk | 14 | 11001.9 | 11019.8 | 1.002 | 24.94 | 128x256 | 5.981 (97 %) → 5.971 (98 %) |
+| r_skinny | 8 | 2998.8 | 2987.0 | 0.996 | 23.01 | 128x256 | 0.9349 (89 %) → 0.9329 (89 %) |
+| r_skinny | 14 | 4174.3 | 4168.7 | 0.999 | 16.48 | 128x256 | 1.617 (90 %) → 1.618 (90 %) |
+| r_mm | 8 | 2637.3 | 2246.7 | 0.852 | 2.85 | 64x64 | 0.6625 (64 %) → 0.5263 (80 %) |
+| r_mm | 14 | 3201.0 | 2906.6 | 0.908 | 2.20 | 128x128 | 0.9073 (82 %) → 0.897 (82 %) |
+| t_nn | 8 | 3100.7 | 3088.9 | 0.996 | 44.49 | 128x256 | 1.736 (96 %) → 1.741 (96 %) |
+| t_nn | 14 | 4745.7 | 4746.2 | 1.000 | 28.96 | 128x256 | 3.037 (96 %) → 3.039 (96 %) |
+| t_batch | 8 | 1776.6 | 1601.0 | 0.901 | 21.46 | 128x256 | 0.5192 (80 %) → 0.5181 (80 %) |
+| t_batch | 14 | 2499.1 | 2279.9 | 0.912 | 15.07 | 128x256 | 0.9011 (81 %) → 0.9011 (81 %) |
+| t_ikl | 8 | 1864.2 | 1714.2 | 0.920 | 20.04 | 128x256 | 0.5233 (80 %) → 0.5233 (80 %) |
+| t_ikl | 14 | 2578.4 | 2370.6 | 0.919 | 14.49 | 128x256 | 0.9032 (81 %) → 0.9021 (81 %) |
+| t_df | 8 | 1701.9 | 1702.9 | 1.001 | 40.35 | 128x256 | 0.9083 (92 %) → 0.9083 (92 %) |
+| t_df | 14 | 2606.6 | 2604.0 | 0.999 | 26.39 | 128x256 | 1.591 (92 %) → 1.589 (92 %) |
+| t_cc | 8 | 2986.5 | 3030.5 | 1.015 | 45.35 | 128x256 | 1.738 (96 %) → 1.752 (95 %) |
+| t_cc | 14 | 4652.0 | 4637.7 | 0.997 | 29.64 | 128x256 | 3.048 (96 %) → 3.04 (96 %) |
+| t_permout | 8 | 3117.6 | 3114.0 | 0.999 | 44.14 | 128x256 | 1.744 (95 %) → 1.741 (96 %) |
+| t_permout | 14 | 4746.8 | 4753.4 | 1.001 | 28.91 | 128x256 | 3.036 (96 %) → 3.041 (96 %) |
 
-- **Small shapes at N = 8 now at or above GEMMul8**: s128 0.87 → 1.06×, s256 0.82 → 1.00×,
-  s512 0.85 → 1.11×, s_cc8 0.85 → 1.03×, sq1024 0.94 → 1.04× (KF ≤ 1024 and K4 tiles), s_batch
-  45 → 60×; s_cc16 0.90 → 0.91× (k̂ = 1536: neither KF nor a smaller tile applies; its K4
-  stays 128×256).
-- **r_mm 0.81 → 0.96× (N = 8), 0.99 → 1.09× (N = 14)**: K1 A 0.86 → 0.60 ms, K4 0.66 →
+- **Small shapes at N = 8 10–26 % faster**: s128 23.6 → 17.4 µs, s256 25.1 → 22.5, s512
+  39.9 → 31.2, s_cc8 41.0 → 33.8 (KF ≤ 1024 and K4 tiles); sq1024 102.4 → 99.8; s_batch
+  99.3 → 74.8 µs (K4 0.046 → 0.014 ms with 64×64 tiles). s_cc16 unchanged within the clock
+  states above (k̂ = 1536: neither KF nor a smaller tile applies; its K4 stays 128×256).
+- **r_mm 2.64 → 2.25 ms (N = 8), 3.20 → 2.91 ms (N = 14)**: K1 A 0.86 → 0.60 ms, K4 0.66 →
   0.53 ms (64×64 tiles, 80 % of its bound) at N = 8.
-- **r_skinny 0.94× and r_bigk 0.97× unchanged**: their K4 was and is at 89–98 % of its
-  bound; the gap is K1 + the pack streaming the large operand (§1), a fusion item (D4), not
-  tile selection.
-- t_batch / t_ikl 0.93–1.19 → 1.10–1.29× (KF for k̂ = 1024); everything else within noise
+- **r_skinny and r_bigk unchanged** (after/before 0.996–1.003): their K4 was and is at
+  89–98 % of its bound; what is left is K1 + the pack streaming the large operand (§1), a
+  fusion item (D4), not tile selection.
+- t_batch / t_ikl 8–10 % faster (KF for k̂ = 1024); everything else within noise
   (after/before 0.97–1.03 on the large shapes, K4 phases unchanged where the rule keeps
   128×256).
-- N = 14: at or above GEMMul8 everywhere (lowest r_bigk 1.01×; GEMMul8 itself is bimodal on the
-  smallest shapes at N = 14, e.g. s512 251 µs in the after process);
-  r_mm now 1.09×.
+- N = 14: small shapes after/before 0.82–1.03 (s512 and s_perm within the clock-state noise),
+  r_mm 0.91, t_batch / t_ikl 0.91–0.92.
 
 ### `k4_tune` (optional plan option): cost and effect (`bench/sweep_a3_tune.txt`, `ae2ac92`)
 
@@ -459,8 +455,8 @@ cases 31: same choice 17, tuned other and >3 % faster 4, >3 % slower 6; geomean 
 
 ### What is left
 
-- s_cc16 (1536³ via a permuted tensor) at N = 8 0.91×: unfused (k̂ = 1536 > 1024: K0 + 2 K1
-  + 2 packs, 0.16 ms of 0.30 ms) and K4 at 73–79 % with 4.5 waves of 128×256 tiles (128×128
+- s_cc16 (1536³ via a permuted tensor) at N = 8, 23 TFLOPS-eq: unfused (k̂ = 1536 > 1024:
+  K0 + 2 K1 + 2 packs, 0.16 ms of 0.30 ms) and K4 at 73–79 % with 4.5 waves of 128×256 tiles (128×128
   is 2 % better there, within the margin). A KF for k̂ up to 2048 would need 8192-value
   tiles (64 KB of shared memory: dynamic, with the attribute set at plan creation).
 - r_skinny / r_bigk: K1 + pack of the large operand at 70–87 % of their bounds; see §1.

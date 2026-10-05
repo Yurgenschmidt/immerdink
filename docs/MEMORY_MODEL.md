@@ -218,8 +218,8 @@ Here:
 
 **Example: 8192³, N = 14, g = 14, β = 0, ρ = 1.** About 7.75 GiB of traffic (≈ 8 ms at
 ~1 TB/s) and `2·14·8192³ ≈ 1.54·10¹³` int8 ops (≈ 23 ms at the 4090's 660 TOPS dense
-peak). Published GEMMul8 runs take about 85 ms (4090 Laptop), so the headroom is in the
-non-GEMM kernels and GEMM efficiency.
+peak). The measured call takes ≈ 30 ms (NOTES-A5 §3.4), so what is left above the bound
+is in the non-GEMM kernels and GEMM efficiency.
 
 ## 5. On-chip resources per CTA (CUTLASS 2.x int8 GEMM on sm_89)
 

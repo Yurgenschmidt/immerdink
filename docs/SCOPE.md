@@ -65,7 +65,7 @@ Neither GEMMul8 (matrices only) nor TBLIS (native float only) does this.
 
 | Device                          | Native FP64        | INT8 path                         | Ozaki-II FP64 outlook                         |
 |---------------------------------|--------------------|-----------------------------------|-----------------------------------------------|
-| RTX 4090 (sm_89)                | ~1.3 TF peak, 1/64 rate | ~660 TOPS dense tensor core (`mma.sync …s8.s8`) | **Big win.** Paper reports ~9.8 TF vs 0.62 TF native DGEMM at n=8192 (~16×) |
+| RTX 4090 (sm_89)                | ~1.3 TF peak, 1/64 rate | ~660 TOPS dense tensor core (`mma.sync …s8.s8`) | **Big win.** The int8 rate is ~500× the FP64 rate, so N ≈ 14 int8 GEMMs leave a wide margin over native DGEMM |
 | i9-13900K (Raptor Lake, P+E)    | AVX2 FMA, 16 flop/cyc/P-core | AVX-VNNI `vpdpbusd` (u8×s8, 256-bit), roughly 8× the FP64 MAC rate | **Slower than native DGEMM.** N≈14 GEMMs at ~8× rate → ≤0.6× before overhead |
 
 On this CPU, Ozaki-II is a **correctness and reference** target, not a speed target. It

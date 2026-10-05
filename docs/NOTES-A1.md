@@ -1,7 +1,7 @@
 # A1 / A4 notes: small-problem overhead, K1 / K5 leftovers
 
-ROADMAP A1 (the ~50–70 µs per-call floor; small shapes at 0.35–0.8× GEMMul8) and A4 (K1 on
-very long rows, K5). Measure first, then fix by measured payoff. Design changes: DESIGN v1.4
+ROADMAP A1 (the ~50–70 µs per-call floor of small shapes) and A4 (K1 on very long rows,
+K5). Measure first, then fix by measured payoff. Design changes: DESIGN v1.4
 (§4 KF, moduli parts, §6a v2), `spec/Pipeline.tla` (`Fused`, `MParts`).
 
 All timings through `tools/run_bench.sh` (quiet gate) and, from 12:10 on 2026-10-03, also
@@ -51,8 +51,8 @@ What this says:
     thread, one store instruction per j̄), 23.6 cycles per issued instruction;
   - K1: two launches (A, B) of 3–5 µs each at small sizes.
 
-GEMMul8 does s128 at N = 8 in 19.5 µs end to end, so it is reachable only by removing
-launches *and* making each remaining kernel use the GPU.
+A call of ~20 µs at s128 is reachable only by removing launches *and* making each remaining
+kernel use the GPU.
 
 A2 (persistent K4, merged into this branch from dev `2961ea4`) changes the K4 column only;
 the same profile of dev + A2 is the baseline every "before" below refers to:
@@ -122,51 +122,41 @@ s128 at N = 8: 49.0 → 17.1 µs of GPU time (7 → 3 launches, gaps 4.2 → 1.4
 does what K0 + K1 + the packs did in 32 µs). sq1024 (k̂ = 1024 > 512) keeps the unfused
 sequence; its gain is K5 (32.5 → 18.8 µs at N = 8).
 
-## 4. Results vs GEMMul8 (same session, quiet-gated, `bench/results/a1-ab2-*.jsonl`)
+## 4. Results (same session, quiet-gated, `bench/results/a1-ab2-*.jsonl`)
 
-Each case ran the baseline bench (dev + A2 `2961ea4`: GEMMul8 and imd) and the A1 bench
-(`19335ff`: imd) back to back, each in its own gated process, 40 timed calls. Median µs;
-"vs G8" = GEMMul8 time / imd time (> 1: imd faster). For the permuted cases (s_cc8,
-s_cc16, s_perm) GEMMul8 runs on pre-permuted operands; the fair comparison is perm +
-GEMMul8 (in parentheses).
+Each case ran the baseline bench (dev + A2 `2961ea4`) and the A1 bench (`19335ff`) back to
+back, each in its own gated process, 40 timed calls. Median µs.
 
-| case | N | GEMMul8 | imd before | imd after | after / before | before vs G8 | **after vs G8** | after TFLOPS-eq |
-|---|---|---|---|---|---|---|---|---|
-| s128 | 8 | 18.4 | 54.0 | 19.2 | 0.36 | 0.34× | **0.96×** | 0.22 |
-| s128 | 14 | 92.4 ¹ | 71.7 | 23.6 | 0.33 | 1.29× | **3.9×** | 0.18 |
-| s256 | 8 | 21.5 | 51.2 | 23.4 | 0.46 | 0.42× | **0.92×** | 1.43 |
-| s256 | 14 | 111.6 ¹ | 73.6 | 24.6 | 0.33 | 1.52× | **4.5×** | 1.37 |
-| s512 | 8 | 33.8 | 65.5 | 36.1 | 0.55 | 0.52× | **0.94×** | 7.43 |
-| s512 | 14 | 91.7 ¹ | 75.8 | 49.4 | 0.65 | 1.21× | **1.86×** | 5.43 |
-| s_lowk | 8 | 303.0 | 191.6 | 106.5 | 0.56 | 1.58× | **2.84×** | 5.04 |
-| s_lowk | 14 | 483.7 | 239.4 | 181.9 | 0.76 | 2.02× | **2.66×** | 2.95 |
-| s_batch | 8 | 4432 | 182.1 | 110.6 | 0.61 | 24× | **40×** | 1.21 |
-| s_batch | 14 | 6897 | 237.6 | 186.9 | 0.79 | 29× | **37×** | 0.72 |
-| s_cc8 | 8 | 33.7 (46.0) | 68.6 | 39.9 | 0.58 | 0.49× (0.67×) | **0.84× (1.15×)** | 6.72 |
-| s_cc8 | 14 | 72.3 (138.8) ¹ | 82.9 | 47.1 | 0.57 | 0.87× (1.7×) | **1.54× (2.9×)** | 5.70 |
-| s_cc16 | 8 | 284.7 (369.3) | 334.8 | 307.1 | 0.92 | 0.85× (1.10×) | **0.93× (1.20×)** | 23.60 |
-| s_cc16 | 14 | 486.4 (576.4) | 455.7 | 437.2 | 0.96 | 1.07× (1.26×) | **1.11× (1.32×)** | 16.58 |
-| s_df | 8 | 67.6 | 95.2 | 52.4 | 0.55 | 0.71× | **1.29×** | 10.24 |
-| s_df | 14 | 110.8 | 121.8 | 81.6 | 0.67 | 0.91× | **1.36×** | 6.58 |
-| s_perm | 8 | 67.6 (150.0) | 96.3 | 53.2 | 0.55 | 0.70× | **1.27× (2.8×)** | 10.08 |
-| s_perm | 14 | 109.6 (118.8) | 146.5 | 88.1 | 0.60 | 0.75× (0.81×) | **1.24× (1.35×)** | 6.10 |
-| sq1024 | 8 | 102.2 | 123.9 | 107.8 | 0.87 | 0.83× | **0.95×** | 19.93 |
-| sq1024 | 14 | 187.4 | 183.3 | 169.0 | 0.92 | 1.02× | **1.11×** | 12.71 |
-| sq2048 | 8 | 596.7 | 628.2 | 576.5 | 0.92 | 0.95× | **1.04×** | 29.80 |
-| sq2048 | 14 | 984.1 | 874.5 | 844.8 | 0.97 | 1.13× | **1.16×** | 20.34 |
-| r_bigk | 8 | 7270 | 8056 | 7537 | 0.94 | 0.90× | **0.96×** | 36.47 |
-| r_bigk | 14 | 11175 | 11456 | 11052 | 0.96 | 0.98× | **1.01×** | 24.87 |
-
-¹ GEMMul8 at N = 14 on the smallest shapes is bimodal in this session (spread 25–54 %;
-s128 min 81.5 µs; an earlier session measured 49 µs). Its N = 8 times are stable (spread
-6–9 %), so N = 8 is the comparison that matters for the small-shape floor.
+| case | N | imd before | imd after | after / before | after TFLOPS-eq |
+|---|---|---|---|---|---|
+| s128 | 8 | 54.0 | 19.2 | 0.36 | 0.22 |
+| s128 | 14 | 71.7 | 23.6 | 0.33 | 0.18 |
+| s256 | 8 | 51.2 | 23.4 | 0.46 | 1.43 |
+| s256 | 14 | 73.6 | 24.6 | 0.33 | 1.37 |
+| s512 | 8 | 65.5 | 36.1 | 0.55 | 7.43 |
+| s512 | 14 | 75.8 | 49.4 | 0.65 | 5.43 |
+| s_lowk | 8 | 191.6 | 106.5 | 0.56 | 5.04 |
+| s_lowk | 14 | 239.4 | 181.9 | 0.76 | 2.95 |
+| s_batch | 8 | 182.1 | 110.6 | 0.61 | 1.21 |
+| s_batch | 14 | 237.6 | 186.9 | 0.79 | 0.72 |
+| s_cc8 | 8 | 68.6 | 39.9 | 0.58 | 6.72 |
+| s_cc8 | 14 | 82.9 | 47.1 | 0.57 | 5.70 |
+| s_cc16 | 8 | 334.8 | 307.1 | 0.92 | 23.60 |
+| s_cc16 | 14 | 455.7 | 437.2 | 0.96 | 16.58 |
+| s_df | 8 | 95.2 | 52.4 | 0.55 | 10.24 |
+| s_df | 14 | 121.8 | 81.6 | 0.67 | 6.58 |
+| s_perm | 8 | 96.3 | 53.2 | 0.55 | 10.08 |
+| s_perm | 14 | 146.5 | 88.1 | 0.60 | 6.10 |
+| sq1024 | 8 | 123.9 | 107.8 | 0.87 | 19.93 |
+| sq1024 | 14 | 183.3 | 169.0 | 0.92 | 12.71 |
+| sq2048 | 8 | 628.2 | 576.5 | 0.92 | 29.80 |
+| sq2048 | 14 | 874.5 | 844.8 | 0.97 | 20.34 |
+| r_bigk | 8 | 8056 | 7537 | 0.94 | 36.47 |
+| r_bigk | 14 | 11456 | 11052 | 0.96 | 24.87 |
 
 Large shapes (`bench/results/a1-ab1-*.jsonl`, 10 timed calls, every case of
 `bench/sweep_compare.txt` except sq16384, commit `14497c8` = this work minus the last two
-commits): after / before is 0.89–1.03 (no regression beyond noise; K5 gives 1–10 %):
-sq4096 1.15× / 1.29× GEMMul8 (N = 8 / 14), sq8192 1.12× / 1.15×, r_lowk 1.83× / 2.04×,
-t_df 1.35× / 1.53×, t_cc 1.15× / 1.27×, t_batch 1.06× / 1.18×, t_nn 1.16× / 1.29×,
-r_skinny 0.92× / 1.07×, r_mm 0.89× / 1.06×.
+commits): after / before is 0.89–1.03 (no regression beyond noise; K5 gives 1–10 %).
 
 ## 5. A4: per-phase before / after (bench phase marks, ms; % of the MEMORY_MODEL §4 bound)
 
@@ -196,16 +186,16 @@ L2 by design (the two-launch split was measured slower in v1.2).
 
 ## 6. The remaining floor
 
-- **s128 at N = 8 (0.96× GEMMul8):** 17.1 µs of GPU time = KF 6.1 + K4 5.6 + K5 4.0 + two
+- **s128 at N = 8 (19.2 µs per call):** 17.1 µs of GPU time = KF 6.1 + K4 5.6 + K5 4.0 + two
   gaps 1.4, plus ≈ 2 µs from the first launch to the first kernel. Three dependent kernels
   (scale + pack → GEMM → CRT) are the minimum for this pipeline: K4 needs every residue of
   both operands (a grid-wide dependency) and K5 every plane, and each kernel costs ≈ 2–3
   µs of launch, fill and drain even when tiny. Going lower needs the CRT inside the GEMM
   for small tiles (all N moduli per CTA; DESIGN §7 rejected it for useful tiles because of
   registers) or K4 and K5 in one persistent launch.
-- **s256 / s512 at N = 8 (0.92× / 0.94×):** K4 (7.5 / 10.8 µs: one 128×256 tile per
+- **s256 / s512 at N = 8 (23.4 / 36.1 µs per call):** K4 (7.5 / 10.8 µs: one 128×256 tile per
   modulus, few CTAs: A3 tile selection), KF at s512 (12.3 µs, instruction-bound: σ plus 8
   residues per element) and K5 (9.4 µs for 262 K outputs, instruction-bound CRT).
-- **N = 14:** at or above GEMMul8 on every small shape.
+- **N = 14:** the same three kernels, 23.6–49.4 µs per call at s128–s512.
 - **k̂ > 512 (sq1024, s_cc16)** keeps K0 + 2 K1 + 2 packs (5 launches, ≈ 50 µs at sq1024,
   N = 8); a KF for k̂ ≤ 1024 (8192-value tiles) is the next step there, with A3 for K4.

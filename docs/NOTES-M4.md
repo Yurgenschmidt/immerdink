@@ -111,10 +111,9 @@ only at large k, and there it is a 1.5× win.
 ## Remaining gaps (where the time still goes)
 
 - **K4** is 85–97 % of its bound at k ≥ 4096 (the bound uses the datasheet 660 TOPS; the
-  best cuBLASLt int8 rate on this box is ≈ 617 TOPS, so 93 % of datasheet is "at
-  cuBLASLt"). At k = 1024 (t_batch, t_ikl, r_lowk) it is 60–65 %: the CUTLASS 2.x
+  best int8 GEMM rate measured on this box is ≈ 617 TOPS, so 93 % of datasheet is the
+  practical ceiling). At k = 1024 (t_batch, t_ikl, r_lowk) it is 60–65 %: the CUTLASS 2.x
   epilogue (mod p, u8 store of N planes) runs after the main loop and is not overlapped.
-  Still faster than N × cuBLASLt int8 (int32 out) on those shapes.
 - **K5** is at ≈ 75 % of its bound.
 - **K1** is 65–84 % at k ≤ 8192 (55 % for B of `t_nn` / A of `t_permout`, read across
   rows) and 55–67 % for long rows (r_bigk 256 KB rows, sq16384): the second pass
@@ -123,8 +122,8 @@ only at large k, and there it is a 1.5× win.
   `bytes / PCIe`: the copy is a separate small DMA, and when the GPU is not busy the PCIe
   link sits in a low-power state (the measured rate is ≈ 2 GB/s). It is 6–9 % of r_mm and
   sq1024. See proposal 1.
-- Small shapes (sq1024 0.25 ms vs GEMMul8 0.175) are dominated by fixed costs: 8–10
-  launches, K0, and K4 at small k.
+- Small shapes (sq1024 0.25 ms) are dominated by fixed costs: 8–10 launches, K0, and K4 at
+  small k.
 
 ## Design proposals (not implemented; each changes DESIGN text and/or a spec)
 
