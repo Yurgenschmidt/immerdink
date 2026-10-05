@@ -32,6 +32,11 @@ if(Python3_FOUND)
   add_test(NAME host_perf
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_host.py"
                    --host-lib "$<TARGET_FILE:immerdink_host>" --suite perf -v)
+  # DESIGN v1.11 §6e: the fast planner queries (python/immerdink/planner.py) == host.py, bit
+  # for bit, on random queries; Planner / Memo bounds and threads. CPU only.
+  add_test(NAME host_planner
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_planner.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" -v)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files

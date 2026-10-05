@@ -796,7 +796,7 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
     """imd_perf_rank: the candidates N x g x vec mode x packs ranked by predicted time inside a
     device-memory budget (bytes; 0 = none). N: an int or a list of admissible N; g: None
     (every g in 1..N) or a list; packs: any of "NONE", "A", "B", "AB"."""
-    Ns = [int(N)] if isinstance(N, int) else [int(x) for x in N]
+    Ns = [int(N)] if hasattr(N, "__index__") else [int(x) for x in N]
     gs = [] if g is None else ([int(g)] if isinstance(g, int) else [int(x) for x in g])
     h, call = _prep(spec, extents, strides, Ns[0], 0, rounding, mode, "GENERATE", lib)
     narr = (C.c_int32 * max(len(Ns), 1))(*Ns)

@@ -23,7 +23,13 @@ first.
   `immerdink.contract`, `PlanCache`, `DeviceArray`): ctypes over the C ABI, any
   `__cuda_array_interface__` / DLPack array or raw pointer, no array library needed; test
   `python_device` (pytest), overhead `bench/python_overhead.py`.
-- **Verification on dev:** 7 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
+- **Hot-path planner (DESIGN v1.11 §6e, branch `planner-fast`, 2026-10-05):**
+  `python/immerdink/planner.py` (`Query`, `Planner`, opt-in `Memo`, lazy views): host.py's
+  queries bit for bit at 0.8–1.8 µs instead of 8–20 µs (C floor 0.25–0.86 µs; `rank` one C
+  call); pure ctypes, host API unchanged (v6), no nanobind. Test `host_planner`; per-call
+  numbers `bench/planner_overhead.py` (C floor: `imd_planner_floor`). Design questions open
+  for review (§6e.7).
+- **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
 - **D3 gate (Eric, 2026-10-04):** D3 begins with a design/theory discussion with Eric to narrow

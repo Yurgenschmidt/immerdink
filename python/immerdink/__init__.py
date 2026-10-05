@@ -2,6 +2,8 @@
 
 - `immerdink.host`: exact memory footprints and the lowering summary from the CUDA-free
   libimmerdink_host (DESIGN §6a), no GPU needed.
+- `immerdink.planner`: the same host queries for hot paths (DESIGN §6e): `Query`, `Planner`,
+  opt-in `Memo`, lazy results; bit-identical to `host`, about 1-2 µs per query.
 - The device API (DESIGN §6d, immerdink.device): `Plan`, `Pack`, `contract` (einsum front
   end) on caller-owned float64 CUDA arrays (__cuda_array_interface__, DLPack or
   `DeviceArray` raw pointers), a ctypes binding of libimmerdink's C ABI. Importing loads no
