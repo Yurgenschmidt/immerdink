@@ -2068,6 +2068,10 @@ workspace_bytes + 8bmn`:
 - **COLD** (`IMD_PERF_CACHE_COLD`, the default): `res = 0`, the inputs come from DRAM;
 - **WARM** (`IMD_PERF_CACHE_WARM`): `res = min(I, L_w)`, the inputs were just written or read
   (e.g. C of the previous call is A of this one).
+- **REPEAT** (`IMD_PERF_CACHE_REPEAT`): `res = res_repeat`, the state the calibration and the
+  hold-out are measured in (the same call just ran); the fitter and the validation predict in it,
+  so the fitted θ are unchanged by the cache term. (Design question: COLD is the default as
+  asked; the v6 model, fitted on repeat calls, effectively predicted REPEAT.)
 
 Each reading phase (KF; KL A / KL B; K5 for C) gets `(res_repeat − res)·Δ` added in proportion to
 its share of I, with Δ = `warm.l2byte` the calibrated saving per byte served from L2 instead of
@@ -2165,7 +2169,13 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   shipped: no clock lock; its `clocks` line records the state) is embedded at configure time
   (CMake reads the file into a raw string literal: the file is the one source; editing it
   re-runs the configure step). `imd_perf_calib_default` parses that text; a NULL calibration
-  pointer anywhere means the default.
+  pointer anywhere means the default. [v1.10] The text is parsed **once** (a function-local static, immutable after its
+  thread-safe initialization: no mutable state) and a NULL pointer uses it in place, with no
+  parse or copy per call (it cost ≈ 2 µs per query before). **NULL is the recommended way to use
+  the shipped calibration**: `imd_perf_calib_default` copies `struct_size` bytes of it, so a
+  caller compiled against version 6 gets its format-1 view (the v7 fields do not fit its
+  struct: no occupancy table, power model, cache term or bands), while NULL always means the
+  full one.
 
 ### 6c.3 API (host API version 6; [v1.10] version 7)
 
@@ -2329,7 +2339,7 @@ typedef struct { int32_t resident, regs, smem_bytes, threads; } imd_perf_kernel_
 const char* imd_perf_kernel_name(int32_t kernel);   /* "k0", "kf16", ..., "k5_n14_e4", "k5b_n14" */
 enum { IMD_PERF_BAND_SMALL, IMD_PERF_BAND_MID, IMD_PERF_BAND_LARGE };  /* < 100 us, < 1 ms, >= */
 enum { IMD_PERF_REGIME_DEFAULT = 0, IMD_PERF_REGIME_BURST = 1, IMD_PERF_REGIME_SUSTAINED = 2 };
-enum { IMD_PERF_CACHE_COLD = 0, IMD_PERF_CACHE_WARM = 1 };
+enum { IMD_PERF_CACHE_COLD = 0, IMD_PERF_CACHE_WARM = 1, IMD_PERF_CACHE_REPEAT = 2 };
 enum { IMD_PERF_ORDER_BAND = 0, IMD_PERF_ORDER_TIME = 1 };
 
 /* imd_perf_calib_t, appended (format 2):                                                    */

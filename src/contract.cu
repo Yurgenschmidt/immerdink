@@ -1579,4 +1579,57 @@ imd_status_t enqueue_pack(const ExecPlan& p, const PackLayout& pl, const double*
   return IMD_STATUS_SUCCESS;
 }
 
+
+// ---- v1.10 (DESIGN §6c.1): occupancy of every kernel for the performance-model calibration --
+namespace {
+
+template <class Kernel>
+cudaError_t occupancy_of(Kernel kernel, int threads, int32_t* out) {
+  cudaFuncAttributes a{};
+  cudaError_t e = cudaFuncGetAttributes(&a, reinterpret_cast<const void*>(kernel));
+  int r = 0;
+  if (e == cudaSuccess) e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&r, kernel, threads, 0);
+  if (e != cudaSuccess) return e;
+  out[0] = r, out[1] = a.numRegs, out[2] = static_cast<int32_t>(a.sharedSizeBytes);
+  out[3] = threads;
+  return cudaSuccess;
+}
+
+template <int N = imd::constants::kNMin>
+cudaError_t k5_occupancy(int n, int variant, int32_t* out) {
+  if (n == N) {
+    switch (variant) {
+      case 0: return occupancy_of(k5_crt_n<N, 1>, kThreads, out);
+      case 1: return occupancy_of(k5_crt_n<N, 2>, kThreads, out);
+      case 2: return occupancy_of(k5_crt_n<N, 4>, kThreads, out);
+      default: return occupancy_of(k5_crt_bfast<N>, kThreads, out);
+    }
+  }
+  if constexpr (N < imd::constants::kNMax) return k5_occupancy<N + 1>(n, variant, out);
+  else return cudaErrorInvalidValue;
+}
+
+}  // namespace
+
+cudaError_t kernel_occupancy(int32_t kernel, int32_t* out) {
+  switch (kernel) {
+    case IMD_PERF_KERNEL_K0: return occupancy_of(k0_vec<kK0SmallModes>, kThreads, out);
+    case IMD_PERF_KERNEL_KF16: return occupancy_of(kf_scale_pack<kK0SmallModes, 16>, kThreads, out);
+    case IMD_PERF_KERNEL_KF4: return occupancy_of(kf_scale_pack<kK0SmallModes, 4>, kThreads, out);
+    case IMD_PERF_KERNEL_KL8: return occupancy_of(kl_scale_pack<8>, kTileElems / 8, out);
+    case IMD_PERF_KERNEL_KL4: return occupancy_of(kl_scale_pack<4>, kTileElems / 4, out);
+    case IMD_PERF_KERNEL_PACK: return occupancy_of(k23_pack, kThreads, out);
+    case IMD_PERF_KERNEL_ZERO_ROWS: return occupancy_of(k23_zero_rows, kThreads, out);
+    case IMD_PERF_KERNEL_DIRECT: return occupancy_of(k_direct, kThreads, out);
+    case IMD_PERF_KERNEL_BETA: return occupancy_of(k5_beta_only, kThreads, out);
+    case IMD_PERF_KERNEL_PACK_PREP: return occupancy_of(kp_prep<kK0SmallModes>, kThreads, out);
+    default:
+      if (kernel >= IMD_PERF_KERNEL_K5 && kernel < IMD_PERF_KERNEL_COUNT) {
+        const int i = kernel - IMD_PERF_KERNEL_K5;
+        return k5_occupancy(imd::constants::kNMin + i / 4, i % 4, out);
+      }
+      return cudaErrorInvalidValue;  // K4: gemm_k4 (api.cpp imd_prof_kernel_occupancy)
+  }
+}
+
 }  // namespace imd::detail

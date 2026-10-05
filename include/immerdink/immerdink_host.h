@@ -430,7 +430,9 @@ enum { IMD_PERF_REGIME_DEFAULT = 0,   /* SUSTAINED if the calibration has a powe
        IMD_PERF_REGIME_BURST = 1,     /* the boost clock (power.clock_ref_mhz)               */
        IMD_PERF_REGIME_SUSTAINED = 2  /* the clock at which the call's power meets the cap   */ };
 enum { IMD_PERF_CACHE_COLD = 0,       /* the inputs come from DRAM                           */
-       IMD_PERF_CACHE_WARM = 1        /* the inputs are L2-resident up to warm.l2_bytes      */ };
+       IMD_PERF_CACHE_WARM = 1,       /* the inputs are L2-resident up to warm.l2_bytes      */
+       IMD_PERF_CACHE_REPEAT = 2      /* the calibration's state: the same call just ran (the
+                                         inputs resident only if the whole footprint fits)   */ };
 enum { IMD_PERF_ORDER_BAND = 0,       /* rank: ties with the best by footprint (v7 default)  */
        IMD_PERF_ORDER_TIME = 1        /* rank: the v6 order by predicted time                */ };
 enum { IMD_PERF_BAND_SMALL = 0, IMD_PERF_BAND_MID = 1, IMD_PERF_BAND_LARGE = 2 }; /* predicted

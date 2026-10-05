@@ -841,16 +841,34 @@ std::string format_calib(const imd_perf_calib_t& c) {
   return s;
 }
 
-// The calibration a function uses: the caller's (validated) or the shipped one, with the v7
-// fields of a format-1 or version-6-sized calibration migrated (built-in occupancy, no power
-// model, no cache term, no bands).
-imd_status_t resolve_calib(const imd_perf_calib_t* in, imd_perf_calib_t* cal) {
-  std::memset(cal, 0, sizeof *cal);
+// The shipped calibration, parsed once (C++11 thread-safe initialization of a function-local
+// static; immutable afterwards, so the model keeps no mutable state). A NULL calibration
+// pointer anywhere means this one, at its full (v7) size: the recommended way to use it.
+const imd_perf_calib_t* shipped_calib() {
+  static const imd_perf_calib_t kShipped = [] {
+    imd_perf_calib_t c;
+    std::memset(&c, 0, sizeof c);
+    c.struct_size = sizeof c;
+    if (parse_calib(std::string_view(kPerfCalibDefault, sizeof kPerfCalibDefault - 1), &c,
+                    nullptr) != IMD_STATUS_SUCCESS)
+      c.format = 0;  // unreachable: the shipped file is tested (perf_calib_shipped)
+    return c;
+  }();
+  return &kShipped;
+}
+
+// The calibration a function uses: the shipped one (NULL; no copy), or the caller's,
+// validated and copied into *scratch with the v7 fields of a format-1 or version-6-sized
+// calibration migrated (built-in occupancy, no power model, no cache term, no bands).
+imd_status_t resolve_calib(const imd_perf_calib_t* in, imd_perf_calib_t* scratch,
+                           const imd_perf_calib_t** use) {
   if (in == nullptr) {
-    cal->struct_size = sizeof *cal;
-    return parse_calib(std::string_view(kPerfCalibDefault, sizeof kPerfCalibDefault - 1), cal,
-                       nullptr);
+    *use = shipped_calib();
+    return (*use)->format == 0 ? IMD_STATUS_INVALID_VALUE : IMD_STATUS_SUCCESS;
   }
+  imd_perf_calib_t* cal = scratch;
+  *use = cal;
+  std::memset(cal, 0, sizeof *cal);
   if (in->struct_size < kCalibV1Size) return IMD_STATUS_INVALID_VALUE;
   std::memcpy(cal, in, std::min<size_t>(in->struct_size, sizeof *cal));
   if (in->struct_size < kCalibV7Size) {
@@ -936,7 +954,9 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   // repeat-call state, charged at warm.l2byte per byte to the phases that read them first.
   const double Lw = cal.warm_l2_bytes, I = P.inputs;
   const double res_repeat = std::clamp(Lw - (P.footprint - I), 0.0, I);
-  const double res = q.cache == IMD_PERF_CACHE_WARM ? std::min(I, Lw) : 0.0;
+  const double res = q.cache == IMD_PERF_CACHE_WARM     ? std::min(I, Lw)
+                     : q.cache == IMD_PERF_CACHE_REPEAT ? res_repeat
+                                                        : 0.0;
   const double cache_ns = (res_repeat - res) * cal.warm_l2byte_ns;
   double t = 0, bound = 0, eps_s = 0, lo = 0, hi = 0;
   for (int i = 0; i < P.n; ++i) {
@@ -1020,7 +1040,7 @@ bool eps_valid(double f) { return f < 0 || (f >= 0 && f <= 1); }  // NaN: invali
 
 bool v7_valid(int32_t regime, int32_t cache, double clock) {
   return regime >= IMD_PERF_REGIME_DEFAULT && regime <= IMD_PERF_REGIME_SUSTAINED &&
-         (cache == IMD_PERF_CACHE_COLD || cache == IMD_PERF_CACHE_WARM) && std::isfinite(clock) &&
+         cache >= IMD_PERF_CACHE_COLD && cache <= IMD_PERF_CACHE_REPEAT && std::isfinite(clock) &&
          clock >= 0;
 }
 
@@ -1077,9 +1097,14 @@ const char* imd_perf_kernel_name(int32_t kernel) { return imd::detail::kernel_na
 imd_status_t imd_perf_calib_default(imd_perf_calib_t* out) {
   if (out == nullptr || out->struct_size < imd::detail::kCalibV1Size) return IMD_STATUS_INVALID_VALUE;
   return imd::detail::guarded([&] {
-    return imd::detail::parse_calib(std::string_view(imd::detail::kPerfCalibDefault,
-                                                     sizeof imd::detail::kPerfCalibDefault - 1),
-                                    out, nullptr);
+    // The parsed-once shipped calibration, the caller's struct_size bytes of it (a version-6
+    // caller gets its format-1 view: the v7 fields do not fit; NULL is the full one).
+    imd_perf_calib_t c = *imd::detail::shipped_calib();
+    if (c.format == 0) return IMD_STATUS_INVALID_VALUE;
+    if (out->struct_size < imd::detail::kCalibV7Size) c.format = 1;
+    c.struct_size = out->struct_size;
+    std::memcpy(out, &c, std::min<size_t>(out->struct_size, sizeof c));
+    return IMD_STATUS_SUCCESS;
   });
 }
 
@@ -1153,10 +1178,12 @@ imd_status_t imd_perf_predict(const imd_tensor_t* A, const imd_tensor_t* B, cons
   std::memset(&r, 0, sizeof r);
   r.struct_size = out->struct_size;
   r.status = imd::detail::guarded([&] {
-    imd_perf_calib_t cal;
-    if (const imd_status_t st = imd::detail::resolve_calib(calib, &cal); st != IMD_STATUS_SUCCESS)
+    imd_perf_calib_t scratch;
+    const imd_perf_calib_t* cal = nullptr;
+    if (const imd_status_t st = imd::detail::resolve_calib(calib, &scratch, &cal);
+        st != IMD_STATUS_SUCCESS)
       return st;
-    return imd::detail::predict_contract(A, B, C, options, packing, q, cal, &r);
+    return imd::detail::predict_contract(A, B, C, options, packing, q, *cal, &r);
   });
   return imd::detail::finish(r, out);
 }
@@ -1173,10 +1200,12 @@ imd_status_t imd_perf_predict_pack(const imd_pack_desc_t* desc,
   std::memset(&r, 0, sizeof r);
   r.struct_size = out->struct_size;
   r.status = imd::detail::guarded([&] {
-    imd_perf_calib_t cal;
-    if (const imd_status_t st = imd::detail::resolve_calib(calib, &cal); st != IMD_STATUS_SUCCESS)
+    imd_perf_calib_t scratch;
+    const imd_perf_calib_t* cal = nullptr;
+    if (const imd_status_t st = imd::detail::resolve_calib(calib, &scratch, &cal);
+        st != IMD_STATUS_SUCCESS)
       return st;
-    return imd::detail::predict_pack(*desc, q, cal, &r);
+    return imd::detail::predict_pack(*desc, q, *cal, &r);
   });
   return imd::detail::finish(r, out);
 }
@@ -1212,8 +1241,11 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
   for (int32_t i = 0; i < req->residue_group_count; ++i)
     if (req->residue_groups[i] < 1) return IMD_STATUS_INVALID_VALUE;
   return guarded([&] {
-    imd_perf_calib_t cal;
-    if (const imd_status_t st = resolve_calib(calib, &cal); st != IMD_STATUS_SUCCESS) return st;
+    imd_perf_calib_t scratch;
+    const imd_perf_calib_t* calp = nullptr;
+    if (const imd_status_t st = resolve_calib(calib, &scratch, &calp); st != IMD_STATUS_SUCCESS)
+      return st;
+    const imd_perf_calib_t& cal = *calp;
     const int32_t vec_mask = req->vec_modes != 0 ? req->vec_modes : IMD_PERF_VEC_GENERATE;
     const int32_t pack_mask = req->pack_modes != 0 ? req->pack_modes : IMD_PERF_PACK_NONE;
     struct Cand {
