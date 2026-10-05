@@ -1,4 +1,4 @@
-# immerdink — design (v1.9)
+# immerdink — design (v1.11)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -26,6 +26,8 @@ changed text is marked **[v1.6]**. v1.7 (§6b, D1 packed operands; design approv
 implementation choices and one clarification of §6b.5 to confirm). v1.8 adds §6c, the
 performance model (ROADMAP B2: host API version 6; no semantic change). v1.9 adds §6d,
 the Python front end over the C ABI (ROADMAP B1; no semantic, layout or C API change).
+v1.11 adds §6e, fast host queries from Python for hot paths (`immerdink.planner`; no
+semantic, layout, C API or spec change; v1.10 is the parallel performance-model revision).
 The change lists are at the end.
 
 Sources:
@@ -1573,6 +1575,7 @@ lifetimes and exact footprints.
 | `immerdink/_arrays.py` | The array protocols: `__cuda_array_interface__`, DLPack capsules (read with `ctypes.pythonapi`), raw pointers (`DeviceArray`), stream objects. Pure Python, no CUDA call. |
 | `immerdink/device.py` | `Handle`, `Plan`, `Pack`, `PlanCache`, `Layout`, `contract`, `workspace_size`, `pack_spec`, the status exceptions. |
 | `immerdink/host.py` | unchanged (§6a); the device API reuses its public queries (`lowering`, `pack_desc_for`, `pack_layout`, `PackSpec`, `Desc`, `ImmerdinkError`). |
+| `immerdink/planner.py` | [v1.11, §6e] the host queries for hot paths: `Query`, `Planner`, `Memo`, lazy result views over host.py's C structs (bit-identical results, ~1–2 µs per query). |
 
 `import immerdink` loads no library and needs no GPU; libimmerdink is loaded on first use:
 `lib=` / `immerdink.load_library(path)`, else `$IMMERDINK_LIB` (the .so), else
@@ -2195,6 +2198,210 @@ legality. HostAPI's rules (pure, thread-safe host queries) cover it as they cove
 
 ---
 
+## 6e. Hot-path planner queries from Python [v1.11]
+
+Eric (2026-10-05): **"Planner calls will be very many one at a time calls on a hot path"**
+(ehrenfest, a Python code). Contraction calls stay as §6d (ctypes, about 1 µs over C). This
+section is about the host queries (§6a, §6b, §6c): `workspace_size`, `plan_bytes`,
+`lowering`, `pack_desc_for`, `predict`, `predict_pack`, `rank`. **No C change:** the host API
+stays version 6 and `libimmerdink_host` stays the single source of truth; the new code is the
+Python module `immerdink.planner` and a C timing tool. (v1.10 is the parallel
+performance-model revision; this section does not depend on it.)
+
+### 6e.1 Where the time went (before)
+
+`bench/planner_overhead.py`: six ehrenfest-like contractions (GEMM `ik,kj->ij` 16³ and 512³;
+CC ring `kjbc,kiac->abij` v = 64, o = 32; CC ladder `abef,efij->abij` v = 48, o = 16; DF
+`Qia,Qjb->iajb` Q = 256, o = 16, v = 64; DF transform `Qma,mi->Qia` Q = 256, m = 80) × N ∈
+{8, 14, 17}; µs per call, median of 11 interleaved rounds of 60 calls, one P-core
+(`taskset`), quiet machine, i9-13900K, Python 3.14.7, 2026-10-05. The **C floor** is the C
+function alone in a C loop (`imd_planner_floor`, `bench/planner_floor.c`: median of 7 batches
+of ~4 ms).
+
+| Entry point | C floor | `host.py` |
+|---|---|---|
+| `workspace_size` | 0.25–0.42 | 7.8–9.5 |
+| `lowering` | 0.52–0.71 | 11.7–13.4 |
+| `plan_bytes` | 0.37–0.58 | 8.1–9.7 |
+| `pack_desc_for` | 0.28–0.50 | 12.2–14.5 |
+| `predict` (calibration passed; NULL: 2.68–2.91) | 0.64–0.86 | 16.3–19.8 (calib passed: 13.9–17.4) |
+| `predict_pack` | 0.36–0.46 | 8.7–9.4 |
+| `rank` (one N, every g) | 5.1–14.5 | 32–63 |
+| `immerdink.workspace_size` (Layouts) | 0.25–0.42 | 7.5–8.8 |
+
+`host.predict` = parse the spec into `Desc`s 2.2–2.7 + build the ctypes structs (three
+tensors of three arrays each, options, request, the 1648-byte output) 4.3–5.3 + the ctypes
+call with prebuilt arguments 1.4–1.6 (of which C 0.6–0.9) + decode into dataclasses 4.7–6.6.
+With `calib=None` the C library also parses the embedded calibration text on every call
+(`resolve_calib(NULL)`: +2.1 µs). `host.rank` calls C twice (count, then fill) and builds a
+dataclass per candidate. Plan creation's host part (descriptors, structs, `imd_workspace_size`)
+is 7.0–8.4 µs, small next to `imd_plan_create` and paid once per `PlanCache` entry.
+
+**Target.** The C floor plus one ctypes foreign call (0.6–0.9 µs: the call row minus the
+floor): about 1–2 µs for a single query (≤ 2 µs for `predict`, inside the 2–3 µs asked for),
+and the C floor plus about 1–2 µs for `rank`, whose C cost is one prediction per candidate.
+
+### 6e.2 Decision
+
+In order of least new machinery:
+
+- **(a) Cheaper marshalling in pure ctypes — chosen.** A `Query` builds the three descriptor
+  structs once per contraction; option structs, packings, requests and the default
+  calibration are built once and reused; a call allocates only its output struct; results are
+  **lazy views** reading the C struct on attribute access; `rank` is one C call. Reaches the
+  target (§6e.6).
+- **(c) Memoization — chosen, explicit and opt-in.** `Memo(maxsize)`: bounded, keyed by the
+  full query, for callers that repeat identical queries (a hit: 0.6–1.0 µs).
+- (b) A handle-based C API (`imd_perf_query_create` caching the lowering) or a batch entry
+  point — **not needed.** A single query's C floor is 0.25–0.86 µs in total, so caching the
+  lowering would save well under 0.5 µs per call, while adding a C object with a lifetime
+  (a HostAPI spec change; §6c.6's "no handle, no state" property lost) and a host API version.
+  ehrenfest's pattern is one query at a time, so a batch entry point does not apply.
+  Reconsider only if a profile of ehrenfest shows `rank` dominating (its C cost scales with
+  the number of candidates).
+- (d) A nanobind module — **not needed.** After (a) the Python overhead over the C floor is
+  0.6–1.0 µs per single query (about one ctypes call plus one small object); a compiled
+  module could save at most that, and a memo hit is already below 1 µs. Not worth a compiled
+  extension and build dependency (§6d's decision stands).
+
+### 6e.3 API (`python/immerdink/planner.py`)
+
+```python
+from immerdink import planner
+
+q = planner.Query(spec, extents, strides=None, calib=None, memo=None, lib=None)
+q = planner.Query((A, B, C))                       # raw descriptors, as host.py
+q = planner.Query.from_layouts(spec, A, B, C)      # CUDA arrays or immerdink.Layout
+q.workspace_size(N, g=0, vec_mode="GENERATE", *, rounding="RN", mode="EMULATE", packing=None)
+q.plan_bytes(N, g=0, vec_mode="GENERATE", *, rounding, mode)            # (device, host)
+q.lowering(N, g=0, vec_mode="GENERATE", *, rounding, mode, sm_count=0, packing=None)
+q.pack_desc_for(operand, N, g=0, vec_mode="GENERATE", *, rounding, mode)   # host.PackSpec
+q.predict(N, g=0, vec_mode="GENERATE", *, rounding, mode, packing=None, request=None,
+          beta=False, alpha_zero=False, k4_config=None, eps_fraction=None, calib=None)
+q.predict_pack(pack, *, eps_fraction=None, request=None, calib=None)
+q.rank(N, g=None, vec_modes=("GENERATE",), packs=("NONE",), reuse=1, budget=0, beta=False,
+       *, rounding, mode, eps_fraction=None, calib=None, **fields)       # -> Ranking
+
+req = planner.Request(beta=True, eps_fraction=0.5)  # prebuilt imd_perf_request_t (+ **fields)
+r = q.rank([12, 14]); r[0], len(r), r[1:4], r.to_list()   # Ranking of lazy Candidates
+r.best(budget)                                      # == q.rank([12, 14], budget=budget)[0]
+p = q.predict(14); p.time_s, p.phase("K4 gemm"), p.to_prediction()   # lazy Prediction
+
+pl = planner.Planner(calib=None, memo=planner.Memo(4096), max_queries=1024, lib=None)
+pl.query(spec, extents, strides=None); pl.query_arrays(spec, A, B, C)   # cached Query
+pl.predict(spec, extents, N=14, ...)   # host.py's signatures: workspace_size, plan_bytes,
+                                       # lowering, pack_desc_for, predict, rank
+planner.default_calibration(lib=None)  # the shipped calibration, loaded once per library
+```
+
+`Prediction`, `Lowering` and `Candidate` have the attribute names and values of
+`host.Prediction` / `host.Lowering` / `host.Candidate`; `.to_prediction()`, `.to_lowering()`,
+`.to_candidate()` (and `Ranking.to_list()`) return exactly host.py's objects.
+
+### 6e.4 Semantics
+
+- **Bit-identical to host.py.** Each method calls the C function host.py calls with the same
+  struct contents (descriptors, options, request, packing, calibration); views decode with
+  host.py's code (`to_prediction` is `host._prediction`). Nothing is computed in Python.
+- **`calib=None`** passes the library's `imd_perf_calib_default`, loaded once per library,
+  instead of NULL: the same calibration the C library parses from NULL (tested on every
+  random query), without the 2.1 µs parse per call.
+- **Requests**: the default is the struct host.py builds (flags 0, `k4_config` −1,
+  `eps_fraction` −1). `Request(**fields)` and `rank(**fields)` set any later field of
+  `imd_perf_request_t` / `imd_perf_rank_request_t` by name, and a view's attribute that is a
+  field of the C struct is read by name, so later request and result fields flow through
+  without changing this module (a `Prediction` attribute of a later host.py dataclass that
+  is not a C field falls back to host.py's decoder; a `Lowering` / `Candidate` one raises
+  AttributeError naming it, so a needed converter is never silently missing).
+- **`rank`** passes the exact candidate count as the capacity (Σ over the N list of the g
+  values ≤ N, or N, × vec modes × pack modes): one C call (a second only if the library
+  reported more). `Ranking.best(budget)`: the order of SUCCESS candidates does not depend on
+  the budget (§6c.3), so the first SUCCESS candidate with `total_bytes ≤ budget` of a
+  budget-free ranking is the first of `rank(budget=budget)` (only `feasible` differs: True
+  in both). A caller whose budget changes per call ranks once (memoizable) and calls `best`.
+- **Views** are immutable (`__slots__`, read-only properties) and own their output struct.
+- **Errors**: the same statuses raise `ImmerdinkError` (plan-time statuses are returned in
+  `.status`, as host.py); an unknown option name is ValueError (host.py: KeyError).
+- The fast calls use the library's own function objects without `argtypes` (host.py's typed
+  declarations are untouched) and pass only pointers, None and int32 values.
+
+### 6e.5 Caches and threads
+
+- **Query**: the descriptor structs are immutable after construction. Its other caches hold
+  argument structs only, never results: option structs (≤ 512, cleared when full), packing
+  descriptors (≤ 64), rank N / g arrays (≤ 64). Dict operations are atomic, output structs are
+  per call: any number of threads may share a Query, with no lock on the call path.
+- **Memo** (opt-in, never implicit): key = (the Query object, the method, every argument);
+  calibrations by identity (treated as immutable). FIFO eviction beyond `maxsize` (a
+  `Prediction` entry holds ~1.7 KB: 4096 entries ≈ 7 MB). Lock-free lookups, inserts under a
+  lock; an unhashable argument (e.g. a list of N) bypasses it. A hit returns the stored,
+  immutable view. Valid because every query is a pure function of its arguments (§6a, §6c.3).
+- **Planner**: Queries keyed by (spec, the spec's extents in label order, strides), by the
+  normalized descriptors, or by (spec, Layouts) for `query_arrays`; bounded FIFO
+  (`max_queries`); an evicted Query stays valid for whoever holds it.
+- Process-wide: one entry (function objects, default calibration) per loaded `HostLibrary`,
+  as host.py's library cache.
+
+### 6e.6 Measured (after), tests, spec
+
+Same method as §6e.1 (µs per call, min–max over the 18 points):
+
+| Entry point | C floor | `host.py` | `planner.Query` | `Planner` (lookup) | Memo hit (`Planner`) |
+|---|---|---|---|---|---|
+| `workspace_size` | 0.25–0.42 | 7.8–9.5 | **0.84–1.00** | 1.17–1.41 | 0.57–0.60 |
+| `lowering` | 0.52–0.71 | 11.7–13.4 | **1.27–1.45** | | |
+| `plan_bytes` | 0.37–0.58 | 8.1–9.7 | **1.09–1.28** | | |
+| `pack_desc_for` | 0.28–0.50 | 12.2–14.5 | **2.42–2.71** | | |
+| `predict` | 0.64–0.86 | 16.3–19.8 | **1.60–1.82** | 2.06–2.30 | 0.74–0.79 |
+| `predict_pack` | 0.36–0.46 | 8.7–9.4 | **1.27–1.37** | | |
+| `rank` (one N, every g) | 5.1–14.5 | 32–63 | **7.2–16.7** | 7.7–17.2 | 0.95–1.00 |
+| workspace of arrays / Layouts | 0.25–0.42 | 7.5–8.8 (`immerdink.workspace_size`) | | 1.55–1.76 (`query_arrays`) | |
+
+Reading `.time_s` of a prediction adds < 0.02 µs; a memo hit through a held Query is 0.38 µs.
+`pack_desc_for` builds a `host.PackSpec` dataclass per call (memoizable).
+
+- **Tests** `host_planner` (CPU, ctest; `tests/test_planner.py`): 3000 random single queries
+  (legal and illegal descriptors, every vec mode, mode, rounding and g, packed operands incl.
+  PACK_MISMATCH, random requests, two synthetic calibrations and the default): every result
+  bit-identical to host.py (floats compared by bits), every lazy attribute equal to the
+  dataclass's, the same error statuses; 600 random `rank` requests (N and g lists, vec / pack
+  masks, reuse, budgets, invalid values): identical lists, exactly one C call each,
+  `best(b) == rank(budget=b)[0]`; Planner keying (spec, extents, strides, raw descriptors,
+  Layouts) and bound; Memo hits, bound, bypass; 8 threads sharing a Planner with a small Memo
+  (evicting) and one without: results identical to the serial host.py ones, the bound held;
+  argument errors.
+- **No TLA+ change.** No C code changes; the Python caches memoize pure functions of
+  immutable keys and hand out immutable values (the §6d.8 argument for `PlanCache`), and a
+  Query holds no C object with a lifetime.
+
+### 6e.7 Design questions (decided conservatively; for review)
+
+1. **A new module** `immerdink.planner` beside an unchanged `host.py` (rather than routing
+   host.py's functions through the fast path): additive, no change for existing callers, no
+   overlap with the v1.10 performance-model work in host.py.
+2. **Lazy views** instead of dataclasses for fast results (`.to_*()` gives the dataclasses;
+   eager decoding costs 4.7–6.6 µs per prediction).
+3. **`calib=None` → the cached default passed explicitly.** Relies on NULL ≡
+   `imd_perf_calib_default` (true; tested on every random query). Suggested to the
+   performance-model owner: parse the shipped calibration once in C (a C++11 function-local
+   static: thread-safe initialization, no mutable global state), which takes 2.1 µs off every
+   `host.predict(calib=None)` and every C caller passing NULL. Not done here (perf.cpp is the
+   v1.10 work's).
+4. **FIFO eviction** for Memo and Planner (not LRU): lock-free hits; the expected working set
+   is small and stable. Default `Memo` size 4096, `max_queries` 1024.
+5. **Memo keys use the Query object's identity** (hashing descriptor dataclasses would cost
+   ~1 µs per hit): two Query objects of one contraction do not share entries; a Planner gives
+   one Query per contraction.
+6. **Unknown option names raise ValueError** in the new API (host.py raises KeyError).
+7. **`rank` returns a `Ranking`** (an immutable sequence of views) rather than a list.
+8. **Untyped ctypes function objects** on the fast path (no argtypes conversion); host.py's
+   typed declarations are unchanged.
+9. **No change to the device API** (`Plan`, `PlanCache`, `immerdink.workspace_size`): plan
+   creation is paid once per cache entry; workspace queries on a hot path use
+   `Planner.query_arrays` (1.6–1.8 µs vs 7.5–8.8 µs).
+
+---
+
 ## 7. What was considered and rejected
 
 | Option | Why not |
@@ -2391,3 +2598,15 @@ and host API; every value the same integer (bit-identical, tested on every contr
   caller's; RESIDENT plans live as long as any graph that captured them. No TLA+ change
   (§6d.8 says why). Tests: `python_device`. Reviewed 2026-10-05 (CAI stream "check" by
   default, `PlanCache.clear()` drops GENERATE plans, `freeze()`, pack use counts).
+
+## v1.11 (hot-path planner queries; no semantic, layout, C API or spec change)
+
+- **§6e (new).** `python/immerdink/planner.py`: `Query` (a contraction's C descriptor structs
+  built once; option, packing, request and default-calibration structs reused; lazy result
+  views; `rank` in one C call), `Planner` (bounded Query cache, host.py's signatures),
+  `Memo` (explicit, bounded, thread-safe memo of identical queries), `Request`,
+  `Ranking.best(budget)`. Results bit-identical to host.py; per query 0.8–1.8 µs instead of
+  8–20 µs (C floor 0.25–0.86 µs), `rank` 7–17 µs instead of 32–63 µs, a memo hit 0.4–1.0 µs.
+  Pure ctypes: host API unchanged (version 6), no nanobind (§6e.2). `bench/planner_floor.c`
+  (`imd_planner_floor`) times the C functions alone; `bench/planner_overhead.py` prints
+  both. No TLA+ change (§6e.6). Tests: `host_planner`. Design questions: §6e.7.

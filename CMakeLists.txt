@@ -104,6 +104,10 @@ add_library(imd_host_internal INTERFACE)
 target_include_directories(imd_host_internal INTERFACE
   "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/src/host")
 target_link_libraries(imd_host_internal INTERFACE immerdink_host imd_constants)
+# DESIGN §6e: the C floor of the planner queries (ns per host-library call in a C loop),
+# driven by bench/planner_overhead.py. CPU only; built in host-only builds too.
+add_executable(imd_planner_floor bench/planner_floor.c)
+target_link_libraries(imd_planner_floor PRIVATE immerdink_host imd_warnings)
 
 if(NOT IMMERDINK_HOST_ONLY)
 # --- CUTLASS (header-only, CUDA translation units only) ----------------------------------
