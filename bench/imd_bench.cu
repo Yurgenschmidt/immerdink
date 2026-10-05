@@ -788,7 +788,10 @@ struct Bench {
 #ifdef IMD_BENCH_PROFILE
     imd_prof_plan_k4(plan, &k4_plan);
 #endif
-    imd_perf_request_t preq{sizeof(imd_perf_request_t), 0, k4_plan, 0};
+    // v1.10: the bench's state (the same call repeated) at the reference clock; the default
+    // eps fraction (the v6 bench passed 0 here by value-initialization).
+    imd_perf_request_t preq{sizeof(imd_perf_request_t), 0, k4_plan, 0, -1.0,
+                            IMD_PERF_REGIME_BURST, o.l2_flush ? IMD_PERF_CACHE_COLD : IMD_PERF_CACHE_REPEAT, 0.0};
     imd_perf_t pred{};
     pred.struct_size = sizeof pred;
     imd_perf_predict(&A, &B, &C, &opt, nullptr, &preq, nullptr, &pred);
@@ -1073,9 +1076,11 @@ struct Bench {
           {"plain_", do_plain}, {"packed_", do_packed}, {"pack_", do_pack}};
       imd_perf_t preds[3] = {};
       for (auto& pr : preds) pr.struct_size = sizeof pr;
-      imd_perf_predict(&A, &B, &C, &opt, nullptr, nullptr, nullptr, &preds[0]);
-      imd_perf_predict(&A, &B, &C, &opt, &packing, nullptr, nullptr, &preds[1]);
-      imd_perf_predict_pack(&desc, nullptr, nullptr, &preds[2]);
+      const imd_perf_request_t rq{sizeof(imd_perf_request_t), 0, -1, 0, -1.0,
+                                  IMD_PERF_REGIME_BURST, IMD_PERF_CACHE_REPEAT, 0.0};
+      imd_perf_predict(&A, &B, &C, &opt, nullptr, &rq, nullptr, &preds[0]);
+      imd_perf_predict(&A, &B, &C, &opt, &packing, &rq, nullptr, &preds[1]);
+      imd_perf_predict_pack(&desc, &rq, nullptr, &preds[2]);
       int ri = 0;
       for (auto& [pre, fn] : runs) {
         fprintf(stderr, "  %sphases:\n", pre);

@@ -36,7 +36,7 @@ __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "work
            "pack_desc_for", "REGIONS", "STATUS", "PACK_MISMATCH", "Calibration", "predict",
            "predict_pack", "rank", "param_names", "PERF_CLASSES", "PERF_PHASES"]
 
-API_VERSION = 6  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+API_VERSION = 7  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
 
 STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT_WORKSPACE",
           "MISALIGNED", "CUDA_ERROR", "ALLOC_FAILED", "PACK_MISMATCH"]
@@ -58,6 +58,14 @@ _PERF_MAX_PARAMS, _PERF_PARAM_CAPACITY, _PERF_MAX_PHASES = 6, 96, 16
 _PERF_BETA_NONZERO, _PERF_ALPHA_ZERO = 1, 2
 _PERF_VEC = {"GENERATE": 1, "RESIDENT": 2}
 _PERF_PACK = {"NONE": 1, "A": 2, "B": 4, "AB": 8}
+# v7 (DESIGN v1.10 §6c)
+_PERF_KERNEL_CAPACITY, _PERF_KERNEL_COUNT, _PERF_CLASS_CAPACITY = 128, 90, 16
+PERF_REGIMES = {"DEFAULT": 0, "BURST": 1, "SUSTAINED": 2}
+PERF_CACHES = {"COLD": 0, "WARM": 1, "REPEAT": 2}
+PERF_ORDERS = {"BAND": 0, "TIME": 1}
+# The parameters new in calibration format 2 (absent from a format-1 file).
+FORMAT2_PARAMS = frozenset({"k0.chain", "kl.chain", "pack.chain", "k5.chain", "direct.chain",
+                            "beta.chain"})
 
 
 class ImmerdinkError(RuntimeError):
@@ -128,12 +136,22 @@ class _PerfCalib(C.Structure):
                 ("peak_int8_ops_per_s", C.c_double), ("peak_fp64_flops_per_s", C.c_double),
                 ("l2_bytes", C.c_double), ("gpu", C.c_char * 64), ("date", C.c_char * 32), ("version", C.c_char * 64),
                 ("clocks", C.c_char * 128), ("notes", C.c_char * 128),
-                ("param", C.c_double * _PERF_PARAM_CAPACITY)]
+                ("param", C.c_double * _PERF_PARAM_CAPACITY),
+                # v7 (format 2)
+                ("kernel", (C.c_int32 * 4) * _PERF_KERNEL_CAPACITY),
+                ("clock_ref_mhz", C.c_double), ("clock_min_mhz", C.c_double),
+                ("power_cap_w", C.c_double), ("power_idle_w", C.c_double),
+                ("energy_tc_pj", C.c_double), ("energy_alu_pj", C.c_double),
+                ("energy_byte_pj", C.c_double), ("energy_gamma", C.c_double),
+                ("warm_l2_bytes", C.c_double), ("warm_l2byte_ns", C.c_double),
+                ("band_call", (C.c_double * 2) * 3),
+                ("band_class", (C.c_double * 2) * _PERF_CLASS_CAPACITY)]
 
 
 class _PerfRequest(C.Structure):
     _fields_ = [("struct_size", C.c_uint32), ("flags", C.c_int32), ("k4_config", C.c_int32),
-                ("reserved", C.c_int32), ("eps_fraction", C.c_double)]
+                ("reserved", C.c_int32), ("eps_fraction", C.c_double),
+                ("regime", C.c_int32), ("cache", C.c_int32), ("clock_mhz", C.c_double)]  # v7
 
 
 class _PerfPhase(C.Structure):
@@ -150,7 +168,13 @@ class _Perf(C.Structure):
                 ("kernel_launches", C.c_int64),
                 ("workspace_bytes", C.c_uint64), ("plan_device_bytes", C.c_uint64),
                 ("pack_bytes", C.c_uint64), ("pack_ws_bytes", C.c_uint64),
-                ("phase", _PerfPhase * _PERF_MAX_PHASES)]
+                ("phase", _PerfPhase * _PERF_MAX_PHASES),
+                # v7
+                ("regime", C.c_int32), ("cache", C.c_int32), ("clock_mhz", C.c_double),
+                ("power_w", C.c_double), ("warm_bytes", C.c_double),
+                ("time_p10_s", C.c_double), ("time_p90_s", C.c_double),
+                ("phase_p10_s", C.c_double * _PERF_MAX_PHASES),
+                ("phase_p90_s", C.c_double * _PERF_MAX_PHASES)]
 
 
 class _RankRequest(C.Structure):
@@ -159,7 +183,9 @@ class _RankRequest(C.Structure):
                 ("num_moduli", C.POINTER(C.c_int32)), ("residue_groups", C.POINTER(C.c_int32)),
                 ("vec_modes", C.c_int32), ("pack_modes", C.c_int32), ("reuse", C.c_int32),
                 ("flags", C.c_int32), ("budget_bytes", C.c_uint64),
-                ("eps_fraction", C.c_double)]
+                ("eps_fraction", C.c_double),
+                ("regime", C.c_int32), ("cache", C.c_int32), ("order", C.c_int32),
+                ("reserved", C.c_int32), ("clock_mhz", C.c_double)]  # v7
 
 
 class _Candidate(C.Structure):
@@ -170,15 +196,18 @@ class _Candidate(C.Structure):
                 ("eps_s", C.c_double), ("eps_fraction", C.c_double),
                 ("workspace_bytes", C.c_uint64), ("plan_device_bytes", C.c_uint64),
                 ("pack_bytes", C.c_uint64), ("pack_ws_bytes", C.c_uint64),
-                ("total_bytes", C.c_uint64), ("kernel_launches", C.c_int64)]
+                ("total_bytes", C.c_uint64), ("kernel_launches", C.c_int64),
+                ("time_p10_s", C.c_double), ("time_p90_s", C.c_double),  # v7
+                ("clock_mhz", C.c_double), ("power_w", C.c_double),
+                ("tie", C.c_int32), ("raw_rank", C.c_int32)]
 
 
 assert C.sizeof(_Lowering) == 184  # version 5 (DESIGN §6b v1.7)
 assert C.sizeof(_Options) == 24
 assert C.sizeof(_PackDesc) == 72 and C.sizeof(_PackLayout) == 136
-assert C.sizeof(_PerfCalib) == 1232 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1648
-assert C.sizeof(_RankRequest) == 64 and C.sizeof(_Candidate) == 128
-assert C.sizeof(_PerfRequest) == 24
+assert C.sizeof(_PerfCalib) == 3664 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1952
+assert C.sizeof(_RankRequest) == 88 and C.sizeof(_Candidate) == 168
+assert C.sizeof(_PerfRequest) == 40
 
 
 # ------------------------------------------------------------------------------------------
@@ -247,6 +276,7 @@ class HostLibrary:
             "imd_perf_class_name": (C.c_char_p, [C.c_int32]),
             "imd_perf_param_name": (C.c_char_p, [C.c_int32, C.c_int32]),
             "imd_perf_phase_name": (C.c_char_p, [C.c_int32]),
+            "imd_perf_kernel_name": (C.c_char_p, [C.c_int32]),  # v7
             "imd_perf_predict": (C.c_int, [T, T, T, O, C.POINTER(_Packing),
                                            C.POINTER(_PerfRequest), C.POINTER(_PerfCalib),
                                            C.POINTER(_Perf)]),
@@ -620,15 +650,64 @@ class Calibration:
         return cls(c, h)
 
     @classmethod
-    def from_values(cls, meta, params, lib=None):
+    def from_values(cls, meta, params, lib=None, extra=None):
         """A calibration from a metadata dict and a {"<class>.<feature>": value} dict, through
-        the format-1 text (so the C parser validates it)."""
+        the calibration text (so the C parser validates it). extra (v7): {key: value or tuple}
+        of the format-2 keys ("kernel.kf16": (2, 128, 48640, 256), "power.cap_w": 450,
+        "band.call_small": (0.9, 1.1), ...); with extra the text is format 2 (every format-2
+        key is then required), else format 1."""
         keys = ("gpu", "sm_count", "date", "version", "clocks", "notes",
                 "peak_dram_bytes_per_s", "peak_int8_ops_per_s", "peak_fp64_flops_per_s",
                 "l2_bytes")
-        lines = ["format = 1"] + [f"{k} = {meta[k]}" for k in keys if k in meta]
+        lines = [f"format = {2 if extra else 1}"] + [f"{k} = {meta[k]}" for k in keys if k in meta]
         lines += [f"{k} = {float(v)!r}" for k, v in params.items()]
+        for k, v in (extra or {}).items():
+            vals = v if isinstance(v, (tuple, list)) else (v,)
+            lines.append(f"{k} = " + " ".join(repr(x) if isinstance(x, float) else str(x)
+                                              for x in vals))
         return cls.parse("\n".join(lines) + "\n", lib)
+
+    @property
+    def format(self):
+        return self._raw.format
+
+    @property
+    def extra(self):
+        """v7: the format-2 keys as from_values takes them ({} for a format-1 calibration)."""
+        r = self._raw
+        if r.format != 2:
+            return {}
+        out = {f"kernel.{n}": tuple(r.kernel[k]) for k, n in enumerate(kernel_names(self._lib))}
+        out.update(self.power)
+        out.update({"warm.l2_bytes": r.warm_l2_bytes, "warm.l2byte": r.warm_l2byte_ns})
+        out.update(self.bands)
+        return out
+
+    @property
+    def kernels(self):
+        """v7: {kernel name: (CTAs per SM, registers, shared memory bytes, threads)}."""
+        r = self._raw
+        return {n: tuple(r.kernel[k]) for k, n in enumerate(kernel_names(self._lib))}
+
+    @property
+    def power(self):
+        r = self._raw
+        return {"power.clock_ref_mhz": r.clock_ref_mhz, "power.clock_min_mhz": r.clock_min_mhz,
+                "power.cap_w": r.power_cap_w, "power.idle_w": r.power_idle_w,
+                "power.tc_pj": r.energy_tc_pj, "power.alu_pj": r.energy_alu_pj,
+                "power.byte_pj": r.energy_byte_pj, "power.gamma": r.energy_gamma}
+
+    @property
+    def warm(self):
+        return {"warm.l2_bytes": self._raw.warm_l2_bytes, "warm.l2byte": self._raw.warm_l2byte_ns}
+
+    @property
+    def bands(self):
+        r = self._raw
+        out = {f"band.call_{n}": tuple(r.band_call[i]) for i, n in
+               enumerate(("small", "mid", "large"))}
+        out.update({f"band.{c}": tuple(r.band_class[i]) for i, c in enumerate(PERF_CLASSES)})
+        return out
 
     def format(self):
         """The canonical format-1 text (imd_perf_calib_format)."""
@@ -655,9 +734,16 @@ class Calibration:
         out = {}
         for cl, names in enumerate(param_names(self._lib).values()):
             for j, name in enumerate(names):
-                if name is not None:
-                    out[f"{PERF_CLASSES[cl]}.{name}"] = self._raw.param[cl * _PERF_MAX_PARAMS + j]
+                key = f"{PERF_CLASSES[cl]}.{name}"
+                if name is not None and (self._raw.format == 2 or key not in FORMAT2_PARAMS):
+                    out[key] = self._raw.param[cl * _PERF_MAX_PARAMS + j]
         return out
+
+
+def kernel_names(lib=None):
+    """v7: the kernel names of the occupancy table (imd_perf_kernel_name), in index order."""
+    h = load(lib) if not isinstance(lib, HostLibrary) else lib
+    return [h.lib.imd_perf_kernel_name(k).decode() for k in range(_PERF_KERNEL_COUNT)]
 
 
 def param_names(lib=None):
@@ -685,6 +771,8 @@ class PhasePrediction:
     bound_s: float
     x: tuple         # features (the model: sum of param[cls][j] * x[j], ns; K4: max of
                      # the round-model terms j < 4 and the DRAM term j = 4)
+    p10_s: float = 0.0  # v7: the phase's band
+    p90_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -706,6 +794,13 @@ class Prediction:
     pack_bytes: int
     pack_ws_bytes: int
     phases: tuple    # PhasePrediction, in launch order (the call term last)
+    regime: str = "BURST"     # v7: the regime used, the cache state, the SM clock (0: no
+    cache: str = "COLD"       # clock model), the call's power there (0: no power model), the
+    clock_mhz: float = 0.0    # input bytes served from L2, and the band of time_s
+    power_w: float = 0.0
+    warm_bytes: float = 0.0
+    time_p10_s: float = 0.0
+    time_p90_s: float = 0.0
 
     def phase(self, name):
         """The PhasePrediction with this name, or None."""
@@ -722,12 +817,17 @@ def _calib_arg(calib):
 
 def _prediction(r, st):
     phases = tuple(PhasePrediction(PERF_PHASES[p.phase], PERF_CLASSES[p.cls], p.launches,
-                                   p.time_s, p.bytes, p.ops, p.bound_s, tuple(p.x))
-                   for p in r.phase[:r.num_phases])
+                                   p.time_s, p.bytes, p.ops, p.bound_s, tuple(p.x),
+                                   r.phase_p10_s[i], r.phase_p90_s[i])
+                   for i, p in enumerate(r.phase[:r.num_phases]))
+    reg = {v: k for k, v in PERF_REGIMES.items()}
+    cac = {v: k for k, v in PERF_CACHES.items()}
     return Prediction(STATUS[st], DISPATCH[r.dispatch], r.k4_config, r.sm_count, r.time_s,
                       r.bound_s, r.flops_eq, r.tflops_eq, r.eps_s, r.eps_fraction,
                       r.kernel_launches, r.workspace_bytes, r.plan_device_bytes, r.pack_bytes,
-                      r.pack_ws_bytes, phases)
+                      r.pack_ws_bytes, phases, reg.get(r.regime, "BURST"),
+                      cac.get(r.cache, "COLD"), r.clock_mhz, r.power_w, r.warm_bytes,
+                      r.time_p10_s, r.time_p90_s)
 
 
 def _eps(eps_fraction):
@@ -736,17 +836,20 @@ def _eps(eps_fraction):
 
 def predict(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",
             vec_mode="GENERATE", packing=None, beta=False, alpha_zero=False, k4_config=None,
-            eps_fraction=None, calib=None, lib=None):
+            eps_fraction=None, regime="DEFAULT", cache="COLD", clock_mhz=0.0, calib=None,
+            lib=None):
     """imd_perf_predict: the predicted imd_contract (DESIGN §6c). A plan-time status is
     returned in .status (with zeros); a bad argument raises. packing = (PackSpec or None,
     PackSpec or None): the packed plan. beta: C is read (beta != 0); alpha_zero: the beta-only
     call; k4_config: force an IMD_K4_* configuration (None: the plan-time rule); eps_fraction:
     the fraction of pack work on the eps path (None: the typical-data default; see
-    immerdink_host.h)."""
+    immerdink_host.h). v7: regime "DEFAULT" / "BURST" / "SUSTAINED", cache "COLD" / "WARM" /
+    "REPEAT", clock_mhz > 0: predict at that SM clock."""
     h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing)
     flags = (_PERF_BETA_NONZERO if beta else 0) | (_PERF_ALPHA_ZERO if alpha_zero else 0)
     req = _PerfRequest(C.sizeof(_PerfRequest), flags,
-                       -1 if k4_config is None else int(k4_config), 0, _eps(eps_fraction))
+                       -1 if k4_config is None else int(k4_config), 0, _eps(eps_fraction),
+                       PERF_REGIMES[regime], PERF_CACHES[cache], float(clock_mhz))
     r = _Perf()
     r.struct_size = C.sizeof(_Perf)
     pk = C.byref(call.packing) if packing is not None else None
@@ -754,13 +857,15 @@ def predict(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EM
     return _prediction(r, st)
 
 
-def predict_pack(pack, *, eps_fraction=None, calib=None, lib=None):
+def predict_pack(pack, *, eps_fraction=None, regime="DEFAULT", cache="COLD", clock_mhz=0.0,
+                 calib=None, lib=None):
     """imd_perf_predict_pack: the predicted imd_pack of a PackSpec."""
     h = load(lib) if not isinstance(lib, HostLibrary) else lib
     arg = _PackArg(pack)
     r = _Perf()
     r.struct_size = C.sizeof(_Perf)
-    req = _PerfRequest(C.sizeof(_PerfRequest), 0, -1, 0, _eps(eps_fraction))
+    req = _PerfRequest(C.sizeof(_PerfRequest), 0, -1, 0, _eps(eps_fraction),
+                       PERF_REGIMES[regime], PERF_CACHES[cache], float(clock_mhz))
     st = h.lib.imd_perf_predict_pack(C.byref(arg.d), C.byref(req), _calib_arg(calib), C.byref(r))
     return _prediction(r, st)
 
@@ -788,11 +893,18 @@ class Candidate:
     pack_ws_bytes: int
     total_bytes: int
     kernel_launches: int
+    time_p10_s: float = 0.0   # v7: band of time_s, the contract's clock and power, tie with
+    time_p90_s: float = 0.0   # the best (ORDER_BAND) and the place in the v6 time order
+    clock_mhz: float = 0.0
+    power_w: float = 0.0
+    tie: bool = False
+    raw_rank: int = 0
 
 
 def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",),
          packs=("NONE",), reuse=1, budget=0, beta=False, rounding="RN", mode="EMULATE",
-         eps_fraction=None, calib=None, lib=None):
+         eps_fraction=None, order="BAND", regime="DEFAULT", cache="COLD", clock_mhz=0.0,
+         calib=None, lib=None):
     """imd_perf_rank: the candidates N x g x vec mode x packs ranked by predicted time inside a
     device-memory budget (bytes; 0 = none). N: an int or a list of admissible N; g: None
     (every g in 1..N) or a list; packs: any of "NONE", "A", "B", "AB"."""
@@ -806,7 +918,9 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
                        C.cast(garr, C.POINTER(C.c_int32)) if gs else None,
                        sum(_PERF_VEC[v] for v in set(vec_modes)),
                        sum(_PERF_PACK[p] for p in set(packs)), int(reuse),
-                       _PERF_BETA_NONZERO if beta else 0, int(budget), _eps(eps_fraction))
+                       _PERF_BETA_NONZERO if beta else 0, int(budget), _eps(eps_fraction),
+                       PERF_REGIMES[regime], PERF_CACHES[cache], PERF_ORDERS[order], 0,
+                       float(clock_mhz))
     count = C.c_int32(0)
     st = h.lib.imd_perf_rank(*call.args(), C.byref(req), _calib_arg(calib), None, 0,
                              C.byref(count))
@@ -823,7 +937,8 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
                       c.k4_config, DISPATCH[c.dispatch], c.time_s, c.contract_s, c.pack_s,
                       c.tflops_eq, c.eps_s, c.eps_fraction, c.workspace_bytes,
                       c.plan_device_bytes, c.pack_bytes,
-                      c.pack_ws_bytes, c.total_bytes, c.kernel_launches)
+                      c.pack_ws_bytes, c.total_bytes, c.kernel_launches, c.time_p10_s,
+                      c.time_p90_s, c.clock_mhz, c.power_w, bool(c.tie), c.raw_rank)
             for c in out[:count.value]]
 
 

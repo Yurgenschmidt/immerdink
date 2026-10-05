@@ -728,10 +728,26 @@ def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks, l2):
     return x
 
 
-def spec_kf_chain(rows, k_hat, g, sms):
+def spec_launch_blocks(work, per=256):
+    return min(max(-(-work // per), 1), 1 << 20)
+
+
+def spec_chain(gx, gy, units, u, resident, sms):
+    """The busiest SM's per-thread chain of one launch (DESIGN v1.10 §6c.1 "Waves and
+    occupancy"): ceil(B / (S r)) waves x ceil(units / grid_x) grid-stride steps x u."""
+    if units <= 0 or gx <= 0:
+        return 0
+    return -(-(gx * gy) // (sms * resident)) * -(-units // gx) * u
+
+
+def spec_parts(tiles, gsize, sms):
+    return 1 if tiles >= 2 * sms else min(gsize, -(-2 * sms // tiles))
+
+
+def spec_kf_chain(rows, k_hat, g, sms, r16=2, r4=4):
     """KF's busiest-SM chain (DESIGN §6c.1), for operands read along k-bar (radix 1): tiles of
-    4096 values (E = 16, 2 blocks per SM) or, below 16 blocks per SM even with all moduli split,
-    1024 (E = 4, 4 per SM); moduli parts when tiles < 2 SMs."""
+    4096 values (E = 16, r16 blocks per SM) or, below 16 blocks per SM even with all moduli
+    split, 1024 (E = 4, r4 per SM); moduli parts when tiles < 2 SMs."""
     tk = 16
     while tk < k_hat:
         tk *= 2
@@ -739,63 +755,270 @@ def spec_kf_chain(rows, k_hat, g, sms):
     small = tiles * g < 16 * sms
     if small:
         tiles = sum(-(-r // max(1024 // tk, 1)) for r in rows)
-    parts = 1 if tiles >= 2 * sms else min(g, -(-2 * sms // tiles))
-    per_sm = sms * (4 if small else 2)
-    return -(-(tiles * parts) // per_sm) * (4 if small else 16) * -(-g // parts)
+    parts = spec_parts(tiles, g, sms)
+    return spec_chain(spec_launch_blocks(tiles, 1), parts, tiles,
+                      (4 if small else 16) * -(-g // parts), r4 if small else r16, sms)
 
 
-def spec_phases(lw, vec, along_rows, l2, beta=False):
+def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128):
     """[(name, launches, x)] of one imd_contract (DESIGN §6c.1 table) from the lowering
-    summary and the operands' read direction (along rows: KL tiles of 512)."""
+    summary and the operands' read direction (along rows: KL tiles of 512). occ: kernel name ->
+    CTAs per SM (the calibration's occupancy table); the chains assume radix 1 (operands read
+    along k-bar) and j-bar-fastest K5: callers compare them only for such cases."""
     m, n, k, b, nh, kh = lw.m, lw.n, lw.k, lw.b, lw.n_hat, lw.k_hat
     N, g = lw.num_moduli, lw.residue_group
     V = lw.vec_entries
     res = vec == "RESIDENT"
     outb = 8 * b * m * n * (2 if beta else 1)
+    occ = occ or {}
+    r = lambda name: occ.get(name, 2)  # noqa: E731
+
+    def grid_chain(name, outputs, u):
+        return spec_chain(spec_launch_blocks(outputs), 1, -(-outputs // 256), u, r(name), sms)
+
+    k0 = ("K0 vec", 1, [1, 8 * V, grid_chain("k0", V, 1), 0, 0, 0])
     ph = []
     if lw.dispatch in ("DIRECT", "SCALE"):
         if not res:
-            ph.append(("K0 vec", 1, [1, 8 * V, 0, 0, 0, 0]))
+            ph.append(k0)
         if lw.dispatch == "SCALE":
-            ph.append(("K5 beta-only", 1, [1, outb, 0, 0, 0, 0]))
+            ph.append(("K5 beta-only", 1, [1, outb, grid_chain("beta", b * m * n, 1), 0, 0, 0]))
         else:
-            ph.append(("DIRECT", 1, [1, 8 * b * (m * k + n * k) + outb, 2 * b * m * n * k, 0,
-                                     0, 0]))
+            ph.append(("DIRECT", 1, [1, 8 * b * (m * k + n * k) + outb, 2 * b * m * n * k,
+                                     grid_chain("direct", b * m * n, k), 0, 0]))
         return ph + [("call", 0, [1, lw.kernel_launches, 0, 0, 0, 0])]
     rows, pad = [b * m, b * n], [b * m, b * nh]
     # the typical-data eps fraction (immerdink_host.h): exact log2 T, the margin ramp
     lt = math.log2(math.isqrt((math.prod(MODULI[:N]) - 1) // 2))
     wide = 0.0 if lt < 53 else min(1.0, max(0.0, (lt - 0.5 * math.log2(k) - 53 + 2.5) / 1.5))
     if not lw.fused and not res:
-        ph.append(("K0 vec", 1, [1, 8 * V, 0, 0, 0, 0]))
+        ph.append(k0)
     if lw.fused:
         byts = (0 if res else 8 * V) + sum(8 * rows[x] * k + g * pad[x] * kh + 3 * rows[x]
                                            for x in (0, 1))
         ops = g * (rows[0] + rows[1]) * k
         ph.append(("KF fused", 1, [1, byts, ops, rows[0] + rows[1], wide * ops,
-                                   (1 + wide) * spec_kf_chain(rows, kh, g, 128)]))
+                                   (1 + wide) * spec_kf_chain(rows, kh, g, sms, r("kf16"),
+                                                              r("kf4"))]))
     else:
         for x, name in ((0, "KL A"), (1, "KL B")):
-            tk = 512 if along_rows[x] else 4096 if kh > 2048 else 1 << max(6, (kh - 1).bit_length())
+            lg_tk = 9 if along_rows[x] else min(12, max(6, (kh - 1).bit_length()))
+            tk = 1 << lg_tk
+            th = 4096 // tk
+            nc = -(-kh // tk)
+            tiles = -(-rows[x] // th)
+            values = 4 if nc > 2 else 8
+            chain = spec_chain(min(tiles, 1 << 20), 1, tiles, nc * values * g,
+                               r("kl4" if values == 4 else "kl8"), sms)
             ph.append((name, 1, [1, 8 * rows[x] * k + g * pad[x] * kh + 3 * rows[x],
                                  g * rows[x] * k, 16 * rows[x] * max(0, kh - 2 * tk),
-                                 wide * g * rows[x] * k, 0]))
+                                 wide * g * rows[x] * k, (1 + wide) * chain]))
     G = lw.num_groups
+    sizes = [g] * (N // g) + ([N % g] if N % g else [])
     for x, name in ((0, "K2 pack A"), (1, "K3 pack B")):
         if G > 1:
             per = 2 if (x == 1 and nh > n) else 1
+            chain = 0
+            for gs in sizes[1:]:  # group 1 is KF's / KL's
+                tiles = -(-rows[x] // 64) * -(-kh // 64)
+                parts = spec_parts(tiles, gs, sms)
+                chain += spec_chain(spec_launch_blocks(tiles, 1), parts, tiles,
+                                    16 * -(-gs // parts), r("pack"), sms)
             ph.append((name, (G - 1) * per, [(G - 1) * per, (G - 1) * 8 * rows[x] * k
                                              + (N - g) * pad[x] * kh, (N - g) * rows[x] * k,
-                                             wide * (N - g) * rows[x] * k, 0, 0]))
+                                             wide * (N - g) * rows[x] * k, (1 + wide) * chain,
+                                             0]))
     ph.append(("K4 gemm", lw.gemm_launches,
-               spec_k4_features(lw.k4_config, m, nh, kh, b, N, g, 128, lw.k_chunks, l2)))
+               spec_k4_features(lw.k4_config, m, nh, kh, b, N, g, sms, lw.k_chunks, l2)))
+    mn = b * m * n
+    e = 1 if mn <= 1024 * sms else 2 if mn <= 8 * 2048 * sms else 4
+    work = b * m * -(-n // e)
+    k5c = spec_chain(spec_launch_blocks(work), 1, -(-work // 256), e * N * L32[N],
+                     r(f"k5_n{N}_e{e}"), sms)
     ph.append(("K5 crt", 1, [1, N * b * m * nh + 3 * b * (m + n) + outb, N * L32[N] * b * m * n,
-                             0, 0, 0]))
+                             k5c, 0, 0]))
     return ph + [("call", 0, [1, lw.kernel_launches, 0, 0, 0, 0])]
+
+
+# The slot of each phase's v1.10 chain feature (compared only when spec_phases' assumptions
+# hold: radix 1, j-bar-fastest K5).
+CHAIN_SLOT = {"K0 vec": 2, "KF fused": 5, "KL A": 5, "KL B": 5, "K2 pack A": 4, "K3 pack B": 4,
+              "K5 crt": 3, "DIRECT": 3, "K5 beta-only": 2}
 
 
 def close(a, b, rel=1e-12):
     return abs(a - b) <= rel * max(abs(a), abs(b), 1.0)
+
+
+# DESIGN v1.10 §6c.1: the feature slots whose time scales with the SM clock (an independent
+# transcription of "ops, chains, L2 traffic, K4's round model; not DRAM bytes, launches, call").
+SPEC_CLOCK_BOUND = {
+    "k0": (2,), "kf": (2, 3, 4, 5), "kl": (2, 3, 4, 5), "pack": (2, 3, 4), "k5": (2, 3),
+    "direct": (2, 3), "beta": (2,), "call": ()}
+
+
+def synthetic_v2(cal, names, rng):
+    """A format-2 calibration: the shipped parameters, random chain parameters, a power model
+    (cap 450 W), a cache term and bands."""
+    params = dict(cal.params)
+    for key in host.FORMAT2_PARAMS:
+        params[key] = rng.choice((0.0, rng.random() * 0.05))
+    extra = {f"kernel.{n}": (v[0] + rng.randint(0, 2), 64, 4096, v[3])
+             for n, v in cal.kernels.items()}
+    extra.update({"power.clock_ref_mhz": 2800.0, "power.clock_min_mhz": 1400.0,
+                  "power.cap_w": 450.0, "power.idle_w": 60.0, "power.tc_pj": 0.7,
+                  "power.alu_pj": 5.0, "power.byte_pj": 20.0, "power.gamma": 2.0,
+                  "warm.l2_bytes": 3.0e7, "warm.l2byte": 3e-4,
+                  "band.call_small": (0.85, 1.2), "band.call_mid": (0.9, 1.12),
+                  "band.call_large": (0.95, 1.06)})
+    for c in host.PERF_CLASSES:
+        extra[f"band.{c}"] = (1.0, 1.0) if c == "call" else (0.8, 1.25)
+    return host.Calibration.from_values(cal.meta, params, extra=extra), params, extra
+
+
+def phase_ns(params, names, q, scale=1.0):
+    """A phase's time (ns) from its features and the parameters, the clock-bound terms times
+    scale (DESIGN §6c.1; K4: max of the round model and the DRAM term)."""
+    if q.cls.startswith("k4_"):
+        rounds = sum(params.get(f"{q.cls}.{n}", 0.0) * x for j, (n, x) in
+                     enumerate(zip(names[q.cls], q.x)) if n and j != 4)
+        return max(rounds * scale, params.get(f"{q.cls}.byte", 0.0) * q.x[4])
+    return sum(params.get(f"{q.cls}.{n}", 0.0) * x * (scale if j in SPEC_CLOCK_BOUND[q.cls] else 1)
+               for j, (n, x) in enumerate(zip(names[q.cls], q.x)) if n)
+
+
+def suite_perf_v110(cal, names, rng):
+    count = 0
+    shapes = [("ik,jk->ij", dict(i=64, j=64, k=64)), ("ik,jk->ij", dict(i=300, j=200, k=1000)),
+              ("ik,jk->ij", dict(i=2048, j=1000, k=3000)), ("ik,jk->ij", dict(i=1000, j=64, k=50000)),
+              ("ik,jk->ij", dict(i=8192, j=8192, k=8192)), ("lik,ljk->lij", dict(l=6, i=100, j=60, k=1500)),
+              ("i,j->ij", dict(i=300, j=200))]
+    # (1) a format-1 file (the v6 shipped one) predicts exactly the v6 formulas: no chain terms,
+    # no clock scaling, no cache term, zero-width bands, and is written back as format 1.
+    v6_path = os.path.join(ROOT, "tests/data/perf_calib_v6_format1.calib")
+    v6 = host.Calibration.load(v6_path)
+    if v6.format != 1 or host.Calibration.parse(v6.format()).format() != v6.format() or \
+            "format = 1" not in v6.format() or "kernel." in v6.format():
+        raise Fail("format-1 round trip")
+    for spec, ext in shapes:
+        for N, g in ((8, 0), (16, 5)):
+            for regime in ("DEFAULT", "SUSTAINED"):
+                for cache in ("COLD", "WARM"):
+                    p = host.predict(spec, ext, N=N, g=g, regime=regime, cache=cache, calib=v6)
+                    if p.status != "SUCCESS":
+                        continue
+                    for q in p.phases:
+                        if not close(q.time_s, 1e-9 * phase_ns(v6.params, names, q), 1e-12) or \
+                                q.p10_s != q.time_s or q.p90_s != q.time_s:
+                            raise Fail(f"format 1 is not v6: {spec} {ext} {q}")
+                    if p.regime != "BURST" or p.clock_mhz != 0 or p.power_w != 0 or \
+                            p.time_p10_s != p.time_s or p.time_p90_s != p.time_s:
+                        raise Fail(f"format 1 v7 fields: {p}")
+                    count += 1
+    # (2) format 2: round trip, parse errors
+    syn, params, extra = synthetic_v2(cal, names, rng)
+    text = syn.format()
+    again = host.Calibration.parse(text)
+    if again.format != 2 or again.format() != text or again.params != syn.params or \
+            again.extra != syn.extra or "format = 2" not in text:
+        raise Fail("format-2 round trip")
+    lines = text.splitlines()
+    bad = {
+        "missing kernel line": "\n".join(l for l in lines if not l.startswith("kernel.kf4 ")),
+        "band p10 > p90": text.replace("band.call_mid = 0.9 1.12", "band.call_mid = 1.2 1.1"),
+        "resident 0": "\n".join(("kernel.k0 = 0 64 4096 256" if l.startswith("kernel.k0 ") else l)
+                                for l in lines),
+        "format-2 key in format 1": v6.format() + "power.cap_w = 1\n",
+        "chain in format 1": v6.format() + "k0.chain = 1\n",
+        "missing chain in format 2": "\n".join(l for l in lines if not l.startswith("k5.chain")),
+        "three numbers in a band": text.replace("band.call_mid = 0.9 1.12", "band.call_mid = 0.9 1 2"),
+    }
+    for why, t in bad.items():
+        try:
+            host.Calibration.parse(t)
+            raise Fail(f"accepted a calibration with {why}")
+        except ValueError:
+            pass
+    # (3) clock regimes, (4) cache states, (5) bands
+    for spec, ext in shapes:
+        for N, g in ((8, 0), (14, 4), (16, 0)):
+            kw = dict(N=N, g=g, calib=syn)
+            pb = host.predict(spec, ext, regime="BURST", cache="REPEAT", **kw)
+            if pb.status != "SUCCESS" or not pb.phases:
+                continue
+            if pb.clock_mhz != 2800.0:
+                raise Fail(f"BURST clock {pb.clock_mhz}")
+            pr = host.predict(spec, ext, clock_mhz=2800.0, cache="REPEAT", **kw)
+            if not close(pr.time_s, pb.time_s):
+                raise Fail("clock_mhz = f_ref differs from BURST")
+            p2 = host.predict(spec, ext, clock_mhz=5600.0, cache="REPEAT", **kw)
+            for q, q2 in zip(pb.phases, p2.phases):  # clock-bound terms halve
+                if not close(q2.time_s, 1e-9 * phase_ns(params, names, q, 0.5), 1e-9) or \
+                        not close(q.time_s, 1e-9 * phase_ns(params, names, q), 1e-9):
+                    raise Fail(f"clock scaling {spec} {ext} {q.name}: {q2.time_s} vs "
+                               f"{1e-9 * phase_ns(params, names, q, 0.5)}")
+            if p2.time_s > pb.time_s * (1 + 1e-12):
+                raise Fail("a higher clock predicts a longer time")
+            ps = host.predict(spec, ext, regime="SUSTAINED", cache="REPEAT", **kw)
+            pd = host.predict(spec, ext, cache="REPEAT", **kw)
+            if pd.regime != "SUSTAINED" or not close(pd.time_s, ps.time_s):
+                raise Fail("DEFAULT is not SUSTAINED with a power model")
+            if ps.time_s < pb.time_s * (1 - 1e-12) or ps.clock_mhz > 2800.0:
+                raise Fail("SUSTAINED faster than BURST")
+            if pb.power_w <= 450.0:
+                if ps.clock_mhz != 2800.0 or not close(ps.time_s, pb.time_s):
+                    raise Fail("SUSTAINED below the cap differs from BURST")
+            elif ps.clock_mhz > 1400.0 and not close(ps.power_w, 450.0, 1e-9):
+                raise Fail(f"SUSTAINED power {ps.power_w} W at {ps.clock_mhz} MHz")
+            cold, rep, warm = (host.predict(spec, ext, regime="BURST", cache=c, **kw).time_s
+                               for c in ("COLD", "REPEAT", "WARM"))
+            if not (cold >= rep * (1 - 1e-12) and rep >= warm * (1 - 1e-12)):
+                raise Fail(f"cache order {cold} {rep} {warm}")
+            lo, hi = extra[("band.call_small", "band.call_mid", "band.call_large")[
+                0 if pb.time_s < 1e-4 else 1 if pb.time_s < 1e-3 else 2]]
+            if not (close(pb.time_p10_s, lo * pb.time_s) and close(pb.time_p90_s, hi * pb.time_s)):
+                raise Fail("call band")
+            for q in pb.phases:
+                blo, bhi = extra[f"band.{q.cls}"]
+                if not (close(q.p10_s, blo * q.time_s) and close(q.p90_s, bhi * q.time_s)):
+                    raise Fail("phase band")
+            count += 1
+    # (6) rank: ties by footprint, raw_rank = the v6 time order, ORDER_TIME = that order
+    for spec, ext in (("ik,jk->ij", dict(i=2048, j=1000, k=3000)),
+                      ("kjbc,kiac->abij", dict(a=24, b=20, c=16, i=12, j=10, k=8))):
+        kw = dict(N=[8, 14], vec_modes=("GENERATE", "RESIDENT"), packs=("NONE", "A", "B", "AB"),
+                  reuse=3, calib=syn)
+        by_time = host.rank(spec, ext, order="TIME", **kw)
+        banded = host.rank(spec, ext, **kw)
+        if [c.raw_rank for c in by_time] != list(range(len(by_time))):
+            raise Fail("raw_rank of the time order")
+        if sorted(c.raw_rank for c in banded) != list(range(len(banded))):
+            raise Fail("raw_rank is not a permutation")
+        if [(c.num_moduli, c.residue_group, c.vec_mode, c.packed) for c in
+                sorted(banded, key=lambda c: c.raw_rank)] != \
+                [(c.num_moduli, c.residue_group, c.vec_mode, c.packed) for c in by_time]:
+            raise Fail("raw_rank does not reproduce the time order")
+        best = by_time[0]
+        ties = [c for c in banded if c.tie]
+        want = [c for c in by_time if c.feasible and c.status == "SUCCESS" and
+                c.time_p10_s <= best.time_p90_s]
+        if len(ties) != len(want) or banded[:len(ties)] != ties or not best.tie:
+            raise Fail("rank ties")
+        for a_, b_ in zip(ties, ties[1:]):
+            if a_.total_bytes > b_.total_bytes:
+                raise Fail("ties not ordered by footprint")
+        if banded[len(ties):] != [c for c in by_time if not c.tie]:
+            raise Fail("rank: the non-tied candidates keep the time order")
+        for c in banded:
+            if c.status == "SUCCESS" and not (c.time_p10_s <= c.time_s <= c.time_p90_s):
+                raise Fail("candidate band")
+        count += 1
+    # (7) occupancy table names
+    kn = host.kernel_names()
+    if len(kn) != 90 or kn[0] != "k0" or kn[14] != "k5_n2_e1" or kn[-1] != "k5b_n20" or \
+            len(set(kn)) != len(kn):
+        raise Fail(f"kernel names {kn[:3]} ... {kn[-3:]}")
+    return count
 
 
 def suite_perf(args):
@@ -812,7 +1035,9 @@ def suite_perf(args):
     if again.params != cal.params or again.meta != cal.meta or again.format() != cal.format():
         raise Fail("format -> parse round trip")
     names = host.param_names()
-    if sorted(cal.params) != sorted(f"{c}.{n}" for c, ns in names.items() for n in ns if n):
+    if sorted(cal.params) != sorted(f"{c}.{n}" for c, ns in names.items() for n in ns
+                                    if n and (cal.format == 2 or
+                                              f"{c}.{n}" not in host.FORMAT2_PARAMS)):
         raise Fail("params keys")
     rng = random.Random(6)
     vals = {k: rng.choice((0.0, rng.random() * 10 ** rng.randint(-6, 4))) for k in cal.params}
@@ -840,6 +1065,7 @@ def suite_perf(args):
         ("i,j->ij", dict(i=300, j=200), (False, False)),
     ]
     n_feat = 0
+    occ = {n: v[0] for n, v in cal.kernels.items()}
     for spec, ext, along in cases:
         for N, g in ((8, 0), (14, 4), (20, 7), (3, 1)):
             for vec in ("GENERATE", "RESIDENT"):
@@ -850,8 +1076,12 @@ def suite_perf(args):
                         raise Fail(f"{spec} {ext}: status {p.status} vs lowering {lw.status}")
                     if p.status != "SUCCESS":
                         continue
-                    want = spec_phases(lw, vec, along, cal.meta["l2_bytes"])
+                    want = spec_phases(lw, vec, along, cal.meta["l2_bytes"], occ=occ)
                     got = [(q.name, q.launches, list(q.x)) for q in p.phases]
+                    if along != (False, False):  # the chains' transcription assumes radix 1
+                        for ph in want + got:
+                            if ph[0] in CHAIN_SLOT and ph[0] != "KF fused":
+                                ph[2][CHAIN_SLOT[ph[0]]] = 0.0
                     ok = len(want) == len(got) and all(
                         a[0] == b[0] and a[1] == b[1] and all(close(u, v) for u, v in zip(a[2], b[2]))
                         for a, b in zip(want, got))
@@ -997,6 +1227,10 @@ def suite_perf(args):
                                                   prev.time_s > c.time_s):
                     raise Fail(f"rank order: {prev} before {c}")
             n_rank += 1
+    n_v110 = suite_perf_v110(cal, names, rng)  # DESIGN v1.10 (host API 7, format 2)
+    if args.verbose:
+        print(f"  ok  v1.10: {n_v110} checks (format 1 = v6, format 2, regimes, cache, bands, "
+              f"rank ties)")
     if args.verbose:
         print(f"  ok  calibration round trip, {n_feat} feature transcriptions, K4 == A3 "
               f"estimate, {mono} monotonicity pairs, statuses, packed, {n_rank} ranked "

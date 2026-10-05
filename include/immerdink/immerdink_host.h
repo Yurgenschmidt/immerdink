@@ -633,7 +633,7 @@ typedef struct {
   double time_p90_s;
   double clock_mhz;          /* the contract's assumed SM clock                              */
   double power_w;            /* the contract's predicted average power                       */
-  int32_t tie;               /* 1: feasible and its band overlaps the best's (ORDER_BAND)    */
+  int32_t tie;               /* 1: feasible and its band overlaps the best's (either order)  */
   int32_t raw_rank;          /* position in the v6 time order (0-based)                      */
 } imd_perf_candidate_t;
 
