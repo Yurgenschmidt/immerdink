@@ -1,4 +1,4 @@
-# B2 notes: the performance model (DESIGN v1.8 §6c)
+# B2 notes: the performance model (DESIGN v1.8 §6c; v1.10 fidelity follow-up in §6)
 
 ROADMAP B2. A CUDA-free model in libimmerdink_host (host API version 6): `imd_perf_predict`
 (per-phase and total time, TFLOPS-eq, MEMORY_MODEL §4 bounds), `imd_perf_predict_pack`,
@@ -153,3 +153,266 @@ term, see §4), the 12 / 56 CC tensor at N = 15 (+15 %), 800³ and 960³ (+13 �
 Examples (TFLOPS-eq measured / predicted, time measured / predicted): 800³ at N = 15 8.06 / 7.06
 (127 / 145 µs); 1200 × 400 × 700 at N = 16 5.61 / 5.93 (120 / 113 µs); batched 4 × 640² × 384 at
 N = 17 5.41 / 5.69 (232 / 221 µs).
+
+## 6. Fidelity follow-up (DESIGN v1.10, host API 7, calibration format 2; branch b2-fidelity)
+
+Four items: wave / occupancy terms for every kernel, a SUSTAINED (power-capped) regime,
+prediction intervals with tie-aware ranking, and COLD / WARM cache state. **All numbers below
+come from data collected on 2026-10-05 13:20–14:00, after the BIOS update** (0809 → 1836: Intel
+default CPU power limits, GPU persistence mode on, PCIe Gen4 x16). That run took ≈ 40 min of GPU
+time: 363 calibration records (bench/sweep_calib.txt with the new fine-k̂ and small-pack cases,
+plus the occupancy table), 136 hold-out records, 14 sustained windows and 33 cache-pair records.
+Data from before the update, and from the period when PCIe was stuck at Gen1, only guided the
+choice of features. Raw records are in `~/repos/immerdink-eval/results/b2/fidelity-postbios/`
+(`calib-`, `validate-`, `sustained-` and `cache-20261005-1320.jsonl`), with the fits and
+validation logs next to them.
+
+### 6.1 Waves and occupancy
+
+- Every launch rule now lives in `src/host/analysis.hpp` (`launch_blocks`, `pack_launch`,
+  `kl_launch`, `pack_kl_lg_rows_for`, `k5_launch`, plus the existing `kf_*`). `contract.cu`
+  launches with these rules, so the launches are unchanged and the bit-exact GPU tests pass.
+  The model computes each launch's waves `⌈B / (SMs · r)⌉` and per-CTA steps from the same rules.
+- CTAs per SM, measured with `imd_bench --methods occupancy`
+  (`cudaOccupancyMaxActiveBlocksPerMultiprocessor`, `cudaFuncGetAttributes`):
+  - K0, zero-rows, DIRECT and beta: 6.
+  - KF E = 16: 2 (47.5 KB smem, 128 regs); KF E = 4: 4.
+  - KL with 512 threads: 2; with 1024 threads: 1.
+  - K2 / K3: 2 (40.8 KB, 114 regs).
+  - K5: 4–6 depending on N and variant.
+  - K4: 1 / 2 / 2 / 3, equal to the configuration table.
+
+  The v1.8 built-in KF residencies (2 / 4) were right.
+- Which terms survived (refit on the v1.8 data, confirmed on the post-BIOS data):
+  - **memory waves** for KL (`kl.wave` = waves × chunks per row) and K2 / K3 (`pack.wave` = tile
+    loads of the busiest SM, ~5.7 µs per wave: a launch of a few hundred tiles runs at ~0.35
+    TB/s). For KL the compute chain nc · E · g fitted to 0 and the wave replaced it;
+  - KF's compute chain, unchanged;
+  - `k5.dram`, the W plane bytes beyond the effective L2 (K5 at 8192², N = 8 was 24 % low).
+
+  The compute chains of K0, K2 / K3 and DIRECT fit to 0; K5's chain is small (5 ns per step).
+- **K4 partial K tile, resolved.** The fine-k̂ sweep covered 2048² × k̂ with the rule and
+  128×256, and 4864–5120 with 128×128 as well. K4 phase in ps per MAC:
+
+  | k̂ | mod 32 / 64 / 128 | ps/MAC (N = 8) | vs aligned |
+  |---|---|---|---|
+  | 768, 832, 896, 960, 1024, 1088 | 0 / 0 / 0–64 | 0.0036–0.0039 | — |
+  | 800 (also with 2000² rows) | 0 / 32 / 32 | 0.0040 (0.0042) | +3 % |
+  | 784, 1040 | 16 / 16 / 16 | 0.0048–0.0049 | +28 … +33 % |
+  | 1008 | 16 / 48 / 112 | 0.0050–0.0051 | +35 % |
+  | 4864, 4928, 4992, 5056, 5120 | 0 | 0.0032–0.0033 | — |
+  | 4960 | 0 / 32 / 96 | 0.0033 (128×128: 0.0040) | +2 % (+14 %) |
+  | 4880, 5008 | 16 | 0.0044–0.0045 (128×128: 0.0057) | +38 % (+60 %) |
+  | 65552 vs 65536 / 65568 | 16 vs 0 | 0.0063 vs 0.0046 / 0.0049 | +37 % |
+
+  The slow case is **k̂ mod 32 = 16**. Then the int8 residue rows of k̂ bytes are not 32-byte
+  aligned: every row starts mid-sector. The partial 64-wide K tile is not the cause (k̂ = 800
+  and 4960 have one and are not slow), and neither is the row count (2000 and 2048 rows behave
+  the same). In format 2, `mac_ktail` counts chunks with k̂ mod 32 ≠ 0; format 1 keeps mod 64.
+  This removes the v1.8 over-prediction at 800³ (+26 … +35 % in K4) and keeps 1008 and 5008
+  correct. Possible kernel follow-up, out of B2's scope: padding k̂ to a multiple of 32 would
+  make these shapes ~30 % faster in K4.
+
+  **After review (2026-10-05):**
+  - The criterion is now applied **per chunk**. K4 reads chunk c of a row at `row·k̂ + c·K_c'`,
+    and K_c' = 131056 ≡ 16 (mod 32), so for an aligned k̂ the odd chunks are misaligned. This
+    is identical to k̂ mod 32 for single-chunk calls.
+  - The two-chunk check measured 512² × 262144 (chunk 1 misaligned) against 262160 (all
+    misaligned), N = 8 / 14. K4 took 3.62 / 5.74 ms and 3.33 / 4.64 ms, about 0.006 ps per MAC,
+    so it is DRAM-bound. The power-of-two row stride is the slower one, which points to a
+    DRAM-channel effect, not alignment. The check is **inconclusive**, and both calls are
+    predicted 12–22 % low (like 768² × 100000: long k with few CTAs).
+  - Evidence strength: 128×256 has the full sweep. 128×128 is partly counter-evidence (4960 is
+    +14 % there). 64×128 and 64×64 are untested.
+
+### 6.2 Hold-out, before and after (post-BIOS data, 136 calls, BURST, REPEAT state)
+
+"Before" is the v1.8 model form refitted on the same post-BIOS calibration data (`perf_fit
+--format1`). The old shipped (pre-BIOS) calibration on the same hold-out gives similar numbers:
+2.1 / 7.6 / 20.1 % on ≥ 1 ms calls, 6.8 / 15.5 / 32.1 % at 100 µs – 1 ms.
+
+| measured call | calls | before: median / p90 / max | after: median / p90 / max | target |
+|---|---|---|---|---|
+| < 100 µs | 34 | 6.5 / 15.3 / 30.8 % | 6.8 / 13.4 / 23.6 % | 15 / 30 % |
+| 100 µs – 1 ms | 49 | 7.6 / 15.8 / 24.5 % | 6.3 / 15.2 / 19.2 % | 10 / 20 % |
+| ≥ 1 ms | 63 | 2.6 / 8.3 / 16.5 % | **1.6 / 6.2 / 14.4 %** | 5 / 15 % |
+
+N = 15–17 (ehrenfest's range):
+
+| measured call | calls | before | after | target |
+|---|---|---|---|---|
+| < 100 µs | 6 | 10.8 / 16.0 / 16.6 % | 8.3 / 10.2 / 10.7 % | 15 / 30 % |
+| 100 µs – 1 ms | 25 | 9.2 / 14.9 / 24.5 % | 8.6 / 15.6 / 17.2 % | 10 / 20 % |
+| ≥ 1 ms | 22 | 3.1 / 7.7 / 11.2 % | 2.2 / 6.9 / 14.4 % | 5 / 15 % |
+
+Per phase on calls ≥ 1 ms (median / p90, before → after):
+
+| phase | before | after |
+|---|---|---|
+| KL B | 6.0 / 18.3 % | 3.9 / 14.2 % |
+| K2 | 5.2 / 10.9 % | 4.5 / 9.6 % |
+| **K3** | 16.4 / 31.1 % | **11.1 / 23.8 %** |
+| K4 | 4.6 / 14.2 % | 4.1 / 15.7 % |
+| **K5** | 8.2 / 23.4 % | **4.1 / 17.6 %** |
+| KF | 17.5 / 25.5 % | 8.8 / 13.7 % |
+
+All targets are met. Two variants were tried and not adopted:
+- without the chain / wave features: ≥ 1 ms median / p90 2.4 / 6.7 %, < 100 µs max 30.7 %;
+- with per-record clock normalization: ≥ 1 ms 2.9 / 7.3 % (see §6.3).
+
+Examples (TFLOPS-eq measured / predicted; time measured / predicted):
+
+| call | TFLOPS-eq | time |
+|---|---|---|
+| sq8192, N = 14 | 37.07 / 37.87 | 29.66 / 29.03 ms |
+| sq8192, N = 8 | 63.06 / 63.88 | 17.44 / 17.21 ms |
+| t_cc, N = 14 | 32.10 / 31.63 | 4.28 / 4.34 ms |
+| 3000³, N = 15 | 24.97 / 23.77 | 2.16 / 2.27 ms |
+| 24576 × 384 × 3072, N = 16, g = 2 | 5.88 / 5.81 | 9.86 / 9.98 ms |
+| 800³, N = 15 (was +14 … +29 %) | 8.16 / 8.75 | 126 / 117 µs |
+| 2048 × 1536 × 816, N = 16 | 11.37 / 11.41 | 452 / 450 µs |
+| s512, N = 8 | 10.47 / 10.46 | 25.6 / 25.7 µs |
+
+Largest remaining errors:
+- 768 × 768 × 100000, N = 15: −14 % (long-k K4, 3 CTA rounds);
+- 640³ at N = 16–17 and 1200 × 400 × 700: −16 … −18 % (KF);
+- 1024³, N = 14: +20 % (K4 at 4 rounds).
+
+### 6.3 SUSTAINED regime
+
+- **The windows.** `imd_bench --methods sustained` runs each case with a 15 s pre-heat, then
+  measures for 6–10 s, reading NVML power and clock every 20 ms; the energy counter is never
+  read. Every tensor-core-heavy window sits at 449–450 W and 2308–2424 MHz (sq2048 … sq12k,
+  t_cc, t_df, 2048² × 32768). The small ones (512³, 1024³, r_mm) sit at 390–449 W and
+  2680–2790 MHz.
+- **Clock reference.** Clock normalization of the burst fit did not help (§6.2), so the
+  parameters θ are the costs of the burst state as measured. `power.clock_ref_mhz` is the
+  effective clock they represent, scanned on the windows: 2530 MHz. The sustained
+  leave-one-case-out median error falls from 4.7 % at 2805 MHz to 1.5 % at 2530 MHz.
+- **Power fit,** with the awake idle fixed at 60 W: e_tc 0.67 pJ per int8 op, e_byte 335 pJ per
+  DRAM byte (an effective value), e_alu 0, γ = 1.
+- **Result, leave-one-case-out:**
+
+  | window | TFLOPS-eq measured | time measured / predicted | error | clock measured / predicted |
+  |---|---|---|---|---|
+  | sq8192, N = 14 | 35.44 | 31.02 / 30.62 ms | −1.3 % | 2312 / 2377 MHz |
+  | sq8192, N = 16 | | | −1.2 % | |
+  | sq12288, N = 14 | 37.40 | 99.2 / 97.6 ms | −1.7 % | |
+  | sq4096, N = 8 / 14 | | | +1.2 / +1.9 % | |
+  | sq2048 | | | +2.3 % | |
+  | t_cc | | | +0.5 % | |
+  | t_df | | | +1.2 % | |
+  | 2048² × 32768 | | | −0.2 % | |
+  | small windows (512³, 1024³) | | | +1 … +10 % | |
+
+  The small windows are high because back-to-back calls hide part of the launch overhead that
+  the call term charges. **Median |error| 1.5 %, max 10.5 %; capped windows within ±2.3 %,
+  settled clock within ±5 % (median 2.8 %).** For comparison, the BURST prediction of the same
+  windows has a median error of 4.3 %, and the capped ones come out 3–6 % too fast.
+- The default regime is **SUSTAINED**, as proposed; below the cap it equals BURST. Design
+  question for the reviewer. Examples, SUSTAINED vs BURST at N = 14: 4096³ ×1.061 (2339 MHz),
+  8192³ ×1.063 (2357 MHz), 16384³ ×1.056 (2385 MHz, where long runs were seen at ~1950 MHz:
+  thermal history beyond a 15 s pre-heat is not modeled), 1024³ ×1.000.
+
+### 6.4 Prediction intervals and ties
+
+- Bands come from the hold-out residuals (measured / predicted): per size class of the
+  predicted call, and per kernel class for phases. Coverage was checked by 2-fold
+  cross-validation over the cases with 20 random halvings:
+
+  | quantiles | covered | < 100 µs | 100 µs – 1 ms | ≥ 1 ms |
+  |---|---|---|---|---|
+  | 10 / 90 (in-sample percentiles) | 72 % | | | |
+  | 5 / 95 | 80 % | | | |
+  | **2.5 / 97.5** | **84 %** | 88 % | 78 % | 87 % |
+
+  The stored band uses the 2.5 / 97.5 quantiles (rule: the narrowest pair that reaches 80 %
+  cross-validated). Shipped call bands, as factors of the predicted time: < 100 µs 0.874–1.212,
+  100 µs – 1 ms 0.864–1.173, ≥ 1 ms 0.914–1.064.
+- These bands already contain the clock spread:
+
+  | size class | NVML clock after the timed loop (p10–p90) | timed-loop spread, median (p90) |
+  |---|---|---|
+  | < 100 µs | 2790–2805 MHz | 28 % (153 %, single slow calls; medians are used) |
+  | 100 µs – 1 ms | 2790–2805 MHz | 5.8 % (13.8 %) |
+  | ≥ 1 ms | 2550–2805 MHz | 0.9 % (2.7 %) |
+
+  The per-call probe reads 2294–2561 MHz (p10–p90) at ≥ 1 ms: ~11 % below NVML and noisy, so
+  it is only a relative indicator.
+- **Ranking ties, changed from the design after the data** (the ratio rule was accepted in
+  review; the default order is **TIME**, and TIES_BY_FOOTPRINT is opt-in, with `tie` set in every
+  order). "Bands overlap the best" tied 236 of
+  360 candidates on a CC tensor, up to 1.36× slower, and the footprint tie-break then picked
+  slow ones. Candidates of one contraction share most of the model error: across pairs of
+  hold-out calls of the same case, the error of the time ratio is ±7.5 % at the 80th
+  percentile. So a tie is now `time_s ≤ best × rank.tie_ratio`, with tie_ratio = 1.075 fitted
+  by `perf_validate --bands`. Ties come first, ordered by footprint, and `raw_rank` keeps the
+  time order. On the same CC tensor 28 of 360 candidates are now ties, and 16 of 176 on 2048 ×
+  1000 × 3000. Design question for the reviewer.
+
+### 6.5 Cache state
+
+| case (N = 14 / 16) | REPEAT | COLD vs REPEAT, measured | COLD vs REPEAT, model | WARM vs REPEAT, measured |
+|---|---|---|---|---|
+| 256³ | 16.5 / 19.4 µs | +11.6 / +10.4 % | +7.6 / +6.8 % | +3.1 / +0.5 % |
+| 512³ | 32.0 / 46.1 µs | +14.1 / +15.6 % | +17.8 / +13.5 % | +2.4 / +0.6 % |
+| 1024³ | 125 / 173 µs | +11.3 / +4.2 % | +7.7 / +1.2 % | −1.6 / −3.9 % |
+| 2048³ | 722 / 843 µs | −1.9 / −0.5 % | 0 % | −2.5 / −0.9 % |
+| 4096 × 768 × 768 | 329 / 435 µs | −5.3 / −2.5 % | 0 % | −7.4 / −4.6 % |
+| 256 × 3000 × 3000 (N = 14) | 457 µs | −2.0 % | 0 % | −0.9 % |
+
+- COLD (an evicted L2) costs +4 … +16 % when the call's footprint fits the L2, and nothing
+  beyond that.
+- WARM (the previous call wrote this call's A) is within −7 … +3 % of the repeat state, so it is
+  modeled as REPEAT. The design's `min(I, L_w)` would have predicted 10–20 % savings on large
+  calls.
+- The parameters are COLD costs: the fitter adds the repeat records' resident-input savings
+  back to their phases, and a REPEAT prediction subtracts them again. Without this, the COLD
+  prediction lost monotonicity in N: a larger footprint keeps less resident, so the cold
+  add-back shrank.
+- Fitted: L_w = 0.8 × 72 MiB, 1.46 ps per resident input byte.
+- The default `cache = COLD` predicts small calls 4–18 % slower than v6 did, because v6 was
+  fitted on the repeat state and predicted it. Design question.
+
+### 6.6 Planner hot path
+
+The shipped calibration is now parsed once in C (a function-local static), so passing a NULL
+calibration costs nothing extra, and `immerdink.planner` now passes NULL. The v7 fields do not
+change per-query costs: in `planner_overhead`, predict takes 1.6–1.8 µs and rank 8–18 µs.
+
+### 6.7 Review decisions (2026-10-05)
+
+- Accepted: the SUSTAINED default (with its two biases documented), the COLD default
+  (recommend WARM when an input is the previous output), WARM = REPEAT (provisional), and the
+  ratio tie rule.
+- Changed:
+  - the default rank order is TIME (`IMD_PERF_ORDER_TIME = 0`; `IMD_PERF_ORDER_TIES_BY_FOOTPRINT
+    = 1` is opt-in);
+  - `tie_ratio` must be ≤ 1.25;
+  - an explicit `clock_mhz` is clamped to the effective clock, renamed `clock_eff_mhz`;
+  - the intervals are named `time_lo_s` / `time_hi_s` and `phase_lo_s` / `phase_hi_s`, and the
+    bands are `{lo, hi}`;
+  - a version-6-sized calibration is a true format-1 view (format-2 parameters zeroed);
+  - the `mac_ktail` test is per chunk;
+  - the planner takes regime, cache and order by name.
+- The shipped parameters are unchanged: no fit or hold-out case changes under the per-chunk
+  rule.
+
+### 6.8 Later (ROADMAP)
+
+- **K4 alignment fix in the kernel.** Set K_c' = 131040 (≡ 0 mod 32) and pad k̂ to a multiple
+  of 32. Half of all k̂ values pay 28–38 % in K4. This is a layout change, so it needs DESIGN
+  and TLA+ work first.
+- A **settled-clock / hot calibration point** for long thermal runs (16384³ at ~1950 MHz).
+- A **clock-scaled e_byte** in the power model.
+
+### 6.9 Open
+
+- KF on 640–1200-class shapes at N = 16–17 is predicted 15–18 % low. K4 at 3–4 CTA rounds
+  (768² × 100000, 1024³) is off by ±15–20 %.
+- The power coefficients are effective values: e_byte absorbs the SM power of memory-bound
+  work. A sequence-level solve for mixed sequences is left to the caller, from `power_w` per
+  call. Thermal history beyond the 15 s pre-heat is not modeled: 16384³ long runs were seen at
+  ~1950 MHz, while the model predicts 2385 MHz.
+- In small sustained windows, back-to-back calls overlap launch latency that the call term
+  charges (+10 % at 512³). A "queued" call term would fix this if it matters.

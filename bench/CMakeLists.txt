@@ -44,4 +44,6 @@ if(NOT IMMERDINK_LIBRARY)
   target_include_directories(imd_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 endif()
 set_target_properties(imd_bench PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-target_link_libraries(imd_bench PRIVATE immerdink CUDA::cudart)
+find_package(Threads REQUIRED)
+# v1.10: method sustained samples NVML (dlopen) in a host thread.
+target_link_libraries(imd_bench PRIVATE immerdink CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})

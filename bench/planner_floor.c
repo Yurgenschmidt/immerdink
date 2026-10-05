@@ -9,7 +9,7 @@
  * One output line per case:
  *   name ws lowering plan_bytes pack_desc_for predict_null predict_calib predict_pack rank
  * in ns per call (median of 7 batches of ~4 ms each). predict_null passes calib = NULL (the
- * shipped calibration, parsed by the library on every call); predict_calib passes a
+ * shipped calibration, parsed once by the library, v1.10); predict_calib passes a
  * calibration already loaded with imd_perf_calib_default; rank: N = {N}, every g,
  * GENERATE only, no packs, calibration given; predict_pack: imd_pack_desc_for(A)'s
  * descriptor. CPU only, no GPU, no allocation in the loops. */
@@ -156,7 +156,8 @@ int main(void) {
     const int pst = imd_pack_desc_for(c.A, c.B, c.C, &c.opt, 0, &c.pdesc, c.plabels, MAXR);
     c.rank_n = N;
     c.rreq = (imd_perf_rank_request_t){sizeof c.rreq, sizeof c.cands[0], 1, 0, &c.rank_n, NULL,
-                                       IMD_PERF_VEC_GENERATE, IMD_PERF_PACK_NONE, 1, 0, 0, -1.0};
+                                       IMD_PERF_VEC_GENERATE, IMD_PERF_PACK_NONE, 1, 0, 0, -1.0,
+                                       0, 0, 0, 0, 0.0};  /* v7: DEFAULT, COLD, ORDER_TIME */
     printf("%s", name);
     for (int q = 0; q < Q_COUNT; ++q) {
       if (q == Q_PREDICT_PACK && pst != IMD_STATUS_SUCCESS) {

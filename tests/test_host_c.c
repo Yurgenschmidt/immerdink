@@ -3,6 +3,7 @@
  * g = 2; spec/params.py cert_workspace), the region table, plan bytes, the lowering summary,
  * the RN acceptance rule and the ABI-versioning rules. */
 #include <stdio.h>
+#include <stddef.h>
 #include <string.h>
 
 #include "immerdink/immerdink_host.h"
@@ -290,15 +291,21 @@ int main(void) {
 
   /* ---- v1.8 (DESIGN §6c): the performance model ---------------------------------------- */
   {
-    CHECK(IMD_HOST_API_VERSION >= 6);
-    CHECK(sizeof(imd_perf_calib_t) == 1232 && sizeof(imd_perf_phase_t) == 96 &&
-          sizeof(imd_perf_t) == 1648 && sizeof(imd_perf_candidate_t) == 128 &&
-          sizeof(imd_perf_rank_request_t) == 64 && sizeof(imd_perf_request_t) == 24);
+    CHECK(IMD_HOST_API_VERSION >= 7);
+    /* v7 sizes (v6: 1232, 96, 1648, 128, 64, 24; the v6 prefixes are unchanged) */
+    CHECK(sizeof(imd_perf_calib_t) == 3672 && sizeof(imd_perf_phase_t) == 96 &&
+          sizeof(imd_perf_t) == 1952 && sizeof(imd_perf_candidate_t) == 168 &&
+          sizeof(imd_perf_rank_request_t) == 88 && sizeof(imd_perf_request_t) == 40);
+    CHECK(offsetof(imd_perf_calib_t, kernel) == 1232 && offsetof(imd_perf_t, regime) == 1648 &&
+          offsetof(imd_perf_candidate_t, time_lo_s) == 128 &&
+          offsetof(imd_perf_rank_request_t, regime) == 64 &&
+          offsetof(imd_perf_request_t, regime) == 24);
     static imd_perf_calib_t cal, back;
     memset(&cal, 0, sizeof cal);
     cal.struct_size = sizeof cal;
     CHECK(imd_perf_calib_default(&cal) == IMD_STATUS_SUCCESS);
-    CHECK(cal.format == IMD_PERF_CALIB_FORMAT && cal.sm_count == 128 && cal.gpu[0] != '\0');
+    CHECK((cal.format == 1 || cal.format == IMD_PERF_CALIB_FORMAT) && cal.sm_count == 128 &&
+          cal.gpu[0] != '\0');
     CHECK(cal.peak_dram_bytes_per_s > 0 && cal.peak_int8_ops_per_s > 0);
     /* format -> parse: bit-exact */
     static char text[16384];
@@ -338,8 +345,8 @@ int main(void) {
       CHECK(imd_perf_calib_parse(bad, (size_t)n, &back, &line) == IMD_STATUS_INVALID_VALUE &&
             line == 0);
       n = snprintf(bad, sizeof bad, "%s", text);
-      p = strstr(bad, "format = 1");
-      if (p) p[9] = '2'; /* another format */
+      p = strstr(bad, "\nformat = ");
+      if (p) p[10] = '3'; /* another format (1 and 2 are read) */
       CHECK(imd_perf_calib_parse(bad, (size_t)n, &back, &line) == IMD_STATUS_INVALID_VALUE &&
             line > 0);
       const char* bad_values[] = {"kl.byte = -1\n", "kl.byte = 1x\n", "kl.byte = nan\n",
@@ -390,7 +397,7 @@ int main(void) {
       CHECK(pr.flops_eq == 2.0 * 17 * 33 * 5 * 3);
     }
     {
-      imd_perf_request_t rq = {sizeof rq, IMD_PERF_ALPHA_ZERO, -1, 0, -1.0};
+      imd_perf_request_t rq = {sizeof rq, IMD_PERF_ALPHA_ZERO, -1, 0, -1.0, 0, 0, 0.0};
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_SUCCESS);
       CHECK(pr.num_phases == 3 && pr.phase[0].phase == IMD_PERF_PHASE_K0 &&
             pr.phase[1].phase == IMD_PERF_PHASE_BETA && pr.kernel_launches == 2);
@@ -406,8 +413,50 @@ int main(void) {
             pr.eps_fraction == 0.0);
       rq.eps_fraction = -1.0;
       back = cal;
-      back.format = 2;
+      back.format = 3;
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, NULL, &back, &pr) == IMD_STATUS_INVALID_VALUE);
+      /* v7: a version-6-sized calibration, request and result are still accepted. The
+       * calibration is then a TRUE format-1 view (the format-2 parameters zeroed: a degraded
+       * model, the v6 formulas) and equals the parse of its own format-1 text; a bad regime
+       * is not accepted */
+      {
+        static imd_perf_calib_t c6, c6b;
+        static imd_perf_t p6, p7;
+        static char t6[16384];
+        size_t n6 = 0;
+        memset(&c6, 0, sizeof c6);
+        c6.struct_size = 1232;
+        CHECK(imd_perf_calib_default(&c6) == IMD_STATUS_SUCCESS && c6.format == 1 &&
+              c6.struct_size == 1232 && c6.kernel[0].resident == 0);
+        CHECK(c6.param[IMD_PERF_CLASS_K5 * IMD_PERF_MAX_PARAMS + 4] == 0.0 &&  /* k5.dram */
+              c6.param[IMD_PERF_CLASS_KL * IMD_PERF_MAX_PARAMS + 5] == 0.0);   /* kl.wave */
+        CHECK(imd_perf_calib_format(&c6, t6, sizeof t6, &n6) == IMD_STATUS_SUCCESS &&
+              strstr(t6, "format = 1") != NULL && strstr(t6, "k5.dram") == NULL);
+        memset(&c6b, 0x5a, sizeof c6b);
+        c6b.struct_size = 1232;
+        CHECK(imd_perf_calib_parse(t6, n6, &c6b, NULL) == IMD_STATUS_SUCCESS &&
+              memcmp(&c6, &c6b, 1232) == 0);
+        memset(&p6, 0, sizeof p6);
+        p6.struct_size = 1648;
+        imd_perf_request_t r6 = {24, 0, -1, 0, -1.0, 99, 99, -5.0};  /* v7 fields ignored */
+        CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r6, &c6, &p6) == IMD_STATUS_SUCCESS &&
+              p6.time_s > 0 && p6.regime == 0 && p6.time_lo_s == 0);
+        memset(&p7, 0, sizeof p7);
+        p7.struct_size = sizeof p7;
+        imd_perf_request_t r7 = {sizeof r7, 0, -1, 0, -1.0, IMD_PERF_REGIME_BURST,
+                                 IMD_PERF_CACHE_COLD, 0.0};
+        CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r7, &c6, &p7) == IMD_STATUS_SUCCESS &&
+              p7.time_s == p6.time_s && p7.time_lo_s == p7.time_s);
+        r7.regime = 7;
+        CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r7, NULL, &p7) == IMD_STATUS_INVALID_VALUE);
+        r7.regime = 0, r7.cache = 3;
+        CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r7, NULL, &p7) == IMD_STATUS_INVALID_VALUE);
+        r7.cache = 0, r7.clock_mhz = -1.0;
+        CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r7, NULL, &p7) == IMD_STATUS_INVALID_VALUE);
+        CHECK(strcmp(imd_perf_kernel_name(IMD_PERF_KERNEL_KF16), "kf16") == 0 &&
+              strcmp(imd_perf_kernel_name(IMD_PERF_KERNEL_K5 + 4 * 12 + 2), "k5_n14_e4") == 0 &&
+              imd_perf_kernel_name(IMD_PERF_KERNEL_COUNT) == NULL);
+      }
       pr.struct_size = 100;
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, NULL, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
       pr.struct_size = sizeof pr;
@@ -437,6 +486,7 @@ int main(void) {
     rr.vec_modes = IMD_PERF_VEC_GENERATE | IMD_PERF_VEC_RESIDENT;
     rr.pack_modes = IMD_PERF_PACK_NONE | IMD_PERF_PACK_A;
     rr.reuse = 4;
+    rr.order = IMD_PERF_ORDER_TIME; /* v7: the v6 time order (ties by band: test_host.py) */
     static imd_perf_candidate_t cand[64];
     int32_t nc = 0;
     CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, NULL, 0, &nc) == IMD_STATUS_SUCCESS && nc == 36);
@@ -445,6 +495,7 @@ int main(void) {
       const imd_perf_candidate_t* c = &cand[i];
       CHECK(c->status == IMD_STATUS_SUCCESS && c->feasible == 1);
       if (i > 0) CHECK(cand[i - 1].time_s <= c->time_s);
+      CHECK(c->raw_rank == i && c->time_lo_s <= c->time_s && c->time_s <= c->time_hi_s);
       const imd_options_t o = {c->num_moduli, c->residue_group, IMD_RN, IMD_EMULATE, c->vec_mode,
                                IMD_K4_TUNE_OFF};
       size_t ws = 0, pdev = 0;

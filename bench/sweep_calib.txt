@@ -4,6 +4,8 @@
 # resident vector mode, packed operands (imd_pack) and the DIRECT kernel. Its shapes are disjoint
 # from the hold-out set (bench/sweep_perf_validate.txt). About 12 min of GPU time on an RTX 4090.
 # name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
+# --- (v1.10) the occupancy of every kernel (no timing; the calibration's kernel.<name> lines)
+c_occ     | ik,jk->ij | i=64,j=64,k=64             | occupancy | 8 |
 # --- fused small path KF (k_hat <= 1024)
 c_s64     | ik,jk->ij | i=64,j=64,k=64             | imd | 8,14,20 | --reps 300 --phase-reps 30 --max-seconds 1 --k4 rule,3
 c_s128    | ik,jk->ij | i=128,j=128,k=128          | imd | 8,14,20 | --reps 300 --phase-reps 30 --max-seconds 1 --g 0,2 --k4 rule,1,2,3
@@ -65,3 +67,40 @@ k_b       | lik,ljk->lij | l=6,i=384,j=384,k=512   | imd | 15,16,17 | --reps 100
 k_cc      | kjbc,kiac->abij | i=8,j=8,k=10,a=64,b=64,c=80 | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
 k_d576    | ik,jk->ij | i=576,j=576,k=576          | imd | 15,16 | --reps 200 --phase-reps 10 --max-seconds 1 --data dominant
 k_dr1     | ik,jk->ij | i=2048,j=512,k=640         | imd | 15,16 | --reps 100 --phase-reps 10 --max-seconds 1 --data dominant
+# --- (v1.10, b2-fidelity) small pack grids (K3 of narrow B: r_mm-like n, groups 2..) and the
+#     K4 partial K tile: k_hat around 768-1088 and 4864-5120 with k_hat mod 64 / 128 varied
+#     (k_hat mod 32 / 64 / 128: 784: 16 / 16 / 16, 800: 0 / 32 / 32, 832: 0 / 0 / 64, 896: 0 / 0 / 0,
+#     1008: 16 / 48 / 112, 1040: 16 / 16 / 16, 4880: 16, 4960: 0 / 32, 5008: 16), rows
+#     of A / B 2048 (multiples of 128) and 2000 (not)
+p_k3a     | ik,jk->ij | i=4096,j=96,k=8192         | imd | 8,14,16 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,2,5
+p_k3b     | ik,jk->ij | i=8192,j=192,k=3000        | imd | 8,16 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,3,7
+p_k3c     | ik,jk->ij | i=1536,j=320,k=1536        | imd | 14,16 | --reps 50 --phase-reps 10 --max-seconds 1 --g 0,4
+t_k768    | ik,jk->ij | i=2048,j=2048,k=768        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_k784    | ik,jk->ij | i=2048,j=2048,k=784        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_k800    | ik,jk->ij | i=2048,j=2048,k=800        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_k832    | ik,jk->ij | i=2048,j=2048,k=832        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_k896    | ik,jk->ij | i=2048,j=2048,k=896        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_k960    | ik,jk->ij | i=2048,j=2048,k=960        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_k1008   | ik,jk->ij | i=2048,j=2048,k=1008       | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_k1024   | ik,jk->ij | i=2048,j=2048,k=1024       | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_k1040   | ik,jk->ij | i=2048,j=2048,k=1040       | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_k1088   | ik,jk->ij | i=2048,j=2048,k=1088       | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_r800    | ik,jk->ij | i=2000,j=2000,k=800        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_r832    | ik,jk->ij | i=2000,j=2000,k=832        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
+t_k4864   | ik,jk->ij | i=2048,j=2048,k=4864       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
+t_k4880   | ik,jk->ij | i=2048,j=2048,k=4880       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
+t_k4928   | ik,jk->ij | i=2048,j=2048,k=4928       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
+t_k4960   | ik,jk->ij | i=2048,j=2048,k=4960       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
+t_k4992   | ik,jk->ij | i=2048,j=2048,k=4992       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
+t_k5008   | ik,jk->ij | i=2048,j=2048,k=5008       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
+t_k5056   | ik,jk->ij | i=2048,j=2048,k=5056       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
+t_k5120   | ik,jk->ij | i=2048,j=2048,k=5120       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
+#     long k, few CTAs (v_n15d: 768 x 768 x 100000, k_hat mod 64 = 32, mod 32 = 0, K4 between the
+#     mod-64 and mod-32 predictions): k_hat mod 32 / 64 = 0 / 0, 16 / 16, 0 / 32
+t_lk0     | ik,jk->ij | i=768,j=768,k=65536        | imd | 8,15 | --reps 10 --phase-reps 3 --max-seconds 1
+t_lk1     | ik,jk->ij | i=768,j=768,k=65552        | imd | 8,15 | --reps 10 --phase-reps 3 --max-seconds 1
+t_lk2     | ik,jk->ij | i=768,j=768,k=65568        | imd | 8,15 | --reps 10 --phase-reps 3 --max-seconds 1
+#     two K-chunks (review 2026-10-05): K4 reads chunk c at row * k_hat + c * K_c' and K_c' =
+#     131056 = 16 mod 32, so with k_hat = 262144 only chunk 1 is misaligned, with 262160 all
+t_2c0     | ik,jk->ij | i=512,j=512,k=262144       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
+t_2c1     | ik,jk->ij | i=512,j=512,k=262160       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1

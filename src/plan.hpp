@@ -35,6 +35,11 @@ imd_status_t enqueue_pack(const ExecPlan& p, const PackLayout& pl, const double*
 // 512 k-bar get taller tiles (up to 64 rows: whole short rows side by side); -1 = KL's rule.
 int32_t pack_kl_lg_rows(const ExecPlan& p);
 
+// v1.10 (DESIGN §6c.1, benchmark use: imd_prof_kernel_occupancy): out[0..3] = CTAs per SM,
+// registers per thread, static shared memory bytes and threads of the launch, of kernel
+// IMD_PERF_KERNEL_* (the K4 ones excepted: cudaErrorInvalidValue).
+cudaError_t kernel_occupancy(int32_t kernel, int32_t* out);
+
 // K0 (contract.cu): write the p.vec_count scatter vectors to `vec` from p.vec_desc, on
 // `stream`. Also builds the resident copy at plan creation. SUCCESS or CUDA_ERROR.
 imd_status_t k0_generate(const ExecPlan& p, int64_t* vec, cudaStream_t stream);

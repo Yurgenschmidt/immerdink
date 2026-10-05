@@ -77,9 +77,38 @@ def to_desc(d):
     return host.Desc(*map(tuple, d))
 
 
-def random_calib(rng, base):
+def random_calib(rng, base, v2=False):
+    """Random parameters; v2: a format-2 calibration (host API 7) with chain parameters, a
+    power model, a cache term and bands, so the v7 request fields change the results."""
     params = {k: v * rng.uniform(0.5, 2.0) for k, v in base.params.items()}
-    return host.Calibration.from_values(base.meta, params, lib=base._lib)
+    extra = base.extra or None  # keep the base's format (the shipped one may be format 2)
+    if v2:
+        for k in host.FORMAT2_PARAMS:
+            params[k] = rng.random() * 0.05
+        extra = {f"kernel.{n}": (v[0] + rng.randint(0, 2), 64, 4096, v[3])
+                 for n, v in base.kernels.items()}
+        extra.update({"power.clock_eff_mhz": 2800.0, "power.clock_min_mhz": 1500.0,
+                      "power.cap_w": rng.choice((300.0, 450.0)), "power.idle_w": 60.0,
+                      "power.tc_pj": 0.7, "power.alu_pj": 4.0, "power.byte_pj": 20.0,
+                      "power.gamma": 2.0, "warm.l2_bytes": 3.0e7, "warm.l2byte": 3e-4,
+                      "rank.tie_ratio": rng.uniform(1.0, 1.2)})
+        for k in host.Calibration.default(base._lib).bands:
+            lo = 1.0 if k == "band.call" else rng.uniform(0.7, 1.0)
+            extra[k] = (lo, 1.0 if k == "band.call" else rng.uniform(1.0, 1.4))
+    return host.Calibration.from_values(base.meta, params, lib=base._lib, extra=extra)
+
+
+# v7 (DESIGN v1.10 §6c) request fields: host.py takes names, planner.Request / rank's
+# **fields the C values.
+V7_REGIMES, V7_CACHES, V7_ORDERS = host.PERF_REGIMES, host.PERF_CACHES, host.PERF_ORDERS
+
+
+def random_v7(rng):
+    """(host.py keyword arguments, the same as C field values) of random v7 request fields."""
+    reg, cac = rng.choice(list(V7_REGIMES)), rng.choice(list(V7_CACHES))
+    clk = rng.choice((0.0, 0.0, 2000.0, 2800.0))
+    return (dict(regime=reg, cache=cac, clock_mhz=clk),
+            dict(regime=V7_REGIMES[reg], cache=V7_CACHES[cac], clock_mhz=clk))
 
 
 def random_packing(rng, descs, opts, lib):
@@ -156,6 +185,18 @@ def check_single(rng, lib, cals, cases, verbose):
              what + f" predict {req}")
         same(q.predict(N, g, vec, packing=packing, calib=cal, request=planner.Request(**req),
                        **fo).to_prediction(), hp, what + f" predict Request {req}")
+        # v7 request fields through planner.Request (C values) vs host.py (names)
+        hk, ck = random_v7(rng)
+        hp = host.predict(descs, packing=packing, calib=cal, **req, **hk, **kw)
+        pv = q.predict(N, g, vec, packing=packing, calib=cal, request=planner.Request(**req, **ck),
+                       **fo)
+        same(pv.to_prediction(), hp, what + f" predict v7 {req} {hk}")
+        same_view(pv, hp, what + f" predict v7 view {hk}")
+        # names (host.py's) and C values give the same result: keywords and Request(**names)
+        same(q.predict(N, g, vec, packing=packing, calib=cal, **req, **hk, **fo).to_prediction(),
+             hp, what + f" predict v7 keywords {hk}")
+        same(q.predict(N, g, vec, packing=packing, calib=cal, request=planner.Request(**req, **hk),
+                       **fo).to_prediction(), hp, what + f" predict v7 Request names {hk}")
         if packing is not None:
             for pk in packing:
                 if pk is not None:
@@ -184,6 +225,15 @@ def random_rank_args(rng):
                 eps_fraction=rng.choice((None, 0.0, 0.7)))
 
 
+def random_rank_v7(rng):
+    """v7 rank fields: (host.rank keywords, planner rank **fields), or ({}, {})."""
+    if rng.random() < 0.3:
+        return {}, {}
+    hk, ck = random_v7(rng)
+    order = rng.choice(list(V7_ORDERS))
+    return dict(hk, order=order), dict(ck, order=V7_ORDERS[order])
+
+
 def check_rank(rng, lib, cals, cases, verbose):
     total = 0
     fns = planner._state(lib)[0]
@@ -195,18 +245,25 @@ def check_rank(rng, lib, cals, cases, verbose):
     for i in range(cases):
         descs = tuple(to_desc(d) for d in random_descs(rng, legal_bias=0.95))
         args = random_rank_args(rng)
+        hv7, cv7 = random_rank_v7(rng)
         rnd, mode = rng.choice(("RN", "RN", "TRUNC")), rng.choice(("EMULATE", "EMULATE", "DIRECT"))
         cal = rng.choice(cals + [None])
         q = planner.Query(descs, lib=lib)
         what = f"rank case {i} {descs} {args} {rnd} {mode}"
         fns.perf_rank, calls[0] = counted, 0
         try:
-            a = outcome(lambda: q.rank(rounding=rnd, mode=mode, calib=cal, **args))
+            a = outcome(lambda: q.rank(rounding=rnd, mode=mode, calib=cal, **args, **cv7))
+            if cv7 and rng.random() < 0.5:  # by name, once more: identical
+                a2 = outcome(lambda: q.rank(rounding=rnd, mode=mode, calib=cal, **args, **hv7))
+                calls[0] -= 1
+                if a2[0] != a[0] or (a[0] == "ok" and a2[1].to_list() != a[1].to_list()):
+                    raise Fail(f"rank by names vs C values: {hv7}")
         finally:
             fns.perf_rank = real
         if calls[0] != 1:
             raise Fail(f"{what}: {calls[0]} imd_perf_rank calls (one expected)")
-        b = outcome(lambda: host.rank(descs, rounding=rnd, mode=mode, calib=cal, lib=lib, **args))
+        b = outcome(lambda: host.rank(descs, rounding=rnd, mode=mode, calib=cal, lib=lib, **args,
+                                      **hv7))
         if a[0] != b[0]:
             raise Fail(f"{what}: {a} vs {b}")
         if a[0] == "err":
@@ -426,8 +483,8 @@ def check_review_fixes(lib, spec, ext, q):
         pass
     else:
         raise Fail("Query.calib is writable")
-    # _RANK_EXTRA: the fields after eps_fraction (none in version 6)
-    if planner._RANK_EXTRA != frozenset():
+    # _RANK_EXTRA: the fields after eps_fraction (none in version 6; version 7: the v1.10 ones)
+    if planner._RANK_EXTRA != frozenset({"regime", "cache", "order", "clock_mhz"}):
         raise Fail(f"_RANK_EXTRA {planner._RANK_EXTRA}")
     # a C array field of a view is an immutable tuple
     @dataclasses.dataclass(frozen=True)
@@ -521,7 +578,8 @@ def main():
     lib = host.load(a.host_lib)
     rng = random.Random(a.seed)
     base = host.Calibration.default(lib)
-    cals = [base, random_calib(rng, base), random_calib(rng, base)]
+    cals = [base, random_calib(rng, base), random_calib(rng, base, v2=True),
+            random_calib(rng, base, v2=True)]
     try:
         check_single(rng, lib, cals, a.cases, a.verbose)
         check_rank(rng, lib, cals, max(a.cases // 5, 20), a.verbose)

@@ -252,8 +252,8 @@ def summary(results):
                for k in (old, new, memo)]
         flo = [r["floor_us"].get(fl) for r in results.values()]
         print(f"  {name:<22} {rng(flo):>13} {rng(col[0]):>13} {rng(col[1]):>13} {rng(col[2]):>13}")
-    print("  (predict's C floor is with the calibration passed; with calib = NULL the C library "
-          "parses the shipped calibration per call: "
+    print("  (predict's C floor is with the calibration passed (copied and validated per "
+          "call); with calib = NULL the C library uses its parsed-once shipped calibration: "
           + rng([r["floor_us"].get("predict_null") for r in results.values()]).strip() + " µs)")
 
 

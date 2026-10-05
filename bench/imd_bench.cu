@@ -39,6 +39,7 @@
 // samples (no operand copies), so host RSS is small for every shape. Reported: max |c - r| / |r| and the
 // normwise max |c - r| / (||a_i||_2 ||b_j||_2) of DESIGN §3.8.
 #include <cuda_runtime.h>
+#include <dlfcn.h>
 #include <sys/resource.h>
 #include <immerdink/immerdink.h>
 
@@ -59,8 +60,10 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <atomic>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -409,6 +412,7 @@ Accuracy check(Reference& R, const double* dC, cudaStream_t st) {
 // -------------------------------------------------------------------------------- timing ---
 struct Timing {
   std::vector<double> t;  // seconds per repetition
+  std::vector<double> mhz;  // v1.10: SM clock right after each timed call (clock probe), MHz
   double median() const {
     auto v = t;
     std::sort(v.begin(), v.end());
@@ -432,6 +436,13 @@ struct Options {
   std::vector<int> k4 = {-1};
   double phi = 0.5;
   bool dominant = false;  // --data dominant (B2 eps-path calibration: one dominant entry per row)
+  // v1.10 (DESIGN §6c): --clock-probe 1 records the SM clock after every timed call (also
+  // IMD_BENCH_CLOCK=1); --l2 flush writes a 2 x L2 buffer before every timed imd call (outside
+  // the timed window: the COLD state; default repeat); --sustain-s / --sustain-warm-s: method
+  // sustained's measured window and warm-up.
+  bool clock_probe = false;
+  bool l2_flush = false;
+  double sustain_s = 8, sustain_warm_s = 3;
   uint64_t seed = 1;
   std::string out;
 };
@@ -448,8 +459,12 @@ __global__ void k_clock_probe(unsigned long long* out) {
   if (threadIdx.x == 0) { out[0] = c1 - c0; out[1] = t1 - t0; }
 }
 
-Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& o) {
-  for (int w = 0; w < o.warmup; ++w) run();
+Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& o,
+               const std::function<void()>& pre = nullptr) {
+  for (int w = 0; w < o.warmup; ++w) {
+    if (pre) pre();
+    run();
+  }
   CU(cudaStreamSynchronize(s));
   CU(cudaGetLastError());
   cudaEvent_t e0, e1;
@@ -458,11 +473,12 @@ Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& 
   Timing T;
   double total = 0;
   const char* clk_env = getenv("IMD_BENCH_CLOCK");
-  const bool clk = clk_env && *clk_env == '1';
+  const bool clk = (clk_env && *clk_env == '1') || o.clock_probe;
   unsigned long long* clk_buf = nullptr;
   std::vector<double> mhz;
   if (clk) CU(cudaHostAlloc(&clk_buf, 2 * sizeof(unsigned long long), cudaHostAllocMapped));
   for (int r = 0; r < o.reps; ++r) {
+    if (pre) pre();  // outside the timed window (v1.10: the L2 flush of --l2 flush)
     CU(cudaEventRecord(e0, s));
     run();
     CU(cudaEventRecord(e1, s));
@@ -486,7 +502,8 @@ Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& 
     for (double t : T.t) fprintf(stderr, " %.1f", t * 1e6);
     fprintf(stderr, "\n");
   }
-  if (clk) {
+  T.mhz = mhz;
+  if (clk && getenv("IMD_BENCH_CLOCK")) {
     fprintf(stderr, "  sm_mhz:");
     for (double m : mhz) fprintf(stderr, " %.0f", m);
     fprintf(stderr, "\n");
@@ -529,6 +546,40 @@ DuelSide parse_duel_side(const std::string& spec, int N) {
   }
   return d;
 }
+
+// v1.10: read n words (L2 eviction by clean lines); the store never happens for the zeroed
+// buffer, but the compiler cannot drop the reads.
+__global__ void k_touch(const unsigned long long* p, size_t n, unsigned long long* sink) {
+  unsigned long long acc = 0;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    acc += p[i];
+  if (acc == 1) sink[0] = acc;
+}
+
+// v1.10 (method sustained): NVML through dlopen (no build dependency): board power and SM
+// clock. Neither read disturbs the energy counter (evaluation workspace findings/energy).
+struct Nvml {
+  void* lib = nullptr;
+  void* dev = nullptr;
+  int (*power)(void*, unsigned*) = nullptr;
+  int (*clock)(void*, int, unsigned*) = nullptr;
+  int (*limit)(void*, unsigned*) = nullptr;
+  bool ok() const { return dev != nullptr; }
+  Nvml() {
+    lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+    if (!lib) return;
+    auto init = reinterpret_cast<int (*)()>(dlsym(lib, "nvmlInit_v2"));
+    auto handle = reinterpret_cast<int (*)(unsigned, void**)>(dlsym(lib, "nvmlDeviceGetHandleByIndex_v2"));
+    power = reinterpret_cast<int (*)(void*, unsigned*)>(dlsym(lib, "nvmlDeviceGetPowerUsage"));
+    clock = reinterpret_cast<int (*)(void*, int, unsigned*)>(dlsym(lib, "nvmlDeviceGetClockInfo"));
+    limit = reinterpret_cast<int (*)(void*, unsigned*)>(dlsym(lib, "nvmlDeviceGetEnforcedPowerLimit"));
+    if (!init || !handle || !power || !clock || init() != 0 || handle(0, &dev) != 0) dev = nullptr;
+  }
+  double power_w() const { unsigned mw = 0; return ok() && power(dev, &mw) == 0 ? mw * 1e-3 : NAN; }
+  double sm_mhz() const { unsigned m = 0; return ok() && clock(dev, 1, &m) == 0 ? double(m) : NAN; }
+  double limit_w() const { unsigned mw = 0; return ok() && limit && limit(dev, &mw) == 0 ? mw * 1e-3 : NAN; }
+};
 
 // Number of elements whose bit patterns differ (method duel: are the two sides' C identical).
 __global__ void k_count_diff(const unsigned long long* x, const unsigned long long* y, size_t n,
@@ -593,6 +644,11 @@ struct Bench {
     j.integer("reps", (long long)T.t.size());
     j.num("median_s", T.median()).num("min_s", T.min()).num("max_s", T.max());
     j.num("spread_pct", 100.0 * (T.max() - T.min()) / T.median());
+    if (!T.mhz.empty()) {  // v1.10: the SM clock of the timed calls (median of the probes)
+      auto v = T.mhz;
+      std::sort(v.begin(), v.end());
+      j.num("sm_mhz_median", v[v.size() / 2]).num("sm_mhz_min", v.front()).num("sm_mhz_max", v.back());
+    }
     j.num("tflops_eq", flops / T.median() / 1e12);
     j.integer("ws_bytes", (long long)ws_bytes);
     if (acc) {
@@ -617,6 +673,23 @@ struct Bench {
     return check(R, dC.as<double>(), s);
   }
   void poison_C() { CU(cudaMemset(dC.p, 0xff, dC.bytes)); }  // NaN everywhere
+
+  // v1.10 (DESIGN §6c.1 "Cache state"): evict the L2 by writing a buffer of twice its size
+  // (on the stream, before the timed window).
+  DevBuf l2buf;
+  int flush_n = 0;
+  void flush_l2() {
+    if (l2buf.bytes == 0) {
+      cudaDeviceProp p{};
+      CU(cudaGetDeviceProperties(&p, 0));
+      l2buf = DevBuf(2 * size_t(p.l2CacheSize));
+    }
+    // Read (not written: dirty lines would be written back during the timed call); the
+    // first use initializes the buffer.
+    if (flush_n++ == 0) CU(cudaMemsetAsync(l2buf.p, 0, l2buf.bytes, s));
+    k_touch<<<1024, 256, 0, s>>>(l2buf.as<const unsigned long long>(), l2buf.bytes / 8,
+                                 l2buf.as<unsigned long long>());
+  }
 
   // ------------------------------------------------------------------------ setup ---
   void setup() {
@@ -706,7 +779,7 @@ struct Bench {
     poison_C();
     Timing T = time_it([&] {
       CI(imd_contract(plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
-    }, s, o);
+    }, s, o, o.l2_flush ? std::function<void()>([&] { flush_l2(); }) : nullptr);
     Accuracy acc = result_accuracy();
     CU(cudaStreamSynchronize(s));
     Json extra;
@@ -715,7 +788,10 @@ struct Bench {
 #ifdef IMD_BENCH_PROFILE
     imd_prof_plan_k4(plan, &k4_plan);
 #endif
-    imd_perf_request_t preq{sizeof(imd_perf_request_t), 0, k4_plan, 0};
+    // v1.10: the bench's state (the same call repeated) at the reference clock; the default
+    // eps fraction (the v6 bench passed 0 here by value-initialization).
+    imd_perf_request_t preq{sizeof(imd_perf_request_t), 0, k4_plan, 0, -1.0,
+                            IMD_PERF_REGIME_BURST, o.l2_flush ? IMD_PERF_CACHE_COLD : IMD_PERF_CACHE_REPEAT, 0.0};
     imd_perf_t pred{};
     pred.struct_size = sizeof pred;
     imd_perf_predict(&A, &B, &C, &opt, nullptr, &preq, nullptr, &pred);
@@ -740,6 +816,7 @@ struct Bench {
     if (o.mode == IMD_DIRECT) vs += " mode=direct";
     if (k4 == -2) vs += " k4=tune";
     else if (k4 >= 0) vs += " k4=" + std::to_string(k4);
+    if (o.l2_flush) vs += " l2=flush";
     record("imd", vs, N, T, &acc, flops(), wsb, extra);
   }
 
@@ -999,9 +1076,11 @@ struct Bench {
           {"plain_", do_plain}, {"packed_", do_packed}, {"pack_", do_pack}};
       imd_perf_t preds[3] = {};
       for (auto& pr : preds) pr.struct_size = sizeof pr;
-      imd_perf_predict(&A, &B, &C, &opt, nullptr, nullptr, nullptr, &preds[0]);
-      imd_perf_predict(&A, &B, &C, &opt, &packing, nullptr, nullptr, &preds[1]);
-      imd_perf_predict_pack(&desc, nullptr, nullptr, &preds[2]);
+      const imd_perf_request_t rq{sizeof(imd_perf_request_t), 0, -1, 0, -1.0,
+                                  IMD_PERF_REGIME_BURST, IMD_PERF_CACHE_REPEAT, 0.0};
+      imd_perf_predict(&A, &B, &C, &opt, nullptr, &rq, nullptr, &preds[0]);
+      imd_perf_predict(&A, &B, &C, &opt, &packing, &rq, nullptr, &preds[1]);
+      imd_perf_predict_pack(&desc, &rq, nullptr, &preds[2]);
       int ri = 0;
       for (auto& [pre, fn] : runs) {
         fprintf(stderr, "  %sphases:\n", pre);
@@ -1110,6 +1189,186 @@ struct Bench {
   }
 #endif
 
+  // ---- v1.10 (DESIGN §6c.1, §6c.2): calibration of occupancy, sustained clock / power, cache
+
+  // An immerdink plan of this case (the rule's K4 configuration), with its workspace.
+  struct SimplePlan {
+    std::vector<int32_t> la, lb, lc;
+    imd_tensor_t A{}, B{}, C{};
+    imd_options_t opt{};
+    imd_plan_t plan = nullptr;
+    size_t wsb = 0;
+    DevBuf ws;
+    ~SimplePlan() {
+      if (plan) { cudaDeviceSynchronize(); imd_plan_destroy(plan); }
+    }
+  };
+  std::unique_ptr<SimplePlan> make_plan(int N, int vec_mode, int g) {
+    auto P = std::make_unique<SimplePlan>();
+    auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
+      lab.assign(x.labels.begin(), x.labels.end());
+      return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
+    };
+    P->A = t(c.A, P->la), P->B = t(c.B, P->lb), P->C = t(c.C, P->lc);
+    P->opt = imd_options_t{N, g, IMD_RN, o.mode, vec_mode, IMD_K4_TUNE_OFF};
+    CI(imd_workspace_size(&P->A, &P->B, &P->C, &P->opt, &P->wsb));
+    CI(imd_plan_create(imd, &P->A, &P->B, &P->C, &P->opt, &P->plan));
+    P->ws = DevBuf(P->wsb);
+    return P;
+  }
+
+  // Method occupancy: the measured CTAs per SM, registers, shared memory and threads of every
+  // kernel (IMD_PERF_KERNEL_*), for the calibration file's kernel.<name> lines. No timing.
+  void method_occupancy() {
+#ifdef IMD_BENCH_PROFILE
+    std::string js = "{";
+    for (int k = 0; k < IMD_PERF_KERNEL_COUNT; ++k) {
+      int32_t v[4] = {0, 0, 0, 0};
+      if (imd_prof_kernel_occupancy(k, v) != 0) throw Failure("imd_prof_kernel_occupancy");
+      js += (k ? ", " : "") + jstr(imd_perf_kernel_name(k)) + ": [" + std::to_string(v[0]) + ", " +
+            std::to_string(v[1]) + ", " + std::to_string(v[2]) + ", " + std::to_string(v[3]) + "]";
+    }
+    Json j;
+    j.str("method", "occupancy").str("variant", "").integer("N", 0).raw("kernels", js + "}");
+    j.str("status", "ok");
+    emit(j);
+#else
+    throw Failure("--methods occupancy needs the profiling build");
+#endif
+  }
+
+  // Method sustained: one plan back to back for --sustain-s seconds after --sustain-warm-s of
+  // the same calls, queued ahead (two chunks of >= 20 ms in flight: the GPU never waits for
+  // the host). Records the mean time per call and the mean board power and SM clock over the
+  // window (NVML, sampled every 20 ms in a host thread; the energy counter is not read).
+  void method_sustained(int N, int vec_mode, int g) {
+    auto P = make_plan(N, vec_mode, g);
+    Nvml nv;
+    if (!nv.ok()) throw Failure("NVML not available (libnvidia-ml.so.1)");
+    auto call = [&] {
+      CI(imd_contract(P->plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), P->ws.p,
+                      P->wsb, s));
+    };
+    for (int w = 0; w < 3; ++w) call();
+    CU(cudaStreamSynchronize(s));
+    cudaEvent_t e0, e1, chunk_ev[2];
+    CU(cudaEventCreate(&e0));
+    CU(cudaEventCreate(&e1));
+    for (auto& e : chunk_ev) CU(cudaEventCreate(&e));
+    CU(cudaEventRecord(e0, s));
+    for (int w = 0; w < 5; ++w) call();
+    CU(cudaEventRecord(e1, s));
+    CU(cudaEventSynchronize(e1));
+    float ms = 0;
+    CU(cudaEventElapsedTime(&ms, e0, e1));
+    const double t_est = std::max(1e-6, ms * 1e-3 / 5);
+    const long chunk = std::max(1L, long(std::ceil(0.02 / t_est)));
+    int cur = 0;
+    // Chunks until `seconds` of host time have passed; returns the calls issued.
+    auto run_for = [&](double seconds) {
+      long calls = 0;
+      const auto t0 = std::chrono::steady_clock::now();
+      bool first = true;
+      while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < seconds) {
+        for (long i = 0; i < chunk; ++i) call();
+        calls += chunk;
+        CU(cudaEventRecord(chunk_ev[cur], s));
+        if (!first) CU(cudaEventSynchronize(chunk_ev[cur ^ 1]));  // two chunks in flight
+        first = false;
+        cur ^= 1;
+      }
+      return calls;
+    };
+    run_for(o.sustain_warm_s);
+    std::atomic<bool> stop{false};
+    std::vector<double> pw, mhz;
+    std::thread sampler([&] {
+      while (!stop.load()) {
+        pw.push_back(nv.power_w());
+        mhz.push_back(nv.sm_mhz());
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+    });
+    CU(cudaEventRecord(e0, s));
+    const long calls = run_for(o.sustain_s);
+    CU(cudaEventRecord(e1, s));
+    CU(cudaEventSynchronize(e1));
+    stop = true;
+    sampler.join();
+    CU(cudaEventElapsedTime(&ms, e0, e1));
+    CU(cudaGetLastError());
+    for (auto e : {e0, e1, chunk_ev[0], chunk_ev[1]}) cudaEventDestroy(e);
+    auto mean = [](const std::vector<double>& v) {
+      double a = 0;
+      int n = 0;
+      for (double x : v)
+        if (std::isfinite(x)) a += x, ++n;
+      return n ? a / n : NAN;
+    };
+    Timing T;
+    T.t.push_back(ms * 1e-3 / double(calls));  // the back-to-back mean time per call
+    Json e;
+    e.num("window_s", ms * 1e-3).integer("calls", calls).integer("chunk", chunk);
+    e.num("power_w_mean", mean(pw)).num("sm_mhz_mean", mean(mhz));
+    e.integer("nvml_samples", (long long)pw.size());
+    e.num("power_limit_w", nv.limit_w()).num("sustain_warm_s", o.sustain_warm_s);
+    e.integer("g", (long long)((g == 0 || g >= N) ? N : g));
+    std::string vs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
+    if (vec_mode == IMD_VEC_RESIDENT) vs += " vec=resident";
+    record("sustained", vs + " sustained", N, T, nullptr, flops(), P->wsb, e);
+  }
+
+  // Method pair (cache state): C = A B^T with n = k, so C of one call is a valid A of the next
+  // (the same plan). Per repetition, interleaved: COLD (L2 evicted, then the call reading C1
+  // as its A), WARM (L2 evicted, call 1 writes C1, then the call reading C1) and REPEAT (the
+  // same call again right after). Three records: cache = cold / warm / repeat.
+  void method_pair(int N) {
+    if (c.A.size != c.C.size || c.A.labels.size() != 2 || c.C.labels.size() != 2 || c.n != c.k)
+      throw Failure("method pair needs ik,jk->ij with j = k (C of one call is A of the next)");
+    auto P = make_plan(N, IMD_VEC_GENERATE, 0);
+    DevBuf C1(dC.bytes);
+    auto call = [&](const double* A, double* C) {
+      CI(imd_contract(P->plan, 1.0, A, dB.as<double>(), 0.0, C, P->ws.p, P->wsb, s));
+    };
+    call(dA.as<double>(), C1.as<double>());  // C1: a valid A
+    for (int w = 0; w < std::max(o.warmup, 3); ++w) call(C1.as<double>(), dC.as<double>());
+    CU(cudaStreamSynchronize(s));
+    cudaEvent_t e0, e1;
+    CU(cudaEventCreate(&e0));
+    CU(cudaEventCreate(&e1));
+    auto timed = [&](const std::function<void()>& f) {
+      CU(cudaEventRecord(e0, s));
+      f();
+      CU(cudaEventRecord(e1, s));
+      CU(cudaEventSynchronize(e1));
+      float ms = 0;
+      CU(cudaEventElapsedTime(&ms, e0, e1));
+      return double(ms) * 1e-3;
+    };
+    Timing tc, tw, tr;
+    double total = 0;
+    auto second = [&] { call(C1.as<double>(), dC.as<double>()); };
+    for (int r = 0; r < o.reps; ++r) {
+      flush_l2();
+      tc.t.push_back(timed(second));
+      flush_l2();
+      call(dA.as<double>(), C1.as<double>());
+      tw.t.push_back(timed(second));
+      tr.t.push_back(timed(second));
+      total += tc.t.back() + tw.t.back() + tr.t.back();
+      if (r + 1 >= o.min_reps && total > o.max_seconds) break;
+    }
+    CU(cudaGetLastError());
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    const std::pair<const char*, Timing*> states[3] = {{"cold", &tc}, {"warm", &tw}, {"repeat", &tr}};
+    for (const auto& [nm, T] : states) {
+      Json e;
+      e.str("cache", nm).integer("g", N);
+      record("pair", std::string("RN g=N cache=") + nm, N, *T, nullptr, flops(), P->wsb, e);
+    }
+  }
+
   void method_bw() {
     DevBuf dst(dA.bytes);
     Timing T = time_it([&] { CU(cudaMemcpyAsync(dst.p, dA.p, dA.bytes, cudaMemcpyDeviceToDevice, s)); }, s, o);
@@ -1129,7 +1388,9 @@ void usage() {
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
           "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4)\n"
-          "  methods: imd,packed,duel,bw (default imd)\n"
+          "  [--clock-probe 0|1] [--l2 repeat|flush] (v1.10: per-call SM clock; L2 evicted\n"
+          "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
+          "  methods: imd,packed,duel,bw,occupancy,sustained,pair (default imd)\n"
           "  [--out file.jsonl]\n");
 }
 
@@ -1143,7 +1404,8 @@ int main(int argc, char** argv) {
   static const char* const kKeys[] = {"name", "spec", "ext", "methods", "N", "reps", "warmup",
                                       "max-seconds", "samples", "phi", "seed", "phase-reps",
                                       "vec", "g", "k4", "pack", "reuse", "duel-a", "duel-b", "out",
-                                      "mode", "data"};
+                                      "mode", "data", "clock-probe", "l2", "sustain-s",
+                                      "sustain-warm-s"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -1156,8 +1418,10 @@ int main(int argc, char** argv) {
     a[k] = argv[++i];
   }
   for (auto& m : split(a["methods"], ','))
-    if (m != "imd" && m != "packed" && m != "duel" && m != "bw") {
-      fprintf(stderr, "unknown method %s (immerdink only: imd, packed, duel, bw)\n", m.c_str());
+    if (m != "imd" && m != "packed" && m != "duel" && m != "bw" && m != "occupancy" &&
+        m != "sustained" && m != "pair") {
+      fprintf(stderr, "unknown method %s (immerdink only: imd, packed, duel, bw, occupancy, "
+                      "sustained, pair)\n", m.c_str());
       return 2;
     }
   if (!a.count("name") || !a.count("spec") || !a.count("ext")) { usage(); return 2; }
@@ -1192,6 +1456,13 @@ int main(int argc, char** argv) {
       B.o.dominant = a["data"] == "dominant";
     }
     if (a.count("phi")) B.o.phi = std::stod(a["phi"]);
+    if (a.count("clock-probe")) B.o.clock_probe = a["clock-probe"] == "1";
+    if (a.count("l2")) {
+      if (a["l2"] != "flush" && a["l2"] != "repeat") throw Failure("--l2 flush|repeat");
+      B.o.l2_flush = a["l2"] == "flush";
+    }
+    if (a.count("sustain-s")) B.o.sustain_s = std::stod(a["sustain-s"]);
+    if (a.count("sustain-warm-s")) B.o.sustain_warm_s = std::stod(a["sustain-warm-s"]);
     if (a.count("seed")) B.o.seed = std::stoull(a["seed"]);
     B.o.min_reps = std::min(B.o.min_reps, B.o.reps);
     if (a.count("out")) {
@@ -1224,6 +1495,14 @@ int main(int argc, char** argv) {
             for (int k4 : B.o.k4)
               if (g <= N) guarded(m, "", N, [&] { B.method_imd(N, v, g, k4); });
     } else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
+    else if (m == "occupancy") guarded(m, "", 0, [&] { B.method_occupancy(); });
+    else if (m == "sustained") {
+      for (int N : Ns)
+        for (int v : B.o.vec_modes)
+          for (int g : B.o.groups)
+            if (g <= N) guarded(m, "", N, [&] { B.method_sustained(N, v, g); });
+    } else if (m == "pair")
+      for (int N : Ns) guarded(m, "", N, [&] { B.method_pair(N); });
     else if (m == "duel")
       for (int N : Ns) guarded(m, "", N, [&] { B.method_duel(N, a["duel-a"], a["duel-b"]); });
     else if (m == "packed") {  // v1.7 (D1): --pack A,B --reuse 1,4,16

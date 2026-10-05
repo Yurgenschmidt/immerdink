@@ -50,3 +50,10 @@ w_b       | lik,ljk->lij | l=4,i=640,j=640,k=384   | imd | 15,16,17 | --reps 100
 w_cc      | kjbc,kiac->abij | i=12,j=12,k=12,a=56,b=56,c=56 | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
 w_d800    | ik,jk->ij | i=800,j=800,k=800          | imd | 15,16 | --reps 200 --phase-reps 10 --max-seconds 1 --data dominant
 w_dr1     | ik,jk->ij | i=1200,j=400,k=700        | imd | 15,16 | --reps 100 --phase-reps 10 --max-seconds 1 --data dominant
+# --- (2026-10-05, b2-fidelity, v1.10) small B-pack grids at g < N and the partial K tile,
+#     disjoint from the fit set
+y_k3a     | ik,jk->ij | i=3000,j=128,k=6000        | imd | 8,16 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,3
+y_k3b     | ik,jk->ij | i=6000,j=256,k=2500        | imd | 14 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,5
+y_kt816   | ik,jk->ij | i=2048,j=1536,k=816        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1
+y_kt880   | ik,jk->ij | i=1600,j=1600,k=880        | imd | 15 | --reps 50 --phase-reps 10 --max-seconds 1
+y_kt4944  | ik,jk->ij | i=2048,j=2048,k=4944       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1

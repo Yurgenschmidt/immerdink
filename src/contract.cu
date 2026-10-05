@@ -36,12 +36,11 @@ namespace {
 using imd::device::c_tables;
 using namespace imd::kernels;
 
-constexpr int kThreads = 256;
-constexpr int64_t kMaxBlocks = int64_t{1} << 20;  // grid-stride loops beyond this
+constexpr int kThreads = kLaunchThreads;            // host/analysis.hpp (shared launch rules)
 
+// v1.10: host/analysis.hpp launch_blocks is the one rule (the performance model uses it too).
 unsigned blocks_for(int64_t work, int per_block = kThreads) {
-  const int64_t b = (work + per_block - 1) / per_block;
-  return static_cast<unsigned>(std::max<int64_t>(1, std::min(b, kMaxBlocks)));
+  return static_cast<unsigned>(launch_blocks(work, per_block));
 }
 
 // q = a / b, r = a % b for a >= 0, b > 0: 32-bit division when both fit (the common case;
@@ -181,19 +180,15 @@ __global__ void __launch_bounds__(T) k1_scale(ScaleArgs a) {
 // B rows n..n_hat-1 (zero) are written by k23_zero_rows.
 
 constexpr int kTileElems = 4096;  // th * tk; kTileElems / 16 == kThreads
+static_assert(kTileElems == 1 << kPackTileLgElems, "host/analysis.hpp pack tile");
 constexpr int kTileRowsMax = 64, kTileRowsMin = 8;
 constexpr int kTileKMax = kTileElems / kTileRowsMin;  // 512
 constexpr int kVec = 16;          // int8 per 16-byte store
 constexpr int kTileSmem = kTileElems + kTileElems / kVec + kTileRowsMax;  // padded words
 static_assert(kTileElems / kVec == kThreads, "one 16-byte chunk per thread");
 
-// log2 of the pack tile height (see above).
-inline int pack_tile_lg_rows(bool along_rows, int64_t D) {
-  if (!along_rows) return 6;
-  int lg = 3;
-  while (lg < 6 && (int64_t{1} << lg) < D) ++lg;
-  return lg;
-}
+// log2 of the pack tile height (see above): host/analysis.hpp pack_tile_lg_rows (v1.10: shared
+// with the performance model, as pack_launch).
 
 // K1 over the pack's row tiles (NOTES-M2M3 #5), used when the pack reads along rows (the
 // operand's smallest-|stride| mode is a row / batch mode, so reading one row along k-bar
@@ -703,28 +698,23 @@ __global__ void __launch_bounds__(kThreads) k5_beta_only(OutArgs a) {
 // per SM, else 4 (A5, NOTES-A5 §2: nsys K5 times, 1 / 2 / 4 per thread, 16 K to 16 M
 // outputs). The test hooks: imd_test_set_k5_one_elem (0: always 4) and imd_test_set_k5_elems
 // (force 1, 2 or 4).
-constexpr int64_t kK5OneElemPerSm = 2048;
+// (kK5OneElemPerSm: host/analysis.hpp.)
 
+// v1.10: the variant and grid are host/analysis.hpp k5_launch (shared with the performance
+// model), with this library's test hooks.
 template <int N>
 void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
-  if (p.k5_batch_fast) {
-    int lg_tl = 1;
-    while (lg_tl < 5 && (int64_t{1} << lg_tl) < p.b) ++lg_tl;
-    const int64_t tl = int64_t{1} << lg_tl, tj = 1024 / tl;
-    const int64_t tiles = p.m * ((p.b + tl - 1) / tl) * ((p.n + tj - 1) / tj);
-    k5_crt_bfast<N><<<blocks_for(tiles, 1), kThreads, 0, stream>>>(out, lg_tl);
-    return;
-  }
-  const int64_t mn = p.b * p.m * p.n, per_sm = k5_one_elem_per_sm();
-  const int e = k5_elems_override() > 0 ? k5_elems_override()
-                : mn <= per_sm / 2 * p.sms ? 1
-                : mn <= 8 * per_sm * p.sms ? 2 : 4;
-  if (e == 1)
-    k5_crt_n<N, 1><<<blocks_for(mn), kThreads, 0, stream>>>(out);
-  else if (e == 2)
-    k5_crt_n<N, 2><<<blocks_for(p.b * p.m * ((p.n + 1) / 2)), kThreads, 0, stream>>>(out);
+  const K5Launch L = k5_launch(p.k5_batch_fast, p.b, p.m, p.n, p.sms, k5_one_elem_per_sm(),
+                               k5_elems_override());
+  const unsigned grid = static_cast<unsigned>(L.grid);
+  if (L.variant == 3)
+    k5_crt_bfast<N><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
+  else if (L.elems == 1)
+    k5_crt_n<N, 1><<<grid, kThreads, 0, stream>>>(out);
+  else if (L.elems == 2)
+    k5_crt_n<N, 2><<<grid, kThreads, 0, stream>>>(out);
   else
-    k5_crt_n<N, 4><<<blocks_for(p.b * p.m * ((p.n + 3) / 4)), kThreads, 0, stream>>>(out);
+    k5_crt_n<N, 4><<<grid, kThreads, 0, stream>>>(out);
 }
 
 // K5 for the plan's N: the run-time N picks its kernel (false: N outside [kNMin, kNMax]).
@@ -1276,17 +1266,15 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
   // Tile: along rows 8 rows side by side (64-byte segments); along k-bar tk = pow2 >= k_hat,
   // at most the whole tile (th = 1). The test hook forces 64-row tiles (many chunks per row).
   // (host/analysis.hpp kl_tile_lg_k: the one rule, also used by the performance model.)
-  const int lg_th = p.kl_lg_rows >= 0 ? p.kl_lg_rows : 12 - kl_tile_lg_k(a.along_rows != 0, p.k_hat);
-  a.lg_th = lg_th;
-  const int64_t th = int64_t{1} << lg_th, tk = kTileElems / th;
-  const int64_t nc = (p.k_hat + tk - 1) / tk;
-  const int64_t D = p.b * op.rows / a.radix, tiles = a.radix * ((D + th - 1) / th);
+  // v1.10: the launch shape is host/analysis.hpp kl_launch (shared with the performance model).
+  const KlLaunch L = kl_launch(a.along_rows != 0, p.kl_lg_rows, p.k_hat, p.b, op.rows, a.radix);
+  a.lg_th = L.lg_th;
   // Threads per CTA (NOTES-D4 §2): rows held on chip (nc <= 2): 8 values per thread, 512
   // threads, two CTAs per SM; longer rows (chunks re-read from L2): 4 values per thread, 1024
   // threads, one CTA per SM, which also keeps the rows in flight at SMs x th x 8 k_hat bytes
   // (r_bigk 32 MB, r_mm 51 MB: inside the L2 budget of K1, A3).
-  const unsigned grid = static_cast<unsigned>(std::max<int64_t>(1, std::min(tiles, kMaxBlocks)));
-  if (nc > 2)
+  const unsigned grid = static_cast<unsigned>(L.grid);
+  if (L.values == 4)
     kl_scale_pack<4><<<grid, kTileElems / 4, 0, stream>>>(a);
   else
     kl_scale_pack<8><<<grid, kTileElems / 8, 0, stream>>>(a);
@@ -1475,12 +1463,12 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
       pa.R = x == 0 ? RA : RB;
       pa.radix = p.pack_radix[x];
       pa.along_rows = p.pack_along_rows[x];
-      const int64_t D = p.b * pa.op.rows / pa.radix;
-      pa.lg_th = pack_tile_lg_rows(pa.along_rows, D);
-      const int64_t th = int64_t{1} << pa.lg_th, tk = kTileElems / th;
-      const int64_t tiles = pa.radix * ((D + th - 1) / th) * ((p.k_hat + tk - 1) / tk);
-      k23_pack<<<dim3(blocks_for(tiles, 1), pack_split(tiles, gsize, p.sms)), kThreads, 0,
-                 stream>>>(pa);
+      // v1.10: host/analysis.hpp pack_launch (shared with the performance model).
+      const PackLaunch L = pack_launch(pa.along_rows, p.b, pa.op.rows, pa.radix, p.k_hat, gsize,
+                                       p.sms);
+      pa.lg_th = L.lg_th;
+      k23_pack<<<dim3(static_cast<unsigned>(L.grid_x), static_cast<unsigned>(L.parts)), kThreads,
+                 0, stream>>>(pa);
       if (pa.rows_pad > pa.op.rows)
         k23_zero_rows<<<blocks_for(gsize * p.b * (pa.rows_pad - pa.op.rows) * p.k_hat / kVec),
                         kThreads, 0, stream>>>(pa.R, pa.op.rows, pa.rows_pad, p.b, p.k_hat,
@@ -1565,10 +1553,9 @@ imd_status_t launch_kp_prep(const ExecPlan& p, const PackLayout& pl, uint8_t* pa
 }  // namespace
 
 int32_t pack_kl_lg_rows(const ExecPlan& p) {
-  if (!p.pack_along_rows[0]) return -1;  // KL's rule: th = 4096 / pow2(k_hat) along k-bar
-  int lg_tk = 6;
-  while (lg_tk < 9 && (int64_t{1} << lg_tk) < p.k_hat) ++lg_tk;
-  return 12 - lg_tk;  // 8 rows (tk = 512) .. 64 rows (tk = 64) side by side
+  // host/analysis.hpp (v1.10: shared with the performance model): 8 rows (tk = 512) .. 64
+  // rows (tk = 64) side by side; -1 (KL's rule) along k-bar.
+  return pack_kl_lg_rows_for(p.pack_along_rows[0], p.k_hat);
 }
 
 imd_status_t enqueue_pack(const ExecPlan& p, const PackLayout& pl, const double* X, void* packed,
@@ -1589,6 +1576,59 @@ imd_status_t enqueue_pack(const ExecPlan& p, const PackLayout& pl, const double*
     return s2;
   IMD_PROF(stream, "pack KL");
   return IMD_STATUS_SUCCESS;
+}
+
+
+// ---- v1.10 (DESIGN §6c.1): occupancy of every kernel for the performance-model calibration --
+namespace {
+
+template <class Kernel>
+cudaError_t occupancy_of(Kernel kernel, int threads, int32_t* out) {
+  cudaFuncAttributes a{};
+  cudaError_t e = cudaFuncGetAttributes(&a, reinterpret_cast<const void*>(kernel));
+  int r = 0;
+  if (e == cudaSuccess) e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&r, kernel, threads, 0);
+  if (e != cudaSuccess) return e;
+  out[0] = r, out[1] = a.numRegs, out[2] = static_cast<int32_t>(a.sharedSizeBytes);
+  out[3] = threads;
+  return cudaSuccess;
+}
+
+template <int N = imd::constants::kNMin>
+cudaError_t k5_occupancy(int n, int variant, int32_t* out) {
+  if (n == N) {
+    switch (variant) {
+      case 0: return occupancy_of(k5_crt_n<N, 1>, kThreads, out);
+      case 1: return occupancy_of(k5_crt_n<N, 2>, kThreads, out);
+      case 2: return occupancy_of(k5_crt_n<N, 4>, kThreads, out);
+      default: return occupancy_of(k5_crt_bfast<N>, kThreads, out);
+    }
+  }
+  if constexpr (N < imd::constants::kNMax) return k5_occupancy<N + 1>(n, variant, out);
+  else return cudaErrorInvalidValue;
+}
+
+}  // namespace
+
+cudaError_t kernel_occupancy(int32_t kernel, int32_t* out) {
+  switch (kernel) {
+    case IMD_PERF_KERNEL_K0: return occupancy_of(k0_vec<kK0SmallModes>, kThreads, out);
+    case IMD_PERF_KERNEL_KF16: return occupancy_of(kf_scale_pack<kK0SmallModes, 16>, kThreads, out);
+    case IMD_PERF_KERNEL_KF4: return occupancy_of(kf_scale_pack<kK0SmallModes, 4>, kThreads, out);
+    case IMD_PERF_KERNEL_KL8: return occupancy_of(kl_scale_pack<8>, kTileElems / 8, out);
+    case IMD_PERF_KERNEL_KL4: return occupancy_of(kl_scale_pack<4>, kTileElems / 4, out);
+    case IMD_PERF_KERNEL_PACK: return occupancy_of(k23_pack, kThreads, out);
+    case IMD_PERF_KERNEL_ZERO_ROWS: return occupancy_of(k23_zero_rows, kThreads, out);
+    case IMD_PERF_KERNEL_DIRECT: return occupancy_of(k_direct, kThreads, out);
+    case IMD_PERF_KERNEL_BETA: return occupancy_of(k5_beta_only, kThreads, out);
+    case IMD_PERF_KERNEL_PACK_PREP: return occupancy_of(kp_prep<kK0SmallModes>, kThreads, out);
+    default:
+      if (kernel >= IMD_PERF_KERNEL_K5 && kernel < IMD_PERF_KERNEL_COUNT) {
+        const int i = kernel - IMD_PERF_KERNEL_K5;
+        return k5_occupancy(imd::constants::kNMin + i / 4, i % 4, out);
+      }
+      return cudaErrorInvalidValue;  // K4: gemm_k4 (api.cpp imd_prof_kernel_occupancy)
+  }
 }
 
 }  // namespace imd::detail

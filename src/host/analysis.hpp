@@ -131,6 +131,117 @@ inline int kl_tile_lg_k(bool along_rows, int64_t k_hat) {
   return lg_tk;
 }
 
+// ---- v1.10 (DESIGN §6c.1 "Waves and occupancy"): the launch shapes of the other kernels ----
+// contract.cu launches with these rules and the performance model (perf.cpp) computes each
+// launch's waves and per-thread chain from them: one implementation of every grid.
+
+// The grid of a grid-stride kernel of 256-thread blocks (K0, DIRECT, beta-only, K5, the
+// zero-rows and pack-prep launches; per_block = 1 for one block per tile): ceil(work /
+// per_block) blocks, at least 1, at most 2^20 (grid-stride loops beyond).
+constexpr int kLaunchThreads = 256;
+constexpr int64_t kLaunchMaxBlocks = int64_t{1} << 20;
+inline int64_t launch_blocks(int64_t work, int64_t per_block = kLaunchThreads) {
+  const int64_t b = (work + per_block - 1) / per_block;
+  return b < 1 ? 1 : b > kLaunchMaxBlocks ? kLaunchMaxBlocks : b;
+}
+
+// The pack tile (K2 / K3, KL, KF): 2^12 FP64 values of th rows x tk k-bar.
+constexpr int kPackTileLgElems = 12;
+
+// log2 of the K2 / K3 pack tile height: 64 rows read along k-bar; read along rows, the
+// smallest power of two >= D in [8, 64] (D = b rows / radix).
+inline int pack_tile_lg_rows(bool along_rows, int64_t D) {
+  if (!along_rows) return 6;
+  int lg = 3;
+  while (lg < 6 && (int64_t{1} << lg) < D) ++lg;
+  return lg;
+}
+
+// One K2 / K3 launch (k23_pack) of a residue group of gsize moduli: tiles of th x tk over the
+// operand's radix x ceil(D / th) row tiles and ceil(k_hat / tk) k-bar tiles; grid
+// (launch_blocks(tiles, 1), parts), 256 threads, 16 values per thread per tile.
+struct PackLaunch {
+  int lg_th = 6;
+  int64_t tiles = 0, grid_x = 1, parts = 1;
+};
+inline PackLaunch pack_launch(bool along_rows, int64_t b, int64_t rows, int64_t radix,
+                              int64_t k_hat, int gsize, int sms) {
+  PackLaunch L;
+  const int64_t D = b * rows / radix;
+  L.lg_th = pack_tile_lg_rows(along_rows, D);
+  const int64_t th = int64_t{1} << L.lg_th, tk = (int64_t{1} << kPackTileLgElems) / th;
+  L.tiles = radix * ((D + th - 1) / th) * ((k_hat + tk - 1) / tk);
+  L.grid_x = launch_blocks(L.tiles, 1);
+  L.parts = pack_moduli_parts(L.tiles, gsize, sms);
+  return L;
+}
+
+// One KL launch for an operand of `rows` rows per batch (DESIGN v1.6 §4): tile height th =
+// 2^lg_th (lg_rows >= 0: imd_pack's or a test's choice, else kl_tile_lg_k), chunks per row nc =
+// ceil(k_hat / tk), tiles = radix ceil(D / th), grid min(tiles, 2^20); rows held on chip (nc
+// <= 2): 8 values per thread, 512 threads (2 CTAs per SM by launch bounds), else 4 values per
+// thread, 1024 threads.
+struct KlLaunch {
+  int lg_th = 0, values = 8, threads = 512;
+  int64_t nc = 1, tiles = 0, grid = 1;
+};
+inline KlLaunch kl_launch(bool along_rows, int32_t lg_rows, int64_t k_hat, int64_t b,
+                          int64_t rows, int64_t radix) {
+  KlLaunch L;
+  L.lg_th = lg_rows >= 0 ? lg_rows : kPackTileLgElems - kl_tile_lg_k(along_rows, k_hat);
+  const int64_t th = int64_t{1} << L.lg_th, tk = (int64_t{1} << kPackTileLgElems) / th;
+  L.nc = (k_hat + tk - 1) / tk;
+  const int64_t D = b * rows / radix;
+  L.tiles = radix * ((D + th - 1) / th);
+  L.grid = L.tiles < 1 ? 1 : L.tiles > kLaunchMaxBlocks ? kLaunchMaxBlocks : L.tiles;
+  L.values = L.nc > 2 ? 4 : 8;
+  L.threads = (1 << kPackTileLgElems) / L.values;
+  return L;
+}
+
+// imd_pack's KL tile height (pack_exec's one-operand view, read along rows): th = 4096 /
+// pow2(k_hat) rows side by side, 8 .. 64 (tk 512 .. 64); -1 (kl_tile_lg_k) read along k-bar.
+inline int32_t pack_kl_lg_rows_for(bool along_rows, int64_t k_hat) {
+  if (!along_rows) return -1;
+  int lg_tk = 6;
+  while (lg_tk < 9 && (int64_t{1} << lg_tk) < k_hat) ++lg_tk;
+  return kPackTileLgElems - lg_tk;
+}
+
+// K5's launch (A5, NOTES-A5 §2): lambda-fastest plans (k5_batch_fast) take tiles of tl x tj =
+// 1024 outputs (tl = pow2 >= b in [2, 32]), 4 per thread; the others 1, 2 or 4 consecutive
+// j-bar per thread: 1 while b m n <= one_elem_per_sm / 2 per SM, 2 while b m n <= 8
+// one_elem_per_sm per SM, else 4 (elems_override > 0: forced; contract.cu passes its test
+// hooks, the model kK5OneElemPerSm and 0). variant: 0 / 1 / 2 = E 1 / 2 / 4, 3 lambda-fastest;
+// work = items (E outputs each, grid of 256-thread blocks) or tiles (one block per tile).
+constexpr int64_t kK5OneElemPerSm = 2048;
+struct K5Launch {
+  int variant = 2, elems = 4, lg_tl = 1;
+  int64_t work = 0, grid = 1;
+};
+inline K5Launch k5_launch(bool batch_fast, int64_t b, int64_t m, int64_t n, int sms,
+                          int64_t one_elem_per_sm = kK5OneElemPerSm, int elems_override = 0) {
+  K5Launch L;
+  if (batch_fast) {
+    int lg_tl = 1;
+    while (lg_tl < 5 && (int64_t{1} << lg_tl) < b) ++lg_tl;
+    const int64_t tl = int64_t{1} << lg_tl, tj = 1024 / tl;
+    L.variant = 3, L.elems = 4, L.lg_tl = lg_tl;
+    L.work = m * ((b + tl - 1) / tl) * ((n + tj - 1) / tj);
+    L.grid = launch_blocks(L.work, 1);
+    return L;
+  }
+  const int64_t mn = b * m * n;
+  const int e = elems_override > 0 ? elems_override
+                : mn <= one_elem_per_sm / 2 * sms ? 1
+                : mn <= 8 * one_elem_per_sm * sms ? 2 : 4;
+  L.elems = e;
+  L.variant = e == 1 ? 0 : e == 2 ? 1 : 2;
+  L.work = b * m * ((n + e - 1) / e);
+  L.grid = launch_blocks(L.work);
+  return L;
+}
+
 // Kernel launches of one imd_contract with alpha != 0 (DESIGN §4, §6a kernel_launches):
 // NOOP 0; DIRECT / SCALE: K0 (generate mode) + 1; EMULATE: fused ? KF : K0 (generate) + one
 // scale launch per operand (K1 of it, or v1.6 KL), then per residue group two packs (+ one

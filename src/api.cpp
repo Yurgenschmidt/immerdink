@@ -13,6 +13,7 @@
 #include "host/checked.hpp"
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink.h"
+#include "k4/k4_ops.hpp"
 #include "plan.hpp"
 #if defined(IMMERDINK_PROFILE) && IMMERDINK_PROFILE
 #  include "profile_hooks.h"
@@ -416,6 +417,20 @@ IMD_API int imd_prof_set_k5_elems(int32_t elems) {
   if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
   imd::detail::k5_elems_override() = elems;
   return 0;
+}
+// Benchmark-only (v1.10, DESIGN §6c.1): the measured occupancy of kernel IMD_PERF_KERNEL_*:
+// out[0..3] = CTAs per SM, registers per thread, shared memory per CTA (static + dynamic),
+// threads. K4: the store-mod kernel of the configuration (its occupancy from plan setup).
+IMD_API int imd_prof_kernel_occupancy(int32_t kernel, int32_t* out) {
+  if (out == nullptr || kernel < 0 || kernel >= IMD_PERF_KERNEL_COUNT) return 1;
+  if (kernel >= IMD_PERF_KERNEL_K4 && kernel < IMD_PERF_KERNEL_K5) {
+    const imd::detail::K4Ops& ops = imd::detail::k4_ops(kernel - IMD_PERF_KERNEL_K4);
+    int occ_store = 0, occ_add = 0;
+    if (ops.setup(&occ_store, &occ_add) != cudaSuccess) return 1;
+    out[0] = occ_store, out[1] = 0, out[2] = ops.smem_bytes, out[3] = ops.threads;
+    return 0;
+  }
+  return imd::detail::kernel_occupancy(kernel, out) == cudaSuccess ? 0 : 1;
 }
 #endif
 
