@@ -2089,13 +2089,18 @@ stays as a reported no-op) and NOTES-B2 says so.** A format-1 calibration has Δ
 
 #### [v1.10] Prediction intervals and ties
 
-Per call and per phase the prediction carries a band `[p10, p90]` = the time times the 10th and
-90th percentiles of measured / predicted on the hold-out set: per size class of the
+Per call and per phase the prediction carries a band `[p10, p90]`, meant as an 80 % prediction
+interval: the time times two quantiles of measured / predicted on the hold-out set. The
+quantiles are the narrowest of 10 / 90, 7.5 / 92.5, 5 / 95, 2.5 / 97.5, 1 / 99 whose
+cross-validated coverage (below) reaches 80 %: the in-sample 10 / 90 percentiles of ~140 calls
+cover only ~71 % of new cases (a case's residuals are correlated; measured on the v1.8 hold-out),
+5 / 95 covers ~81 %. The ratios are taken per size class of the
 **predicted** call time (< 100 µs, 100 µs – 1 ms, ≥ 1 ms) for the call, per kernel class for a
 phase (the CALL phase: zero width). `bench/perf_validate.py --bands` computes them from the
 hold-out residuals of the fitted calibration and writes them into it (format 2 `band.*`); it
-reports the coverage by **2-fold cross-validation over the hold-out cases** (bands from half
-the cases, coverage on the other half, both ways), so the coverage it prints is not in-sample.
+reports the coverage by **2-fold cross-validation over the hold-out cases**, repeated over 20
+seeded random halvings (bands from half the cases, coverage on the other half, both ways), so
+the coverage it prints is not in-sample.
 A calibration without bands (format 1) has zero-width bands. The bands describe the model's
 error on shapes like the hold-out's (BURST, the bench's repeat calls); the same ratios are
 applied in every regime and cache state (documented approximation).

@@ -145,22 +145,39 @@ def coverage(rows, bands):
             [float(np.mean(c)) if c else float("nan") for c in inside], [len(c) for c in inside])
 
 
-def cross_validated_coverage(rows):
-    """2-fold cross-validation over the cases (sorted names, alternating): bands from one half,
-    coverage on the other, both ways, pooled."""
+def cross_validated_coverage(rows, lo_q=10, hi_q=90, splits=20):
+    """2-fold cross-validation over the cases, repeated over `splits` seeded random halvings:
+    bands (quantiles lo_q / hi_q) from one half, coverage on the other, both ways, pooled."""
     cases = sorted({r[5] for r in rows})
-    half = [set(cases[0::2]), set(cases[1::2])]
     res = []
-    for i in (0, 1):
-        train = [r for r in rows if r[5] in half[i]]
-        test = [r for r in rows if r[5] not in half[i]]
-        b = band_values(train)
-        for r in test:
-            lo, hi = b[BAND_KEYS[size_class(r[2])]]
-            res.append((size_class(r[1]), lo * r[2] <= r[1] <= hi * r[2]))
+    for seed in range(splits):
+        perm = list(np.random.default_rng(seed).permutation(cases))
+        half = [set(perm[0::2]), set(perm[1::2])]
+        for i in (0, 1):
+            b = band_values([r for r in rows if r[5] in half[i]], lo_q, hi_q)
+            for r in rows:
+                if r[5] in half[i]:
+                    continue
+                lo, hi = b[BAND_KEYS[size_class(r[2])]]
+                res.append((size_class(r[1]), lo * r[2] <= r[1] <= hi * r[2]))
     per = [[x for c, x in res if c == k] for k in range(3)]
     return (float(np.mean([x for _, x in res])) if res else float("nan"),
-            [float(np.mean(c)) if c else float("nan") for c in per], [len(c) for c in per])
+            [float(np.mean(c)) if c else float("nan") for c in per],
+            [len(c) // (2 * splits) * 2 for c in per])
+
+
+# The quantile pairs tried for the stored [p10, p90] band (DESIGN §6c.1): the narrowest whose
+# cross-validated coverage reaches 80 % (in-sample p10 / p90 of a few hundred calls under-cover
+# new cases: the residuals of one case are correlated).
+QUANTILE_PAIRS = ((10, 90), (7.5, 92.5), (5, 95), (2.5, 97.5), (1, 99))
+
+
+def choose_quantiles(rows, target=0.80):
+    for lo, hi in QUANTILE_PAIRS:
+        cov = cross_validated_coverage(rows, lo, hi)
+        if cov[0] >= target:
+            return lo, hi, cov
+    return lo, hi, cov
 
 
 def main(argv=None):
@@ -205,16 +222,24 @@ def main(argv=None):
               f"records): {100 * cov:.0f} % (< 100 us {100 * per[0]:.0f} % of {n[0]}, "
               f"100 us - 1 ms {100 * per[1]:.0f} % of {n[1]}, >= 1 ms {100 * per[2]:.0f} % "
               f"of {n[2]})")
-    cov, per, n = cross_validated_coverage(rows)
-    print(f"band coverage, 2-fold cross-validated over the cases (target 80 %, 70-90 % per "
-          f"class): {100 * cov:.0f} % (< 100 us {100 * per[0]:.0f} % of {n[0]}, 100 us - 1 ms "
-          f"{100 * per[1]:.0f} % of {n[1]}, >= 1 ms {100 * per[2]:.0f} % of {n[2]})")
+    for lo_q, hi_q in QUANTILE_PAIRS[:3]:
+        cov, per, n = cross_validated_coverage(rows, lo_q, hi_q)
+        print(f"band coverage of the hold-out quantiles {lo_q} / {hi_q}, 2-fold cross-validated "
+              f"over the cases x 20 (target 80 %, 70-90 % per class): {100 * cov:.0f} % (< 100 us "
+              f"{100 * per[0]:.0f} %, 100 us - 1 ms {100 * per[1]:.0f} %, >= 1 ms "
+              f"{100 * per[2]:.0f} %; calls {n[0]} / {n[1]} / {n[2]})")
     if a.bands:
-        b = band_values(rows)
+        lo_q, hi_q, cov = choose_quantiles(rows)
+        print(f"stored band = the hold-out quantiles {lo_q} / {hi_q} (cross-validated coverage "
+              f"{100 * cov[0]:.0f} %)")
+        b = band_values(rows, lo_q, hi_q)
         print("bands: " + ", ".join(f"{k[5:]} {lo:.3f}-{hi:.3f}" for k, (lo, hi) in b.items()))
         extra = calib.extra if calib.file_format == 2 else perf_fit.seed_extra(a.lib)
         extra = dict(extra, **b)
-        cal2 = host.Calibration.from_values(calib.meta, calib.params, a.lib, extra)
+        params = dict(calib.params)
+        for k in host.FORMAT2_PARAMS:  # a format-1 calibration: its chain parameters are 0
+            params.setdefault(k, 0.0)
+        cal2 = host.Calibration.from_values(calib.meta, params, a.lib, extra)
         with open(a.bands, "w") as f:
             f.write(cal2.format())
         print(f"wrote {a.bands}")
