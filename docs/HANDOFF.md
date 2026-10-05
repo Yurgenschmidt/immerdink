@@ -13,7 +13,7 @@ first.
 - **Host API v5** (`include/immerdink/immerdink_host.h`, CUDA-free `libimmerdink_host`, Python
   `python/immerdink/host.py`): the single source of truth for lowering, legality, workspace,
   plan bytes, K4 config, launch counts and packed-operand sizing and compatibility.
-- **Python device API (B1, DESIGN v1.9 §6c):** `python/immerdink` (`Plan`, `Pack`,
+- **Python device API (B1, DESIGN v1.9 §6d):** `python/immerdink` (`Plan`, `Pack`,
   `immerdink.contract`, `PlanCache`, `DeviceArray`): ctypes over the C ABI, any
   `__cuda_array_interface__` / DLPack array or raw pointer, no array library needed; test
   `python_device` (pytest), overhead `bench/python_overhead.py`.

@@ -45,7 +45,7 @@ version). Strides default to dense (last mode fastest); pass `strides=(sA, sB, s
 
 ### Contractions from Python
 
-`immerdink.Plan` / `immerdink.contract` (DESIGN §6c) run contractions on caller-owned float64
+`immerdink.Plan` / `immerdink.contract` (DESIGN §6d) run contractions on caller-owned float64
 CUDA arrays: anything with `__cuda_array_interface__` or DLPack (CuPy, PyTorch, Numba, JAX),
 or raw pointers (`immerdink.DeviceArray(ptr, shape, strides)`). No array library is
 required, nothing is copied between host and device, and immerdink allocates nothing: the

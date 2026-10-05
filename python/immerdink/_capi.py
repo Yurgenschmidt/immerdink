@@ -135,13 +135,14 @@ class Library:
             raise RuntimeError(f"cudaGetDevice failed ({err})")
         return d.value
 
-    def sm_count(self):
-        """The current device's SM count (cudaDevAttrMultiProcessorCount); 0 (the host
-        library's default) when libcudart cannot be found."""
+    def sm_count(self, device=None):
+        """The SM count (cudaDevAttrMultiProcessorCount) of `device` (None: the current one);
+        0 (the host library's default) when libcudart cannot be found."""
         if self.cudart is None:
             return 0
         v = C.c_int(0)
-        if self.cudart.cudaDeviceGetAttribute(C.byref(v), 16, self.current_device()) != 0:
+        dev = self.current_device() if device is None else device
+        if self.cudart.cudaDeviceGetAttribute(C.byref(v), 16, dev) != 0:
             raise RuntimeError("cudaDeviceGetAttribute failed")
         return v.value
 

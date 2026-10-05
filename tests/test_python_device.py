@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Python device API (python/immerdink, DESIGN §6c) on the GPU, bit for bit.
+"""The Python device API (python/immerdink, DESIGN §6d) on the GPU, bit for bit.
 
     IMMERDINK_LIB=build/libimmerdink.so python3 -m pytest tests/test_python_device.py
 
@@ -458,11 +458,21 @@ def test_packed(cuda, shim, which):
                 plan.contract(A, B, Cc, workspace=(ws, plan.workspace_bytes),
                               packed=tuple((bufs[x], 1) for x in (0, 1)))
         cuda.sync()
-        for p in packs:     # the calls returned: the handles may go (§6b.7); a NULL pack
-            if p is not None:   # handle for a packed slot is PACK_MISMATCH
-                p.close()
-        with pytest.raises(imd.PackMismatchError):
-            plan.contract(A, B, Cc, workspace=(ws, plan.workspace_bytes), packed=pbuf)
+        # Pack.close() while the plan uses the pack: closed for new use at once, the C handle
+        # kept until the plan is closed (the plan passes it to imd_contract_packed)
+        live = [p for p in packs if p is not None]
+        for p in live:
+            p.close()
+            assert p.closed and p._fin.alive
+            with pytest.raises(ValueError, match="closed"):
+                p.pack(ops[0].arr, (bufs[0] or bufs[1], p.pack_bytes))
+            with pytest.raises(ValueError, match="closed"):
+                imd.Plan(spec, A, B, Cc, N=N, packs=packs)
+        ops[2].reset()
+        plan.contract(A, B, Cc, alpha=1.5, beta=0.5, workspace=(ws, plan.workspace_bytes),
+                      packed=pbuf)
+        same_bits(ops[2].result(), want, f"packed {which} after Pack.close()")
+    assert all(not p._fin.alive and p._h is None for p in live)   # destroyed with the plan
 
 
 def test_pack_mismatch_reason(cuda):
@@ -543,6 +553,121 @@ def test_plan_cache_and_threads(cuda):
     assert len(cache) == 0
     for s in streams:
         cuda.rt.cudaStreamDestroy(s)
+
+
+def test_plan_cache_clear_freeze(cuda):
+    spec, ext = "ik,kj->ij", dict(i=6, j=5, k=7)
+    ops = make(cuda, spec, ext)
+    A, B, Cc = (x.arr for x in ops)
+    want = oracle(ops, 1.0, 0.0, 9)
+    cache = imd.PlanCache()
+    pg = cache.get(spec, A, B, Cc, N=9)
+    pr = cache.get(spec, A, B, Cc, N=9, vec_mode="RESIDENT")
+    assert len(cache) == 2 and set(map(id, cache.plans())) == {id(pg), id(pr)}
+    assert pr.device_bytes > 0 and cache.device_bytes == pg.device_bytes + pr.device_bytes
+    ws = (cuda.malloc(pg.workspace_bytes), pg.workspace_bytes)
+    cache.freeze()
+    imd.contract(spec, A, B, Cc, N=9, workspace=ws, plan_cache=cache)  # warmed: no creation
+    with pytest.raises(KeyError):
+        cache.get(spec, A, B, Cc, N=10)
+    with pytest.raises(KeyError):
+        imd.contract(spec, A, B, Cc, N=11, workspace=ws, plan_cache=cache)
+    assert len(cache) == 2
+    cache.freeze(False)
+    cache.get(spec, A, B, Cc, N=10)
+    assert len(cache) == 3
+    same_bits(ops[2].result(), want, "frozen cache")
+    cuda.sync()
+    cache.clear()           # drops GENERATE plans (still usable by holders), closes RESIDENT
+    assert len(cache) == 0 and cache.device_bytes == 0
+    assert pr._h is None and pg._h is not None
+    ops[2].reset()
+    pg.contract(A, B, Cc, workspace=ws)
+    same_bits(ops[2].result(), want, "a GENERATE plan dropped by clear()")
+
+
+def test_resident_resource_warning():
+    import gc
+    import warnings
+    lay = (imd.Layout((4, 5)), imd.Layout((5, 3)), imd.Layout((4, 3)))
+    p = imd.Plan("ik,kj->ij", *lay, N=9, vec_mode="RESIDENT")
+    with pytest.warns(ResourceWarning, match="RESIDENT"):
+        del p
+        gc.collect()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        imd.Plan("ik,kj->ij", *lay, N=9, vec_mode="RESIDENT").close()   # closed: no warning
+        p = imd.Plan("ik,kj->ij", *lay, N=9)                            # GENERATE: none
+        del p
+        gc.collect()
+
+
+def test_cai_stream_policy(cuda):
+    s = cuda.stream()
+    spec, ext = "ik,kj->ij", dict(i=5, j=4, k=6)
+    ops = make(cuda, spec, ext)
+    want = oracle(ops, 1.0, 0.0, 9)
+    on_s = [Cai(x.ptr, x.desc.extent, None, stream=s) for x in ops]
+    legacy = [Cai(x.ptr, x.desc.extent, None, stream=1) for x in ops]
+    plan = imd.Plan(spec, *on_s, N=9)       # a layout read: no stream check
+    W = (cuda.malloc(plan.workspace_bytes), plan.workspace_bytes)
+    assert imd.get_cai_stream_policy() == "check"
+    with pytest.raises(ValueError, match="set_cai_stream_policy"):
+        plan.contract(*on_s, workspace=W)                   # producer s, call NULL
+    with pytest.raises(ValueError, match="stream"):
+        imd.contract(spec, *on_s, N=9, workspace=W, plan_cache=imd.PlanCache())
+    with pytest.raises(ValueError, match="stream"):          # workspace buffers too
+        plan.contract(*legacy, workspace=Cai(W[0], (W[1],), None, "|u1", stream=s))
+    plan.contract(*on_s, workspace=W, stream=s)              # the producer's stream
+    plan.contract(*legacy, workspace=W)                      # CAI 1 == the call's NULL
+    plan.contract(*legacy, workspace=W, stream=0)
+    with pytest.raises(ValueError):
+        plan.contract(*legacy, workspace=W, stream=2)        # per-thread != legacy
+    try:
+        imd.set_cai_stream_policy("ignore")
+        plan.contract(*on_s, workspace=W)                     # opt-out: the caller orders
+        imd.contract(spec, *on_s, N=9, workspace=W, plan_cache=imd.PlanCache())
+    finally:
+        imd.set_cai_stream_policy("check")
+    with pytest.raises(ValueError):
+        imd.set_cai_stream_policy("sync")
+    same_bits(ops[2].result(), want, "CAI stream policy")
+    # packs: X, the packed buffer and the workspace
+    pk = imd.Pack(imd.pack_spec(spec, *(x.arr for x in ops), operand=0, N=9))
+    buf, pws = cuda.malloc(pk.pack_bytes), cuda.malloc(pk.workspace_bytes)
+    with pytest.raises(ValueError, match="stream"):
+        pk.pack(on_s[0], (buf, pk.pack_bytes), workspace=(pws, pk.workspace_bytes))
+    pk.pack(on_s[0], (buf, pk.pack_bytes), workspace=(pws, pk.workspace_bytes), stream=s)
+    cuda.sync()
+    pk.close()
+    plan.close()
+    cuda.rt.cudaStreamDestroy(s)
+    # the environment opt-out, read at import
+    import subprocess
+    code = ("import sys; sys.path.insert(0, %r); import immerdink; "
+            "print(immerdink.get_cai_stream_policy())" % os.path.join(ROOT, "python"))
+    env = dict(os.environ, IMMERDINK_CAI_SYNC="0")
+    env.pop("LD_PRELOAD", None)
+    assert subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                          text=True).stdout.strip() == "ignore"
+
+
+def test_dlpack_layout_stream_and_device(cuda):
+    ops = make(cuda, "ik,kj->ij", dict(i=4, j=3, k=5), kinds=("dlpack", "dlpack0", "cai"))
+    A, B, Cc = (x.arr for x in ops)
+    plan = imd.Plan("ik,kj->ij", A, B, Cc, N=9)
+    assert A.streams == [-1] and B.streams == [-1]   # layout reads: "do not synchronize"
+    imd.workspace_size("ik,kj->ij", A, B, Cc, N=9)
+    imd.pack_spec("ik,kj->ij", A, B, Cc, operand=0, N=9)
+    assert set(A.streams) == {-1}
+    W = (cuda.malloc(plan.workspace_bytes), plan.workspace_bytes)
+    plan.contract(A, B, Cc, workspace=W)
+    assert A.streams[-1] == 1
+    other = DLPackArray(ops[0].ptr, (4, 5), [5, 1], device=(2, plan.device + 1))
+    with pytest.raises(ValueError, match="device"):
+        plan.contract(other, B, Cc, workspace=W)
+    cuda.sync()
+    plan.close()
 
 
 # ------------------------------------------------------------------------------------------

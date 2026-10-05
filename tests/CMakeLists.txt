@@ -137,7 +137,7 @@ if(Python3_FOUND)
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
 
-  # DESIGN v1.9 §6c: the Python device API (python/immerdink: Plan, Pack, contract) on the
+  # DESIGN v1.9 §6d: the Python device API (python/immerdink: Plan, Pack, contract) on the
   # GPU, bit for bit vs spec/oracle.py, with the allocation shim (pytest; CAI / DLPack
   # producers built with ctypes, no CuPy or PyTorch needed).
   add_test(NAME python_device

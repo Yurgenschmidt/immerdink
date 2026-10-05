@@ -23,7 +23,7 @@ per-operand fused scale-and-pack launch KL for k̂ > 1024 (§4, chosen at plan t
 same workspace, one DRAM read of the operand less) and reports it in the host API (§6a);
 changed text is marked **[v1.6]**. v1.7 (§6b, D1 packed operands; design approved by Eric,
 2026-10-03, all §6b.10 recommendations) is implemented (host API version 5; §6b.11 lists the
-implementation choices and one clarification of §6b.5 to confirm). v1.9 adds §6c, the
+implementation choices and one clarification of §6b.5 to confirm). v1.9 adds §6d, the
 Python front end over the C ABI (ROADMAP B1; no semantic, layout or C API change). The change
 lists are at the end.
 
@@ -706,7 +706,7 @@ Negative models:
 
 ---
 
-## 6. API (C ABI, ctypes-friendly; Python package later)
+## 6. API (C ABI, ctypes-friendly; Python: §6d)
 
 ```c
 typedef struct { int32_t rank; const int64_t* extent; const int64_t* stride; /* elements */
@@ -1028,7 +1028,7 @@ there is no budget option (BENCHMARKS "Residue-group size g" gives the speed sid
   (both libraries are built together).
 
 **Python.** `python/immerdink/host.py` is a thin ctypes wrapper over these functions
-(nanobind later), with an einsum-style front end (`"kjbc,kiac->abij"` + extents + optional
+(the device API, §6d, is ctypes too), with an einsum-style front end (`"kjbc,kiac->abij"` + extents + optional
 strides) and raw descriptors; it implements no sizing logic. Library lookup: argument,
 `$IMMERDINK_HOST_LIB`, `$IMMERDINK_LIB_DIR`, the build directory, the system path.
 
@@ -1548,7 +1548,7 @@ What §6b left to the implementation, as implemented (libimmerdink_host `src/hos
   an empty pack). Step 6's `packed_bytes < pack_bytes` applies to a non-NULL `packed`.
   Tested (tests/test_packed.py suite api).
 
-## 6c. Python front end (ROADMAP B1) [v1.9]
+## 6d. Python front end (ROADMAP B1) [v1.9]
 
 `python/immerdink` gains the device API: contractions on caller-owned CUDA arrays from
 Python. It is a **binding**, not a second implementation: every number (sizes, legality,
@@ -1564,7 +1564,7 @@ explicit shape and strides. Kernel scope (§6 "Kernel-level scope"): no host↔d
 operand or workspace allocation, the caller's stream; plans are cheap handles with explicit
 lifetimes and exact footprints.
 
-### 6c.1 Modules
+### 6d.1 Modules
 
 | Module | Contents |
 |---|---|
@@ -1580,7 +1580,7 @@ the system search path (the order of `host.py`). The host queries a device objec
 to the `libimmerdink_host.so` next to that libimmerdink (the one it links), so both report
 the same numbers.
 
-### 6c.2 API
+### 6d.2 API
 
 ```python
 import immerdink as imd
@@ -1603,6 +1603,12 @@ pa.pack_bytes, pa.workspace_bytes, pa.layout
 pa.pack(A, out=bufA, workspace=pws, stream=s)                 # imd_pack
 plan = imd.Plan("ik,kj->ij", A, B, C, N=14, packs=(pa, None)) # imd_plan_create_packed
 plan.contract(A, B, C, workspace=ws, stream=s, packed=(bufA, None))   # imd_contract_packed
+
+cache = imd.PlanCache()                  # imd.default_plan_cache is the default one
+cache.get("ik,kj->ij", A, B, C, N=14)    # warm before a capture, then
+cache.freeze()                           # a miss raises KeyError
+cache.plans(), cache.device_bytes, cache.clear()
+imd.set_cai_stream_policy("ignore")      # CAI v3 stream opt-out (default "check", §6d.3)
 ```
 
 - **Operands** `A, B, C` of `Plan`, `contract`, `workspace_size` and `pack_spec`: CUDA
@@ -1625,12 +1631,12 @@ plan.contract(A, B, C, workspace=ws, stream=s, packed=(bufA, None))   # imd_cont
   pointers match the plan's descriptors); the C checks (null, aliasing, alignment, sizes)
   still run.
 
-### 6c.3 Arrays → `imd_tensor_t`
+### 6d.3 Arrays → `imd_tensor_t`
 
 | Protocol | pointer (element 0) | shape | strides → elements | dtype | readonly | device |
 |---|---|---|---|---|---|---|
-| CAI v2/v3 | `data[0]` | `shape` | `strides` bytes / 8 (None: C-contiguous) | `typestr` `<f8` | `data[1]` | CUDA by definition |
-| DLPack (0.x, 1.x) | `data + byte_offset` | `shape` | `strides` (NULL: row-major) | code 2 (float), bits 64, lanes 1 | 1.x flag `READ_ONLY` | `kDLCUDA` (2) or `kDLCUDAManaged` (13); else TypeError |
+| CAI v2/v3 | `data[0]` | `shape` | `strides` bytes / 8 (None: C-contiguous) | `typestr` `<f8` | `data[1]` | CUDA by definition (not checked) |
+| DLPack (0.x, 1.x) | `data + byte_offset` | `shape` | `strides` (NULL: row-major) | code 2 (float), bits 64, lanes 1 | 1.x flag `READ_ONLY` | `kDLCUDA` (2) or `kDLCUDAManaged` (13), else TypeError; a `kDLCUDA` device id other than the plan's device: ValueError |
 | `DeviceArray` | `ptr` | `shape` | `strides` | `dtype` | `readonly` | caller's word |
 
 - **dtype must be float64** for A, B, C and a pack's X (TypeError otherwise). A byte stride
@@ -1641,13 +1647,28 @@ plan.contract(A, B, C, workspace=ws, stream=s, packed=(bufA, None))   # imd_cont
 - The pointer is that of element (0, …, 0), as `imd_contract` expects; with negative
   strides it is not the lowest address (both protocols define it this way).
 - CAI is preferred when an object has both (a dict lookup, no capsule). DLPack is asked
-  with `max_version=(1, 0)` (falling back to the 0.x call) and `stream=` the call's stream
-  (1 for the legacy default stream, the protocol's spelling of NULL): the **producer**
-  orders its pending work before that stream (its rule). The capsule is read and dropped:
-  immerdink takes no ownership (the caller keeps the array alive while its GPU work runs,
-  as for any stream-ordered library). CAI v3's `stream` field is **ignored**: immerdink
-  does not synchronize with another stream on the caller's behalf (no hidden events, which
-  would also break capture); ordering across streams is the caller's, as in §6.
+  with `max_version=(1, 0)` (falling back to the 0.x call). In a call it is asked with
+  `stream=` the call's stream (1 for NULL, the protocol's spelling of the legacy default
+  stream): the **producer** orders its pending work before that stream (its rule). When
+  only the layout is read (plan creation, `pack_spec`, `workspace_size`, `PlanCache.get`) it
+  is asked with `stream=-1` ("the producer must not synchronize"). The capsule is read and
+  dropped: immerdink takes no ownership (the caller keeps the array alive while its GPU work
+  runs, as for any stream-ordered library).
+- **CAI v3 `stream`** (reviewed 2026-10-05). immerdink never synchronizes streams on the
+  caller's behalf (an event record / wait would be a hidden CUDA call and break capture), so
+  it cannot honour the consumer synchronization CAI v3 asks for. Policy, process-wide:
+  - **"check"** (default): in `Plan.contract`, `immerdink.contract` and `Pack.pack`
+    (operands, workspaces and packed buffers alike), an array whose CAI `stream` is not
+    None and not the call's stream raises ValueError, telling the caller to pass the
+    producer's stream or to opt out. The call's NULL (None / 0) and a CAI 1 are the same
+    stream (libimmerdink is not built with per-thread default streams). An integer compare:
+    no CUDA call, capture-safe.
+  - **"ignore"**: the opt-out the CAI v3 specification sanctions for consumers (as Numba's
+    `NUMBA_CUDA_ARRAY_INTERFACE_SYNC=0` and CuPy's `CUPY_CUDA_ARRAY_INTERFACE_SYNC=0`): the
+    field is not looked at and ordering across streams is the caller's, as in §6.
+    `immerdink.set_cai_stream_policy("ignore")`, or `IMMERDINK_CAI_SYNC=0` in the
+    environment at import. Not a per-call keyword.
+  - No event-wait mode. `contract_ptr` / `pack_ptr` take integers and check nothing.
 - **Validation in Python (what the C API cannot see).** A plan is created for fixed
   extents and strides, so `Plan.contract` checks that each array's shape equals the plan's
   and its strides equal the plan's on every mode with extent > 1 (strides of extent-1
@@ -1656,9 +1677,9 @@ plan.contract(A, B, C, workspace=ws, stream=s, packed=(bufA, None))   # imd_cont
   checks X against the pack's descriptor the same way. Everything else is the C API's:
   null pointers, ALIASING, MISALIGNED (8-byte operands, 256-byte workspace and packed
   buffers), INSUFFICIENT_WORKSPACE, PACK_MISMATCH. Python does not query pointer
-  attributes (the device of a CAI pointer is not checked; a DLPack device type is).
+  attributes (the device of a CAI pointer is not checked; a DLPack device is).
 
-### 6c.4 Statuses → exceptions
+### 6d.4 Statuses → exceptions
 
 Every non-SUCCESS status raises a subclass of `host.ImmerdinkError` (a RuntimeError with
 `.status`, the status name) that also derives from the matching builtin, so callers can
@@ -1679,7 +1700,7 @@ Python-side argument errors (not CUDA memory, wrong dtype, shape or stride misma
 plan, readonly output, malformed spec) are plain TypeError / ValueError, raised before any C
 call.
 
-### 6c.5 Streams, capture, workspace
+### 6d.5 Streams, capture, workspace
 
 - `stream`: None or 0 → NULL (the legacy default stream, as `imd_contract` defines it;
   libimmerdink is not built with per-thread default streams); an int is the
@@ -1699,37 +1720,55 @@ call.
   `workspace_bytes > 0` and `workspace=None` the C null rule applies (InvalidValueError,
   message with the size). `imd.workspace_size(...)` answers before any plan exists.
 
-### 6c.6 Lifetimes, threads, plan cache
+### 6d.6 Lifetimes, threads, plan cache
 
 - `Handle`: `imd_create` on the current device. A default handle per device
   (`imd.default_handle()`) is created on first use and lives for the process. Plans and
   packs hold a reference to their handle, so the §6 rule (the handle outlives every plan
   creation) holds by construction.
 - `Plan` and `Pack` own their C object: `close()` (idempotent), `with`, or a
-  `weakref.finalize` when the last reference goes. A packed plan holds references to its
-  `Pack` objects and passes their handles to `imd_contract_packed` (§6b.7: a handle with the
-  plan's key must be passed; the pack may outlive its creator only because the plan keeps it).
-  **GENERATE** plans may be closed as soon as the calls returned (§6 lifetime), which every
+  `weakref.finalize` when the last reference goes. A plan is bound to the device current at
+  its creation (`Plan.device`; `imd_plan_create` uses it); `Plan.lowering` uses that device's
+  SM count and reports the plan-time rule's K4 configuration (a `k4_tune` plan may run
+  another, bit-identical one).
+- **Packs.** A packed plan passes its packs' handles to `imd_contract_packed` (§6b.7: a
+  handle with the plan's key), so it holds them: `Pack.close()` closes the pack for new use
+  (`pack()`, new plans: ValueError naming the pack) at once, but `imd_pack_destroy` waits
+  until the last open plan made with it is closed or collected (a count kept by the plans).
+- **GENERATE** plans may be closed as soon as the calls returned (§6 lifetime), which every
   Python reference pattern guarantees. **RESIDENT** plans must outlive the GPU work of their
-  calls (§6): synchronize those streams before `close()` or dropping the last reference;
-  Python cannot know (that would need a host synchronization).
+  calls (§6), and **graph replays are GPU work of the plan**: a replay reads the resident
+  vectors, and finalizing the plan `cudaFree`s them. So a RESIDENT plan, or the cache
+  holding it, must stay alive while any CUDA graph that captured it may be replayed, and its
+  streams must be synchronized before `close()` or dropping the last reference. Python
+  cannot know (that would need a host synchronization); a RESIDENT plan finalized without
+  `close()` emits a `ResourceWarning`.
 - **Threads**: a `Plan` is immutable after creation; any number of threads may call
   `contract` on one plan (ctypes releases the GIL during the C call) under §6's rules: an own
   workspace per in-flight call, and no `close()` while another thread is in a call.
 - **`PlanCache`** (used by `imd.contract`): a plan is a pure function of (descriptors,
   options, packs, device), so a cache keyed by (spec, shapes, element strides, options,
   current device) returns a plan equivalent to a fresh one. Thread-safe (a lock around the
-  dict; plan creation outside the lock; a losing duplicate, never used, is closed). It
-  never evicts on its own (a RESIDENT plan cannot be closed safely without a sync):
-  `clear()` closes every plan (after the caller synchronized resident plans' streams).
-  `imd.default_plan_cache` is the default; `plan_cache=False` makes a plan per call and
-  closes it after the call returns (GENERATE only; RESIDENT → ValueError).
+  dict; plan creation outside the lock; a losing duplicate, never used, is closed).
+  - It never evicts on its own. A bounded variant (deferred) would have to **drop
+    references** rather than call `close()`, for the reason below.
+  - `clear()` empties it. GENERATE plans are only **dropped**: `close()` on a plan another
+    thread is using in `contract()` would be a host use-after-free; each is destroyed by its
+    finalizer once no reference remains. RESIDENT plans are **closed**, which is valid only
+    after the streams of their calls were synchronized and while no CUDA graph that
+    captured them will be replayed.
+  - `plans()` lists the distinct plans held; `device_bytes` is the sum of their
+    `imd_plan_device_bytes` (the RESIDENT vectors).
+  - `freeze()`: a lookup that would create a plan raises KeyError, so a caller (ehrenfest)
+    can assert every plan was made before a capture (`freeze(False)` thaws it).
+  - `imd.default_plan_cache` is the default; `plan_cache=False` makes a plan per call and
+    closes it after the call returns (GENERATE only; RESIDENT → ValueError).
 - `cudaGetDevice` (host-only, capture-safe) supplies the device of the default handle and
   of the cache key, and `cudaDeviceGetAttribute` the SM count `Plan.lowering` passes to
   `imd_lowering` (not on the call path); they are the only CUDA runtime functions the
   package calls, through the libcudart libimmerdink already loaded.
 
-### 6c.7 Per-call overhead
+### 6d.7 Per-call overhead
 
 A plan precomputes everything a call needs that does not change (expected shapes and byte
 strides per operand, the ctypes function with its argtypes, the in-line operand structs'
@@ -1750,23 +1789,29 @@ DLPack costs per array about 2.7 µs in the producer (capsule construction; a re
 library's is its own) plus about 2 µs in the consumer (`__dlpack_device__`, capsule name and
 pointer, three reads), so CAI is preferred when both exist.
 
-### 6c.8 Tests and verification
+### 6d.8 Tests and verification
 
 - **No TLA+ change.** The package adds no state the C API does not already model: plans,
   packs and handles are the C objects with the same lifetimes (`HostAPI`: shared plan,
   early destroy, resident plans; `PackedOperand` / `HostAPI` pack handle); the plan cache
   memoizes a pure function and only hands out immutable plans (`pos_shared_plan`); a cache
-  never destroys a plan on its own; finalizers run only when no Python reference (hence no
-  Python call) remains, which is the GENERATE lifetime rule; the RESIDENT rule stays the
-  caller's, as in C.
+  never destroys a GENERATE plan, it only drops references; finalizers run only when no
+  Python reference (hence no Python call) remains, which is the GENERATE lifetime rule; the
+  RESIDENT rule (graph replays included) stays the caller's, as in C. The packs' use count
+  only delays `imd_pack_destroy` past every plan that passes the handle, which is stronger
+  than §6b.7 requires.
 - `python_device` (ctest, GPU lock, allocation shim preloaded; pytest, no CuPy/PyTorch
   needed: a ctypes libcudart helper allocates and copies, a minimal CAI object and a
   hand-built DLPack capsule (0.x and 1.x) present the memory): results bit-exact against
   `spec/oracle.py` (GEMM, permuted and batched rank ≥ 4 tensors, non-contiguous and negative
   strides, diagonals, a scalar output, DIRECT, α = 0, β ≠ 0, packed A / B / both via
   `pack_spec`, every packed byte equal to `oracle.pack`), and equal to the direct C call;
-  `contract_ptr`; plan reuse over many calls and many plans alive at once; the plan cache;
-  stream objects of every accepted kind; CUDA-graph capture and replay of `Plan.contract`
+  `contract_ptr`; plan reuse over many calls and many plans alive at once; the plan cache
+  (threads, `clear()` dropping GENERATE and closing RESIDENT plans, `plans()`,
+  `device_bytes`, `freeze()`); stream objects of every accepted kind; the CAI stream policy
+  (mismatch raises, NULL ≡ 1, opt-out); DLPack layout reads with stream −1 and the device-id
+  check; `Pack.close()` while plans use the pack; the ResourceWarning of an unclosed
+  RESIDENT plan; CUDA-graph capture and replay of `Plan.contract`
   and `imd.contract`; no CUDA allocation in any call (shim); every error row above (wrong
   dtype, host memory, shape / stride mismatch, readonly C, missing / short workspace,
   misaligned and aliased pointers, NOT_SUPPORTED, INVALID_VALUE, PACK_MISMATCH); the ctypes
@@ -1947,11 +1992,14 @@ and host API; every value the same integer (bit-identical, tested on every contr
 
 ## v1.9 (B1 Python front end; no semantic, layout, C API or spec change)
 
-- **§6c (new).** `python/immerdink` device API over the §6 / §6b C ABI with ctypes:
+- **§6d (new).** `python/immerdink` device API over the §6 / §6b C ABI with ctypes:
   `Plan`, `Pack`, `Handle`, `PlanCache`, the einsum front end `immerdink.contract`, raw
   entry points (`contract_ptr`, `pack_ptr`). Arrays through `__cuda_array_interface__`,
   DLPack or raw pointers (`DeviceArray`), no array library required; float64 only; Python
   checks only what the C API cannot see (shapes and strides against the plan, dtype,
-  device type, writable outputs); statuses map to exception classes. No CUDA call of its
-  own besides `cudaGetDevice`; capture-safe calls; workspace always the caller's. No TLA+
-  change (§6c.8 says why). Tests: `python_device`.
+  device, writable outputs, the CAI v3 stream with a spec-sanctioned opt-out); statuses map
+  to exception classes. No CUDA call of its own besides `cudaGetDevice` (and
+  `cudaDeviceGetAttribute` for `Plan.lowering`); capture-safe calls; workspace always the
+  caller's; RESIDENT plans live as long as any graph that captured them. No TLA+ change
+  (§6d.8 says why). Tests: `python_device`. Reviewed 2026-10-05 (CAI stream "check" by
+  default, `PlanCache.clear()` drops GENERATE plans, `freeze()`, pack use counts).

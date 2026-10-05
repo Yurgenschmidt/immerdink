@@ -1,12 +1,35 @@
-"""CUDA array protocols for the device API (DESIGN §6c.3): __cuda_array_interface__ (v2/v3),
+"""CUDA array protocols for the device API (DESIGN §6d.3): __cuda_array_interface__ (v2/v3),
 DLPack (0.x and 1.x capsules) and raw device pointers (DeviceArray), plus stream objects.
 Pure Python over ctypes: no CUDA call, no allocation, no array library."""
 
 import ctypes as C
 import math
+import os
 import struct
 
-__all__ = ["DeviceArray", "view", "buffer", "stream_handle"]
+__all__ = ["DeviceArray", "view", "buffer", "stream_handle", "set_cai_stream_policy",
+           "get_cai_stream_policy"]
+
+# CAI v3 "stream" (DESIGN §6d.5): "check" (default) refuses an array whose producer stream is
+# not the call's stream; "ignore" is the consumer opt-out the CAI v3 specification allows
+# (as Numba's NUMBA_CUDA_ARRAY_INTERFACE_SYNC=0, CuPy's CUPY_CUDA_ARRAY_INTERFACE_SYNC=0).
+_POLICIES = ("check", "ignore")
+_cai_check = os.environ.get("IMMERDINK_CAI_SYNC", "1").strip() != "0"
+
+
+def set_cai_stream_policy(policy):
+    """"check" (default; $IMMERDINK_CAI_SYNC=0 starts with "ignore") or "ignore": what a call
+    does with a __cuda_array_interface__ v3 "stream" that is not the call's stream. immerdink
+    never synchronizes streams itself (no events: capture-safe); "check" raises ValueError,
+    "ignore" leaves the ordering to the caller. Process-wide."""
+    global _cai_check
+    if policy not in _POLICIES:
+        raise ValueError(f"policy must be one of {_POLICIES}, got {policy!r}")
+    _cai_check = policy == "check"
+
+
+def get_cai_stream_policy():
+    return "check" if _cai_check else "ignore"
 
 KDL_CUDA, KDL_CUDA_MANAGED = 2, 13
 _DL_FLOAT = 2
@@ -22,7 +45,7 @@ class DeviceArray:
     __slots__ = ("ptr", "shape", "strides", "dtype", "readonly", "__cuda_array_interface__")
 
     def __init__(self, ptr, shape, strides=None, dtype="f8", readonly=False):
-        self.ptr = int(ptr.value if isinstance(ptr, C.c_void_p) else ptr or 0)
+        self.ptr = int((ptr.value or 0) if isinstance(ptr, C.c_void_p) else ptr or 0)
         self.shape = tuple(int(e) for e in shape)
         dtype = dtype.lstrip("<|=")
         itemsize = int(dtype[1:])
@@ -92,13 +115,18 @@ _I64 = [struct.Struct(f"<{n}q") for n in range(65)]
 assert _DLT.size == C.sizeof(_DLTensor) == 48
 
 
-def _dlpack_view(x, stream):
+def _dlpack_view(x, stream, device):
     """(ptr, shape, byte strides or None, is_f8, readonly, itemsize) of a DLPack producer."""
     dev = x.__dlpack_device__()
     if int(dev[0]) not in (KDL_CUDA, KDL_CUDA_MANAGED):
         raise TypeError(f"{type(x).__name__} lives on DLPack device type {int(dev[0])}, not CUDA "
                         "memory (immerdink never copies host <-> device)")
-    s = 1 if stream in (None, 0) else stream   # DLPack: 1 = the legacy default stream
+    if device is not None and int(dev[0]) == KDL_CUDA and int(dev[1]) != device:
+        raise ValueError(f"{type(x).__name__} is on CUDA device {int(dev[1])}, the plan on "
+                         f"device {device}")
+    # a layout read (stream None): -1, "the producer must not synchronize"; a call: its
+    # stream, 1 for NULL (the protocol's spelling of the legacy default stream)
+    s = -1 if stream is None else 1 if stream == 0 else stream
     try:
         cap = x.__dlpack__(stream=s, max_version=(1, 0))
     except TypeError:                          # a DLPack 0.x producer
@@ -128,31 +156,44 @@ def _dlpack_view(x, stream):
     return ptr, shape, strides, f8, readonly, itemsize
 
 
-def view(x, stream=None):
+def view(x, stream=None, device=None):
     """(ptr, shape, byte strides or None (C-contiguous), is_float64, readonly, itemsize) of a
-    CUDA array: __cuda_array_interface__ first, else DLPack."""
+    CUDA array: __cuda_array_interface__ first, else DLPack. stream: None for a layout read
+    (DLPack is asked with stream -1, the CAI stream is not checked), else the call's
+    cudaStream_t value (DLPack: the producer orders its work before it; CAI v3: the stream
+    policy). device: the plan's device, checked against a DLPack device id."""
     try:
         d = x.__cuda_array_interface__
     except AttributeError:
         if hasattr(x, "__dlpack__"):
-            return _dlpack_view(x, stream)
+            return _dlpack_view(x, stream, device)
         raise TypeError(f"{type(x).__name__} is not a CUDA array (no __cuda_array_interface__ "
                         "or __dlpack__); immerdink never copies host <-> device") from None
     if d.get("mask") is not None:
         raise TypeError("masked arrays are not supported")
+    if _cai_check and stream is not None:
+        cs = d.get("stream")
+        # NULL (0) and 1 are both the legacy default stream here: libimmerdink is not built
+        # with per-thread default streams
+        if cs is not None and cs != stream and not (cs == 1 and stream == 0):
+            raise ValueError(
+                f"{type(x).__name__}: its __cuda_array_interface__ stream {cs} is not the call's "
+                f"stream {stream}; pass the producer's stream (stream=...), or opt out with "
+                "immerdink.set_cai_stream_policy('ignore') or IMMERDINK_CAI_SYNC=0 and order "
+                "the streams yourself")
     ts = d["typestr"]
     data = d["data"]
     return data[0] or 0, d["shape"], d.get("strides"), ts == "<f8", data[1], int(ts[2:])
 
 
-def buffer(x, what, writable=True, stream=None):
+def buffer(x, what, writable=True, stream=None, device=None):
     """(ptr, nbytes) of a byte buffer: None, an (int ptr, nbytes) tuple, or a contiguous CUDA
-    array of any dtype."""
+    array of any dtype (view's stream and device rules)."""
     if x is None:
         return None, 0
     if isinstance(x, tuple):
         return int(x[0] or 0), int(x[1])
-    ptr, shape, strides, _, readonly, itemsize = view(x, stream)
+    ptr, shape, strides, _, readonly, itemsize = view(x, stream, device)
     if writable and readonly:
         raise ValueError(f"{what} is read-only")
     n = math.prod(shape)
@@ -166,7 +207,7 @@ def buffer(x, what, writable=True, stream=None):
 
 
 def stream_handle(s):
-    """The cudaStream_t value of a stream argument (DESIGN §6c.5): None / 0 = NULL (the
+    """The cudaStream_t value of a stream argument (DESIGN §6d.5): None / 0 = NULL (the
     legacy default stream), an int as is (1 = cudaStreamLegacy, 2 = cudaStreamPerThread),
     __cuda_stream__ (CUDA Python protocol), .cuda_stream (PyTorch), .ptr (CuPy), c_void_p."""
     if s is None:

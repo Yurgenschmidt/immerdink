@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-call host overhead of the Python device API (DESIGN §6c.7).
+"""Per-call host overhead of the Python device API (DESIGN §6d.7).
 
     flock <gpu.lock> tools/memcap.sh python3 bench/python_overhead.py [--lib build/libimmerdink.so]
 
