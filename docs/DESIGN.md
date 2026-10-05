@@ -2283,11 +2283,11 @@ q.rank(N, g=None, vec_modes=("GENERATE",), packs=("NONE",), reuse=1, budget=0, b
        *, rounding, mode, eps_fraction=None, calib=None, **fields)       # -> Ranking
 
 req = planner.Request(beta=True, eps_fraction=0.5)  # prebuilt imd_perf_request_t (+ **fields)
-r = q.rank([12, 14]); r[0], len(r), r[1:4], r.to_list()   # Ranking of lazy Candidates
-r.best(budget)                                      # == q.rank([12, 14], budget=budget)[0]
+r = q.rank([12, 14], budget=2**31); r[0], len(r), r[1:4], r.to_list()  # lazy Candidates
 p = q.predict(14); p.time_s, p.phase("K4 gemm"), p.to_prediction()   # lazy Prediction
 
-pl = planner.Planner(calib=None, memo=planner.Memo(4096), max_queries=1024, lib=None)
+pl = planner.Planner(calib=None, memo=planner.Memo(4096, max_bytes=64 * 2**20),
+                     max_queries=1024, lib=None)
 pl.query(spec, extents, strides=None); pl.query_arrays(spec, A, B, C)   # cached Query
 pl.predict(spec, extents, N=14, ...)   # host.py's signatures: workspace_size, plan_bytes,
                                        # lowering, pack_desc_for, predict, rank
@@ -2313,12 +2313,12 @@ planner.default_calibration(lib=None)  # the shipped calibration, loaded once pe
   without changing this module (a `Prediction` attribute of a later host.py dataclass that
   is not a C field falls back to host.py's decoder; a `Lowering` / `Candidate` one raises
   AttributeError naming it, so a needed converter is never silently missing).
-- **`rank`** passes the exact candidate count as the capacity (Σ over the N list of the g
-  values ≤ N, or N, × vec modes × pack modes): one C call (a second only if the library
-  reported more). `Ranking.best(budget)`: the order of SUCCESS candidates does not depend on
-  the budget (§6c.3), so the first SUCCESS candidate with `total_bytes ≤ budget` of a
-  budget-free ranking is the first of `rank(budget=budget)` (only `feasible` differs: True
-  in both). A caller whose budget changes per call ranks once (memoizable) and calls `best`.
+- **`rank`** passes the candidate count as the capacity (Σ over the N list of the g values
+  ≤ N, or N, × vec modes × pack modes), bounded by 4096 (so an absurd N, which C rejects,
+  allocates nothing large): one C call, a second, exact one only when the library reports
+  more. Feasibility, order and ties are C's alone (no ranking logic in Python): a caller
+  wanting the best configuration under a budget calls `rank(budget=b)[0]` (memoizable; the
+  budget is part of the key).
 - **Views** are immutable (`__slots__`, read-only properties) and own their output struct.
 - **Errors**: the same statuses raise `ImmerdinkError` (plan-time statuses are returned in
   `.status`, as host.py); an unknown option name is ValueError (host.py: KeyError).
@@ -2332,13 +2332,26 @@ planner.default_calibration(lib=None)  # the shipped calibration, loaded once pe
   descriptors (≤ 64), rank N / g arrays (≤ 64). Dict operations are atomic, output structs are
   per call: any number of threads may share a Query, with no lock on the call path.
 - **Memo** (opt-in, never implicit): key = (the Query object, the method, every argument);
-  calibrations by identity (treated as immutable). FIFO eviction beyond `maxsize` (a
-  `Prediction` entry holds ~1.7 KB: 4096 entries ≈ 7 MB). Lock-free lookups, inserts under a
+  calibrations by identity (treated as immutable). **Two bounds, both always on**: `maxsize`
+  entries (default 4096) and `max_bytes` of stored C result structs (default 64 MiB).
+  `nbytes` is exact: the `ctypes.sizeof` of each stored output struct, counted at insert.
+  Worst cases per entry: a `Prediction` 1648 B (~1.7 KB); a `Ranking` 128 B per candidate,
+  up to ~214 KB for every N in 2..20 × every g × both vec modes × four pack modes (1672
+  candidates; a list repeating N values can be larger, up to the bound); `workspace_size`,
+  `plan_bytes`, `pack_desc_for` results hold no C struct (0 counted). So 4096 rankings alone
+  could reach ~0.9 GB without the byte bound; with it the memo stays ≤ 64 MiB of structs.
+  Oldest entries are evicted until both bounds hold; a single result larger than `max_bytes`
+  is returned but not stored (a bypass, not an error). An entry keeps its Query alive (the
+  key holds it), also after the Planner evicted that Query. Lock-free lookups, inserts under a
   lock; an unhashable argument (e.g. a list of N) bypasses it. A hit returns the stored,
   immutable view. Valid because every query is a pure function of its arguments (§6a, §6c.3).
 - **Planner**: Queries keyed by (spec, the spec's extents in label order, strides), by the
   normalized descriptors, or by (spec, Layouts) for `query_arrays`; bounded FIFO
-  (`max_queries`); an evicted Query stays valid for whoever holds it.
+  (`max_queries` ≥ 1, default 1024); an evicted Query stays valid for whoever holds it. A
+  Query with its cache key takes 4.6–5.7 KB (measured with tracemalloc, fresh and after a few
+  queries; three operand descriptors, its argument-struct caches), so 1024 queries are ≤ 6 MB
+  and a count bound suffices. The spec → labels table is bounded by `max_queries` as well
+  and emptied by `clear()`.
 - Process-wide: one entry (function objects, default calibration) per loaded `HostLibrary`,
   as host.py's library cache.
 
@@ -2365,16 +2378,23 @@ Reading `.time_s` of a prediction adds < 0.02 µs; a memo hit through a held Que
   PACK_MISMATCH, random requests, two synthetic calibrations and the default): every result
   bit-identical to host.py (floats compared by bits), every lazy attribute equal to the
   dataclass's, the same error statuses; 600 random `rank` requests (N and g lists, vec / pack
-  masks, reuse, budgets, invalid values): identical lists, exactly one C call each,
-  `best(b) == rank(budget=b)[0]`; Planner keying (spec, extents, strides, raw descriptors,
-  Layouts) and bound; Memo hits, bound, bypass; 8 threads sharing a Planner with a small Memo
+  masks, reuse, budgets, invalid values): identical lists, exactly one C call each (two
+  beyond the 4096 capacity bound: 4320 candidates), `rank(N=10**7)` rejected without a large
+  allocation, numpy integers as N and g; Planner keying (spec, extents, strides, raw
+  descriptors, Layouts), its query and label bounds, `max_queries` ≥ 1; Memo hits, the entry
+  and byte bounds (rank entries within `max_bytes`, exact `nbytes`, an oversized entry not
+  stored), bypass; read-only `Query.calib`; C array fields as tuples; 8 threads sharing a Planner with a small Memo
   (evicting) and one without: results identical to the serial host.py ones, the bound held;
   argument errors.
 - **No TLA+ change.** No C code changes; the Python caches memoize pure functions of
   immutable keys and hand out immutable values (the §6d.8 argument for `PlanCache`), and a
   Query holds no C object with a lifetime.
 
-### 6e.7 Design questions (decided conservatively; for review)
+### 6e.7 Design questions (reviewed 2026-10-05)
+
+Ruling: 1, 2, 5, 6, 8, 9 accepted; 3 kept until C parses the shipped calibration once (then
+`calib=None` passes NULL); 4 with a byte bound on the memo; 7 accepted without
+`Ranking.best` (removed: it re-derived C's feasibility and ordering in Python).
 
 1. **A new module** `immerdink.planner` beside an unchanged `host.py` (rather than routing
    host.py's functions through the fast path): additive, no change for existing callers, no
@@ -2388,7 +2408,8 @@ Reading `.time_s` of a prediction adds < 0.02 µs; a memo hit through a held Que
    `host.predict(calib=None)` and every C caller passing NULL. Not done here (perf.cpp is the
    v1.10 work's).
 4. **FIFO eviction** for Memo and Planner (not LRU): lock-free hits; the expected working set
-   is small and stable. Default `Memo` size 4096, `max_queries` 1024.
+   is small and stable. Default `Memo` size 4096 entries and 64 MiB (both bounds always on),
+   `max_queries` 1024.
 5. **Memo keys use the Query object's identity** (hashing descriptor dataclasses would cost
    ~1 µs per hit): two Query objects of one contraction do not share entries; a Planner gives
    one Query per contraction.
@@ -2604,8 +2625,8 @@ and host API; every value the same integer (bit-identical, tested on every contr
 - **§6e (new).** `python/immerdink/planner.py`: `Query` (a contraction's C descriptor structs
   built once; option, packing, request and default-calibration structs reused; lazy result
   views; `rank` in one C call), `Planner` (bounded Query cache, host.py's signatures),
-  `Memo` (explicit, bounded, thread-safe memo of identical queries), `Request`,
-  `Ranking.best(budget)`. Results bit-identical to host.py; per query 0.8–1.8 µs instead of
+  `Memo` (explicit, thread-safe memo of identical queries, bounded by entries and by exact C
+  struct bytes), `Request`. Results bit-identical to host.py; per query 0.8–1.8 µs instead of
   8–20 µs (C floor 0.25–0.86 µs), `rank` 7–17 µs instead of 32–63 µs, a memo hit 0.4–1.0 µs.
   Pure ctypes: host API unchanged (version 6), no nanobind (§6e.2). `bench/planner_floor.c`
   (`imd_planner_floor`) times the C functions alone; `bench/planner_overhead.py` prints

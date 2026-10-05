@@ -90,8 +90,7 @@ from immerdink import planner
 q = planner.Query(spec, ext)                      # once per contraction
 q.predict(14, g=7).time_s                         # ~1.7 µs (host.predict: ~17 µs)
 q.workspace_size(14, g=7)                         # ~0.9 µs
-r = q.rank([12, 14], vec_modes=("GENERATE", "RESIDENT"))   # one C call
-r.best(budget=2 * 2**30)                          # == rank(..., budget=...)[0]
+q.rank([12, 14], vec_modes=("GENERATE", "RESIDENT"), budget=2 * 2**30)[0]   # one C call
 pl = planner.Planner(memo=planner.Memo(4096))     # Query cache + opt-in memo of identical queries
 pl.predict(spec, ext, N=14)                       # host.predict's signature; a repeat: ~0.8 µs
 ```

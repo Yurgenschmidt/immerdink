@@ -10,7 +10,7 @@ requests (beta, alpha_zero, k4_config, eps_fraction, synthetic calibrations):
   - Query.lowering / predict / predict_pack: .to_*() == host.py's dataclass (floats compared
     by their bits) and every lazy attribute == the dataclass attribute;
   - Query.rank: Ranking.to_list() == host.rank (order, footprints, statuses, bits), one C
-    call (counted); Ranking.best(b) on a budget-free ranking == rank(budget=b)[0];
+    call (counted), also beyond the first-call capacity bound; numpy-like integer N;
   - calib=None (the cached imd_perf_calib_default passed explicitly) == host.py's NULL;
   - Planner: one Query per contraction (spec + extents + strides, raw descriptors, Layouts),
     bounded; Memo: hits return the stored object, bounded FIFO, unhashable arguments bypass;
@@ -20,6 +20,7 @@ requests (beta, alpha_zero, k4_config, eps_fraction, synthetic calibrations):
 """
 
 import argparse
+import ctypes as C
 import dataclasses
 import os
 import random
@@ -49,7 +50,7 @@ def bits(x):
         return tuple(bits(v) for v in x)
     if isinstance(x, dict):
         return tuple(sorted((k, bits(v)) for k, v in x.items()))
-    return x
+    return (type(x).__name__, x)   # an int vs bool (or str) regression fails
 
 
 def same(a, b, what):
@@ -220,18 +221,6 @@ def check_rank(rng, lib, cals, cases, verbose):
             same_view(r[0], hr[0], what + " [0]")
             same_view(r[-1], hr[-1], what + " [-1]")
             same([c.to_candidate() for c in r[1:3]], hr[1:3], what + " slice")
-        # best(budget) on the budget-free ranking == rank(budget)[0] (when one fits)
-        if args["budget"] == 0 and hr:
-            for b in (2**20, 2**26, 2**30):
-                hb = host.rank(descs, rounding=rnd, mode=mode, calib=cal, lib=lib,
-                               **dict(args, budget=b))
-                best = r.best(b)
-                first = hb[0] if hb and hb[0].feasible else None
-                if (best is None) != (first is None):
-                    raise Fail(f"{what}: best({b}) {best} vs {first}")
-                if best is not None:
-                    same(best.to_candidate(), dataclasses.replace(first, feasible=True),
-                         what + f" best({b})")
     if verbose:
         print(f"  rank: {cases} cases, {total} candidates")
 
@@ -296,8 +285,10 @@ def check_planner_memo(rng, lib, verbose):
     if pm.workspace_size(spec, ext, N=20) != host.workspace_size(spec, ext, N=20, lib=lib):
         raise Fail("Memo: value")
     memo.clear()
-    if len(memo) or memo.hits:
+    if len(memo) or memo.hits or memo.nbytes:
         raise Fail("Memo.clear")
+    check_memo_bytes(lib, spec, ext)
+    check_review_fixes(lib, spec, ext, q)
     # immutable views, argument errors
     p = pl.predict(spec, ext, N=14)
     for obj, attr in ((p, "time_s"), (p, "foo"), (pl.lowering(spec, ext, N=14), "m")):
@@ -337,6 +328,119 @@ def check_planner_memo(rng, lib, verbose):
         raise Fail("default_calibration not shared")
     if verbose:
         print("  Planner / Memo / views / errors: ok")
+
+
+def check_memo_bytes(lib, spec, ext):
+    """Memo's byte bound: exact ctypes.sizeof accounting, rank entries within max_bytes,
+    oldest-first eviction, an oversized entry not stored (bypass)."""
+    def exact(m):
+        return sum(planner._struct_bytes(v) for v in m._d.values())
+
+    if planner.Memo().max_bytes != 64 * 2**20:
+        raise Fail("Memo default max_bytes")
+    one = planner.Query(spec, ext, lib=lib).rank(14)          # 14 candidates: 1792 bytes
+    per = C.sizeof(one._arr)
+    if per != 14 * C.sizeof(host._Candidate):
+        raise Fail(f"rank struct bytes {per}")
+    memo = planner.Memo(maxsize=1000, max_bytes=3 * per + 100)
+    pm = planner.Planner(lib=lib, memo=memo)
+    for k, ex in enumerate((ext, dict(ext, a=65), dict(ext, a=66), dict(ext, a=67), ext)):
+        r = pm.rank(spec, ex, N=14)
+        same(r.to_list(), host.rank(spec, ex, N=14, lib=lib), f"memo rank {k}")
+        if memo.nbytes > memo.max_bytes or memo.nbytes != exact(memo):
+            raise Fail(f"memo bytes {memo.nbytes} (exact {exact(memo)}, bound {memo.max_bytes})")
+    if len(memo) != 3:
+        raise Fail(f"memo byte eviction: {len(memo)} entries")
+    p = pm.predict(spec, ext, N=14)                           # 1648 bytes: evicts the oldest
+    if memo.nbytes > memo.max_bytes or memo.nbytes != exact(memo) or \
+            pm.predict(spec, ext, N=14) is not p:
+        raise Fail("memo bytes after a prediction")
+    small = planner.Memo(max_bytes=per - 1)                   # a ranking does not fit at all
+    ps = planner.Planner(lib=lib, memo=small)
+    r = ps.rank(spec, ext, N=14)
+    if len(small) or small.nbytes or r.to_list() != one.to_list():
+        raise Fail("oversized memo entry stored")
+    ps.predict(spec, ext, N=14)
+    if len(small) != 1 or small.nbytes != C.sizeof(host._Perf):
+        raise Fail("memo: small entry next to an oversized one")
+    for bad in (dict(maxsize=0), dict(max_bytes=0)):
+        try:
+            planner.Memo(**bad)
+        except ValueError:
+            pass
+        else:
+            raise Fail(f"Memo({bad}) accepted")
+
+
+def check_review_fixes(lib, spec, ext, q):
+    import numpy as np
+    # numpy integers as N / g (planner and host.rank)
+    for N in (np.int64(14), np.int32(14)):
+        same(q.rank(N, g=np.int64(7)).to_list(), host.rank(spec, ext, N=14, g=7, lib=lib),
+             "numpy N")
+        same(host.rank(spec, ext, N=N, lib=lib), host.rank(spec, ext, N=14, lib=lib),
+             "host.rank numpy N")
+    same(q.rank([np.int64(8), 14]).to_list(), host.rank(spec, ext, N=[8, 14], lib=lib),
+         "numpy N list")
+    # capacity bound: a huge N is rejected by C without a huge allocation; more candidates
+    # than the first-call bound need exactly one more call
+    if outcome(lambda: q.rank(10**7)) != ("err", "INVALID_VALUE"):
+        raise Fail("rank(N=10**7)")
+    Ns = [20] * 27                                    # 27 x 20 g x 2 vec x 4 packs = 4320
+    args = dict(vec_modes=("GENERATE", "RESIDENT"), packs=("NONE", "A", "B", "AB"))
+    fns = planner._state(lib)[0]
+    real, calls = fns.perf_rank, [0]
+
+    def counted(*a):
+        calls[0] += 1
+        return real(*a)
+    fns.perf_rank = counted
+    try:
+        r = q.rank(Ns, **args)
+    finally:
+        fns.perf_rank = real
+    if len(r) != 4320 or calls[0] != 2:
+        raise Fail(f"rank beyond the capacity bound: {len(r)} candidates, {calls[0]} calls")
+    same(r.to_list(), host.rank(spec, ext, N=Ns, lib=lib, **args), "rank beyond the bound")
+    # Planner bounds and arguments
+    for bad in (0, -1):
+        try:
+            planner.Planner(lib=lib, max_queries=bad)
+        except ValueError:
+            pass
+        else:
+            raise Fail(f"max_queries={bad} accepted")
+    pl = planner.Planner(lib=lib, max_queries=4)
+    labs = "abcdefghij"
+    for x in range(10):
+        pl.query(f"{labs[x]}k,kj->{labs[x]}j", {labs[x]: 4, "k": 4, "j": 4})
+    if len(pl._labels) > 4 or len(pl) > 4:
+        raise Fail(f"Planner label cache {len(pl._labels)} / queries {len(pl)} over 4")
+    pl.clear()
+    if pl._labels or len(pl):
+        raise Fail("Planner.clear")
+    # Query.calib is read-only
+    try:
+        q.calib = host.Calibration.default(lib)
+    except AttributeError:
+        pass
+    else:
+        raise Fail("Query.calib is writable")
+    # _RANK_EXTRA: the fields after eps_fraction (none in version 6)
+    if planner._RANK_EXTRA != frozenset():
+        raise Fail(f"_RANK_EXTRA {planner._RANK_EXTRA}")
+    # a C array field of a view is an immutable tuple
+    @dataclasses.dataclass(frozen=True)
+    class DC:
+        v: tuple
+        n: int
+
+    class S(C.Structure):
+        _fields_ = [("v", C.c_int32 * 3), ("n", C.c_int32)]
+    V = planner._view_class("V", "", DC, S, {}, None)
+    s = S((C.c_int32 * 3)(1, 2, 3), 7)
+    if V(s).v != (1, 2, 3) or type(V(s).v) is not tuple or V(s).n != 7:
+        raise Fail("array field view")
 
 
 def check_threads(rng, lib, verbose, threads=8, per_thread=300):

@@ -28,8 +28,9 @@ Objects:
   Prediction, Lowering, Candidate (in a Ranking): lazy, immutable views with the attribute
       names of host.Prediction / host.Lowering / host.Candidate; .to_prediction(),
       .to_lowering(), .to_candidate() (Ranking.to_list()) give exactly host.py's objects.
-  Memo(maxsize): an EXPLICIT, bounded (FIFO), thread-safe memo of results keyed by the full
-      query; opt-in (Query(..., memo=) or Planner(memo=)). Only identical queries hit.
+  Memo(maxsize, max_bytes): an EXPLICIT, thread-safe memo of results keyed by the full
+      query, bounded by entries and by exact C struct bytes (FIFO); opt-in (Query(...,
+      memo=) or Planner(memo=)). Only identical queries hit.
   Planner: Query objects cached by (spec, extents, strides) (bounded), host.py-style
       signatures, an optional Memo and calibration.
 
@@ -40,8 +41,9 @@ every call, about 2 µs).
 
 import ctypes as C
 import dataclasses
+import numbers
 import threading
-from operator import attrgetter
+from operator import attrgetter, index
 
 from . import host
 from .host import (DISPATCH, PACK_MISMATCH, STATUS, Calibration, HostLibrary, ImmerdinkError,
@@ -62,6 +64,7 @@ _CAND_SIZE = C.sizeof(host._Candidate)
 _OPTS_MAX = 512     # option structs kept per Query (a finite set in practice; cleared if full)
 _PACKS_MAX = 64     # packing structs kept per Query
 _RANKARGS_MAX = 64  # (N list, g list) arrays kept per Query
+_RANK_CAP_MAX = 4096  # first-call capacity bound of rank (a larger count: one exact retry)
 _MISS = object()
 
 
@@ -124,11 +127,10 @@ def _opt_err(table, value, what):
 # Requests
 
 _REQ_FIELDS = tuple(f for f, _ in host._PerfRequest._fields_ if f != "struct_size")
-# imd_perf_rank_request_t fields rank() takes as **fields (those after version 6's)
-_RANK_EXTRA = frozenset(f for f, _ in host._RankRequest._fields_) - {
-    "struct_size", "candidate_size", "num_moduli_count", "residue_group_count", "num_moduli",
-    "residue_groups", "vec_modes", "pack_modes", "reuse", "flags", "budget_bytes",
-    "eps_fraction"}
+# imd_perf_rank_request_t fields rank() takes as **fields: those after eps_fraction (the
+# last field of version 6; later versions only append)
+_RANK_NAMES = [f for f, _ in host._RankRequest._fields_]
+_RANK_EXTRA = frozenset(_RANK_NAMES[_RANK_NAMES.index("eps_fraction") + 1:])
 
 
 class Request:
@@ -200,10 +202,12 @@ class _View:
 
 def _view_class(name, doc, dc, struct, converters, full):
     """A _View subclass with one read-only property per field of the host.py dataclass `dc`:
-    converters[field] if given, else the C struct's field of that name, else (a field of a
+    converters[field] if given, else the C struct's field of that name (a C array field as
+    a tuple), else (a field of a
     later host.py the view does not know) the fully decoded object's (`full`, a host.py
     decoder), or an error naming the field when the view has no such decoder."""
     names = {f for f, _ in struct._fields_}
+    arrays = {f for f, t in struct._fields_ if isinstance(t, type(C.Array))}
     ns = {"__slots__": (), "__doc__": doc, "_fields": tuple(f.name for f in dataclasses.fields(dc)),
           "_full": full}
 
@@ -213,6 +217,8 @@ def _view_class(name, doc, dc, struct, converters, full):
     for f in ns["_fields"]:
         if f in converters:
             ns[f] = property(converters[f])
+        elif f in arrays:   # a C array field: an immutable tuple, as host.py's dataclasses
+            ns[f] = property(lambda self, get=attrgetter("_r." + f): tuple(get(self)))
         elif f in names:
             ns[f] = property(attrgetter("_r." + f))
         elif full is not None:
@@ -309,19 +315,6 @@ class Ranking:
         """Exactly host.rank's list of host.Candidate."""
         return [c.to_candidate() for c in self]
 
-    def best(self, budget=0):
-        """The first SUCCESS candidate with total_bytes <= budget (0: any), or None. On a
-        ranking made with budget 0 this is the candidate rank(budget=budget) puts first
-        (the order of SUCCESS candidates does not depend on the budget, §6c.3), so one
-        memoized budget-free ranking serves every budget; its .feasible says True (it was
-        ranked without one)."""
-        arr = self._arr
-        for j in range(self._n):
-            c = arr[j]
-            if c.status == 0 and (budget == 0 or c.total_bytes <= budget):
-                return Candidate(c)
-        return None
-
     def __repr__(self):
         return f"<Ranking of {self._n} candidates>"
 
@@ -333,24 +326,45 @@ class Memo:
     """An explicit, bounded memo of planner results keyed by the full query (the Query object,
     the method and every argument). Only an identical query hits: the results are pure
     functions of the key (DESIGN §6e), and immutable views, so a hit returns the same object
-    a miss stored. FIFO eviction beyond `maxsize` entries. Thread-safe: lookups are lock-free
-    dict reads; inserts take a lock. hits / misses are informational (not exact under
-    threads)."""
+    a miss stored. Two bounds, both always on: at most `maxsize` entries and at most
+    `max_bytes` (default 64 MiB) of stored C result structs (nbytes: the exact sum of
+    ctypes.sizeof of the structs held, counted at insert; a Prediction 1648 B, a Ranking 128 B
+    per candidate). Oldest entries are evicted until both hold; a single result larger than
+    max_bytes is returned but not stored (a bypass, not an error). An entry keeps its
+    Query alive. Thread-safe: lookups are lock-free dict reads; inserts take a lock. hits /
+    misses are informational (not exact under threads)."""
 
-    def __init__(self, maxsize=4096):
+    def __init__(self, maxsize=4096, max_bytes=64 * 2**20):
         if int(maxsize) < 1:
             raise ValueError("maxsize must be >= 1")
+        if int(max_bytes) < 1:
+            raise ValueError("max_bytes must be >= 1")
         self.maxsize = int(maxsize)
+        self.max_bytes = int(max_bytes)
         self._d = {}
+        self._sz = {}       # key -> bytes counted for it
+        self.nbytes = 0
         self._lock = threading.Lock()
         self.hits = self.misses = 0
 
     def _put(self, key, value):
+        n = _struct_bytes(value)
+        if n > self.max_bytes:
+            return value            # too large to keep: not stored
         with self._lock:
             d = self._d
-            while len(d) >= self.maxsize:
-                del d[next(iter(d))]
-            return d.setdefault(key, value)
+            old = d.get(key, _MISS)
+            if old is not _MISS:
+                return old
+            while d and (len(d) >= self.maxsize or
+                         self.nbytes + n > self.max_bytes):
+                k = next(iter(d))
+                del d[k]
+                self.nbytes -= self._sz.pop(k)
+            d[key] = value
+            self._sz[key] = n
+            self.nbytes += n
+            return value
 
     def __len__(self):
         return len(self._d)
@@ -358,10 +372,22 @@ class Memo:
     def clear(self):
         with self._lock:
             self._d.clear()
+            self._sz.clear()
+            self.nbytes = 0
             self.hits = self.misses = 0
 
     def __repr__(self):
-        return f"<Memo {len(self._d)}/{self.maxsize} entries, {self.hits} hits, {self.misses} misses>"
+        return (f"<Memo {len(self._d)}/{self.maxsize} entries, {self.nbytes} bytes, "
+                f"{self.hits} hits, {self.misses} misses>")
+
+
+def _struct_bytes(value):
+    """ctypes.sizeof of the C structs a memo value holds (0 for plain Python values)."""
+    if isinstance(value, _View):
+        return C.sizeof(value._r)
+    if isinstance(value, Ranking):
+        return C.sizeof(value._arr)
+    return 0
 
 
 def _memo(memo, key, make):
@@ -386,7 +412,7 @@ class Query:
     workspace_size, plan_bytes, lowering, pack_desc_for, predict, predict_pack, rank.
     calib: the calibration of predict / rank calls that pass none (None: the shipped one).
     memo: an optional Memo. Thread-safe."""
-    __slots__ = ("lib", "descs", "calib", "memo", "_t", "_A", "_B", "_C", "_f", "_cal",
+    __slots__ = ("lib", "descs", "_calib", "memo", "_t", "_A", "_B", "_C", "_f", "_cal",
                  "_opts", "_pks", "_rargs", "__weakref__")
 
     def __init__(self, spec, extents=None, *, strides=None, calib=None, memo=None, lib=None):
@@ -409,7 +435,7 @@ class Query:
         self._A, self._B, self._C = (C.byref(t) for t in self._t)
         fns, default = _state(h)
         self._f = fns
-        self.calib = calib
+        self._calib = calib
         self._cal = _calib_ref(default if calib is None else calib)
         self.memo = memo
         if memo is not None and not isinstance(memo, Memo):
@@ -417,6 +443,12 @@ class Query:
         self._opts = {}
         self._pks = {}
         self._rargs = {}
+
+    @property
+    def calib(self):
+        """The calibration of calls that pass none (None: the shipped one); read-only (the C
+        struct reference is fixed at construction)."""
+        return self._calib
 
     def __repr__(self):
         return f"<immerdink.planner.Query {self.descs!r}>"
@@ -614,8 +646,7 @@ class Query:
              **fields):
         """imd_perf_rank in ONE C call (the capacity is the exact candidate count) as a
         Ranking of lazy Candidate views (host.rank's order and values). fields: any other
-        imd_perf_rank_request_t field by name (later host API versions). With a budget that
-        changes per call, rank once with budget 0 (memoizable) and use Ranking.best(budget)."""
+        imd_perf_rank_request_t field by name (later host API versions)."""
         m = self.memo
         if m is not None:
             return _memo(m, (self, "r", N, g, vec_modes, packs, reuse, budget, beta, rounding,
@@ -650,7 +681,7 @@ class Query:
                                C.byref(count))
         if st:
             raise ImmerdinkError(st, "imd_perf_rank")
-        if count.value > cap:   # not reached (cap is the exact count); stay correct anyway
+        if count.value > cap:   # more than _RANK_CAP_MAX candidates: once more, exactly
             out = (host._Candidate * count.value)()
             st = self._f.perf_rank(self._A, self._B, self._C, o, C.byref(req), cal, out,
                                    count.value, C.byref(count))
@@ -659,8 +690,9 @@ class Query:
         return Ranking(out, count.value)
 
     def _rank_args(self, N, g, vec_modes, packs):
-        Ns = (int(N),) if isinstance(N, int) else tuple(int(x) for x in N)
-        gs = () if g is None else ((int(g),) if isinstance(g, int) else tuple(int(x) for x in g))
+        Ns = (index(N),) if isinstance(N, numbers.Integral) else tuple(index(x) for x in N)
+        gs = () if g is None else ((index(g),) if isinstance(g, numbers.Integral)
+                                   else tuple(index(x) for x in g))
         if not Ns:
             raise ImmerdinkError(1, "imd_perf_rank")
         narr = C.cast((C.c_int32 * len(Ns))(*Ns), C.POINTER(C.c_int32))
@@ -670,7 +702,7 @@ class Query:
         nv = bin(vmask or 1).count("1")
         npk = bin(pmask or 1).count("1")
         per_n = [(sum(1 for x in gs if x <= n) if gs else max(n, 0)) for n in Ns]
-        cap = max(sum(per_n) * nv * npk, 1)
+        cap = min(max(sum(per_n) * nv * npk, 1), _RANK_CAP_MAX)  # C validates N, g
         # keep the arrays alive with the pointers (C.cast keeps its source in _objects)
         ra = (Ns, narr, garr, len(gs), vmask, pmask, cap)
         try:
@@ -693,6 +725,8 @@ class Planner:
     queries; calib: the calibration of predict / rank calls that pass none (None: shipped)."""
 
     def __init__(self, *, calib=None, memo=None, max_queries=1024, lib=None):
+        if int(max_queries) < 1:
+            raise ValueError("max_queries must be >= 1")
         self.lib = _lib(lib)
         self.calib = calib
         self.memo = memo
@@ -707,6 +741,7 @@ class Planner:
     def clear(self):
         with self._lock:
             self._q.clear()
+            self._labels.clear()
 
     def _insert(self, key, make):
         q = make()
@@ -721,6 +756,8 @@ class Planner:
         if isinstance(spec, str):
             labs = self._labels.get(spec)
             if labs is None:
+                if len(self._labels) >= self.max_queries:
+                    self._labels.clear()
                 labs = self._labels[spec] = "".join(dict.fromkeys(spec.replace("->", "")
                                                                   .replace(",", "")
                                                                   .replace(" ", "")))
