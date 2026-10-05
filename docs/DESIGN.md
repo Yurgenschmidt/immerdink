@@ -581,7 +581,7 @@ Properties checked by **[spec: Pipeline]**:
     then runs kernels and allocates temporarily, and timing on a shared GPU is noisy.
   - Measured and not in the table: 256×128×64 (within noise of 128×256, M4/A2), 4 stages
     of 128×256 (1–3 % slower, A2), 32-row warp tiles at 128×128 (register-limited).
-- cuBLASLt (int32 out) is used only as a test oracle and baseline.
+- cuBLASLt is not used (no runtime or test dependency).
 
 **DIRECT path.**
 - Native FP64, our own small kernel.

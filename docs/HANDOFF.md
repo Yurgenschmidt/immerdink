@@ -25,9 +25,9 @@ first.
   configurations interleaved; docs/BENCHMARKING.md, NOTES-A5 §1.2). The bench is
   immerdink-only; comparisons with other libraries live in the evaluation workspace.
 
-- **Comparison (2026-10-04):** paper-grade, clock-locked comparison with GEMMul8 (paper versions and
-  current), cuBLAS emulation, DGEMM and cuTENSOR, including energy efficiency, lives in the local
-  workspace `~/repos/immerdink-eval` (never pushed; data untracked). Product benches stay
+- **Comparison (2026-10-04):** the clock-locked comparison with other libraries lives in the
+  local workspace `~/repos/immerdink-eval` (never pushed; data untracked), together with the
+  raw results and campaign sweeps the NOTES files refer to. Product benches stay
   immerdink-only (docs/BENCHMARKING.md).
 
 ## Open items needing Eric

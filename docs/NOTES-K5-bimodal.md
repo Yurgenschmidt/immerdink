@@ -26,8 +26,8 @@ lock. The per-call probe is `bench/k5bimodal/k5probe.cu`. The trace analysis is
 
 ## 1. Distribution (task 1)
 
-**Ten gated processes on dev 0613e49** (`bench/run_sweep.sh`, `gemmul8,imd`, warm-up 3 s),
-in `bench/results/k5bimodal-dev-0613e49.jsonl`. The commit field reads `0613e49-dirty`
+**Ten gated processes on dev 0613e49** (`bench/run_sweep.sh`, another library's calls before
+imd's as in the comparison sweeps, warm-up 3 s), in `bench/results/k5bimodal-dev-0613e49.jsonl`. The commit field reads `0613e49-dirty`
 because a temporary stderr print of the buffer addresses was in `imd_bench.cu`; it has been
 removed and is not committed.
 

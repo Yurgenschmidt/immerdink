@@ -130,14 +130,13 @@ python3 bench/ab_ratio.py <before.jsonl> <after.jsonl>
 
 Until 2026-10-04 the repository held every campaign's raw results (`bench/results/`), the
 campaign sweep files (`bench/sweep_compare.txt`, `sweep_m4`, `sweep_small`, `sweep_a*`,
-`sweep_d1*`, `sweep_g`, `sweep_v12`), the comparison write-up (`docs/BENCHMARKS.md`) and the
-GEMMul8 fetch script (`tools/get_gemmul8.sh`). They moved to the local evaluation workspace
-(`immerdink-eval/legacy/`), which also holds new comparison campaigns. The NOTES files keep
-their historical references to those paths; the numbers they quote are summaries of those runs.
+`sweep_d1*`, `sweep_g`, `sweep_v12`) and the comparison write-up (`docs/BENCHMARKS.md`). They
+moved to a local evaluation workspace outside this repository (`legacy/` there). The NOTES
+files keep their historical references to those paths; the numbers they quote are
+immerdink's own results from those runs. Comparisons with other libraries are kept outside
+this repository.
 
-The comparison methods of `imd_bench` went the same way. Up to `db8bfbd` the bench also timed
-native cuBLAS DGEMM (`dgemm`), cuBLAS FP64 emulation (`emu`), a cuBLASLt int8 roofline
-(`int8`), cuTENSOR (`cutensor`) and GEMMul8 (`gemmul8`), plus `perm+X` wrappers that permute
-the operands to the GEMM view. Its `duel` then meant imd against GEMMul8. The evaluation
-workspace keeps that version of the bench. NOTES files that quote those methods, or
-`AFTER_METHODS=gemmul8,imd`, refer to it.
+The comparison methods of `imd_bench` went the same way: up to `db8bfbd` the bench also
+timed other libraries (and `perm+X` wrappers that permute the operands to the GEMM view),
+and its `duel` paired imd with one of them. The evaluation workspace keeps that version of
+the bench. NOTES files that mention other libraries' calls in the same process refer to it.

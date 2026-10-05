@@ -9,9 +9,8 @@ cert, spec or Apalache change.
 
 Tooling. Every profile and timing went through `tools/run_bench.sh` (quiet gate, memcap)
 inside the shared GPU lock. ncu 2026.3.1, `--set full`, the first K4 launch of a call
-(`imd`, N = 14, g = N; each case is a single K-chunk, so one store-mod launch), and the
-cuBLASLt int8 TN GEMM (int32 out, one modulus) of the bench's `int8` method. ncu locks the
-clocks (2.5 GHz SM here), so ncu durations are comparable with each other, not with the
+(`imd`, N = 14, g = N; each case is a single K-chunk, so one store-mod launch). ncu locks
+the clocks (2.5 GHz SM here), so ncu durations are comparable with each other, not with the
 event timings. The int8 tensor-pipe utilization `sm__pipe_tensor_cycles_active` at this
 clock is the fraction of the 660 TOPS bound: duration × tensor % ≈ the §4 math bound
 (r_lowk: 2.92 ms vs 2.91). The main-loop / epilogue split is from warp-state sampling per
@@ -22,17 +21,18 @@ epilogue = after it (for K4Gemm this includes issuing the next tile's prologue).
 
 ### Whole kernel (ncu, N = 14)
 
-| case (m×n×k, b) | K4 ncu ms | tensor pipe | L2 | cuBLASLt int8 (1 modulus) tensor pipe |
-|---|---|---|---|---|
-| r_lowk 8192²×1024 | 4.80 | 61.3 % | 53.7 % | 53.7 % (0.39 ms; int32 out) |
-| t_df 4096²×2048 | 1.93 | 75.7 % | 61.9 % | 73.9 % |
-| t_ikl 1024³, b = 16 | 1.21 | 60.5 % | 52.9 % | 57.6 % |
-| sq8192 | 25.2 | 92.3 % | 70.8 % | 93.2 % |
-| r_bigk 2048²×32768 | 6.09 | 97.0 % | 73.5 % | 56.8 % (128 tiles: one partial wave) |
+| case (m×n×k, b) | K4 ncu ms | tensor pipe | L2 |
+|---|---|---|---|
+| r_lowk 8192²×1024 | 4.80 | 61.3 % | 53.7 % |
+| t_df 4096²×2048 | 1.93 | 75.7 % | 61.9 % |
+| t_ikl 1024³, b = 16 | 1.21 | 60.5 % | 52.9 % |
+| sq8192 | 25.2 | 92.3 % | 70.8 % |
+| r_bigk 2048²×32768 | 6.09 | 97.0 % | 73.5 % |
 
-- cuBLASLt picks `cutlass_80_tensorop_i16832gemm_s8_256x128_64x3` — the same CUTLASS 2.x
-  main loop at 256×128 — and is *not* a better roofline at moderate k: its int32 output
-  (4 B per element) costs it more than our u8 epilogue. At large k both sit at 92–97 %.
+- The vendor int8 GEMM (cuBLASLt) uses `cutlass_80_tensorop_i16832gemm_s8_256x128_64x3` for
+  these shapes — the same CUTLASS 2.x main loop at 256×128 — so there is no better main loop
+  to borrow; with int32 output (4 B per element) it is no better roofline for K4 at moderate
+  k than our u8 epilogue.
 - Occupancy: 1 CTA (8 warps) per SM, limited by both registers (226 / thread) and shared
   memory (72 KB). Achieved 16.6 % of 48 warps = 2 warps per scheduler.
 - Stalls (whole kernel, r_lowk): math-pipe throttle 45 %, wait 23 %, short scoreboard 11 %,
@@ -161,9 +161,8 @@ fit the register file and at 128×128 hits L2 bandwidth (§1).
 ### Timings (CUDA events, `bench/sweep_a2.txt`, quiet-gated)
 
 Before (`c63117a`, `build/bench-base`) and after (`3e419b2`) ran **interleaved per case**
-in one session (`bench/results/a2-before-ab-c63117a.jsonl`, `a2-after-3e419b2.jsonl`; the
-after file also has GEMMul8 and the cuBLASLt int8 GEMM of the same session). The 4090 runs
-these at its power cap, so differences below ~3 % are noise. An earlier, non-interleaved
+in one session (`bench/results/a2-before-ab-c63117a.jsonl`, `a2-after-3e419b2.jsonl`). The
+4090 runs these at its power cap, so differences below ~3 % are noise. An earlier, non-interleaved
 before run is `a2-before-c63117a.jsonl` (same picture; K4 63.7 / 71.3 / 64.5 % of bound on
 r_lowk / t_df / t_ikl at N = 14).
 
@@ -190,51 +189,34 @@ r_lowk / t_df / t_ikl at N = 14).
 | s_cc16 | 8 | 0.141 | 62 % | 0.119 | 74 % | 1.19× |
 | s_cc16 | 14 | 0.231 | 67 % | 0.186 | 83 % | 1.24× |
 
-### Whole call: TFLOPS-eq (median), immerdink before / after vs GEMMul8 (after session)
+### Whole call: TFLOPS-eq (median), immerdink before / after
 
-| case | N | imd before | imd after | speedup | GEMMul8 | after / GEMMul8 (before) |
-|---|---|---|---|---|---|---|
-| r_lowk | 8 | 28.01 | 33.52 | 1.20× | 20.39 | 1.64 (1.37) |
-| r_lowk | 14 | 19.00 | 22.55 | 1.19× | 11.46 | 1.97 (1.66) |
-| t_df | 8 | 33.34 | 36.57 | 1.10× | 29.26 | 1.25 (1.14) |
-| t_df | 14 | 22.50 | 25.16 | 1.12× | 16.69 | 1.51 (1.35) |
-| t_ikl | 8 | 16.03 | 17.84 | 1.11× | 18.13 | 0.98 (0.88) |
-| t_ikl | 14 | 11.32 | 12.85 | 1.14× | 11.56 | 1.11 (0.98) |
-| t_cc | 8 | 40.49 | 43.49 | 1.07× | 39.06 | 1.11 (1.04) |
-| t_cc | 14 | 27.09 | 29.03 | 1.07× | 22.69 | 1.28 (1.19) |
-| t_permout | 8 | 38.97 | 42.27 | 1.08× | 37.17 | 1.14 (1.05) |
-| t_permout | 14 | 26.18 | 28.43 | 1.09× | 21.99 | 1.29 (1.19) |
-| sq4096 | 8 | 40.54 | 43.18 | 1.07× | 39.10 | 1.10 (1.04) |
-| sq4096 | 14 | 26.90 | 29.18 | 1.08× | 22.69 | 1.29 (1.19) |
-| sq8192 | 8 | 55.30 | 56.29 | 1.02× | 52.68 | 1.07 (1.05) |
-| sq8192 | 14 | 33.84 | 34.84 | 1.03× | 30.89 | 1.13 (1.10) |
-| r_bigk | 8 | 33.84 | 34.44 | 1.02× | 37.88 | 0.91 (0.89) |
-| r_bigk | 14 | 23.96 | 24.15 | 1.01× | 24.77 | 0.97 (0.97) |
-| s_cc16 | 8 | 19.88 | 21.40 | 1.08× | 25.55 | 0.84 (0.78) |
-| s_cc16 | 14 | 14.27 | 15.70 | 1.10× | 14.78 | 1.06 (0.97) |
-
-### cuBLASLt int8 (one modulus, int32 out), after session
-
-| case | ms | TOPS | × N=14 ms | imd K4 N=14 ms |
+| case | N | imd before | imd after | speedup |
 |---|---|---|---|---|
-| r_lowk | 0.405 | 339 | 5.68 | 3.55 |
-| t_df | 0.155 | 445 | 2.16 | 1.63 |
-| t_ikl | 0.118 | 292 | 1.65 | 0.90 |
-| t_cc | 0.258 | 533 | 3.61 | 3.10 |
-| t_permout | 0.262 | 525 | 3.66 | 3.07 |
-| sq4096 | 0.257 | 535 | 3.60 | 3.07 |
-| sq8192 | 1.798 | 612 | 25.17 | 24.74 |
-| r_bigk | 0.743 | 370 | 10.41 | 5.96 |
-| s_cc16 | 0.035 | 208 | 0.49 | 0.19 |
+| r_lowk | 8 | 28.01 | 33.52 | 1.20× |
+| r_lowk | 14 | 19.00 | 22.55 | 1.19× |
+| t_df | 8 | 33.34 | 36.57 | 1.10× |
+| t_df | 14 | 22.50 | 25.16 | 1.12× |
+| t_ikl | 8 | 16.03 | 17.84 | 1.11× |
+| t_ikl | 14 | 11.32 | 12.85 | 1.14× |
+| t_cc | 8 | 40.49 | 43.49 | 1.07× |
+| t_cc | 14 | 27.09 | 29.03 | 1.07× |
+| t_permout | 8 | 38.97 | 42.27 | 1.08× |
+| t_permout | 14 | 26.18 | 28.43 | 1.09× |
+| sq4096 | 8 | 40.54 | 43.18 | 1.07× |
+| sq4096 | 14 | 26.90 | 29.18 | 1.08× |
+| sq8192 | 8 | 55.30 | 56.29 | 1.02× |
+| sq8192 | 14 | 33.84 | 34.84 | 1.03× |
+| r_bigk | 8 | 33.84 | 34.44 | 1.02× |
+| r_bigk | 14 | 23.96 | 24.15 | 1.01× |
+| s_cc16 | 8 | 19.88 | 21.40 | 1.08× |
+| s_cc16 | 14 | 14.27 | 15.70 | 1.10× |
 
 - **K4 at moderate k**: 60–64 % → 80–86 % of the bound at k = 1024 (r_lowk, t_ikl), 75 →
   90 % at k = 2048 (t_df), 85–89 → 94–96 % at k = 4096 (t_cc, t_permout, sq4096). Large k
-  (sq8192, r_bigk) moves 1–4 %. K4 is now faster than N × the cuBLASLt int8 GEMM on every
-  case (that one writes int32), by 1.2–2× at moderate k.
-- **Whole call**: 1.07–1.20× faster at moderate k, 1.01–1.03× at large k. Against GEMMul8
-  (same session): r_lowk 1.64× / 1.97× (N = 8 / 14), t_df 1.25× / 1.51×, the 4096-class
-  cases 1.10–1.14× / 1.28–1.29×, t_ikl 0.98× / 1.11× (was 0.88× / 0.98×), s_cc16 0.84× /
-  1.06× (was 0.78× / 0.97×). r_bigk stays at 0.91× / 0.97×: its K4 was already at 96–98 %;
-  the gap there is K1 / the pack on 256 KB rows (A4) and tile selection (A3).
+  (sq8192, r_bigk) moves 1–4 %.
+- **Whole call**: 1.07–1.20× faster at moderate k, 1.01–1.03× at large k. r_bigk moves
+  1–2 %: its K4 was already at 96–98 %; what is left there is K1 / the pack on 256 KB rows
+  (A4) and tile selection (A3).
 - What remains of K4's gap at k = 1024 is the epilogue's integer work itself (see the ncu
   results above).
