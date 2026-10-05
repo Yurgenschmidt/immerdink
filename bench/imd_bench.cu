@@ -12,8 +12,11 @@
 //   imd       immerdink imd_plan_create + imd_contract, N from --N. With a library built
 //             by this project (IMMERDINK_PROFILE=ON), --phase-reps more calls are made with
 //             per-phase event marks and the record gets "phases": per phase the median
-//             time, its MEMORY_MODEL §4 lower bound and the time as % of that bound
-//             (the timed whole-call loop runs with the marks switched off)
+//             time, its MEMORY_MODEL §4 lower bound, the time as % of that bound and the
+//             performance model's predicted time (pred_ms; bounds and predictions from
+//             libimmerdink_host imd_perf_predict, DESIGN §6c, shipped calibration); every
+//             record has pred_ms / pred_err_pct of the whole call (the timed whole-call loop
+//             runs with the marks switched off)
 //   packed    v1.7 (DESIGN §6b, D1): the caller's A or B (--pack A,B) packed once with
 //             imd_pack (imd_pack_desc_for: bit-identical C) and reused by R contractions
 //             (--reuse 1,4,16): R x imd_contract vs imd_pack + R x imd_contract_packed,
@@ -171,14 +174,16 @@ __device__ __host__ inline uint64_t splitmix64(uint64_t x) {
   return x ^ (x >> 31);
 }
 // (u - 1/2) * exp(phi * g), u uniform in [0,1), g standard normal: GEMMul8's test data.
-__global__ void k_fill(double* p, size_t n, uint64_t seed, double phi) {
+// dom > 0 (--data dominant): every dom-th element (one per row of k contiguous contracted
+// elements, e.g. ik / jk operands) is multiplied by 2^20, so each row has one dominant entry.
+__global__ void k_fill(double* p, size_t n, uint64_t seed, double phi, size_t dom) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
        i += size_t(gridDim.x) * blockDim.x) {
     uint64_t h1 = splitmix64(seed ^ (2 * i)), h2 = splitmix64(seed ^ (2 * i + 1));
     double u = double(h1 >> 11) * 0x1.0p-53, u1 = (double(h2 >> 11) + 1.0) * 0x1.0p-53;
     double u2 = double(splitmix64(h2) >> 11) * 0x1.0p-53;
     double g = sqrt(-2.0 * log(u1)) * cospi(2.0 * u2);
-    p[i] = (u - 0.5) * exp(phi * g);
+    p[i] = (u - 0.5) * exp(phi * g) * ((dom != 0 && i % dom == 0) ? 1048576.0 : 1.0);
   }
 }
 
@@ -420,11 +425,13 @@ struct Options {
   long long samples = 256;
   int phase_reps = 5;  // profiled imd calls (per-phase marks), after the timed loop
   std::vector<int> vec_modes = {IMD_VEC_GENERATE};  // imd: --vec generate,resident (v1.2)
+  int mode = IMD_EMULATE;  // imd: --mode emulate|direct (B2 calibration of the DIRECT kernel)
   std::vector<int> groups = {0};  // imd: --g 1,2,4,0 (residue group size g; 0 = N)
   // imd: --k4 rule,tune,0,1,2,3 (A3: the K4 configuration; -1 = the plan-time rule, -2 =
   // the k4_tune plan option, 0.. = forced through the benchmark hook)
   std::vector<int> k4 = {-1};
   double phi = 0.5;
+  bool dominant = false;  // --data dominant (B2 eps-path calibration: one dominant entry per row)
   uint64_t seed = 1;
   std::string out;
 };
@@ -619,8 +626,9 @@ struct Bench {
     dA = DevBuf(c.A.size * 8);
     dB = DevBuf(c.B.size * 8);
     dC = DevBuf(c.C.size * 8);
-    k_fill<<<1024, 256, 0, s>>>(dA.as<double>(), c.A.size, splitmix64(o.seed * 3 + 0), o.phi);
-    k_fill<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1), o.phi);
+    const size_t dom = o.dominant ? size_t(c.k) : 0;
+    k_fill<<<1024, 256, 0, s>>>(dA.as<double>(), c.A.size, splitmix64(o.seed * 3 + 0), o.phi, dom);
+    k_fill<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1), o.phi, dom);
     CU(cudaStreamSynchronize(s));
     CU(cudaGetLastError());
     R = make_reference(c, dA.as<double>(), dB.as<double>(), o.samples, o.seed, s);
@@ -648,7 +656,9 @@ struct Bench {
     meta.str("gemm_view", cA + "," + cB + "->" + cC);
     meta.raw("perm_needed", std::string("\"") + (needA ? "A" : "") + (needB ? "B" : "") + (needC ? "C" : "") + "\"");
     meta.num("phi", o.phi).integer("seed", (long long)o.seed);
+    meta.str("data", o.dominant ? "dominant" : "normal");
     meta.str("gpu", p.name).integer("sm_count", p.multiProcessorCount);
+    meta.integer("l2_bytes", (long long)p.l2CacheSize);
     meta.str("driver", sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null"));
     meta.integer("cuda_driver_api", drv).integer("cuda_runtime", rt);
     meta.str("gpu_max_clocks", sh("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem "
@@ -668,7 +678,7 @@ struct Bench {
     };
     std::vector<int32_t> la, lb, lc;
     imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
-    imd_options_t opt{N, g, IMD_RN, IMD_EMULATE, vec_mode, k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF};
+    imd_options_t opt{N, g, IMD_RN, o.mode, vec_mode, k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF};
     size_t wsb = 0;
     CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
     imd_lowering_t low{};
@@ -700,12 +710,22 @@ struct Bench {
     Accuracy acc = result_accuracy();
     CU(cudaStreamSynchronize(s));
     Json extra;
+    // DESIGN §6c: the predicted call (shipped calibration) for the K4 configuration the plan runs.
+    int32_t k4_plan = -1;
 #ifdef IMD_BENCH_PROFILE
-    extra = profile_imd(plan, N, [&] {
+    imd_prof_plan_k4(plan, &k4_plan);
+#endif
+    imd_perf_request_t preq{sizeof(imd_perf_request_t), 0, k4_plan, 0};
+    imd_perf_t pred{};
+    pred.struct_size = sizeof pred;
+    imd_perf_predict(&A, &B, &C, &opt, nullptr, &preq, nullptr, &pred);
+#ifdef IMD_BENCH_PROFILE
+    extra = profile_imd(plan, N, pred, [&] {
       CI(imd_contract(plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
     });
 #endif
     extra.integer("plan_device_bytes", (long long)plan_dev).num("plan_create_ms", 1e3 * create_s);
+    extra.num("pred_ms", 1e3 * pred.time_s).num("pred_err_pct", 100.0 * (pred.time_s / T.median() - 1));
     const std::string gs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
     extra.integer("g", (long long)((g == 0 || g >= N) ? N : g));
     // A3: the K4 configuration of the rule (host query) and the one the plan runs.
@@ -717,6 +737,7 @@ struct Bench {
         .integer("k4_tune_bytes", (long long)low.k4_tune_bytes)
         .integer("fused", low.fused).integer("fused_large", low.fused_large);
     std::string vs = vec_mode == IMD_VEC_RESIDENT ? gs + " vec=resident" : gs;
+    if (o.mode == IMD_DIRECT) vs += " mode=direct";
     if (k4 == -2) vs += " k4=tune";
     else if (k4 >= 0) vs += " k4=" + std::to_string(k4);
     record("imd", vs, N, T, &acc, flops(), wsb, extra);
@@ -976,9 +997,15 @@ struct Bench {
     if (o.phase_reps > 0) {
       const std::pair<const char*, std::function<void()>> runs[3] = {
           {"plain_", do_plain}, {"packed_", do_packed}, {"pack_", do_pack}};
+      imd_perf_t preds[3] = {};
+      for (auto& pr : preds) pr.struct_size = sizeof pr;
+      imd_perf_predict(&A, &B, &C, &opt, nullptr, nullptr, nullptr, &preds[0]);
+      imd_perf_predict(&A, &B, &C, &opt, &packing, nullptr, nullptr, &preds[1]);
+      imd_perf_predict_pack(&desc, nullptr, nullptr, &preds[2]);
+      int ri = 0;
       for (auto& [pre, fn] : runs) {
         fprintf(stderr, "  %sphases:\n", pre);
-        Json pj = profile_imd(std::string(pre) == "plain_" ? plain : packed, N, fn);
+        Json pj = profile_imd(std::string(pre) == "plain_" ? plain : packed, N, preds[ri++], fn);
         for (auto& kv : pj.kv) phases.raw(pre + kv.first, kv.second);
       }
     }
@@ -1006,30 +1033,21 @@ struct Bench {
   }
 
 #ifdef IMD_BENCH_PROFILE
-  // Per-phase times from the library's event marks, against MEMORY_MODEL §4 lower bounds
-  // (g = N, beta = 0, rho = 1, datasheet peaks as in bench/summarize.py).
-  Json profile_imd(imd_plan_t plan, int N, const std::function<void()>& call) {
-    constexpr double kBW = 1008e9, kOps = 660.6e12, kKc = 131056;
+  // Per-phase times from the library's event marks, against the MEMORY_MODEL §4 lower bounds
+  // and the performance model's predicted phase times (DESIGN §6c: `pred` is imd_perf_predict /
+  // imd_perf_predict_pack with the shipped calibration, the one implementation of the bound
+  // formulas: the actual g, beta = 0, rho = 1, datasheet peaks).
+  Json profile_imd(imd_plan_t plan, int N, const imd_perf_t& pred,
+                   const std::function<void()>& call) {
     int64_t d[7];
     CI(imd_prof_plan_dims(plan, d) == 0 ? IMD_STATUS_SUCCESS : IMD_STATUS_INVALID_VALUE);
-    const double m = double(d[0]), n = double(d[1]), k = double(d[2]), b = double(d[3]),
-                 nh = double(d[4]), kh = double(d[5]);
-    const double nc = std::ceil(kh / kKc);
-    std::map<std::string, double> lb;
-    lb["K0 vec"] = 8 * (2 * m + 2 * n + 2 * k + 3 * b) / kBW;  // v1.2: generated (written once)
-    lb["K1 scale A"] = 8 * b * m * k / kBW;
-    lb["K1 scale B"] = 8 * b * n * k / kBW;
-    lb["K2 pack A"] = (8 * b * m * k + N * b * m * kh) / kBW;
-    lb["K3 pack B"] = (8 * b * n * k + N * b * nh * kh) / kBW;
-    // v1.6 KL (K1 + group 1's pack of one operand): one read of the operand, group 1's
-    // residues written (g = N here, like the pack bounds).
-    lb["KL A"] = (8 * b * m * k + N * b * m * kh) / kBW;
-    lb["KL B"] = (8 * b * n * k + N * b * nh * kh) / kBW;
-    lb["K4 gemm"] = std::max(2.0 * N * b * m * nh * kh / kOps,
-                             (N * b * (m * kh + nh * kh) + N * b * m * nh * (2 * nc - 1)) / kBW);
-    lb["K5 crt"] = (N * b * m * nh + 8 * b * m * n) / kBW;
-    lb["DIRECT"] = 8 * b * (m * k + k * n + m * n) / kBW;
-    lb["K5 beta-only"] = 8 * b * m * n / kBW;
+    std::map<std::string, double> lb, pm;  // phase -> bound, predicted time (s)
+    for (int i = 0; i < pred.num_phases; ++i) {
+      const char* nm = imd_perf_phase_name(pred.phase[i].phase);
+      if (nm == nullptr) continue;
+      lb[nm] = pred.phase[i].bound_s;
+      pm[nm] = pred.phase[i].time_s;
+    }
 
     if (imd_prof_enable(1) != 0) throw Failure("imd_prof_enable failed");
     std::map<std::string, std::vector<double>> per;  // phase -> per-call total ms
@@ -1071,11 +1089,13 @@ struct Bench {
       const double t_ms = median(per[t]);
       const double l_ms = lb.count(t) ? lb[t] * 1e3 : NAN;
       if (lb.count(t) && t != "K0 vec") lb_sum += l_ms;
+      const double p_ms = pm.count(t) ? pm[t] * 1e3 : NAN;
       Json p;
       p.num("ms", t_ms).num("lb_ms", l_ms).num("pct_of_lb", 100.0 * l_ms / t_ms).integer("marks", launches[t]);
+      p.num("pred_ms", p_ms);
       js += (js.size() > 1 ? ", " : "") + jstr(t) + ": " + p.dump();
-      fprintf(stderr, "    %-14s %9.3f ms  LB %9.3f ms  %5.1f %% of LB  (%d marks)\n", t.c_str(),
-              t_ms, l_ms, 100.0 * l_ms / t_ms, launches[t]);
+      fprintf(stderr, "    %-14s %9.3f ms  LB %9.3f ms  %5.1f %% of LB  pred %9.3f ms  (%d marks)\n",
+              t.c_str(), t_ms, l_ms, 100.0 * l_ms / t_ms, p_ms, launches[t]);
     }
     js += "}";
     const double tot = median(totals);
@@ -1104,7 +1124,8 @@ void usage() {
           "usage: imd_bench --name NAME --spec 'ab,bc->ac' --ext a=..,b=..,c=.. [--methods LIST]\n"
           "  [--N 8,14,20] [--reps 10] [--warmup 2]\n"
           "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--phase-reps 5]\n"
-          "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)] [--k4 rule,tune,0,1,2,3] (method imd)\n"
+          "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)] [--k4 rule,tune,0,1,2,3]\n"
+          "  [--mode emulate|direct] (method imd) [--data normal|dominant]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
           "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4)\n"
@@ -1121,7 +1142,8 @@ int main(int argc, char** argv) {
                                        {"duel-b", "k4=tune"}};
   static const char* const kKeys[] = {"name", "spec", "ext", "methods", "N", "reps", "warmup",
                                       "max-seconds", "samples", "phi", "seed", "phase-reps",
-                                      "vec", "g", "k4", "pack", "reuse", "duel-a", "duel-b", "out"};
+                                      "vec", "g", "k4", "pack", "reuse", "duel-a", "duel-b", "out",
+                                      "mode", "data"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -1160,6 +1182,14 @@ int main(int argc, char** argv) {
       B.o.k4.clear();
       for (auto& v : split(a["k4"], ','))
         B.o.k4.push_back(v == "rule" ? -1 : v == "tune" ? -2 : std::stoi(v));
+    }
+    if (a.count("mode")) {
+      if (a["mode"] != "emulate" && a["mode"] != "direct") throw Failure("--mode emulate|direct");
+      B.o.mode = a["mode"] == "direct" ? IMD_DIRECT : IMD_EMULATE;
+    }
+    if (a.count("data")) {
+      if (a["data"] != "normal" && a["data"] != "dominant") throw Failure("--data normal|dominant");
+      B.o.dominant = a["data"] == "dominant";
     }
     if (a.count("phi")) B.o.phi = std::stod(a["phi"]);
     if (a.count("seed")) B.o.seed = std::stoull(a["seed"]);

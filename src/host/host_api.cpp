@@ -10,31 +10,7 @@
 #include "analysis.hpp"
 #include "immerdink/immerdink_host.h"
 
-namespace {
-
-using imd::detail::Analysis;
-using imd::detail::ExecPlan;
-
-// The version-1 size of imd_lowering_t (§6a): fields are only ever appended.
-constexpr uint32_t kLoweringV1Size = 136;
-constexpr uint32_t kLoweringV2Size = 152;  // + fused, reserved, kernel_launches (v1.4)
-constexpr uint32_t kLoweringV3Size = 168;  // + sm_count, k4_config, k4_tune_bytes (v1.5)
-constexpr uint32_t kLoweringV4Size = 176;  // + fused_large, reserved4 (v1.6)
-constexpr uint32_t kLoweringV5Size = 184;  // + packed, pack_mismatch (v1.7)
-static_assert(offsetof(imd_lowering_t, fused) == kLoweringV1Size, "imd_lowering_t v1 layout changed");
-static_assert(offsetof(imd_lowering_t, sm_count) == kLoweringV2Size, "imd_lowering_t v2 layout changed");
-static_assert(offsetof(imd_lowering_t, fused_large) == kLoweringV3Size, "imd_lowering_t v3 layout changed");
-static_assert(offsetof(imd_lowering_t, packed) == kLoweringV4Size, "imd_lowering_t v4 layout changed");
-static_assert(sizeof(imd_lowering_t) == kLoweringV5Size, "imd_lowering_t v5 layout changed");
-static_assert(sizeof(imd_options_t) == 24, "imd_options_t layout changed");
-static_assert(sizeof(imd_region_t) == 16, "imd_region_t layout changed");
-// v1.7 (§6b.5): the version-1 pack structs (64-bit ABI).
-static_assert(sizeof(imd_pack_desc_t) == 72, "imd_pack_desc_t v1 layout changed");
-static_assert(sizeof(imd_pack_layout_t) == 136, "imd_pack_layout_t v1 layout changed");
-constexpr uint32_t kPackLayoutV1Size = 136;
-
-using imd::detail::PackLowered;
-using imd::detail::PackSource;
+namespace imd::detail {
 
 // The packs of a host query (imd_packing_t: descriptors), lowered: each descriptor's own
 // status first (imd_pack_layout's), then the plan's analyze_packed.
@@ -59,6 +35,34 @@ imd_status_t analyze_with(const imd_tensor_t* A, const imd_tensor_t* B, const im
   }
   return imd::detail::analyze_packed(A, B, C, options, src, an);
 }
+
+}  // namespace imd::detail
+
+namespace {
+
+using imd::detail::Analysis;
+using imd::detail::ExecPlan;
+
+// The version-1 size of imd_lowering_t (§6a): fields are only ever appended.
+constexpr uint32_t kLoweringV1Size = 136;
+constexpr uint32_t kLoweringV2Size = 152;  // + fused, reserved, kernel_launches (v1.4)
+constexpr uint32_t kLoweringV3Size = 168;  // + sm_count, k4_config, k4_tune_bytes (v1.5)
+constexpr uint32_t kLoweringV4Size = 176;  // + fused_large, reserved4 (v1.6)
+constexpr uint32_t kLoweringV5Size = 184;  // + packed, pack_mismatch (v1.7)
+static_assert(offsetof(imd_lowering_t, fused) == kLoweringV1Size, "imd_lowering_t v1 layout changed");
+static_assert(offsetof(imd_lowering_t, sm_count) == kLoweringV2Size, "imd_lowering_t v2 layout changed");
+static_assert(offsetof(imd_lowering_t, fused_large) == kLoweringV3Size, "imd_lowering_t v3 layout changed");
+static_assert(offsetof(imd_lowering_t, packed) == kLoweringV4Size, "imd_lowering_t v4 layout changed");
+static_assert(sizeof(imd_lowering_t) == kLoweringV5Size, "imd_lowering_t v5 layout changed");
+static_assert(sizeof(imd_options_t) == 24, "imd_options_t layout changed");
+static_assert(sizeof(imd_region_t) == 16, "imd_region_t layout changed");
+// v1.7 (§6b.5): the version-1 pack structs (64-bit ABI).
+static_assert(sizeof(imd_pack_desc_t) == 72, "imd_pack_desc_t v1 layout changed");
+static_assert(sizeof(imd_pack_layout_t) == 136, "imd_pack_layout_t v1 layout changed");
+constexpr uint32_t kPackLayoutV1Size = 136;
+
+using imd::detail::analyze_with;
+using imd::detail::PackLowered;
 
 // Runs f() and maps a host allocation failure to ALLOC_FAILED (the queries allocate only
 // O(rank) host memory for the lowering tables).

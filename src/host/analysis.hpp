@@ -55,6 +55,13 @@ IMD_HOST_INTERNAL imd_status_t analyze_packed(const imd_tensor_t* A, const imd_t
                                               const imd_options_t* options,
                                               const PackSource* const src[2], Analysis* out);
 
+// The analysis of a host query with an imd_packing_t of pack DESCRIPTORS (host_api.cpp): no
+// packing (or both members NULL) is analyze; otherwise analyze, then each descriptor's own
+// status (pack_lower: imd_pack_layout's INVALID_VALUE / NOT_SUPPORTED), then analyze_packed.
+IMD_HOST_INTERNAL imd_status_t analyze_with(const imd_tensor_t* A, const imd_tensor_t* B,
+                                           const imd_tensor_t* C, const imd_options_t* options,
+                                           const imd_packing_t* packing, Analysis* an);
+
 // kappa >= T(N) (§3.2 RN acceptance), exactly.
 IMD_HOST_INTERNAL bool kappa_at_least_T(uint64_t kappa, int N);
 
@@ -79,6 +86,17 @@ constexpr int32_t kFusedLargeA = 1, kFusedLargeB = 2;
 inline int32_t fused_large(const ExecPlan& e) {
   if (!emulates(e) || fused_path(e)) return 0;
   return (kFusedLargeA | kFusedLargeB) & ~e.packed;
+}
+
+// v1.8 (DESIGN §4 KL, §6c): log2 of KL's tile length tk along k-bar. A KL tile holds 4096 FP64
+// of th rows x tk: read along rows, th = 8 rows side by side (tk = 512); along k-bar, tk =
+// pow2 >= k_hat in [64, 4096] (th = 4096 / tk). Rows longer than two tiles re-read their middle
+// chunks from L2. contract.cu launch_kl and the performance model (perf.cpp) use this one rule.
+inline int kl_tile_lg_k(bool along_rows, int64_t k_hat) {
+  if (along_rows) return 9;
+  int lg_tk = 6;
+  while (lg_tk < 12 && (int64_t{1} << lg_tk) < k_hat) ++lg_tk;
+  return lg_tk;
 }
 
 // Kernel launches of one imd_contract with alpha != 0 (DESIGN §4, §6a kernel_launches):

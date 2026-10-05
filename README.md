@@ -64,6 +64,23 @@ imd.contract("ijk,kl->lij", A, B, C, N=14, workspace=ws)     # einsum front end,
 pa = imd.Pack(plan.pack_spec(0))                             # packed operands (DESIGN §6b)
 ```
 
+### Predicted time and configuration ranking (no GPU)
+
+The same library predicts what a call costs on a calibrated GPU (the RTX 4090 calibration
+ships with it; `tools/calibrate.sh` makes one for another GPU) and ranks the configurations a
+caller may choose inside a memory budget, each with its exact footprint (DESIGN §6c):
+
+```python
+p = host.predict(spec, ext, N=14, g=7)            # per-phase and total time, TFLOPS-eq
+(p.tflops_eq, p.time_s, [(q.name, q.time_s) for q in p.phases])
+for c in host.rank(spec, ext, N=[12, 14], vec_modes=("GENERATE", "RESIDENT"),
+                   packs=("NONE", "A", "B"), reuse=4, budget=2 * 2**30)[:5]:
+    print(c.num_moduli, c.residue_group, c.vec_mode, c.packed, c.time_s, c.total_bytes)
+```
+
+or `python3 -m immerdink.host <spec> <extents> -N 14 --rank 12,14 --budget 2147483648`. From C:
+`imd_perf_predict`, `imd_perf_rank`, `imd_perf_calib_load` (`immerdink_host.h`).
+
 Day-to-day work lands on `dev`; `main` only changes via pull request.
 
 ## License and credits

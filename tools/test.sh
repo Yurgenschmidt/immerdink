@@ -40,7 +40,7 @@ gpu_lock="${IMMERDINK_GPU_LOCK:-/home/ef/repos/ehrenfest-ipdps/_wip/gpu.lock}"
 [ "$gpu_lock" = none ] || [ -d "$(dirname "$gpu_lock")" ] || gpu_lock="${XDG_RUNTIME_DIR:-/tmp}/gpu.lock"
 # CPU-only tests never touch the GPU, so they run first without the lock; only the GPU
 # tests wait for it. A caller's own -R/-E filters apply to both passes.
-cpu_only='^(host_c_api|host_python|host_cuda_free|workspace_vs_params|params_check|constants_header_current)$'
+cpu_only='^(host_c_api|host_python|host_perf|host_cuda_free|workspace_vs_params|params_check|constants_header_current)$'
 if [ "$gpu_lock" = none ]; then ctest --test-dir "$build" --output-on-failure "$@"
 else
   rc=0

@@ -23,9 +23,10 @@ per-operand fused scale-and-pack launch KL for k̂ > 1024 (§4, chosen at plan t
 same workspace, one DRAM read of the operand less) and reports it in the host API (§6a);
 changed text is marked **[v1.6]**. v1.7 (§6b, D1 packed operands; design approved by Eric,
 2026-10-03, all §6b.10 recommendations) is implemented (host API version 5; §6b.11 lists the
-implementation choices and one clarification of §6b.5 to confirm). v1.9 adds §6d, the
-Python front end over the C ABI (ROADMAP B1; no semantic, layout or C API change). The change
-lists are at the end.
+implementation choices and one clarification of §6b.5 to confirm). v1.8 adds §6c, the
+performance model (ROADMAP B2: host API version 6; no semantic change). v1.9 adds §6d,
+the Python front end over the C ABI (ROADMAP B1; no semantic, layout or C API change).
+The change lists are at the end.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -1820,6 +1821,369 @@ pointer, three reads), so CAI is preferred when both exist.
 
 ---
 
+## 6c. Performance model (ROADMAP B2) [v1.8]
+
+A CUDA-free prediction of what one `imd_contract` (or `imd_pack`) costs on a given GPU, per
+phase and in total, and a helper that ranks the configurations a caller may choose (N, g,
+`vec_mode`, packed operands) by predicted time inside a device-memory budget, each with its
+exact footprint. It is designed to be called directly by ehrenfest, which therefore needs no
+model of its own. **Decided by Eric:** it lives in `libimmerdink_host` next to the lowering
+(one implementation; Python wraps it); a calibration for the RTX 4090 (sm_89) ships with the
+library and a recalibration tool writes a calibration file for another GPU, which the model
+loads instead; output = predict + rank, the caller makes the final choice; kernel level only
+(no streams, graphs or transfers); accuracy and the choice of N are the caller's, the model
+only reports each candidate's plan-time status (which includes the §3.2 RN acceptance rule).
+
+Nothing here changes what a plan does: the calibration is read only by the `imd_perf_*`
+functions, never by plan creation (`k4_select` keeps its fixed A3 constants, §4), so a
+calibration file cannot change a result, a launch or a footprint.
+
+### 6c.1 Model form
+
+`t_call = Σ_phases t_p + t_call-term`, each term **linear in calibrated parameters**:
+
+```
+t_p = Σ_j θ[class(p), j] · x[p, j]        (ns; θ ≥ 0 except the call term; j < 6)
+K4:   t_p = max(Σ_{j≠4} θ_j x_j, θ_4 x_4)  (the A3 round model, or the DRAM term)
+```
+
+The features `x` are exact functions of the plan's lowering (the `ExecPlan` that
+`imd_lowering` / `imd_lowering_packed` build: GEMM view, dispatch, KF / KL choice, packed
+roles, groups, K-chunks, K4 configuration), computed by the host library only. The parameters
+`θ` are per **kernel class** and physically meaningful: ns per launch (launch + fixed
+latency + the bandwidth ramp of a small grid), ns per DRAM byte (1 / effective bandwidth),
+ns per residue or CRT operation (1 / effective instruction throughput), ns per byte re-read
+from L2, and for K4 the A3 round model (ns per round, ns per MAC at q concurrent CTAs) and ns
+per DRAM byte beyond L2. A phase's time is a sum of terms (no overlap, made accurate by the
+fit: each kernel's terms are fitted on that kernel's own measurements), except K4, which is
+the roofline max of its compute (round) model and its DRAM term: K4 is either, and a sum
+would charge every compute-bound GEMM for its reads. Linear parameters make each fit a small
+non-negative least-squares problem (K4: one more scan over the DRAM rate), deterministic
+and reproducible.
+
+Notation (post-swap view, §1.1): `rows_A = b·m`, `rows_B = b·n`, padded rows `pad_A = b·m`,
+`pad_B = b·n̂`, elements `E_x = rows_x·k`, `V` = `vec_entries`, `G = ⌈N/g⌉` groups of sizes
+`g_1 = g, …, g_G = N − (G−1)·g`, `L32(N)` = CRT limbs (§2), β' = [β ≠ 0], `f` = the eps
+fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands x (not packed,
+§6b) have scale and pack phases.
+
+| phase (bench tag) | when | class | x₀ | x₁ | x₂ | x₃ | x₄ |
+|---|---|---|---|---|---|---|---|
+| `K0 vec` | `IMD_VEC_GENERATE`, no KF (any dispatch but NOOP) | K0 | 1 | `8V` written | | | |
+| `KF fused` | `fused` (§4) | KF | 1 | `Σ_x (8E_x + g·pad_x·k̂ + 3rows_x) + 8V·[GENERATE]` | `g·Σ_x E_x` residues | `Σ_x rows_x` | `f·x₂` |
+| `KL A`, `KL B` | `fused_large` bit of x | KL | 1 | `8E_x + g·pad_x·k̂ + 3rows_x` | `g·E_x` | `16·rows_x·max(0, k̂ − 2·tk_x)` L2 re-read | `f·x₂` |
+| `K2 pack A`, `K3 pack B` | groups of x not packed by KF / KL | PACK | launches (B: + the zero-rows launch per group if n̂ > n) | `Σ_groups (8E_x + g_i·pad_x·k̂)` | `Σ_groups g_i·E_x` | `f·x₂` | |
+| `K4 gemm` | EMULATE | K4[config] | rounds | MACs run at q = 1 | q = 2 | q = 3 | DRAM bytes beyond L2: `Σ_groups max(0, g_i·b·(m + n̂)·k̂ + g_i·b·m·n̂·(2·k_chunks − 1) − L2)`; x₅ = the busiest SM's MACs of K-chunks whose length is not a multiple of 64 (`mac_ktail`) |
+| `K5 crt` | EMULATE | K5 | 1 | `N·b·m·n̂ + 3b(m+n) + 8bmn(1+β')` | `N·L32·b·m·n` limb operations | | |
+| `DIRECT` | DIRECT dispatch | DIRECT | 1 | `8b(mk + nk) + 8bmn(1+β')` | `2bmnk` FP64 flops | | |
+| `K5 beta-only` | SCALE dispatch or α = 0 | BETA | 1 | `8bmn(1+β')` | | | |
+| `call` | every non-NOOP call | CALL | 1 | `kernel_launches` | | | |
+| `pack prep` (imd_pack) | every non-empty pack | K0 | 1 | `8(r+k+b)` + the zeroed gaps and tail | | | |
+| `pack KL` (imd_pack) | every non-empty pack | KL | as KL with g = N, rows = pad = b·r, x the pack's one-operand view (`pack_exec`) | | | | |
+
+(x₅ is unused outside K4: room for one more feature per class in a later format.)
+
+- **K4's partial K tile** (`mac_ktail`, found on the hold-out set). A K-chunk whose length is
+  not a multiple of the 64-wide K tile (k̂ = 1008, 5008, 30000, 150000; every full chunk K_c' =
+  131056) runs CUTLASS 2.x's predicated residue tile, and the whole chunk is measurably slower
+  (sq5000, 3000 × 700 × 5000: K4 24–29 % above the round model without the feature; with it the
+  K4 hold-out p90 on ≥ 1 ms calls drops from 19 % to 18 % and the 64×128 class from 28 % to
+  15 %). Tested criteria: k̂ mod 64 (adopted), 128, 256.
+
+- **The eps path** (the `op_eps` features, reviewed 2026-10-05). The packs quantize an
+  element to `μ·2^ε`; a residue costs one more modular multiply when ε > 0, i.e. |a'| ≥ 2⁵³
+  (§3.4, the "rare" path of the pack emitter), and a warp pays it for its whole tile (32 lanes
+  × up to 16 elements) when any element of the tile has ε > 0. This depends on the **data**,
+  so it is an input: `eps_fraction` f ∈ [0, 1] in the requests (the fraction of pack work on
+  the eps path), forced to 0 when T < 2⁵³ (N ≤ 13). The default (f < 0 in the request) is a
+  plan-only **typical-data** estimate: rows of comparable entries are scaled to a norm of about
+  T, so with the margin `D = log₂T − ½·log₂k − 53` (T exact, not ⌊log₂T⌋; log₂T = 54.58 /
+  58.39 / 62.19 / 65.98 / 77.19 at N = 14 / 15 / 16 / 17 / 20) the fraction of 512-element tiles whose
+  maximum after the row's power-of-two scaling reaches 2⁵³ is a function of D alone, k-free:
+  simulated for the benchmark generator `(u − ½)·exp(g/2)` with random row scales (k = 1024 and
+  8192 agree), 0.03 at D = −2.5, 0.23 at −2, 0.65 at −1.5, 0.96 at −1 (a tile's maximum is about
+  1.6 bits above the RMS margin); the default is the ramp f = clamp((D + 2.5)/1.5, 0, 1). So at
+  N = 14 only k < 286 is on the path (fully for k ≤ 36), at N = 15 fully for k ≤ 7 000 and not
+  at all for k ≥ 56 000, at N ≥ 16 for every practical k. Rows with one dominant entry have f ≈ 512/k (one tile per row);
+  callers pass their own f. Every prediction reports `eps_s`, the eps terms at f = 1, so the
+  exact bracket for any data is `[time − f·eps_s, time + (1 − f)·eps_s]`. The calibration
+  identifies op_eps on the same plans with different data (`imd_bench --data dominant`), not
+  only through N. Consequence: with the default f, doubling k can lower the predicted time
+  (f falls from 1 to 0 as k grows); never below the time without the eps terms (tested).
+- **K4's DRAM term.** The operands of a group were just written by the packs and stay in L2
+  while the group's operands and W planes fit; beyond that K4 streams them from DRAM
+  (measured memory-bound: r_mm-like n̂ = 64–128 with long k, skinny m ≫ n). The calibration
+  holds an **effective** L2 (`l2_bytes`), fitted: the L2 is shared with W, the other operand
+  and the packs' traffic, so the working set streams from DRAM well before the nominal size
+  (on the 4090 the fit picks 0.4 × 72 MiB; with the nominal 72 MiB the memory-bound g < N
+  points were up to 48 % low). The DRAM rate is per configuration: the three larger tiles
+  agree (one rate), 64×64 is slower per byte, consistent with its narrower tiles re-reading
+  the operands more often (NOTES-B2).
+
+- **KL's tile** (`tk_x`): 4096 FP64 along k̄, 512 when the operand is read along rows
+  (`pack_along_rows`, §4 KL "th · tk = 4096"); rows of more than two tiles re-read the middle
+  chunks from L2 in passes 2 and 3 (the x₃ bytes). The tile rule moves into a host header that
+  `contract.cu launch_kl` uses too (one implementation).
+- **K4** (`class = K4[c]`, c = the plan's configuration: `k4_select` for the calibration's SM
+  count S, or the request's override). For each group size g_i and each K-chunk length κ
+  (`k_chunks − 1` chunks of K_c', then the last): tiles `T = ⌈m/tm⌉·⌈n̂/tn⌉·g_i·b`, the
+  busiest SM's `j = ⌈T/S⌉` tiles run as `⌊j/o⌋` rounds of o CTAs and, if `ρ = j mod o > 0`,
+  one round of ρ; x₀ += rounds, x_q += (rounds of q CTAs)·q·tm·tn·κ. With the A3 constants
+  as parameters this is exactly `k4_estimate` (§4 "Selection", summed over groups and
+  chunks): the same round decomposition, one function used by both. The batch (≤ 65535)
+  and n̂ splits are not modeled (they only cut a very large tile count in parts).
+- **K5 per N** (A5: one kernel per N): the N·L32 limb operations and the N·b·m·n̂ plane
+  bytes carry the N dependence; the j̄-per-thread choice is not a feature.
+- **g**: the KF / KL group-1 terms use g_1 = g; groups 2..G are the PACK phase (one operand
+  read per group); K4 is summed over groups (fewer, smaller launches as g shrinks).
+- **`vec_mode`**: RESIDENT removes K0 and KF's vec bytes (and the call term's launch).
+- **Packed operands** (§6b): a packed role has no KF / KL / PACK terms (KF covers the in-line
+  operand only, `fused` = 0 with both packed); K4 and K5 are unchanged; `imd_pack` is
+  predicted separately (`imd_perf_predict_pack`, phases `pack prep` + `pack KL` + call).
+- **Batch dimensions and permuted (tensor) layouts** enter through the GEMM view (b, m, n,
+  k), `pack_along_rows` and the dispatch; the model has no stride feature: permuted tensors
+  run within a few % of the matrix case (ROADMAP "Where we are"); the hold-out set measures
+  it (6c.5).
+- **Small problems**: the affine x₀ + x₁ form absorbs a kernel's bandwidth ramp (an effective
+  bandwidth `B·bytes/(bytes + b½)` is affine in bytes); K4's wave quantization is the round
+  model. The **call term** (`θ₀ + θ₁·kernel_launches`, sign-free) maps the sum of the
+  measured phases (event marks between kernels, §6c.2) onto the timed call: launch gaps the
+  phases do not see, minus the marks' own overhead.
+- **Bounds.** Each phase also reports its MEMORY_MODEL §4 lower bound with the actual g:
+  `bytes` (the x₁ DRAM bytes above; K4: `N·b·(m + n̂)·k̂ + N·b·m·n̂·(2·k_chunks − 1)`), `ops`
+  (K4: `2·N·b·m·n̂·k̂` int8; DIRECT: `2bmnk` FP64) and `bound = max(bytes / peak_bw, ops /
+  peak)` with the datasheet peaks stored in the calibration. `imd_bench`'s per-phase "% of
+  bound" takes them from here (it had its own copy of the formulas, at g = N).
+
+### 6c.2 Calibration: data, fit, file, shipped table
+
+- **Data.** `tools/calibrate.sh` runs `bench/sweep_calib.txt` through `bench/run_sweep.sh`
+  (quiet gate, GPU lock, warm-up) with the profiling build of `imd_bench`: per case and
+  variant the timed median of `imd_contract` and the median per-phase times of
+  `--phase-reps` profiled calls (`phases`), packed cases (`imd_pack` phases) and DIRECT. The
+  fit set covers every class: KF and KL shapes, every K4 configuration (forced with `--k4`),
+  N from 4 to 20, g < N (PACK), RESIDENT, packed operands, K-empty and DIRECT. ≈ 12 min of
+  GPU time on the 4090. Its shapes are disjoint from the hold-out set (6c.5).
+- **Fit** (`bench/perf_fit.py`, numpy only). The fitter gets every feature vector from
+  `imd_perf_predict` through `host.py` (no feature formula in Python). Per class, θ minimizes
+  the relative error `Σ ((θ·x − t)/t)²` over that class's measured phases, subject to θ ≥ 0
+  (exact NNLS by enumerating the active sets of ≤ 5 parameters); for K4, a scan over the DRAM
+  rate (bandwidths 0.1–2 TB/s, or none): the round model is fitted on the phases the DRAM term
+  does not explain, and the rate with the smallest relative error of the max wins; around it a
+  scan of the effective L2 (0–1 × the recorded L2 size) keeps the fraction with the smallest K4
+  error. Features are computed under a seed calibration of the measured device (the records'
+  `sm_count` and `l2_bytes`), never the shipped one. Then the call term (with the C library
+  doing the sum / max of the fitted phases):
+  ordinary least squares of `(t_timed − Σ_p t̂_p) / t_timed` on (1, kernel_launches). Classes
+  the sweep cannot exercise get documented stand-ins: BETA takes K5's launch and byte
+  parameters. The fitter prints per-class residuals and writes the file.
+- **File format 1** (`*.calib`): UTF-8 text, one `key = value` per line, `#` comments and
+  blank lines ignored, keys unique, values to the end of the line (trimmed). Required:
+  `format = 1`, `gpu`, `sm_count`, the three peaks, `l2_bytes` and **every** parameter
+  (`<class>.<feature>`, ns per feature unit, e.g. `kl.byte`, `kl.op_eps`, `k4_64x64.mac2`,
+  `k4_64x64.byte`); optional
+  metadata `date`, `version` (immerdink commit / host API), `clocks` (clock and power state
+  of the calibration run), `notes`. Unknown keys, duplicates, a missing key, a malformed or
+  negative-where-forbidden number, or another `format` → INVALID_VALUE with the line number.
+  Numbers are parsed and printed locale-independently (`std::from_chars` / `std::to_chars`,
+  shortest round-trip form), so format → parse is bit-exact. No dependency, parseable by any
+  C program.
+- **Shipped table.** `src/host/calib/rtx4090_sm89.calib` (the 4090 at stock clocks, as
+  shipped: no clock lock; its `clocks` line records the state) is embedded at configure time
+  (CMake reads the file into a raw string literal: the file is the one source; editing it
+  re-runs the configure step). `imd_perf_calib_default` parses that text; a NULL calibration
+  pointer anywhere means the default.
+
+### 6c.3 API (host API version 6)
+
+All functions are pure and thread-safe like §6a; a calibration is a **caller-owned plain
+struct** (no handle, no allocation, no lifetime rules), so nothing new needs a spec (6c.6).
+
+```c
+#define IMD_PERF_CALIB_FORMAT   1
+#define IMD_PERF_MAX_PARAMS     6    /* parameters per class (5 used) */
+#define IMD_PERF_PARAM_CAPACITY 96   /* param slots: class·6 + j (12 classes used) */
+#define IMD_PERF_MAX_PHASES     16
+enum { IMD_PERF_CLASS_K0, IMD_PERF_CLASS_KF, IMD_PERF_CLASS_KL, IMD_PERF_CLASS_PACK,
+       IMD_PERF_CLASS_K4_128x256, IMD_PERF_CLASS_K4_128x128, IMD_PERF_CLASS_K4_64x128,
+       IMD_PERF_CLASS_K4_64x64, IMD_PERF_CLASS_K5, IMD_PERF_CLASS_DIRECT, IMD_PERF_CLASS_BETA,
+       IMD_PERF_CLASS_CALL, IMD_PERF_CLASS_COUNT };
+enum { IMD_PERF_PHASE_K0, IMD_PERF_PHASE_KF, IMD_PERF_PHASE_KL_A, IMD_PERF_PHASE_KL_B,
+       IMD_PERF_PHASE_PACK_A, IMD_PERF_PHASE_PACK_B, IMD_PERF_PHASE_K4, IMD_PERF_PHASE_K5,
+       IMD_PERF_PHASE_DIRECT, IMD_PERF_PHASE_BETA, IMD_PERF_PHASE_CALL,
+       IMD_PERF_PHASE_PACK_PREP, IMD_PERF_PHASE_PACK_KL, IMD_PERF_PHASE_COUNT };
+enum { IMD_PERF_BETA_NONZERO = 1, IMD_PERF_ALPHA_ZERO = 2 };          /* request flags */
+
+typedef struct {
+  uint32_t struct_size;  int32_t format, sm_count, reserved;
+  double   peak_dram_bytes_per_s, peak_int8_ops_per_s, peak_fp64_flops_per_s, l2_bytes;
+  char     gpu[64], date[32], version[64], clocks[128], notes[128];   /* NUL-terminated */
+  double   param[IMD_PERF_PARAM_CAPACITY];                            /* ns per unit */
+} imd_perf_calib_t;
+
+imd_status_t imd_perf_calib_default(imd_perf_calib_t* out);
+imd_status_t imd_perf_calib_parse(const char* text, size_t length, imd_perf_calib_t* out,
+                                  int32_t* error_line);            /* error_line may be NULL */
+imd_status_t imd_perf_calib_load(const char* path, imd_perf_calib_t* out, int32_t* error_line);
+imd_status_t imd_perf_calib_format(const imd_perf_calib_t*, char* buf, size_t capacity,
+                                   size_t* length);
+const char*  imd_perf_class_name(int32_t cls);          /* "k0", "kf", ..., "call"         */
+const char*  imd_perf_param_name(int32_t cls, int32_t j); /* "launch", "byte", ...; NULL: unused */
+const char*  imd_perf_phase_name(int32_t phase);        /* the bench tags: "K0 vec", ...   */
+
+typedef struct { uint32_t struct_size; int32_t flags, k4_config /* -1: rule */, reserved;
+                 double eps_fraction; /* < 0: the typical-data default; else 0..1 */ }
+        imd_perf_request_t;
+typedef struct {
+  int32_t phase, cls;  int64_t launches;
+  double  time_s, bytes, ops, bound_s;  double x[IMD_PERF_MAX_PARAMS];
+} imd_perf_phase_t;
+typedef struct {
+  uint32_t struct_size;
+  int32_t  status, dispatch, k4_config, sm_count, num_phases;
+  double   time_s, bound_s, flops_eq, tflops_eq;
+  double   eps_s, eps_fraction;     /* eps terms at f = 1; the f used */
+  int64_t  kernel_launches;
+  uint64_t workspace_bytes, plan_device_bytes, pack_bytes, pack_ws_bytes;
+  imd_perf_phase_t phase[IMD_PERF_MAX_PHASES];
+} imd_perf_t;
+
+imd_status_t imd_perf_predict(const imd_tensor_t* A, const imd_tensor_t* B,
+                              const imd_tensor_t* C, const imd_options_t*,
+                              const imd_packing_t* /* NULL: none */,
+                              const imd_perf_request_t* /* NULL: defaults */,
+                              const imd_perf_calib_t* /* NULL: shipped */, imd_perf_t* out);
+imd_status_t imd_perf_predict_pack(const imd_pack_desc_t*, const imd_perf_request_t*,
+                                   const imd_perf_calib_t*, imd_perf_t* out);
+```
+- **predict**: returns the plan-time status of `imd_lowering(_packed)` (also in
+  `out->status`); the prediction is filled only on SUCCESS (otherwise every field but
+  `struct_size` and `status` is 0: a plan that cannot be created has no time). `time_s` =
+  Σ phases (the call term is the `call` phase), `tflops_eq = 2bmnk / time_s / 10¹²` (DESIGN's
+  TFLOPS-equivalent), `bound_s` = Σ phase bounds, `kernel_launches`, `workspace_bytes`,
+  `plan_device_bytes` = the lowering's (exact). `k4_config` / `sm_count`: the configuration
+  predicted and the calibration's SMs. With `IMD_PERF_ALPHA_ZERO` the call is K0 + `K5
+  beta-only`.
+- **predict_pack**: `imd_pack_layout`'s status; on SUCCESS the phases `pack prep`, `pack KL`,
+  `call`, `pack_bytes` and `pack_ws_bytes` (exact); 0 time for an empty pack. Of the request
+  only `eps_fraction` is used.
+- **Calibration functions**: parse / load fill `out` (with `out->struct_size` as the
+  caller's size; fields past it are not written) or return INVALID_VALUE (with
+  `*error_line`, 0 when not tied to a line: a missing key, an unreadable file);
+  `imd_perf_calib_format` writes the canonical text (every key, numbers in the shortest round-trip form) and its
+  length (without the NUL), INSUFFICIENT_WORKSPACE if `capacity` ≤ length (the length is
+  still reported, as `snprintf`). A calibration whose `format` is not 1 or whose `sm_count`
+  < 1 is INVALID_VALUE in every function that takes one.
+
+**Rank:**
+```c
+enum { IMD_PERF_VEC_GENERATE = 1, IMD_PERF_VEC_RESIDENT = 2 };             /* vec_modes */
+enum { IMD_PERF_PACK_NONE = 1, IMD_PERF_PACK_A = 2, IMD_PERF_PACK_B = 4,
+       IMD_PERF_PACK_AB = 8 };                                              /* pack_modes */
+typedef struct {
+  uint32_t struct_size, candidate_size;    /* sizeof as compiled by the caller            */
+  int32_t num_moduli_count, residue_group_count;  /* ≥ 1; 0: every g in 1..N               */
+  const int32_t* num_moduli;               /* N values (2..20)                             */
+  const int32_t* residue_groups;           /* g values ≥ 1 (> N: skipped for that N)       */
+  int32_t vec_modes, pack_modes;   /* masks; 0 = GENERATE / NONE only                    */
+  int32_t reuse;                   /* contractions per pack, ≥ 1                        */
+  int32_t flags;                   /* IMD_PERF_BETA_NONZERO                             */
+  uint64_t budget_bytes;           /* 0: no budget                                      */
+  double   eps_fraction;           /* as imd_perf_request_t                             */
+} imd_perf_rank_request_t;
+typedef struct {
+  int32_t  num_moduli, residue_group, vec_mode, packed;  /* packed: bit 0 / 1 = caller's A / B */
+  int32_t  status, feasible, k4_config, dispatch;
+  double   time_s, contract_s, pack_s, tflops_eq, eps_s, eps_fraction;
+  uint64_t workspace_bytes, plan_device_bytes, pack_bytes, pack_ws_bytes, total_bytes;
+  int64_t  kernel_launches;
+} imd_perf_candidate_t;
+imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B,
+                           const imd_tensor_t* C, const imd_options_t* base,
+                           const imd_perf_rank_request_t*, const imd_perf_calib_t*,
+                           imd_perf_candidate_t* out, int32_t capacity,
+                           int32_t* num_candidates);
+```
+- Candidates: the product of the N list, g (the list, values > N skipped; or 1..N), the
+  vec modes and the pack modes; `base` gives rounding, mode and `k4_tune` (N, g, `vec_mode`
+  are overwritten). A packed operand uses `imd_pack_desc_for`'s descriptor (the unpacked
+  plan's orders: bit-identical results, §6b.2).
+- Per candidate: the plan-time status (`imd_lowering(_packed)`: §5 rows 1–5, PACK_MISMATCH,
+  the §3.2 RN acceptance), `contract_s` = `imd_perf_predict`, `pack_s` = Σ
+  `imd_perf_predict_pack` of its packed operands, **`time_s = contract_s + pack_s / reuse`**
+  (the rank key), and the exact footprint from the existing functions: `workspace_bytes`
+  (`imd_workspace_size(_packed)`), `plan_device_bytes` (`imd_plan_bytes`), `pack_bytes` and
+  `pack_ws_bytes` (Σ `imd_pack_layout`), `total_bytes` = their sum (separate buffers: a
+  caller that lends the contract workspace to `imd_pack` needs less). `feasible` = SUCCESS
+  and `total_bytes ≤ budget` (or no budget).
+- Order: feasible by `time_s`, then infeasible SUCCESS candidates by `time_s`, then the
+  others in enumeration order; ties by `total_bytes`, then N, g, `vec_mode`, `packed`. The
+  first `min(capacity, n)` are written (`candidate_size` bytes each), `*num_candidates = n`.
+- Statuses: INVALID_VALUE for the request (NULL pointers, empty or out-of-range N, bad masks,
+  `reuse < 1`, `capacity < 0`, a struct or candidate size below version 1's); otherwise
+  SUCCESS, with each candidate's own status.
+- The model reports, the caller decides: no accuracy model (N comes from the caller's list),
+  no K4 configuration candidates (a plan runs the rule's, or `k4_tune`).
+
+**Python** (`host.py`, thin wrappers): `Calibration` (`.default()`, `.load(path)`,
+`.parse(text)`, `.format()`, `.params` by name), `predict(spec, ext, N=, g=, vec_mode=,
+packing=, beta=, alpha_zero=, k4_config=, calib=)` → per-phase records with names,
+`predict_pack(pack)`, `rank(spec, ext, N=[…], g=None, vec_modes=, packs=, reuse=, budget=,
+calib=)` → ranked candidates. `python3 -m immerdink.host … --rank` prints the table.
+
+**Versioning.** `IMD_HOST_API_VERSION` 6 adds the functions, the enums and the structs (each
+with `struct_size` or a caller-given element size; fields are only appended). The exception is
+`imd_perf_phase_t`, which has no size field and is a fixed `[IMD_PERF_MAX_PHASES]` array inside
+`imd_perf_t`: its 96-byte layout and the array length are **frozen** for version 6 (a change is
+a new struct and new function names);
+`imd_lowering_t` and everything existing are unchanged. The calibration file is versioned
+by `format` (a new feature set is a new format and a refit).
+
+### 6c.4 Tests
+
+`host_c_api` (C): default calibration, format → parse round trip (bit-exact), every parse
+error with its line, predict / rank smoke and footprint equality. `host_python`: the same
+from Python plus an **independent Python transcription of the features** on random
+descriptors (as for `k4_select`), K4 features × A3 constants = `k4_estimate`, monotonicity
+against the shipped (fitted) calibration and a synthetic one with a large eps-path cost
+(doubling m, n or k never lowers the predicted time at fixed configuration and fixed eps
+fraction; with the default fraction never below the time without the eps terms), the eps
+bracket and the default ramp (exact log₂T), rank: every
+footprint equals `imd_workspace_size(_packed)` / `imd_plan_bytes` / `imd_pack_layout` exactly,
+the budget is respected, the order is as specified; `perf_calib_shipped`: the shipped file
+parses and its sm_count is 128. `host_cuda_free` unchanged (the model is plain C++).
+
+### 6c.5 Validation (hold-out)
+
+`bench/sweep_perf_validate.txt` (shapes disjoint from the fit set: the regression sweep's
+cases, tensor cases, odd sizes, many small shapes; N = 8 / 14 plus 10 / 16, g < N,
+RESIDENT, packed) run like the calibration; `bench/perf_validate.py` compares the predicted
+total with the measured timed median (and per phase with the phase medians) and prints the
+error distribution per size class. **Targets** (relative error of the total):
+
+| measured call | median \|err\| | 90th percentile |
+|---|---|---|
+| ≥ 1 ms | ≤ 5 % | ≤ 15 % |
+| 100 µs – 1 ms | ≤ 10 % | ≤ 20 % |
+| < 100 µs | ≤ 15 % | ≤ 30 % |
+
+Tiny calls drift by 10–20 % between performance states (BENCHMARKING "Tiny shapes"), so
+their target is loose. If a target is missed: per-class residuals first; then the smallest
+physically motivated feature (e.g. tile-quantized bytes for grids below one wave, the K5
+λ-fastest kernel), never per-shape factors; a feature change is a new file format.
+
+### 6c.6 Spec
+
+**No TLA+ change.** The model is a pure function of (descriptors, options, request,
+calibration) over caller-owned plain data: no handle, no shared or global state, no
+lifetime, no GPU, no effect on plans (the calibration is never read by plan creation).
+`imd_perf_rank`'s footprints are the existing exact functions (§4a, §6a, §6b.4, already
+checked: `Pipeline LayoutExact / PlanBytesExact`, `cert_workspace`, `cert_pack_layout`) and
+its feasibility test only compares them with a number; it creates no plan and changes no
+legality. HostAPI's rules (pure, thread-safe host queries) cover it as they cover §6a.
+
+---
+
 ## 7. What was considered and rejected
 
 | Option | Why not |
@@ -1989,6 +2353,19 @@ and host API; every value the same integer (bit-identical, tested on every contr
   53 bits (m′ = m·2ᶻ, the same real number m′²/2ˢ with s = 2(γ − ilogb x) + 104 − F ≥ 44) in two
   64-bit words instead of generic 128-bit shifts (`square_term_n`; equal to `square_term` on
   2²⁸ sampled (x, γ) pairs including every shift branch and subnormals, GPU test).
+
+## Changes v1.7 → v1.8 (B2 performance model)
+
+- **§6c (new).** A CUDA-free per-phase performance model in libimmerdink_host (host API
+  version 6): `imd_perf_predict` / `imd_perf_predict_pack` (per-phase and total time,
+  TFLOPS-eq, MEMORY_MODEL §4 bounds), `imd_perf_rank` (N × g × `vec_mode` × packed
+  candidates ranked by predicted time inside a memory budget, with exact footprints and
+  plan-time statuses), and the calibration (`imd_perf_calib_*`: a versioned `key = value`
+  text file; the RTX 4090 calibration embedded; `tools/calibrate.sh` fits a new GPU). Each
+  phase time is linear in calibrated per-kernel parameters over exact features of the
+  lowering. No kernel, layout, launch or plan changes; the calibration is never read by plan
+  creation. No spec change (pure functions over caller-owned data, §6c.6).
+- **§4 KL**: the tile rule (`tk`) moves to a host header used by `launch_kl` and the model.
 
 ## v1.9 (B1 Python front end; no semantic, layout, C API or spec change)
 

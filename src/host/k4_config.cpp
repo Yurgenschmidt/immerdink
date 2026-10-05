@@ -22,9 +22,8 @@ u128 div_up(u128 a, u128 b) { return a / b + (a % b != 0); }
 
 }  // namespace
 
-u128 k4_estimate_fs(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb, int32_t sms) {
+K4Rounds k4_rounds(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb, int32_t sms) {
   const K4ConfigDesc& d = kK4Configs[c];
-  const K4Cost& cost = kK4Costs[c];
   // Tiles of one launch over a group's g b batches; the busiest SM gets j of them: j / occ
   // full rounds of occ concurrent CTAs, then a round of the remaining j mod occ.
   const u128 tiles = mul_sat(mul_sat(div_up(static_cast<u128>(m), d.tile_m),
@@ -32,15 +31,22 @@ u128 k4_estimate_fs(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb, 
                              static_cast<u128>(gb));
   const u128 j = div_up(tiles, static_cast<u128>(sms));
   const u128 occ = static_cast<u128>(d.ctas_per_sm);
-  const u128 tile_macs = mul_sat(static_cast<u128>(d.tile_m) * d.tile_n, static_cast<u128>(k_hat));
+  K4Rounds r;
+  r.full = j / occ;
+  r.rest = static_cast<int32_t>(j % occ);
+  r.tile_macs = mul_sat(static_cast<u128>(d.tile_m) * d.tile_n, static_cast<u128>(k_hat));
+  return r;
+}
+
+u128 k4_estimate_fs(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb, int32_t sms) {
+  const K4Cost& cost = kK4Costs[c];
+  const K4Rounds r = k4_rounds(c, m, n_hat, k_hat, gb, sms);
   const auto round_fs = [&](int q) {  // one round of q concurrent CTAs
     return add_sat(mul_sat(static_cast<u128>(cost.round_ns), 1000000),
-                   mul_sat(mul_sat(tile_macs, static_cast<u128>(q)), static_cast<u128>(cost.mac_fs[q])));
+                   mul_sat(mul_sat(r.tile_macs, static_cast<u128>(q)), static_cast<u128>(cost.mac_fs[q])));
   };
-  const u128 full = j / occ;
-  const int rest = static_cast<int>(j % occ);
-  u128 est = full == 0 ? 0 : mul_sat(full, round_fs(d.ctas_per_sm));
-  if (rest != 0) est = add_sat(est, round_fs(rest));
+  u128 est = r.full == 0 ? 0 : mul_sat(r.full, round_fs(kK4Configs[c].ctas_per_sm));
+  if (r.rest != 0) est = add_sat(est, round_fs(r.rest));
   return est;
 }
 

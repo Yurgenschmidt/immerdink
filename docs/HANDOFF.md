@@ -8,16 +8,22 @@ first.
 
 - **Branches:** all work is on `dev` (pushed). `main` = PR #1 (v1.3 state); later work reaches
   main by another PR from dev. Never push to main directly.
-- **DESIGN v1.7** (docs/DESIGN.md): v1.4 KF fused small path, v1.5 K4 configs and rule, v1.6
-  KL fused large path, v1.7 §6b packed operands (implemented).
-- **Host API v5** (`include/immerdink/immerdink_host.h`, CUDA-free `libimmerdink_host`, Python
+- **DESIGN v1.9** (docs/DESIGN.md): v1.4 KF fused small path, v1.5 K4 configs and rule, v1.6
+  KL fused large path, v1.7 §6b packed operands, v1.8 §6c performance model, v1.9 §6d Python.
+- **Host API v6** (`include/immerdink/immerdink_host.h`, CUDA-free `libimmerdink_host`, Python
   `python/immerdink/host.py`): the single source of truth for lowering, legality, workspace,
-  plan bytes, K4 config, launch counts and packed-operand sizing and compatibility.
+  plan bytes, K4 config, launch counts, packed-operand sizing and compatibility, and (v6) the
+  performance model.
+- **Performance model (B2, DESIGN v1.8 §6c, host API v6):** `imd_perf_predict`,
+  `imd_perf_predict_pack`, `imd_perf_rank`, `imd_perf_calib_*` in libimmerdink_host (Python
+  `host.predict`, `host.rank`, `host.Calibration`); shipped RTX 4090 calibration
+  `src/host/calib/rtx4090_sm89.calib`, recalibrate with `tools/calibrate.sh [--validate]`
+  (after kernel changes too); results and open items in docs/NOTES-B2.md; test `host_perf`.
 - **Python device API (B1, DESIGN v1.9 §6d):** `python/immerdink` (`Plan`, `Pack`,
   `immerdink.contract`, `PlanCache`, `DeviceArray`): ctypes over the C ABI, any
   `__cuda_array_interface__` / DLPack array or raw pointer, no array library needed; test
   `python_device` (pytest), overhead `bench/python_overhead.py`.
-- **Verification on dev:** 6 CPU + 26 GPU ctest tests, 284 TLC models, 20 Apalache checks,
+- **Verification on dev:** 7 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
 - **D3 gate (Eric, 2026-10-04):** D3 begins with a design/theory discussion with Eric to narrow

@@ -14,6 +14,8 @@ plans and workspaces; nothing is recomputed here. No CUDA, GPU or driver is need
     pa = host.pack_desc_for(spec, ext, operand=0, N=14)   # pack the caller's A (DESIGN §6b)
     host.pack_layout(pa)                             # its packed bytes and imd_pack workspace
     host.workspace_size(spec, ext, N=14, packing=(pa, None))  # the workspace with A packed
+    host.predict(spec, ext, N=14)                    # predicted time per phase (DESIGN §6c)
+    host.rank(spec, ext, N=[8, 14], budget=2**30)    # configurations ranked by predicted time
 
 Operands: an einsum-style spec with an extents dict (labels are single characters; strides
 default to dense with the last mode fastest, or pass strides=(sA, sB, sC)), or raw
@@ -31,9 +33,10 @@ from dataclasses import dataclass
 
 __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "workspace_size",
            "workspace_layout", "plan_bytes", "lowering", "g_tradeoff", "PackSpec", "pack_layout",
-           "pack_desc_for", "REGIONS", "STATUS", "PACK_MISMATCH"]
+           "pack_desc_for", "REGIONS", "STATUS", "PACK_MISMATCH", "Calibration", "predict",
+           "predict_pack", "rank", "param_names", "PERF_CLASSES", "PERF_PHASES"]
 
-API_VERSION = 5  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+API_VERSION = 6  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
 
 STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT_WORKSPACE",
           "MISALIGNED", "CUDA_ERROR", "ALLOC_FAILED", "PACK_MISMATCH"]
@@ -46,6 +49,15 @@ _ROUNDING = {"RN": 0, "TRUNC": 1}
 _MODE = {"EMULATE": 0, "DIRECT": 1}
 _VEC = {"GENERATE": 0, "RESIDENT": 1}
 K4_CONFIGS = ["128x256", "128x128", "64x128", "64x64"]  # IMD_K4_* tiles (DESIGN v1.5 §4)
+# Performance model (DESIGN v1.8 §6c): IMD_PERF_CLASS_* key prefixes, IMD_PERF_PHASE_* names
+PERF_CLASSES = ["k0", "kf", "kl", "pack", "k4_128x256", "k4_128x128", "k4_64x128", "k4_64x64",
+                "k5", "direct", "beta", "call"]
+PERF_PHASES = ["K0 vec", "KF fused", "KL A", "KL B", "K2 pack A", "K3 pack B", "K4 gemm",
+               "K5 crt", "DIRECT", "K5 beta-only", "call", "pack prep", "pack KL"]
+_PERF_MAX_PARAMS, _PERF_PARAM_CAPACITY, _PERF_MAX_PHASES = 6, 96, 16
+_PERF_BETA_NONZERO, _PERF_ALPHA_ZERO = 1, 2
+_PERF_VEC = {"GENERATE": 1, "RESIDENT": 2}
+_PERF_PACK = {"NONE": 1, "A": 2, "B": 4, "AB": 8}
 
 
 class ImmerdinkError(RuntimeError):
@@ -110,9 +122,63 @@ class _Packing(C.Structure):
     _fields_ = [("A", C.POINTER(_PackDesc)), ("B", C.POINTER(_PackDesc))]
 
 
+class _PerfCalib(C.Structure):
+    _fields_ = [("struct_size", C.c_uint32), ("format", C.c_int32), ("sm_count", C.c_int32),
+                ("reserved", C.c_int32), ("peak_dram_bytes_per_s", C.c_double),
+                ("peak_int8_ops_per_s", C.c_double), ("peak_fp64_flops_per_s", C.c_double),
+                ("l2_bytes", C.c_double), ("gpu", C.c_char * 64), ("date", C.c_char * 32), ("version", C.c_char * 64),
+                ("clocks", C.c_char * 128), ("notes", C.c_char * 128),
+                ("param", C.c_double * _PERF_PARAM_CAPACITY)]
+
+
+class _PerfRequest(C.Structure):
+    _fields_ = [("struct_size", C.c_uint32), ("flags", C.c_int32), ("k4_config", C.c_int32),
+                ("reserved", C.c_int32), ("eps_fraction", C.c_double)]
+
+
+class _PerfPhase(C.Structure):
+    _fields_ = [("phase", C.c_int32), ("cls", C.c_int32), ("launches", C.c_int64),
+                ("time_s", C.c_double), ("bytes", C.c_double), ("ops", C.c_double),
+                ("bound_s", C.c_double), ("x", C.c_double * _PERF_MAX_PARAMS)]
+
+
+class _Perf(C.Structure):
+    _fields_ = [("struct_size", C.c_uint32), ("status", C.c_int32), ("dispatch", C.c_int32),
+                ("k4_config", C.c_int32), ("sm_count", C.c_int32), ("num_phases", C.c_int32),
+                ("time_s", C.c_double), ("bound_s", C.c_double), ("flops_eq", C.c_double),
+                ("tflops_eq", C.c_double), ("eps_s", C.c_double), ("eps_fraction", C.c_double),
+                ("kernel_launches", C.c_int64),
+                ("workspace_bytes", C.c_uint64), ("plan_device_bytes", C.c_uint64),
+                ("pack_bytes", C.c_uint64), ("pack_ws_bytes", C.c_uint64),
+                ("phase", _PerfPhase * _PERF_MAX_PHASES)]
+
+
+class _RankRequest(C.Structure):
+    _fields_ = [("struct_size", C.c_uint32), ("candidate_size", C.c_uint32),
+                ("num_moduli_count", C.c_int32), ("residue_group_count", C.c_int32),
+                ("num_moduli", C.POINTER(C.c_int32)), ("residue_groups", C.POINTER(C.c_int32)),
+                ("vec_modes", C.c_int32), ("pack_modes", C.c_int32), ("reuse", C.c_int32),
+                ("flags", C.c_int32), ("budget_bytes", C.c_uint64),
+                ("eps_fraction", C.c_double)]
+
+
+class _Candidate(C.Structure):
+    _fields_ = [("num_moduli", C.c_int32), ("residue_group", C.c_int32), ("vec_mode", C.c_int32),
+                ("packed", C.c_int32), ("status", C.c_int32), ("feasible", C.c_int32),
+                ("k4_config", C.c_int32), ("dispatch", C.c_int32), ("time_s", C.c_double),
+                ("contract_s", C.c_double), ("pack_s", C.c_double), ("tflops_eq", C.c_double),
+                ("eps_s", C.c_double), ("eps_fraction", C.c_double),
+                ("workspace_bytes", C.c_uint64), ("plan_device_bytes", C.c_uint64),
+                ("pack_bytes", C.c_uint64), ("pack_ws_bytes", C.c_uint64),
+                ("total_bytes", C.c_uint64), ("kernel_launches", C.c_int64)]
+
+
 assert C.sizeof(_Lowering) == 184  # version 5 (DESIGN §6b v1.7)
 assert C.sizeof(_Options) == 24
 assert C.sizeof(_PackDesc) == 72 and C.sizeof(_PackLayout) == 136
+assert C.sizeof(_PerfCalib) == 1232 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1648
+assert C.sizeof(_RankRequest) == 64 and C.sizeof(_Candidate) == 128
+assert C.sizeof(_PerfRequest) == 24
 
 
 # ------------------------------------------------------------------------------------------
@@ -170,6 +236,25 @@ class HostLibrary:
                                                       C.POINTER(C.c_size_t)]),
             "imd_lowering_packed": (C.c_int, [T, T, T, O, C.POINTER(_Packing),
                                               C.POINTER(_Lowering)]),
+            # v6 (DESIGN §6c): the performance model
+            "imd_perf_calib_default": (C.c_int, [C.POINTER(_PerfCalib)]),
+            "imd_perf_calib_parse": (C.c_int, [C.c_char_p, C.c_size_t, C.POINTER(_PerfCalib),
+                                               C.POINTER(C.c_int32)]),
+            "imd_perf_calib_load": (C.c_int, [C.c_char_p, C.POINTER(_PerfCalib),
+                                              C.POINTER(C.c_int32)]),
+            "imd_perf_calib_format": (C.c_int, [C.POINTER(_PerfCalib), C.c_char_p, C.c_size_t,
+                                                C.POINTER(C.c_size_t)]),
+            "imd_perf_class_name": (C.c_char_p, [C.c_int32]),
+            "imd_perf_param_name": (C.c_char_p, [C.c_int32, C.c_int32]),
+            "imd_perf_phase_name": (C.c_char_p, [C.c_int32]),
+            "imd_perf_predict": (C.c_int, [T, T, T, O, C.POINTER(_Packing),
+                                           C.POINTER(_PerfRequest), C.POINTER(_PerfCalib),
+                                           C.POINTER(_Perf)]),
+            "imd_perf_predict_pack": (C.c_int, [C.POINTER(_PackDesc), C.POINTER(_PerfRequest),
+                                                C.POINTER(_PerfCalib), C.POINTER(_Perf)]),
+            "imd_perf_rank": (C.c_int, [T, T, T, O, C.POINTER(_RankRequest),
+                                        C.POINTER(_PerfCalib), C.POINTER(_Candidate), C.c_int32,
+                                        C.POINTER(C.c_int32)]),
         }
         for name, (res, args) in sig.items():
             f = getattr(lib, name)
@@ -485,6 +570,263 @@ def g_tradeoff(spec, extents=None, *, strides=None, N, rounding="RN", mode="EMUL
     return rows
 
 
+# ------------------------------------------------------------------------------------------
+# Performance model (DESIGN v1.8 §6c, host API version 6)
+
+class Calibration:
+    """A performance-model calibration (imd_perf_calib_t, DESIGN §6c.2). Calibration.default()
+    is the shipped one (RTX 4090); .load(path) / .parse(text) read a format-1 file; .format()
+    gives its canonical text. .params maps "<class>.<feature>" to its value (ns per unit);
+    .meta holds gpu, sm_count, date, version, clocks, notes and the three peaks."""
+
+    def __init__(self, raw, lib=None):
+        self._raw = raw
+        self._lib = lib
+
+    @staticmethod
+    def _new():
+        c = _PerfCalib()
+        c.struct_size = C.sizeof(_PerfCalib)
+        return c
+
+    @classmethod
+    def default(cls, lib=None):
+        h = load(lib) if not isinstance(lib, HostLibrary) else lib
+        c = cls._new()
+        st = h.lib.imd_perf_calib_default(C.byref(c))
+        if st != 0:
+            raise ImmerdinkError(st, "imd_perf_calib_default")
+        return cls(c, h)
+
+    @classmethod
+    def parse(cls, text, lib=None):
+        """Parse format-1 text; ValueError (with the line) if it is invalid."""
+        h = load(lib) if not isinstance(lib, HostLibrary) else lib
+        data = text.encode() if isinstance(text, str) else bytes(text)
+        c, line = cls._new(), C.c_int32(0)
+        st = h.lib.imd_perf_calib_parse(data, len(data), C.byref(c), C.byref(line))
+        if st != 0:
+            raise ValueError(f"invalid calibration (line {line.value}): IMD_STATUS_{STATUS[st]}")
+        return cls(c, h)
+
+    @classmethod
+    def load(cls, path, lib=None):
+        h = load(lib) if not isinstance(lib, HostLibrary) else lib
+        c, line = cls._new(), C.c_int32(0)
+        st = h.lib.imd_perf_calib_load(os.fsencode(path), C.byref(c), C.byref(line))
+        if st != 0:
+            raise ValueError(f"{path}: invalid calibration (line {line.value}): "
+                             f"IMD_STATUS_{STATUS[st]}")
+        return cls(c, h)
+
+    @classmethod
+    def from_values(cls, meta, params, lib=None):
+        """A calibration from a metadata dict and a {"<class>.<feature>": value} dict, through
+        the format-1 text (so the C parser validates it)."""
+        keys = ("gpu", "sm_count", "date", "version", "clocks", "notes",
+                "peak_dram_bytes_per_s", "peak_int8_ops_per_s", "peak_fp64_flops_per_s",
+                "l2_bytes")
+        lines = ["format = 1"] + [f"{k} = {meta[k]}" for k in keys if k in meta]
+        lines += [f"{k} = {float(v)!r}" for k, v in params.items()]
+        return cls.parse("\n".join(lines) + "\n", lib)
+
+    def format(self):
+        """The canonical format-1 text (imd_perf_calib_format)."""
+        h = self._lib or load()
+        n = C.c_size_t(0)
+        h.lib.imd_perf_calib_format(C.byref(self._raw), None, 0, C.byref(n))
+        buf = C.create_string_buffer(n.value + 1)
+        st = h.lib.imd_perf_calib_format(C.byref(self._raw), buf, n.value + 1, C.byref(n))
+        if st != 0:
+            raise ImmerdinkError(st, "imd_perf_calib_format")
+        return buf.value.decode()
+
+    @property
+    def meta(self):
+        r = self._raw
+        return {"gpu": r.gpu.decode(), "sm_count": r.sm_count, "date": r.date.decode(),
+                "version": r.version.decode(), "clocks": r.clocks.decode(),
+                "notes": r.notes.decode(), "peak_dram_bytes_per_s": r.peak_dram_bytes_per_s,
+                "peak_int8_ops_per_s": r.peak_int8_ops_per_s,
+                "peak_fp64_flops_per_s": r.peak_fp64_flops_per_s, "l2_bytes": r.l2_bytes}
+
+    @property
+    def params(self):
+        out = {}
+        for cl, names in enumerate(param_names(self._lib).values()):
+            for j, name in enumerate(names):
+                if name is not None:
+                    out[f"{PERF_CLASSES[cl]}.{name}"] = self._raw.param[cl * _PERF_MAX_PARAMS + j]
+        return out
+
+
+def param_names(lib=None):
+    """{class name: [feature name or None per slot]} (imd_perf_param_name)."""
+    h = load(lib) if not isinstance(lib, HostLibrary) else lib
+    out = {}
+    for cl, name in enumerate(PERF_CLASSES):
+        names = []
+        for j in range(_PERF_MAX_PARAMS):
+            n = h.lib.imd_perf_param_name(cl, j)
+            names.append(n.decode() if n is not None else None)
+        out[name] = names
+    return out
+
+
+@dataclass(frozen=True)
+class PhasePrediction:
+    """imd_perf_phase_t: one phase's predicted time, its features and its §4 bound."""
+    name: str        # the bench's phase tag ("K0 vec", "KL A", ...)
+    cls: str         # the kernel class ("kl", "k4_128x256", ...)
+    launches: int
+    time_s: float
+    bytes: float
+    ops: float
+    bound_s: float
+    x: tuple         # features (the model: sum of param[cls][j] * x[j], ns; K4: max of
+                     # the round-model terms j < 4 and the DRAM term j = 4)
+
+
+@dataclass(frozen=True)
+class Prediction:
+    """imd_perf_t: the predicted call (status "SUCCESS", else the plan-time status and zeros)."""
+    status: str
+    dispatch: str
+    k4_config: int
+    sm_count: int
+    time_s: float
+    bound_s: float
+    flops_eq: float
+    tflops_eq: float
+    eps_s: float          # eps-path time at fraction 1: bracket [t - f eps_s, t + (1 - f) eps_s]
+    eps_fraction: float   # the eps fraction f used (immerdink_host.h: typical-data default)
+    kernel_launches: int
+    workspace_bytes: int
+    plan_device_bytes: int
+    pack_bytes: int
+    pack_ws_bytes: int
+    phases: tuple    # PhasePrediction, in launch order (the call term last)
+
+    def phase(self, name):
+        """The PhasePrediction with this name, or None."""
+        return next((p for p in self.phases if p.name == name), None)
+
+
+def _calib_arg(calib):
+    if calib is None:
+        return None
+    if isinstance(calib, Calibration):
+        return C.byref(calib._raw)
+    raise TypeError("calib must be a Calibration or None")
+
+
+def _prediction(r, st):
+    phases = tuple(PhasePrediction(PERF_PHASES[p.phase], PERF_CLASSES[p.cls], p.launches,
+                                   p.time_s, p.bytes, p.ops, p.bound_s, tuple(p.x))
+                   for p in r.phase[:r.num_phases])
+    return Prediction(STATUS[st], DISPATCH[r.dispatch], r.k4_config, r.sm_count, r.time_s,
+                      r.bound_s, r.flops_eq, r.tflops_eq, r.eps_s, r.eps_fraction,
+                      r.kernel_launches, r.workspace_bytes, r.plan_device_bytes, r.pack_bytes,
+                      r.pack_ws_bytes, phases)
+
+
+def _eps(eps_fraction):
+    return -1.0 if eps_fraction is None else float(eps_fraction)
+
+
+def predict(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",
+            vec_mode="GENERATE", packing=None, beta=False, alpha_zero=False, k4_config=None,
+            eps_fraction=None, calib=None, lib=None):
+    """imd_perf_predict: the predicted imd_contract (DESIGN §6c). A plan-time status is
+    returned in .status (with zeros); a bad argument raises. packing = (PackSpec or None,
+    PackSpec or None): the packed plan. beta: C is read (beta != 0); alpha_zero: the beta-only
+    call; k4_config: force an IMD_K4_* configuration (None: the plan-time rule); eps_fraction:
+    the fraction of pack work on the eps path (None: the typical-data default; see
+    immerdink_host.h)."""
+    h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing)
+    flags = (_PERF_BETA_NONZERO if beta else 0) | (_PERF_ALPHA_ZERO if alpha_zero else 0)
+    req = _PerfRequest(C.sizeof(_PerfRequest), flags,
+                       -1 if k4_config is None else int(k4_config), 0, _eps(eps_fraction))
+    r = _Perf()
+    r.struct_size = C.sizeof(_Perf)
+    pk = C.byref(call.packing) if packing is not None else None
+    st = h.lib.imd_perf_predict(*call.args(), pk, C.byref(req), _calib_arg(calib), C.byref(r))
+    return _prediction(r, st)
+
+
+def predict_pack(pack, *, eps_fraction=None, calib=None, lib=None):
+    """imd_perf_predict_pack: the predicted imd_pack of a PackSpec."""
+    h = load(lib) if not isinstance(lib, HostLibrary) else lib
+    arg = _PackArg(pack)
+    r = _Perf()
+    r.struct_size = C.sizeof(_Perf)
+    req = _PerfRequest(C.sizeof(_PerfRequest), 0, -1, 0, _eps(eps_fraction))
+    st = h.lib.imd_perf_predict_pack(C.byref(arg.d), C.byref(req), _calib_arg(calib), C.byref(r))
+    return _prediction(r, st)
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """imd_perf_candidate_t: one configuration, its predicted time and exact footprint."""
+    num_moduli: int
+    residue_group: int
+    vec_mode: str
+    packed: str          # "NONE", "A", "B", "AB" (the caller's operands)
+    status: str
+    feasible: bool
+    k4_config: int
+    dispatch: str
+    time_s: float        # contract_s + pack_s / reuse: the rank key
+    contract_s: float
+    pack_s: float
+    tflops_eq: float
+    eps_s: float         # eps-path time at fraction 1 (contract + pack / reuse)
+    eps_fraction: float
+    workspace_bytes: int
+    plan_device_bytes: int
+    pack_bytes: int
+    pack_ws_bytes: int
+    total_bytes: int
+    kernel_launches: int
+
+
+def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",),
+         packs=("NONE",), reuse=1, budget=0, beta=False, rounding="RN", mode="EMULATE",
+         eps_fraction=None, calib=None, lib=None):
+    """imd_perf_rank: the candidates N x g x vec mode x packs ranked by predicted time inside a
+    device-memory budget (bytes; 0 = none). N: an int or a list of admissible N; g: None
+    (every g in 1..N) or a list; packs: any of "NONE", "A", "B", "AB"."""
+    Ns = [int(N)] if isinstance(N, int) else [int(x) for x in N]
+    gs = [] if g is None else ([int(g)] if isinstance(g, int) else [int(x) for x in g])
+    h, call = _prep(spec, extents, strides, Ns[0], 0, rounding, mode, "GENERATE", lib)
+    narr = (C.c_int32 * max(len(Ns), 1))(*Ns)
+    garr = (C.c_int32 * max(len(gs), 1))(*gs)
+    req = _RankRequest(C.sizeof(_RankRequest), C.sizeof(_Candidate), len(Ns), len(gs),
+                       C.cast(narr, C.POINTER(C.c_int32)),
+                       C.cast(garr, C.POINTER(C.c_int32)) if gs else None,
+                       sum(_PERF_VEC[v] for v in set(vec_modes)),
+                       sum(_PERF_PACK[p] for p in set(packs)), int(reuse),
+                       _PERF_BETA_NONZERO if beta else 0, int(budget), _eps(eps_fraction))
+    count = C.c_int32(0)
+    st = h.lib.imd_perf_rank(*call.args(), C.byref(req), _calib_arg(calib), None, 0,
+                             C.byref(count))
+    if st != 0:
+        raise ImmerdinkError(st, "imd_perf_rank")
+    out = (_Candidate * max(count.value, 1))()
+    st = h.lib.imd_perf_rank(*call.args(), C.byref(req), _calib_arg(calib), out, count.value,
+                             C.byref(count))
+    if st != 0:
+        raise ImmerdinkError(st, "imd_perf_rank")
+    vec_name = {v: k for k, v in _VEC.items()}
+    return [Candidate(c.num_moduli, c.residue_group, vec_name[c.vec_mode],
+                      ["NONE", "A", "B", "AB"][c.packed], STATUS[c.status], bool(c.feasible),
+                      c.k4_config, DISPATCH[c.dispatch], c.time_s, c.contract_s, c.pack_s,
+                      c.tflops_eq, c.eps_s, c.eps_fraction, c.workspace_bytes,
+                      c.plan_device_bytes, c.pack_bytes,
+                      c.pack_ws_bytes, c.total_bytes, c.kernel_launches)
+            for c in out[:count.value]]
+
+
 def _main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(
@@ -496,6 +838,12 @@ def _main(argv=None):
     ap.add_argument("--rounding", default="RN", choices=sorted(_ROUNDING))
     ap.add_argument("--vec-mode", default="GENERATE", choices=sorted(_VEC))
     ap.add_argument("--lib", default=None, help="path to libimmerdink_host.so")
+    ap.add_argument("--rank", default=None, metavar="N_LIST",
+                    help="also rank configurations by predicted time (DESIGN §6c) for these N, "
+                         "e.g. 8,14: every g, both vec modes, A / B packed or not")
+    ap.add_argument("--budget", type=int, default=0, help="device-memory budget (bytes) for --rank")
+    ap.add_argument("--reuse", type=int, default=1, help="contractions per pack for --rank")
+    ap.add_argument("--calib", default=None, help="calibration file (default: the shipped one)")
     a = ap.parse_args(argv)
     ext = {kv.split("=")[0]: int(kv.split("=")[1]) for kv in a.extents.split(",")}
     kw = dict(N=a.N, rounding=a.rounding, vec_mode=a.vec_mode, lib=a.lib)
@@ -510,6 +858,20 @@ def _main(argv=None):
     for r in rows:
         print(f"{r['g']:>3} {r['workspace']:>16,} {r['workspace'] / 2**30:>8.3f} "
               f"{100 * r['workspace'] / full:>6.0f}% {r['groups']:>6} {r['gemm_launches']:>8}")
+    if a.rank:
+        cal = Calibration.load(a.calib, a.lib) if a.calib else None
+        cands = rank(a.spec, ext, N=[int(x) for x in a.rank.split(",")],
+                     vec_modes=("GENERATE", "RESIDENT"), packs=("NONE", "A", "B", "AB"),
+                     reuse=a.reuse, budget=a.budget, rounding=a.rounding, calib=cal, lib=a.lib)
+        print(f"ranked by predicted time (reuse {a.reuse}, budget "
+              f"{a.budget:,} B){'' if a.budget else ' = none'}; first 20 of {len(cands)}:")
+        print(f"{'N':>3} {'g':>3} {'vec':>9} {'pack':>4} {'TFLOPS-eq':>9} {'time ms':>9} "
+              f"{'contract':>9} {'pack ms':>8} {'total bytes':>15} {'fits':>4} status")
+        for c in cands[:20]:
+            print(f"{c.num_moduli:>3} {c.residue_group:>3} {c.vec_mode:>9} {c.packed:>4} "
+                  f"{c.tflops_eq:>9.2f} {1e3 * c.time_s:>9.4f} {1e3 * c.contract_s:>9.4f} "
+                  f"{1e3 * c.pack_s:>8.4f} {c.total_bytes:>15,} {'yes' if c.feasible else 'no':>4} "
+                  f"{c.status}")
 
 
 if __name__ == "__main__":
