@@ -839,7 +839,7 @@ def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod
     k5c = spec_chain(spec_launch_blocks(work), 1, -(-work // 256), e * N * L32[N],
                      r(f"k5_n{N}_e{e}"), sms)
     ph.append(("K5 crt", 1, [1, N * b * m * nh + 3 * b * (m + n) + outb, N * L32[N] * b * m * n,
-                             k5c, 0, 0]))
+                             k5c, max(0, N * b * m * nh - l2), 0]))
     return ph + [("call", 0, [1, lw.kernel_launches, 0, 0, 0, 0])]
 
 

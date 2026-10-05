@@ -369,7 +369,7 @@ enum {
   IMD_PERF_CLASS_K4_128x128 = 5, /* (k4_128x128) round, mac1, mac2, byte, mac_ktail         */
   IMD_PERF_CLASS_K4_64x128 = 6,  /* (k4_64x128)  round, mac1, mac2, byte, mac_ktail         */
   IMD_PERF_CLASS_K4_64x64 = 7,   /* (k4_64x64)   round, mac1, mac2, mac3, byte, mac_ktail   */
-  IMD_PERF_CLASS_K5 = 8,         /* (k5) CRT: launch, byte, op, chain                       */
+  IMD_PERF_CLASS_K5 = 8,         /* (k5) CRT: launch, byte, op, chain, dram                 */
   IMD_PERF_CLASS_DIRECT = 9,     /* (direct) native FP64: launch, byte, flop, chain         */
   IMD_PERF_CLASS_BETA = 10,      /* (beta) C <- beta C: launch, byte, chain                 */
   IMD_PERF_CLASS_CALL = 11,      /* (call) per-call correction: call, launch (may be < 0)   */

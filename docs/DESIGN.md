@@ -1894,7 +1894,10 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
 DIRECT x₃, BETA x₂ = `chain`, the busiest SM's per-thread compute chain of the phase's launches
 (KF's x₅ is the same definition); KL x₅ and PACK x₅ = `wave`, the busiest SM's tile loads in
 sequence (memory latency). Both are defined below ("Waves and occupancy"). The K4 classes
-keep the round model (it already is a wave model).
+keep the round model (it already is a wave model). K5 x₄ = `dram`: the W plane bytes beyond the
+effective L2, `max(0, N·b·m·n̂ − L2)` (K4 leaves at most the effective L2 of them resident; at
+8192², N = 8 K5 reads 1.07 GB at 0.93 TB/s, which the byte term fitted on mostly resident planes
+predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.7 → 4.4 %).
 
 - **KF's per-thread chain** (`kf.chain`, added 2026-10-05 for N = 15–17 on mid-size shapes). KF
   launches B = tiles × parts blocks (the shared launch rules `kf_lg_tk`, `kf_operand_tiles`,
@@ -2174,7 +2177,7 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   pair, ≈ 2 min) the cache fit; `tools/calibrate.sh` runs all three.
 - **File format 2** [v1.10] (written by v7; format 1 is still read). Format 1 plus, all
   required:
-  - every v1.10 parameter (`k0.chain`, `kl.wave`, `pack.chain`, `pack.wave`, `k5.chain`, `direct.chain`,
+  - every v1.10 parameter (`k0.chain`, `kl.wave`, `pack.chain`, `pack.wave`, `k5.chain`, `k5.dram`, `direct.chain`,
     `beta.chain`);
   - `kernel.<name> = resident regs smem threads` for every kernel of `imd_perf_kernel_name`
     (four integers; resident ≥ 1, the others ≥ 0);

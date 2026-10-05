@@ -65,6 +65,7 @@ PERF_CACHES = {"COLD": 0, "WARM": 1, "REPEAT": 2}
 PERF_ORDERS = {"BAND": 0, "TIME": 1}
 # The parameters new in calibration format 2 (absent from a format-1 file).
 FORMAT2_PARAMS = frozenset({"k0.chain", "kl.wave", "pack.chain", "pack.wave", "k5.chain",
+                            "k5.dram",
                             "direct.chain", "beta.chain"})
 
 

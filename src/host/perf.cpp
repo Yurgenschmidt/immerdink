@@ -53,7 +53,7 @@ const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
     {"round", "mac1", "mac2", nullptr, "byte", "mac_ktail"},         // k4_128x128 (2)
     {"round", "mac1", "mac2", nullptr, "byte", "mac_ktail"},         // k4_64x128  (2)
     {"round", "mac1", "mac2", "mac3", "byte", "mac_ktail"},          // k4_64x64   (3)
-    {"launch", "byte", "op", "chain", nullptr, nullptr},             // k5
+    {"launch", "byte", "op", "chain", "dram", nullptr},              // k5
     {"launch", "byte", "flop", "chain", nullptr, nullptr},           // direct
     {"launch", "byte", "chain", nullptr, nullptr, nullptr},          // beta
     {"call", "launch", nullptr, nullptr, nullptr, nullptr},          // call (signed: a correction)
@@ -65,7 +65,7 @@ constexpr bool kFormat2Param[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, false, false, false, true},   // kl.wave
     {false, false, false, false, true, true},    // pack.chain, pack.wave
     {}, {}, {}, {},
-    {false, false, false, true, false, false},   // k5.chain
+    {false, false, false, true, true, false},    // k5.chain, k5.dram
     {false, false, false, true, false, false},   // direct.chain
     {false, false, true, false, false, false},   // beta.chain
     {}};
@@ -467,8 +467,12 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
             ? chain_of(L5.grid, 1, L5.work, 4 * limbs, resident_of(cal, k5k), sms)
             : chain_of(L5.grid, 1, (L5.work + kLaunchThreads - 1) / kLaunchThreads,
                        L5.elems * limbs, resident_of(cal, k5k), sms);
+    // v1.10: the W plane bytes beyond the (effective) L2 that K4 left them in come from DRAM
+    // (K5 at 8192^2, N = 8: 1.07 GB at 0.93 TB/s; the byte term alone, fitted on mostly
+    // L2-resident planes, was 24 % low there).
+    const double k5_dram = std::max(0.0, N * b * m * nh - l2);
     add_phase(&P, IMD_PERF_PHASE_K5, IMD_PERF_CLASS_K5, 1,
-              {1, k5_bytes, limbs * b * m * n, k5_chain}, k5_bytes)
+              {1, k5_bytes, limbs * b * m * n, k5_chain, k5_dram}, k5_bytes)
         .in_bytes = c_in;
     P.launches = plan_launches(e, fused, fl, resident, kc.launches);
   }
