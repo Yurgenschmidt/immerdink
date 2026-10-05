@@ -16,7 +16,9 @@ requests (beta, alpha_zero, k4_config, eps_fraction, synthetic calibrations):
     bounded; Memo: hits return the stored object, bounded FIFO, unhashable arguments bypass;
   - threads: one Planner + Memo (small, so it evicts) and one Query shared by 8 threads give
     exactly the serial results; the memo never exceeds its bound;
-  - argument errors: ValueError for bad option names, ImmerdinkError statuses as host.py.
+  - argument errors: ValueError for bad option names, ImmerdinkError statuses as host.py;
+  - v8 (DESIGN v1.12 §6f): predict / Request / rank with a random Accuracy (valid and invalid
+    statistics, both bases, targets) and Query.min_moduli == host.py's, bit for bit.
 """
 
 import argparse
@@ -111,6 +113,21 @@ def random_v7(rng):
             dict(regime=V7_REGIMES[reg], cache=V7_CACHES[cac], clock_mhz=clk))
 
 
+def random_accuracy(rng):
+    """None or a random host.Accuracy (metric, target, statistics, basis; sometimes invalid:
+    INVALID_VALUE statuses must match too)."""
+    if rng.random() < 0.3:
+        return None
+    metric = rng.choice(list(host.ERR_METRICS))
+    bad = rng.random() < 0.05
+    return host.Accuracy(
+        metric=metric, target=rng.choice((0.0, 1e-6, 1e-10, 1e-13, 1e-15, 1e-17)),
+        cond=(0.0 if bad else rng.choice((1.0, 10.0, 1e6))) if metric == "ELEMENTWISE" else 0.0,
+        norm_product=rng.choice((1.0, 3e4)) if metric == "ABSOLUTE" else 0.0,
+        l1_ratio_a=rng.choice((0.0, 0.0, 1.0, 5.0, 1e9)), l1_ratio_b=rng.choice((0.0, 2.0)),
+        basis=rng.choice(list(host.ERR_BASES)), fail_prob=rng.choice((0.0, 0.0, 1e-3)))
+
+
 def random_packing(rng, descs, opts, lib):
     """None, or (PackSpec or None) x 2 from pack_desc_for (sometimes for another N or
     rounding: a PACK_MISMATCH)."""
@@ -197,6 +214,22 @@ def check_single(rng, lib, cals, cases, verbose):
              hp, what + f" predict v7 keywords {hk}")
         same(q.predict(N, g, vec, packing=packing, calib=cal, request=planner.Request(**req, **hk),
                        **fo).to_prediction(), hp, what + f" predict v7 Request names {hk}")
+        # v8 (DESIGN v1.12 §6f): accuracy keyword, Request(accuracy=), min_moduli
+        acc = random_accuracy(rng)
+        hp = host.predict(descs, packing=packing, calib=cal, accuracy=acc, **req, **kw)
+        pv = q.predict(N, g, vec, packing=packing, calib=cal, accuracy=acc, **req, **fo)
+        same(pv.to_prediction(), hp, what + f" predict accuracy {acc}")
+        same_view(pv, hp, what + f" predict accuracy view {acc}")
+        same(q.predict(N, g, vec, packing=packing, calib=cal,
+                       request=planner.Request(accuracy=acc, **req), **fo).to_prediction(), hp,
+             what + f" predict Request accuracy {acc}")
+        if acc is not None and acc.target > 0:
+            n_lo, n_hi = rng.choice(((0, 0), (0, 0), (4, 12), (8, 20)))
+            e = q.min_moduli(acc, rounding=rnd, mode=mode, n_lo=n_lo, n_hi=n_hi)
+            he = host.min_moduli(descs, accuracy=acc, rounding=rnd, mode=mode, n_lo=n_lo,
+                                 n_hi=n_hi, lib=lib)
+            same(e.to_err_estimate(), he, what + f" min_moduli {acc}")
+            same_view(e, he, what + f" min_moduli view {acc}")
         if packing is not None:
             for pk in packing:
                 if pk is not None:
@@ -231,7 +264,8 @@ def random_rank_v7(rng):
         return {}, {}
     hk, ck = random_v7(rng)
     order = rng.choice(list(V7_ORDERS))
-    return dict(hk, order=order), dict(ck, order=V7_ORDERS[order])
+    acc = random_accuracy(rng)     # v8: the same Accuracy object for both
+    return dict(hk, order=order, accuracy=acc), dict(ck, order=V7_ORDERS[order], accuracy=acc)
 
 
 def check_rank(rng, lib, cals, cases, verbose):
@@ -483,8 +517,9 @@ def check_review_fixes(lib, spec, ext, q):
         pass
     else:
         raise Fail("Query.calib is writable")
-    # _RANK_EXTRA: the fields after eps_fraction (none in version 6; version 7: the v1.10 ones)
-    if planner._RANK_EXTRA != frozenset({"regime", "cache", "order", "clock_mhz"}):
+    # _RANK_EXTRA: the fields after eps_fraction (none in version 6; version 7: the v1.10
+    # ones; version 8: accuracy)
+    if planner._RANK_EXTRA != frozenset({"regime", "cache", "order", "clock_mhz", "accuracy"}):
         raise Fail(f"_RANK_EXTRA {planner._RANK_EXTRA}")
     # a C array field of a view is an immutable tuple
     @dataclasses.dataclass(frozen=True)

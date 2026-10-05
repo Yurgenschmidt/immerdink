@@ -37,6 +37,11 @@ if(Python3_FOUND)
   add_test(NAME host_planner
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_planner.py"
                    --host-lib "$<TARGET_FILE:immerdink_host>" -v)
+  # DESIGN v1.12 §6f: accuracy-aware planning (imd_err_*, predict / rank err fields) vs
+  # spec/params.py error_estimate (exact rational enclosure). CPU only.
+  add_test(NAME host_accuracy
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_accuracy.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" -v)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
@@ -174,6 +179,13 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/contractions.py"
                    --lib "$<TARGET_FILE:immerdink>" --quick --rows 16)
   set_tests_properties(accuracy_bound_quick PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+  # DESIGN v1.12 §6f: measured errors <= libimmerdink_host's rigorous estimates (every metric)
+  # on random small cases; reports the typical estimate's coverage. Exit 1 on a violation.
+  add_test(NAME accuracy_err_api_quick
+           COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/err_api.py"
+                   --lib "$<TARGET_FILE:immerdink>" --host-lib "$<TARGET_FILE:immerdink_host>"
+                   --quick)
+  set_tests_properties(accuracy_err_api_quick PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
 endif()
 
 # GPU tests share one device; run them one at a time.

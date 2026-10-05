@@ -14,6 +14,10 @@ recomputed here.
     q.predict(14).time_s              # imd_perf_predict, ~2 µs; .to_prediction(): host.Prediction
     q.workspace_size(14, g=7)         # imd_workspace_size, ~1 µs
     q.rank([8, 14], budget=2**30)[0]  # imd_perf_rank (one C call), best candidate
+    acc = planner.Accuracy(target=1e-12)                      # DESIGN v1.12 §6f, built once
+    n = q.min_moduli(acc).num_moduli  # imd_err_min_moduli: cheapest N for the target, ~1 µs
+    best = q.rank([n, n + 1], accuracy=acc)[0]  # meets the target only if best.feasible
+                                   # (else: the fastest infeasible candidate)
     q.lowering(14).k4_config, q.plan_bytes(14), q.pack_desc_for(0, 14)
 
     pl = planner.Planner(memo=planner.Memo(4096))   # one Query per contraction, cached
@@ -24,7 +28,10 @@ Objects:
       the C descriptors of one contraction; methods take the options (N, g, vec_mode, ...).
       Immutable descriptors; thread-safe (each call has its own output struct).
   Request: a prebuilt imd_perf_request_t (beta, alpha_zero, k4_config, eps_fraction, or any
-      other field of the C struct by name), for predict(request=...).
+      other field of the C struct by name; v8: accuracy=Accuracy(...)), for
+      predict(request=...).
+  Accuracy (host.Accuracy): a prebuilt imd_err_request_t (metric, target, statistics); for
+      min_moduli, predict(accuracy=) / Request(accuracy=) and rank(accuracy=).
   Prediction, Lowering, Candidate (in a Ranking): lazy, immutable views with the attribute
       names of host.Prediction / host.Lowering / host.Candidate; .to_prediction(),
       .to_lowering(), .to_candidate() (Ranking.to_list()) give exactly host.py's objects.
@@ -50,7 +57,9 @@ from .host import (DISPATCH, PACK_MISMATCH, STATUS, Calibration, HostLibrary, Im
                    PackSpec)
 
 __all__ = ["Query", "Planner", "Memo", "Request", "Prediction", "Lowering", "Candidate",
-           "Ranking", "default_calibration"]
+           "Ranking", "default_calibration", "Accuracy", "ErrEstimate"]
+
+Accuracy = host.Accuracy   # v8 (DESIGN v1.12 §6f): immutable, hashable, its C struct built once
 
 _ROUNDING, _MODE, _VEC = host._ROUNDING, host._MODE, host._VEC
 _VEC_NAME = {v: k for k, v in _VEC.items()}
@@ -61,6 +70,7 @@ _PD_SIZE = C.sizeof(host._PackDesc)
 _REQ_SIZE = C.sizeof(host._PerfRequest)
 _RANK_SIZE = C.sizeof(host._RankRequest)
 _CAND_SIZE = C.sizeof(host._Candidate)
+_ERR_SIZE = C.sizeof(host._Err)
 _OPTS_MAX = 512     # option structs kept per Query (a finite set in practice; cleared if full)
 _PACKS_MAX = 64     # packing structs kept per Query
 _RANKARGS_MAX = 64  # (N list, g list) arrays kept per Query
@@ -87,7 +97,8 @@ class _Fns:
     def __init__(self, h):
         for name in ("imd_workspace_size", "imd_workspace_size_packed", "imd_plan_bytes",
                      "imd_lowering", "imd_lowering_packed", "imd_pack_desc_for",
-                     "imd_perf_predict", "imd_perf_predict_pack", "imd_perf_rank"):
+                     "imd_perf_predict", "imd_perf_predict_pack", "imd_perf_rank",
+                     "imd_err_min_moduli"):
             setattr(self, name[4:], _fn(h, name))
 
 
@@ -161,8 +172,9 @@ class Request:
     beta-only call), k4_config (None: the plan-time rule), eps_fraction (None: the
     typical-data default), and any other field of the C struct by its name (later host API
     versions; v7: regime / cache by host.py's names, e.g. "SUSTAINED", "WARM", or their C
-    values, clock_mhz). Immutable; equal requests compare and hash equal."""
-    __slots__ = ("_c", "_ref", "_key")
+    values, clock_mhz; v8: accuracy, a host.Accuracy). Immutable; equal requests compare and
+    hash equal."""
+    __slots__ = ("_c", "_ref", "_key", "_acc")
 
     def __init__(self, *, beta=False, alpha_zero=False, k4_config=None, eps_fraction=None,
                  **fields):
@@ -172,13 +184,18 @@ class Request:
                   (host._PERF_ALPHA_ZERO if alpha_zero else 0)
         c.k4_config = -1 if k4_config is None else int(k4_config)
         c.eps_fraction = host._eps(eps_fraction)
+        self._acc = None
         for k, v in fields.items():
             if k not in _REQ_FIELDS or k in ("flags", "k4_config", "eps_fraction"):
                 raise TypeError(f"unknown request field {k!r} (fields: {_REQ_FIELDS})")
-            setattr(c, k, _enum_value(k, v))
+            if k == "accuracy":     # v8: a pointer; the Accuracy (kept alive here) is the key
+                c.accuracy = host._accuracy_ptr(v)
+                self._acc = v
+            else:
+                setattr(c, k, _enum_value(k, v))
         self._c = c
         self._ref = C.byref(c)
-        self._key = tuple(getattr(c, f) for f in _REQ_FIELDS)
+        self._key = tuple(self._acc if f == "accuracy" else getattr(c, f) for f in _REQ_FIELDS)
 
     def __eq__(self, other):
         return isinstance(other, Request) and self._key == other._key
@@ -194,12 +211,13 @@ _DEFAULT_REQUEST = Request()
 
 
 def _request(request, beta, alpha_zero, k4_config, eps_fraction, v7=None):
-    """v7: a dict of regime / cache / clock_mhz keywords (None values: not given)."""
+    """v7: a dict of regime / cache / clock_mhz (v8: accuracy) keywords (None values: not
+    given)."""
     v7 = {k: v for k, v in (v7 or {}).items() if v is not None}
     if request is not None:
         if beta or alpha_zero or k4_config is not None or eps_fraction is not None or v7:
             raise TypeError("pass either request= or beta / alpha_zero / k4_config / "
-                            "eps_fraction / regime / cache / clock_mhz")
+                            "eps_fraction / regime / cache / clock_mhz / accuracy")
         return request
     if beta or alpha_zero or k4_config is not None or eps_fraction is not None or v7:
         return Request(beta=beta, alpha_zero=alpha_zero, k4_config=k4_config,
@@ -278,7 +296,10 @@ Prediction = _view_class(
      "phases": _phases,
      # v7 (DESIGN v1.10 §6c): enums as host._prediction decodes them
      "regime": lambda s: _REGIME_NAME.get(s._r.regime, "BURST"),
-     "cache": lambda s: _CACHE_NAME.get(s._r.cache, "COLD")}, _to_prediction)
+     "cache": lambda s: _CACHE_NAME.get(s._r.cache, "COLD"),
+     # v8 (DESIGN v1.12 §6f)
+     "err_status": lambda s: host.ERR_STATUS[s._r.err_status],
+     "err_metric": lambda s: host._ERR_METRIC_NAME[s._r.err_metric]}, _to_prediction)
 Prediction.to_prediction = _to_prediction
 
 
@@ -316,9 +337,25 @@ Candidate = _view_class(
     {"vec_mode": lambda s: _VEC_NAME[s._r.vec_mode],
      "packed": lambda s: _PACKED_NAME[s._r.packed], "status": lambda s: STATUS[s._r.status],
      "feasible": lambda s: bool(s._r.feasible), "dispatch": lambda s: DISPATCH[s._r.dispatch],
-     "tie": lambda s: bool(s._r.tie)},  # v7
+     "tie": lambda s: bool(s._r.tie),  # v7
+     "err_status": lambda s: host.ERR_STATUS[s._r.err_status]},  # v8
     None)
 Candidate.to_candidate = _to_candidate
+
+
+def _to_err_estimate(self):
+    """Exactly host.min_moduli's host.ErrEstimate."""
+    return host._err_estimate(self._r, self._st)
+
+
+ErrEstimate = _view_class(
+    "ErrEstimate", "imd_err_t as a lazy host.ErrEstimate (.to_err_estimate()).",
+    host.ErrEstimate, host._Err,
+    {"status": lambda s: STATUS[s._st],
+     "rounding": lambda s: host._ROUNDING_NAME.get(s._r.rounding, "RN"),
+     "dispatch": lambda s: DISPATCH[s._r.dispatch],
+     "err_status": lambda s: host.ERR_STATUS[s._r.err_status]}, _to_err_estimate)
+ErrEstimate.to_err_estimate = _to_err_estimate
 
 
 class Ranking:
@@ -629,11 +666,13 @@ class Query:
 
     def predict(self, N, g=0, vec_mode="GENERATE", *, rounding="RN", mode="EMULATE",
                 packing=None, request=None, beta=False, alpha_zero=False, k4_config=None,
-                eps_fraction=None, calib=None, regime=None, cache=None, clock_mhz=None):
+                eps_fraction=None, calib=None, regime=None, cache=None, clock_mhz=None,
+                accuracy=None):
         """imd_perf_predict as a lazy Prediction view (host.predict). request: a prebuilt
         Request (the fastest), or beta / alpha_zero / k4_config / eps_fraction / regime /
-        cache / clock_mhz as host.py (None: the C defaults, DEFAULT regime, COLD)."""
-        v7 = (regime, cache, clock_mhz)
+        cache / clock_mhz / accuracy as host.py (None: the C defaults, DEFAULT regime, COLD,
+        NORMWISE estimates without a target)."""
+        v7 = (regime, cache, clock_mhz, accuracy)
         m = self.memo
         if m is not None:
             return _memo(m, (self, "p", N, g, vec_mode, rounding, mode, packing, request, beta,
@@ -645,15 +684,15 @@ class Query:
                              k4_config, eps_fraction, calib, v7)
 
     def _predict(self, N, g, vec_mode, rounding, mode, packing, request, beta, alpha_zero,
-                 k4_config, eps_fraction, calib, v7=(None, None, None)):
+                 k4_config, eps_fraction, calib, v7=(None, None, None, None)):
         key = (N, g, vec_mode, rounding, mode)
         o = self._opts.get(key) or self._options(key)
         if request is None and not beta and not alpha_zero and k4_config is None and \
-                eps_fraction is None and v7 == (None, None, None):
+                eps_fraction is None and v7 == (None, None, None, None):
             req = _DEFAULT_REQUEST
         else:
             req = _request(request, beta, alpha_zero, k4_config, eps_fraction,
-                           dict(zip(("regime", "cache", "clock_mhz"), v7)))
+                           dict(zip(("regime", "cache", "clock_mhz", "accuracy"), v7)))
         r = host._Perf(_PERF_SIZE)
         st = self._f.perf_predict(self._A, self._B, self._C, o,
                                   None if packing is None else self._packing(packing), req._ref,
@@ -687,7 +726,8 @@ class Query:
         """imd_perf_rank in ONE C call (the capacity is the exact candidate count) as a
         Ranking of lazy Candidate views (host.rank's order and values). fields: any other
         imd_perf_rank_request_t field by name (v7: regime, cache, order by host.py's names or
-        C values, clock_mhz)."""
+        C values, clock_mhz; v8: accuracy, a host.Accuracy whose target makes the candidates
+        that miss it infeasible)."""
         m = self.memo
         if m is not None:
             return _memo(m, (self, "r", N, g, vec_modes, packs, reuse, budget, beta, rounding,
@@ -714,7 +754,10 @@ class Query:
         for k, v in fields.items():
             if k not in _RANK_EXTRA:
                 raise TypeError(f"unknown rank request field {k!r}")
-            setattr(req, k, _enum_value(k, v))
+            if k == "accuracy":   # v8: a pointer to the Accuracy's struct (alive in the caller)
+                req.accuracy = host._accuracy_ptr(v)
+            else:
+                setattr(req, k, _enum_value(k, v))
         out = (host._Candidate * cap)()
         count = C.c_int32(0)
         cal = self._cal if calib is None else _calib_ref(calib)
@@ -729,6 +772,24 @@ class Query:
             if st:
                 raise ImmerdinkError(st, "imd_perf_rank")
         return Ranking(out, count.value)
+
+    def min_moduli(self, accuracy, *, rounding="RN", mode="EMULATE", n_lo=0, n_hi=0):
+        """imd_err_min_moduli (host.min_moduli) as a lazy ErrEstimate view: the smallest N in
+        [n_lo, n_hi] (0, 0: 2..20) whose estimate meets accuracy.target (num_moduli; 0 and
+        status "NOT_SUPPORTED" if none). One lowering and a closed form per N in C."""
+        m = self.memo
+        if m is not None:
+            return _memo(m, (self, "e", accuracy, rounding, mode, n_lo, n_hi),
+                         lambda: self._min_moduli(accuracy, rounding, mode, n_lo, n_hi))
+        return self._min_moduli(accuracy, rounding, mode, n_lo, n_hi)
+
+    def _min_moduli(self, accuracy, rounding, mode, n_lo, n_hi):
+        key = (20, 1, "GENERATE", rounding, mode)
+        o = self._opts.get(key) or self._options(key)
+        r = host._Err(_ERR_SIZE)
+        st = self._f.err_min_moduli(self._A, self._B, self._C, o, index(n_lo), index(n_hi),
+                                    host._accuracy_ptr(accuracy), C.byref(r))
+        return ErrEstimate(r, st)
 
     def _rank_args(self, N, g, vec_modes, packs):
         Ns = (index(N),) if isinstance(N, numbers.Integral) else tuple(index(x) for x in N)
@@ -851,11 +912,16 @@ class Planner:
     def predict(self, spec, extents=None, *, strides=None, N, g=0, rounding="RN",
                 mode="EMULATE", vec_mode="GENERATE", packing=None, request=None, beta=False,
                 alpha_zero=False, k4_config=None, eps_fraction=None, calib=None, regime=None,
-                cache=None, clock_mhz=None):
+                cache=None, clock_mhz=None, accuracy=None):
         return self.query(spec, extents, strides=strides).predict(
             N, g, vec_mode, rounding=rounding, mode=mode, packing=packing, request=request,
             beta=beta, alpha_zero=alpha_zero, k4_config=k4_config, eps_fraction=eps_fraction,
-            calib=calib, regime=regime, cache=cache, clock_mhz=clock_mhz)
+            calib=calib, regime=regime, cache=cache, clock_mhz=clock_mhz, accuracy=accuracy)
+
+    def min_moduli(self, spec, extents=None, *, strides=None, accuracy, rounding="RN",
+                   mode="EMULATE", n_lo=0, n_hi=0):
+        return self.query(spec, extents, strides=strides).min_moduli(
+            accuracy, rounding=rounding, mode=mode, n_lo=n_lo, n_hi=n_hi)
 
     def rank(self, spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",),
              packs=("NONE",), reuse=1, budget=0, beta=False, rounding="RN", mode="EMULATE",

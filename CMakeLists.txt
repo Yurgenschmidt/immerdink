@@ -82,7 +82,7 @@ target_include_directories(imd_constants INTERFACE "${PROJECT_SOURCE_DIR}/includ
 # v1.8 (§6c): the performance model (src/host/perf.cpp) and its shipped calibration.
 add_library(immerdink_host SHARED
   src/host/index_map.cpp src/host/workspace.cpp src/host/analysis.cpp src/host/k4_config.cpp
-  src/host/pack.cpp src/host/host_api.cpp src/host/perf.cpp)
+  src/host/pack.cpp src/host/host_api.cpp src/host/perf.cpp src/host/accuracy.cpp)
 target_include_directories(immerdink_host PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 # DESIGN §6c.2: the shipped calibration file is embedded as a raw string literal (the file is

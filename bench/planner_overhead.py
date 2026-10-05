@@ -70,7 +70,7 @@ def floor_lines(cases, Ns):
 
 
 FLOOR_COLS = ["workspace_size", "lowering", "plan_bytes", "pack_desc_for", "predict_null",
-              "predict", "predict_pack", "rank"]
+              "predict", "predict_pack", "rank", "min_moduli"]
 
 
 def run_floor(path, cases, Ns):
@@ -159,6 +159,10 @@ def methods(spec, ext, N, h, cal):
         m["q.predict(request)"] = lambda: q.predict(N, request=req)
         m["q.rank"] = lambda: q.rank(N)
         m["q.rank[0]"] = lambda: q.rank(N)[0].num_moduli
+        acc = planner.Accuracy(target=1e-12)                 # v8 (DESIGN §6f)
+        m["host.min_moduli"] = lambda: host.min_moduli(spec, ext, accuracy=acc, lib=lib)
+        m["q.min_moduli"] = lambda: q.min_moduli(acc)
+        m["q.min_moduli.N"] = lambda: q.min_moduli(acc).num_moduli
         pl = planner.Planner(lib=lib)
         m["pl.predict"] = lambda: pl.predict(spec, ext, N=N)
         m["pl.workspace_size"] = lambda: pl.workspace_size(spec, ext, N=N)
@@ -171,6 +175,7 @@ def methods(spec, ext, N, h, cal):
         m["memo.rank"] = lambda: mp.rank(spec, ext, N=N)
         m["memo.workspace_size"] = lambda: mp.workspace_size(spec, ext, N=N)
         m["memo.q.predict"] = (lambda qq: lambda: qq.predict(N))(mp.query(spec, ext))
+        m["memo.min_moduli"] = lambda: mp.min_moduli(spec, ext, accuracy=acc)
     return m
 
 
@@ -236,6 +241,8 @@ SUMMARY = [("workspace_size", "host.workspace_size", "q.workspace_size", "memo.w
            ("predict (calib None)", "host.predict", "q.predict", "memo.predict", "predict"),
            ("predict_pack", "host.predict_pack", "q.predict_pack", None, "predict_pack"),
            ("rank (one N, all g)", "host.rank", "q.rank", "memo.rank", "rank"),
+           ("min_moduli (§6f)", "host.min_moduli", "q.min_moduli", "memo.min_moduli",
+            "min_moduli"),
            ("device workspace_size", "device.workspace_size", "pl.query_arrays.ws", None,
             "workspace_size")]
 

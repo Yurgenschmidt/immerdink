@@ -27,7 +27,7 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 7  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 8  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
@@ -37,7 +37,9 @@ extern "C" {
                                    6: the performance model (§6c v1.8): imd_perf_*;
                                    7: performance model v1.10 (§6c): calibration format 2,
                                       occupancy (imd_perf_kernel_t, imd_perf_kernel_name),
-                                      clock regimes, cache state, intervals, rank ties */
+                                      clock regimes, cache state, intervals, rank ties;
+                                   8: accuracy-aware planning (§6f v1.12): imd_err_*,
+                                      the requests' accuracy, err_* / infeasible fields */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -532,6 +534,9 @@ typedef struct {
   double clock_mhz;      /* > 0: an NVML-scale SM clock for capped / sustained operation
                             (e.g. a measured settled clock; overrides the regime); values at
                             or above the effective clock (clock_eff_mhz) mean BURST; 0: none */
+  /* ---- v8 (§6f; a struct_size of version 7: accuracy NULL) ---- */
+  const struct imd_err_request_s* accuracy; /* metric, target and statistics of err_*;
+                                               NULL: NORMWISE, no target                    */
 } imd_perf_request_t;
 
 /* One phase: its features x (the model is sum_j param[cls * 6 + j] x[j]; K4: the max of the
@@ -582,6 +587,11 @@ typedef struct {
   double time_hi_s;
   double phase_lo_s[IMD_PERF_MAX_PHASES]; /* the same per phase                             */
   double phase_hi_s[IMD_PERF_MAX_PHASES];
+  /* ---- v8 (§6f) ---- */
+  double err_bound;      /* rigorous error bound in the request's metric (+inf: none)       */
+  double err_typical;    /* typical estimate (RN EMULATE; else = err_bound)                 */
+  int32_t err_status;    /* IMD_ERR_UNCHECKED (no target) / IMD_ERR_MET / IMD_ERR_MISSED    */
+  int32_t err_metric;    /* the metric used                                                 */
 } imd_perf_t;
 
 /* Predicted imd_contract (packing != NULL: imd_contract_packed of that packed plan). Returns
@@ -622,6 +632,10 @@ typedef struct {
   int32_t order;                 /* IMD_PERF_ORDER_*                                          */
   int32_t reserved;              /* 0                                                         */
   double clock_mhz;              /* as imd_perf_request_t                                     */
+  /* ---- v8 (§6f; a struct_size of version 7: accuracy NULL) ---- */
+  const struct imd_err_request_s* accuracy; /* NULL: no error target (NORMWISE reported); a
+                                               target > 0 makes the candidates whose estimate
+                                               (by basis) exceeds it infeasible             */
 } imd_perf_rank_request_t;
 
 typedef struct {
@@ -650,7 +664,17 @@ typedef struct {
   double power_w;            /* the contract's predicted average power                       */
   int32_t tie;               /* 1: feasible and time_s <= the best's x tie_ratio (any order) */
   int32_t raw_rank;          /* position in the v6 time order (0-based)                      */
+  /* ---- v8 (§6f) ---- */
+  double err_bound;          /* rigorous error bound in the request's metric (+inf: none)    */
+  double err_typical;        /* typical estimate (RN EMULATE; else = err_bound)              */
+  int32_t err_status;        /* IMD_ERR_UNCHECKED / IMD_ERR_MET / IMD_ERR_MISSED             */
+  int32_t infeasible;        /* IMD_PERF_INFEASIBLE_* bits; feasible = (infeasible == 0)     */
 } imd_perf_candidate_t;
+
+/* v8: why a candidate is infeasible (imd_perf_candidate_t.infeasible). */
+enum { IMD_PERF_INFEASIBLE_STATUS = 1,   /* its plan-time status is not SUCCESS               */
+       IMD_PERF_INFEASIBLE_BUDGET = 2,   /* total_bytes > budget_bytes                        */
+       IMD_PERF_INFEASIBLE_ACCURACY = 4  /* its error estimate (accuracy->basis) > target     */ };
 
 /* Every candidate of N x g x vec mode x pack mode (base gives rounding, mode, k4_tune), ranked:
  * feasible by time_s, then infeasible SUCCESS ones by time_s, then the others in enumeration
@@ -665,6 +689,85 @@ IMD_API imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B,
                                    const imd_perf_rank_request_t* request,
                                    const imd_perf_calib_t* calib, imd_perf_candidate_t* out,
                                    int32_t capacity, int32_t* num_candidates);
+
+/* ---- Accuracy-aware planning (§6f, host API version 8) -------------------------------------
+ * The §3.8 error of a configuration from the caller's operand statistics; immerdink never
+ * reads the data. Per output x_ij = sum_h a_ih b_hj of the GEMM view (a_i a row of A, b_j a
+ * column of B, k the contracted length), D the emulated product (alpha = 1, beta = 0):
+ *   E = 2 delta (nu_a + nu_b) s / d + 4 delta^2 k s^2 / d^2      (EMULATE; PROOFS L3a)
+ *       delta = 1/2, d = T - kappa/2 (RN; kappa >= T: +inf) | delta = 1, d = T (TRUNC),
+ *       s = sqrt(1 + k 2^-60), nu = min(l1_ratio, sqrt k) (0: sqrt k)
+ *   NORMWISE    |D - x| / (||a_i|| ||b_j||) <= E (1 + u) + u                     (u = 2^-53)
+ *   ELEMENTWISE |D - x| / |x|               <= E rho (1 + u) + u
+ *   ABSOLUTE    |D - x|                     <= (E (1 + u) + u) norm_product
+ *   DIRECT dispatch: gamma_k = k u / (1 - k u) in place of E (1 + u) + u (times rho /
+ *   norm_product); NOOP / SCALE / k = 0: 0.
+ * ABSOLUTE also adds 2^-1075 (EMULATE: a gradual underflow of D) or 2k 2^-1075 (DIRECT: the
+ * fma chain's underflows); in C a little more (the subnormal rounding of the computation).
+ * Guaranteed for finite inputs when the statistics are true bounds; NORMWISE / ELEMENTWISE
+ * also need D (DIRECT: every partial sum) outside the subnormal range (PROOFS L3c).
+ * The bound is on the product D. imd_contract writes C = beta C + RN(alpha D) (§3.7):
+ *   alpha != 1 adds one rounding: a bound n becomes n (1 + u) + u per metric (ABSOLUTE: pass
+ *     |alpha| times the norm_product);
+ *   beta != 0 adds u |beta C + alpha D| (the fma), which no statistic here expresses.
+ * The TYPICAL estimate (RN EMULATE only; NOT a guarantee) replaces E by
+ *   min(E, s / d sqrt(8 ln(2 M / p)) + k s^2 / d^2), M = outputs, p = fail_prob:
+ * Hoeffding's bound under independent zero-mean quantization errors, exceeded with
+ * probability <= p per call; rows of many equal non-representable entries violate the model.
+ * The C value of the bound is >= the exact real bound (double, times (1 + 2^-40)). */
+enum { IMD_ERR_NORMWISE = 0, IMD_ERR_ELEMENTWISE = 1, IMD_ERR_ABSOLUTE = 2 };
+enum { IMD_ERR_BASIS_BOUND = 0, IMD_ERR_BASIS_TYPICAL = 1 };
+enum { IMD_ERR_UNCHECKED = 0, IMD_ERR_MET = 1, IMD_ERR_MISSED = 2 };
+
+typedef struct imd_err_request_s {
+  uint32_t struct_size;  /* sizeof(imd_err_request_t)                                       */
+  int32_t metric;        /* IMD_ERR_NORMWISE / ELEMENTWISE / ABSOLUTE                       */
+  double target;         /* >= 0; 0: no target (estimates reported, err_status UNCHECKED)   */
+  double cond;           /* ELEMENTWISE: rho >= 1, upper bound on ||a_i|| ||b_j|| / |x_ij|   */
+  double norm_product;   /* ABSOLUTE: > 0, upper bound on ||a_i|| ||b_j||                   */
+  double l1_ratio_a;     /* 0 (unknown: sqrt k) or >= 1: upper bound on ||a_i||_1/||a_i||_2  */
+  double l1_ratio_b;     /* the same for the columns b_j of B                               */
+  int32_t basis;         /* IMD_ERR_BASIS_BOUND (default) / TYPICAL: what meets the target  */
+  int32_t reserved;      /* must be 0 (INVALID_VALUE otherwise): reserved for flags     */
+  double fail_prob;      /* TYPICAL: p in (0, 1); 0: 2^-40                                  */
+} imd_err_request_t;
+
+typedef struct {
+  uint32_t struct_size;  /* in: sizeof(imd_err_t) as compiled by the caller                 */
+  int32_t status;        /* as returned                                                     */
+  int32_t num_moduli;    /* the N estimated (imd_err_min_moduli: the answer; 0: none)       */
+  int32_t rounding;      /* IMD_RN / IMD_TRUNC                                              */
+  int32_t dispatch;      /* IMD_DISPATCH_*                                                  */
+  int32_t err_status;    /* IMD_ERR_UNCHECKED / MET / MISSED                                */
+  int64_t k;             /* contracted length of the GEMM view                              */
+  int64_t outputs;       /* M = b m n                                                       */
+  double bound;          /* rigorous, in the request's metric (+inf: none)                  */
+  double typical;        /* typical estimate, same metric                                   */
+  double unit_bound;     /* E (EMULATE) or gamma_k (DIRECT): the coefficient of
+                            ||a_i|| ||b_j|| before the metric                               */
+  double unit_typical;   /* the typical one                                                 */
+} imd_err_t;
+
+/* The estimates of one configuration from scalars: num_moduli 2..20, rounding IMD_RN /
+ * IMD_TRUNC, dispatch IMD_DISPATCH_*, k >= 0, outputs >= 0; request NULL: NORMWISE, no target.
+ * INVALID_VALUE for a bad argument or request (a statistic missing for the metric, cond < 1,
+ * l1_ratio in (0, 1), fail_prob outside [0, 1), a negative or non-finite target). */
+IMD_API imd_status_t imd_err_estimate(int32_t num_moduli, int32_t rounding, int32_t dispatch,
+                                      int64_t k, int64_t outputs,
+                                      const imd_err_request_t* request, imd_err_t* out);
+/* The smallest N in [n_lo, n_hi] (0 / 0: 2 / 20) whose estimate (request->basis) is <=
+ * request->target (> 0), for this contraction with options' rounding and mode (N, g and
+ * vec_mode do not matter): one lowering, then the closed form per N. SUCCESS: out at that N.
+ * NOT_SUPPORTED with out->err_status MISSED: no N in the range meets the target (out at
+ * n_hi, num_moduli 0). The lowering's own status (§5: INVALID_VALUE, or NOT_SUPPORTED for e.g.
+ * a repeated or broadcast C label) is returned as such, with out zeroed (err_status
+ * UNCHECKED): so err_status tells the two NOT_SUPPORTED cases apart. INVALID_VALUE for a bad
+ * request or range. Only the lowering is checked, not the workspace of any N. DIRECT
+ * dispatch: N does not matter; the answer is n_lo if met. */
+IMD_API imd_status_t imd_err_min_moduli(const imd_tensor_t* A, const imd_tensor_t* B,
+                                        const imd_tensor_t* C, const imd_options_t* options,
+                                        int32_t n_lo, int32_t n_hi,
+                                        const imd_err_request_t* request, imd_err_t* out);
 
 #ifdef __cplusplus
 } /* extern "C" */
