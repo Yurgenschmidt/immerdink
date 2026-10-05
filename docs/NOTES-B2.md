@@ -416,3 +416,69 @@ change per-query costs: in `planner_overhead`, predict takes 1.6–1.8 µs and r
   ~1950 MHz, while the model predicts 2385 MHz.
 - In small sustained windows, back-to-back calls overlap launch latency that the call term
   charges (+10 % at 512³). A "queued" call term would fix this if it matters.
+
+## 7. Accuracy-aware ranking (DESIGN v1.12 §6f, host API 8; branch b2-accuracy)
+
+Eric approved this item. `rank` answers **the cheapest configuration that meets an error target**,
+using the §3.8 bounds and the operand statistics the caller supplies. The formulas and API are in
+DESIGN §6f. This section holds the evidence and the open questions.
+
+### 7.1 Design in brief
+
+- **Rigorous.** PROOFS L3a's ℓ1 form, with the caller's optional ℓ1/ℓ2 ratios (√k by default
+  gives §3.8 exactly), composed with the final rounding per metric:
+  - NORMWISE needs nothing from the caller;
+  - ELEMENTWISE needs ρ ≥ max ‖a‖‖b‖/|x|;
+  - ABSOLUTE needs a bound on max ‖a‖‖b‖.
+
+  DIRECT uses the native γ_k.
+- **Typical.** Hoeffding under the standard probabilistic model of RN quantization errors
+  (independent, zero-mean, |e| ≤ ½), with a union bound over the M = b·m·n outputs at failure
+  probability p (default 2⁻²⁰). No fitted constants. TRUNC and DIRECT report the rigorous bound
+  as their typical value.
+- **One implementation.** The math is in C (`src/host/accuracy.cpp`). `spec/params.py`
+  (`error_estimate`, exact rational enclosure) is the reference, and `cert_error_estimate`
+  checks the bound on emulated rows. Python only marshals.
+
+### 7.4 Design questions (for the reviewer; conservative choices taken)
+
+1. **The typical estimate comes from a model and is not fitted.** Hoeffding gives a
+   probabilistic bound with stated assumptions.
+   - On the M5 data it is about 4× above the observed maxima (about half a modulus).
+   - A constant fitted to the data would recover that, but it would have no model behind it
+     and no coverage guarantee outside the fitted families.
+   - Chosen: the model. The coverage is reported, not tuned.
+2. **TRUNC and DIRECT have no typical estimate** (`err_typical` = `err_bound`). TRUNC's errors
+   are biased by the data's signs (§3.3), so the zero-mean model does not apply. For DIRECT a
+   probabilistic γ̃_k is possible but brings little.
+3. **The default basis is the rigorous bound.** The typical estimate is opt-in
+   (`basis = TYPICAL`) and always reported.
+4. **`fail_prob` defaults to 2⁻²⁰ per call.** This is a union bound over every output of the
+   call. A caller making 10⁹ calls should lower it; the cost is about √(ln) and grows slowly.
+5. **The bound is on the product D** (α = 1, β = 0). With other α and β, the §3.7 roundings of
+   the epilogue (≤ u|αD| and one fma) are the caller's to add. Folding them in would need α,
+   β and |C| statistics.
+6. **Rank keeps v6's order.**
+   - Candidates that miss the accuracy target sort with the budget misses, as infeasible
+     SUCCESS by time; there is no separate group.
+   - No candidate is pruned before prediction. The ones the target rules out are the cheap
+     low-N ones, and the recommended hot-path pattern (`min_moduli`, then `rank([n, n+1])`)
+     avoids predicting them.
+7. **`imd_err_min_moduli` returns NOT_SUPPORTED** (with `num_moduli` = 0 and the estimates at
+   `n_hi`) when no N meets the target. For DIRECT dispatch it returns `n_lo`, since N does not
+   matter there.
+8. **One scalar ρ (ELEMENTWISE) and one `norm_product` (ABSOLUTE) per call.** These are the
+   worst case over the outputs the caller cares about. Per-row or per-column vectors were not
+   taken: they would mean data-sized arguments on a hot path.
+9. **A v8 predict or rank always reports the NORMWISE estimates**, even without a request.
+   This costs one closed-form evaluation per candidate.
+10. **The C bound is made rigorous by an inflation factor (1 + 2⁻⁴⁰)** rather than by directed
+    rounding modes, which are portable only with a change of the FP environment. The test
+    checks both directions against an exact enclosure.
+11. **Statistics validation:**
+    - INVALID_VALUE for `l1_ratio` < 1 (but ≠ 0), ρ < 1, a non-positive `norm_product` for its
+      metric, `fail_prob` outside (0, 1), and a negative or non-finite target;
+    - an `l1_ratio` above √k is clamped (it is a valid but loose bound).
+12. **The ε path and the K4 configuration do not enter the error.** They are exact, so
+    accuracy depends only on (N, rounding, dispatch, k, M) and the statistics. g, the vec mode
+    and packing have no effect.

@@ -1,4 +1,4 @@
-# immerdink — design (v1.11)
+# immerdink — design (v1.12)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -34,6 +34,9 @@ intervals and rank ties (default order: time) (no semantic, layout, launch or sp
 merged after v1.11, numbered as planned).
 v1.11 adds §6e, fast host queries from Python for hot paths (`immerdink.planner`; no
 semantic, layout, C API or spec change; v1.10 is the parallel performance-model revision).
+v1.12 adds §6f, accuracy-aware planning (host API version 8): rigorous and typical error
+estimates per configuration from caller-supplied operand statistics, `imd_err_min_moduli`, and
+an error target in `imd_perf_rank` (no semantic, layout, launch or spec change).
 The change lists are at the end.
 
 Sources:
@@ -288,7 +291,9 @@ Worst-case guidance, `2√k/T` relative to `‖a_ī‖‖b_j̄‖`:
 | 16 | 3.8e−17 (< u) | 1.4e−16 (≈ 1.2u) |
 
 Typical errors are smaller. Choosing N is the caller's job, guided by
-`params.py --table`.
+`params.py --table`. **[v1.12]** It can also be left to the host library: §6f computes this
+bound (and a typical estimate) per configuration from the caller's operand statistics, and
+`imd_err_min_moduli` / `imd_perf_rank` return the cheapest N that meets an error target.
 
 ---
 
@@ -2777,6 +2782,251 @@ Ruling: 1, 2, 5, 6, 8, 9 accepted; 3 kept until C parses the shipped calibration
 
 ---
 
+## 6f. Accuracy-aware planning (ROADMAP B2) [v1.12]
+
+Eric (2026-10-05): `rank` should answer **"the cheapest configuration that meets this error
+target"**, combining the §3.8 bounds with operand statistics the caller supplies. Until now the
+caller picked N itself, from `params.py --table` or docs/ACCURACY.md §4. The consumer is
+ehrenfest, which makes many single planner calls on a hot path (§6e). Host API **version 8**.
+No semantic, layout, launch or plan change.
+
+### 6f.1 What the caller supplies
+
+immerdink never reads the data here (kernel scope). The caller passes an `imd_err_request_t`:
+
+| field | meaning | needed for |
+|---|---|---|
+| `metric` | one of:<br>`IMD_ERR_NORMWISE`, `\|D−x\| / (‖a_i‖₂‖b_j‖₂)` (the §3.8 metric);<br>`IMD_ERR_ELEMENTWISE`, `\|D−x\| / \|x\|`;<br>`IMD_ERR_ABSOLUTE`, `\|D−x\|` | always (default NORMWISE) |
+| `target` | the error the configuration must meet; 0 = report only | `rank`, `imd_err_min_moduli` |
+| `cond` | ρ ≥ 1, an upper bound on `max ‖a_i‖₂‖b_j‖₂ / \|x_ij\|` over the outputs that must meet the target | ELEMENTWISE |
+| `norm_product` | an upper bound on `max ‖a_i‖₂‖b_j‖₂` (e.g. `max_i ‖a_i‖ · max_j ‖b_j‖`) | ABSOLUTE |
+| `l1_ratio_a`, `l1_ratio_b` | optional: upper bounds on `max_i ‖a_i‖₁ / ‖a_i‖₂` (and on the same ratio for the columns of B), in [1, √k]; 0 = unknown = √k | a tighter bound for decaying or sparse rows |
+| `basis` | which estimate must meet the target:<br>`IMD_ERR_BASIS_BOUND` (the default: the rigorous bound);<br>`IMD_ERR_BASIS_TYPICAL` (opt-in: the typical estimate) | `rank`, `imd_err_min_moduli` |
+| `fail_prob` | p, the typical estimate's failure probability per call; 0 = 2⁻²⁰ | TYPICAL |
+
+**From the lowering:**
+- k, the GEMM view's contracted length;
+- M = b·m·n, the number of outputs;
+- the dispatch;
+- N and the rounding, from the options.
+
+**No request (NULL)** reports the NORMWISE values with no target. NORMWISE needs **no
+statistics at all**: the §3.8 bound relative to ‖a_i‖‖b_j‖ depends only on (N, k, rounding).
+
+How the caller gets the statistics is up to the caller:
+- row and column 2-norms and 1-norms cost one pass over the operands;
+- ρ needs |x|, so it comes from a previous iteration, from physics, or from a cheap low-N
+  pass (docs/ACCURACY.md §4).
+
+### 6f.2 The two estimates
+
+Notation:
+- δ = ½ (RN) or 1 (TRUNC);
+- d = T − κ/2 (RN) or T (TRUNC);
+- s = √(1 + k·2⁻⁶⁰);
+- u = 2⁻⁵³;
+- ν_a and ν_b are `l1_ratio_a` and `l1_ratio_b`, clamped to √k (0 means √k).
+
+**Rigorous bound (`err_bound`), EMULATE.** PROOFS L3a (the ℓ1 form of §3.8), with
+‖a‖₁ ≤ ν_a‖a‖₂ and L1d's 2⁻σ < 2‖a‖s/d:
+
+```
+E   = 2δ·(ν_a + ν_b)·s/d  +  4δ²·k·s²/d²            (relative to ‖a_i‖‖b_j‖)
+```
+
+- With ν = √k this is exactly §3.8's term1 + term2 (`params.error_guidance`).
+- The final rounding satisfies |D − y| ≤ u|y|, where y = z·2^{−σ−τ}, |y − x| ≤ E‖a‖‖b‖ and
+  |x| ≤ ‖a‖‖b‖. Hence:
+
+```
+NORMWISE      E·(1+u) + u
+ELEMENTWISE   E·ρ·(1+u) + u
+ABSOLUTE      (E·(1+u) + u) · norm_product
+```
+
+**Guaranteed under the §3.8 hypotheses:**
+- finite inputs;
+- no over- or underflow of D;
+- α = 1, β = 0 (the bound is on the product D; other α and β add §3.7's single roundings);
+- the caller's statistics are true bounds.
+
+It does not depend on the ε path (§6c), which is exact. It needs RN acceptance (κ < T);
+otherwise there is no bound (+∞), and plan creation rejects that configuration anyway.
+
+**DIRECT dispatch** (DIRECT mode, K-empty) is the native FMA chain (§3.7).
+- Its bound is `γ_k = k·u / (1 − k·u)` relative to Σ|a_h b_h| ≤ ‖a‖‖b‖. The final rounding is
+  already included.
+- NORMWISE γ_k, ELEMENTWISE γ_k·ρ, ABSOLUTE γ_k·norm_product.
+- +∞ if k·u ≥ 1.
+
+NOOP and SCALE (no product, k = 0) give 0.
+
+**Typical estimate (`err_typical`), EMULATE with RN only.** This is a probabilistic bound
+under a stated model, not a guarantee.
+
+The model is the standard one of probabilistic rounding-error analysis: the quantization errors
+are independent and zero-mean, with |e_h| ≤ ½.
+- Per output, the first-order error Σ_h (a_h f_h 2^{−τ} + b_h e_h 2^{−σ}) is a sum of
+  independent zero-mean terms. Each lies in an interval of width
+  w_h = |a_h|2^{−τ} + |b_h|2^{−σ}, and Σ w_h² < 16(‖a‖‖b‖s/d)².
+- Hoeffding's inequality plus a union bound over the M outputs then give, with probability
+  ≥ 1 − p:
+
+```
+E_typ = min(E,  s/d·√(8·ln(2M/p))  +  k·s²/d²)        (relative to ‖a_i‖‖b_j‖)
+```
+
+It uses the same metric composition as E.
+
+For TRUNC and DIRECT, `err_typical` = `err_bound`. TRUNC's errors are not zero-mean: their sign
+follows the data (§3.3's same-sign bias).
+
+**Where the model fails:** rows with low-entropy mantissas, e.g. many equal entries that are not
+representable at the row's scale. Their quantization errors are equal and add coherently, up
+to the rigorous bound (√k / √(8 ln(2M/p)) above E_typ). This is measured in NOTES-B2 §7.
+
+**No fitted constant.** The estimate was checked against the accuracy data instead:
+- it covers all 520 M5 runs (max observed / estimate 0.23 where the emulation error dominates,
+  N ≤ 13);
+- held-out coverage (φ = 0.5…4, scaled inputs, k = 64…10⁵, structured rows) is in NOTES-B2 §7.
+
+**In moduli:** at k = 10⁴ the rigorous bound is 2√k/T = 200/T, while E_typ ≈ 13/T at M = 10⁶.
+That is about one modulus cheaper. Observed errors are another 4× below E_typ (half a modulus).
+
+### 6f.3 API (host API version 8)
+
+```c
+enum { IMD_ERR_NORMWISE = 0, IMD_ERR_ELEMENTWISE = 1, IMD_ERR_ABSOLUTE = 2 };
+enum { IMD_ERR_BASIS_BOUND = 0, IMD_ERR_BASIS_TYPICAL = 1 };
+enum { IMD_ERR_UNCHECKED = 0, IMD_ERR_MET = 1, IMD_ERR_MISSED = 2 };   /* err_status        */
+typedef struct {                 /* 64 bytes                                                  */
+  uint32_t struct_size;  int32_t metric;
+  double target, cond, norm_product, l1_ratio_a, l1_ratio_b;
+  int32_t basis, reserved;  double fail_prob;
+} imd_err_request_t;
+typedef struct {                 /* 72 bytes                                                  */
+  uint32_t struct_size;  int32_t status;
+  int32_t num_moduli, rounding, dispatch, err_status;
+  int64_t k, outputs;
+  double bound, typical;         /* in the request's metric                                  */
+  double unit_bound, unit_typical;  /* E and E_typ (EMULATE), γ_k (DIRECT): the per-(i, j)
+                                       coefficient of ‖a_i‖‖b_j‖ before the metric           */
+} imd_err_t;
+
+/* The estimates of one configuration, from scalars. num_moduli 2..20, rounding IMD_RN/TRUNC,
+   dispatch IMD_DISPATCH_*, k >= 0, outputs >= 0; req NULL = NORMWISE, no target. */
+imd_status_t imd_err_estimate(int32_t num_moduli, int32_t rounding, int32_t dispatch, int64_t k,
+                              int64_t outputs, const imd_err_request_t* req, imd_err_t* out);
+/* The smallest N in [n_lo, n_hi] (0, 0 = 2..20) whose estimate (req->basis) meets
+   req->target > 0, for this contraction and options (rounding, mode; N, g, vec_mode ignored):
+   one lowering, then the estimate per N. SUCCESS: out at that N. NOT_SUPPORTED: no N in range
+   meets the target (out at n_hi, num_moduli 0). A plan-time status of the lowering
+   (INVALID_VALUE, ...) is returned as such. */
+imd_status_t imd_err_min_moduli(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
+                                const imd_options_t* options, int32_t n_lo, int32_t n_hi,
+                                const imd_err_request_t* req, imd_err_t* out);
+
+/* appended (v8):                                                                             */
+imd_perf_request_t       { ...; const imd_err_request_t* accuracy; }          /* 40 -> 48 B  */
+imd_perf_t               { ...; double err_bound, err_typical; int32_t err_status, err_metric; }
+imd_perf_rank_request_t  { ...; const imd_err_request_t* accuracy; }          /* 88 -> 96 B  */
+imd_perf_candidate_t     { ...; double err_bound, err_typical; int32_t err_status, infeasible; }
+enum { IMD_PERF_INFEASIBLE_STATUS = 1, IMD_PERF_INFEASIBLE_BUDGET = 2,
+       IMD_PERF_INFEASIBLE_ACCURACY = 4 };                                    /* infeasible bits */
+```
+
+**One implementation.** The formulas live in `src/host/accuracy.cpp`. `imd_err_estimate`,
+`imd_err_min_moduli`, predict and rank all call the same internal function; Python only
+marshals.
+
+**Rigor in floating point.** E is computed in double and multiplied by (1 + 2⁻⁴⁰).
+- Each of its ~20 roundings, T → double included, is below 2⁻⁵³ relative, so the result is
+  never below the exact real bound.
+- The test checks this against `params.error_estimate`'s exact rational enclosure, and checks
+  that the result is at most 2⁻³⁹ above it.
+
+**predict.** A v8 `imd_perf_t` reports `err_bound` and `err_typical` of the predicted
+configuration, in the request's metric.
+- With `accuracy` NULL (or a v7-sized request): NORMWISE, no target, `err_status` UNCHECKED.
+- With a target: MET or MISSED, by `basis`.
+- A statistic missing for the metric is INVALID_VALUE.
+
+**rank.** With `accuracy` and a target, a candidate whose estimate (by basis) exceeds the
+target is **infeasible**: `feasible` = 0 and `infeasible` has `IMD_PERF_INFEASIBLE_ACCURACY`.
+- A budget miss sets `_BUDGET`; a plan-time status sets `_STATUS`. A candidate is feasible
+  iff `infeasible` = 0.
+- The order is v6's:
+  1. feasible candidates, by time;
+  2. infeasible SUCCESS candidates (budget or accuracy), by time;
+  3. the rest.
+- Ties are among the feasible candidates only.
+- So `rank(...)[0]`, when feasible, is **the cheapest configuration that meets the target**.
+  Every candidate also carries its estimates, so a caller can relax the target without
+  re-ranking.
+- A v8 candidate reports the NORMWISE estimates even without `accuracy`.
+- Requests and candidates shorter than v8 behave as v7.
+
+**Minimal N on the hot path.** `imd_err_min_moduli` is one lowering (0.3–0.7 µs) plus at most
+19 closed-form evaluations, with no performance model.
+- Time grows with N at fixed (g, vec mode), so the recommended pattern is
+  `n = min_moduli(acc)`, then `rank([n, n+1], ...)`.
+- Ranking from N = 2 upward predicts candidates the target rules out.
+
+**Python.**
+- `host.py`:
+  - `Accuracy(metric=, target=, cond=, norm_product=, l1_ratio_a=, l1_ratio_b=, basis=,
+    fail_prob=)`, a frozen dataclass marshalled to the C struct;
+  - `err_estimate(N, k, rounding=, dispatch=, outputs=, accuracy=)` and
+    `min_moduli(spec, extents, accuracy, rounding=, mode=, n_lo=, n_hi=)`, which return
+    `ErrEstimate`;
+  - `predict(..., accuracy=)`, `rank(..., accuracy=)`;
+  - `Prediction.err_*`, `Candidate.err_*` / `.infeasible`.
+- `planner.py`:
+  - `planner.Accuracy(...)` builds the C struct once (immutable, hashable);
+  - `Request(accuracy=acc)` and `q.rank(..., accuracy=acc)` take it;
+  - `q.min_moduli(acc, rounding=, mode=, n_lo=, n_hi=)` and
+    `Planner.min_moduli(spec, extents, acc, ...)` return a lazy `ErrEstimate` view
+    (memoizable).
+- Results are bit-identical to host.py (`host_planner`).
+
+### 6f.4 Tests
+
+**`host_accuracy` (CPU):**
+- `imd_err_estimate` vs `params.error_estimate` on 20 000 random (N, k, rounding, dispatch,
+  M, metric, statistics) cases: the rigorous bound lies in [exact, exact·(1 + 2⁻³⁹)], and the
+  typical estimate agrees to 1e−12 relative.
+- Invalid requests are rejected.
+- min_moduli equals a brute-force scan of `imd_err_estimate` (and of params), for both bases.
+- predict and rank:
+  - the estimates equal `imd_err_estimate` at the candidate's (N, k, dispatch, M);
+  - feasibility = (status, budget, estimate ≤ target);
+  - the order is as specified;
+  - the best feasible candidate is the fastest among those meeting the target;
+  - v7-sized structs behave as v7.
+
+**`params.py --check`:** `cert_error_estimate` checks the composed bound (with ν, ρ,
+norm_product, and DIRECT's γ_k) against `emulate_element` / exact rationals on random rows, in
+both roundings.
+
+**`host_planner`:** Accuracy, min_moduli, and predict / rank with accuracy, vs host.py.
+
+**`accuracy_err_api_quick` (GPU):** `bench/accuracy/err_api.py` checks that the measured error
+is ≤ `err_bound` in every metric on random cases. The full run is a few hundred cases; it also
+reports the typical estimate's coverage.
+
+### 6f.5 Spec
+
+**No TLA+ change.** The new functions are pure functions of scalars, descriptors and
+caller-owned plain structs: no handle, no state, no lifetime, no GPU (the §6c.6 argument).
+Rank's feasibility only compares one more number with a threshold. The bound itself is a
+[cert] (params.py) with its proof in PROOFS L3; it is not a protocol property.
+
+### 6f.6 Design questions
+
+These are for the reviewer: NOTES-B2 §7.4.
+
+---
+
 ## 7. What was considered and rejected
 
 | Option | Why not |
@@ -3000,3 +3250,24 @@ and host API; every value the same integer (bit-identical, tested on every contr
   Pure ctypes: host API unchanged (version 6), no nanobind (§6e.2). `bench/planner_floor.c`
   (`imd_planner_floor`) times the C functions alone; `bench/planner_overhead.py` prints
   both. No TLA+ change (§6e.6). Tests: `host_planner`. Design questions: §6e.7.
+
+## v1.12 (accuracy-aware planning: host API 8; no semantic, layout, launch or spec change)
+
+- **§6f (new).** `imd_err_request_t` gives the metric (normwise, elementwise or absolute), the
+  target, and the caller's operand statistics (ρ, a norm-product bound, optional ℓ1/ℓ2 ratios).
+  Two estimates come back:
+  - a rigorous bound (PROOFS L3a composed with the final rounding; DIRECT: γ_k);
+  - a typical estimate (Hoeffding under independent zero-mean RN quantization errors, RN
+    EMULATE only).
+
+  The API additions:
+  - `imd_err_estimate` (scalars) and `imd_err_min_moduli` (one lowering, smallest N meeting
+    the target);
+  - predict reports `err_bound` / `err_typical`;
+  - rank flags candidates that miss the target as infeasible (`infeasible` bits) and keeps
+    v6's order.
+
+  Python: `host.Accuracy`, `host.err_estimate`, `host.min_moduli`, and `planner.Accuracy` /
+  `Query.min_moduli`. Reference and certificate: `params.error_estimate`,
+  `cert_error_estimate`. No TLA+ change (§6f.5).
+- **§3.8.** A pointer to §6f.
