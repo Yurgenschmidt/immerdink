@@ -43,6 +43,27 @@ for the g table ([docs/MEMORY_MODEL.md](docs/MEMORY_MODEL.md) §3a has its outpu
 version). Strides default to dense (last mode fastest); pass `strides=(sA, sB, sC)` or raw
 `(extent, stride, label)` descriptors otherwise.
 
+### Contractions from Python
+
+`immerdink.Plan` / `immerdink.contract` (DESIGN §6c) run contractions on caller-owned float64
+CUDA arrays: anything with `__cuda_array_interface__` or DLPack (CuPy, PyTorch, Numba, JAX),
+or raw pointers (`immerdink.DeviceArray(ptr, shape, strides)`). No array library is
+required, nothing is copied between host and device, and immerdink allocates nothing: the
+output and the workspace are yours.
+
+```python
+import immerdink as imd                     # finds build/libimmerdink.so, or set IMMERDINK_LIB
+import cupy as cp                           # any CUDA array library works the same way
+A, B = cp.random.rand(64, 32, 48), cp.random.rand(48, 40)
+C = cp.empty((40, 64, 32))
+plan = imd.Plan("ijk,kl->lij", A, B, C, N=14)                # imd_plan_create
+ws = cp.empty(plan.workspace_bytes, cp.uint8)                # exact bytes (also: imd.workspace_size)
+plan.contract(A, B, C, alpha=1.0, beta=0.0, workspace=ws,
+              stream=cp.cuda.get_current_stream())           # enqueue only: capture-safe
+imd.contract("ijk,kl->lij", A, B, C, N=14, workspace=ws)     # einsum front end, cached plans
+pa = imd.Pack(plan.pack_spec(0))                             # packed operands (DESIGN §6b)
+```
+
 Day-to-day work lands on `dev`; `main` only changes via pull request.
 
 ## License and credits
