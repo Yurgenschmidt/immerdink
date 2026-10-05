@@ -81,7 +81,7 @@ def random_calib(rng, base, v2=False):
     """Random parameters; v2: a format-2 calibration (host API 7) with chain parameters, a
     power model, a cache term and bands, so the v7 request fields change the results."""
     params = {k: v * rng.uniform(0.5, 2.0) for k, v in base.params.items()}
-    extra = None
+    extra = base.extra or None  # keep the base's format (the shipped one may be format 2)
     if v2:
         for k in host.FORMAT2_PARAMS:
             params[k] = rng.random() * 0.05

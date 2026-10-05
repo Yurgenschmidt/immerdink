@@ -1983,7 +1983,8 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
   N = 14 only k < 286 is on the path (fully for k ≤ 36), at N = 15 fully for k ≤ 7 000 and not
   at all for k ≥ 56 000, at N ≥ 16 for every practical k. Rows with one dominant entry have f ≈ 512/k (one tile per row);
   callers pass their own f. Every prediction reports `eps_s`, the eps terms at f = 1, so the
-  exact bracket for any data is `[time − f·eps_s, time + (1 − f)·eps_s]`. The calibration
+  exact bracket for any data is `[time − f·eps_s, time + (1 − f)·eps_s]` ([v1.10] at a fixed clock:
+BURST or an explicit `clock_mhz`; under SUSTAINED the eps work also changes the settled clock). The calibration
   identifies op_eps on the same plans with different data (`imd_bench --data dominant`), not
   only through N. Consequence: with the default f, doubling k can lower the predicted time
   (f falls from 1 to 0 as k grows); never below the time without the eps terms (tested).

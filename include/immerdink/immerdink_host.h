@@ -506,7 +506,8 @@ IMD_API const char* imd_perf_phase_name(int32_t phase);
  * default is that linear ramp). Rows with one dominant entry have a fraction of about
  * 512 / k; the caller passes its own value then. Every prediction also reports eps_s, the
  * time of the eps terms at fraction 1, so a caller unsure of its data has the exact bracket
- * [time_s - f eps_s, time_s + (1 - f) eps_s] for the fraction f used (eps_fraction out). */
+ * [time_s - f eps_s, time_s + (1 - f) eps_s] for the fraction f used (eps_fraction out), at a
+ * fixed clock (v7: BURST or clock_mhz; under SUSTAINED the eps work also moves the clock). */
 
 /* What to predict beyond the options. NULL = flags 0, k4_config -1, eps_fraction -1. */
 typedef struct {

@@ -1162,8 +1162,10 @@ def suite_perf(args):
     # the eps bracket: time at fraction f = time at 0 + f eps_s; the default ramp
     for N, k in ((14, 300), (15, 4096), (16, 50000), (17, 2048), (13, 64)):
         ext = dict(i=256, j=256, k=k)
-        p0, p1 = (host.predict("ik,jk->ij", ext, N=N, eps_fraction=f) for f in (0.0, 1.0))
-        pd = host.predict("ik,jk->ij", ext, N=N)
+        # (at a fixed clock: under SUSTAINED the eps work also moves the settled clock)
+        p0, p1 = (host.predict("ik,jk->ij", ext, N=N, eps_fraction=f, regime="BURST")
+                  for f in (0.0, 1.0))
+        pd = host.predict("ik,jk->ij", ext, N=N, regime="BURST")
         lt = math.log2(math.isqrt((math.prod(MODULI[:N]) - 1) // 2))
         want = 0.0 if lt < 53 else min(1.0, max(0.0, (lt - 0.5 * math.log2(k) - 53 + 2.5) / 1.5))
         if not close(pd.eps_fraction, want, 1e-9) or \
