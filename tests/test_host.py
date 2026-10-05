@@ -712,7 +712,7 @@ def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks, l2, tail_mod=64
     last = k_hat - (k_chunks - 1) * K_C_PRIME
     chunks = [K_C_PRIME] * (k_chunks - 1) + [last]
     for gs in groups:
-        for kc in chunks:
+        for ci, kc in enumerate(chunks):
             tiles = -(-m // tm) * -(-n_hat // tn) * gs * b
             j = -(-tiles // sms)
             full, rest = divmod(j, occ)
@@ -720,8 +720,10 @@ def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks, l2, tail_mod=64
             x[occ] += full * occ * tm * tn * kc
             if rest:
                 x[rest] += rest * tm * tn * kc
-            if kc % tail_mod:  # format 1: a partial 64-wide K tile; format 2: rows not
-                # 32-byte aligned (v1.10): the chunk's MACs again (mac_ktail)
+            # format 1: a partial 64-wide K tile; format 2 (v1.10): the chunk's residue rows
+            # start mid-sector (row stride k_hat, chunk offset ci K_c'): the MACs again
+            slow = kc % 64 if tail_mod == 64 else (k_hat % 32 or (ci * K_C_PRIME) % 32)
+            if slow:
                 x[5] += (full * occ + rest) * tm * tn * kc
     for gs in groups:  # the DRAM term: a group's operands and W planes beyond L2
         x[4] += max(0, gs * b * (m + n_hat) * k_hat + gs * b * m * n_hat * (2 * k_chunks - 1)
@@ -868,7 +870,7 @@ def synthetic_v2(cal, names, rng):
         params[key] = rng.choice((0.0, rng.random() * 0.05))
     extra = {f"kernel.{n}": (v[0] + rng.randint(0, 2), 64, 4096, v[3])
              for n, v in cal.kernels.items()}
-    extra.update({"power.clock_ref_mhz": 2800.0, "power.clock_min_mhz": 1400.0,
+    extra.update({"power.clock_eff_mhz": 2800.0, "power.clock_min_mhz": 1400.0,
                   "power.cap_w": 450.0, "power.idle_w": 60.0, "power.tc_pj": 0.7,
                   "power.alu_pj": 5.0, "power.byte_pj": 20.0, "power.gamma": 2.0,
                   "warm.l2_bytes": 3.0e7, "warm.l2byte": 3e-4, "rank.tie_ratio": 1.08,
@@ -912,11 +914,11 @@ def suite_perf_v110(cal, names, rng):
                         continue
                     for q in p.phases:
                         if not close(q.time_s, 1e-9 * phase_ns(v6.params, names, q), 1e-12) or \
-                                q.p10_s != q.time_s or q.p90_s != q.time_s:
+                                q.lo_s != q.time_s or q.hi_s != q.time_s:
                             raise Fail(f"format 1 is not v6: {spec} {ext} {q}")
                     want_regime = "BURST" if regime == "DEFAULT" else regime
                     if p.regime != want_regime or p.clock_mhz != 0 or p.power_w != 0 or \
-                            p.time_p10_s != p.time_s or p.time_p90_s != p.time_s:
+                            p.time_lo_s != p.time_s or p.time_hi_s != p.time_s:
                         raise Fail(f"format 1 v7 fields: {p}")
                     count += 1
     # (2) format 2: round trip, parse errors
@@ -955,14 +957,17 @@ def suite_perf_v110(cal, names, rng):
             pr = host.predict(spec, ext, clock_mhz=2800.0, cache="COLD", **kw)
             if not close(pr.time_s, pb.time_s):
                 raise Fail("clock_mhz = f_ref differs from BURST")
-            p2 = host.predict(spec, ext, clock_mhz=5600.0, cache="COLD", **kw)
-            for q, q2 in zip(pb.phases, p2.phases):  # clock-bound terms halve
-                if not close(q2.time_s, 1e-9 * phase_ns(params, names, q, 0.5), 1e-9) or \
+            p2 = host.predict(spec, ext, clock_mhz=1400.0, cache="COLD", **kw)
+            for q, q2 in zip(pb.phases, p2.phases):  # clock-bound terms double
+                if not close(q2.time_s, 1e-9 * phase_ns(params, names, q, 2.0), 1e-9) or \
                         not close(q.time_s, 1e-9 * phase_ns(params, names, q), 1e-9):
                     raise Fail(f"clock scaling {spec} {ext} {q.name}: {q2.time_s} vs "
-                               f"{1e-9 * phase_ns(params, names, q, 0.5)}")
-            if p2.time_s > pb.time_s * (1 + 1e-12):
-                raise Fail("a higher clock predicts a longer time")
+                               f"{1e-9 * phase_ns(params, names, q, 2.0)}")
+            if p2.time_s < pb.time_s * (1 - 1e-12):
+                raise Fail("a lower clock predicts a shorter time")
+            p3 = host.predict(spec, ext, clock_mhz=5600.0, cache="COLD", **kw)  # clamped: BURST
+            if p3.clock_mhz != 2800.0 or not close(p3.time_s, pb.time_s):
+                raise Fail(f"clock above the effective clock is not BURST: {p3.clock_mhz}")
             ps = host.predict(spec, ext, regime="SUSTAINED", cache="COLD", **kw)
             pd = host.predict(spec, ext, cache="COLD", **kw)
             if pd.regime != "SUSTAINED" or not close(pd.time_s, ps.time_s):
@@ -980,11 +985,11 @@ def suite_perf_v110(cal, names, rng):
                 raise Fail(f"cache order {cold} {rep} {warm}")
             lo, hi = extra[("band.call_small", "band.call_mid", "band.call_large")[
                 0 if pb.time_s < 1e-4 else 1 if pb.time_s < 1e-3 else 2]]
-            if not (close(pb.time_p10_s, lo * pb.time_s) and close(pb.time_p90_s, hi * pb.time_s)):
+            if not (close(pb.time_lo_s, lo * pb.time_s) and close(pb.time_hi_s, hi * pb.time_s)):
                 raise Fail("call band")
             for q in pb.phases:
                 blo, bhi = extra[f"band.{q.cls}"]
-                if not (close(q.p10_s, blo * q.time_s) and close(q.p90_s, bhi * q.time_s)):
+                if not (close(q.lo_s, blo * q.time_s) and close(q.hi_s, bhi * q.time_s)):
                     raise Fail("phase band")
             count += 1
     # (6) rank: ties by footprint, raw_rank = the v6 time order, ORDER_TIME = that order
@@ -992,8 +997,12 @@ def suite_perf_v110(cal, names, rng):
                       ("kjbc,kiac->abij", dict(a=24, b=20, c=16, i=12, j=10, k=8))):
         kw = dict(N=[8, 14], vec_modes=("GENERATE", "RESIDENT"), packs=("NONE", "A", "B", "AB"),
                   reuse=3, calib=syn)
-        by_time = host.rank(spec, ext, order="TIME", **kw)
-        banded = host.rank(spec, ext, **kw)
+        by_time = host.rank(spec, ext, **kw)  # the default order is TIME
+        if by_time != host.rank(spec, ext, order="TIME", **kw):
+            raise Fail("rank default order is not TIME")
+        banded = host.rank(spec, ext, order="TIES_BY_FOOTPRINT", **kw)
+        if [c.tie for c in sorted(banded, key=lambda c: c.raw_rank)] != [c.tie for c in by_time]:
+            raise Fail("tie differs between the orders")
         if [c.raw_rank for c in by_time] != list(range(len(by_time))):
             raise Fail("raw_rank of the time order")
         if sorted(c.raw_rank for c in banded) != list(range(len(banded))):
@@ -1014,7 +1023,7 @@ def suite_perf_v110(cal, names, rng):
         if banded[len(ties):] != [c for c in by_time if not c.tie]:
             raise Fail("rank: the non-tied candidates keep the time order")
         for c in banded:
-            if c.status == "SUCCESS" and not (c.time_p10_s <= c.time_s <= c.time_p90_s):
+            if c.status == "SUCCESS" and not (c.time_lo_s <= c.time_s <= c.time_hi_s):
                 raise Fail("candidate band")
         count += 1
     # (7) occupancy table names

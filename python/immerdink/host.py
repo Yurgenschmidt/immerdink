@@ -62,7 +62,7 @@ _PERF_PACK = {"NONE": 1, "A": 2, "B": 4, "AB": 8}
 _PERF_KERNEL_CAPACITY, _PERF_KERNEL_COUNT, _PERF_CLASS_CAPACITY = 128, 90, 16
 PERF_REGIMES = {"DEFAULT": 0, "BURST": 1, "SUSTAINED": 2}
 PERF_CACHES = {"COLD": 0, "WARM": 1, "REPEAT": 2}
-PERF_ORDERS = {"BAND": 0, "TIME": 1}
+PERF_ORDERS = {"TIME": 0, "TIES_BY_FOOTPRINT": 1}
 # The parameters new in calibration format 2 (absent from a format-1 file).
 FORMAT2_PARAMS = frozenset({"k0.chain", "kl.wave", "pack.chain", "pack.wave", "k5.chain",
                             "k5.dram",
@@ -140,7 +140,7 @@ class _PerfCalib(C.Structure):
                 ("param", C.c_double * _PERF_PARAM_CAPACITY),
                 # v7 (format 2)
                 ("kernel", (C.c_int32 * 4) * _PERF_KERNEL_CAPACITY),
-                ("clock_ref_mhz", C.c_double), ("clock_min_mhz", C.c_double),
+                ("clock_eff_mhz", C.c_double), ("clock_min_mhz", C.c_double),
                 ("power_cap_w", C.c_double), ("power_idle_w", C.c_double),
                 ("energy_tc_pj", C.c_double), ("energy_alu_pj", C.c_double),
                 ("energy_byte_pj", C.c_double), ("energy_gamma", C.c_double),
@@ -174,9 +174,9 @@ class _Perf(C.Structure):
                 # v7
                 ("regime", C.c_int32), ("cache", C.c_int32), ("clock_mhz", C.c_double),
                 ("power_w", C.c_double), ("warm_bytes", C.c_double),
-                ("time_p10_s", C.c_double), ("time_p90_s", C.c_double),
-                ("phase_p10_s", C.c_double * _PERF_MAX_PHASES),
-                ("phase_p90_s", C.c_double * _PERF_MAX_PHASES)]
+                ("time_lo_s", C.c_double), ("time_hi_s", C.c_double),
+                ("phase_lo_s", C.c_double * _PERF_MAX_PHASES),
+                ("phase_hi_s", C.c_double * _PERF_MAX_PHASES)]
 
 
 class _RankRequest(C.Structure):
@@ -199,7 +199,7 @@ class _Candidate(C.Structure):
                 ("workspace_bytes", C.c_uint64), ("plan_device_bytes", C.c_uint64),
                 ("pack_bytes", C.c_uint64), ("pack_ws_bytes", C.c_uint64),
                 ("total_bytes", C.c_uint64), ("kernel_launches", C.c_int64),
-                ("time_p10_s", C.c_double), ("time_p90_s", C.c_double),  # v7
+                ("time_lo_s", C.c_double), ("time_hi_s", C.c_double),  # v7
                 ("clock_mhz", C.c_double), ("power_w", C.c_double),
                 ("tie", C.c_int32), ("raw_rank", C.c_int32)]
 
@@ -696,7 +696,7 @@ class Calibration:
     @property
     def power(self):
         r = self._raw
-        return {"power.clock_ref_mhz": r.clock_ref_mhz, "power.clock_min_mhz": r.clock_min_mhz,
+        return {"power.clock_eff_mhz": r.clock_eff_mhz, "power.clock_min_mhz": r.clock_min_mhz,
                 "power.cap_w": r.power_cap_w, "power.idle_w": r.power_idle_w,
                 "power.tc_pj": r.energy_tc_pj, "power.alu_pj": r.energy_alu_pj,
                 "power.byte_pj": r.energy_byte_pj, "power.gamma": r.energy_gamma}
@@ -714,7 +714,7 @@ class Calibration:
         return out
 
     def format(self):
-        """The canonical format-1 text (imd_perf_calib_format)."""
+        """The canonical text in the calibration's own format, 1 or 2 (imd_perf_calib_format)."""
         h = self._lib or load()
         n = C.c_size_t(0)
         h.lib.imd_perf_calib_format(C.byref(self._raw), None, 0, C.byref(n))
@@ -775,8 +775,8 @@ class PhasePrediction:
     bound_s: float
     x: tuple         # features (the model: sum of param[cls][j] * x[j], ns; K4: max of
                      # the round-model terms j < 4 and the DRAM term j = 4)
-    p10_s: float = 0.0  # v7: the phase's band
-    p90_s: float = 0.0
+    lo_s: float = 0.0  # v7: the phase's band
+    hi_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -803,8 +803,8 @@ class Prediction:
     clock_mhz: float = 0.0    # input bytes served from L2, and the band of time_s
     power_w: float = 0.0
     warm_bytes: float = 0.0
-    time_p10_s: float = 0.0
-    time_p90_s: float = 0.0
+    time_lo_s: float = 0.0
+    time_hi_s: float = 0.0
 
     def phase(self, name):
         """The PhasePrediction with this name, or None."""
@@ -822,7 +822,7 @@ def _calib_arg(calib):
 def _prediction(r, st):
     phases = tuple(PhasePrediction(PERF_PHASES[p.phase], PERF_CLASSES[p.cls], p.launches,
                                    p.time_s, p.bytes, p.ops, p.bound_s, tuple(p.x),
-                                   r.phase_p10_s[i], r.phase_p90_s[i])
+                                   r.phase_lo_s[i], r.phase_hi_s[i])
                    for i, p in enumerate(r.phase[:r.num_phases]))
     reg = {v: k for k, v in PERF_REGIMES.items()}
     cac = {v: k for k, v in PERF_CACHES.items()}
@@ -831,7 +831,7 @@ def _prediction(r, st):
                       r.kernel_launches, r.workspace_bytes, r.plan_device_bytes, r.pack_bytes,
                       r.pack_ws_bytes, phases, reg.get(r.regime, "BURST"),
                       cac.get(r.cache, "COLD"), r.clock_mhz, r.power_w, r.warm_bytes,
-                      r.time_p10_s, r.time_p90_s)
+                      r.time_lo_s, r.time_hi_s)
 
 
 def _eps(eps_fraction):
@@ -897,8 +897,8 @@ class Candidate:
     pack_ws_bytes: int
     total_bytes: int
     kernel_launches: int
-    time_p10_s: float = 0.0   # v7: band of time_s, the contract's clock and power, tie with
-    time_p90_s: float = 0.0   # the best (ORDER_BAND) and the place in the v6 time order
+    time_lo_s: float = 0.0   # v7: band of time_s, the contract's clock and power, tie with
+    time_hi_s: float = 0.0   # the best (ORDER_BAND) and the place in the v6 time order
     clock_mhz: float = 0.0
     power_w: float = 0.0
     tie: bool = False
@@ -907,11 +907,14 @@ class Candidate:
 
 def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",),
          packs=("NONE",), reuse=1, budget=0, beta=False, rounding="RN", mode="EMULATE",
-         eps_fraction=None, order="BAND", regime="DEFAULT", cache="COLD", clock_mhz=0.0,
+         eps_fraction=None, order="TIME", regime="DEFAULT", cache="COLD", clock_mhz=0.0,
          calib=None, lib=None):
     """imd_perf_rank: the candidates N x g x vec mode x packs ranked by predicted time inside a
     device-memory budget (bytes; 0 = none). N: an int or a list of admissible N; g: None
-    (every g in 1..N) or a list; packs: any of "NONE", "A", "B", "AB"."""
+    (every g in 1..N) or a list; packs: any of "NONE", "A", "B", "AB". v7: order "TIME" (the
+    default) or "TIES_BY_FOOTPRINT" (the candidates within the calibration's tie ratio of the
+    best first, by footprint; Candidate.tie is set in either order), regime / cache / clock_mhz
+    as predict."""
     Ns = [int(N)] if hasattr(N, "__index__") else [int(x) for x in N]
     gs = [] if g is None else ([int(g)] if isinstance(g, int) else [int(x) for x in g])
     h, call = _prep(spec, extents, strides, Ns[0], 0, rounding, mode, "GENERATE", lib)
@@ -941,8 +944,8 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
                       c.k4_config, DISPATCH[c.dispatch], c.time_s, c.contract_s, c.pack_s,
                       c.tflops_eq, c.eps_s, c.eps_fraction, c.workspace_bytes,
                       c.plan_device_bytes, c.pack_bytes,
-                      c.pack_ws_bytes, c.total_bytes, c.kernel_launches, c.time_p10_s,
-                      c.time_p90_s, c.clock_mhz, c.power_w, bool(c.tie), c.raw_rank)
+                      c.pack_ws_bytes, c.total_bytes, c.kernel_launches, c.time_lo_s,
+                      c.time_hi_s, c.clock_mhz, c.power_w, bool(c.tie), c.raw_rank)
             for c in out[:count.value]]
 
 

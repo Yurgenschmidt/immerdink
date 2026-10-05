@@ -431,7 +431,7 @@ def seed_extra(lib, kernels=None, fref=0.0, base=None):
     if kernels:
         for n, v in kernels.items():
             ex[f"kernel.{n}"] = v
-    ex.update({"power.clock_ref_mhz": fref, "power.clock_min_mhz": fref, "power.cap_w": 0.0,
+    ex.update({"power.clock_eff_mhz": fref, "power.clock_min_mhz": fref, "power.cap_w": 0.0,
                "power.idle_w": 0.0, "power.tc_pj": 0.0, "power.alu_pj": 0.0,
                "power.byte_pj": 0.0, "power.gamma": 2.0,
                "warm.l2_bytes": 0.0, "warm.l2byte": 0.0, "rank.tie_ratio": 1.0})
@@ -494,7 +494,7 @@ def fit_power(rows, fref, gammas=(1.0, 2.0, 3.0), idle=60.0):
         if best is None or err < best[0]:
             best = (err, gm, th)
     _, gm, th = best
-    return {"power.clock_ref_mhz": fref, "power.clock_min_mhz": 0.8 * min(r["f"] for r in rows),
+    return {"power.clock_eff_mhz": fref, "power.clock_min_mhz": 0.8 * min(r["f"] for r in rows),
             "power.cap_w": float(np.median([r["cap"] for r in rows])), "power.idle_w": float(idle),
             "power.tc_pj": float(th[0]), "power.alu_pj": float(th[1]), "power.byte_pj": float(th[2]),
             "power.gamma": gm}

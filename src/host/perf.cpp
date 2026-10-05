@@ -103,7 +103,7 @@ constexpr uint32_t kRequestV1Size = offsetof(imd_perf_request_t, regime);
 constexpr uint32_t kPerfV1Size = offsetof(imd_perf_t, regime);
 constexpr uint32_t kRankRequestV1Size = offsetof(imd_perf_rank_request_t, regime);
 constexpr uint32_t kRankRequestV7Size = sizeof(imd_perf_rank_request_t);
-constexpr uint32_t kCandidateV1Size = offsetof(imd_perf_candidate_t, time_p10_s);
+constexpr uint32_t kCandidateV1Size = offsetof(imd_perf_candidate_t, time_lo_s);
 static_assert(sizeof(imd_perf_phase_t) == 96, "imd_perf_phase_t v1 layout changed");
 static_assert(kCalibV1Size == 1232, "imd_perf_calib_t v1 layout changed");
 static_assert(kPerfV1Size == 1648, "imd_perf_t v1 layout changed");
@@ -194,13 +194,23 @@ imd_perf_kernel_t builtin_kernel(int32_t k) {
 void migrate_v7_fields(imd_perf_calib_t* cal) {
   for (int k = 0; k < IMD_PERF_KERNEL_CAPACITY; ++k)
     cal->kernel[k] = k < IMD_PERF_KERNEL_COUNT ? builtin_kernel(k) : imd_perf_kernel_t{0, 0, 0, 0};
-  cal->clock_ref_mhz = cal->clock_min_mhz = cal->power_cap_w = cal->power_idle_w = 0;
+  cal->clock_eff_mhz = cal->clock_min_mhz = cal->power_cap_w = cal->power_idle_w = 0;
   cal->energy_tc_pj = cal->energy_alu_pj = cal->energy_byte_pj = 0;
   cal->energy_gamma = 2;
   cal->warm_l2_bytes = cal->warm_l2byte_ns = 0;
   cal->tie_ratio = 1;
   for (auto& b : cal->band_call) b[0] = b[1] = 1;
   for (auto& b : cal->band_class) b[0] = b[1] = 1;
+}
+
+// A true format-1 calibration (DESIGN §6c.2): format 1, every format-2 parameter 0 (format 1
+// has none: a format-2 parameter kept with format-1 features would be an unvalidated hybrid).
+// The v7 fields (if the struct has them) are migrated by the caller.
+void to_format1_params(imd_perf_calib_t* cal) {
+  cal->format = 1;
+  for (int cl = 0; cl < IMD_PERF_CLASS_COUNT; ++cl)
+    for (int j = 0; j < kP; ++j)
+      if (kFormat2Param[cl][j]) cal->param[cl * kP + j] = 0;
 }
 
 // ---- features -----------------------------------------------------------------------------
@@ -424,12 +434,34 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     const int64_t chunk = c::kKcPrime;
     const int64_t gsz[2] = {e.g, e.N % e.g}, gcnt[2] = {e.N / e.g, e.N % e.g ? 1 : 0};
     const int64_t last = e.k_hat - (kc.k_chunks - 1) * chunk;
-    const int64_t ksz[2] = {chunk, last}, kcnt[2] = {kc.k_chunks - 1, 1};
+    // The K-chunk kinds: full chunks with aligned / misaligned rows, then the last chunk.
+    // The slow K-chunks (mac_ktail): format 1 (v1.8) took a chunk whose length is not a
+    // multiple of the 64-wide K tile (CUTLASS's predicated residue tile); format 2 (v1.10,
+    // NOTES-B2 §6) one whose residue rows start mid-sector: K4 reads chunk c of a row at
+    // row * k_hat + c * K_c' (lda = k_hat, gemm_k4.cu), so the rows are 32-byte aligned iff
+    // k_hat and the chunk offset c * K_c' are multiples of 32 (K_c' = 131056 = 16 mod 32: the
+    // odd chunks are misaligned when k_hat is aligned). That explains k_hat = 1008 / 5008
+    // (slow) and 800 (not slow) alike.
+    const int64_t nfull = kc.k_chunks - 1;
+    bool last_slow;
+    int64_t full_slow;
+    if (cal.format == 1) {
+      full_slow = chunk % kK4TileK != 0 ? nfull : 0;
+      last_slow = last % kK4TileK != 0;
+    } else if (e.k_hat % kK4RowAlign != 0) {
+      full_slow = nfull, last_slow = true;
+    } else {
+      const auto misaligned = [&](int64_t c) { return (c * chunk) % kK4RowAlign != 0; };
+      full_slow = 0;
+      for (int64_t c = 0; c < nfull; ++c) full_slow += misaligned(c) ? 1 : 0;
+      last_slow = misaligned(nfull);
+    }
+    const int64_t ksz[3] = {chunk, chunk, last}, kcnt[3] = {nfull - full_slow, full_slow, 1};
+    const bool kslow[3] = {false, true, last_slow};
     double x[kP] = {0, 0, 0, 0, 0, 0};
     const int occ = kK4Configs[cfg].ctas_per_sm;
-    const int64_t tail_mod = cal.format == 1 ? kK4TileK : kK4RowAlign;
     for (int i = 0; i < 2; ++i)
-      for (int j = 0; j < 2; ++j) {
+      for (int j = 0; j < 3; ++j) {
         if (gcnt[i] == 0 || kcnt[j] == 0) continue;
         const K4Rounds r = k4_rounds(cfg, e.m, e.n_hat, ksz[j], gsz[i] * e.b, sms);
         const double cnt = static_cast<double>(gcnt[i]) * static_cast<double>(kcnt[j]);
@@ -437,13 +469,8 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         x[0] += cnt * (full + (r.rest > 0 ? 1 : 0));
         x[occ] += cnt * full * occ * macs;
         if (r.rest > 0) x[r.rest] += cnt * r.rest * macs;
-        // The slow K-chunks (mac_ktail): format 1 (v1.8) took a chunk whose length is not a
-        // multiple of the 64-wide K tile (CUTLASS's predicated residue tile); format 2 (v1.10,
-        // NOTES-B2 §6) one whose rows are not 32-byte aligned (k_hat mod 32 = 16: every int8
-        // residue row starts mid-sector, so the k-tile loads touch one more sector), which
-        // explains k_hat = 1008 / 5008 (slow) and 800 (not slow) alike. Its MACs again, at
-        // their extra cost.
-        if (ksz[j] % tail_mod != 0) x[kK4TailSlot] += cnt * (full * occ + r.rest) * macs;
+        // A slow chunk's MACs again, at their extra cost (mac_ktail).
+        if (kslow[j]) x[kK4TailSlot] += cnt * (full * occ + r.rest) * macs;
       }
     const double k4_bytes = N * b * (m + nh) * kh + N * b * m * nh * (2.0 * kc.k_chunks - 1);
     // The DRAM term: per group, its operand residues (just written by the packs) and its W
@@ -595,14 +622,14 @@ bool calib_valid(const imd_perf_calib_t& c) {
     const imd_perf_kernel_t& q = c.kernel[k];
     if (q.resident < 1 || q.regs < 0 || q.smem_bytes < 0 || q.threads < 0) return false;
   }
-  for (const double v : {c.clock_ref_mhz, c.clock_min_mhz, c.power_cap_w, c.power_idle_w,
+  for (const double v : {c.clock_eff_mhz, c.clock_min_mhz, c.power_cap_w, c.power_idle_w,
                          c.energy_tc_pj, c.energy_alu_pj, c.energy_byte_pj, c.energy_gamma,
                          c.warm_l2_bytes, c.warm_l2byte_ns, c.tie_ratio})
     if (!finite_nonneg(v)) return false;
-  if (c.power_cap_w > 0 && !(c.clock_ref_mhz > 0 && c.clock_min_mhz > 0 &&
-                             c.clock_min_mhz <= c.clock_ref_mhz))
+  if (c.power_cap_w > 0 && !(c.clock_eff_mhz > 0 && c.clock_min_mhz > 0 &&
+                             c.clock_min_mhz <= c.clock_eff_mhz))
     return false;
-  if (!(c.tie_ratio >= 1)) return false;
+  if (!(c.tie_ratio >= 1 && c.tie_ratio <= 1.25)) return false;
   const auto band_ok = [](const double* b) {
     return std::isfinite(b[0]) && std::isfinite(b[1]) && b[0] > 0 && b[0] <= b[1];
   };
@@ -619,7 +646,7 @@ struct ScalarKey {
   double imd_perf_calib_t::*field;
 };
 constexpr ScalarKey kScalarKeys[] = {
-    {"power.clock_ref_mhz", &imd_perf_calib_t::clock_ref_mhz},
+    {"power.clock_eff_mhz", &imd_perf_calib_t::clock_eff_mhz},
     {"power.clock_min_mhz", &imd_perf_calib_t::clock_min_mhz},
     {"power.cap_w", &imd_perf_calib_t::power_cap_w},
     {"power.idle_w", &imd_perf_calib_t::power_idle_w},
@@ -766,19 +793,19 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
   if (f2) {
     for (int i = kKernelSlot; i < kSeen; ++i)
       if (!seen[i]) return fail(0);
-    if (r.power_cap_w > 0 && !(r.clock_ref_mhz > 0 && r.clock_min_mhz > 0 &&
-                               r.clock_min_mhz <= r.clock_ref_mhz))
+    if (r.power_cap_w > 0 && !(r.clock_eff_mhz > 0 && r.clock_min_mhz > 0 &&
+                               r.clock_min_mhz <= r.clock_eff_mhz))
       return fail(0);
-    if (!(r.tie_ratio >= 1)) return fail(0);
+    if (!(r.tie_ratio >= 1 && r.tie_ratio <= 1.25)) return fail(0);
     for (int k = IMD_PERF_KERNEL_COUNT; k < IMD_PERF_KERNEL_CAPACITY; ++k) r.kernel[k] = {};
     for (int cl = IMD_PERF_CLASS_COUNT; cl < IMD_PERF_CLASS_CAPACITY; ++cl)
       r.band_class[cl][0] = r.band_class[cl][1] = 1;
   } else {
     migrate_v7_fields(&r);
   }
-  // A caller compiled against version 6 has no room for the v7 fields: it gets the v6 part
-  // (a format-2 calibration then reads as format 1 there, which is what it is to that caller).
-  if (out->struct_size < kCalibV7Size) r.format = 1;
+  // A caller compiled against version 6 has no room for the v7 fields: it gets a true
+  // format-1 view (the format-2 parameters zeroed): a degraded model (DESIGN §6c.3).
+  if (out->struct_size < kCalibV7Size) to_format1_params(&r);
   r.struct_size = out->struct_size;
   std::memcpy(out, &r, std::min<size_t>(out->struct_size, sizeof r));
   if (error_line != nullptr) *error_line = 0;
@@ -897,7 +924,10 @@ imd_status_t resolve_calib(const imd_perf_calib_t* in, imd_perf_calib_t* scratch
     cal->format = 1;
   }
   if (!calib_valid(*cal)) return IMD_STATUS_INVALID_VALUE;
-  if (cal->format == 1) migrate_v7_fields(cal);
+  if (cal->format == 1) {
+    to_format1_params(cal);
+    migrate_v7_fields(cal);
+  }
   cal->struct_size = sizeof *cal;
   return IMD_STATUS_SUCCESS;
 }
@@ -910,7 +940,10 @@ struct Req {
   double eps = -1, clock = 0;
 };
 
-// The time of every phase at clock scale s = f_ref / f (no cache term), and its sum.
+// The time of every phase at clock scale s = f_eff / f (no cache term), and its sum. The power
+// model and the SUSTAINED clock use this COLD time in every cache state (documented
+// approximation: the REPEAT saving is up to 16 % only on calls that fit the L2, which are far
+// below the power cap, so the solved clock is the same).
 double call_seconds(const imd_perf_calib_t& cal, const PerfPhases& P, double scale) {
   double t = 0;
   for (int i = 0; i < P.n; ++i) t += perf_phase_seconds(cal, P.ph[i], scale);
@@ -920,7 +953,7 @@ double call_seconds(const imd_perf_calib_t& cal, const PerfPhases& P, double sca
 // The call's average power at clock f (DESIGN §6c.1 "Clock regimes"): idle + (tensor-core and
 // ALU energy scaled by (f / f_ref)^gamma + DRAM energy) / time; 0 without a power model.
 double call_power(const imd_perf_calib_t& cal, const PerfPhases& P, double f, double t) {
-  if (!(cal.power_cap_w > 0) || !(cal.clock_ref_mhz > 0)) return 0;
+  if (!(cal.power_cap_w > 0) || !(cal.clock_eff_mhz > 0)) return 0;
   double tc = 0, alu = 0, bytes = 0;
   for (int i = 0; i < P.n; ++i) {
     const PerfPhase& p = P.ph[i];
@@ -931,7 +964,7 @@ double call_power(const imd_perf_calib_t& cal, const PerfPhases& P, double f, do
              p.cls == IMD_PERF_CLASS_DIRECT)
       alu += p.x[2];
   }
-  const double dyn = std::pow(f / cal.clock_ref_mhz, cal.energy_gamma);
+  const double dyn = std::pow(f / cal.clock_eff_mhz, cal.energy_gamma);
   const double joules = ((cal.energy_tc_pj * tc + cal.energy_alu_pj * alu) * dyn +
                          cal.energy_byte_pj * bytes) * 1e-12;
   return cal.power_idle_w + (t > 0 ? joules / t : 0);
@@ -942,19 +975,19 @@ double call_power(const imd_perf_calib_t& cal, const PerfPhases& P, double f, do
 // (bisection; f_min if even that is above). 0: no clock model (f_ref = 0).
 double resolve_clock(const imd_perf_calib_t& cal, const PerfPhases& P, const Req& q,
                      int32_t* regime_used) {
-  const bool has_power = cal.power_cap_w > 0 && cal.clock_ref_mhz > 0;
+  const bool has_power = cal.power_cap_w > 0 && cal.clock_eff_mhz > 0;
   int32_t reg = q.regime;
   if (reg == IMD_PERF_REGIME_DEFAULT) reg = has_power ? IMD_PERF_REGIME_SUSTAINED : IMD_PERF_REGIME_BURST;
   *regime_used = reg;
-  const double fr = cal.clock_ref_mhz;
+  const double fr = cal.clock_eff_mhz;
   if (!(fr > 0)) return 0;
-  if (q.clock > 0) return q.clock;
+  if (q.clock > 0) return std::min(q.clock, fr);  // at or above the effective clock: BURST
   if (reg == IMD_PERF_REGIME_BURST || !has_power) return fr;
   const auto power_at = [&](double f) { return call_power(cal, P, f, call_seconds(cal, P, fr / f)); };
   if (power_at(fr) <= cal.power_cap_w) return fr;
   double lo = cal.clock_min_mhz, hi = fr;
   if (power_at(lo) >= cal.power_cap_w) return lo;
-  for (int it = 0; it < 60; ++it) {  // P is increasing in f: power(lo) < cap < power(hi)
+  for (int it = 0; it < 40 && hi - lo > 0.05; ++it) {  // P increases in f; 0.05 MHz
     const double mid = 0.5 * (lo + hi);
     (power_at(mid) > cal.power_cap_w ? hi : lo) = mid;
   }
@@ -970,7 +1003,7 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   r->kernel_launches = P.launches;
   int32_t regime = IMD_PERF_REGIME_BURST;
   const double f = resolve_clock(cal, P, q, &regime);
-  const double scale = f > 0 ? cal.clock_ref_mhz / f : 1.0;
+  const double scale = f > 0 ? cal.clock_eff_mhz / f : 1.0;
   // COLD / WARM (DESIGN §6c.1 "Cache state"): the parameters are COLD costs (the fitter adds the
   // calibration records' resident-input saving back); a REPEAT / WARM call saves warm.l2byte per
   // resident input byte in the phases that read them first.
@@ -999,8 +1032,8 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
     for (int j = 0; j < kP; ++j) o.x[j] = p.x[j];
     const bool call = p.cls == IMD_PERF_CLASS_CALL;
     const double* b = cal.band_class[p.cls];
-    r->phase_p10_s[i] = call ? o.time_s : o.time_s * b[0];
-    r->phase_p90_s[i] = call ? o.time_s : o.time_s * b[1];
+    r->phase_lo_s[i] = call ? o.time_s : o.time_s * b[0];
+    r->phase_hi_s[i] = call ? o.time_s : o.time_s * b[1];
     t += o.time_s;
     bound += o.bound_s;
   }
@@ -1011,7 +1044,7 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   r->tflops_eq = t > 0 ? r->flops_eq / t * 1e-12 : 0;
   const double* bc = cal.band_call[band_class_of(t)];
   lo = t * bc[0], hi = t * bc[1];
-  r->time_p10_s = lo, r->time_p90_s = hi;
+  r->time_lo_s = lo, r->time_hi_s = hi;
   r->regime = regime;
   r->cache = q.cache;
   r->clock_mhz = f;
@@ -1124,7 +1157,7 @@ imd_status_t imd_perf_calib_default(imd_perf_calib_t* out) {
     // caller gets its format-1 view: the v7 fields do not fit; NULL is the full one).
     imd_perf_calib_t c = *imd::detail::shipped_calib();
     if (c.format == 0) return IMD_STATUS_INVALID_VALUE;
-    if (out->struct_size < imd::detail::kCalibV7Size) c.format = 1;
+    if (out->struct_size < imd::detail::kCalibV7Size) imd::detail::to_format1_params(&c);
     c.struct_size = out->struct_size;
     std::memcpy(out, &c, std::min<size_t>(out->struct_size, sizeof c));
     return IMD_STATUS_SUCCESS;
@@ -1172,6 +1205,7 @@ imd_status_t imd_perf_calib_format(const imd_perf_calib_t* calib, char* buf, siz
   std::memcpy(&c, calib, std::min<size_t>(calib->struct_size, sizeof c));
   if (calib->struct_size < imd::detail::kCalibV7Size && c.format == 2) c.format = 1;
   if (!imd::detail::calib_valid(c)) return IMD_STATUS_INVALID_VALUE;
+  if (c.format == 1) imd::detail::to_format1_params(&c);
   for (const auto& [p, cap] : {std::pair<const char*, size_t>{c.gpu, sizeof c.gpu},
                                {c.date, sizeof c.date},
                                {c.version, sizeof c.version},
@@ -1254,7 +1288,7 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
   int32_t order = IMD_PERF_ORDER_TIME;  // a version-6 request: the v6 order
   if (req->struct_size >= kRankRequestV7Size) {
     if (!v7_valid(req->regime, req->cache, req->clock_mhz) ||
-        (req->order != IMD_PERF_ORDER_BAND && req->order != IMD_PERF_ORDER_TIME))
+        (req->order != IMD_PERF_ORDER_TIES_BY_FOOTPRINT && req->order != IMD_PERF_ORDER_TIME))
       return IMD_STATUS_INVALID_VALUE;
     q.regime = req->regime, q.cache = req->cache, q.clock = req->clock_mhz;
     order = req->order;
@@ -1329,8 +1363,8 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
               st = predict_pack(desc[x], q, cal, &pp);
               pack_s += pp.time_s;
               pack_eps += pp.eps_s;
-              pack_lo += pp.time_p10_s;
-              pack_hi += pp.time_p90_s;
+              pack_lo += pp.time_lo_s;
+              pack_hi += pp.time_hi_s;
               pack_bytes += pp.pack_bytes;
               pack_ws += pp.pack_ws_bytes;
             }
@@ -1351,8 +1385,8 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
               c.total_bytes = fits ? total : UINT64_MAX;
               c.feasible = req->budget_bytes == 0 || c.total_bytes <= req->budget_bytes;
               c.kernel_launches = pr.kernel_launches;
-              c.time_p10_s = pr.time_p10_s + pack_lo / req->reuse;
-              c.time_p90_s = pr.time_p90_s + pack_hi / req->reuse;
+              c.time_lo_s = pr.time_lo_s + pack_lo / req->reuse;
+              c.time_hi_s = pr.time_hi_s + pack_hi / req->reuse;
               c.clock_mhz = pr.clock_mhz, c.power_w = pr.power_w;
             }
             cands.push_back(cd);
@@ -1379,15 +1413,15 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
       return tail(x.c, y.c);
     });
     for (size_t i = 0; i < cands.size(); ++i) cands[i].c.raw_rank = static_cast<int32_t>(i);
-    // v7 (DESIGN §6c.1 "Prediction intervals and ties"): the feasible candidates whose band
-    // overlaps the best's are ties, first, by footprint.
+    // v7 (DESIGN §6c.1 "Prediction intervals and ties"): in every order, the feasible
+    // candidates within tie_ratio x the best's time are ties; ORDER_TIES_BY_FOOTPRINT puts them
+    // first, by footprint. (A time ratio, not band overlap: candidates of one contraction share
+    // most of the model's error, and overlapping 80 % bands tied candidates 1.2-1.4x apart.)
     if (!cands.empty() && rank_of(cands[0].c) == 0) {
-      // (DESIGN §6c.1: a ratio, not band overlap: two candidates of one contraction share most
-      // of the model's error, and overlapping 80 % bands would tie candidates 1.2-1.4x apart.)
       const double best_tie = cands[0].c.time_s * cal.tie_ratio;
       for (Cand& cd : cands)
         cd.c.tie = rank_of(cd.c) == 0 && cd.c.time_s <= best_tie ? 1 : 0;
-      if (order == IMD_PERF_ORDER_BAND)
+      if (order == IMD_PERF_ORDER_TIES_BY_FOOTPRINT)
         std::stable_sort(cands.begin(), cands.end(), [&](const Cand& x, const Cand& y) {
           if (x.c.tie != y.c.tie) return x.c.tie > y.c.tie;
           if (!x.c.tie) return x.c.raw_rank < y.c.raw_rank;

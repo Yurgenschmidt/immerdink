@@ -213,6 +213,18 @@ validation logs next to them.
   correct. Possible kernel follow-up, out of B2's scope: padding k̂ to a multiple of 32 would
   make these shapes ~30 % faster in K4.
 
+  **After review (2026-10-05):**
+  - The criterion is now applied **per chunk**. K4 reads chunk c of a row at `row·k̂ + c·K_c'`,
+    and K_c' = 131056 ≡ 16 (mod 32), so for an aligned k̂ the odd chunks are misaligned. This
+    is identical to k̂ mod 32 for single-chunk calls.
+  - The two-chunk check measured 512² × 262144 (chunk 1 misaligned) against 262160 (all
+    misaligned), N = 8 / 14. K4 took 3.62 / 5.74 ms and 3.33 / 4.64 ms, about 0.006 ps per MAC,
+    so it is DRAM-bound. The power-of-two row stride is the slower one, which points to a
+    DRAM-channel effect, not alignment. The check is **inconclusive**, and both calls are
+    predicted 12–22 % low (like 768² × 100000: long k with few CTAs).
+  - Evidence strength: 128×256 has the full sweep. 128×128 is partly counter-evidence (4960 is
+    +14 % there). 64×128 and 64×64 are untested.
+
 ### 6.2 Hold-out, before and after (post-BIOS data, 136 calls, BURST, REPEAT state)
 
 "Before" is the v1.8 model form refitted on the same post-BIOS calibration data (`perf_fit
@@ -327,7 +339,9 @@ Largest remaining errors:
 
   The per-call probe reads 2294–2561 MHz (p10–p90) at ≥ 1 ms: ~11 % below NVML and noisy, so
   it is only a relative indicator.
-- **Ranking ties, changed from the design after the data.** "Bands overlap the best" tied 236 of
+- **Ranking ties, changed from the design after the data** (the ratio rule was accepted in
+  review; the default order is **TIME**, and TIES_BY_FOOTPRINT is opt-in, with `tie` set in every
+  order). "Bands overlap the best" tied 236 of
   360 candidates on a CC tensor, up to 1.36× slower, and the footprint tie-break then picked
   slow ones. Candidates of one contraction share most of the model error: across pairs of
   hold-out calls of the same case, the error of the time ratio is ±7.5 % at the 80th
@@ -366,7 +380,33 @@ The shipped calibration is now parsed once in C (a function-local static), so pa
 calibration costs nothing extra, and `immerdink.planner` now passes NULL. The v7 fields do not
 change per-query costs: in `planner_overhead`, predict takes 1.6–1.8 µs and rank 8–18 µs.
 
-### 6.7 Open
+### 6.7 Review decisions (2026-10-05)
+
+- Accepted: the SUSTAINED default (with its two biases documented), the COLD default
+  (recommend WARM when an input is the previous output), WARM = REPEAT (provisional), and the
+  ratio tie rule.
+- Changed:
+  - the default rank order is TIME (`IMD_PERF_ORDER_TIME = 0`; `IMD_PERF_ORDER_TIES_BY_FOOTPRINT
+    = 1` is opt-in);
+  - `tie_ratio` must be ≤ 1.25;
+  - an explicit `clock_mhz` is clamped to the effective clock, renamed `clock_eff_mhz`;
+  - the intervals are named `time_lo_s` / `time_hi_s` and `phase_lo_s` / `phase_hi_s`, and the
+    bands are `{lo, hi}`;
+  - a version-6-sized calibration is a true format-1 view (format-2 parameters zeroed);
+  - the `mac_ktail` test is per chunk;
+  - the planner takes regime, cache and order by name.
+- The shipped parameters are unchanged: no fit or hold-out case changes under the per-chunk
+  rule.
+
+### 6.8 Later (ROADMAP)
+
+- **K4 alignment fix in the kernel.** Set K_c' = 131040 (≡ 0 mod 32) and pad k̂ to a multiple
+  of 32. Half of all k̂ values pay 28–38 % in K4. This is a layout change, so it needs DESIGN
+  and TLA+ work first.
+- A **settled-clock / hot calibration point** for long thermal runs (16384³ at ~1950 MHz).
+- A **clock-scaled e_byte** in the power model.
+
+### 6.9 Open
 
 - KF on 640–1200-class shapes at N = 16–17 is predicted 15–18 % low. K4 at 3–4 CTA rounds
   (768² × 100000, 1024³) is off by ±15–20 %.

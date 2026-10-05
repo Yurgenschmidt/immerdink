@@ -159,7 +159,7 @@ kernel.k5_n20_e2 = 5 48 0 256
 kernel.k5_n20_e4 = 4 64 8704 256
 kernel.k5b_n20 = 4 60 8448 256
 # Clock / power model and cache state (§6c.1).
-power.clock_ref_mhz = 2530
+power.clock_eff_mhz = 2530
 power.clock_min_mhz = 1846.528
 power.cap_w = 450
 power.idle_w = 60

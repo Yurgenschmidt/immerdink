@@ -157,7 +157,7 @@ int main(void) {
     c.rank_n = N;
     c.rreq = (imd_perf_rank_request_t){sizeof c.rreq, sizeof c.cands[0], 1, 0, &c.rank_n, NULL,
                                        IMD_PERF_VEC_GENERATE, IMD_PERF_PACK_NONE, 1, 0, 0, -1.0,
-                                       0, 0, 0, 0, 0.0};  /* v7: DEFAULT, COLD, ORDER_BAND */
+                                       0, 0, 0, 0, 0.0};  /* v7: DEFAULT, COLD, ORDER_TIME */
     printf("%s", name);
     for (int q = 0; q < Q_COUNT; ++q) {
       if (q == Q_PREDICT_PACK && pst != IMD_STATUS_SUCCESS) {

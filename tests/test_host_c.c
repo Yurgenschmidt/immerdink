@@ -297,7 +297,7 @@ int main(void) {
           sizeof(imd_perf_t) == 1952 && sizeof(imd_perf_candidate_t) == 168 &&
           sizeof(imd_perf_rank_request_t) == 88 && sizeof(imd_perf_request_t) == 40);
     CHECK(offsetof(imd_perf_calib_t, kernel) == 1232 && offsetof(imd_perf_t, regime) == 1648 &&
-          offsetof(imd_perf_candidate_t, time_p10_s) == 128 &&
+          offsetof(imd_perf_candidate_t, time_lo_s) == 128 &&
           offsetof(imd_perf_rank_request_t, regime) == 64 &&
           offsetof(imd_perf_request_t, regime) == 24);
     static imd_perf_calib_t cal, back;
@@ -415,26 +415,38 @@ int main(void) {
       back = cal;
       back.format = 3;
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, NULL, &back, &pr) == IMD_STATUS_INVALID_VALUE);
-      /* v7: a version-6-sized calibration, request and result are still accepted (the
-       * calibration then reads as format 1: v6 predictions); a bad regime is not */
+      /* v7: a version-6-sized calibration, request and result are still accepted. The
+       * calibration is then a TRUE format-1 view (the format-2 parameters zeroed: a degraded
+       * model, the v6 formulas) and equals the parse of its own format-1 text; a bad regime
+       * is not accepted */
       {
-        static imd_perf_calib_t c6;
+        static imd_perf_calib_t c6, c6b;
         static imd_perf_t p6, p7;
+        static char t6[16384];
+        size_t n6 = 0;
         memset(&c6, 0, sizeof c6);
         c6.struct_size = 1232;
         CHECK(imd_perf_calib_default(&c6) == IMD_STATUS_SUCCESS && c6.format == 1 &&
               c6.struct_size == 1232 && c6.kernel[0].resident == 0);
+        CHECK(c6.param[IMD_PERF_CLASS_K5 * IMD_PERF_MAX_PARAMS + 4] == 0.0 &&  /* k5.dram */
+              c6.param[IMD_PERF_CLASS_KL * IMD_PERF_MAX_PARAMS + 5] == 0.0);   /* kl.wave */
+        CHECK(imd_perf_calib_format(&c6, t6, sizeof t6, &n6) == IMD_STATUS_SUCCESS &&
+              strstr(t6, "format = 1") != NULL && strstr(t6, "k5.dram") == NULL);
+        memset(&c6b, 0x5a, sizeof c6b);
+        c6b.struct_size = 1232;
+        CHECK(imd_perf_calib_parse(t6, n6, &c6b, NULL) == IMD_STATUS_SUCCESS &&
+              memcmp(&c6, &c6b, 1232) == 0);
         memset(&p6, 0, sizeof p6);
         p6.struct_size = 1648;
         imd_perf_request_t r6 = {24, 0, -1, 0, -1.0, 99, 99, -5.0};  /* v7 fields ignored */
         CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r6, &c6, &p6) == IMD_STATUS_SUCCESS &&
-              p6.time_s > 0 && p6.regime == 0 && p6.time_p10_s == 0);
+              p6.time_s > 0 && p6.regime == 0 && p6.time_lo_s == 0);
         memset(&p7, 0, sizeof p7);
         p7.struct_size = sizeof p7;
         imd_perf_request_t r7 = {sizeof r7, 0, -1, 0, -1.0, IMD_PERF_REGIME_BURST,
                                  IMD_PERF_CACHE_COLD, 0.0};
         CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r7, &c6, &p7) == IMD_STATUS_SUCCESS &&
-              p7.time_s == p6.time_s && p7.time_p10_s == p7.time_s);
+              p7.time_s == p6.time_s && p7.time_lo_s == p7.time_s);
         r7.regime = 7;
         CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r7, NULL, &p7) == IMD_STATUS_INVALID_VALUE);
         r7.regime = 0, r7.cache = 3;
@@ -483,7 +495,7 @@ int main(void) {
       const imd_perf_candidate_t* c = &cand[i];
       CHECK(c->status == IMD_STATUS_SUCCESS && c->feasible == 1);
       if (i > 0) CHECK(cand[i - 1].time_s <= c->time_s);
-      CHECK(c->raw_rank == i && c->time_p10_s <= c->time_s && c->time_s <= c->time_p90_s);
+      CHECK(c->raw_rank == i && c->time_lo_s <= c->time_s && c->time_s <= c->time_hi_s);
       const imd_options_t o = {c->num_moduli, c->residue_group, IMD_RN, IMD_EMULATE, c->vec_mode,
                                IMD_K4_TUNE_OFF};
       size_t ws = 0, pdev = 0;

@@ -15,7 +15,7 @@ time alongside.
 v1.10: each record is predicted in the cache state it was measured in (REPEAT: the bench's
 repeat calls; COLD for --l2 flush) in the BURST regime (--record-clock: at its NVML clock, for a
 calibration fitted with perf_fit --clock-normalize). The prediction bands (§6c.1) are checked: the share of calls
-inside their [p10, p90] band, by 2-fold cross-validation over the cases (bands from one half,
+inside their [lo, hi] band, by 2-fold cross-validation over the cases (bands from one half,
 coverage on the other); --bands out.calib writes the calibration with the bands of the whole
 hold-out set (format 2). --sustained: the SUSTAINED prediction of method-sustained windows
 (power model as calibrated; the leave-one-out check is perf_fit's).
@@ -42,15 +42,15 @@ BAND_KEYS = ("band.call_small", "band.call_mid", "band.call_large")
 
 def evaluate(samples, calib, lib=None):
     """Per sample: (label, measured s, predicted s, flops, [(phase, measured s, predicted s,
-    class)], case, p10 s, p90 s), the prediction from the C library (imd_perf_predict with
+    class)], case, lo s, hi s), the prediction from the C library (imd_perf_predict with
     `calib`)."""
     rows = []
     for s in samples:
         p = s.again(calib)
         ph = [(q.name, s.measured[q.name], q.time_s, q.cls) for q in p.phases
               if q.name in s.measured]
-        rows.append((s.label, s.timed_s, p.time_s, p.flops_eq, ph, s.case, p.time_p10_s,
-                     p.time_p90_s))
+        rows.append((s.label, s.timed_s, p.time_s, p.flops_eq, ph, s.case, p.time_lo_s,
+                     p.time_hi_s))
     return rows
 
 
@@ -106,7 +106,7 @@ def size_class(t):
 
 
 def band_values(rows, lo_q=10, hi_q=90, min_n=5):
-    """{band key: (p10, p90)} of measured / predicted: per size class of the PREDICTED call, per
+    """{band key: (lo, hi)} of measured / predicted: per size class of the PREDICTED call, per
     kernel class for the phases; a class with fewer than min_n values takes the pooled band."""
     calls = [[], [], []]
     phases = {}
@@ -134,7 +134,7 @@ def band_values(rows, lo_q=10, hi_q=90, min_n=5):
 
 
 def coverage(rows, bands):
-    """Share of calls whose measured time lies in [p10, p90] x predicted under `bands`, overall
+    """Share of calls whose measured time lies in [lo, hi] x predicted under `bands`, overall
     and per size class of the measured call."""
     inside = [[], [], []]
     for r in rows:
@@ -166,7 +166,7 @@ def cross_validated_coverage(rows, lo_q=10, hi_q=90, splits=20):
             [len(c) // (2 * splits) * 2 for c in per])
 
 
-# The quantile pairs tried for the stored [p10, p90] band (DESIGN §6c.1): the narrowest whose
+# The quantile pairs tried for the stored [lo, hi] band (DESIGN §6c.1): the narrowest whose
 # cross-validated coverage reaches 80 % (in-sample p10 / p90 of a few hundred calls under-cover
 # new cases: the residuals of one case are correlated).
 QUANTILE_PAIRS = ((10, 90), (7.5, 92.5), (5, 95), (2.5, 97.5), (1, 99))

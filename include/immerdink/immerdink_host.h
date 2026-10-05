@@ -350,7 +350,8 @@ IMD_API const char* imd_status_string(imd_status_t status);
  * features x computed exactly from the plan's lowering (the table in §6c.1). A calibration is
  * a caller-owned plain struct (no handle, no allocation); NULL = the shipped one (RTX 4090,
  * sm_89). The calibration is read only by these functions, never by plan creation. */
-#define IMD_PERF_CALIB_FORMAT 2     /* the calibration file format written (v7; 1 is read too) */
+#define IMD_PERF_CALIB_FORMAT 2     /* the newest calibration format (v7); formats 1 and 2 are
+                                       read, and each is written as itself                  */
 #define IMD_PERF_MAX_PARAMS 6       /* parameters (features) per class                       */
 #define IMD_PERF_PARAM_CAPACITY 96  /* imd_perf_calib_t.param slots: class * 6 + j            */
 #define IMD_PERF_MAX_PHASES 16      /* imd_perf_t.phase capacity                              */
@@ -427,14 +428,17 @@ typedef struct {
 IMD_API const char* imd_perf_kernel_name(int32_t kernel);
 /* v7 request fields (DESIGN v1.10 §6c.1). */
 enum { IMD_PERF_REGIME_DEFAULT = 0,   /* SUSTAINED if the calibration has a power model     */
-       IMD_PERF_REGIME_BURST = 1,     /* the boost clock (power.clock_ref_mhz)               */
+       IMD_PERF_REGIME_BURST = 1,     /* the calibration's burst state (effective clock
+                                         power.clock_eff_mhz, below the boost readout)       */
        IMD_PERF_REGIME_SUSTAINED = 2  /* the clock at which the call's power meets the cap   */ };
 enum { IMD_PERF_CACHE_COLD = 0,       /* the inputs come from DRAM                           */
-       IMD_PERF_CACHE_WARM = 1,       /* the inputs are L2-resident up to warm.l2_bytes      */
+       IMD_PERF_CACHE_WARM = 1,       /* the input was the previous call's output; modeled as
+                                         REPEAT (provisional: one method, square GEMM pairs,
+                                         N = 14 / 16). Recommended in that case.             */
        IMD_PERF_CACHE_REPEAT = 2      /* the calibration's state: the same call just ran (the
                                          inputs resident only if the whole footprint fits)   */ };
-enum { IMD_PERF_ORDER_BAND = 0,       /* rank: ties with the best by footprint (v7 default)  */
-       IMD_PERF_ORDER_TIME = 1        /* rank: the v6 order by predicted time                */ };
+enum { IMD_PERF_ORDER_TIME = 0,       /* rank: by predicted time (the default; v6's order)   */
+       IMD_PERF_ORDER_TIES_BY_FOOTPRINT = 1 /* rank: the ties with the best first, by footprint */ };
 enum { IMD_PERF_BAND_SMALL = 0, IMD_PERF_BAND_MID = 1, IMD_PERF_BAND_LARGE = 2 }; /* predicted
                                          call < 100 us, < 1 ms, >= 1 ms                       */
 
@@ -452,26 +456,30 @@ typedef struct {
                                      and plane bytes beyond it (§6c.1)                      */
   char gpu[64], date[32], version[64], clocks[128], notes[128];
   double param[IMD_PERF_PARAM_CAPACITY]; /* param[class * IMD_PERF_MAX_PARAMS + j]; 0 unused */
-  /* ---- v7 (format 2; a struct_size of version 6 reads as format 1: built-in occupancy, no
-   *      power model, no cache term, no bands) ---- */
+  /* ---- v7 (format 2). A caller with a version-6 struct_size gets a true format-1 view of a
+   *      format-2 calibration: the format-2 parameters zeroed, built-in occupancy, no power
+   *      model, no cache term, no bands: a degraded model. Such callers should pass NULL. ---- */
   imd_perf_kernel_t kernel[IMD_PERF_KERNEL_CAPACITY]; /* [IMD_PERF_KERNEL_*]; 0 unused        */
-  double clock_ref_mhz;   /* SM clock of the time model (BURST); 0: no clock scaling         */
+  double clock_eff_mhz;   /* the effective SM clock of the burst-state parameters (NVML scale,
+                             below the boost readout); 0: no clock scaling                  */
   double clock_min_mhz;   /* lowest SUSTAINED clock                                          */
   double power_cap_w;     /* board power limit; 0: no power model (SUSTAINED = BURST)        */
   double power_idle_w;    /* awake idle power                                                */
-  double energy_tc_pj;    /* per int8 tensor-core op at clock_ref                            */
-  double energy_alu_pj;   /* per residue / CRT limb op / FP64 flop at clock_ref              */
+  double energy_tc_pj;    /* per int8 tensor-core op at clock_eff                            */
+  double energy_alu_pj;   /* per residue / CRT limb op / FP64 flop at clock_eff              */
   double energy_byte_pj;  /* per DRAM byte                                                   */
-  double energy_gamma;    /* energy per op scales with (f / clock_ref)^gamma                 */
+  double energy_gamma;    /* energy per op scales with (f / clock_eff)^gamma                 */
   double warm_l2_bytes;   /* L2 bytes that can hold a call's inputs (COLD / WARM)            */
   double warm_l2byte_ns;  /* saving per input byte served from L2 instead of DRAM            */
-  double band_call[3][2]; /* [IMD_PERF_BAND_*] {p10, p90} of measured / predicted per call   */
-  double band_class[IMD_PERF_CLASS_CAPACITY][2]; /* [IMD_PERF_CLASS_*] {p10, p90} per phase  */
+  double band_call[3][2]; /* [IMD_PERF_BAND_*] {lo, hi} factors of the predicted call time  */
+  double band_class[IMD_PERF_CLASS_CAPACITY][2]; /* [IMD_PERF_CLASS_*] {lo, hi} per phase    */
   double tie_ratio;       /* rank: a feasible candidate within tie_ratio x the best's time is a
-                             tie (>= 1; 1: exact ties only)                                  */
+                             tie (1 <= tie_ratio <= 1.25; 1: exact ties only)                */
 } imd_perf_calib_t;
 
-/* The shipped calibration (RTX 4090, sm_89). out->struct_size must be set; SUCCESS. */
+/* The shipped calibration (RTX 4090, sm_89). out->struct_size must be set; SUCCESS. A
+ * version-6-sized struct receives the degraded format-1 view (see above); pass NULL to the
+ * imd_perf_* functions instead to use the full calibration (parsed once, no copy). */
 IMD_API imd_status_t imd_perf_calib_default(imd_perf_calib_t* out);
 /* Parse calibration text (format 1 or 2: "key = value" lines, '#' comments; every key of the
  * format required, no unknown or repeated key; format 2 adds the chain parameters and the
@@ -521,7 +529,9 @@ typedef struct {
   /* ---- v7 (a struct_size of version 6: DEFAULT, COLD, no clock) ---- */
   int32_t regime;        /* IMD_PERF_REGIME_*                                               */
   int32_t cache;         /* IMD_PERF_CACHE_*                                                */
-  double clock_mhz;      /* > 0: predict at this SM clock (overrides the regime); 0: none   */
+  double clock_mhz;      /* > 0: an NVML-scale SM clock for capped / sustained operation
+                            (e.g. a measured settled clock; overrides the regime); values at
+                            or above the effective clock (clock_eff_mhz) mean BURST; 0: none */
 } imd_perf_request_t;
 
 /* One phase: its features x (the model is sum_j param[cls * 6 + j] x[j]; K4: the max of the
@@ -563,13 +573,15 @@ typedef struct {
   /* ---- v7 ---- */
   int32_t regime;        /* the regime used (DEFAULT resolved)                              */
   int32_t cache;         /* the cache state used                                            */
-  double clock_mhz;      /* the SM clock the prediction assumes (0: no clock model)         */
+  double clock_mhz;      /* the SM clock assumed, at most clock_eff_mhz (0: no clock model) */
   double power_w;        /* the call's average board power at that clock (0: no power model) */
   double warm_bytes;     /* input bytes served from L2 (WARM)                               */
-  double time_p10_s;     /* the band of time_s (calibration bands; equal to time_s without) */
-  double time_p90_s;
-  double phase_p10_s[IMD_PERF_MAX_PHASES]; /* per phase                                     */
-  double phase_p90_s[IMD_PERF_MAX_PHASES];
+  double time_lo_s;      /* [time_lo_s, time_hi_s]: an interval aimed at 80 % coverage (2-fold
+                            CV on the hold-out; BURST / REPEAT residuals, applied unchanged in
+                            every regime / cache state); = time_s without calibration bands */
+  double time_hi_s;
+  double phase_lo_s[IMD_PERF_MAX_PHASES]; /* the same per phase                             */
+  double phase_hi_s[IMD_PERF_MAX_PHASES];
 } imd_perf_t;
 
 /* Predicted imd_contract (packing != NULL: imd_contract_packed of that packed plan). Returns
@@ -605,7 +617,7 @@ typedef struct {
   int32_t flags;                 /* IMD_PERF_BETA_NONZERO                                    */
   uint64_t budget_bytes;         /* device memory for total_bytes; 0 = no budget             */
   double eps_fraction;           /* as imd_perf_request_t: < 0 the default, else 0..1        */
-  /* ---- v7 (a struct_size of version 6: DEFAULT, COLD, no clock, ORDER_TIME) ---- */
+  /* ---- v7 (a struct_size of version 6: DEFAULT regime, COLD, no clock, ORDER_TIME) ---- */
   int32_t regime, cache;         /* as imd_perf_request_t                                     */
   int32_t order;                 /* IMD_PERF_ORDER_*                                          */
   int32_t reserved;              /* 0                                                         */
@@ -632,8 +644,8 @@ typedef struct {
   uint64_t total_bytes;      /* the four above (separate buffers)                            */
   int64_t kernel_launches;   /* per imd_contract                                             */
   /* ---- v7 ---- */
-  double time_p10_s;         /* band of time_s: contract band + pack band / reuse            */
-  double time_p90_s;
+  double time_lo_s;          /* interval of time_s: contract's + pack's / reuse              */
+  double time_hi_s;
   double clock_mhz;          /* the contract's assumed SM clock                              */
   double power_w;            /* the contract's predicted average power                       */
   int32_t tie;               /* 1: feasible and time_s <= the best's x tie_ratio (any order) */
@@ -642,10 +654,10 @@ typedef struct {
 
 /* Every candidate of N x g x vec mode x pack mode (base gives rounding, mode, k4_tune), ranked:
  * feasible by time_s, then infeasible SUCCESS ones by time_s, then the others in enumeration
- * order (ties: total_bytes, N, g, vec_mode, packed). v7, order IMD_PERF_ORDER_BAND (the
- * default of a v7-sized request): the feasible candidates whose time_s <= the best's
- * time_s x the calibration's tie_ratio are ties (tie = 1) and come first, by total_bytes (then time_s, N, g, vec_mode,
- * packed); raw_rank is every candidate's place in the time order above. Writes
+ * order (ties: total_bytes, N, g, vec_mode, packed). v7: in every order, tie = 1 marks the
+ * feasible candidates whose time_s <= the best's time_s x the calibration's tie_ratio; with
+ * order IMD_PERF_ORDER_TIES_BY_FOOTPRINT (opt-in) they come first, by total_bytes (then
+ * time_s, N, g, vec_mode, packed); raw_rank is every candidate's place in the time order. Writes
  * min(capacity, n) candidates of candidate_size bytes each and *num_candidates = n.
  * INVALID_VALUE for a bad request or argument; else SUCCESS with each candidate's own status. */
 IMD_API imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B,

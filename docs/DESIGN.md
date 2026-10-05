@@ -28,8 +28,10 @@ performance model (ROADMAP B2: host API version 6; no semantic change). v1.9 add
 the Python front end over the C ABI (ROADMAP B1; no semantic, layout or C API change).
 v1.10 extends §6c (host API version 7, calibration format 2): per-kernel wave and occupancy
 features from launch rules shared with the kernels, BURST / SUSTAINED clock regimes with a
-power-cap model, COLD / WARM cache state, prediction intervals and tie-aware ranking (no
-semantic, layout, launch or spec change; merged after v1.11, numbered as planned).
+power-cap model (default SUSTAINED), COLD / WARM cache state (default COLD; the hold-out
+accuracy is measured in the REPEAT state, COLD rests on a 6-shape cache sweep), prediction
+intervals and rank ties (default order: time) (no semantic, layout, launch or spec change;
+merged after v1.11, numbered as planned).
 v1.11 adds §6e, fast host queries from Python for hot paths (`immerdink.planner`; no
 semantic, layout, C API or spec change; v1.10 is the parallel performance-model revision).
 The change lists are at the end.
@@ -1966,6 +1968,16 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
   100 µs – 1 ms max error 29.1 → 14.8 %, N = 15–17 100 µs – 1 ms median / p90 8.0 / 15.1 →
   5.3 / 11.7 %; mod 128 was worse (≥ 1 ms median 3.9 %). The fine-k̂ sweep (NOTES-B2 §6)
   separates the criteria. A format-1 calibration keeps mod 64 (v6-identical predictions).
+  **Per chunk (review 2026-10-05):** K4 reads chunk c of a row at `row·k̂ + c·K_c'` (lda = k̂,
+  gemm_k4.cu), so the criterion is the row start of each chunk: slow iff `k̂ mod 32 ≠ 0` or
+  `c·K_c' mod 32 ≠ 0`; K_c' = 131056 ≡ 16 (mod 32), so for an aligned k̂ the odd chunks are
+  slow. This equals k̂ mod 32 for single-chunk calls (every measured case but two). **Evidence
+  strength:** 128×256 (the rule's usual choice) has the full fine-k̂ sweep; 128×128 has the
+  4864–5120 points, where k̂ = 4960 (mod 32 = 0, mod 64 = 32) is still +14 % (partly counter-
+  evidence: that tile may also pay for the 64-wide residue tile); 64×128 and 64×64 are
+  untested. The two-chunk check (512² × 262144, chunk 1 misaligned, vs 262160, all misaligned)
+  is inconclusive: K4 there is DRAM-bound and 262144 (a power-of-two row stride) is the slower
+  one (NOTES-B2 §6).
 
 - **The eps path** (the `op_eps` features, reviewed 2026-10-05). The packs quantize an
   element to `μ·2^ε`; a residue costs one more modular multiply when ε > 0, i.e. |a'| ≥ 2⁵³
@@ -2052,7 +2064,7 @@ split into a time model at a given clock and a clock model per regime.
   hold-out worse: ≥ 1 ms median / p90 2.9 / 7.3 % vs 1.6 / 6.2 %; that clock is one sample after
   the loop, 2805 MHz for most records). The per-call probe (`imd_bench --clock-probe`, one warp
   timing `%globaltimer`) reads ~11 % below NVML with ~28 % call-to-call scatter and is only a
-  relative indicator. `f_ref` (`power.clock_ref_mhz`) is then the **effective** clock of those
+  relative indicator. `f_ref` (`power.clock_eff_mhz`) is then the **effective** clock of those
   θ: scanned from the boost clock down by the leave-one-case-out error of the sustained
   windows (the burst calibration's large calls already ran below boost: the limiter acts
   within a timed loop). On the 4090: 2530 MHz (boost 2805). `clock_mhz` in requests and
@@ -2085,9 +2097,20 @@ split into a time model at a given clock and a clock model per regime.
   never read, so nothing perturbs the window). Each window gives one linear equation in
   (P_idle, e_tc, e_alu, e_byte) at its measured clock. A calibration without a power model
   (format 1, or `power.cap_w = 0`) predicts SUSTAINED = BURST.
-- **Default: SUSTAINED** (design question for review: ehrenfest runs long sequences; for calls
+- **Default: SUSTAINED** (accepted, review 2026-10-05: ehrenfest runs long sequences; for calls
   below the cap both regimes coincide, so the default only changes the large, tensor-core-heavy
-  calls, which in a sequence do run at the capped clock).
+  calls, which in a sequence do run at the capped clock). Two known biases: **pessimistic** for a
+  heavy call between light ones (the card's clock follows the sequence's average power, the
+  model the call's own), and **optimistic** for long hot runs (16384³ measured at ~1950 MHz after
+  minutes at the cap, the model 2385 MHz: ~20 % on the clock; the calibration's 15 s pre-heat
+  does not reach that thermal state). A caller that has measured its settled clock passes it as
+  `clock_mhz` (NVML scale).
+- **`clock_mhz`** (request) is an NVML-scale SM clock for capped / sustained operation; it is
+  clamped to the effective clock (`min(clock_mhz, clock_eff)`, the value reported): values at or
+  above it mean BURST.
+- The power model and the solved clock use the cache-free (COLD) time in every cache state
+  (documented approximation: the REPEAT saving is large only on calls that fit the L2, which
+  are far below the cap). The bisection stops at 0.05 MHz (≤ 40 steps).
 
 #### [v1.10] Cache state: COLD and WARM
 
@@ -2109,7 +2132,9 @@ workspace_bytes + 8bmn`:
 - **COLD** (`IMD_PERF_CACHE_COLD`, the default): `res = 0`, the inputs come from DRAM;
 - **WARM** (`IMD_PERF_CACHE_WARM`): the inputs were just written or read (e.g. C of the
   previous call is A of this one); `res = res_repeat` (as measured; the design's `min(I, L_w)`
-  predicted 10–20 % savings on large calls where 1–7 % were measured).
+  predicted 10–20 % savings on large calls where 1–7 % were measured). **Provisional: one
+  method (square GEMM pairs, N = 14 / 16).** Callers whose input is the previous call's output
+  should pass WARM (COLD would charge up to +18 % on small calls).
 - **REPEAT** (`IMD_PERF_CACHE_REPEAT`): `res = res_repeat`, the state the calibration and the
   hold-out are measured in (the same call just ran); the validation predicts in it (method
   packed's interleaved calls and `--l2 flush` records: COLD). (Design question: COLD is the
@@ -2129,8 +2154,9 @@ stays as a reported no-op) and NOTES-B2 says so.** A format-1 calibration has Δ
 
 #### [v1.10] Prediction intervals and ties
 
-Per call and per phase the prediction carries a band `[p10, p90]`, meant as an 80 % prediction
-interval: the time times two quantiles of measured / predicted on the hold-out set. The
+Per call and per phase the prediction carries an interval `[time_lo_s, time_hi_s]` (`phase_lo_s`,
+`phase_hi_s`; calibration `band_*` = `{lo, hi}` factors), aimed at 80 % coverage (2-fold CV on the
+hold-out; BURST / REPEAT residuals, applied unchanged in every regime / cache state): the time times two quantiles of measured / predicted on the hold-out set. The
 quantiles are the narrowest of 10 / 90, 7.5 / 92.5, 5 / 95, 2.5 / 97.5, 1 / 99 whose
 cross-validated coverage (below) reaches 80 %: the in-sample 10 / 90 percentiles of ~140 calls
 cover only ~71 % of new cases (a case's residuals are correlated; measured on the v1.8 hold-out),
@@ -2145,20 +2171,22 @@ A calibration without bands (format 1) has zero-width bands. The bands describe 
 error on shapes like the hold-out's (BURST, the bench's repeat calls); the same ratios are
 applied in every regime and cache state (documented approximation).
 
-`imd_perf_rank` (v7 request, `order = IMD_PERF_ORDER_BAND`, the default of a v7-sized request):
-the best candidate is the feasible one with the smallest `time_s`; every feasible candidate
-with `time_s ≤ best.time_s × tie_ratio` is a **tie** (`tie = 1`, the best included). **Changed
+`imd_perf_rank` (v7): the best candidate is the feasible one with the smallest `time_s`; in
+**every** order, every feasible candidate with `time_s ≤ best.time_s × tie_ratio` is a **tie**
+(`tie = 1`, the best included; `1 ≤ tie_ratio ≤ 1.25`). The default order is
+`IMD_PERF_ORDER_TIME = 0` (review 2026-10-05: a zero-initialized request gets the pure time
+order); `IMD_PERF_ORDER_TIES_BY_FOOTPRINT = 1` is opt-in and puts the ties first. **Changed
 from band overlap after the data (design question):** overlapping 80 % call bands (±6–17 %)
 tied candidates up to 1.36× slower (236 of 360 candidates on a CC tensor) and the footprint
 tie-break then picked slow ones. Candidates of one contraction share most of the model error, so
 the tie window is the model's error of a **time ratio**: `tie_ratio` (format 2 `rank.tie_ratio`)
 = exp of the 80th percentile of |log(meas_i/pred_i) − log(meas_j/pred_j)| over pairs of hold-out
-calls of the same case (`perf_validate --bands`; 1.075 on the 4090; 28 of 360 ties). Ties come
-first, ordered by `total_bytes` (the smaller footprint wins), then `time_s`, N, g, vec mode,
+calls of the same case (`perf_validate --bands`; 1.075 on the 4090; 28 of 360 ties). With
+TIES_BY_FOOTPRINT the ties come first, ordered by `total_bytes` (the smaller footprint wins), then `time_s`, N, g, vec mode,
 packed; then the remaining feasible candidates by time, then the infeasible SUCCESS ones, then
 the others (as v6). `raw_rank` = the candidate's position in the v6 time order, so the raw order
-is always available; `order = IMD_PERF_ORDER_TIME` keeps the v6 order (and a v6-sized request
-always gets it). The accuracy-aware ranking (a later item) extends the request and the
+is always available; `order = IMD_PERF_ORDER_TIME` (the default; a v6-sized request always
+gets it) is the v6 order. The accuracy-aware ranking (a later item) extends the request and the
 candidate by appended fields (`struct_size`, `candidate_size`), not by changing these.
 
 ### 6c.2 Calibration: data, fit, file, shipped table
@@ -2209,17 +2237,24 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
     `beta.chain`);
   - `kernel.<name> = resident regs smem threads` for every kernel of `imd_perf_kernel_name`
     (four integers; resident ≥ 1, the others ≥ 0);
-  - `power.clock_ref_mhz`, `power.clock_min_mhz`, `power.cap_w`, `power.idle_w`,
+  - `power.clock_eff_mhz`, `power.clock_min_mhz`, `power.cap_w`, `power.idle_w`,
     `power.tc_pj`, `power.alu_pj`, `power.byte_pj`, `power.gamma` (≥ 0; `power.cap_w = 0`:
-    no power model, `power.clock_ref_mhz = 0`: no clock scaling);
-  - `warm.l2_bytes`, `warm.l2byte` (≥ 0); `rank.tie_ratio` (≥ 1);
+    no power model, `power.clock_eff_mhz = 0`: no clock scaling);
+  - `warm.l2_bytes`, `warm.l2byte` (≥ 0); `rank.tie_ratio` (1 … 1.25);
   - `band.call_small`, `band.call_mid`, `band.call_large` and `band.<class>` for every class
-    = `p10 p90` (two numbers, 0 < p10 ≤ p90; `1 1`: no band).
+    = `lo hi` (two factors, 0 < lo ≤ hi; `1 1`: no band).
   A value of several numbers is separated by blanks. **Reading format 1** migrates: the new
   parameters 0, the built-in occupancy table, no power model, Δ = 0, bands `1 1`; such a
   calibration predicts exactly as host API 6 did (tested). `imd_perf_calib_format` writes the
   calibration's own format (a migrated format-1 struct keeps `format = 1` and is written as
-  format 1), so format → parse stays bit-exact for both.
+  format 1), so format → parse stays bit-exact for both. **A version-6-sized struct** (a caller
+  compiled against host API 6) cannot hold the v7 fields: `imd_perf_calib_default`,
+  `imd_perf_calib_parse` and the predictors give it a **true format-1 view** of a format-2
+  calibration: format 1, the format-2 parameters zeroed (`k0.chain`, `kl.wave`, `pack.chain`,
+  `pack.wave`, `k5.chain`, `k5.dram`, …), built-in occupancy, mod-64 ktail, no power / cache /
+  bands. It equals the parse of its own format-1 text (tested), but it is a **degraded,
+  unvalidated model** (the format-2 θ were fitted with those terms): such callers should pass
+  NULL (the full shipped calibration).
 - **Shipped table.** `src/host/calib/rtx4090_sm89.calib` (the 4090 at stock clocks, as
   shipped: no clock lock; its `clocks` line records the state) is embedded at configure time
   (CMake reads the file into a raw string literal: the file is the one source; editing it
@@ -2395,45 +2430,48 @@ const char* imd_perf_kernel_name(int32_t kernel);   /* "k0", "kf16", ..., "k5_n1
 enum { IMD_PERF_BAND_SMALL, IMD_PERF_BAND_MID, IMD_PERF_BAND_LARGE };  /* < 100 us, < 1 ms, >= */
 enum { IMD_PERF_REGIME_DEFAULT = 0, IMD_PERF_REGIME_BURST = 1, IMD_PERF_REGIME_SUSTAINED = 2 };
 enum { IMD_PERF_CACHE_COLD = 0, IMD_PERF_CACHE_WARM = 1, IMD_PERF_CACHE_REPEAT = 2 };
-enum { IMD_PERF_ORDER_BAND = 0, IMD_PERF_ORDER_TIME = 1 };
+enum { IMD_PERF_ORDER_TIME = 0, IMD_PERF_ORDER_TIES_BY_FOOTPRINT = 1 };
 
 /* imd_perf_calib_t, appended (format 2):                                                    */
   imd_perf_kernel_t kernel[IMD_PERF_KERNEL_CAPACITY];       /* measured occupancy           */
-  double clock_ref_mhz, clock_min_mhz, power_cap_w, power_idle_w;
+  double clock_eff_mhz, clock_min_mhz, power_cap_w, power_idle_w;
   double energy_tc_pj, energy_alu_pj, energy_byte_pj, energy_gamma;
   double warm_l2_bytes, warm_l2byte_ns;
-  double band_call[3][2];                                    /* {p10, p90} per size class    */
+  double band_call[3][2];                                    /* {lo, hi} per size class      */
   double band_class[16][2];                                  /* per IMD_PERF_CLASS_*         */
-  double tie_ratio;                                          /* rank tie window (>= 1)       */
+  double tie_ratio;                                          /* rank tie window, 1 ... 1.25  */
 /* imd_perf_request_t, appended (v6: 24 bytes, v7: 40):                                      */
   int32_t regime, cache;          /* IMD_PERF_REGIME_*, IMD_PERF_CACHE_*                    */
-  double  clock_mhz;              /* > 0: predict at this SM clock (overrides the regime)   */
+  double  clock_mhz;              /* > 0: NVML-scale clock, clamped to clock_eff (overrides
+                                     the regime; >= clock_eff: BURST)                       */
 /* imd_perf_t, appended:                                                                      */
   int32_t regime, cache;          /* the ones used (DEFAULT resolved)                        */
   double  clock_mhz, power_w;     /* the SM clock assumed; the call's average power there (0:
                                      no power model)                                         */
   double  warm_bytes;             /* input bytes served from L2 (WARM)                       */
-  double  time_p10_s, time_p90_s;
-  double  phase_p10_s[IMD_PERF_MAX_PHASES], phase_p90_s[IMD_PERF_MAX_PHASES];
+  double  time_lo_s, time_hi_s;
+  double  phase_lo_s[IMD_PERF_MAX_PHASES], phase_hi_s[IMD_PERF_MAX_PHASES];
 /* imd_perf_rank_request_t, appended:                                                         */
   int32_t regime, cache, order, reserved;   double clock_mhz;
 /* imd_perf_candidate_t, appended:                                                            */
-  double  time_p10_s, time_p90_s, clock_mhz, power_w;
+  double  time_lo_s, time_hi_s, clock_mhz, power_w;
   int32_t tie, raw_rank;
 ```
 - A request shorter than v7 (24 / 64 bytes) means regime DEFAULT, COLD, no clock override and,
-  for rank, the v6 time order. DEFAULT = SUSTAINED when the calibration has a power model,
-  else BURST. Invalid: an unknown regime, cache or order, `clock_mhz` < 0 or not finite.
-- A calibration struct shorter than v7 (passed by a v6 caller) is read as format 1 (its
-  appended fields absent: built-in occupancy, no power model, Δ = 0, no bands), whatever its
-  `format` field says. `calib_valid` for format 2: resident ≥ 1, every power / warm value ≥ 0
-  and finite, 0 < p10 ≤ p90 in every band.
+  for rank, the time order. DEFAULT = SUSTAINED when the calibration has a power model,
+  else BURST. **So a v6-sized request with the shipped (format-2) calibration gets COLD +
+  SUSTAINED: its numbers change** (small calls slower by the cold-input cost, capped calls by the
+  settled clock); this is the one exception to "v6-sized means v6 behavior". Invalid: an unknown regime, cache or order, `clock_mhz` < 0 or not finite.
+- A calibration struct shorter than v7 (passed by a v6 caller) is read as a true format 1
+  (the format-2 parameters zeroed, built-in occupancy, no power model, Δ = 0, no bands; §6c.2),
+  whatever its `format` field says. `calib_valid` for format 2: resident ≥ 1, every power / warm value ≥ 0
+  and finite, 0 < lo ≤ hi in every band, 1 ≤ tie_ratio ≤ 1.25.
 - `imd_perf_predict_pack` uses the request's regime, cache (its input is X: WARM serves X from
   L2 up to L_w) and clock as `imd_perf_predict`.
 - Python (`host.py`): `predict(..., regime=, cache=, clock_mhz=)`, `Prediction.regime`,
-  `.cache`, `.clock_mhz`, `.power_w`, `.warm_bytes`, `.time_p10_s`, `.time_p90_s`, phases'
-  `p10_s` / `p90_s`; `rank(..., order=, regime=, cache=, clock_mhz=)`, `Candidate.tie`,
-  `.raw_rank`, `.time_p10_s`, `.time_p90_s`, `.clock_mhz`, `.power_w`; `Calibration.kernels`,
+  `.cache`, `.clock_mhz`, `.power_w`, `.warm_bytes`, `.time_lo_s`, `.time_hi_s`, phases'
+  `lo_s` / `hi_s`; `rank(..., order=, regime=, cache=, clock_mhz=)`, `Candidate.tie`,
+  `.raw_rank`, `.time_lo_s`, `.time_hi_s`, `.clock_mhz`, `.power_w`; `Calibration.kernels`,
   `.power`, `.warm`, `.bands`; `kernel_names()`.
 - `IMD_HOST_API_VERSION` 7. No change to plans, launches, results or footprints.
 
@@ -2479,12 +2517,15 @@ error distribution per size class. **Targets** (relative error of the total):
 | < 100 µs | ≤ 15 % | ≤ 30 % |
 
 **[v1.10] Further targets.** (1) The table above holds in the BURST regime and the records' cache state
-(REPEAT; method packed and `--l2 flush`: COLD) and stays met after the chain features (a
+(**REPEAT**; method packed and `--l2 flush`: COLD). The default COLD on small calls rests on the
+6-shape cache sweep only (`bench/sweep_cache.txt`) and stays met after the chain features (a
 clock-conditioned evaluation, `perf_validate --record-clock`, was worse and is not used); per-class phase errors are reported before / after (K3, K4 at
 k̂ mod 64 ≠ 0 named). (2) **SUSTAINED**: the predicted time of each sustained window vs its
 measured mean time per call, with the power model fitted leave-one-case-out (the window's own
 case excluded): the table's size-class targets, and the predicted settled clock within 5 %
-(median) of the measured. (3) **Intervals**: 80 % of hold-out calls inside their [p10, p90]
+(median) of the measured (the effective-clock scan used the same 14 windows, so the reported
+leave-one-out median is mildly optimistic). (3) **Intervals**: 80 % of hold-out calls inside
+their [lo, hi]
 band, between 70 % and 90 % per size class, by the 2-fold cross-validation above. (4) **Cache**:
 the measured COLD / repeat / WARM differences and the model's, per case (no target: an effect
 size; Δ = 0 if it is small).

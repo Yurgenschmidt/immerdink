@@ -23,7 +23,7 @@ first.
   `b2-fidelity`, NOTES-B2 §6):** wave / occupancy features (launch rules shared with
   contract.cu in `src/host/analysis.hpp`), request options `regime` (BURST / SUSTAINED, default
   SUSTAINED) and `cache` (COLD default / WARM / REPEAT), per-call and per-phase bands
-  (`time_p10_s` / `time_p90_s`), rank ties (`tie`, `raw_rank`, `order`). The shipped 4090
+  (`time_lo_s` / `time_hi_s`), rank ties (`tie`, `raw_rank`, `order`). The shipped 4090
   calibration was refitted on post-BIOS data (2026-10-05 13:20–14:00); `tools/calibrate.sh
   --validate` now also runs bench/sweep_sustained.txt and bench/sweep_cache.txt (~40 min of GPU in
   total) and writes the bands. Design questions for the reviewer: NOTES-B2 §6 (SUSTAINED and

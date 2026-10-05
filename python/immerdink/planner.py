@@ -143,11 +143,25 @@ _RANK_EXTRA = frozenset(f for f in _RANK_NAMES[_RANK_NAMES.index("eps_fraction")
                         if not f.startswith("reserved"))  # v7: regime, cache, order, clock_mhz
 
 
+# v7 enum fields given by name (host.py's names) or by their C value.
+_ENUM_FIELDS = {"regime": host.PERF_REGIMES, "cache": host.PERF_CACHES, "order": host.PERF_ORDERS}
+
+
+def _enum_value(k, v):
+    t = _ENUM_FIELDS.get(k)
+    if t is not None and isinstance(v, str):
+        if v not in t:
+            raise ValueError(f"{k} must be one of {sorted(t)}, got {v!r}")
+        return t[v]
+    return v
+
+
 class Request:
     """A prebuilt imd_perf_request_t (DESIGN §6c.3): beta (C is read), alpha_zero (the
     beta-only call), k4_config (None: the plan-time rule), eps_fraction (None: the
     typical-data default), and any other field of the C struct by its name (later host API
-    versions). Immutable; equal requests compare and hash equal."""
+    versions; v7: regime / cache by host.py's names, e.g. "SUSTAINED", "WARM", or their C
+    values, clock_mhz). Immutable; equal requests compare and hash equal."""
     __slots__ = ("_c", "_ref", "_key")
 
     def __init__(self, *, beta=False, alpha_zero=False, k4_config=None, eps_fraction=None,
@@ -161,7 +175,7 @@ class Request:
         for k, v in fields.items():
             if k not in _REQ_FIELDS or k in ("flags", "k4_config", "eps_fraction"):
                 raise TypeError(f"unknown request field {k!r} (fields: {_REQ_FIELDS})")
-            setattr(c, k, v)
+            setattr(c, k, _enum_value(k, v))
         self._c = c
         self._ref = C.byref(c)
         self._key = tuple(getattr(c, f) for f in _REQ_FIELDS)
@@ -179,15 +193,17 @@ class Request:
 _DEFAULT_REQUEST = Request()
 
 
-def _request(request, beta, alpha_zero, k4_config, eps_fraction):
+def _request(request, beta, alpha_zero, k4_config, eps_fraction, v7=None):
+    """v7: a dict of regime / cache / clock_mhz keywords (None values: not given)."""
+    v7 = {k: v for k, v in (v7 or {}).items() if v is not None}
     if request is not None:
-        if beta or alpha_zero or k4_config is not None or eps_fraction is not None:
+        if beta or alpha_zero or k4_config is not None or eps_fraction is not None or v7:
             raise TypeError("pass either request= or beta / alpha_zero / k4_config / "
-                            "eps_fraction")
+                            "eps_fraction / regime / cache / clock_mhz")
         return request
-    if beta or alpha_zero or k4_config is not None or eps_fraction is not None:
+    if beta or alpha_zero or k4_config is not None or eps_fraction is not None or v7:
         return Request(beta=beta, alpha_zero=alpha_zero, k4_config=k4_config,
-                       eps_fraction=eps_fraction)
+                       eps_fraction=eps_fraction, **v7)
     return _DEFAULT_REQUEST
 
 
@@ -613,45 +629,52 @@ class Query:
 
     def predict(self, N, g=0, vec_mode="GENERATE", *, rounding="RN", mode="EMULATE",
                 packing=None, request=None, beta=False, alpha_zero=False, k4_config=None,
-                eps_fraction=None, calib=None):
+                eps_fraction=None, calib=None, regime=None, cache=None, clock_mhz=None):
         """imd_perf_predict as a lazy Prediction view (host.predict). request: a prebuilt
-        Request (the fastest), or beta / alpha_zero / k4_config / eps_fraction as host.py."""
+        Request (the fastest), or beta / alpha_zero / k4_config / eps_fraction / regime /
+        cache / clock_mhz as host.py (None: the C defaults, DEFAULT regime, COLD)."""
+        v7 = (regime, cache, clock_mhz)
         m = self.memo
         if m is not None:
             return _memo(m, (self, "p", N, g, vec_mode, rounding, mode, packing, request, beta,
-                             alpha_zero, k4_config, eps_fraction, calib),
+                             alpha_zero, k4_config, eps_fraction, calib) + v7,
                          lambda: self._predict(N, g, vec_mode, rounding, mode, packing, request,
-                                               beta, alpha_zero, k4_config, eps_fraction, calib))
+                                               beta, alpha_zero, k4_config, eps_fraction, calib,
+                                               v7))
         return self._predict(N, g, vec_mode, rounding, mode, packing, request, beta, alpha_zero,
-                             k4_config, eps_fraction, calib)
+                             k4_config, eps_fraction, calib, v7)
 
     def _predict(self, N, g, vec_mode, rounding, mode, packing, request, beta, alpha_zero,
-                 k4_config, eps_fraction, calib):
+                 k4_config, eps_fraction, calib, v7=(None, None, None)):
         key = (N, g, vec_mode, rounding, mode)
         o = self._opts.get(key) or self._options(key)
         if request is None and not beta and not alpha_zero and k4_config is None and \
-                eps_fraction is None:
+                eps_fraction is None and v7 == (None, None, None):
             req = _DEFAULT_REQUEST
         else:
-            req = _request(request, beta, alpha_zero, k4_config, eps_fraction)
+            req = _request(request, beta, alpha_zero, k4_config, eps_fraction,
+                           dict(zip(("regime", "cache", "clock_mhz"), v7)))
         r = host._Perf(_PERF_SIZE)
         st = self._f.perf_predict(self._A, self._B, self._C, o,
                                   None if packing is None else self._packing(packing), req._ref,
                                   self._cal if calib is None else _calib_ref(calib), C.byref(r))
         return Prediction(r, st)
 
-    def predict_pack(self, pack, *, eps_fraction=None, request=None, calib=None):
+    def predict_pack(self, pack, *, eps_fraction=None, request=None, calib=None, regime=None,
+                     cache=None, clock_mhz=None):
         """imd_perf_predict_pack of a PackSpec (host.predict_pack); its descriptor struct is
         cached in this Query."""
+        v7 = (regime, cache, clock_mhz)
         m = self.memo
         if m is not None:
-            return _memo(m, (self, "pp", pack, eps_fraction, request, calib),
-                         lambda: self._predict_pack(pack, eps_fraction, request, calib))
-        return self._predict_pack(pack, eps_fraction, request, calib)
+            return _memo(m, (self, "pp", pack, eps_fraction, request, calib) + v7,
+                         lambda: self._predict_pack(pack, eps_fraction, request, calib, v7))
+        return self._predict_pack(pack, eps_fraction, request, calib, v7)
 
-    def _predict_pack(self, pack, eps_fraction, request, calib):
+    def _predict_pack(self, pack, eps_fraction, request, calib, v7=(None, None, None)):
         ref, _keep = self._pack_ref(pack)
-        req = _request(request, False, False, None, eps_fraction)
+        req = _request(request, False, False, None, eps_fraction,
+                       dict(zip(("regime", "cache", "clock_mhz"), v7)))
         r = host._Perf(_PERF_SIZE)
         st = self._f.perf_predict_pack(ref, req._ref,
                                        self._cal if calib is None else _calib_ref(calib),
@@ -663,7 +686,8 @@ class Query:
              **fields):
         """imd_perf_rank in ONE C call (the capacity is the exact candidate count) as a
         Ranking of lazy Candidate views (host.rank's order and values). fields: any other
-        imd_perf_rank_request_t field by name (later host API versions)."""
+        imd_perf_rank_request_t field by name (v7: regime, cache, order by host.py's names or
+        C values, clock_mhz)."""
         m = self.memo
         if m is not None:
             return _memo(m, (self, "r", N, g, vec_modes, packs, reuse, budget, beta, rounding,
@@ -690,7 +714,7 @@ class Query:
         for k, v in fields.items():
             if k not in _RANK_EXTRA:
                 raise TypeError(f"unknown rank request field {k!r}")
-            setattr(req, k, v)
+            setattr(req, k, _enum_value(k, v))
         out = (host._Candidate * cap)()
         count = C.c_int32(0)
         cal = self._cal if calib is None else _calib_ref(calib)
@@ -826,11 +850,12 @@ class Planner:
 
     def predict(self, spec, extents=None, *, strides=None, N, g=0, rounding="RN",
                 mode="EMULATE", vec_mode="GENERATE", packing=None, request=None, beta=False,
-                alpha_zero=False, k4_config=None, eps_fraction=None, calib=None):
+                alpha_zero=False, k4_config=None, eps_fraction=None, calib=None, regime=None,
+                cache=None, clock_mhz=None):
         return self.query(spec, extents, strides=strides).predict(
             N, g, vec_mode, rounding=rounding, mode=mode, packing=packing, request=request,
             beta=beta, alpha_zero=alpha_zero, k4_config=k4_config, eps_fraction=eps_fraction,
-            calib=calib)
+            calib=calib, regime=regime, cache=cache, clock_mhz=clock_mhz)
 
     def rank(self, spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",),
              packs=("NONE",), reuse=1, budget=0, beta=False, rounding="RN", mode="EMULATE",

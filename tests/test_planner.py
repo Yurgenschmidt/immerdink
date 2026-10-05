@@ -87,7 +87,7 @@ def random_calib(rng, base, v2=False):
             params[k] = rng.random() * 0.05
         extra = {f"kernel.{n}": (v[0] + rng.randint(0, 2), 64, 4096, v[3])
                  for n, v in base.kernels.items()}
-        extra.update({"power.clock_ref_mhz": 2800.0, "power.clock_min_mhz": 1500.0,
+        extra.update({"power.clock_eff_mhz": 2800.0, "power.clock_min_mhz": 1500.0,
                       "power.cap_w": rng.choice((300.0, 450.0)), "power.idle_w": 60.0,
                       "power.tc_pj": 0.7, "power.alu_pj": 4.0, "power.byte_pj": 20.0,
                       "power.gamma": 2.0, "warm.l2_bytes": 3.0e7, "warm.l2byte": 3e-4,
@@ -192,6 +192,11 @@ def check_single(rng, lib, cals, cases, verbose):
                        **fo)
         same(pv.to_prediction(), hp, what + f" predict v7 {req} {hk}")
         same_view(pv, hp, what + f" predict v7 view {hk}")
+        # names (host.py's) and C values give the same result: keywords and Request(**names)
+        same(q.predict(N, g, vec, packing=packing, calib=cal, **req, **hk, **fo).to_prediction(),
+             hp, what + f" predict v7 keywords {hk}")
+        same(q.predict(N, g, vec, packing=packing, calib=cal, request=planner.Request(**req, **hk),
+                       **fo).to_prediction(), hp, what + f" predict v7 Request names {hk}")
         if packing is not None:
             for pk in packing:
                 if pk is not None:
@@ -248,6 +253,11 @@ def check_rank(rng, lib, cals, cases, verbose):
         fns.perf_rank, calls[0] = counted, 0
         try:
             a = outcome(lambda: q.rank(rounding=rnd, mode=mode, calib=cal, **args, **cv7))
+            if cv7 and rng.random() < 0.5:  # by name, once more: identical
+                a2 = outcome(lambda: q.rank(rounding=rnd, mode=mode, calib=cal, **args, **hv7))
+                calls[0] -= 1
+                if a2[0] != a[0] or (a[0] == "ok" and a2[1].to_list() != a[1].to_list()):
+                    raise Fail(f"rank by names vs C values: {hv7}")
         finally:
             fns.perf_rank = real
         if calls[0] != 1:
