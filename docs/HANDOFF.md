@@ -29,7 +29,7 @@ first.
   call); pure ctypes, host API unchanged (v6), no nanobind. Test `host_planner`; per-call
   numbers `bench/planner_overhead.py` (C floor: `imd_planner_floor`). Design questions open
   for review (§6e.7).
-- **Verification on dev:** 7 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
+- **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
 - **D3 gate (Eric, 2026-10-04):** D3 begins with a design/theory discussion with Eric to narrow
