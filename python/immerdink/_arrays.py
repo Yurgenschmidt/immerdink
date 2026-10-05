@@ -4,6 +4,7 @@ Pure Python over ctypes: no CUDA call, no allocation, no array library."""
 
 import ctypes as C
 import math
+import struct
 
 __all__ = ["DeviceArray", "view", "buffer", "stream_handle"]
 
@@ -83,6 +84,12 @@ _api.PyCapsule_IsValid.argtypes = [C.py_object, C.c_char_p]
 _api.PyCapsule_IsValid.restype = C.c_int
 _api.PyCapsule_GetPointer.argtypes = [C.py_object, C.c_char_p]
 _api.PyCapsule_GetPointer.restype = C.c_void_p
+_api.PyCapsule_GetName.argtypes = [C.py_object]
+_api.PyCapsule_GetName.restype = C.c_char_p
+_u64 = C.c_uint64
+_DLT = struct.Struct("<QiiiBBHQQQ")             # DLTensor, 48 bytes (x86-64 / aarch64)
+_I64 = [struct.Struct(f"<{n}q") for n in range(65)]
+assert _DLT.size == C.sizeof(_DLTensor) == 48
 
 
 def _dlpack_view(x, stream):
@@ -96,22 +103,26 @@ def _dlpack_view(x, stream):
         cap = x.__dlpack__(stream=s, max_version=(1, 0))
     except TypeError:                          # a DLPack 0.x producer
         cap = x.__dlpack__(stream=s)
-    readonly = False
-    if _api.PyCapsule_IsValid(cap, b"dltensor_versioned"):
-        m = _DLManagedTensorVersioned.from_address(
-            _api.PyCapsule_GetPointer(cap, b"dltensor_versioned"))
-        t, readonly = m.dl_tensor, bool(m.flags & _DL_READ_ONLY)
-    elif _api.PyCapsule_IsValid(cap, b"dltensor"):
-        t = _DLManagedTensor.from_address(_api.PyCapsule_GetPointer(cap, b"dltensor")).dl_tensor
+    name = _api.PyCapsule_GetName(cap)
+    if name == b"dltensor_versioned":
+        # DLManagedTensorVersioned: version (8), manager_ctx, deleter, flags, dl_tensor
+        p = _api.PyCapsule_GetPointer(cap, name)
+        readonly = bool(_u64.from_address(p + 24).value & _DL_READ_ONLY)
+        p += 32
+    elif name == b"dltensor":
+        p, readonly = _api.PyCapsule_GetPointer(cap, name), False
     else:
         raise TypeError(f"{type(x).__name__}.__dlpack__ returned no DLPack capsule")
-    nd = t.ndim
-    shape = tuple(t.shape[d] for d in range(nd))
-    lanes = t.dtype.lanes
-    itemsize = t.dtype.bits * lanes // 8
-    strides = None if not t.strides else tuple(t.strides[d] * itemsize for d in range(nd))
-    ptr = (t.data or 0) + t.byte_offset
-    f8 = t.dtype.code == _DL_FLOAT and t.dtype.bits == 64 and lanes == 1
+    # DLTensor: data, device (2 x int32), ndim, dtype (u8 code, u8 bits, u16 lanes), shape,
+    # strides, byte_offset
+    data, _, _, nd, code, bits, lanes, pshape, pstrides, off = _DLT.unpack(C.string_at(p, 48))
+    i64 = _I64[nd] if nd < len(_I64) else struct.Struct(f"<{nd}q")
+    shape = i64.unpack(C.string_at(pshape, 8 * nd)) if nd else ()
+    itemsize = bits * lanes // 8
+    strides = None if not pstrides else \
+        tuple(v * itemsize for v in i64.unpack(C.string_at(pstrides, 8 * nd)))
+    ptr = data + off
+    f8 = code == _DL_FLOAT and bits == 64 and lanes == 1
     # The capsule is dropped here: its destructor calls the producer's deleter (immerdink
     # takes no ownership; the caller keeps x alive while its GPU work runs).
     return ptr, shape, strides, f8, readonly, itemsize

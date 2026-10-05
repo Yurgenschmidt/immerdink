@@ -360,6 +360,11 @@ def test_against_c_call(cuda, shim, lib):
                        plan.workspace_bytes) == "SUCCESS"
     hl.plan_destroy(p)
     same_bits(got, ops[2].result(), "Plan.contract vs imd_contract")
+    ops[2].reset()
+    with imd.Plan.from_descs(*((x.desc.extent, x.desc.stride, x.desc.label) for x in ops),
+                             N=11) as plan:   # raw descriptors, integer labels
+        plan.contract(A, B, Cc, beta=0.5, workspace=(ws, plan.workspace_bytes))
+        same_bits(got, ops[2].result(), "Plan.from_descs")
 
 
 def test_contract_ptr(cuda, shim):

@@ -1725,16 +1725,30 @@ call.
   `imd.default_plan_cache` is the default; `plan_cache=False` makes a plan per call and
   closes it after the call returns (GENERATE only; RESIDENT → ValueError).
 - `cudaGetDevice` (host-only, capture-safe) supplies the device of the default handle and
-  of the cache key; it is the only CUDA runtime function the package calls, through the
-  libcudart libimmerdink already loaded.
+  of the cache key, and `cudaDeviceGetAttribute` the SM count `Plan.lowering` passes to
+  `imd_lowering` (not on the call path); they are the only CUDA runtime functions the
+  package calls, through the libcudart libimmerdink already loaded.
 
 ### 6c.7 Per-call overhead
 
 A plan precomputes everything a call needs that does not change (expected shapes and byte
 strides per operand, the ctypes function with its argtypes, the in-line operand structs'
 static fields, the error context); a call extracts three pointers, compares a few tuples
-and calls C. Measured (`bench/python_overhead.py`, tiny shape, CPU time per call):
-see the B1 entry of ROADMAP and §6c.8; target a few µs above the bare ctypes call.
+and calls C. Measured (`bench/python_overhead.py`: "ik,kj->ij" 16³, N = 8, host time per
+call, median of 200 interleaved rounds of 50 calls, RTX 4090 box, 2026-10-05):
+
+| Entry point | µs per call | over the bare ctypes call |
+|---|---|---|
+| `lib.imd_contract(...)` via ctypes, prebuilt integer arguments | 3.9 | — |
+| `Plan.contract_ptr` | 3.95 | +0.05 |
+| `Plan.contract`, `__cuda_array_interface__` arrays (layout checks included) | 4.85 | +0.9–1.0 |
+| `immerdink.contract`, cached plan, CAI arrays | 5.9 | +1.9–2.1 |
+| `Plan.contract`, DLPack arrays (the tests' hand-built producer) | 19.3 | +15.4 |
+
+The bare call is the library's own enqueue (fused KF path: three launches) plus ctypes.
+DLPack costs per array about 2.7 µs in the producer (capsule construction; a real
+library's is its own) plus about 2 µs in the consumer (`__dlpack_device__`, capsule name and
+pointer, three reads), so CAI is preferred when both exist.
 
 ### 6c.8 Tests and verification
 

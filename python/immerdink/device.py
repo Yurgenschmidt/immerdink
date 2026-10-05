@@ -402,7 +402,8 @@ class Plan:
         if unknown:
             raise TypeError(f"unknown options {sorted(unknown)}")
         kw.update(options)
-        self._create(tuple(_as_desc(d) for d in (A, B, C)), options["N"], **kw)
+        N = kw.pop("N")
+        self._create(tuple(_as_desc(d) for d in (A, B, C)), N, **kw)
         return self
 
     def _create(self, descs, N, g, rounding, mode, vec_mode, k4_tune, packs, handle, lib):
