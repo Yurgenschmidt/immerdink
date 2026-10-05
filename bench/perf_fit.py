@@ -27,7 +27,7 @@ Records with --data dominant (one dominant entry per row) are predicted with the
 v1.10 (DESIGN §6c, format 2): the method-occupancy record gives the occupancy table (else the
 built-in one); each record is predicted at its measured SM clock (sm_mhz_median of the per-call
 probe, else gpu_after) in the REPEAT cache state, and the clock-bound features are scaled to the
-reference clock (the median clock of the calls < 1 ms; --no-clock: none); the chain features
+reference clock (the median NVML clock of the calls < 1 ms; with --clock-normalize); the chain features
 are fitted like the others (--no-chain drops them, --kernel kf4=4 overrides an occupancy for an
 A/B). Method-sustained records fit the power model (NNLS on the windows' mean power, a scan of
 gamma; a leave-one-case-out check is printed), method-pair records the cache term (L_w scan,
@@ -83,8 +83,9 @@ class Sample:
         self.pred = pred              # host.Prediction (features; times under some calibration)
         self.measured = measured_phases  # phase name -> seconds (phase marks)
         self.timed_s = timed_s        # timed median of the whole call (no marks)
-        self.again = again            # calib -> host.Prediction (the C model, that calibration,
-                                      # at this record's SM clock and cache state)
+        self.again = again            # (calib, state=None) -> host.Prediction (the C model,
+                                      # that calibration, at this record's SM clock and cache
+                                      # state, or `state`)
         self.clock = clock            # v1.10: the record's SM clock (MHz; 0: unknown)
         self.case = case
 
@@ -150,11 +151,11 @@ def samples_from_records(records, lib=None, seed=None):
             o = variant_options(r)
             eps = record_eps(r, ext, lib)
 
-            def again(calib, spec=spec, ext=ext, o=o, eps=eps, clk=clk, cache=cache):
+            def again(calib, state=None, spec=spec, ext=ext, o=o, eps=eps, clk=clk, cache=cache):
                 return host.predict(spec, ext, N=o["N"], g=o["g"], vec_mode=o["vec_mode"],
                                     mode=o["mode"], k4_config=o["k4_config"], eps_fraction=eps,
-                                    regime="BURST", cache=cache, clock_mhz=clk, calib=calib,
-                                    lib=lib)
+                                    regime="BURST", cache=state or cache, clock_mhz=clk,
+                                    calib=calib, lib=lib)
             p = again(seed)
             if p.status != "SUCCESS":
                 continue
@@ -167,14 +168,17 @@ def samples_from_records(records, lib=None, seed=None):
             pk = host.pack_desc_for(spec, ext, operand=which, N=N, lib=lib)
             packing = (pk, None) if which == 0 else (None, pk)
             eps = record_eps(r, ext, lib)
-            kw = dict(regime="BURST", cache="REPEAT", clock_mhz=clk, lib=lib)
-            fns = {"plain_": lambda c, spec=spec, ext=ext, N=N, eps=eps, kw=kw: host.predict(
-                       spec, ext, N=N, eps_fraction=eps, calib=c, **kw),
-                   "packed_": lambda c, spec=spec, ext=ext, N=N, packing=packing, eps=eps, kw=kw:
-                       host.predict(spec, ext, N=N, packing=packing, eps_fraction=eps, calib=c,
-                                    **kw),
-                   "pack_": lambda c, pk=pk, eps=eps, kw=kw: host.predict_pack(
-                       pk, eps_fraction=eps, calib=c, **kw)}
+            # method packed times imd_pack, the plain and the packed contract interleaved: each
+            # finds the L2 holding the other calls' traffic, i.e. COLD for its own inputs
+            kw = dict(regime="BURST", clock_mhz=clk, lib=lib)
+            fns = {"plain_": lambda c, st=None, spec=spec, ext=ext, N=N, eps=eps, kw=kw:
+                       host.predict(spec, ext, N=N, eps_fraction=eps, calib=c,
+                                    cache=st or "COLD", **kw),
+                   "packed_": lambda c, st=None, spec=spec, ext=ext, N=N, packing=packing, eps=eps,
+                   kw=kw: host.predict(spec, ext, N=N, packing=packing, eps_fraction=eps, calib=c,
+                                       cache=st or "COLD", **kw),
+                   "pack_": lambda c, st=None, pk=pk, eps=eps, kw=kw: host.predict_pack(
+                       pk, eps_fraction=eps, calib=c, cache=st or "COLD", **kw)}
             lab = f"{r['case']} pack {r.get('pack')} N={N}"
             for pre, timed in (("plain_", r["contract_ms"] * 1e-3),
                                ("packed_", r["contract_packed_ms"] * 1e-3),
@@ -472,28 +476,31 @@ def sustained_rows(records, cal, lib=None):
     return out
 
 
-def fit_power(rows, fref, gammas=(1.0, 2.0, 3.0)):
-    """P = idle + ((e_tc tc + e_alu alu) (f / fref)^gamma + e_byte D) 1e-12 / t, NNLS in the
-    relative error of P, over the sustained windows; the gamma of the smallest error. Returns the
-    power.* keys (cap = the records' enforced limit, clock_min = 0.8 x the lowest measured)."""
+def fit_power(rows, fref, gammas=(1.0, 2.0, 3.0), idle=60.0):
+    """P = idle + ((e_tc tc + e_alu alu) (f / fref)^gamma + e_byte D) 1e-12 / t over the
+    sustained windows at their measured clock f, time t and power P: NNLS of P - idle on the
+    three energies (relative error), the gamma of the smallest error. The awake idle is held
+    fixed (`idle`): with most windows pinned at the cap, a free intercept absorbs the power
+    (it fitted 366 W on the post-BIOS data). Returns the power.* keys (cap = the records'
+    enforced limit, clock_min = 0.8 x the lowest measured)."""
     best = None
     P = np.array([r["P"] for r in rows])
     for gm in gammas:
-        X = np.array([[1.0, r["tc"] * (r["f"] / fref) ** gm * 1e-12 / r["t"],
+        X = np.array([[r["tc"] * (r["f"] / fref) ** gm * 1e-12 / r["t"],
                        r["alu"] * (r["f"] / fref) ** gm * 1e-12 / r["t"], r["D"] * 1e-12 / r["t"]]
                       for r in rows])
-        th = nnls_relative(X, P)
-        err = float(np.sum(((X @ th - P) / P) ** 2))
+        th = nnls_relative(X, np.maximum(P - idle, 1e-3))  # relative in the dynamic power
+        err = float(np.sum(((idle + X @ th - P) / P) ** 2))
         if best is None or err < best[0]:
             best = (err, gm, th)
     _, gm, th = best
     return {"power.clock_ref_mhz": fref, "power.clock_min_mhz": 0.8 * min(r["f"] for r in rows),
-            "power.cap_w": float(np.median([r["cap"] for r in rows])), "power.idle_w": float(th[0]),
-            "power.tc_pj": float(th[1]), "power.alu_pj": float(th[2]), "power.byte_pj": float(th[3]),
+            "power.cap_w": float(np.median([r["cap"] for r in rows])), "power.idle_w": float(idle),
+            "power.tc_pj": float(th[0]), "power.alu_pj": float(th[1]), "power.byte_pj": float(th[2]),
             "power.gamma": gm}
 
 
-def power_validation(rows, meta, params, extra, fref, lib=None, verbose=True):
+def power_validation(rows, meta, params, extra, fref, lib=None, verbose=True, idle=60.0):
     """Leave-one-case-out: the power model fitted without the window's case, then the window's
     SUSTAINED prediction (time, clock) against the measured. Returns [(label, t meas, t pred,
     f meas, f pred, P meas, P pred)]."""
@@ -502,7 +509,7 @@ def power_validation(rows, meta, params, extra, fref, lib=None, verbose=True):
         train = [r for r in rows if r["case"] != case]
         if len(train) < 4:
             continue
-        pw = fit_power(train, fref)
+        pw = fit_power(train, fref, idle=idle)
         cal = host.Calibration.from_values(meta, params, lib, dict(extra, **pw))
         for r in rows:
             if r["case"] != case:
@@ -535,7 +542,7 @@ def pair_cases(records):
 def fit_warm(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=True):
     """L_w (a scan over fractions of the nominal L2) and Delta >= 0 (least squares, relative):
     measured t_state - t_repeat against the model's (res_repeat - res_state) bytes, which the C
-    model gives as its COLD / WARM minus REPEAT time at Delta = 1 ns per byte. Delta = 0 when
+    model gives as its COLD minus REPEAT time at a unit Delta. Delta = 0 when
     no measured |COLD - REPEAT| or |WARM - REPEAT| reaches min_effect of the call."""
     effects = []
     for (case, spec, ext, N), t in sorted(cases.items()):
@@ -553,16 +560,17 @@ def fit_warm(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=
         return {"warm.l2_bytes": 0.0, "warm.l2byte": 0.0}, effects
     best = None
     for frac in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0):
-        ex = dict(extra, **{"warm.l2_bytes": frac * l2, "warm.l2byte": 1.0})
+        unit = 1e-6  # ns per byte: small, so no REPEAT phase is clamped at 0
+        ex = dict(extra, **{"warm.l2_bytes": frac * l2, "warm.l2byte": unit})
         cal = host.Calibration.from_values(meta, params, lib, ex)
         X, y = [], []
         for (case, spec, ext, N), t in cases.items():
             e = parse_ext(ext)
             pr = host.predict(spec, e, N=N, cache="REPEAT", regime="BURST", calib=cal, lib=lib)
-            for st in ("COLD", "WARM"):
+            for st in ("COLD",):  # WARM is modeled as REPEAT (perf.cpp)
                 d = host.predict(spec, e, N=N, cache=st, regime="BURST", calib=cal,
                                  lib=lib).time_s - pr.time_s
-                X.append(d / t["repeat"])
+                X.append(d / unit / t["repeat"])
                 y.append((t[st.lower()] - t["repeat"]) / t["repeat"])
         X, y = np.array(X), np.array(y)
         delta = max(0.0, float(X @ y) / float(X @ X)) if float(X @ X) > 0 else 0.0
@@ -597,8 +605,15 @@ def main(argv=None):
     ap.add_argument("--no-l2-scan", action="store_true",
                     help="use the nominal L2 (no scan of the effective L2 fraction)")
     # v1.10
+    ap.add_argument("--clock-normalize", action="store_true",
+                    help="scale each record's clock-bound features by f_ref / its NVML clock "
+                         "(off by default: on the post-BIOS 4090 data it did not improve the "
+                         "hold-out, NOTES-B2 §6)")
     ap.add_argument("--no-clock", action="store_true",
-                    help="no clock normalization (records predicted at the reference clock)")
+                    help="no reference clock at all (no power model, SUSTAINED = BURST)")
+    ap.add_argument("--idle-w", type=float, default=60.0,
+                    help="awake-idle board power held fixed in the power fit (W; the 4090: about "
+                         "60 W, evaluation workspace findings/energy-20261004.md)")
     ap.add_argument("--clock-ref", type=float, default=None, help="reference SM clock (MHz)")
     ap.add_argument("--no-chain", action="store_true",
                     help="drop the v1.10 chain features of K0, KL, PACK, K5, DIRECT, BETA")
@@ -610,7 +625,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.format1:
         a.no_clock = a.no_chain = True
-    USE_RECORD_CLOCK = not a.no_clock
+    USE_RECORD_CLOCK = a.clock_normalize and not a.no_clock
     records = []
     for f in a.records:
         records += [json.loads(line) for line in open(f) if line.strip()]
@@ -640,6 +655,7 @@ def main(argv=None):
             "version": a.version or f"immerdink {commit}, host API {host.API_VERSION}",
             "clocks": clock_summary(records)[:127], **peaks, "l2_bytes": l2}
     fref = 0.0 if a.no_clock else (a.clock_ref or reference_clock(records))
+    fnorm = fref if USE_RECORD_CLOCK else 0.0  # the clock normalization of the fit
     kernels = occupancy_from_records(records, a.lib) or {}
     for kv in a.kernel:
         n, r = kv.split("=")
@@ -668,27 +684,57 @@ def main(argv=None):
             m2 = dict(meta, l2_bytes=max(frac * l2, 1.0))  # l2_bytes > 0
             sd = host.Calibration.from_values(m2, params0, a.lib, extra)
             sm = samples_from_records(records, a.lib, sd)
-            err = k4_error(sm, a.lib, a.k4_shared_dram, fref)
+            err = k4_error(sm, a.lib, a.k4_shared_dram, fnorm)
             print(f"  effective L2 {frac:.2f} x {l2 / 2**20:.0f} MiB: K4 relative SSE {err:.3f}")
             if best is None or err < best[0] - 1e-9:
                 best = (err, frac, sd, sm)
         _, frac, seed, samples = best
         meta["l2_bytes"] = max(frac * l2, 1.0)
         print(f"effective L2: {frac:.2f} of the nominal {l2 / 2**20:.0f} MiB")
+    # The cache term first (DESIGN §6c.1 "Cache state"): Delta and L_w from the COLD / REPEAT
+    # pairs; then each REPEAT phase measurement gets its resident-input saving added back, so
+    # the parameters are COLD costs (a REPEAT prediction subtracts the saving again).
+    cases = pair_cases(records) if extra is not None else {}
+    if cases:
+        wm, _ = fit_warm(cases, meta, params0, extra, l2, a.lib)
+        extra.update(wm)
+        if wm["warm.l2byte"] > 0:
+            calw = host.Calibration.from_values(meta, params0, a.lib, extra)
+            added = []
+            for s in samples:
+                if "l2=flush" in s.label or " pack " in s.label:
+                    continue  # measured COLD already (flushed, or method packed's interleaving)
+                cold, rep = s.again(calw, "COLD"), s.again(calw, "REPEAT")
+                for qc, qr in zip(cold.phases, rep.phases):
+                    if qc.name in s.measured and qc.time_s != qr.time_s:
+                        s.measured[qc.name] += qc.time_s - qr.time_s
+                added.append((cold.time_s - rep.time_s) / s.timed_s)
+            print(f"cache term: REPEAT phases raised to COLD by {100 * np.median(added):.1f} % "
+                  f"(median), {100 * max(added):.1f} % (max) of the call")
+        seed = host.Calibration.from_values(meta, seed.params, a.lib, extra)
     params = fit(samples, seed, a.lib, worst=a.worst, k4_shared_dram=a.k4_shared_dram,
-                 fref=fref, drop=drop)
+                 fref=fnorm, drop=drop)
     if extra is not None:
         rows = sustained_rows(records, host.Calibration.from_values(meta, params, a.lib, extra),
                               a.lib)
         if len(rows) >= 4 and fref > 0:
-            pw = fit_power(rows, fref)
+            # The time model's effective clock (DESIGN §6c.1): the burst calibration's large calls
+            # already ran below the boost clock (the limiter acts within a timed loop), so the
+            # clock that SUSTAINED scales from is scanned (leave-one-case-out median error of
+            # the sustained windows), from the boost clock down.
+            best = None
+            for fr in [fref - 25 * i for i in range(0, 17)]:
+                out = power_validation(rows, meta, params, extra, fr, a.lib, verbose=False,
+                                       idle=a.idle_w)
+                err = float(np.median([abs(tp - tm) / tm for _, tm, tp, *_ in out]))
+                print(f"  time-model clock {fr:.0f} MHz: sustained LOO median |err| {100 * err:.2f} %")
+                if best is None or err < best[0] - 1e-12:
+                    best = (err, fr)
+            fr = best[1] if a.clock_ref is None else fref
+            pw = fit_power(rows, fr, idle=a.idle_w)
             print("power model: " + ", ".join(f"{k} {v:.4g}" for k, v in pw.items()))
-            power_validation(rows, meta, params, extra, fref, a.lib)
+            power_validation(rows, meta, params, extra, fr, a.lib, idle=a.idle_w)
             extra.update(pw)
-        cases = pair_cases(records)
-        if cases:
-            wm, _ = fit_warm(cases, meta, params, extra, l2, a.lib)
-            extra.update(wm)
     meta["notes"] = (a.notes or f"fit on {len(samples)} calls ({len(ok)} records) by "
                      f"bench/perf_fit.py")[:127]
     cal = host.Calibration.from_values(meta, params, a.lib, extra)

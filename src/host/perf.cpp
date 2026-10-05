@@ -967,14 +967,16 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   int32_t regime = IMD_PERF_REGIME_BURST;
   const double f = resolve_clock(cal, P, q, &regime);
   const double scale = f > 0 ? cal.clock_ref_mhz / f : 1.0;
-  // COLD / WARM (DESIGN §6c.1 "Cache state"): input bytes resident relative to the calibration's
-  // repeat-call state, charged at warm.l2byte per byte to the phases that read them first.
+  // COLD / WARM (DESIGN §6c.1 "Cache state"): the parameters are COLD costs (the fitter adds the
+  // calibration records' resident-input saving back); a REPEAT / WARM call saves warm.l2byte per
+  // resident input byte in the phases that read them first.
   const double Lw = cal.warm_l2_bytes, I = P.inputs;
   const double res_repeat = std::clamp(Lw - (P.footprint - I), 0.0, I);
-  const double res = q.cache == IMD_PERF_CACHE_WARM     ? std::min(I, Lw)
-                     : q.cache == IMD_PERF_CACHE_REPEAT ? res_repeat
-                                                        : 0.0;
-  const double cache_ns = (res_repeat - res) * cal.warm_l2byte_ns;
+  // WARM is modeled as REPEAT (measured on the 4090, NOTES-B2 §6: a call whose A was the
+  // previous call's C runs within -7 ... +3 % of the same call repeated; COLD, an evicted L2,
+  // is the real effect: up to +16 % for calls whose footprint fits the L2).
+  const double res = q.cache == IMD_PERF_CACHE_COLD ? 0.0 : res_repeat;
+  const double cache_ns = -res * cal.warm_l2byte_ns;
   double t = 0, bound = 0, eps_s = 0, lo = 0, hi = 0;
   for (int i = 0; i < P.n; ++i) {
     const PerfPhase& p = P.ph[i];

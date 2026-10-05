@@ -13,8 +13,8 @@ measured call (< 100 us, 100 us - 1 ms, >= 1 ms) against the §6c.5 targets; TFL
 time alongside.
 
 v1.10: each record is predicted in the cache state it was measured in (REPEAT: the bench's
-repeat calls; COLD for --l2 flush) at its measured SM clock (clock-conditioned; --burst: at the
-calibration's reference clock). The prediction bands (§6c.1) are checked: the share of calls
+repeat calls; COLD for --l2 flush) in the BURST regime (--record-clock: at its NVML clock, for a
+calibration fitted with perf_fit --clock-normalize). The prediction bands (§6c.1) are checked: the share of calls
 inside their [p10, p90] band, by 2-fold cross-validation over the cases (bands from one half,
 coverage on the other); --bands out.calib writes the calibration with the bands of the whole
 hold-out set (format 2). --sustained: the SUSTAINED prediction of method-sustained windows
@@ -188,14 +188,16 @@ def main(argv=None):
     ap.add_argument("--per-call", action="store_true", help="print every call")
     ap.add_argument("--phases", action="store_true", help="per-phase errors (calls >= 1 ms)")
     ap.add_argument("--markdown", action="store_true")
-    ap.add_argument("--burst", action="store_true",
-                    help="predict at the reference clock, not the records' measured clocks")
+    ap.add_argument("--burst", action="store_true", help="(the default; kept for old scripts)")
+    ap.add_argument("--record-clock", action="store_true",
+                    help="predict each record at its NVML clock (for a calibration fitted with "
+                         "perf_fit --clock-normalize)")
     ap.add_argument("--bands", default=None, metavar="OUT",
                     help="write the calibration with the hold-out bands to OUT (format 2)")
     ap.add_argument("--sustained", nargs="*", default=[],
                     help="method-sustained records: SUSTAINED predictions vs measured")
     a = ap.parse_args(argv)
-    perf_fit.USE_RECORD_CLOCK = not a.burst
+    perf_fit.USE_RECORD_CLOCK = a.record_clock
     records = []
     for f in a.records:
         records += [json.loads(line) for line in open(f) if line.strip()]

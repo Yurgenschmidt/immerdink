@@ -947,15 +947,15 @@ def suite_perf_v110(cal, names, rng):
     for spec, ext in shapes:
         for N, g in ((8, 0), (14, 4), (16, 0)):
             kw = dict(N=N, g=g, calib=syn)
-            pb = host.predict(spec, ext, regime="BURST", cache="REPEAT", **kw)
+            pb = host.predict(spec, ext, regime="BURST", cache="COLD", **kw)
             if pb.status != "SUCCESS" or not pb.phases:
                 continue
             if pb.clock_mhz != 2800.0:
                 raise Fail(f"BURST clock {pb.clock_mhz}")
-            pr = host.predict(spec, ext, clock_mhz=2800.0, cache="REPEAT", **kw)
+            pr = host.predict(spec, ext, clock_mhz=2800.0, cache="COLD", **kw)
             if not close(pr.time_s, pb.time_s):
                 raise Fail("clock_mhz = f_ref differs from BURST")
-            p2 = host.predict(spec, ext, clock_mhz=5600.0, cache="REPEAT", **kw)
+            p2 = host.predict(spec, ext, clock_mhz=5600.0, cache="COLD", **kw)
             for q, q2 in zip(pb.phases, p2.phases):  # clock-bound terms halve
                 if not close(q2.time_s, 1e-9 * phase_ns(params, names, q, 0.5), 1e-9) or \
                         not close(q.time_s, 1e-9 * phase_ns(params, names, q), 1e-9):
@@ -963,8 +963,8 @@ def suite_perf_v110(cal, names, rng):
                                f"{1e-9 * phase_ns(params, names, q, 0.5)}")
             if p2.time_s > pb.time_s * (1 + 1e-12):
                 raise Fail("a higher clock predicts a longer time")
-            ps = host.predict(spec, ext, regime="SUSTAINED", cache="REPEAT", **kw)
-            pd = host.predict(spec, ext, cache="REPEAT", **kw)
+            ps = host.predict(spec, ext, regime="SUSTAINED", cache="COLD", **kw)
+            pd = host.predict(spec, ext, cache="COLD", **kw)
             if pd.regime != "SUSTAINED" or not close(pd.time_s, ps.time_s):
                 raise Fail("DEFAULT is not SUSTAINED with a power model")
             if ps.time_s < pb.time_s * (1 - 1e-12) or ps.clock_mhz > 2800.0:
@@ -976,7 +976,7 @@ def suite_perf_v110(cal, names, rng):
                 raise Fail(f"SUSTAINED power {ps.power_w} W at {ps.clock_mhz} MHz")
             cold, rep, warm = (host.predict(spec, ext, regime="BURST", cache=c, **kw).time_s
                                for c in ("COLD", "REPEAT", "WARM"))
-            if not (cold >= rep * (1 - 1e-12) and rep >= warm * (1 - 1e-12)):
+            if not (cold >= rep * (1 - 1e-12) and close(rep, warm)):  # WARM = REPEAT
                 raise Fail(f"cache order {cold} {rep} {warm}")
             lo, hi = extra[("band.call_small", "band.call_mid", "band.call_large")[
                 0 if pb.time_s < 1e-4 else 1 if pb.time_s < 1e-3 else 2]]
@@ -1046,7 +1046,7 @@ def suite_perf(args):
     rng = random.Random(6)
     vals = {k: rng.choice((0.0, rng.random() * 10 ** rng.randint(-6, 4))) for k in cal.params}
     vals["call.launch"] = -1.5
-    cv = host.Calibration.from_values(cal.meta, vals)
+    cv = host.Calibration.from_values(cal.meta, vals, extra=cal.extra or None)
     if cv.params != vals or host.Calibration.parse(cv.format()).params != vals:
         raise Fail("from_values / round trip of arbitrary values")
     for bad in ("format = 1\n", cal.format().replace("k5.op =", "k5.ops ="),
@@ -1130,7 +1130,8 @@ def suite_perf(args):
     for key in ("kf.op_eps", "kl.op_eps", "pack.op_eps"):
         heavy[key] = 50 * (heavy[key] + 1e-4)
     mono = 0
-    for which, cb in (("shipped", None), ("heavy eps", host.Calibration.from_values(cal.meta, heavy))):
+    for which, cb in (("shipped", None), ("heavy eps", host.Calibration.from_values(cal.meta, heavy,
+                                                                          extra=cal.extra or None))):
         for t in range(120):
             # n a multiple of 16: doubling n then keeps n_hat = n (no zero-rows launch appears
             # or disappears; one launch less can be a real saving)
@@ -1205,7 +1206,8 @@ def suite_perf(args):
         foot = sorted(c.total_bytes for c in allc if c.status == "SUCCESS")
         budget = foot[len(foot) // 3]
         ranked = host.rank(spec, ext, N=Ns, vec_modes=("GENERATE", "RESIDENT"),
-                           packs=("NONE", "A", "B", "AB"), reuse=3, budget=budget)
+                           packs=("NONE", "A", "B", "AB"), reuse=3, budget=budget,
+                           order="TIME")  # the v6 order (ORDER_BAND: suite_perf_v110)
         seen_bad = False
         for i, c in enumerate(ranked):
             pk = [host.pack_desc_for(spec, ext, operand=x, N=c.num_moduli)

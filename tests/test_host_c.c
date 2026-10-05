@@ -345,8 +345,8 @@ int main(void) {
       CHECK(imd_perf_calib_parse(bad, (size_t)n, &back, &line) == IMD_STATUS_INVALID_VALUE &&
             line == 0);
       n = snprintf(bad, sizeof bad, "%s", text);
-      p = strstr(bad, "format = 1");
-      if (p) p[9] = '3'; /* another format (1 and 2 are read) */
+      p = strstr(bad, "\nformat = ");
+      if (p) p[10] = '3'; /* another format (1 and 2 are read) */
       CHECK(imd_perf_calib_parse(bad, (size_t)n, &back, &line) == IMD_STATUS_INVALID_VALUE &&
             line > 0);
       const char* bad_values[] = {"kl.byte = -1\n", "kl.byte = 1x\n", "kl.byte = nan\n",
