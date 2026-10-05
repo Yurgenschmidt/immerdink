@@ -73,7 +73,7 @@ milestone like M2/M3, L ≈ multi-milestone or research.
 | # | Item | Addresses | Size |
 |---|---|---|---|
 | F1 | Test gaps: compute-sanitizer racecheck; a real n̂ > 16.7M split run (sampled check) | coverage | S |
-| F2 | Paper track (if wanted): clock-locked runs, H100 numbers (E1), Lean proofs completed against DESIGN v1.3, write-up | credibility | L |
+| F2 | Paper track (if wanted): clock-locked runs, H100 numbers (E1), Lean proofs completed against DESIGN v1.3, write-up. **Clock-locked comparison done (2026-10-04)** against the GEMMul8 versions of the Ozaki-II papers, current GEMMul8, cuBLAS emulation and native FP64 (speed vs accuracy, tensor cases, energy efficiency); kept outside this repo in the local evaluation workspace `~/repos/immerdink-eval` (`findings/`) | credibility | L |
 
 ## Out of scope (decided)
 

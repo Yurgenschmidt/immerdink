@@ -25,6 +25,11 @@ first.
   configurations interleaved; docs/BENCHMARKING.md, NOTES-A5 §1.2). The bench is
   immerdink-only; comparisons with other libraries live in the evaluation workspace.
 
+- **Comparison (2026-10-04):** paper-grade, clock-locked comparison with GEMMul8 (paper versions and
+  current), cuBLAS emulation, DGEMM and cuTENSOR, including energy efficiency, lives in the local
+  workspace `~/repos/immerdink-eval` (never pushed; data untracked). Product benches stay
+  immerdink-only (docs/BENCHMARKING.md).
+
 ## Open items needing Eric
 
 1. **DONE 2026-10-04 (accepted)** — D1 §6b.11 clarification: a missing pack handle is PACK_MISMATCH; a missing packed
