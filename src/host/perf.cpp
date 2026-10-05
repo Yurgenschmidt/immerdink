@@ -47,7 +47,7 @@ const char* const kClassNames[IMD_PERF_CLASS_COUNT] = {
 const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
     {"launch", "byte", "chain", nullptr, nullptr, nullptr},          // k0
     {"launch", "byte", "op", "row", "op_eps", "chain"},              // kf
-    {"launch", "byte", "op", "l2byte", "op_eps", "chain"},           // kl
+    {"launch", "byte", "op", "l2byte", "op_eps", "wave"},            // kl
     {"launch", "byte", "op", "op_eps", "chain", "wave"},             // pack
     {"round", "mac1", nullptr, nullptr, "byte", "mac_ktail"},        // k4_128x256 (1 CTA per SM)
     {"round", "mac1", "mac2", nullptr, "byte", "mac_ktail"},         // k4_128x128 (2)
@@ -62,7 +62,7 @@ const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
 constexpr bool kFormat2Param[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, true, false, false, false},   // k0.chain
     {},                                          // kf (kf.chain is format 1)
-    {false, false, false, false, false, true},   // kl.chain
+    {false, false, false, false, false, true},   // kl.wave
     {false, false, false, false, true, true},    // pack.chain, pack.wave
     {}, {}, {}, {},
     {false, false, false, true, false, false},   // k5.chain
@@ -74,7 +74,7 @@ constexpr bool kFormat2Param[IMD_PERF_CLASS_COUNT][kP] = {
 constexpr bool kClockBound[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, true, false, false, false},   // k0: chain
     {false, false, true, true, true, true},      // kf: op, row, op_eps, chain
-    {false, false, true, true, true, true},      // kl: op, l2byte, op_eps, chain
+    {false, false, true, true, true, false},     // kl: op, l2byte, op_eps (not wave: memory)
     {false, false, true, true, true, false},     // pack: op, op_eps, chain (not wave: memory)
     {true, true, true, true, false, true},       // k4: the round model, not the DRAM term
     {true, true, true, true, false, true},
@@ -278,18 +278,20 @@ double u128_to_double(u128 v) { return static_cast<double>(v); }
 // batch rows_b, radix; lg_rows >= 0 for imd_pack's tile).
 void add_kl(PerfPhases* P, const imd_perf_calib_t& cal, int32_t phase, double rows, double pad,
             double k, double k_hat, double g, bool along_rows, int64_t k_hat_i, double f,
-            int32_t lg_rows, int64_t b, int64_t rows_b, int64_t radix, int gi) {
+            int32_t lg_rows, int64_t b, int64_t rows_b, int64_t radix) {
   const double tk = static_cast<double>(int64_t{1} << kl_tile_lg_k(along_rows, k_hat_i));
   const double bytes = 8 * rows * k + g * pad * k_hat + 3 * rows;
   const double l2 = 16 * rows * std::max(0.0, k_hat - 2 * tk);
   const KlLaunch L = kl_launch(along_rows, lg_rows, k_hat_i, b, rows_b, radix);
-  const double chain =
-      chain_of(L.grid, 1, L.tiles, dbl(L.nc) * L.values * gi,
+  // v1.10: the busiest SM's tile-chunk loads in sequence (memory latency of a small grid; a
+  // compute chain nc x values x g fitted to 0 on the v1.8 data and was replaced by it).
+  const double wave =
+      chain_of(L.grid, 1, L.tiles, dbl(L.nc),
                resident_of(cal, L.values == 4 ? IMD_PERF_KERNEL_KL4 : IMD_PERF_KERNEL_KL8),
                cal.sm_count);
-  PerfPhase& p = add_phase(P, phase, IMD_PERF_CLASS_KL, 1, {1, bytes, g * rows * k, l2, 0, 0}, bytes);
-  set_eps(set_eps(p, 4, g * rows * k, f), 5, chain, f);
-  p.x[5] += chain;  // set_eps added f chain: the chain is (1 + f) x the plain chain
+  PerfPhase& p = add_phase(P, phase, IMD_PERF_CLASS_KL, 1, {1, bytes, g * rows * k, l2, 0, wave},
+                           bytes);
+  set_eps(p, 4, g * rows * k, f);
   p.in_bytes = 8 * rows * k;
 }
 
@@ -382,7 +384,7 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         if (inl[x])
           add_kl(&P, cal, x == 0 ? IMD_PERF_PHASE_KL_A : IMD_PERF_PHASE_KL_B, rows[x], pad[x], k,
                  kh, g, e.pack_along_rows[x], e.k_hat, f, -1, e.b, x == 0 ? e.m : e.n,
-                 e.pack_radix[x], e.g);
+                 e.pack_radix[x]);
     }
     // K2 / K3: the groups of an in-line operand that KF / KL did not pack (groups 2..G):
     // per group one read of the operand and the group's residues (+ the zero-rows launch of B).
@@ -498,7 +500,7 @@ void perf_pack_phases(const PackLowered& pl, const imd_perf_calib_t& cal, double
   P.eps_possible = perf_log2_T(pl.N) >= 53;
   add_kl(&P, cal, IMD_PERF_PHASE_PACK_KL, b * r, b * r, k, kh, N, e.pack_along_rows[0], pl.k_hat,
          P.eps_fraction, pack_kl_lg_rows_for(e.pack_along_rows[0], pl.k_hat), pl.b, pl.r,
-         e.pack_radix[0], pl.N);
+         e.pack_radix[0]);
   P.launches = 2;
   P.inputs = 8 * b * r * k;
   P.footprint = P.inputs + static_cast<double>(pl.layout.total) + static_cast<double>(pl.ws_bytes);

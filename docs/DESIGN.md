@@ -1890,10 +1890,11 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
 
 (x₅ is unused outside K4 and KF: room for one more feature per class in a later format.)
 
-**[v1.10] `chain` features** (format 2; every class but K4 and CALL, the free slot of each):
-K0 x₂, KL x₅, PACK x₄, K5 x₃, DIRECT x₃, BETA x₂ = the busiest SM's per-thread chain of the
-phase's launches, defined below ("Waves and occupancy"); KF's x₅ is the same definition. The
-K4 classes keep the round model (it already is a wave model).
+**[v1.10] `chain` and `wave` features** (format 2; the free slots): K0 x₂, PACK x₄, K5 x₃,
+DIRECT x₃, BETA x₂ = `chain`, the busiest SM's per-thread compute chain of the phase's launches
+(KF's x₅ is the same definition); KL x₅ and PACK x₅ = `wave`, the busiest SM's tile loads in
+sequence (memory latency). Both are defined below ("Waves and occupancy"). The K4 classes
+keep the round model (it already is a wave model).
 
 - **KF's per-thread chain** (`kf.chain`, added 2026-10-05 for N = 15–17 on mid-size shapes). KF
   launches B = tiles × parts blocks (the shared launch rules `kf_lg_tk`, `kf_operand_tiles`,
@@ -1921,11 +1922,18 @@ K4 classes keep the round model (it already is a wave model).
   |---|---|---|
   | K0 `k0_vec`, `kp_prep`, BETA, DIRECT | 256 outputs (one per thread) | 1; DIRECT: k FMAs |
   | KF | a tile | E · ⌈g/parts⌉ residues (× (1 + f)) |
-  | KL | a tile of th rows | nc · E · g residues (nc = chunks per row; × (1 + f)) |
+  | KL (`wave`) | a tile of th rows | nc chunk loads (nc = chunks per row) |
+  | K2 / K3 (`wave`, per group launch, summed) | a tile | 1 tile load |
   | K2 / K3 `k23_pack` (per group launch, summed) | a tile | 16 · ⌈gᵢ/parts⌉ residues (× (1 + f)) |
   | K5 j̄-fastest (E = 1 / 2 / 4) | 256 items of E outputs | E · N · L32 limb operations |
   | K5 λ-fastest | a 1024-output tile | 4 · N · L32 |
 
+  `chain` counts compute steps (clock-bound), `wave` memory round trips (not clock-bound).
+  **Adopted after the v1.8 data (refit, hold-out; NOTES-B2 §6):** a KL compute chain (nc · E ·
+  g) fitted to 0 and the KL `wave` replaced it (KL B p90 22.7 → 19.2 %); the PACK `wave` takes
+  K3 from 18.7 / 37.0 % to 12.2 / 32.4 % (median / p90 on ≥ 1 ms calls) and ≥ 1 ms calls from
+  2.8 / 7.8 % to 2.1 / 5.8 %: a K2 / K3 launch of a few hundred tiles (B with n = 96 … 384) runs
+  at ~0.35 TB/s, one ~6 µs tile round trip per wave, which the byte term at 0.9 TB/s did not see.
   A chain step is a thread's serial unit of work; for a grid much larger than one wave the
   chain is proportional to the work (collinear with the op features), for small grids it is the
   wave-quantized latency the byte and op features cannot see (one CTA too many is a second
@@ -2166,7 +2174,7 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   pair, ≈ 2 min) the cache fit; `tools/calibrate.sh` runs all three.
 - **File format 2** [v1.10] (written by v7; format 1 is still read). Format 1 plus, all
   required:
-  - every v1.10 parameter (`k0.chain`, `kl.chain`, `pack.chain`, `k5.chain`, `direct.chain`,
+  - every v1.10 parameter (`k0.chain`, `kl.wave`, `pack.chain`, `pack.wave`, `k5.chain`, `direct.chain`,
     `beta.chain`);
   - `kernel.<name> = resident regs smem threads` for every kernel of `imd_perf_kernel_name`
     (four integers; resident ≥ 1, the others ≥ 0);

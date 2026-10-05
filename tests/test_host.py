@@ -809,11 +809,11 @@ def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod
             nc = -(-kh // tk)
             tiles = -(-rows[x] // th)
             values = 4 if nc > 2 else 8
-            chain = spec_chain(min(tiles, 1 << 20), 1, tiles, nc * values * g,
-                               r("kl4" if values == 4 else "kl8"), sms)
+            wave = spec_chain(min(tiles, 1 << 20), 1, tiles, nc,
+                              r("kl4" if values == 4 else "kl8"), sms)
             ph.append((name, 1, [1, 8 * rows[x] * k + g * pad[x] * kh + 3 * rows[x],
                                  g * rows[x] * k, 16 * rows[x] * max(0, kh - 2 * tk),
-                                 wide * g * rows[x] * k, (1 + wide) * chain]))
+                                 wide * g * rows[x] * k, wave]))
     G = lw.num_groups
     sizes = [g] * (N // g) + ([N % g] if N % g else [])
     for x, name in ((0, "K2 pack A"), (1, "K3 pack B")):
@@ -856,7 +856,7 @@ def close(a, b, rel=1e-12):
 # DESIGN v1.10 §6c.1: the feature slots whose time scales with the SM clock (an independent
 # transcription of "ops, chains, L2 traffic, K4's round model; not DRAM bytes, launches, call").
 SPEC_CLOCK_BOUND = {
-    "k0": (2,), "kf": (2, 3, 4, 5), "kl": (2, 3, 4, 5), "pack": (2, 3, 4), "k5": (2, 3),  # not pack.wave
+    "k0": (2,), "kf": (2, 3, 4, 5), "kl": (2, 3, 4), "pack": (2, 3, 4), "k5": (2, 3),  # not pack.wave
     "direct": (2, 3), "beta": (2,), "call": ()}
 
 
