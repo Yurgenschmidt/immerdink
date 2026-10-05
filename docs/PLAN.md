@@ -202,7 +202,8 @@ comparisons are kept outside this repository (docs/BENCHMARKING.md). Note that c
   sign), whether to skip redundant output blocks in the GEMM tiling or only in the scatter,
   and IndexMap/TLA+ extensions for packed legality and injectivity. Not before M4.
 - Accurate-mode scaling.
-- Python package (nanobind), device arrays only (cupy / DLPack); no host-array transfers.
+- Python package, device arrays only (cupy / DLPack); no host-array transfers. **Done (B1,
+  2026-10-05): ctypes over the C ABI, not nanobind (Eric), DESIGN v1.9 §6d.**
 - **Next after the g sweep (Eric, 2026-10-03):**
   - **g trade-off.** Benchmark g ∈ {1, 2, 4, 7, N} (workspace ≈ (g/8)(|A|+|B|) +
     (N/8)|C|; only g = N has been measured). If the speed cost is modest, add a
@@ -212,7 +213,7 @@ comparisons are kept outside this repository (docs/BENCHMARKING.md). Note that c
     vec_mode), plan device bytes, plan host bytes, and the per-region breakdown. **Single
     source of truth:** a CUDA-free `libimmerdink_host` (lowering, legality, memory model,
     later the performance model) with a plain C ABI, linked by the CUDA library, so callers
-    get exactly the numbers the kernels use. Python (ctypes now, nanobind later) and other
+    get exactly the numbers the kernels use. Python (ctypes; DESIGN §6a, §6d) and other
     languages call that ABI; nothing is reimplemented. `spec/params.py` and the oracle stay
     as independent verification (tests compare them with the C), not as an API.
     **Done (2026-10-03, DESIGN v1.3 §6a):** `libimmerdink_host.so` + `immerdink_host.h`

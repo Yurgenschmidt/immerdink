@@ -137,6 +137,15 @@ if(Python3_FOUND)
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
 
+  # DESIGN v1.9 §6d: the Python device API (python/immerdink: Plan, Pack, contract) on the
+  # GPU, bit for bit vs spec/oracle.py, with the allocation shim (pytest; CAI / DLPack
+  # producers built with ctypes, no CuPy or PyTorch needed).
+  add_test(NAME python_device
+           COMMAND Python3::Interpreter -m pytest -q -p no:cacheprovider
+                   "${CMAKE_CURRENT_SOURCE_DIR}/test_python_device.py")
+  set_tests_properties(python_device PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                       ENVIRONMENT "IMMERDINK_LIB=$<TARGET_FILE:immerdink>;IMMERDINK_SHIM=${shim};LD_PRELOAD=${shim}")
+
   # libimmerdink's real plans vs libimmerdink_host's queries (DESIGN §6a): the plan's GEMM
   # view, workspace layout, device bytes, K4 parameter sets and launches, and host payload
   # (src/test_hooks.cpp imd_test_plan_sizes) equal imd_lowering / imd_plan_bytes /
