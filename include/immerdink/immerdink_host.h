@@ -355,7 +355,8 @@ IMD_API const char* imd_status_string(imd_status_t status);
 /* Kernel classes (one parameter set each; file key prefix in parentheses). */
 enum {
   IMD_PERF_CLASS_K0 = 0,         /* (k0) K0 vectors, imd_pack's prep: launch, byte          */
-  IMD_PERF_CLASS_KF = 1,         /* (kf) fused small launch: launch, byte, op, row, op_eps  */
+  IMD_PERF_CLASS_KF = 1,         /* (kf) fused small launch: launch, byte, op, row, op_eps,
+                                    chain                                                   */
   IMD_PERF_CLASS_KL = 2,         /* (kl) fused large launch, imd_pack: launch, byte, op,
                                     l2byte, op_eps                                          */
   IMD_PERF_CLASS_PACK = 3,       /* (pack) K2 / K3, groups 2..: launch, byte, op, op_eps    */

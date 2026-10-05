@@ -450,10 +450,9 @@ __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
 
 // gridDim.y of a pack launch: with fewer tiles than 2 per SM, split the group's moduli over
 // up to gsize block rows so that about 2 blocks per SM run (a launch choice only).
+// (host/analysis.hpp pack_moduli_parts: the one rule, also used by the performance model.)
 inline unsigned pack_split(int64_t tiles, int gsize, int sms) {
-  const int64_t want = 2 * int64_t{sms};
-  if (tiles >= want) return 1;
-  return static_cast<unsigned>(std::min<int64_t>(gsize, (want + tiles - 1) / tiles));
+  return static_cast<unsigned>(pack_moduli_parts(tiles, gsize, sms));
 }
 
 // Zero rows [rows, rows_pad) of every (slot, lambda): the n_hat padding of RB.
@@ -1000,7 +999,8 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
 // even with every modulus of the group in its own block row (4x the blocks, a 4x shorter
 // chain per thread; its 14 KB of shared memory allow more blocks per SM, so its moduli split
 // targets 4 blocks per SM).
-constexpr int64_t kKfSmallBlocksPerSm = 16;
+// (kKfSmallBlocksPerSm, kf_lg_tk, kf_operand_tiles, kf_small: host/analysis.hpp, shared with
+// the performance model.)
 template <int Cap>
 imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void* ws,
                        int64_t* vec_out, cudaStream_t stream) {
@@ -1011,15 +1011,13 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   a.flag[0] = region<uint8_t>(ws, p, Region::fA), a.flag[1] = region<uint8_t>(ws, p, Region::fB);
   a.R[0] = region<int8_t>(ws, p, Region::RA), a.R[1] = region<int8_t>(ws, p, Region::RB);
   a.b = p.b, a.k = p.k, a.k_hat = p.k_hat;
-  int lg_tk = 4;
-  while ((int64_t{1} << lg_tk) < p.k_hat) ++lg_tk;  // k_hat <= kKfKMax: lg_tk <= 10
+  const int lg_tk = kf_lg_tk(p.k_hat);  // k_hat <= kKfKMax: lg_tk <= 10
   a.lg_tk = lg_tk;
   a.gsize = std::min(p.g, p.N);
   a.trunc = p.trunc ? 1 : 0;
   for (int w = 0; w < 4; ++w) a.rhs[w] = p.rhs[w];
   a.rhs_bits = p.rhs_bits, a.lhs_shift = p.lhs_shift;
   const auto tiles_for = [&](int lg_te) {
-    const int64_t th = int64_t{1} << (lg_te - lg_tk);
     int64_t total = 0;
     for (int x = 0; x < 2; ++x) {
       a.rows[x] = x == 0 ? p.m : p.n;
@@ -1031,16 +1029,14 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
         a.rows_pad[x] = a.rows[x];
         continue;
       }
-      const int64_t D = p.b * a.rows[x] / a.radix[x];
-      a.tiles[x] = a.radix[x] * ((D + th - 1) / th);
+      a.tiles[x] = kf_operand_tiles(lg_te, lg_tk, p.b, a.rows[x], a.radix[x]);
       total += a.tiles[x];
     }
     return total;
   };
   int64_t tiles = tiles_for(12);
   // (k5_one_elem_per_sm() == 0, test hook only: no small-problem variants anywhere.)
-  const bool small =
-      tiles * a.gsize < kKfSmallBlocksPerSm * int64_t{p.sms} && k5_one_elem_per_sm() != 0;
+  const bool small = kf_small(tiles, a.gsize, p.sms) && k5_one_elem_per_sm() != 0;
   if (small) {
     tiles = tiles_for(10);
     kf_scale_pack<Cap, 4><<<dim3(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms)),

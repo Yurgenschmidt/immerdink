@@ -43,7 +43,7 @@ const char* const kClassNames[IMD_PERF_CLASS_COUNT] = {
 // Feature names per class (nullptr: the class does not use that slot).
 const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
     {"launch", "byte", nullptr, nullptr, nullptr, nullptr},          // k0
-    {"launch", "byte", "op", "row", "op_eps", nullptr},              // kf
+    {"launch", "byte", "op", "row", "op_eps", "chain"},              // kf
     {"launch", "byte", "op", "l2byte", "op_eps", nullptr},           // kl
     {"launch", "byte", "op", "op_eps", nullptr, nullptr},            // pack
     {"round", "mac1", nullptr, nullptr, "byte", "mac_ktail"},        // k4_128x256 (1 CTA per SM)
@@ -98,11 +98,41 @@ PerfPhase& add_phase(PerfPhases* P, int32_t phase, int32_t cls, int64_t launches
   return p;
 }
 
-// The op_eps feature of a phase: x[slot] = f * ops (f = the call's eps fraction).
-void set_eps(PerfPhase& p, int slot, double ops, double f) {
-  p.eps_slot = slot;
-  p.eps_ops = ops;
-  p.x[slot] = f * ops;
+// The eps-path part of feature `slot`: x[slot] += f * ops (f = the call's eps fraction).
+PerfPhase& set_eps(PerfPhase& p, int slot, double ops, double f) {
+  p.eps_x[slot] = ops;
+  p.x[slot] += f * ops;
+  return p;
+}
+
+// KF blocks resident per SM: the E = 16 kernel (47.5 KB of static shared memory) 2, the E = 4
+// kernel 4.
+constexpr int64_t kKfBlocksPerSm16 = 2, kKfBlocksPerSm4 = 4;
+
+// KF's per-thread chain on the busiest SM (DESIGN §6c.1): its launch (kf_* rules, shared with
+// contract.cu) has B = tiles x parts blocks; each thread holds E values of a tile and emits the
+// residues of ceil(g / parts) moduli for each of them in sequence, an eps-path residue taking
+// a second modular multiply. With few blocks per SM this chain, not the bytes, sets the time:
+// chain = ceil(B / (SMs x resident)) x E x ceil(g / parts) (x (1 + f) with the eps path).
+double kf_chain(const ExecPlan& e, int32_t sms) {
+  const int lg_tk = kf_lg_tk(e.k_hat);
+  const int gs = e.g;
+  const auto tiles_for = [&](int lg_te) {
+    int64_t t = 0;
+    for (int x = 0; x < 2; ++x)
+      if (!(e.packed & (1 << x)))
+        t += kf_operand_tiles(lg_te, lg_tk, e.b, x == 0 ? e.m : e.n, e.pack_radix[x]);
+    return t;
+  };
+  int64_t tiles = tiles_for(12);
+  const bool small = kf_small(tiles, gs, sms);
+  if (small) tiles = tiles_for(10);
+  if (tiles <= 0) return 0;
+  const int64_t parts = pack_moduli_parts(tiles, gs, sms);
+  const int64_t per_sm = int64_t{sms} * (small ? kKfBlocksPerSm4 : kKfBlocksPerSm16);
+  const int64_t waves = (tiles * parts + per_sm - 1) / per_sm;
+  return static_cast<double>(waves) * (small ? 4.0 : 16.0) *
+         static_cast<double>((gs + parts - 1) / parts);
 }
 
 double u128_to_double(u128 v) { return static_cast<double>(v); }
@@ -179,8 +209,11 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         ops += g * rows[x] * k;
         r += rows[x];
       }
-      set_eps(add_phase(&P, IMD_PERF_PHASE_KF, IMD_PERF_CLASS_KF, 1, {1, bytes, ops, r}, bytes),
-              4, ops, f);
+      const double chain = kf_chain(e, sms);
+      set_eps(set_eps(add_phase(&P, IMD_PERF_PHASE_KF, IMD_PERF_CLASS_KF, 1,
+                                {1, bytes, ops, r, 0, chain}, bytes),
+                      4, ops, f),
+              5, chain, f);
     } else {  // KL per in-line operand (v1.6: every in-line operand without KF)
       for (int x = 0; x < 2; ++x)
         if (inl[x])
@@ -490,8 +523,8 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, imd_perf_
   double t = 0, bound = 0, eps_s = 0;
   for (int i = 0; i < P.n; ++i) {
     const PerfPhase& p = P.ph[i];
-    if (p.eps_slot >= 0 && P.eps_possible)
-      eps_s += cal.param[p.cls * kP + p.eps_slot] * p.eps_ops * 1e-9;
+    if (P.eps_possible)
+      for (int j = 0; j < kP; ++j) eps_s += cal.param[p.cls * kP + j] * p.eps_x[j] * 1e-9;
     imd_perf_phase_t& o = r->phase[i];
     o.phase = p.phase, o.cls = p.cls, o.launches = p.launches;
     o.time_s = perf_phase_seconds(cal, p);

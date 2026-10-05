@@ -54,3 +54,14 @@ c_d15a    | ik,jk->ij | i=2048,j=2048,k=4096       | imd | 15,16 | --reps 10 --p
 c_d15b    | ik,jk->ij | i=1024,j=1024,k=32768      | imd | 15,16 | --reps 10 --phase-reps 3 --max-seconds 1 --data dominant
 c_d15c    | ik,jk->ij | i=4096,j=256,k=1024        | imd | 15,16 | --reps 50 --phase-reps 10 --max-seconds 1 --data dominant
 c_d15d    | ik,jk->ij | i=768,j=768,k=768          | imd | 15,16,20 | --reps 100 --phase-reps 10 --max-seconds 1 --data dominant
+# --- (2026-10-05, b2-kf-n15) the fused small path KF at N = 15..17 on mid-size shapes
+k_s448    | ik,jk->ij | i=448,j=448,k=448          | imd | 15,16,17 | --reps 200 --phase-reps 10 --max-seconds 1
+k_s576    | ik,jk->ij | i=576,j=576,k=576          | imd | 15,16,17 | --reps 200 --phase-reps 10 --max-seconds 1
+k_s704    | ik,jk->ij | i=704,j=704,k=704          | imd | 15,16,17 | --reps 200 --phase-reps 10 --max-seconds 1
+k_s896    | ik,jk->ij | i=896,j=896,k=896          | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
+k_r1      | ik,jk->ij | i=2048,j=512,k=640         | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
+k_r2      | ik,jk->ij | i=384,j=1536,k=960         | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
+k_b       | lik,ljk->lij | l=6,i=384,j=384,k=512   | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
+k_cc      | kjbc,kiac->abij | i=8,j=8,k=10,a=64,b=64,c=80 | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
+k_d576    | ik,jk->ij | i=576,j=576,k=576          | imd | 15,16 | --reps 200 --phase-reps 10 --max-seconds 1 --data dominant
+k_dr1     | ik,jk->ij | i=2048,j=512,k=640         | imd | 15,16 | --reps 100 --phase-reps 10 --max-seconds 1 --data dominant

@@ -88,6 +88,38 @@ inline int32_t fused_large(const ExecPlan& e) {
   return (kFusedLargeA | kFusedLargeB) & ~e.packed;
 }
 
+// v1.8 (DESIGN §4, §6c): the moduli parts of a pack launch (KF, K2 / K3; gridDim.y): with
+// fewer tiles than 2 per SM, the group's moduli are split over up to gsize block rows so that
+// about 2 blocks per SM run (a launch choice only). contract.cu and the performance model use
+// this one rule.
+inline int64_t pack_moduli_parts(int64_t tiles, int gsize, int sms) {
+  const int64_t want = 2 * int64_t{sms};
+  if (tiles >= want) return 1;
+  const int64_t parts = (want + tiles - 1) / tiles;
+  return parts < gsize ? parts : gsize;
+}
+
+// v1.8 (DESIGN §4 KF, §6c): KF's launch shape. log2 of its tile length tk = pow2 >= k_hat
+// (>= 16); a tile holds 2^lg_te FP64 (th = 2^(lg_te - lg_tk) rows): 4096 for the E = 16 kernel
+// (16 values per thread), 1024 for the E = 4 one, which runs when the E = 16 grid would have
+// fewer than kKfSmallBlocksPerSm blocks per SM even with every modulus in its own block row.
+// The tiles of operand x: radix_x ceil((b rows_x / radix_x) / th) (none for a packed one).
+// contract.cu launch_kf and the performance model (perf.cpp) use these rules.
+constexpr int64_t kKfSmallBlocksPerSm = 16;
+inline int kf_lg_tk(int64_t k_hat) {
+  int lg_tk = 4;
+  while ((int64_t{1} << lg_tk) < k_hat) ++lg_tk;
+  return lg_tk;
+}
+inline int64_t kf_operand_tiles(int lg_te, int lg_tk, int64_t b, int64_t rows, int64_t radix) {
+  const int64_t th = int64_t{1} << (lg_te - lg_tk);
+  const int64_t D = b * rows / radix;
+  return radix * ((D + th - 1) / th);
+}
+inline bool kf_small(int64_t tiles_4096, int gsize, int sms) {
+  return tiles_4096 * gsize < kKfSmallBlocksPerSm * int64_t{sms};
+}
+
 // v1.8 (DESIGN §4 KL, §6c): log2 of KL's tile length tk along k-bar. A KL tile holds 4096 FP64
 // of th rows x tk: read along rows, th = 8 rows side by side (tk = 512); along k-bar, tk =
 // pow2 >= k_hat in [64, 4096] (th = 4096 / tk). Rows longer than two tiles re-read their middle
