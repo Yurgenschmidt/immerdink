@@ -428,17 +428,35 @@ IMD_API const char* imd_perf_class_name(int32_t cls);
 IMD_API const char* imd_perf_param_name(int32_t cls, int32_t j);
 IMD_API const char* imd_perf_phase_name(int32_t phase);
 
-/* What to predict beyond the options. NULL = flags 0, k4_config -1. */
+/* The eps path (§6c.1, a property of the DATA, not of the plan). The packs (KF, KL, K2/K3,
+ * imd_pack) quantize an element to mu 2^eps; when |a'| >= 2^53 (eps > 0) a residue costs one
+ * more modular multiply, and a warp pays it for its whole tile (32 lanes x up to 16 elements)
+ * if any element of the tile has eps > 0. eps_fraction = the fraction of the pack work that
+ * takes that path. It is 0 whenever T < 2^53 (N <= 13: no |a'| reaches 2^53). The DEFAULT
+ * (eps_fraction < 0) is a plan-only estimate for TYPICAL data, i.e. rows of comparable
+ * entries such as the benchmark generator's (u - 1/2) exp(g / 2): with the margin
+ * D = log2 T - log2(k) / 2 - 53 (T exact, not floor(log2 T)), the fraction of 512-element
+ * tiles on the eps path rises from 0 at D = -2.5 to 1 at D = -1 (simulated: a tile's maximum
+ * after the row's power-of-two scaling is about 1.6 bits above the row RMS margin; the
+ * default is that linear ramp). Rows with one dominant entry have a fraction of about
+ * 512 / k; the caller passes its own value then. Every prediction also reports eps_s, the
+ * time of the eps terms at fraction 1, so a caller unsure of its data has the exact bracket
+ * [time_s - f eps_s, time_s + (1 - f) eps_s] for the fraction f used (eps_fraction out). */
+
+/* What to predict beyond the options. NULL = flags 0, k4_config -1, eps_fraction -1. */
 typedef struct {
   uint32_t struct_size;  /* sizeof(imd_perf_request_t)                                      */
   int32_t flags;         /* IMD_PERF_BETA_NONZERO (C is read), IMD_PERF_ALPHA_ZERO          */
   int32_t k4_config;     /* -1: the plan-time rule for the calibration's sm_count; else IMD_K4_* */
   int32_t reserved;      /* 0                                                               */
+  double eps_fraction;   /* < 0: the typical-data default; 0..1: the caller's (see above)   */
 } imd_perf_request_t;
 
 /* One phase: its features x (the model is sum_j param[cls * 6 + j] x[j]; K4: the max of the
- * terms j < 4 and the term j = 4), its predicted time,
- * and its MEMORY_MODEL §4 lower bound: bound_s = max(bytes / peak DRAM, ops / peak). */
+ * terms j < 4 and the term j = 4; the op_eps features already carry the eps fraction), its
+ * predicted time, and its MEMORY_MODEL §4 lower bound: bound_s = max(bytes / peak DRAM,
+ * ops / peak). It has no struct_size: its layout (96 bytes) and IMD_PERF_MAX_PHASES are
+ * FROZEN for host API version 6; a change would be a new struct and function names. */
 typedef struct {
   int32_t phase;         /* IMD_PERF_PHASE_*                                                */
   int32_t cls;           /* IMD_PERF_CLASS_*                                                */
@@ -461,6 +479,8 @@ typedef struct {
   double bound_s;        /* sum of the phase bounds                                         */
   double flops_eq;       /* 2 b m n k (imd_pack: 0)                                         */
   double tflops_eq;      /* flops_eq / time_s / 1e12 (0 when time_s is 0)                   */
+  double eps_s;          /* time of the eps-path terms at fraction 1 (the bracket above)    */
+  double eps_fraction;   /* the eps fraction used (the default estimate or the request's)  */
   int64_t kernel_launches;
   uint64_t workspace_bytes;   /* imd_workspace_size(_packed) (exact)                        */
   uint64_t plan_device_bytes; /* imd_plan_bytes (exact)                                     */
@@ -478,8 +498,10 @@ IMD_API imd_status_t imd_perf_predict(const imd_tensor_t* A, const imd_tensor_t*
                                       const imd_packing_t* packing,
                                       const imd_perf_request_t* request,
                                       const imd_perf_calib_t* calib, imd_perf_t* out);
-/* Predicted imd_pack of a pack descriptor (imd_pack_layout's status). */
+/* Predicted imd_pack of a pack descriptor (imd_pack_layout's status); of the request only
+ * eps_fraction is used (NULL: the default). */
 IMD_API imd_status_t imd_perf_predict_pack(const imd_pack_desc_t* desc,
+                                           const imd_perf_request_t* request,
                                            const imd_perf_calib_t* calib, imd_perf_t* out);
 
 /* Ranking (§6c.3). Masks: */
@@ -497,6 +519,7 @@ typedef struct {
   int32_t reuse;                 /* contractions per imd_pack (amortization), >= 1           */
   int32_t flags;                 /* IMD_PERF_BETA_NONZERO                                    */
   uint64_t budget_bytes;         /* device memory for total_bytes; 0 = no budget             */
+  double eps_fraction;           /* as imd_perf_request_t: < 0 the default, else 0..1        */
 } imd_perf_rank_request_t;
 
 typedef struct {
@@ -510,6 +533,8 @@ typedef struct {
   double contract_s;         /* imd_perf_predict                                             */
   double pack_s;             /* sum of imd_perf_predict_pack over the packed operands        */
   double tflops_eq;          /* 2 b m n k / time_s / 1e12                                    */
+  double eps_s;              /* eps-path time at fraction 1: contract + pack / reuse         */
+  double eps_fraction;       /* the eps fraction used                                        */
   uint64_t workspace_bytes;  /* imd_workspace_size(_packed)                                  */
   uint64_t plan_device_bytes;/* imd_plan_bytes                                               */
   uint64_t pack_bytes;       /* sum of imd_pack_layout pack_bytes                            */

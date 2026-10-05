@@ -41,3 +41,16 @@ c_outer1  | i,j->ij | i=2048,j=2048                | imd | 8 | --reps 100 --phas
 c_outer2  | i,j->ij | i=8192,j=4096                | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1
 c_dir1    | ik,jk->ij | i=512,j=512,k=512          | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --mode direct
 c_dir2    | ik,jk->ij | i=1024,j=768,k=128         | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --mode direct
+# --- (review 2026-10-05) memory-bound K4 at g < N
+c_rmm2g   | ik,jk->ij | i=2000,j=128,k=30000       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1 --g 1,2,4,7
+c_rskin2g | ik,jk->ij | i=32768,j=256,k=2048       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1 --g 1,2,4,7
+c_rkl2g   | ik,jk->ij | i=256,j=256,k=150000       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1 --g 1,2,4,7
+# --- the eps path: N = 15, 16 on both sides of the typical-data threshold, and the same plans
+#     with one dominant entry per row (eps fraction about 512 / k)
+c_e15a    | ik,jk->ij | i=2048,j=2048,k=4096       | imd | 14,15,16,17 | --reps 10 --phase-reps 5 --max-seconds 1
+c_e15b    | ik,jk->ij | i=512,j=512,k=131000       | imd | 15,16 | --reps 10 --phase-reps 3 --max-seconds 1
+c_e15c    | ik,jk->ij | i=768,j=768,k=768          | imd | 14,15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
+c_d15a    | ik,jk->ij | i=2048,j=2048,k=4096       | imd | 15,16 | --reps 10 --phase-reps 5 --max-seconds 1 --data dominant
+c_d15b    | ik,jk->ij | i=1024,j=1024,k=32768      | imd | 15,16 | --reps 10 --phase-reps 3 --max-seconds 1 --data dominant
+c_d15c    | ik,jk->ij | i=4096,j=256,k=1024        | imd | 15,16 | --reps 50 --phase-reps 10 --max-seconds 1 --data dominant
+c_d15d    | ik,jk->ij | i=768,j=768,k=768          | imd | 15,16,20 | --reps 100 --phase-reps 10 --max-seconds 1 --data dominant

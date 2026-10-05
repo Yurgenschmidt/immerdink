@@ -198,7 +198,9 @@ Peak device memory for a set of live plans and one call at a time is then exactl
 ## 4. Compulsory global-memory traffic (lower bound)
 
 The kernels run in sequence, so a time lower bound is the sum over kernels of
-`max(ops / peak_ops, bytes / bandwidth)`.
+`max(ops / peak_ops, bytes / bandwidth)`. `imd_perf_predict` (libimmerdink_host, DESIGN §6c)
+reports these bytes, ops and bounds per phase for concrete descriptors (with the actual g and
+the fused paths KF / KL), next to a calibrated time prediction; `imd_bench` prints them.
 
 | Kernel | Bytes moved | Work |
 |---|---|---|

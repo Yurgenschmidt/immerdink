@@ -1592,16 +1592,16 @@ and reproducible.
 
 Notation (post-swap view, §1.1): `rows_A = b·m`, `rows_B = b·n`, padded rows `pad_A = b·m`,
 `pad_B = b·n̂`, elements `E_x = rows_x·k`, `V` = `vec_entries`, `G = ⌈N/g⌉` groups of sizes
-`g_1 = g, …, g_G = N − (G−1)·g`, `L32(N)` = CRT limbs (§2), β' = [β ≠ 0], `w(N, k)` = 1 if
-`eps_max(N) + ½ − ½·log₂k ≥ 53` else 0 (below), `L2` = the calibration's `l2_bytes`. Only
-**in-line** operands x (not packed, §6b) have scale and pack phases.
+`g_1 = g, …, g_G = N − (G−1)·g`, `L32(N)` = CRT limbs (§2), β' = [β ≠ 0], `f` = the eps
+fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands x (not packed,
+§6b) have scale and pack phases.
 
 | phase (bench tag) | when | class | x₀ | x₁ | x₂ | x₃ | x₄ |
 |---|---|---|---|---|---|---|---|
 | `K0 vec` | `IMD_VEC_GENERATE`, no KF (any dispatch but NOOP) | K0 | 1 | `8V` written | | | |
-| `KF fused` | `fused` (§4) | KF | 1 | `Σ_x (8E_x + g·pad_x·k̂ + 3rows_x) + 8V·[GENERATE]` | `g·Σ_x E_x` residues | `Σ_x rows_x` | `w·x₂` |
-| `KL A`, `KL B` | `fused_large` bit of x | KL | 1 | `8E_x + g·pad_x·k̂ + 3rows_x` | `g·E_x` | `16·rows_x·max(0, k̂ − 2·tk_x)` L2 re-read | `w·x₂` |
-| `K2 pack A`, `K3 pack B` | groups of x not packed by KF / KL | PACK | launches (B: + the zero-rows launch per group if n̂ > n) | `Σ_groups (8E_x + g_i·pad_x·k̂)` | `Σ_groups g_i·E_x` | `w·x₂` | |
+| `KF fused` | `fused` (§4) | KF | 1 | `Σ_x (8E_x + g·pad_x·k̂ + 3rows_x) + 8V·[GENERATE]` | `g·Σ_x E_x` residues | `Σ_x rows_x` | `f·x₂` |
+| `KL A`, `KL B` | `fused_large` bit of x | KL | 1 | `8E_x + g·pad_x·k̂ + 3rows_x` | `g·E_x` | `16·rows_x·max(0, k̂ − 2·tk_x)` L2 re-read | `f·x₂` |
+| `K2 pack A`, `K3 pack B` | groups of x not packed by KF / KL | PACK | launches (B: + the zero-rows launch per group if n̂ > n) | `Σ_groups (8E_x + g_i·pad_x·k̂)` | `Σ_groups g_i·E_x` | `f·x₂` | |
 | `K4 gemm` | EMULATE | K4[config] | rounds | MACs run at q = 1 | q = 2 | q = 3 | DRAM bytes beyond L2: `Σ_groups max(0, g_i·b·(m + n̂)·k̂ + g_i·b·m·n̂·(2·k_chunks − 1) − L2)` |
 | `K5 crt` | EMULATE | K5 | 1 | `N·b·m·n̂ + 3b(m+n) + 8bmn(1+β')` | `N·L32·b·m·n` limb operations | | |
 | `DIRECT` | DIRECT dispatch | DIRECT | 1 | `8b(mk + nk) + 8bmn(1+β')` | `2bmnk` FP64 flops | | |
@@ -1612,14 +1612,26 @@ Notation (post-swap view, §1.1): `rows_A = b·m`, `rows_B = b·n`, padded rows 
 
 (x₅ is unused: room for one more feature per class in a later format.)
 
-- **The eps > 0 regime** (`w`, the `op_eps` features). The packs quantize an element to
-  `μ·2^ε`; a residue costs one more modular multiply when ε > 0 (§3.4, the "rare" path of the
-  pack emitter). A row is scaled so that its norm is about T, so a typical element is about
-  `T/√k`; when that is ≥ 2⁵³ most elements have ε > 0. T < 2^(eps_max+1) with eps_max = 54 /
-  62 / 65 / 77 at N = 14 / 16 / 17 / 20, so the regime starts at N ≈ 16–17 for k in the
-  thousands: measured, KL / KF cost per residue jumps there (sq2048: N = 14 → 17 +45 % for
-  3 more moduli; with g = 5, +11 % for the same work). `w` is a property of typical data
-  (rows of comparable entries), not of the plan; heavy-tailed rows are in the cheap regime.
+- **The eps path** (the `op_eps` features, reviewed 2026-10-05). The packs quantize an
+  element to `μ·2^ε`; a residue costs one more modular multiply when ε > 0, i.e. |a'| ≥ 2⁵³
+  (§3.4, the "rare" path of the pack emitter), and a warp pays it for its whole tile (32 lanes
+  × up to 16 elements) when any element of the tile has ε > 0. This depends on the **data**,
+  so it is an input: `eps_fraction` f ∈ [0, 1] in the requests (the fraction of pack work on
+  the eps path), forced to 0 when T < 2⁵³ (N ≤ 13). The default (f < 0 in the request) is a
+  plan-only **typical-data** estimate: rows of comparable entries are scaled to a norm of about
+  T, so with the margin `D = log₂T − ½·log₂k − 53` (T exact, not ⌊log₂T⌋; log₂T = 54.58 /
+  58.39 / 62.19 / 65.98 / 77.19 at N = 14 / 15 / 16 / 17 / 20) the fraction of 512-element tiles whose
+  maximum after the row's power-of-two scaling reaches 2⁵³ is a function of D alone, k-free:
+  simulated for the benchmark generator `(u − ½)·exp(g/2)` with random row scales (k = 1024 and
+  8192 agree), 0.03 at D = −2.5, 0.23 at −2, 0.65 at −1.5, 0.96 at −1 (a tile's maximum is about
+  1.6 bits above the RMS margin); the default is the ramp f = clamp((D + 2.5)/1.5, 0, 1). So at
+  N = 14 only k < 286 is on the path (fully for k ≤ 36), at N = 15 fully for k ≤ 7 000 and not
+  at all for k ≥ 56 000, at N ≥ 16 for every practical k. Rows with one dominant entry have f ≈ 512/k (one tile per row);
+  callers pass their own f. Every prediction reports `eps_s`, the eps terms at f = 1, so the
+  exact bracket for any data is `[time − f·eps_s, time + (1 − f)·eps_s]`. The calibration
+  identifies op_eps on the same plans with different data (`imd_bench --data dominant`), not
+  only through N. Consequence: with the default f, doubling k can lower the predicted time
+  (f falls from 1 to 0 as k grows); never below the time without the eps terms (tested).
 - **K4's DRAM term.** The operands of a group were just written by the packs and stay in L2
   while the group's operands and W planes fit; beyond that K4 streams them from DRAM
   (measured memory-bound: r_mm-like n̂ = 64–128 with long k, skinny m ≫ n). The calibration
@@ -1733,7 +1745,8 @@ const char*  imd_perf_class_name(int32_t cls);          /* "k0", "kf", ..., "cal
 const char*  imd_perf_param_name(int32_t cls, int32_t j); /* "launch", "byte", ...; NULL: unused */
 const char*  imd_perf_phase_name(int32_t phase);        /* the bench tags: "K0 vec", ...   */
 
-typedef struct { uint32_t struct_size; int32_t flags, k4_config /* -1: rule */, reserved; }
+typedef struct { uint32_t struct_size; int32_t flags, k4_config /* -1: rule */, reserved;
+                 double eps_fraction; /* < 0: the typical-data default; else 0..1 */ }
         imd_perf_request_t;
 typedef struct {
   int32_t phase, cls;  int64_t launches;
@@ -1743,6 +1756,7 @@ typedef struct {
   uint32_t struct_size;
   int32_t  status, dispatch, k4_config, sm_count, num_phases;
   double   time_s, bound_s, flops_eq, tflops_eq;
+  double   eps_s, eps_fraction;     /* eps terms at f = 1; the f used */
   int64_t  kernel_launches;
   uint64_t workspace_bytes, plan_device_bytes, pack_bytes, pack_ws_bytes;
   imd_perf_phase_t phase[IMD_PERF_MAX_PHASES];
@@ -1753,8 +1767,8 @@ imd_status_t imd_perf_predict(const imd_tensor_t* A, const imd_tensor_t* B,
                               const imd_packing_t* /* NULL: none */,
                               const imd_perf_request_t* /* NULL: defaults */,
                               const imd_perf_calib_t* /* NULL: shipped */, imd_perf_t* out);
-imd_status_t imd_perf_predict_pack(const imd_pack_desc_t*, const imd_perf_calib_t*,
-                                   imd_perf_t* out);
+imd_status_t imd_perf_predict_pack(const imd_pack_desc_t*, const imd_perf_request_t*,
+                                   const imd_perf_calib_t*, imd_perf_t* out);
 ```
 - **predict**: returns the plan-time status of `imd_lowering(_packed)` (also in
   `out->status`); the prediction is filled only on SUCCESS (otherwise every field but
@@ -1765,7 +1779,8 @@ imd_status_t imd_perf_predict_pack(const imd_pack_desc_t*, const imd_perf_calib_
   predicted and the calibration's SMs. With `IMD_PERF_ALPHA_ZERO` the call is K0 + `K5
   beta-only`.
 - **predict_pack**: `imd_pack_layout`'s status; on SUCCESS the phases `pack prep`, `pack KL`,
-  `call`, `pack_bytes` and `pack_ws_bytes` (exact); 0 time for an empty pack.
+  `call`, `pack_bytes` and `pack_ws_bytes` (exact); 0 time for an empty pack. Of the request
+  only `eps_fraction` is used.
 - **Calibration functions**: parse / load fill `out` (with `out->struct_size` as the
   caller's size; fields past it are not written) or return INVALID_VALUE (with
   `*error_line`, 0 when not tied to a line: a missing key, an unreadable file);
@@ -1788,11 +1803,12 @@ typedef struct {
   int32_t reuse;                   /* contractions per pack, ≥ 1                        */
   int32_t flags;                   /* IMD_PERF_BETA_NONZERO                             */
   uint64_t budget_bytes;           /* 0: no budget                                      */
+  double   eps_fraction;           /* as imd_perf_request_t                             */
 } imd_perf_rank_request_t;
 typedef struct {
   int32_t  num_moduli, residue_group, vec_mode, packed;  /* packed: bit 0 / 1 = caller's A / B */
   int32_t  status, feasible, k4_config, dispatch;
-  double   time_s, contract_s, pack_s, tflops_eq;
+  double   time_s, contract_s, pack_s, tflops_eq, eps_s, eps_fraction;
   uint64_t workspace_bytes, plan_device_bytes, pack_bytes, pack_ws_bytes, total_bytes;
   int64_t  kernel_launches;
 } imd_perf_candidate_t;
@@ -1830,7 +1846,10 @@ packing=, beta=, alpha_zero=, k4_config=, calib=)` → per-phase records with na
 calib=)` → ranked candidates. `python3 -m immerdink.host … --rank` prints the table.
 
 **Versioning.** `IMD_HOST_API_VERSION` 6 adds the functions, the enums and the structs (each
-with `struct_size` or a caller-given element size; fields are only appended);
+with `struct_size` or a caller-given element size; fields are only appended). The exception is
+`imd_perf_phase_t`, which has no size field and is a fixed `[IMD_PERF_MAX_PHASES]` array inside
+`imd_perf_t`: its 96-byte layout and the array length are **frozen** for version 6 (a change is
+a new struct and new function names);
 `imd_lowering_t` and everything existing are unchanged. The calibration file is versioned
 by `format` (a new feature set is a new format and a refit).
 

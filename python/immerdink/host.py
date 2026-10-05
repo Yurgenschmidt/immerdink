@@ -133,7 +133,7 @@ class _PerfCalib(C.Structure):
 
 class _PerfRequest(C.Structure):
     _fields_ = [("struct_size", C.c_uint32), ("flags", C.c_int32), ("k4_config", C.c_int32),
-                ("reserved", C.c_int32)]
+                ("reserved", C.c_int32), ("eps_fraction", C.c_double)]
 
 
 class _PerfPhase(C.Structure):
@@ -146,7 +146,8 @@ class _Perf(C.Structure):
     _fields_ = [("struct_size", C.c_uint32), ("status", C.c_int32), ("dispatch", C.c_int32),
                 ("k4_config", C.c_int32), ("sm_count", C.c_int32), ("num_phases", C.c_int32),
                 ("time_s", C.c_double), ("bound_s", C.c_double), ("flops_eq", C.c_double),
-                ("tflops_eq", C.c_double), ("kernel_launches", C.c_int64),
+                ("tflops_eq", C.c_double), ("eps_s", C.c_double), ("eps_fraction", C.c_double),
+                ("kernel_launches", C.c_int64),
                 ("workspace_bytes", C.c_uint64), ("plan_device_bytes", C.c_uint64),
                 ("pack_bytes", C.c_uint64), ("pack_ws_bytes", C.c_uint64),
                 ("phase", _PerfPhase * _PERF_MAX_PHASES)]
@@ -157,7 +158,8 @@ class _RankRequest(C.Structure):
                 ("num_moduli_count", C.c_int32), ("residue_group_count", C.c_int32),
                 ("num_moduli", C.POINTER(C.c_int32)), ("residue_groups", C.POINTER(C.c_int32)),
                 ("vec_modes", C.c_int32), ("pack_modes", C.c_int32), ("reuse", C.c_int32),
-                ("flags", C.c_int32), ("budget_bytes", C.c_uint64)]
+                ("flags", C.c_int32), ("budget_bytes", C.c_uint64),
+                ("eps_fraction", C.c_double)]
 
 
 class _Candidate(C.Structure):
@@ -165,6 +167,7 @@ class _Candidate(C.Structure):
                 ("packed", C.c_int32), ("status", C.c_int32), ("feasible", C.c_int32),
                 ("k4_config", C.c_int32), ("dispatch", C.c_int32), ("time_s", C.c_double),
                 ("contract_s", C.c_double), ("pack_s", C.c_double), ("tflops_eq", C.c_double),
+                ("eps_s", C.c_double), ("eps_fraction", C.c_double),
                 ("workspace_bytes", C.c_uint64), ("plan_device_bytes", C.c_uint64),
                 ("pack_bytes", C.c_uint64), ("pack_ws_bytes", C.c_uint64),
                 ("total_bytes", C.c_uint64), ("kernel_launches", C.c_int64)]
@@ -173,8 +176,9 @@ class _Candidate(C.Structure):
 assert C.sizeof(_Lowering) == 184  # version 5 (DESIGN §6b v1.7)
 assert C.sizeof(_Options) == 24
 assert C.sizeof(_PackDesc) == 72 and C.sizeof(_PackLayout) == 136
-assert C.sizeof(_PerfCalib) == 1232 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1632
-assert C.sizeof(_RankRequest) == 56 and C.sizeof(_Candidate) == 112
+assert C.sizeof(_PerfCalib) == 1232 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1648
+assert C.sizeof(_RankRequest) == 64 and C.sizeof(_Candidate) == 128
+assert C.sizeof(_PerfRequest) == 24
 
 
 # ------------------------------------------------------------------------------------------
@@ -246,8 +250,8 @@ class HostLibrary:
             "imd_perf_predict": (C.c_int, [T, T, T, O, C.POINTER(_Packing),
                                            C.POINTER(_PerfRequest), C.POINTER(_PerfCalib),
                                            C.POINTER(_Perf)]),
-            "imd_perf_predict_pack": (C.c_int, [C.POINTER(_PackDesc), C.POINTER(_PerfCalib),
-                                                C.POINTER(_Perf)]),
+            "imd_perf_predict_pack": (C.c_int, [C.POINTER(_PackDesc), C.POINTER(_PerfRequest),
+                                                C.POINTER(_PerfCalib), C.POINTER(_Perf)]),
             "imd_perf_rank": (C.c_int, [T, T, T, O, C.POINTER(_RankRequest),
                                         C.POINTER(_PerfCalib), C.POINTER(_Candidate), C.c_int32,
                                         C.POINTER(C.c_int32)]),
@@ -694,6 +698,8 @@ class Prediction:
     bound_s: float
     flops_eq: float
     tflops_eq: float
+    eps_s: float          # eps-path time at fraction 1: bracket [t - f eps_s, t + (1 - f) eps_s]
+    eps_fraction: float   # the eps fraction f used (immerdink_host.h: typical-data default)
     kernel_launches: int
     workspace_bytes: int
     plan_device_bytes: int
@@ -719,21 +725,28 @@ def _prediction(r, st):
                                    p.time_s, p.bytes, p.ops, p.bound_s, tuple(p.x))
                    for p in r.phase[:r.num_phases])
     return Prediction(STATUS[st], DISPATCH[r.dispatch], r.k4_config, r.sm_count, r.time_s,
-                      r.bound_s, r.flops_eq, r.tflops_eq, r.kernel_launches, r.workspace_bytes,
-                      r.plan_device_bytes, r.pack_bytes, r.pack_ws_bytes, phases)
+                      r.bound_s, r.flops_eq, r.tflops_eq, r.eps_s, r.eps_fraction,
+                      r.kernel_launches, r.workspace_bytes, r.plan_device_bytes, r.pack_bytes,
+                      r.pack_ws_bytes, phases)
+
+
+def _eps(eps_fraction):
+    return -1.0 if eps_fraction is None else float(eps_fraction)
 
 
 def predict(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",
             vec_mode="GENERATE", packing=None, beta=False, alpha_zero=False, k4_config=None,
-            calib=None, lib=None):
+            eps_fraction=None, calib=None, lib=None):
     """imd_perf_predict: the predicted imd_contract (DESIGN §6c). A plan-time status is
     returned in .status (with zeros); a bad argument raises. packing = (PackSpec or None,
     PackSpec or None): the packed plan. beta: C is read (beta != 0); alpha_zero: the beta-only
-    call; k4_config: force an IMD_K4_* configuration (None: the plan-time rule)."""
+    call; k4_config: force an IMD_K4_* configuration (None: the plan-time rule); eps_fraction:
+    the fraction of pack work on the eps path (None: the typical-data default; see
+    immerdink_host.h)."""
     h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing)
     flags = (_PERF_BETA_NONZERO if beta else 0) | (_PERF_ALPHA_ZERO if alpha_zero else 0)
     req = _PerfRequest(C.sizeof(_PerfRequest), flags,
-                       -1 if k4_config is None else int(k4_config), 0)
+                       -1 if k4_config is None else int(k4_config), 0, _eps(eps_fraction))
     r = _Perf()
     r.struct_size = C.sizeof(_Perf)
     pk = C.byref(call.packing) if packing is not None else None
@@ -741,13 +754,14 @@ def predict(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EM
     return _prediction(r, st)
 
 
-def predict_pack(pack, *, calib=None, lib=None):
+def predict_pack(pack, *, eps_fraction=None, calib=None, lib=None):
     """imd_perf_predict_pack: the predicted imd_pack of a PackSpec."""
     h = load(lib) if not isinstance(lib, HostLibrary) else lib
     arg = _PackArg(pack)
     r = _Perf()
     r.struct_size = C.sizeof(_Perf)
-    st = h.lib.imd_perf_predict_pack(C.byref(arg.d), _calib_arg(calib), C.byref(r))
+    req = _PerfRequest(C.sizeof(_PerfRequest), 0, -1, 0, _eps(eps_fraction))
+    st = h.lib.imd_perf_predict_pack(C.byref(arg.d), C.byref(req), _calib_arg(calib), C.byref(r))
     return _prediction(r, st)
 
 
@@ -766,6 +780,8 @@ class Candidate:
     contract_s: float
     pack_s: float
     tflops_eq: float
+    eps_s: float         # eps-path time at fraction 1 (contract + pack / reuse)
+    eps_fraction: float
     workspace_bytes: int
     plan_device_bytes: int
     pack_bytes: int
@@ -776,7 +792,7 @@ class Candidate:
 
 def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",),
          packs=("NONE",), reuse=1, budget=0, beta=False, rounding="RN", mode="EMULATE",
-         calib=None, lib=None):
+         eps_fraction=None, calib=None, lib=None):
     """imd_perf_rank: the candidates N x g x vec mode x packs ranked by predicted time inside a
     device-memory budget (bytes; 0 = none). N: an int or a list of admissible N; g: None
     (every g in 1..N) or a list; packs: any of "NONE", "A", "B", "AB"."""
@@ -790,7 +806,7 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
                        C.cast(garr, C.POINTER(C.c_int32)) if gs else None,
                        sum(_PERF_VEC[v] for v in set(vec_modes)),
                        sum(_PERF_PACK[p] for p in set(packs)), int(reuse),
-                       _PERF_BETA_NONZERO if beta else 0, int(budget))
+                       _PERF_BETA_NONZERO if beta else 0, int(budget), _eps(eps_fraction))
     count = C.c_int32(0)
     st = h.lib.imd_perf_rank(*call.args(), C.byref(req), _calib_arg(calib), None, 0,
                              C.byref(count))
@@ -805,7 +821,8 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
     return [Candidate(c.num_moduli, c.residue_group, vec_name[c.vec_mode],
                       ["NONE", "A", "B", "AB"][c.packed], STATUS[c.status], bool(c.feasible),
                       c.k4_config, DISPATCH[c.dispatch], c.time_s, c.contract_s, c.pack_s,
-                      c.tflops_eq, c.workspace_bytes, c.plan_device_bytes, c.pack_bytes,
+                      c.tflops_eq, c.eps_s, c.eps_fraction, c.workspace_bytes,
+                      c.plan_device_bytes, c.pack_bytes,
                       c.pack_ws_bytes, c.total_bytes, c.kernel_launches)
             for c in out[:count.value]]
 

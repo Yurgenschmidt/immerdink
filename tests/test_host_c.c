@@ -292,8 +292,8 @@ int main(void) {
   {
     CHECK(IMD_HOST_API_VERSION >= 6);
     CHECK(sizeof(imd_perf_calib_t) == 1232 && sizeof(imd_perf_phase_t) == 96 &&
-          sizeof(imd_perf_t) == 1632 && sizeof(imd_perf_candidate_t) == 112 &&
-          sizeof(imd_perf_rank_request_t) == 56 && sizeof(imd_perf_request_t) == 16);
+          sizeof(imd_perf_t) == 1648 && sizeof(imd_perf_candidate_t) == 128 &&
+          sizeof(imd_perf_rank_request_t) == 64 && sizeof(imd_perf_request_t) == 24);
     static imd_perf_calib_t cal, back;
     memset(&cal, 0, sizeof cal);
     cal.struct_size = sizeof cal;
@@ -390,7 +390,7 @@ int main(void) {
       CHECK(pr.flops_eq == 2.0 * 17 * 33 * 5 * 3);
     }
     {
-      imd_perf_request_t rq = {sizeof rq, IMD_PERF_ALPHA_ZERO, -1, 0};
+      imd_perf_request_t rq = {sizeof rq, IMD_PERF_ALPHA_ZERO, -1, 0, -1.0};
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_SUCCESS);
       CHECK(pr.num_phases == 3 && pr.phase[0].phase == IMD_PERF_PHASE_K0 &&
             pr.phase[1].phase == IMD_PERF_PHASE_BETA && pr.kernel_launches == 2);
@@ -398,6 +398,13 @@ int main(void) {
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
       rq.flags = 0, rq.k4_config = IMD_K4_CONFIG_COUNT;
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
+      rq.k4_config = -1, rq.eps_fraction = 1.5; /* a fraction above 1 */
+      CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
+      /* N = 9: T < 2^53, so the eps fraction is 0 whatever the request */
+      rq.eps_fraction = 1.0;
+      CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_SUCCESS &&
+            pr.eps_fraction == 0.0);
+      rq.eps_fraction = -1.0;
       back = cal;
       back.format = 2;
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, NULL, &back, &pr) == IMD_STATUS_INVALID_VALUE);
@@ -416,7 +423,7 @@ int main(void) {
     memset(&pl, 0, sizeof pl);
     pl.struct_size = sizeof pl;
     CHECK(imd_pack_layout(&pa2, &pl) == IMD_STATUS_SUCCESS);
-    CHECK(imd_perf_predict_pack(&pa2, NULL, &pr) == IMD_STATUS_SUCCESS);
+    CHECK(imd_perf_predict_pack(&pa2, NULL, NULL, &pr) == IMD_STATUS_SUCCESS);
     CHECK(pr.num_phases == 3 && pr.phase[0].phase == IMD_PERF_PHASE_PACK_PREP &&
           pr.phase[1].phase == IMD_PERF_PHASE_PACK_KL && pr.pack_bytes == pl.pack_bytes &&
           pr.pack_ws_bytes == pl.pack_ws_bytes && pr.time_s > 0);

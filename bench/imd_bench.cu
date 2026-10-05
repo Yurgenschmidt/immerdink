@@ -174,14 +174,16 @@ __device__ __host__ inline uint64_t splitmix64(uint64_t x) {
   return x ^ (x >> 31);
 }
 // (u - 1/2) * exp(phi * g), u uniform in [0,1), g standard normal: GEMMul8's test data.
-__global__ void k_fill(double* p, size_t n, uint64_t seed, double phi) {
+// dom > 0 (--data dominant): every dom-th element (one per row of k contiguous contracted
+// elements, e.g. ik / jk operands) is multiplied by 2^20, so each row has one dominant entry.
+__global__ void k_fill(double* p, size_t n, uint64_t seed, double phi, size_t dom) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
        i += size_t(gridDim.x) * blockDim.x) {
     uint64_t h1 = splitmix64(seed ^ (2 * i)), h2 = splitmix64(seed ^ (2 * i + 1));
     double u = double(h1 >> 11) * 0x1.0p-53, u1 = (double(h2 >> 11) + 1.0) * 0x1.0p-53;
     double u2 = double(splitmix64(h2) >> 11) * 0x1.0p-53;
     double g = sqrt(-2.0 * log(u1)) * cospi(2.0 * u2);
-    p[i] = (u - 0.5) * exp(phi * g);
+    p[i] = (u - 0.5) * exp(phi * g) * ((dom != 0 && i % dom == 0) ? 1048576.0 : 1.0);
   }
 }
 
@@ -429,6 +431,7 @@ struct Options {
   // the k4_tune plan option, 0.. = forced through the benchmark hook)
   std::vector<int> k4 = {-1};
   double phi = 0.5;
+  bool dominant = false;  // --data dominant (B2 eps-path calibration: one dominant entry per row)
   uint64_t seed = 1;
   std::string out;
 };
@@ -623,8 +626,9 @@ struct Bench {
     dA = DevBuf(c.A.size * 8);
     dB = DevBuf(c.B.size * 8);
     dC = DevBuf(c.C.size * 8);
-    k_fill<<<1024, 256, 0, s>>>(dA.as<double>(), c.A.size, splitmix64(o.seed * 3 + 0), o.phi);
-    k_fill<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1), o.phi);
+    const size_t dom = o.dominant ? size_t(c.k) : 0;
+    k_fill<<<1024, 256, 0, s>>>(dA.as<double>(), c.A.size, splitmix64(o.seed * 3 + 0), o.phi, dom);
+    k_fill<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1), o.phi, dom);
     CU(cudaStreamSynchronize(s));
     CU(cudaGetLastError());
     R = make_reference(c, dA.as<double>(), dB.as<double>(), o.samples, o.seed, s);
@@ -652,7 +656,9 @@ struct Bench {
     meta.str("gemm_view", cA + "," + cB + "->" + cC);
     meta.raw("perm_needed", std::string("\"") + (needA ? "A" : "") + (needB ? "B" : "") + (needC ? "C" : "") + "\"");
     meta.num("phi", o.phi).integer("seed", (long long)o.seed);
+    meta.str("data", o.dominant ? "dominant" : "normal");
     meta.str("gpu", p.name).integer("sm_count", p.multiProcessorCount);
+    meta.integer("l2_bytes", (long long)p.l2CacheSize);
     meta.str("driver", sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null"));
     meta.integer("cuda_driver_api", drv).integer("cuda_runtime", rt);
     meta.str("gpu_max_clocks", sh("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem "
@@ -995,7 +1001,7 @@ struct Bench {
       for (auto& pr : preds) pr.struct_size = sizeof pr;
       imd_perf_predict(&A, &B, &C, &opt, nullptr, nullptr, nullptr, &preds[0]);
       imd_perf_predict(&A, &B, &C, &opt, &packing, nullptr, nullptr, &preds[1]);
-      imd_perf_predict_pack(&desc, nullptr, &preds[2]);
+      imd_perf_predict_pack(&desc, nullptr, nullptr, &preds[2]);
       int ri = 0;
       for (auto& [pre, fn] : runs) {
         fprintf(stderr, "  %sphases:\n", pre);
@@ -1119,7 +1125,7 @@ void usage() {
           "  [--N 8,14,20] [--reps 10] [--warmup 2]\n"
           "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--phase-reps 5]\n"
           "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)] [--k4 rule,tune,0,1,2,3]\n"
-          "  [--mode emulate|direct] (method imd)\n"
+          "  [--mode emulate|direct] (method imd) [--data normal|dominant]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
           "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4)\n"
@@ -1137,7 +1143,7 @@ int main(int argc, char** argv) {
   static const char* const kKeys[] = {"name", "spec", "ext", "methods", "N", "reps", "warmup",
                                       "max-seconds", "samples", "phi", "seed", "phase-reps",
                                       "vec", "g", "k4", "pack", "reuse", "duel-a", "duel-b", "out",
-                                      "mode"};
+                                      "mode", "data"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -1180,6 +1186,10 @@ int main(int argc, char** argv) {
     if (a.count("mode")) {
       if (a["mode"] != "emulate" && a["mode"] != "direct") throw Failure("--mode emulate|direct");
       B.o.mode = a["mode"] == "direct" ? IMD_DIRECT : IMD_EMULATE;
+    }
+    if (a.count("data")) {
+      if (a["data"] != "normal" && a["data"] != "dominant") throw Failure("--data normal|dominant");
+      B.o.dominant = a["data"] == "dominant";
     }
     if (a.count("phi")) B.o.phi = std::stod(a["phi"]);
     if (a.count("seed")) B.o.seed = std::stoull(a["seed"]);

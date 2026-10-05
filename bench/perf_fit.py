@@ -9,11 +9,19 @@ imd_contract (median_s) and the median per-phase times ("phases"; packed records
 plain_/packed_/pack_phases, contract_packed_ms, pack_ms).
 
 The features of every phase come from libimmerdink_host (imd_perf_predict through
-python/immerdink/host.py): no feature formula lives here. Per kernel class the parameters
-minimize the relative error sum(((theta . x - t) / t)^2) subject to theta >= 0 (exact NNLS by
-enumerating the active sets of <= 4 parameters); then the call term (sign-free least squares of
-(t_timed - sum of the predicted phases) / t_timed on (1, kernel_launches)). BETA (not measured
-by the sweep) takes K5's launch and byte parameters. numpy only.
+python/immerdink/host.py) under a SEED calibration of the measured device: its sm_count and
+l2_bytes from the records (imd_bench records them; --sm-count / --l2-bytes override), so the
+K4 configuration, the rounds and the DRAM term are the measured GPU's. No feature formula lives
+here. Per kernel class the parameters minimize the relative error sum(((theta . x - t) / t)^2)
+subject to theta >= 0 (exact NNLS by enumerating the active sets of <= 5 parameters); for the K4
+classes the roofline max(round model, DRAM term) with a scan over the DRAM rate (--k4-shared-dram:
+one rate for the four configurations). Then the call term: sign-free least squares of
+(t_timed - the C model's phases) / t_timed on (1, kernel_launches), where the phases are
+re-predicted by the C library with the fitted parameters (the C does the sum / max). BETA (not
+measured by the sweep) takes K5's launch and byte parameters. Records with --data dominant
+(one dominant entry per row) are predicted with eps fraction min(1, 512 / k); the others with
+the typical-data default. Datasheet peaks: the RTX 4090's, else --peak-dram / --peak-int8 /
+--peak-fp64 are required. numpy only.
 """
 
 import argparse
@@ -66,7 +74,17 @@ class Sample:
         self.again = again            # calib -> host.Prediction (the C model, that calibration)
 
 
-def samples_from_records(records, lib=None):
+def record_eps(rec, ext):
+    """The eps fraction of a record's data: None (the typical-data default) for the normal
+    generator; for one dominant entry per row, the tiles holding it: min(1, 512 / k)."""
+    if rec.get("data") != "dominant":
+        return None
+    lw = host.lowering(rec["spec"], ext, N=int(rec.get("N", 8)))
+    return min(1.0, 512.0 / max(lw.k, 1))
+
+
+def samples_from_records(records, lib=None, seed=None):
+    """seed: the calibration whose sm_count / l2_bytes the features use (the measured GPU)."""
     out = []
     for r in records:
         if r.get("status") != "ok":
@@ -78,11 +96,13 @@ def samples_from_records(records, lib=None):
         ext = parse_ext(ext)
         if meth == "imd" and "phases" in r:
             o = variant_options(r)
-            def again(calib, spec=spec, ext=ext, o=o):
+            eps = record_eps(r, ext)
+
+            def again(calib, spec=spec, ext=ext, o=o, eps=eps):
                 return host.predict(spec, ext, N=o["N"], g=o["g"], vec_mode=o["vec_mode"],
-                                    mode=o["mode"], k4_config=o["k4_config"], calib=calib,
-                                    lib=lib)
-            p = again(None)
+                                    mode=o["mode"], k4_config=o["k4_config"], eps_fraction=eps,
+                                    calib=calib, lib=lib)
+            p = again(seed)
             if p.status != "SUCCESS":
                 continue
             meas = {k: v["ms"] * 1e-3 for k, v in r["phases"].items() if v.get("ms") is not None}
@@ -93,16 +113,19 @@ def samples_from_records(records, lib=None):
             N = int(r["N"])
             pk = host.pack_desc_for(spec, ext, operand=which, N=N, lib=lib)
             packing = (pk, None) if which == 0 else (None, pk)
-            fns = {"plain_": lambda c, spec=spec, ext=ext, N=N: host.predict(
-                       spec, ext, N=N, calib=c, lib=lib),
-                   "packed_": lambda c, spec=spec, ext=ext, N=N, packing=packing: host.predict(
-                       spec, ext, N=N, packing=packing, calib=c, lib=lib),
-                   "pack_": lambda c, pk=pk: host.predict_pack(pk, calib=c, lib=lib)}
+            eps = record_eps(r, ext)
+            fns = {"plain_": lambda c, spec=spec, ext=ext, N=N, eps=eps: host.predict(
+                       spec, ext, N=N, eps_fraction=eps, calib=c, lib=lib),
+                   "packed_": lambda c, spec=spec, ext=ext, N=N, packing=packing, eps=eps:
+                       host.predict(spec, ext, N=N, packing=packing, eps_fraction=eps, calib=c,
+                                    lib=lib),
+                   "pack_": lambda c, pk=pk, eps=eps: host.predict_pack(
+                       pk, eps_fraction=eps, calib=c, lib=lib)}
             lab = f"{r['case']} pack {r.get('pack')} N={N}"
             for pre, timed in (("plain_", r["contract_ms"] * 1e-3),
                                ("packed_", r["contract_packed_ms"] * 1e-3),
                                ("pack_", r["pack_ms"] * 1e-3)):
-                pred = fns[pre](None)
+                pred = fns[pre](seed)
                 ph = r.get(pre + "phases")
                 if ph is None or pred.status != "SUCCESS":
                     continue
@@ -173,7 +196,7 @@ def predicted_ns(params, names, cls, x):
     return sum(terms)
 
 
-def fit_k4(X, t, byte_col):
+def fit_k4(X, t, byte_col, rates=None):
     """max(round model, DRAM term) (a roofline): for each candidate DRAM rate (bandwidths from
     100 GB/s to 2 TB/s, or none) the round model is fitted (NNLS, relative) on the phases the
     DRAM term does not explain (its time below 90 % of the measured), and the rate with the
@@ -181,8 +204,9 @@ def fit_k4(X, t, byte_col):
     comp = [j for j in range(X.shape[1]) if j != byte_col]
     xb = X[:, byte_col]
     best, best_err = None, float("inf")
-    for bw in [None] + list(np.geomspace(100e9, 2000e9, 61)):
-        rate = 0.0 if bw is None else 1.0 / bw
+    if rates is None:
+        rates = [0.0] + [1.0 / bw for bw in np.geomspace(100e9, 2000e9, 61)]
+    for rate in rates:
         sel = rate * xb < 0.9 * t
         if sel.sum() < len(comp):
             continue
@@ -192,14 +216,34 @@ def fit_k4(X, t, byte_col):
         err = float(np.sum(((np.maximum(X[:, comp] @ th[comp], rate * xb) - t) / t) ** 2))
         if err < best_err:
             best, best_err = th, err
-    return best
+    return best, best_err
 
 
-def fit(samples, lib=None, verbose=True, worst=0):
+def fit(samples, seed, lib=None, verbose=True, worst=0, k4_shared_dram=False):
     names = host.param_names(lib)
     rows = phase_rows(samples)
     params = {}
     report = []
+    shared = None
+    if k4_shared_dram:  # one DRAM rate for the four K4 configurations: the best total
+        best = None
+        for rate in [0.0] + [1.0 / bw for bw in np.geomspace(100e9, 2000e9, 61)]:
+            tot = 0.0
+            for cls in host.PERF_CLASSES[4:8]:
+                data = rows.get(cls, [])
+                if not data:
+                    continue
+                used = [j for j, n in enumerate(names[cls]) if n]
+                X = np.array([d[0][used] for d in data])
+                t = np.array([d[1] for d in data])
+                th = fit_k4(X, t, used.index(K4_BYTE), [rate])[0]
+                if th is None:
+                    tot = float("inf")
+                    break
+                tot += fit_k4(X, t, used.index(K4_BYTE), [rate])[1]
+            if best is None or tot < best[1]:
+                best = (rate, tot)
+        shared = best[0]
     for cls in host.PERF_CLASSES:
         if cls in (CALL, "beta"):
             continue
@@ -211,7 +255,7 @@ def fit(samples, lib=None, verbose=True, worst=0):
         X = np.array([d[0][used] for d in data])
         t = np.array([d[1] for d in data])
         if is_k4(cls):
-            theta = fit_k4(X, t, used.index(K4_BYTE))
+            theta = fit_k4(X, t, used.index(K4_BYTE), None if shared is None else [shared])[0]
         else:
             theta = nnls_relative(X, t)
         for j, v in zip(used, theta):
@@ -231,17 +275,23 @@ def fit(samples, lib=None, verbose=True, worst=0):
                 params[f"{cls}.{n}"] = 0.0
     params["beta.launch"] = params.get("k5.launch", 0.0)
     params["beta.byte"] = params.get("k5.byte", 0.0)
-    # The call term: (t_timed - sum of the predicted phases) on (1, kernel_launches).
+    # The call term: (t_timed - the C model's phases with these parameters, call term 0) on
+    # (1, kernel_launches).
+    params["call.call"], params["call.launch"] = 0.0, 0.0
+    trial = host.Calibration.from_values(seed.meta, params, lib)
     Xc, rc, tc = [], [], []
     for s in samples:
-        tp = sum(predicted_ns(params, names, p.cls, p.x) for p in s.pred.phases if p.cls != CALL)
-        Xc.append([1.0, float(s.pred.kernel_launches)])
-        rc.append(s.timed_s - tp * 1e-9)
+        p = s.again(trial)
+        Xc.append([1.0, float(p.kernel_launches)])
+        rc.append(s.timed_s - p.time_s)
         tc.append(s.timed_s)
     Xc, rc, tc = np.array(Xc), np.array(rc), np.array(tc)
     sol, *_ = np.linalg.lstsq(Xc / tc[:, None], rc / tc, rcond=None)
     params["call.call"], params["call.launch"] = float(sol[0] * 1e9), float(sol[1] * 1e9)
     if verbose:
+        rates = {c: params.get(f"{c}.byte", 0.0) for c in host.PERF_CLASSES[4:8]}
+        print("K4 DRAM rates (GB/s): " + ", ".join(
+            f"{c} {1 / v:.0f}" if v > 0 else f"{c} none" for c, v in rates.items()))
         print(f"{'class':<12} {'phases':>6} {'median|err|':>12} {'p90|err|':>9}")
         for cls, n, med, p90 in report:
             if med is None:
@@ -272,38 +322,58 @@ def main(argv=None):
     ap.add_argument("--version", default=None, help="version string (default: the commit)")
     ap.add_argument("--notes", default=None)
     ap.add_argument("--worst", type=int, default=0, help="print the N worst phases per class")
-    ap.add_argument("--l2-bytes", type=float, default=72 * 2**20,
-                    help="the GPU's L2 cache bytes (default: the RTX 4090's 72 MiB)")
+    ap.add_argument("--sm-count", type=int, default=None, help="override the records' sm_count")
+    ap.add_argument("--l2-bytes", type=float, default=None,
+                    help="override the records' l2_bytes (needed for records without it; "
+                         "an RTX 4090 defaults to 72 MiB)")
+    ap.add_argument("--peak-dram", type=float, default=None, help="datasheet DRAM bytes/s")
+    ap.add_argument("--peak-int8", type=float, default=None, help="datasheet int8 ops/s")
+    ap.add_argument("--peak-fp64", type=float, default=None, help="datasheet FP64 flops/s")
+    ap.add_argument("--k4-shared-dram", action="store_true",
+                    help="one DRAM rate for the four K4 configurations")
     a = ap.parse_args(argv)
     records = []
     for f in a.records:
         records += [json.loads(line) for line in open(f) if line.strip()]
-    samples = samples_from_records(records, a.lib)
+    ok = [r for r in records if r.get("status") == "ok" and r.get("gpu")]
+    if not ok:
+        sys.exit("no usable records")
+    gpus = {r["gpu"] for r in ok}
+    if len(gpus) != 1:
+        sys.exit(f"records of several GPUs: {sorted(gpus)}")
+    gpu = ok[0]["gpu"]
+    is4090 = "RTX 4090" in gpu
+    sms = a.sm_count or int(ok[0]["sm_count"])
+    l2 = a.l2_bytes or next((float(r["l2_bytes"]) for r in ok if r.get("l2_bytes")), None)
+    if l2 is None:
+        if not is4090:
+            sys.exit("the records have no l2_bytes: pass --l2-bytes")
+        l2 = 72 * 2**20
+    peaks = {"peak_dram_bytes_per_s": a.peak_dram, "peak_int8_ops_per_s": a.peak_int8,
+             "peak_fp64_flops_per_s": a.peak_fp64}
+    for k, v in zip(peaks, (1008e9, 660.6e12, 1.29e12)):  # RTX 4090 datasheet
+        if peaks[k] is None:
+            if not is4090:
+                sys.exit(f"{gpu}: pass --peak-dram, --peak-int8 and --peak-fp64 (datasheet)")
+            peaks[k] = v
+    commit = next((r.get("commit") for r in ok if r.get("commit")), "unknown")
+    meta = {"gpu": gpu, "sm_count": sms, "date": datetime.date.today().isoformat(),
+            "version": a.version or f"immerdink {commit}, host API {host.API_VERSION}",
+            "clocks": clock_summary(records)[:127], **peaks, "l2_bytes": l2}
+    # The seed: the measured device's sm_count and L2 with the shipped parameters (features
+    # depend only on sm_count and l2_bytes).
+    seed = host.Calibration.from_values(meta, host.Calibration.default(a.lib).params, a.lib)
+    samples = samples_from_records(records, a.lib, seed)
     if not samples:
         sys.exit("no usable records (profiling build, method imd / packed, status ok)")
-    params = fit(samples, a.lib, worst=a.worst)
-    ok = [r for r in records if r.get("status") == "ok" and r.get("gpu")]
-    commit = next((r.get("commit") for r in ok if r.get("commit")), "unknown")
-    meta = {"gpu": ok[0]["gpu"], "sm_count": int(ok[0]["sm_count"]),
-            "date": datetime.date.today().isoformat(),
-            "version": a.version or f"immerdink {commit}, host API {host.API_VERSION}",
-            "clocks": clock_summary(records)[:127],
-            "notes": (a.notes or f"fit on {len(samples)} calls ({len(ok)} records) by "
-                      f"bench/perf_fit.py")[:127],
-            "peak_dram_bytes_per_s": 1008e9, "peak_int8_ops_per_s": 660.6e12,
-            "peak_fp64_flops_per_s": 1.29e12, "l2_bytes": a.l2_bytes}
-    if "4090" not in meta["gpu"]:
-        print("note: the datasheet peaks are the RTX 4090's (edit the peak_* lines) and the "
-              "fit used --l2-bytes for this GPU's L2",
-              file=sys.stderr)
+    params = fit(samples, seed, a.lib, worst=a.worst, k4_shared_dram=a.k4_shared_dram)
+    meta["notes"] = (a.notes or f"fit on {len(samples)} calls ({len(ok)} records) by "
+                     f"bench/perf_fit.py")[:127]
     cal = host.Calibration.from_values(meta, params, a.lib)
     with open(a.out, "w") as f:
         f.write(cal.format())
-    # The fit's own error on the timed totals (in-sample).
-    errs = []
-    for s in samples:
-        tp = sum(predicted_ns(params, host.param_names(a.lib), p.cls, p.x) for p in s.pred.phases)
-        errs.append(abs(tp * 1e-9 - s.timed_s) / s.timed_s)
+    # The fit's own error on the timed totals (in-sample, the C model).
+    errs = [abs(s.again(cal).time_s - s.timed_s) / s.timed_s for s in samples]
     print(f"in-sample total: median |err| {100 * statistics.median(errs):.1f}%, "
           f"p90 {100 * float(np.percentile(errs, 90)):.1f}%, max {100 * max(errs):.1f}% "
           f"over {len(errs)} calls")

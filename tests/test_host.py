@@ -698,7 +698,8 @@ def suite_host(args):
 # Suite perf (DESIGN v1.8 §6c): the performance model, CPU only
 
 L32 = [0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]  # §2: CRT limbs per N
-EPS_MAX = [0, 0, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 46, 50, 54, 58, 62, 65, 69, 73, 77]
+MODULI = [256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199, 197, 193, 191,
+          181, 179, 173]  # DESIGN §2
 L2_4090 = 72 * 2**20
 K_C_PRIME = 131056
 
@@ -745,7 +746,9 @@ def spec_phases(lw, vec, along_rows, beta=False):
                                      0, 0]))
         return ph + [("call", 0, [1, lw.kernel_launches, 0, 0, 0, 0])]
     rows, pad = [b * m, b * n], [b * m, b * nh]
-    wide = 1 if EPS_MAX[N] + 0.5 - 0.5 * math.log2(k) >= 53 else 0  # typical eps > 0
+    # the typical-data eps fraction (immerdink_host.h): exact log2 T, the margin ramp
+    lt = math.log2(math.isqrt((math.prod(MODULI[:N]) - 1) // 2))
+    wide = 0.0 if lt < 53 else min(1.0, max(0.0, (lt - 0.5 * math.log2(k) - 53 + 2.5) / 1.5))
     if not lw.fused and not res:
         ph.append(("K0 vec", 1, [1, 8 * V, 0, 0, 0, 0]))
     if lw.fused:
@@ -864,28 +867,54 @@ def suite_perf(args):
             if q.cls != host.PERF_CLASSES[4 + c] or not close(ns, est, 1e-9):
                 raise Fail(f"K4 {m},{n},{k},{b} config {c}: {ns} ns vs A3 estimate {est} ns")
     # --- monotonicity: a bigger shape never takes less time (same K4 configuration, path) -
+    # Against the shipped (fitted) calibration and a synthetic one with a large eps-path cost.
+    # With a fixed eps fraction the time never drops; with the default fraction it may drop
+    # when k doubles (the typical-data estimate falls from 1 to 0 as k grows, DESIGN §6c.1),
+    # but never below the time without the eps terms.
+    heavy = dict(cal.params)
+    for key in ("kf.op_eps", "kl.op_eps", "pack.op_eps"):
+        heavy[key] = 50 * (heavy[key] + 1e-4)
     mono = 0
-    for t in range(200):
-        # n a multiple of 16: doubling n then keeps n_hat = n (no zero-rows launch appears or
-        # disappears; one launch less can be a real saving)
-        m, n = rng.randint(1, 4000), 16 * rng.randint(1, 250)
-        k = rng.choice((rng.randint(2, 1000), rng.randint(1100, 60000)))
-        N = rng.randint(2, 20)
-        g = rng.randint(1, N)
-        base = host.predict("ik,jk->ij", dict(i=m, j=n, k=k), N=N, g=g)
-        if base.status != "SUCCESS":
-            continue
-        for ext in (dict(i=2 * m, j=n, k=k), dict(i=m, j=2 * n, k=k)) + \
-                ((dict(i=m, j=n, k=2 * k),) if k > 1024 else ()):
-            big = host.predict("ik,jk->ij", ext, N=N, g=g, k4_config=base.k4_config)
-            if big.status == "SUCCESS" and big.time_s < base.time_s:
-                raise Fail(f"monotonicity: {ext} N={N} g={g}: {big.time_s} < {base.time_s} "
-                           f"({m},{n},{k})")
-            mono += 1
-        more_n = host.predict("ik,jk->ij", dict(i=m, j=n, k=k), N=min(N + 1, 20), g=0)
-        same = host.predict("ik,jk->ij", dict(i=m, j=n, k=k), N=N, g=0, k4_config=more_n.k4_config)
-        if more_n.status == same.status == "SUCCESS" and more_n.time_s < same.time_s:
-            raise Fail(f"monotonicity in N: {m},{n},{k} N={N}")
+    for which, cb in (("shipped", None), ("heavy eps", host.Calibration.from_values(cal.meta, heavy))):
+        for t in range(120):
+            # n a multiple of 16: doubling n then keeps n_hat = n (no zero-rows launch appears
+            # or disappears; one launch less can be a real saving)
+            m, n = rng.randint(1, 4000), 16 * rng.randint(1, 250)
+            k = rng.choice((rng.randint(2, 1000), rng.randint(1100, 60000)))
+            N = rng.randint(2, 20)
+            g = rng.randint(1, N)
+            for eps in (0.0, 1.0, None):
+                base = host.predict("ik,jk->ij", dict(i=m, j=n, k=k), N=N, g=g, eps_fraction=eps,
+                                    calib=cb)
+                if base.status != "SUCCESS":
+                    continue
+                for ext in (dict(i=2 * m, j=n, k=k), dict(i=m, j=2 * n, k=k)) + \
+                        ((dict(i=m, j=n, k=2 * k),) if k > 1024 else ()):
+                    big = host.predict("ik,jk->ij", ext, N=N, g=g, k4_config=base.k4_config,
+                                       eps_fraction=eps, calib=cb)
+                    if big.status != "SUCCESS":
+                        continue
+                    floor = base.time_s - (base.eps_fraction * base.eps_s if eps is None else 0)
+                    if big.time_s < floor * (1 - 1e-12):
+                        raise Fail(f"monotonicity ({which}, eps {eps}): {ext} N={N} g={g}: "
+                                   f"{big.time_s} < {floor} ({m},{n},{k})")
+                    mono += 1
+            more_n = host.predict("ik,jk->ij", dict(i=m, j=n, k=k), N=min(N + 1, 20), g=0, calib=cb)
+            same = host.predict("ik,jk->ij", dict(i=m, j=n, k=k), N=N, g=0,
+                                k4_config=more_n.k4_config, calib=cb)
+            if more_n.status == same.status == "SUCCESS" and more_n.time_s < same.time_s:
+                raise Fail(f"monotonicity in N ({which}): {m},{n},{k} N={N}")
+    # the eps bracket: time at fraction f = time at 0 + f eps_s; the default ramp
+    for N, k in ((14, 300), (15, 4096), (16, 50000), (17, 2048), (13, 64)):
+        ext = dict(i=256, j=256, k=k)
+        p0, p1 = (host.predict("ik,jk->ij", ext, N=N, eps_fraction=f) for f in (0.0, 1.0))
+        pd = host.predict("ik,jk->ij", ext, N=N)
+        lt = math.log2(math.isqrt((math.prod(MODULI[:N]) - 1) // 2))
+        want = 0.0 if lt < 53 else min(1.0, max(0.0, (lt - 0.5 * math.log2(k) - 53 + 2.5) / 1.5))
+        if not close(pd.eps_fraction, want, 1e-9) or \
+                not close(pd.time_s, p0.time_s + pd.eps_fraction * pd.eps_s) or \
+                not close(p1.time_s, p0.time_s + p0.eps_s) or (lt < 53 and p1.eps_fraction != 0):
+            raise Fail(f"eps bracket N={N} k={k}: {pd.eps_fraction} vs {want}")
     # --- statuses: kappa >= T (N = 2, T = 180) gives the plan-time status and no time -------
     p = host.predict("ik,jk->ij", dict(i=3, j=5, k=180 * 180), N=2)
     if p.status != "NOT_SUPPORTED" or p.time_s != 0 or p.phases:

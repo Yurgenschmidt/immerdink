@@ -31,3 +31,13 @@ v_t_4d    | abcd,cdef->abef | a=32,b=32,c=48,d=48,e=32,f=32 | imd | 8,14 | --rep
 v_b_kl    | lik,ljk->lij | l=4,i=1024,j=1024,k=3000 | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
 v_pk1024  | ik,jk->ij | i=1024,j=1024,k=2048       | packed | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1 --pack A,B --reuse 1
 v_pks     | ik,jk->ij | i=384,j=384,k=384          | packed | 8 | --reps 100 --phase-reps 5 --max-seconds 1 --pack A --reuse 1
+# --- (review 2026-10-05) N = 15, 16, 17 (the operating range of ehrenfest) and g < N on
+#     memory-bound shapes, disjoint from the fit set
+v_n15a    | ik,jk->ij | i=3000,j=3000,k=3000       | imd | 15,16,17 | --reps 10 --phase-reps 3 --max-seconds 1
+v_n15b    | ik,jk->ij | i=640,j=640,k=640          | imd | 15,16,17 | --reps 200 --phase-reps 10 --max-seconds 1
+v_n15c    | kjbc,kiac->abij | i=24,j=24,k=24,a=112,b=112,c=112 | imd | 15,16,17 | --reps 10 --phase-reps 3 --max-seconds 1 --g 0,6
+v_n15d    | ik,jk->ij | i=768,j=768,k=100000       | imd | 15,16 | --reps 10 --phase-reps 3 --max-seconds 1
+v_n15e    | lik,ljk->lij | l=8,i=512,j=512,k=2048  | imd | 15,16,17 | --reps 20 --phase-reps 5 --max-seconds 1
+v_mmg     | ik,jk->ij | i=1500,j=96,k=40000        | imd | 8,14,16 | --reps 10 --phase-reps 3 --max-seconds 1 --g 0,2,5
+v_skg     | ik,jk->ij | i=24576,j=384,k=3072       | imd | 8,14,16 | --reps 10 --phase-reps 3 --max-seconds 1 --g 0,2,7
+v_dom     | ik,jk->ij | i=1536,j=1536,k=6144       | imd | 15,16 | --reps 10 --phase-reps 3 --max-seconds 1 --data dominant

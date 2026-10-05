@@ -15,6 +15,7 @@ time alongside.
 import argparse
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -98,7 +99,7 @@ def main(argv=None):
     for f in a.records:
         records += [json.loads(line) for line in open(f) if line.strip()]
     calib = host.Calibration.load(a.calib, a.lib) if a.calib else host.Calibration.default(a.lib)
-    rows = evaluate(perf_fit.samples_from_records(records, a.lib), calib, a.lib)
+    rows = evaluate(perf_fit.samples_from_records(records, a.lib, calib), calib, a.lib)
     if a.per_call:
         print(f"{'call':<44} {'TFLOPS-eq meas':>14} {'pred':>8} {'time meas':>11} {'pred':>11} {'err':>7}")
         for lab, m, p, fl, _ in sorted(rows, key=lambda r: r[1]):
@@ -107,6 +108,10 @@ def main(argv=None):
                   f"{100 * (p - m) / m:>+6.1f}%")
     ok, table = summarize(rows, a.markdown)
     print(table)
+    sub = [r for r in rows if re.search(r"N=1[567]\b", r[0])]
+    if sub:  # the operating range of ehrenfest (informational)
+        print("N = 15..17 only:")
+        print(summarize(sub, a.markdown)[1])
     if a.phases:
         print(phase_summary(rows, a.markdown))
     print(f"calibration: {calib.meta['gpu']} ({calib.meta['date']}, {calib.meta['version']})")
