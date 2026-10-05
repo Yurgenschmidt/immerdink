@@ -179,6 +179,13 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/contractions.py"
                    --lib "$<TARGET_FILE:immerdink>" --quick --rows 16)
   set_tests_properties(accuracy_bound_quick PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+  # DESIGN v1.12 §6f: measured errors <= libimmerdink_host's rigorous estimates (every metric)
+  # on random small cases; reports the typical estimate's coverage. Exit 1 on a violation.
+  add_test(NAME accuracy_err_api_quick
+           COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/err_api.py"
+                   --lib "$<TARGET_FILE:immerdink>" --host-lib "$<TARGET_FILE:immerdink_host>"
+                   --quick)
+  set_tests_properties(accuracy_err_api_quick PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
 endif()
 
 # GPU tests share one device; run them one at a time.

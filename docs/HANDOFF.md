@@ -8,9 +8,9 @@ first.
 
 - **Branches:** all work is on `dev` (pushed). `main` = PR #1 (v1.3 state); later work reaches
   main by another PR from dev. Never push to main directly.
-- **DESIGN v1.11** (v1.10 §6c performance-model follow-up, v1.11 §6e planner) (docs/DESIGN.md): v1.4 KF fused small path, v1.5 K4 configs and rule, v1.6
+- **DESIGN v1.12** (v1.10 §6c performance-model follow-up, v1.11 §6e planner, v1.12 §6f accuracy-aware planning) (docs/DESIGN.md): v1.4 KF fused small path, v1.5 K4 configs and rule, v1.6
   KL fused large path, v1.7 §6b packed operands, v1.8 §6c performance model, v1.9 §6d Python.
-- **Host API v7** (`include/immerdink/immerdink_host.h`, CUDA-free `libimmerdink_host`, Python
+- **Host API v8** (`include/immerdink/immerdink_host.h`, CUDA-free `libimmerdink_host`, Python
   `python/immerdink/host.py`): the single source of truth for lowering, legality, workspace,
   plan bytes, K4 config, launch counts, packed-operand sizing and compatibility, and (v6) the
   performance model.
@@ -38,8 +38,23 @@ first.
   call); pure ctypes, host API unchanged (v6), no nanobind. Test `host_planner`; per-call
   numbers `bench/planner_overhead.py` (C floor: `imd_planner_floor`). Design questions open
   for review (§6e.7).
+- **Accuracy-aware planning (DESIGN v1.12 §6f, host API 8, branch `b2-accuracy`,
+  2026-10-05, NOTES-B2 §7):** the planner input is the caller's `imd_err_request_t`: a metric
+  (normwise, elementwise, absolute), a target, and operand statistics. It gets:
+  - `imd_err_estimate`, the estimates from scalars;
+  - `imd_err_min_moduli`, the smallest N that meets the target, from one lowering;
+  - `err_bound` / `err_typical` in `imd_perf_predict` and in rank's candidates;
+  - rank marks the candidates that miss the target as infeasible (`infeasible` bits).
+
+  The rigorous bound has 0 violations in 300 held-out GPU cases. The typical estimate
+  (Hoeffding, RN, opt-in) is not valid for rows of equal entries. The bound math lives only in
+  `src/host/accuracy.cpp`; `spec/params.py error_estimate` + `cert_error_estimate` are the
+  reference. Python: `host.Accuracy`, `host.min_moduli`, `planner.Accuracy`,
+  `Query.min_moduli`. Tests: `host_accuracy`, `accuracy_err_api_quick`; the full GPU check is
+  `bench/accuracy/err_api.py`. No TLA+ change. Design questions for the reviewer: NOTES-B2
+  §7.4.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
-  oracle suite, 26 params certificates, all passing (`tools/test.sh`, `spec/check.sh`,
+  oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
 - **D3 gate (Eric, 2026-10-04):** D3 begins with a design/theory discussion with Eric to narrow
   the questions. Do not start D3 agents or specs before that.

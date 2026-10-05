@@ -2810,6 +2810,10 @@ immerdink never reads the data here (kernel scope). The caller passes an `imd_er
 - the dispatch;
 - N and the rounding, from the options.
 
+Rows and columns are those of the GEMM view (§1.1). For a tensor, a_i is A's fiber over the
+contracted labels at one value of its free and batch labels, and b_j is B's. A role swap (§5)
+changes nothing, because every formula is symmetric in A and B.
+
 **No request (NULL)** reports the NORMWISE values with no target. NORMWISE needs **no
 statistics at all**: the §3.8 bound relative to ‖a_i‖‖b_j‖ depends only on (N, k, rounding).
 
@@ -2950,6 +2954,7 @@ configuration, in the request's metric.
 - With `accuracy` NULL (or a v7-sized request): NORMWISE, no target, `err_status` UNCHECKED.
 - With a target: MET or MISSED, by `basis`.
 - A statistic missing for the metric is INVALID_VALUE.
+- `imd_perf_predict_pack` (no product) leaves the err fields 0.
 
 **rank.** With `accuracy` and a target, a candidate whose estimate (by basis) exceeds the
 target is **infeasible**: `feasible` = 0 and `infeasible` has `IMD_PERF_INFEASIBLE_ACCURACY`.
@@ -2963,7 +2968,8 @@ target is **infeasible**: `feasible` = 0 and `infeasible` has `IMD_PERF_INFEASIB
 - So `rank(...)[0]`, when feasible, is **the cheapest configuration that meets the target**.
   Every candidate also carries its estimates, so a caller can relax the target without
   re-ranking.
-- A v8 candidate reports the NORMWISE estimates even without `accuracy`.
+- A v8 candidate reports the NORMWISE estimates even without `accuracy`. A candidate whose
+  plan-time status is not SUCCESS has no plan: +∞, UNCHECKED, `infeasible` = `_STATUS`.
 - Requests and candidates shorter than v8 behave as v7.
 
 **Minimal N on the hot path.** `imd_err_min_moduli` is one lowering (0.3–0.7 µs) plus at most
@@ -2994,7 +3000,7 @@ target is **infeasible**: `feasible` = 0 and `infeasible` has `IMD_PERF_INFEASIB
 **`host_accuracy` (CPU):**
 - `imd_err_estimate` vs `params.error_estimate` on 20 000 random (N, k, rounding, dispatch,
   M, metric, statistics) cases: the rigorous bound lies in [exact, exact·(1 + 2⁻³⁹)], and the
-  typical estimate agrees to 1e−12 relative.
+  typical estimate agrees to 1e−11 relative (it may take the min with the inflated E).
 - Invalid requests are rejected.
 - min_moduli equals a brute-force scan of `imd_err_estimate` (and of params), for both bases.
 - predict and rank:

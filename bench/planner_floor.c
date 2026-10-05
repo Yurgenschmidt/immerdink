@@ -8,11 +8,13 @@
  *   name N g vec_mode  rA eA[rA] sA[rA] lA[rA]  rB eB.. sB.. lB..  rC eC.. sC.. lC..
  * One output line per case:
  *   name ws lowering plan_bytes pack_desc_for predict_null predict_calib predict_pack rank
+ *        min_moduli
  * in ns per call (median of 7 batches of ~4 ms each). predict_null passes calib = NULL (the
  * shipped calibration, parsed once by the library, v1.10); predict_calib passes a
  * calibration already loaded with imd_perf_calib_default; rank: N = {N}, every g,
  * GENERATE only, no packs, calibration given; predict_pack: imd_pack_desc_for(A)'s
- * descriptor. CPU only, no GPU, no allocation in the loops. */
+ * descriptor; min_moduli (v8, DESIGN §6f): imd_err_min_moduli, NORMWISE target 1e-12 (the
+ * rigorous bound). CPU only, no GPU, no allocation in the loops. */
 #define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,7 +54,7 @@ static int read_tensor(Tensor* x) {
 
 /* The query being timed, as a switch so that every function runs through one loop. */
 enum { Q_WS, Q_LOWERING, Q_PLAN_BYTES, Q_PACK_DESC, Q_PREDICT_NULL, Q_PREDICT_CALIB,
-       Q_PREDICT_PACK, Q_RANK, Q_COUNT };
+       Q_PREDICT_PACK, Q_RANK, Q_MIN_MODULI, Q_COUNT };
 
 typedef struct {
   const imd_tensor_t *A, *B, *C;
@@ -65,6 +67,8 @@ typedef struct {
   imd_perf_candidate_t cands[32];
   imd_lowering_t lw;
   imd_perf_t perf;
+  imd_err_request_t acc;
+  imd_err_t err;
 } Ctx;
 
 static volatile int64_t sink;
@@ -102,6 +106,11 @@ static void run(Ctx* c, int q) {
       break;
     case Q_RANK:
       st = imd_perf_rank(c->A, c->B, c->C, &c->opt, &c->rreq, c->cal, c->cands, 32, &n);
+      break;
+    case Q_MIN_MODULI:
+      c->err.struct_size = sizeof c->err;
+      st = imd_err_min_moduli(c->A, c->B, c->C, &c->opt, 0, 0, &c->acc, &c->err);
+      n = c->err.num_moduli;
       break;
   }
   sink += st + (int64_t)a + n;
@@ -157,7 +166,9 @@ int main(void) {
     c.rank_n = N;
     c.rreq = (imd_perf_rank_request_t){sizeof c.rreq, sizeof c.cands[0], 1, 0, &c.rank_n, NULL,
                                        IMD_PERF_VEC_GENERATE, IMD_PERF_PACK_NONE, 1, 0, 0, -1.0,
-                                       0, 0, 0, 0, 0.0};  /* v7: DEFAULT, COLD, ORDER_TIME */
+                                       0, 0, 0, 0, 0.0, NULL};  /* v7: DEFAULT, COLD, TIME */
+    memset(&c.acc, 0, sizeof c.acc);
+    c.acc.struct_size = sizeof c.acc, c.acc.target = 1e-12;
     printf("%s", name);
     for (int q = 0; q < Q_COUNT; ++q) {
       if (q == Q_PREDICT_PACK && pst != IMD_STATUS_SUCCESS) {

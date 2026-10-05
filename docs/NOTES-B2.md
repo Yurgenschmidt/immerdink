@@ -440,6 +440,92 @@ DESIGN §6f. This section holds the evidence and the open questions.
   (`error_estimate`, exact rational enclosure) is the reference, and `cert_error_estimate`
   checks the bound on emulated rows. Python only marshals.
 
+### 7.2 Validation on the GPU (rigorous bound; typical-estimate coverage)
+
+**Calibration set: the M5 records.** These are 520 runs: 4 CC fixtures × 5 data families ×
+N = 8…20 × RN / TRUNC, with the maximum taken over a sampled grid of 4096 or 512 outputs. On
+them, `host.err_estimate` gives:
+
+- rigorous: max measured / bound 0.908;
+- typical (RN), estimated over the grid's outputs: covers 260 / 260, with max measured /
+  estimate 0.91 overall and 0.23 where the emulation error dominates (N ≤ 13);
+- TRUNC's typical value is its bound.
+
+The estimate has no fitted constant. This set was only checked; nothing was tuned on it.
+
+**Held out: `bench/accuracy/err_api.py`, 300 random cases.** The cases cover:
+- 10 families: φ = 0.5, 1, 2, 4; rows and columns scaled by 2^U(−300, 300); uniform; same
+  sign; M5's decay_opp and outliers; and "constant" rows, which are outside the typical model;
+- k = 64…93 564 (log-uniform);
+- N = 5…20, RN (236 cases) and TRUNC (64);
+- the GEMM `ik,kj->ij` and the two-label `akp,bkp->ab`;
+- sampled grids of 16² to 32² outputs with an exact reference.
+
+The statistics come from the data, as a caller would supply them. Raw data:
+`~/repos/immerdink-eval/results/b2/accuracy-20261005/` (grids, records, report).
+
+Results:
+- **Rigorous: 0 violations** in every metric (NORMWISE with ν = √k and with the measured
+  ℓ1/ℓ2 ratios, ELEMENTWISE with the measured ρ, ABSOLUTE). The maximum measured / bound is
+  0.964, at N ≥ 16, where the final-rounding term u is attained.
+- **Supplying the ℓ1/ℓ2 ratios** tightens the rigorous bound at N ≤ 13 (median over a family):
+  - decay_opp: 0.31× (about ½ modulus);
+  - outliers: 0.13×;
+  - φ = 4: 0.11× (about ¾ modulus);
+  - constant rows: 1× (ν = √k).
+- **Typical estimate, RN.** Coverage is over the grid's outputs, by family. "Emulation regime"
+  means the typical coefficient is > 8u, so the emulation error rather than the final rounding
+  is measured.
+
+| family | cases | covered | max meas / typ | median | emulation regime: covered, max |
+|---|---|---|---|---|---|
+| φ = 0.5 | 29 | 29 | 0.23 | 0.15 | 23 / 23, 0.23 |
+| φ = 1 | 25 | 25 | 0.35 | 0.15 | 16 / 16, 0.20 |
+| φ = 2 | 27 | 27 | 0.34 | 0.15 | 16 / 16, 0.18 |
+| φ = 4 | 26 | 26 | 0.32 | 0.13 | 20 / 20, 0.20 |
+| scaled 2^±300 | 23 | 23 | 0.25 | 0.15 | 16 / 16, 0.25 |
+| uniform | 22 | 22 | 0.24 | 0.14 | 14 / 14, 0.24 |
+| same sign | 22 | 22 | 0.84 | 0.17 | 19 / 19, 0.20 |
+| decay_opp | 21 | 21 | 0.22 | 0.04 | 14 / 14, 0.22 |
+| outliers | 21 | 21 | 0.69 | 0.13 | 16 / 16, 0.15 |
+| **constant rows** | 20 | **1** | **25.5** | 6.0 | **0 / 19**, 25.5 |
+
+  - On data with random mantissas the estimate covered **all 216 RN cases**. In the emulation
+    regime (154 cases) the maximum measured / estimate is 0.25, so the estimate is about 4×
+    above the observed maximum.
+  - It is a median 0.13× of the rigorous bound: about ¾ modulus at these k, and more at large
+    k (the bound grows as √k, the estimate as √ln M).
+  - Rows of equal, non-representable entries violate it by up to 25×, as designed. Their
+    errors add coherently and stay within the rigorous bound.
+  - **So the typical estimate is reliable for data whose quantization errors behave
+    randomly.** That is why it ships opt-in (`basis = TYPICAL`) and is labelled "not a
+    guarantee". A caller with structured operands (constant or low-entropy rows, e.g.
+    uniform initial states) must use the rigorous bound.
+
+**GPU time:** about 11 s of contractions for the 300 cases plus 0.2 s for the quick run, under
+the shared GPU lock. The check phase runs on the CPU: 126 s, with the lock not held.
+
+### 7.3 Tests and cost
+
+- **`host_accuracy` (new, CPU):**
+  - 20 000 random `imd_err_estimate` cases vs `params.error_estimate`'s exact enclosure
+    (18 585 valid, 661 without a bound, 1415 rejected requests): the bound lies within
+    [exact, exact·(1 + 2⁻³⁹)], and the typical estimate is within 1e−11;
+  - 1000 `imd_err_min_moduli` cases equal a scan of the C and params estimates;
+  - 400 rank / predict cases (9480 candidates): feasibility, infeasible bits, order and best
+    candidate as specified;
+  - v7-sized structs behave as v7.
+- **`params.py --check`:** 27 certificates, including the new `cert_error_estimate` (640
+  emulated and native elements, 3 metrics each).
+- **`host_c_api`:** the v8 sizes and offsets, the estimates, min_moduli, predict and rank with
+  a target.
+- **`host_planner`:** parity with an Accuracy in 3000 single queries, 600 rank cases and the
+  min_moduli queries.
+- **`accuracy_err_api_quick` (GPU):** 20 small cases, exit 1 on any violation.
+- **Cost.** `planner.Query.min_moduli` takes about 1.7 µs on a non-quiet machine (one ctypes
+  call: one lowering plus at most 19 closed forms). `bench/planner_overhead.py` and
+  `imd_planner_floor` now include it.
+
 ### 7.4 Design questions (for the reviewer; conservative choices taken)
 
 1. **The typical estimate comes from a model and is not fitted.** Hoeffding gives a

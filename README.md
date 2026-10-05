@@ -95,6 +95,23 @@ pl = planner.Planner(memo=planner.Memo(4096))     # Query cache + opt-in memo of
 pl.predict(spec, ext, N=14)                       # host.predict's signature; a repeat: ~0.8 µs
 ```
 
+### Cheapest N for a target error (no GPU)
+
+The host library also turns the §3.8 error bound into a planning input (DESIGN §6f). You give
+a metric, a target, and whatever operand statistics you have; immerdink never reads the data.
+It returns the rigorous bound of every configuration and a typical (probabilistic)
+estimate. `rank` marks configurations that miss the target as infeasible, so the first
+feasible candidate is the cheapest one that meets it:
+
+```python
+acc = planner.Accuracy(target=1e-12)              # normwise |D - x| / (|a_i| |b_j|): needs no stats
+n = q.min_moduli(acc).num_moduli                  # smallest N whose rigorous bound meets it (~1.5 µs)
+best = q.rank([n, n + 1], accuracy=acc)[0]        # the cheapest configuration that meets it
+acc_el = planner.Accuracy(metric="ELEMENTWISE", target=1e-10, cond=1e4)   # cond >= |a||b| / |x|
+q.min_moduli(planner.Accuracy(target=1e-12, basis="TYPICAL"))  # typical estimate, not a guarantee
+host.err_estimate(14, k=4096, outputs=2**20)      # the bounds from scalars (imd_err_estimate)
+```
+
 Day-to-day work lands on `dev`; `main` only changes via pull request.
 
 ## License and credits
