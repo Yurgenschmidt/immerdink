@@ -467,6 +467,8 @@ typedef struct {
   double warm_l2byte_ns;  /* saving per input byte served from L2 instead of DRAM            */
   double band_call[3][2]; /* [IMD_PERF_BAND_*] {p10, p90} of measured / predicted per call   */
   double band_class[IMD_PERF_CLASS_CAPACITY][2]; /* [IMD_PERF_CLASS_*] {p10, p90} per phase  */
+  double tie_ratio;       /* rank: a feasible candidate within tie_ratio x the best's time is a
+                             tie (>= 1; 1: exact ties only)                                  */
 } imd_perf_calib_t;
 
 /* The shipped calibration (RTX 4090, sm_89). out->struct_size must be set; SUCCESS. */
@@ -634,15 +636,15 @@ typedef struct {
   double time_p90_s;
   double clock_mhz;          /* the contract's assumed SM clock                              */
   double power_w;            /* the contract's predicted average power                       */
-  int32_t tie;               /* 1: feasible and its band overlaps the best's (either order)  */
+  int32_t tie;               /* 1: feasible and time_s <= the best's x tie_ratio (any order) */
   int32_t raw_rank;          /* position in the v6 time order (0-based)                      */
 } imd_perf_candidate_t;
 
 /* Every candidate of N x g x vec mode x pack mode (base gives rounding, mode, k4_tune), ranked:
  * feasible by time_s, then infeasible SUCCESS ones by time_s, then the others in enumeration
  * order (ties: total_bytes, N, g, vec_mode, packed). v7, order IMD_PERF_ORDER_BAND (the
- * default of a v7-sized request): the feasible candidates whose time_p10_s <= the best's
- * time_p90_s are ties (tie = 1) and come first, by total_bytes (then time_s, N, g, vec_mode,
+ * default of a v7-sized request): the feasible candidates whose time_s <= the best's
+ * time_s x the calibration's tie_ratio are ties (tie = 1) and come first, by total_bytes (then time_s, N, g, vec_mode,
  * packed); raw_rank is every candidate's place in the time order above. Writes
  * min(capacity, n) candidates of candidate_size bytes each and *num_candidates = n.
  * INVALID_VALUE for a bad request or argument; else SUCCESS with each candidate's own status. */

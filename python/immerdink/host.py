@@ -146,7 +146,8 @@ class _PerfCalib(C.Structure):
                 ("energy_byte_pj", C.c_double), ("energy_gamma", C.c_double),
                 ("warm_l2_bytes", C.c_double), ("warm_l2byte_ns", C.c_double),
                 ("band_call", (C.c_double * 2) * 3),
-                ("band_class", (C.c_double * 2) * _PERF_CLASS_CAPACITY)]
+                ("band_class", (C.c_double * 2) * _PERF_CLASS_CAPACITY),
+                ("tie_ratio", C.c_double)]
 
 
 class _PerfRequest(C.Structure):
@@ -206,7 +207,7 @@ class _Candidate(C.Structure):
 assert C.sizeof(_Lowering) == 184  # version 5 (DESIGN §6b v1.7)
 assert C.sizeof(_Options) == 24
 assert C.sizeof(_PackDesc) == 72 and C.sizeof(_PackLayout) == 136
-assert C.sizeof(_PerfCalib) == 3664 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1952
+assert C.sizeof(_PerfCalib) == 3672 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1952
 assert C.sizeof(_RankRequest) == 88 and C.sizeof(_Candidate) == 168
 assert C.sizeof(_PerfRequest) == 40
 
@@ -683,6 +684,7 @@ class Calibration:
         out.update(self.power)
         out.update({"warm.l2_bytes": r.warm_l2_bytes, "warm.l2byte": r.warm_l2byte_ns})
         out.update(self.bands)
+        out["rank.tie_ratio"] = r.tie_ratio
         return out
 
     @property

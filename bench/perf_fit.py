@@ -434,7 +434,7 @@ def seed_extra(lib, kernels=None, fref=0.0, base=None):
     ex.update({"power.clock_ref_mhz": fref, "power.clock_min_mhz": fref, "power.cap_w": 0.0,
                "power.idle_w": 0.0, "power.tc_pj": 0.0, "power.alu_pj": 0.0,
                "power.byte_pj": 0.0, "power.gamma": 2.0,
-               "warm.l2_bytes": 0.0, "warm.l2byte": 0.0})
+               "warm.l2_bytes": 0.0, "warm.l2byte": 0.0, "rank.tie_ratio": 1.0})
     ex.update({k: (1.0, 1.0) for k in ref.bands})
     if base:
         ex.update(base)

@@ -180,6 +180,20 @@ def choose_quantiles(rows, target=0.80):
     return lo, hi, cov
 
 
+def tie_ratio(rows, q=80):
+    """exp of the q-th percentile of |log(meas_i / pred_i) - log(meas_j / pred_j)| over pairs of
+    calls of the same case (configurations of one contraction): the model's typical error of a
+    time ratio, the rank tie window (DESIGN §6c.1)."""
+    import itertools
+    import math
+    by = {}
+    for r in rows:
+        if r[1] > 0 and r[2] > 0:
+            by.setdefault(r[5], []).append(math.log(r[1] / r[2]))
+    d = [abs(a - b) for v in by.values() for a, b in itertools.combinations(v, 2)]
+    return float(math.exp(np.percentile(d, q))) if d else 1.0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("records", nargs="+")
@@ -235,7 +249,11 @@ def main(argv=None):
         print(f"stored band = the hold-out quantiles {lo_q} / {hi_q} (cross-validated coverage "
               f"{100 * cov[0]:.0f} %)")
         b = band_values(rows, lo_q, hi_q)
-        print("bands: " + ", ".join(f"{k[5:]} {lo:.3f}-{hi:.3f}" for k, (lo, hi) in b.items()))
+        b["rank.tie_ratio"] = tie_ratio(rows)
+        print(f"rank tie ratio: {b['rank.tie_ratio']:.3f} (80th percentile of the error of the "
+              f"time ratio of two configurations of one contraction)")
+        print("bands: " + ", ".join(f"{k[5:]} {v[0]:.3f}-{v[1]:.3f}" for k, v in b.items()
+                                    if k.startswith("band.")))
         extra = calib.extra if calib.file_format == 2 else perf_fit.seed_extra(a.lib)
         extra = dict(extra, **b)
         params = dict(calib.params)

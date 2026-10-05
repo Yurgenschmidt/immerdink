@@ -293,7 +293,7 @@ int main(void) {
   {
     CHECK(IMD_HOST_API_VERSION >= 7);
     /* v7 sizes (v6: 1232, 96, 1648, 128, 64, 24; the v6 prefixes are unchanged) */
-    CHECK(sizeof(imd_perf_calib_t) == 3664 && sizeof(imd_perf_phase_t) == 96 &&
+    CHECK(sizeof(imd_perf_calib_t) == 3672 && sizeof(imd_perf_phase_t) == 96 &&
           sizeof(imd_perf_t) == 1952 && sizeof(imd_perf_candidate_t) == 168 &&
           sizeof(imd_perf_rank_request_t) == 88 && sizeof(imd_perf_request_t) == 40);
     CHECK(offsetof(imd_perf_calib_t, kernel) == 1232 && offsetof(imd_perf_t, regime) == 1648 &&

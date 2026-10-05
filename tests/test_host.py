@@ -871,7 +871,7 @@ def synthetic_v2(cal, names, rng):
     extra.update({"power.clock_ref_mhz": 2800.0, "power.clock_min_mhz": 1400.0,
                   "power.cap_w": 450.0, "power.idle_w": 60.0, "power.tc_pj": 0.7,
                   "power.alu_pj": 5.0, "power.byte_pj": 20.0, "power.gamma": 2.0,
-                  "warm.l2_bytes": 3.0e7, "warm.l2byte": 3e-4,
+                  "warm.l2_bytes": 3.0e7, "warm.l2byte": 3e-4, "rank.tie_ratio": 1.08,
                   "band.call_small": (0.85, 1.2), "band.call_mid": (0.9, 1.12),
                   "band.call_large": (0.95, 1.06)})
     for c in host.PERF_CLASSES:
@@ -1005,7 +1005,7 @@ def suite_perf_v110(cal, names, rng):
         best = by_time[0]
         ties = [c for c in banded if c.tie]
         want = [c for c in by_time if c.feasible and c.status == "SUCCESS" and
-                c.time_p10_s <= best.time_p90_s]
+                c.time_s <= best.time_s * 1.08]
         if len(ties) != len(want) or banded[:len(ties)] != ties or not best.tie:
             raise Fail("rank ties")
         for a_, b_ in zip(ties, ties[1:]):

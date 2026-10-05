@@ -2046,16 +2046,25 @@ split into a time model at a given clock and a clock model per regime.
   DRAM bytes (every `byte` feature, K4's DRAM term), `launch` and the call term are not; every
   other feature (op, op_eps, row, chain, l2byte, K4's round model) is. With the calibration's
   reference clock `f_ref`: `t_p(f) = Σ_{clock-bound j} θ_j x_j · f_ref / f + Σ_{others} θ_j x_j`
-  (K4: `max(rounds · f_ref / f, DRAM term)`). The fit normalizes each record to `f_ref` by the
-  SM clock recorded with it (`sm_mhz_median` of the per-call clock probe, else the clock right
-  after the timed loop), so θ is the reference-clock cost (**adopted only if the hold-out is as
-  good or better than unnormalized**, NOTES-B2).
+  (K4: `max(rounds · f_ref / f, DRAM term)`). **As calibrated (NOTES-B2 §6):** θ are the costs
+  of the burst calibration state as measured, **not** normalized per record (normalizing by
+  the NVML clock read after each timed loop, `perf_fit --clock-normalize`, made the post-BIOS
+  hold-out worse: ≥ 1 ms median / p90 2.9 / 7.3 % vs 1.6 / 6.2 %; that clock is one sample after
+  the loop, 2805 MHz for most records). The per-call probe (`imd_bench --clock-probe`, one warp
+  timing `%globaltimer`) reads ~11 % below NVML with ~28 % call-to-call scatter and is only a
+  relative indicator. `f_ref` (`power.clock_ref_mhz`) is then the **effective** clock of those
+  θ: scanned from the boost clock down by the leave-one-case-out error of the sustained
+  windows (the burst calibration's large calls already ran below boost: the limiter acts
+  within a timed loop). On the 4090: 2530 MHz (boost 2805). `clock_mhz` in requests and
+  results is on this scale.
 - **Power at clock f** (an energy roofline): `P(f) = P_idle + [ (e_tc·O_tc + e_alu·O_alu) ·
   (f/f_ref)^γ + e_byte·D ] / t(f)`, with O_tc = K4's int8 ops (its phase `ops`), O_alu = the
   residue and CRT limb operations (the op features of KF, KL, PACK, K5) plus DIRECT's FP64
   flops, D = the compulsory DRAM bytes (Σ phase `bytes`), γ = 2 (dynamic energy per operation
-  ∝ V², V ∝ f in the DVFS range; the fitter scans γ ∈ {1, 2, 3} and keeps the best). P(f) rises
-  monotonically with f (numerator up, t(f) down).
+  ∝ V², V ∝ f in the DVFS range; the fitter scans γ ∈ {1, 2, 3} and keeps the best: γ = 1 on
+  the 4090, the windows span 2300–2800 MHz only). P(f) rises monotonically with f (numerator
+  up, t(f) down). The coefficients are effective: e_byte (335 pJ/B on the 4090) carries the SM
+  power of memory-bound work too, e_alu fitted to 0.
 - **Regimes.** `BURST`: f = f_ref. `SUSTAINED`: f = f_ref if P(f_ref) ≤ P_cap, else the f in
   [f_min, f_ref] with P(f) = P_cap (bisection, deterministic), f_min if even that is above the
   cap. An explicit `clock_mhz` in the request overrides both (e.g. a locked clock, or the
@@ -2065,8 +2074,11 @@ split into a time model at a given clock and a clock model per regime.
   runs faster than its SUSTAINED estimate (a sequence-level solve is the caller's, from the
   reported `power_w`; not modeled here).
 - **Calibration** (format 2 `power.*`): `f_ref` = the median SM clock of the uncapped
-  calibration records; `P_cap` = the enforced power limit (NVML), `f_min`; `P_idle`, e_tc,
-  e_alu, e_byte by non-negative least squares on **sustained windows**: `imd_bench --methods
+  calibration records (then the effective-clock scan above); `P_cap` = the enforced power limit
+  (NVML), `f_min`; `P_idle` fixed at the awake idle (`perf_fit --idle-w`, 60 W on the 4090: with
+  most windows pinned at the cap a free intercept took 366 W), e_tc, e_alu, e_byte by
+  non-negative least squares on **sustained windows** (15 s pre-heat each: thermal and boost
+  history move the settled clock by up to 10 %): `imd_bench --methods
   sustained` runs one plan back-to-back for `--sustain-s` seconds (calls queued ahead, as a
   sequence, after the warm-up) and records the mean time per call, the mean SM clock and the
   mean board power (NVML instant power and clock, sampled every 20 ms; the energy counter is
@@ -2079,6 +2091,12 @@ split into a time model at a given clock and a clock model per regime.
 
 #### [v1.10] Cache state: COLD and WARM
 
+**As calibrated (NOTES-B2 §6):** COLD (an evicted L2) is slower than the repeat state by +4 …
++16 % for calls whose footprint fits the L2 (256³ … 1024²) and ±2 % above; WARM (the previous
+call wrote this call's A) is within −7 … +3 % of REPEAT, so **WARM is modeled as REPEAT**. The
+parameters θ are **COLD costs**: the fitter adds each repeat record's resident-input saving
+`Δ·res_repeat` back to its phases before the fit, and a REPEAT / WARM prediction subtracts it.
+
 The calibration records are repeat calls of one plan on the same operands: at the start of a
 call, the L2 holds the end of the previous call's traffic (C, the W planes, the last residues),
 so the operands A and B are still resident only when the whole call footprint fits the L2
@@ -2089,21 +2107,23 @@ workspace_bytes + 8bmn`:
 - `res_repeat = clamp(L_w − (F − I), 0, I)`: input bytes resident in the calibration's repeat
   state (the most recent L_w bytes of traffic; A and B are the oldest);
 - **COLD** (`IMD_PERF_CACHE_COLD`, the default): `res = 0`, the inputs come from DRAM;
-- **WARM** (`IMD_PERF_CACHE_WARM`): `res = min(I, L_w)`, the inputs were just written or read
-  (e.g. C of the previous call is A of this one).
+- **WARM** (`IMD_PERF_CACHE_WARM`): the inputs were just written or read (e.g. C of the
+  previous call is A of this one); `res = res_repeat` (as measured; the design's `min(I, L_w)`
+  predicted 10–20 % savings on large calls where 1–7 % were measured).
 - **REPEAT** (`IMD_PERF_CACHE_REPEAT`): `res = res_repeat`, the state the calibration and the
-  hold-out are measured in (the same call just ran); the fitter and the validation predict in it,
-  so the fitted θ are unchanged by the cache term. (Design question: COLD is the default as
-  asked; the v6 model, fitted on repeat calls, effectively predicted REPEAT.)
+  hold-out are measured in (the same call just ran); the validation predicts in it (method
+  packed's interleaved calls and `--l2 flush` records: COLD). (Design question: COLD is the
+  default as asked; the v6 model, fitted on repeat calls, effectively predicted REPEAT.)
 
-Each reading phase (KF; KL A / KL B; K5 for C) gets `(res_repeat − res)·Δ` added in proportion to
-its share of I, with Δ = `warm.l2byte` the calibrated saving per byte served from L2 instead of
+Each reading phase (KF; KL A / KL B; K5 for C) gets `−res·Δ` added in proportion to
+its share of I (never below 0), with Δ = `warm.l2byte` the calibrated saving per byte served from L2 instead of
 DRAM (ns per byte; ≥ 0). The phase's `x₁` stays the compulsory DRAM bytes (no new feature: the
 phase layout is frozen); the prediction reports `warm_bytes` = res. Calibration: `imd_bench
 --l2 flush` (a 2 × L2 buffer written before each timed call, outside the timed window: COLD),
 the repeat calls (`--l2 repeat`, the default) and `--methods pair` (a square GEMM whose second
 call reads the first call's C as its A: WARM); Δ and L_w are fitted on the differences
-(a scan over L_w, least squares for Δ). **If the measured COLD / WARM difference is below a few
+(a scan over L_w, least squares for Δ on COLD − REPEAT; 4090: L_w = 0.8 × 72 MiB, Δ = 1.46 ps
+per byte). **If the measured COLD / WARM difference is below a few
 % of the call on every measured shape, the calibration keeps Δ = 0 (COLD = WARM, the option
 stays as a reported no-op) and NOTES-B2 says so.** A format-1 calibration has Δ = 0.
 
@@ -2127,7 +2147,13 @@ applied in every regime and cache state (documented approximation).
 
 `imd_perf_rank` (v7 request, `order = IMD_PERF_ORDER_BAND`, the default of a v7-sized request):
 the best candidate is the feasible one with the smallest `time_s`; every feasible candidate
-whose `time_p10_s ≤ best.time_p90_s` is a **tie** (`tie = 1`, the best included); ties come
+with `time_s ≤ best.time_s × tie_ratio` is a **tie** (`tie = 1`, the best included). **Changed
+from band overlap after the data (design question):** overlapping 80 % call bands (±6–17 %)
+tied candidates up to 1.36× slower (236 of 360 candidates on a CC tensor) and the footprint
+tie-break then picked slow ones. Candidates of one contraction share most of the model error, so
+the tie window is the model's error of a **time ratio**: `tie_ratio` (format 2 `rank.tie_ratio`)
+= exp of the 80th percentile of |log(meas_i/pred_i) − log(meas_j/pred_j)| over pairs of hold-out
+calls of the same case (`perf_validate --bands`; 1.075 on the 4090; 28 of 360 ties). Ties come
 first, ordered by `total_bytes` (the smaller footprint wins), then `time_s`, N, g, vec mode,
 packed; then the remaining feasible candidates by time, then the infeasible SUCCESS ones, then
 the others (as v6). `raw_rank` = the candidate's position in the v6 time order, so the raw order
@@ -2185,7 +2211,7 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   - `power.clock_ref_mhz`, `power.clock_min_mhz`, `power.cap_w`, `power.idle_w`,
     `power.tc_pj`, `power.alu_pj`, `power.byte_pj`, `power.gamma` (≥ 0; `power.cap_w = 0`:
     no power model, `power.clock_ref_mhz = 0`: no clock scaling);
-  - `warm.l2_bytes`, `warm.l2byte` (≥ 0);
+  - `warm.l2_bytes`, `warm.l2byte` (≥ 0); `rank.tie_ratio` (≥ 1);
   - `band.call_small`, `band.call_mid`, `band.call_large` and `band.<class>` for every class
     = `p10 p90` (two numbers, 0 < p10 ≤ p90; `1 1`: no band).
   A value of several numbers is separated by blanks. **Reading format 1** migrates: the new
@@ -2377,6 +2403,7 @@ enum { IMD_PERF_ORDER_BAND = 0, IMD_PERF_ORDER_TIME = 1 };
   double warm_l2_bytes, warm_l2byte_ns;
   double band_call[3][2];                                    /* {p10, p90} per size class    */
   double band_class[16][2];                                  /* per IMD_PERF_CLASS_*         */
+  double tie_ratio;                                          /* rank tie window (>= 1)       */
 /* imd_perf_request_t, appended (v6: 24 bytes, v7: 40):                                      */
   int32_t regime, cache;          /* IMD_PERF_REGIME_*, IMD_PERF_CACHE_*                    */
   double  clock_mhz;              /* > 0: predict at this SM clock (overrides the regime)   */
@@ -2431,7 +2458,7 @@ trips as format 1; format-2 parse errors (a missing `kernel.` line, a band with 
 resident 0); BURST at `clock_mhz = f_ref` equals BURST; SUSTAINED ≤ BURST in speed (never
 faster) and = BURST when P(f_ref) ≤ cap; P(f_s) = cap within 1e-9 relative when capped; a
 larger clock never predicts a longer time; COLD ≥ WARM; bands contain the time and scale with
-it; rank: ties = the feasible candidates whose p10 ≤ the best's p90, ordered by total_bytes,
+it; rank: ties = the feasible candidates within tie_ratio of the best's time, ordered by total_bytes,
 `raw_rank` is a permutation reproducing the v6 order, `order = TIME` and a v6-sized request give
 the v6 order. `host_c_api`: the v7 sizes, v6-sized structs still accepted. The kernel-side launch
 refactor (rules moved to `analysis.hpp`) is covered by the existing bit-exact GPU tests.

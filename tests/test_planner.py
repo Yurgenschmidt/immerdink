@@ -90,7 +90,8 @@ def random_calib(rng, base, v2=False):
         extra.update({"power.clock_ref_mhz": 2800.0, "power.clock_min_mhz": 1500.0,
                       "power.cap_w": rng.choice((300.0, 450.0)), "power.idle_w": 60.0,
                       "power.tc_pj": 0.7, "power.alu_pj": 4.0, "power.byte_pj": 20.0,
-                      "power.gamma": 2.0, "warm.l2_bytes": 3.0e7, "warm.l2byte": 3e-4})
+                      "power.gamma": 2.0, "warm.l2_bytes": 3.0e7, "warm.l2byte": 3e-4,
+                      "rank.tie_ratio": rng.uniform(1.0, 1.2)})
         for k in host.Calibration.default(base._lib).bands:
             lo = 1.0 if k == "band.call" else rng.uniform(0.7, 1.0)
             extra[k] = (lo, 1.0 if k == "band.call" else rng.uniform(1.0, 1.4))

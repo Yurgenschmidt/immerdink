@@ -8,9 +8,9 @@ first.
 
 - **Branches:** all work is on `dev` (pushed). `main` = PR #1 (v1.3 state); later work reaches
   main by another PR from dev. Never push to main directly.
-- **DESIGN v1.9** (docs/DESIGN.md): v1.4 KF fused small path, v1.5 K4 configs and rule, v1.6
+- **DESIGN v1.11** (v1.10 §6c performance-model follow-up, v1.11 §6e planner) (docs/DESIGN.md): v1.4 KF fused small path, v1.5 K4 configs and rule, v1.6
   KL fused large path, v1.7 §6b packed operands, v1.8 §6c performance model, v1.9 §6d Python.
-- **Host API v6** (`include/immerdink/immerdink_host.h`, CUDA-free `libimmerdink_host`, Python
+- **Host API v7** (`include/immerdink/immerdink_host.h`, CUDA-free `libimmerdink_host`, Python
   `python/immerdink/host.py`): the single source of truth for lowering, legality, workspace,
   plan bytes, K4 config, launch counts, packed-operand sizing and compatibility, and (v6) the
   performance model.
@@ -19,6 +19,15 @@ first.
   `host.predict`, `host.rank`, `host.Calibration`); shipped RTX 4090 calibration
   `src/host/calib/rtx4090_sm89.calib`, recalibrate with `tools/calibrate.sh [--validate]`
   (after kernel changes too); results and open items in docs/NOTES-B2.md; test `host_perf`.
+- **Performance model v1.10 (DESIGN §6c, host API 7, calibration format 2, branch
+  `b2-fidelity`, NOTES-B2 §6):** wave / occupancy features (launch rules shared with
+  contract.cu in `src/host/analysis.hpp`), request options `regime` (BURST / SUSTAINED, default
+  SUSTAINED) and `cache` (COLD default / WARM / REPEAT), per-call and per-phase bands
+  (`time_p10_s` / `time_p90_s`), rank ties (`tie`, `raw_rank`, `order`). The shipped 4090
+  calibration was refitted on post-BIOS data (2026-10-05 13:20–14:00); `tools/calibrate.sh
+  --validate` now also runs bench/sweep_sustained.txt and bench/sweep_cache.txt (~40 min of GPU in
+  total) and writes the bands. Design questions for the reviewer: NOTES-B2 §6 (SUSTAINED and
+  COLD defaults, the tie rule).
 - **Python device API (B1, DESIGN v1.9 §6d):** `python/immerdink` (`Plan`, `Pack`,
   `immerdink.contract`, `PlanCache`, `DeviceArray`): ctypes over the C ABI, any
   `__cuda_array_interface__` / DLPack array or raw pointer, no array library needed; test

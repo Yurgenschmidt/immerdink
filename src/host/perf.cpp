@@ -110,7 +110,7 @@ static_assert(kPerfV1Size == 1648, "imd_perf_t v1 layout changed");
 static_assert(kCandidateV1Size == 128, "imd_perf_candidate_t v1 layout changed");
 static_assert(kRankRequestV1Size == 64, "imd_perf_rank_request_t v1 layout changed");
 static_assert(kRequestV1Size == 24, "imd_perf_request_t v1 layout changed");
-static_assert(sizeof(imd_perf_calib_t) == 1232 + 16 * 128 + 8 * 10 + 8 * 6 + 8 * 32, "v7 calib");
+static_assert(sizeof(imd_perf_calib_t) == 1232 + 16 * 128 + 8 * 10 + 8 * 6 + 8 * 32 + 8, "v7 calib");
 static_assert(sizeof(imd_perf_request_t) == 40, "v7 request");
 static_assert(sizeof(imd_perf_t) == 1648 + 8 + 8 * 5 + 16 * 16, "v7 prediction");
 static_assert(sizeof(imd_perf_rank_request_t) == 88, "v7 rank request");
@@ -198,6 +198,7 @@ void migrate_v7_fields(imd_perf_calib_t* cal) {
   cal->energy_tc_pj = cal->energy_alu_pj = cal->energy_byte_pj = 0;
   cal->energy_gamma = 2;
   cal->warm_l2_bytes = cal->warm_l2byte_ns = 0;
+  cal->tie_ratio = 1;
   for (auto& b : cal->band_call) b[0] = b[1] = 1;
   for (auto& b : cal->band_class) b[0] = b[1] = 1;
 }
@@ -596,11 +597,12 @@ bool calib_valid(const imd_perf_calib_t& c) {
   }
   for (const double v : {c.clock_ref_mhz, c.clock_min_mhz, c.power_cap_w, c.power_idle_w,
                          c.energy_tc_pj, c.energy_alu_pj, c.energy_byte_pj, c.energy_gamma,
-                         c.warm_l2_bytes, c.warm_l2byte_ns})
+                         c.warm_l2_bytes, c.warm_l2byte_ns, c.tie_ratio})
     if (!finite_nonneg(v)) return false;
   if (c.power_cap_w > 0 && !(c.clock_ref_mhz > 0 && c.clock_min_mhz > 0 &&
                              c.clock_min_mhz <= c.clock_ref_mhz))
     return false;
+  if (!(c.tie_ratio >= 1)) return false;
   const auto band_ok = [](const double* b) {
     return std::isfinite(b[0]) && std::isfinite(b[1]) && b[0] > 0 && b[0] <= b[1];
   };
@@ -626,7 +628,8 @@ constexpr ScalarKey kScalarKeys[] = {
     {"power.byte_pj", &imd_perf_calib_t::energy_byte_pj},
     {"power.gamma", &imd_perf_calib_t::energy_gamma},
     {"warm.l2_bytes", &imd_perf_calib_t::warm_l2_bytes},
-    {"warm.l2byte", &imd_perf_calib_t::warm_l2byte_ns}};
+    {"warm.l2byte", &imd_perf_calib_t::warm_l2byte_ns},
+    {"rank.tie_ratio", &imd_perf_calib_t::tie_ratio}};
 constexpr int kScalarKeyCount = sizeof kScalarKeys / sizeof kScalarKeys[0];
 const char* const kBandCallKeys[3] = {"band.call_small", "band.call_mid", "band.call_large"};
 
@@ -766,6 +769,7 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
     if (r.power_cap_w > 0 && !(r.clock_ref_mhz > 0 && r.clock_min_mhz > 0 &&
                                r.clock_min_mhz <= r.clock_ref_mhz))
       return fail(0);
+    if (!(r.tie_ratio >= 1)) return fail(0);
     for (int k = IMD_PERF_KERNEL_COUNT; k < IMD_PERF_KERNEL_CAPACITY; ++k) r.kernel[k] = {};
     for (int cl = IMD_PERF_CLASS_COUNT; cl < IMD_PERF_CLASS_CAPACITY; ++cl)
       r.band_class[cl][0] = r.band_class[cl][1] = 1;
@@ -1378,9 +1382,11 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
     // v7 (DESIGN §6c.1 "Prediction intervals and ties"): the feasible candidates whose band
     // overlaps the best's are ties, first, by footprint.
     if (!cands.empty() && rank_of(cands[0].c) == 0) {
-      const double best_hi = cands[0].c.time_p90_s;
+      // (DESIGN §6c.1: a ratio, not band overlap: two candidates of one contraction share most
+      // of the model's error, and overlapping 80 % bands would tie candidates 1.2-1.4x apart.)
+      const double best_tie = cands[0].c.time_s * cal.tie_ratio;
       for (Cand& cd : cands)
-        cd.c.tie = rank_of(cd.c) == 0 && cd.c.time_p10_s <= best_hi ? 1 : 0;
+        cd.c.tie = rank_of(cd.c) == 0 && cd.c.time_s <= best_tie ? 1 : 0;
       if (order == IMD_PERF_ORDER_BAND)
         std::stable_sort(cands.begin(), cands.end(), [&](const Cand& x, const Cand& y) {
           if (x.c.tie != y.c.tie) return x.c.tie > y.c.tie;
