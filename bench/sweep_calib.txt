@@ -95,3 +95,8 @@ t_k4992   | ik,jk->ij | i=2048,j=2048,k=4992       | imd | 8 | --reps 20 --phase
 t_k5008   | ik,jk->ij | i=2048,j=2048,k=5008       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
 t_k5056   | ik,jk->ij | i=2048,j=2048,k=5056       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
 t_k5120   | ik,jk->ij | i=2048,j=2048,k=5120       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1
+#     long k, few CTAs (v_n15d: 768 x 768 x 100000, k_hat mod 64 = 32, mod 32 = 0, K4 between the
+#     mod-64 and mod-32 predictions): k_hat mod 32 / 64 = 0 / 0, 16 / 16, 0 / 32
+t_lk0     | ik,jk->ij | i=768,j=768,k=65536        | imd | 8,15 | --reps 10 --phase-reps 3 --max-seconds 1
+t_lk1     | ik,jk->ij | i=768,j=768,k=65552        | imd | 8,15 | --reps 10 --phase-reps 3 --max-seconds 1
+t_lk2     | ik,jk->ij | i=768,j=768,k=65568        | imd | 8,15 | --reps 10 --phase-reps 3 --max-seconds 1
