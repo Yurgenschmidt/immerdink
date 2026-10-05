@@ -98,10 +98,12 @@ CLOCK_BOUND = {
 
 
 def record_clock(rec):
-    """The SM clock of a record's timed calls (MHz): the per-call probe's median
-    (imd_bench --clock-probe 1), else the clock right after the timed loop (gpu_after), else 0."""
-    if rec.get("sm_mhz_median"):
-        return float(rec["sm_mhz_median"])
+    """The SM clock of a record's timed calls (MHz): NVML's right after the timed loop
+    (gpu_after; the same source as the sustained windows' clock, so the power model and the
+    time model share one clock scale), else 0. The per-call probe (sm_mhz_median, imd_bench
+    --clock-probe) is not used: one warp timing %globaltimer reads ~11 % below NVML on the
+    4090 with a ~28 % spread between calls (globaltimer granularity); it is kept in the records
+    as a relative indicator (NOTES-B2 §6)."""
     g = rec.get("gpu_after", "").split()
     return float(g[0]) if g and g[0].isdigit() else 0.0
 
