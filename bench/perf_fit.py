@@ -341,7 +341,7 @@ def fit(samples, seed, lib=None, verbose=True, worst=0, k4_shared_dram=False, fr
     # The call term: (t_timed - the C model's phases with these parameters, call term 0) on
     # (1, kernel_launches).
     params["call.call"], params["call.launch"] = 0.0, 0.0
-    if seed.format == 1:  # a format-1 calibration has none of the v1.10 chain parameters
+    if seed.file_format == 1:  # a format-1 calibration has none of the v1.10 chain parameters
         for k in NEW_CHAINS:
             params.pop(k, None)
     trial = host.Calibration.from_values(seed.meta, params, lib, seed.extra or None)

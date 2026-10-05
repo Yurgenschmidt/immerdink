@@ -668,7 +668,8 @@ class Calibration:
         return cls.parse("\n".join(lines) + "\n", lib)
 
     @property
-    def format(self):
+    def file_format(self):
+        """v7: the calibration format (1 or 2)."""
         return self._raw.format
 
     @property

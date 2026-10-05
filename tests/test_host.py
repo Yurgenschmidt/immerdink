@@ -477,7 +477,7 @@ def check_pack_layout(p, what):
     want_regs = {n: (o, nb) for n, o, nb in regs} or {n: (0, 0) for n in ("sig", "flag", "res")}
     if lay.regions != want_regs or lay.pack_bytes != total or \
             lay.pack_ws_bytes != params.pack_ws_bytes(lay.b, lay.r, lay.k) or \
-            lay.k_hat != params.align_up(lay.k, 16) or lay.format != 1:
+            lay.k_hat != params.align_up(lay.k, 16) or lay.file_format != 1:
         raise Fail(f"{what}: pack layout {lay} vs params {regs} {total}")
     if want_st == "SUCCESS":
         if (lay.b, lay.r, lay.k, lay.kappa) != (pv.b, pv.r, pv.k, pv.kappa) or \
@@ -897,7 +897,7 @@ def suite_perf_v110(cal, names, rng):
     # no clock scaling, no cache term, zero-width bands, and is written back as format 1.
     v6_path = os.path.join(ROOT, "tests/data/perf_calib_v6_format1.calib")
     v6 = host.Calibration.load(v6_path)
-    if v6.format != 1 or host.Calibration.parse(v6.format()).format() != v6.format() or \
+    if v6.file_format != 1 or host.Calibration.parse(v6.format()).format() != v6.format() or \
             "format = 1" not in v6.format() or "kernel." in v6.format():
         raise Fail("format-1 round trip")
     for spec, ext in shapes:
@@ -911,7 +911,8 @@ def suite_perf_v110(cal, names, rng):
                         if not close(q.time_s, 1e-9 * phase_ns(v6.params, names, q), 1e-12) or \
                                 q.p10_s != q.time_s or q.p90_s != q.time_s:
                             raise Fail(f"format 1 is not v6: {spec} {ext} {q}")
-                    if p.regime != "BURST" or p.clock_mhz != 0 or p.power_w != 0 or \
+                    want_regime = "BURST" if regime == "DEFAULT" else regime
+                    if p.regime != want_regime or p.clock_mhz != 0 or p.power_w != 0 or \
                             p.time_p10_s != p.time_s or p.time_p90_s != p.time_s:
                         raise Fail(f"format 1 v7 fields: {p}")
                     count += 1
@@ -919,7 +920,7 @@ def suite_perf_v110(cal, names, rng):
     syn, params, extra = synthetic_v2(cal, names, rng)
     text = syn.format()
     again = host.Calibration.parse(text)
-    if again.format != 2 or again.format() != text or again.params != syn.params or \
+    if again.file_format != 2 or again.format() != text or again.params != syn.params or \
             again.extra != syn.extra or "format = 2" not in text:
         raise Fail("format-2 round trip")
     lines = text.splitlines()
@@ -1036,7 +1037,7 @@ def suite_perf(args):
         raise Fail("format -> parse round trip")
     names = host.param_names()
     if sorted(cal.params) != sorted(f"{c}.{n}" for c, ns in names.items() for n in ns
-                                    if n and (cal.format == 2 or
+                                    if n and (cal.file_format == 2 or
                                               f"{c}.{n}" not in host.FORMAT2_PARAMS)):
         raise Fail("params keys")
     rng = random.Random(6)

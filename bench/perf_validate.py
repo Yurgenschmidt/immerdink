@@ -199,7 +199,7 @@ def main(argv=None):
         print(summarize(sub, a.markdown)[1])
     if a.phases:
         print(phase_summary(rows, a.markdown))
-    if calib.format == 2:
+    if calib.file_format == 2:
         cov, per, n = coverage(rows, calib.bands)
         print(f"band coverage (this calibration's bands, in-sample if they came from these "
               f"records): {100 * cov:.0f} % (< 100 us {100 * per[0]:.0f} % of {n[0]}, "
@@ -212,7 +212,7 @@ def main(argv=None):
     if a.bands:
         b = band_values(rows)
         print("bands: " + ", ".join(f"{k[5:]} {lo:.3f}-{hi:.3f}" for k, (lo, hi) in b.items()))
-        extra = calib.extra if calib.format == 2 else perf_fit.seed_extra(a.lib)
+        extra = calib.extra if calib.file_format == 2 else perf_fit.seed_extra(a.lib)
         extra = dict(extra, **b)
         cal2 = host.Calibration.from_values(calib.meta, calib.params, a.lib, extra)
         with open(a.bands, "w") as f:
@@ -237,7 +237,7 @@ def main(argv=None):
             print(f"sustained: median |err| {100 * float(np.median(errs)):.1f} %, max "
                   f"{100 * max(errs):.1f} % over {len(errs)} windows")
     print(f"calibration: {calib.meta['gpu']} ({calib.meta['date']}, {calib.meta['version']}, "
-          f"format {calib.format})")
+          f"format {calib.file_format})")
     sys.exit(0 if ok else 1)
 
 

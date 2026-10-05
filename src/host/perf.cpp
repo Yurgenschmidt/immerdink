@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -460,6 +461,7 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         .in_bytes = c_in;
     P.launches = plan_launches(e, fused, fl, resident, kc.launches);
   }
+  P.footprint += P.inputs;  // F = I + workspace (+ packed buffers) + the output
   add_phase(&P, IMD_PERF_PHASE_CALL, IMD_PERF_CLASS_CALL, 0,
             {1, static_cast<double>(P.launches)}, 0);
 }
