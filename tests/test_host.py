@@ -728,6 +728,22 @@ def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks, l2):
     return x
 
 
+def spec_kf_chain(rows, k_hat, g, sms):
+    """KF's busiest-SM chain (DESIGN §6c.1), for operands read along k-bar (radix 1): tiles of
+    4096 values (E = 16, 2 blocks per SM) or, below 16 blocks per SM even with all moduli split,
+    1024 (E = 4, 4 per SM); moduli parts when tiles < 2 SMs."""
+    tk = 16
+    while tk < k_hat:
+        tk *= 2
+    tiles = sum(-(-r // (4096 // tk)) for r in rows)
+    small = tiles * g < 16 * sms
+    if small:
+        tiles = sum(-(-r // max(1024 // tk, 1)) for r in rows)
+    parts = 1 if tiles >= 2 * sms else min(g, -(-2 * sms // tiles))
+    per_sm = sms * (4 if small else 2)
+    return -(-(tiles * parts) // per_sm) * (4 if small else 16) * -(-g // parts)
+
+
 def spec_phases(lw, vec, along_rows, l2, beta=False):
     """[(name, launches, x)] of one imd_contract (DESIGN §6c.1 table) from the lowering
     summary and the operands' read direction (along rows: KL tiles of 512)."""
@@ -756,7 +772,8 @@ def spec_phases(lw, vec, along_rows, l2, beta=False):
         byts = (0 if res else 8 * V) + sum(8 * rows[x] * k + g * pad[x] * kh + 3 * rows[x]
                                            for x in (0, 1))
         ops = g * (rows[0] + rows[1]) * k
-        ph.append(("KF fused", 1, [1, byts, ops, rows[0] + rows[1], wide * ops, 0]))
+        ph.append(("KF fused", 1, [1, byts, ops, rows[0] + rows[1], wide * ops,
+                                   (1 + wide) * spec_kf_chain(rows, kh, g, 128)]))
     else:
         for x, name in ((0, "KL A"), (1, "KL B")):
             tk = 512 if along_rows[x] else 4096 if kh > 2048 else 1 << max(6, (kh - 1).bit_length())

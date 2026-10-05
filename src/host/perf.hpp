@@ -21,8 +21,8 @@ struct PerfPhase {
   double x[IMD_PERF_MAX_PARAMS] = {0, 0, 0, 0, 0, 0};
   double bytes = 0, ops = 0;
   int peak = 0;
-  int eps_slot = -1;    // the op_eps feature's slot (x[eps_slot] = eps_fraction * eps_ops)
-  double eps_ops = 0;   // the residue ops of that feature at eps fraction 1
+  // The eps-path part of each feature at eps fraction 1 (x[j] carries f * eps_x[j] of it).
+  double eps_x[IMD_PERF_MAX_PARAMS] = {0, 0, 0, 0, 0, 0};
 };
 struct PerfPhases {
   PerfPhase ph[IMD_PERF_MAX_PHASES];

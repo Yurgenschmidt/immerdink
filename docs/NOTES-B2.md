@@ -101,15 +101,55 @@ and 3000 × 700 × 5000 were −21 / −22 %; now +5 % / −6 %.
 
 ## 4. Open
 
-- KF at N ≥ 15 on mid-size shapes (100 µs – 1 ms) is predicted 20–30 % low. Maybe the KF eps cost
-  is not linear in the fraction; more N = 15–17 KF shapes in the fit set would settle it.
-- K3 (B packs of groups 2..) has a 37 % p90: the zero-rows launch and the B-side tile mapping are
-  not separate features.
+- **Closed (2026-10-05, branch b2-kf-n15): KF at N = 15–17 on mid-size shapes.** More data alone
+  did not fix it: on 10 new fit cases (448–960³, non-square, batched, a CC tensor; bench
+  generator and dominant-entry data; ≈ 4.5 min of GPU time with 8 new hold-out cases), KF was
+  predicted up to 45 % low on the shapes with 512 < k̂ ≤ 1024 at N ≥ 15 (576³: 62 µs measured,
+  36 µs predicted) and up to 20 % high below. The cause is KF's launch shape: above k̂ = 512 at
+  these N the E = 16 kernel runs (16 values per thread; 288 blocks at 576³, 2 resident per SM),
+  and each thread emits g residues for each of its 16 values in sequence, so time follows the
+  busiest SM's chain, not the bytes (448³ runs the E = 4 kernel with 4× the blocks: 20 µs). The
+  new KF feature `chain` = ⌈blocks / (SMs × resident)⌉ × E × ⌈g / parts⌉ × (1 + f) (DESIGN §6c.1),
+  from the launch rules now shared with contract.cu (`kf_lg_tk`, `kf_operand_tiles`,
+  `kf_small`, `pack_moduli_parts`), fitted at 23.6 ns per step. Offline, of the resident counts
+  (1, 2, 3) × (2, 4, 6) and with or without the eps weight, (2, 4) with the weight gave the best
+  hold-out (KF phase at N = 15–17: median / p90 19.6 / 33.6 % → 13.6 / 17.9 %).
+- K3 (B packs of groups 2..) still has a 37 % p90 on ≥ 1 ms calls (K2: 15 %). No obvious cheap
+  fix: the B side has the zero-rows launch and often few rows (r_mm-like n = 64–384), i.e. a
+  small pack grid, which the PACK features do not see; a wave term like KF's would be the
+  candidate.
+- The K4 partial-K-tile term overpredicts k̂ = 800 (K4 +35 % on 800³ at N = 15 / 16) while it
+  fixed k̂ = 1008 / 5008; whether the cost is the predicated residue tile or the 128-byte row
+  alignment (800 mod 128 = 32, 1008 mod 128 = 112) is not settled with the data at hand.
 - Possible kernel follow-up, out of B2's scope: a branch-free eps path in the pack emitter
   (apply the 2^ε factor unconditionally, with ε = 0 giving 1) would remove the data dependence
   from the packs. Then `eps_fraction` would no longer matter and `eps_s` would become a constant
   cost, at the price of the multiply on every element at N ≤ 14.
 - Recalibrate after any kernel change that moves per-phase times (`tools/calibrate.sh`).
 
-Raw records: the local evaluation workspace, `results/b2/` (calib-1/2, validate-1/2 and
-validation-final.txt).
+Raw records: the local evaluation workspace, `results/b2/` (calib-1/2/3, validate-1/2/3,
+validation-final.txt and validation-kf-n15.txt).
+
+## 5. After the KF chain term (2026-10-05, shipped calibration refit on 297 calls)
+
+Hold-out, 136 calls (the §3 set plus 8 KF cases at N = 15–17):
+
+| measured call | calls | median \|err\| | p90 \|err\| | max \|err\| | target (median / p90) | met |
+|---|---|---|---|---|---|---|
+| < 100 µs | 34 | 10.1 % | 15.4 % | 20.1 % | 15 % / 30 % | yes |
+| 100 µs – 1 ms | 43 | 5.4 % | 14.4 % | 29.1 % | 10 % / 20 % | yes |
+| ≥ 1 ms | 59 | 2.8 % | 7.8 % | 20.2 % | 5 % / 15 % | yes |
+
+N = 15–17 only:
+
+| measured call | calls | median \|err\| | p90 \|err\| | max \|err\| | target | met |
+|---|---|---|---|---|---|---|
+| < 100 µs | 6 | 8.1 % | 12.2 % | 12.6 % | 15 % / 30 % | yes |
+| 100 µs – 1 ms | 23 | 8.0 % | 15.1 % | 29.1 % | 10 % / 20 % | yes |
+| ≥ 1 ms | 20 | 4.0 % | 7.3 % | 12.4 % | 5 % / 15 % | yes |
+
+The largest N = 15–17 errors: 800³ with dominant-entry data (+26 / +29 %, K4's partial-K-tile
+term, see §4), the 12 / 56 CC tensor at N = 15 (+15 %), 800³ and 960³ (+13 … +15 %).
+Examples (TFLOPS-eq measured / predicted, time measured / predicted): 800³ at N = 15 8.06 / 7.06
+(127 / 145 µs); 1200 × 400 × 700 at N = 16 5.61 / 5.93 (120 / 113 µs); batched 4 × 640² × 384 at
+N = 17 5.41 / 5.69 (232 / 221 µs).

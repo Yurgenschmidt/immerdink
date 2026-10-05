@@ -1870,7 +1870,7 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
 | phase (bench tag) | when | class | x₀ | x₁ | x₂ | x₃ | x₄ |
 |---|---|---|---|---|---|---|---|
 | `K0 vec` | `IMD_VEC_GENERATE`, no KF (any dispatch but NOOP) | K0 | 1 | `8V` written | | | |
-| `KF fused` | `fused` (§4) | KF | 1 | `Σ_x (8E_x + g·pad_x·k̂ + 3rows_x) + 8V·[GENERATE]` | `g·Σ_x E_x` residues | `Σ_x rows_x` | `f·x₂` |
+| `KF fused` | `fused` (§4) | KF | 1 | `Σ_x (8E_x + g·pad_x·k̂ + 3rows_x) + 8V·[GENERATE]` | `g·Σ_x E_x` residues | `Σ_x rows_x` | `f·x₂`; x₅ = the busiest SM's chain (below) |
 | `KL A`, `KL B` | `fused_large` bit of x | KL | 1 | `8E_x + g·pad_x·k̂ + 3rows_x` | `g·E_x` | `16·rows_x·max(0, k̂ − 2·tk_x)` L2 re-read | `f·x₂` |
 | `K2 pack A`, `K3 pack B` | groups of x not packed by KF / KL | PACK | launches (B: + the zero-rows launch per group if n̂ > n) | `Σ_groups (8E_x + g_i·pad_x·k̂)` | `Σ_groups g_i·E_x` | `f·x₂` | |
 | `K4 gemm` | EMULATE | K4[config] | rounds | MACs run at q = 1 | q = 2 | q = 3 | DRAM bytes beyond L2: `Σ_groups max(0, g_i·b·(m + n̂)·k̂ + g_i·b·m·n̂·(2·k_chunks − 1) − L2)`; x₅ = the busiest SM's MACs of K-chunks whose length is not a multiple of 64 (`mac_ktail`) |
@@ -1881,7 +1881,18 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
 | `pack prep` (imd_pack) | every non-empty pack | K0 | 1 | `8(r+k+b)` + the zeroed gaps and tail | | | |
 | `pack KL` (imd_pack) | every non-empty pack | KL | as KL with g = N, rows = pad = b·r, x the pack's one-operand view (`pack_exec`) | | | | |
 
-(x₅ is unused outside K4: room for one more feature per class in a later format.)
+(x₅ is unused outside K4 and KF: room for one more feature per class in a later format.)
+
+- **KF's per-thread chain** (`kf.chain`, added 2026-10-05 for N = 15–17 on mid-size shapes). KF
+  launches B = tiles × parts blocks (the shared launch rules `kf_lg_tk`, `kf_operand_tiles`,
+  `kf_small`, `pack_moduli_parts`: tiles of 4096 values with 16 per thread, or 1024 with 4 per
+  thread when the 4096 grid has fewer than 16 blocks per SM even with every modulus split; parts
+  when tiles < 2 per SM). Each thread emits the residues of its E values for ⌈g/parts⌉ moduli
+  in sequence, so with few blocks per SM the busiest SM's chain, not the bytes, sets the time:
+  `x₅ = ⌈B / (SMs · r)⌉ · E · ⌈g/parts⌉ · (1 + f)`, r = 2 resident blocks per SM for E = 16
+  (47.5 KB of static shared memory), 4 for E = 4; an eps-path residue doubles the step. Measured:
+  at N = 15, 576³ (E = 16, 288 blocks) takes 62 µs in KF and 448³ (E = 4) 20 µs; without the
+  term KF at N = 15–17 on 576–960³ was predicted up to 45 % low.
 
 - **K4's partial K tile** (`mac_ktail`, found on the hold-out set). A K-chunk whose length is
   not a multiple of the 64-wide K tile (k̂ = 1008, 5008, 30000, 150000; every full chunk K_c' =
