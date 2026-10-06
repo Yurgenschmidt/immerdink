@@ -54,7 +54,10 @@ pack-format, API, calibration-format or TLA+ change; changed text is marked **[v
 v1.15 (§6c.7): measurements of long hot runs and a clock-scaled byte energy in the power
 model, `power.byte_f_pj` (host API 11, optional calibration key: absent = 0 predicts exactly
 as before). Implemented 2026-10-06; its design questions were decided by the independent
-reviewer. The shipped calibration does not use the key yet (the combined refit writes it).
+reviewer. v1.15 also retires the model's eps data dependence (§6c.1 "The eps path —
+retired"; the v1.14 kernels have none): `eps_fraction` is validated and ignored, `eps_s` /
+`eps_fraction` out are 0, the `op_eps` features are 0 and their keys optional (format 2
+kept). The shipped calibration is the combined refit of both (NOTES-B2 §10).
 The change lists are at the end.
 
 Sources:
@@ -2710,32 +2713,37 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
     θ was refit after stage 2 and `k4_select` re-checked (unchanged; NOTES-B2 §8). The model's K4 and byte terms use
     the plan's (padded) k̂; useful flops stay the logical 2mnk.
 
-- **The eps path** (the `op_eps` features, reviewed 2026-10-05). The packs quantize an
-  element to `μ·2^ε`; a residue costs one more modular multiply when ε > 0, i.e. |a'| ≥ 2⁵³
-  (§3.4, the "rare" path of the pack emitter), and a warp pays it for its whole tile (32 lanes
-  × up to 16 elements) when any element of the tile has ε > 0. This depends on the **data**,
-  so it is an input: `eps_fraction` f ∈ [0, 1] in the requests (the fraction of pack work on
-  the eps path), forced to 0 when T < 2⁵³ (N ≤ 13). The default (f < 0 in the request) is a
-  plan-only **typical-data** estimate: rows of comparable entries are scaled to a norm of about
-  T, so with the margin `D = log₂T − ½·log₂k − 53` (T exact, not ⌊log₂T⌋; log₂T = 54.58 /
-  58.39 / 62.19 / 65.98 / 77.19 at N = 14 / 15 / 16 / 17 / 20) the fraction of 512-element tiles whose
-  maximum after the row's power-of-two scaling reaches 2⁵³ is a function of D alone, k-free:
-  simulated for the benchmark generator `(u − ½)·exp(g/2)` with random row scales (k = 1024 and
-  8192 agree), 0.03 at D = −2.5, 0.23 at −2, 0.65 at −1.5, 0.96 at −1 (a tile's maximum is about
-  1.6 bits above the RMS margin); the default is the ramp f = clamp((D + 2.5)/1.5, 0, 1). So at
-  N = 14 only k < 286 is on the path (fully for k ≤ 36), at N = 15 fully for k ≤ 7 000 and not
-  at all for k ≥ 56 000, at N ≥ 16 for every practical k. Rows with one dominant entry have f ≈ 512/k (one tile per row);
-  callers pass their own f. Every prediction reports `eps_s`, the eps terms at f = 1, so the
-  exact bracket for any data is `[time − f·eps_s, time + (1 − f)·eps_s]` ([v1.10] at a fixed clock:
-BURST or an explicit `clock_mhz`; under SUSTAINED the eps work also changes the settled clock). The calibration
-  identifies op_eps on the same plans with different data (`imd_bench --data dominant`), not
-  only through N. Consequence: with the default f, doubling k can lower the predicted time
-  (f falls from 1 to 0 as k grows); never below the time without the eps terms (tested).
-  **[v1.14]** The kernels no longer have an eps path (§3.4.1): the pack cost no longer
-  depends on the data. The model is unchanged in v1.14 (`eps_fraction`, `eps_s`, the
-  `op_eps` features and the D-ramp default stay, so its predictions at N ≥ 15 and for
-  dominant-entry data are now high by up to the eps terms); a later calibration change
-  retires them.
+- **The eps path — retired [v1.15]** (was: the `op_eps` features, reviewed 2026-10-05). Up to
+  v1.14 the packs paid one more modular multiply per residue when ε > 0 (|a'| ≥ 2⁵³), per warp
+  tile, so the pack cost depended on the **data**; the model took that as an input
+  (`eps_fraction` f ∈ [0, 1] in the requests, a plan-only typical-data ramp
+  f = clamp((D + 2.5)/1.5, 0, 1) with D = log₂T − ½·log₂k − 53 as the default, `eps_s` the
+  eps terms at f = 1, the bracket `[time − f·eps_s, time + (1 − f)·eps_s]`, and the
+  calibration identified `op_eps` on `imd_bench --data dominant` cases). Since v1.14
+  (§3.4.1) the pack emitter has no eps path: |a'| is reduced from W(N) words by the same
+  instructions for every ε, and the measured pack time no longer depends on the data
+  (NOTES-BFEPS: dominant-entry data cost what typical data cost, every N, K2/K3, KF, KL and
+  `imd_pack`). **[v1.15]** the model drops the dependence, with no ABI change (the fields'
+  meaning change is part of host API 11's change set):
+  - the `op_eps` feature slots (`kf` slot 4, `kl` slot 4, `pack` slot 3) are always 0, and the
+    chain features (`kf.chain`, `pack.chain`) no longer carry the (1 + f) factor;
+  - `imd_perf_request_t.eps_fraction` and `imd_perf_rank_request_t.eps_fraction` are
+    **validated as before** (< 0, or 0 … 1; NaN and > 1 are INVALID_VALUE) **and then ignored**;
+  - `imd_perf_t.eps_s`, `.eps_fraction` and the rank candidates' `eps_s`, `eps_fraction` are
+    **always 0** (struct fields kept for the ABI);
+  - the `op_eps` parameters stay in the struct and the key set (calibration format 2, no
+    format bump: the remaining parameters keep their meaning, and a calibration belongs to the
+    kernels it was fitted on, as after v1.13 stage 2). Their keys become **optional (absent =
+    0)** in formats 1 and 2, any value ≥ 0 is accepted and has no effect, and
+    `imd_perf_calib_format` writes them only when non-zero (an older file keeps its text
+    exactly; a file fitted after v1.15 has none);
+  - `bench/perf_fit.py` fits them to 0 (all-zero feature columns) and drops the dominant-data
+    eps fraction (`record_eps`); `bench/sweep_calib.txt` drops its `--data dominant`
+    cases; the hold-out keeps its three dominant-data cases (`v_dom`, `w_d800`, `w_dr1`) as a
+    check that the data no longer matter.
+  A pre-v1.15 calibration (the shipped one before the combined refit, NOTES-B2 §10) loaded by
+  this library predicts without its eps terms; at N ≥ 15 on typical data that is up to the
+  eps terms faster than it predicted before, which is what the v1.14 kernels measure.
 - **K4's DRAM term.** The operands of a group were just written by the packs and stay in L2
   while the group's operands and W planes fit; beyond that K4 streams them from DRAM
   (measured memory-bound: r_mm-like n̂ = 64–128 with long k, skinny m ≫ n). The calibration
@@ -2964,7 +2972,8 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   blank lines ignored, keys unique, values to the end of the line (trimmed). Required:
   `format = 1`, `gpu`, `sm_count`, the three peaks, `l2_bytes` and **every** parameter
   (`<class>.<feature>`, ns per feature unit, e.g. `kl.byte`, `kl.op_eps`, `k4_64x64.mac2`,
-  `k4_64x64.byte`); optional
+  `k4_64x64.byte`; [v1.15] except `kf.op_eps`, `kl.op_eps`, `pack.op_eps`: optional, absent =
+  0, no effect, written only when non-zero, §6c.1 "The eps path — retired"); optional
   metadata `date`, `version` (immerdink commit / host API), `clocks` (clock and power state
   of the calibration run), `notes`. Unknown keys, duplicates, a missing key, a malformed or
   negative-where-forbidden number, or another `format` → INVALID_VALUE with the line number.
@@ -2994,7 +3003,7 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   - `band.call_small`, `band.call_mid`, `band.call_large` and `band.<class>` for every class
     = `lo hi` (two factors, 0 < lo ≤ hi; `1 1`: no band).
   - **[v1.15, host API 11] optional:** `power.byte_f_pj` (≥ 0; absent = 0), the clock-scaled
-    byte energy of §6c.7. It is the only optional key; in a format-1 file it is a format-2 key
+    byte energy of §6c.7. [v1.15] With the `op_eps` keys (§6c.1) it is one of the optional keys; in a format-1 file it is a format-2 key
     (rejected). A library older than API 11 rejects a file containing it (unknown key).
     `imd_perf_calib_format` writes it only when it is non-zero, so the text of a calibration
     without it is unchanged and format → parse stays bit-exact.
@@ -3067,7 +3076,7 @@ const char*  imd_perf_param_name(int32_t cls, int32_t j); /* "launch", "byte", .
 const char*  imd_perf_phase_name(int32_t phase);        /* the bench tags: "K0 vec", ...   */
 
 typedef struct { uint32_t struct_size; int32_t flags, k4_config /* -1: rule */, reserved;
-                 double eps_fraction; /* < 0: the typical-data default; else 0..1 */ }
+                 double eps_fraction; /* [v1.15] validated (< 0 or 0..1), ignored */ }
         imd_perf_request_t;
 typedef struct {
   int32_t phase, cls;  int64_t launches;
@@ -3077,7 +3086,7 @@ typedef struct {
   uint32_t struct_size;
   int32_t  status, dispatch, k4_config, sm_count, num_phases;
   double   time_s, bound_s, flops_eq, tflops_eq;
-  double   eps_s, eps_fraction;     /* eps terms at f = 1; the f used */
+  double   eps_s, eps_fraction;     /* [v1.15] always 0 (were: eps terms at f = 1; f) */
   int64_t  kernel_launches;
   uint64_t workspace_bytes, plan_device_bytes, pack_bytes, pack_ws_bytes;
   imd_perf_phase_t phase[IMD_PERF_MAX_PHASES];
@@ -3101,7 +3110,7 @@ imd_status_t imd_perf_predict_pack(const imd_pack_desc_t*, const imd_perf_reques
   beta-only`.
 - **predict_pack**: `imd_pack_layout`'s status; on SUCCESS the phases `pack prep`, `pack KL`,
   `call`, `pack_bytes` and `pack_ws_bytes` (exact); 0 time for an empty pack. Of the request
-  only `eps_fraction` is used.
+  only `eps_fraction` is used ([v1.15]: validated, then ignored).
 - **Calibration functions**: parse / load fill `out` (with `out->struct_size` as the
   caller's size; fields past it are not written) or return INVALID_VALUE (with
   `*error_line`, 0 when not tied to a line: a missing key, an unreadable file);
@@ -3190,12 +3199,12 @@ typedef struct {
   int32_t reuse;                   /* contractions per pack, ≥ 1                        */
   int32_t flags;                   /* IMD_PERF_BETA_NONZERO                             */
   uint64_t budget_bytes;           /* 0: no budget                                      */
-  double   eps_fraction;           /* as imd_perf_request_t                             */
+  double   eps_fraction;           /* as imd_perf_request_t ([v1.15] ignored)           */
 } imd_perf_rank_request_t;
 typedef struct {
   int32_t  num_moduli, residue_group, vec_mode, packed;  /* packed: bit 0 / 1 = caller's A / B */
   int32_t  status, feasible, k4_config, dispatch;
-  double   time_s, contract_s, pack_s, tflops_eq, eps_s, eps_fraction;
+  double   time_s, contract_s, pack_s, tflops_eq, eps_s, eps_fraction;  /* [v1.15] eps_*: 0 */
   uint64_t workspace_bytes, plan_device_bytes, pack_bytes, pack_ws_bytes, total_bytes;
   int64_t  kernel_launches;
 } imd_perf_candidate_t;
@@ -3317,7 +3326,7 @@ descriptors (as for `k4_select`), K4 features × A3 constants = `k4_estimate`, m
 against the shipped (fitted) calibration and a synthetic one with a large eps-path cost
 (doubling m, n or k never lowers the predicted time at fixed configuration and fixed eps
 fraction; with the default fraction never below the time without the eps terms), the eps
-bracket and the default ramp (exact log₂T), rank: every
+bracket and the default ramp (exact log₂T) ([v1.15]: replaced, see below), rank: every
 footprint equals `imd_workspace_size(_packed)` / `imd_plan_bytes` / `imd_pack_layout` exactly,
 the budget is respected, the order is as specified; `perf_calib_shipped`: the shipped file
 parses and its sm_count is 128. `host_cuda_free` unchanged (the model is plain C++).
@@ -3346,6 +3355,15 @@ energy from e_byte into e_byte^f never lowers the SUSTAINED clock, raising e_byt
 raises it, and the 2026-10-05 refit pair (e_tc 0.650 + e_byte 335 vs e_tc 0.691 + e_byte^f
 296) lowers the solved clock of tensor-core-heavy calls (8192³, 16384³) as §6c.7 expects;
 a capped solve with byte_f > 0 brackets the cap: P(f_s − 0.05 MHz) ≤ cap ≤ P(f_s + 0.05 MHz).
+
+[v1.15, eps retired] `host_perf` (Python) replaces the eps-bracket / default-ramp / "heavy eps"
+checks by: for N in 2..20 and k across the old ramp, every request fraction (−1, 0, 0.5, 1)
+predicts bit-identically (time, phases, features, clock) and reports `eps_s = eps_fraction =
+0`; the `op_eps` feature slots are 0 in every phase; a calibration with large `op_eps` values
+predicts bit-identically to the same one with them 0; the `op_eps` keys optional (absent = 0)
+in formats 1 and 2, written only when non-zero (the old shipped text round-trips unchanged); a
+fraction > 1 or NaN still INVALID_VALUE (`host_c_api`). Monotonicity (doubling m, n or k never
+lowers the predicted time) is checked against the shipped and a synthetic calibration.
 
 ### 6c.5 Validation (hold-out)
 
@@ -4566,7 +4584,8 @@ and host API; every value the same integer (bit-identical, tested on every contr
   `kPackXBits3`, `kPackWeightBytes`.
 - **Tests.** `mod_exhaustive_cpu` widened to [0, 12·255²] and `mod_p_words32`; new GPU unit
   test `pack_emitter`; new contract suite `eps` and packed cases with ε-heavy data.
-- **Performance model.** Unchanged (§6c "The eps path", [v1.14] note).
+- **Performance model.** Unchanged in v1.14; its eps data dependence is retired in v1.15
+  (§6c.1 "The eps path — retired").
 - **Measured** (RTX 4090; eval workspace `results/followups2/bf-eps/`, bench/sweep_bf_eps.txt,
   two interleaved before/after rounds, C bit-identical by hash in every case):
   - Registers (ptxas): `k23_pack` 114 → 84 (W = 2) / 117 (W = 3); KF and KL stay at their
@@ -4581,7 +4600,7 @@ and host API; every value the same integer (bit-identical, tested on every contr
   - N ≤ 13: no regression beyond 1 % (large and medium shapes 0–6 % faster; tiny calls
     of 12–16 µs, three rounds of 3000 calls: median ratio 1.000–1.008).
 
-## v1.15 (§6c.7 long hot runs and clock-scaled byte energy; host API 11, calibration format 2 with one optional key; no semantic, layout, launch, pack-format or spec change)
+## v1.15 (§6c.7 long hot runs and clock-scaled byte energy; host API 11, calibration format 2 with optional keys, the model's eps path retired; no semantic, layout, launch, pack-format or spec change)
 
 - **§6c.7 (new, draft).** Long sustained windows (2–4 min, NVML traces, energy counter never
   read) on 16384³, 8192³ and a DF 96⁴ × 3000 at N = 14 settle at 74–75 °C and 2240–2310
@@ -4610,3 +4629,14 @@ and host API; every value the same integer (bit-identical, tested on every contr
   Tests: §6c.4 [v1.15]. **The shipped calibration is unchanged** (no key); new 60 s pre-heat
   windows and the redone form comparison are in §6c.7 "Implementation"; the combined refit
   writes the key.
+- **§6c.1 / §6c.2 / §6c.3 / §6c.4: the eps path retired** (combined branch
+  `followups-combined`, part of host API 11's change set; no struct layout change). The
+  v1.14 pack emitter has no eps path, so: `op_eps` features 0 and the chains without the
+  (1 + f) factor; request `eps_fraction` validated as before, then ignored; `eps_s` /
+  `eps_fraction` out always 0 (predict, predict_pack, rank candidates); the `op_eps` keys
+  optional (absent = 0, formats 1 and 2), written only when non-zero; calibration format 2
+  kept (the other parameters keep their meaning; a calibration is refit with the kernels, as
+  after v1.13 stage 2). `bench/perf_fit.py` drops `record_eps`; `bench/sweep_calib.txt` drops
+  its six `--data dominant` cases; the hold-out keeps its three as a check. Python
+  docstrings and `host.Prediction` / `host.Candidate` comments updated. Tests: §6c.4 [v1.15,
+  eps retired].
