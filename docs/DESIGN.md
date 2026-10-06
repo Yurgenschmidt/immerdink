@@ -806,6 +806,18 @@ K_c'  = 131008                            (stage 1)
     16 / 32 under 128×256) and 10–12 % on 512² (k = 144 / 160, where the rule's
     configuration changes).
   - A rule that also looks at k̂ mod 64 reaches 0.26 %; not worth a second parameter.
+  - **Re-checked with the real A = 64** (follow-up 2026-10-06, docs/NOTES-K4ALIGN.md §11;
+    immerdink-eval `findings/followup-threshold.md`): A = 16 against A = 64 interleaved in one
+    process (`imd_bench` duel `ka=`), 7 shapes × N ∈ {8, 14} × k = 65…385. **96 stays.** The
+    best k-only rule on that data (a per-k oracle) is +0.065 % mean (mean loss vs the per-case
+    best 0.228 %, against 0.29 % for 96), "never pad class 32"
+    +0.03 to +0.05 %; padding-fraction rules (pad iff (⌈k⌉₆₄ − ⌈k⌉₁₆) ≤ f·⌈k⌉₁₆) lose 0.04
+    to 1.2 % because class 16 is the most misaligned class and nets a gain; cuts 112…320
+    lose 0.24 to 1.1 %. Even a per-case oracle knowing (m, n, N) gains only 0.29 %. The
+    residual loss is skinny shapes (16384×512, 512×16384) at k̂ ≡ 16 / 32, −1 to −4 %, where
+    the tall operand's producer bytes outweigh K4's gain. A rule in m or n is inadmissible
+    anyway: a pack knows only its own free extent (r) and k, and both K4 operands share
+    one k̂, so A must be resolvable from what both packs and the plan know (k, N, b).
 - **Rejected:**
   - *Stride-only padding* (row stride ⌈k⌉₆₄, GEMM K extent ⌈k⌉₁₆): the residue tile of
     `extent mod 64` elements shifts every main-loop load; with the old K_c' it misaligns
@@ -4157,7 +4169,7 @@ and host API; every value the same integer (bit-identical, tested on every contr
   `imd_pack_layout_t.format == IMD_PACK_FORMAT` to decide whether saved bytes are reusable
   is wrong for k ≤ 96 packs (format 1, still valid); compare with the `format` saved next
   to the bytes instead (§4b.5 contract, §6a integration contract, §6b.5). Also in
-  NOTES-K4ALIGN §11.
+  NOTES-K4ALIGN §12.
 - **§6c.3: explicit calibration parse errors (host API 10, additive).**
   `imd_perf_calib_error_t` (version 1, 272 bytes), `IMD_PERF_CALIB_ERR_*`,
   `imd_perf_calib_parse_ex`, `_load_ex`, `_default_ex`, `imd_perf_calib_error_name`. The

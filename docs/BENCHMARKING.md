@@ -61,7 +61,7 @@ python3 bench/ab_ratio.py <before.jsonl> <after.jsonl>
     `ratio_p10` and `ratio_p90`. It also checks both sides' accuracy, whether their C are
     bit-identical, and each side's plan bytes and kernel launches.
     - A side is `default` or a comma list of overrides: `N=<n>`, `vec=generate|resident`,
-      `g=<g>` (0 = N), `k4=rule|tune|0..3`, `k5=0|1|2|4` (0 = the launch rule). Unset keys
+      `g=<g>` (0 = N), `k4=rule|tune|0..3`, `k5=0|1|2|4` (0 = the launch rule), `ka=auto|16|64` (v1.13 §4b: the side's K alignment through the host library's test hook at plan creation; times A = 16 against A = 64 in one process). Unset keys
       keep the plan defaults, and N defaults to each `--N` value. Forced `k4` and `k5` use the
       profiling hooks (the default build).
     - The defaults are `--duel-a default --duel-b k4=tune`. This compares the two K4
