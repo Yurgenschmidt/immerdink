@@ -208,7 +208,7 @@ class Library:
 
     def kernel_occupancy_w(self, kernel, w):
         """[CTAs per SM, registers, static shared bytes, threads] of IMD_PERF_KERNEL_* `kernel`
-        at pack-emitter word count w (1, 2, 3; 0: the row the performance model reads), or
+        at pack-emitter word count w (2, 3; 0: the row the performance model reads), or
         None if the hook rejects the arguments."""
         out = (C.c_int32 * 4)()
         return list(out) if self.lib.imd_test_kernel_occupancy_w(kernel, w, out) == 0 else None

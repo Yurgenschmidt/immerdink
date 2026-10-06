@@ -35,9 +35,7 @@ inline constexpr int kSigmaMin = -1037;       // §3.2 sigma range, N = 2..20, k
 inline constexpr int kSigmaMax = 1151;
 inline constexpr int kEpsMax = 77;             // §3.3 eps_max at N = kNMax (pow2_mod width - 1)
 inline constexpr int32_t kModMaskModulus = 256;  // §3.5 p = 256 reduces by v & 255
-inline constexpr int kPackW1MaxN = 8;          // v1.16 §3.4.1 W(N) = 1 for N <= this
 inline constexpr int kPackW2MaxN = 16;         // v1.14 §3.4.1 W(N) = 2 for N <= this, else 3
-inline constexpr int kPackXBits1 = 32;         // v1.16 §3.4.1 bitlen |a'| <= this at W = 1
 inline constexpr int kPackXBits2 = 63;         // v1.14 §3.4.1 bitlen |a'| <= this at W = 2
 inline constexpr int kPackXBits3 = 78;         // ... and at W = 3
 inline constexpr int kPackWeightBytes = 10;    // v1.14 §3.4.1 bytes 0..9 of |a'| (2^0 .. 2^72)

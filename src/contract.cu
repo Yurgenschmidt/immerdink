@@ -314,8 +314,8 @@ struct PackArgs {
 
 // §3.3 + §3.4 for one row's E consecutive k-bar: quantize once, then residues per modulus:
 // PackEmitterT<E, W> (kernels/pack_emitter.cuh, v1.14 §3.4.1: |a'| as W = pack_words(N) u32
-// words, branch-free). Every pack kernel is instantiated for W = 2 and 3 (v1.16: and 1); the
-// launch picks W from the plan's N.
+// words, branch-free). Every pack kernel is instantiated for W = 2 and 3; the launch picks W
+// from the plan's N.
 
 template <int W>  // v1.14 §3.4.1: pack_words(N)
 __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
@@ -971,14 +971,12 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   const bool small = kf_small(tiles, a.gsize, p.sms) && k5_one_elem_per_sm() != 0;
   if (small) tiles = tiles_for(10);
   const dim3 grid(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms));
-  const int w = pack_words(p.N);  // v1.14 §3.4.1 (v1.16: W = 1 for N <= 8)
+  const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1
   if (small) {
-    if (w == 1) kf_scale_pack<Cap, 4, 1><<<grid, kThreads, 0, stream>>>(a);
-    else if (w == 2) kf_scale_pack<Cap, 4, 2><<<grid, kThreads, 0, stream>>>(a);
+    if (w2) kf_scale_pack<Cap, 4, 2><<<grid, kThreads, 0, stream>>>(a);
     else kf_scale_pack<Cap, 4, 3><<<grid, kThreads, 0, stream>>>(a);
   } else {
-    if (w == 1) kf_scale_pack<Cap, 16, 1><<<grid, kThreads, 0, stream>>>(a);
-    else if (w == 2) kf_scale_pack<Cap, 16, 2><<<grid, kThreads, 0, stream>>>(a);
+    if (w2) kf_scale_pack<Cap, 16, 2><<<grid, kThreads, 0, stream>>>(a);
     else kf_scale_pack<Cap, 16, 3><<<grid, kThreads, 0, stream>>>(a);
   }
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
@@ -1221,14 +1219,12 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
   // threads, one CTA per SM, which also keeps the rows in flight at SMs x th x 8 k_hat bytes
   // (r_bigk 32 MB, r_mm 51 MB: inside the L2 budget of K1, A3).
   const unsigned grid = static_cast<unsigned>(L.grid);
-  const int w = pack_words(p.N);  // v1.14 §3.4.1, v1.16 (imd_pack: the pack's N)
+  const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1 (imd_pack: the pack's N)
   if (L.values == 4) {
-    if (w == 1) kl_scale_pack<4, 1><<<grid, kTileElems / 4, 0, stream>>>(a);
-    else if (w == 2) kl_scale_pack<4, 2><<<grid, kTileElems / 4, 0, stream>>>(a);
+    if (w2) kl_scale_pack<4, 2><<<grid, kTileElems / 4, 0, stream>>>(a);
     else kl_scale_pack<4, 3><<<grid, kTileElems / 4, 0, stream>>>(a);
   } else {
-    if (w == 1) kl_scale_pack<8, 1><<<grid, kTileElems / 8, 0, stream>>>(a);
-    else if (w == 2) kl_scale_pack<8, 2><<<grid, kTileElems / 8, 0, stream>>>(a);
+    if (w2) kl_scale_pack<8, 2><<<grid, kTileElems / 8, 0, stream>>>(a);
     else kl_scale_pack<8, 3><<<grid, kTileElems / 8, 0, stream>>>(a);
   }
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
@@ -1466,9 +1462,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
                                        p.sms);
       pa.lg_th = L.lg_th;
       const dim3 grid(static_cast<unsigned>(L.grid_x), static_cast<unsigned>(L.parts));
-      const int w = pack_words(p.N);  // v1.14 §3.4.1 (v1.16: W = 1 for N <= 8)
-      if (w == 1) k23_pack<1><<<grid, kThreads, 0, stream>>>(pa);
-      else if (w == 2) k23_pack<2><<<grid, kThreads, 0, stream>>>(pa);
+      if (pack_words(p.N) == 2) k23_pack<2><<<grid, kThreads, 0, stream>>>(pa);  // v1.14 §3.4.1
       else k23_pack<3><<<grid, kThreads, 0, stream>>>(pa);
       if (pa.rows_pad > pa.op.rows)
         k23_zero_rows<<<blocks_for(gsize * p.b * (pa.rows_pad - pa.op.rows) * p.k_hat / kVec),
@@ -1609,7 +1603,7 @@ cudaError_t k5_occupancy(int n, int variant, int32_t* out) {
   else return cudaErrorInvalidValue;
 }
 
-// v1.16 §3.4.1: one W instantiation (1, 2, 3) of a pack kernel.
+// v1.16 §3.4.1: one W instantiation (2, 3) of a pack kernel.
 template <int W>
 cudaError_t pack_occupancy(int32_t kernel, int32_t* out) {
   switch (kernel) {
@@ -1634,7 +1628,6 @@ cudaError_t kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out) {
   if (w == 0) return kernel_occupancy(kernel, out);
   if (!is_pack_kernel(kernel)) return cudaErrorInvalidValue;
   switch (w) {
-    case 1: return pack_occupancy<1>(kernel, out);
     case 2: return pack_occupancy<2>(kernel, out);
     case 3: return pack_occupancy<3>(kernel, out);
     default: return cudaErrorInvalidValue;
@@ -1643,11 +1636,11 @@ cudaError_t kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out) {
 
 cudaError_t kernel_occupancy(int32_t kernel, int32_t* out) {
   // v1.16 §3.4.1: a pack kernel reports its most constrained W instantiation (fewest CTAs per
-  // SM, then most registers; the first such W of 3, 2, 1). On sm_89 the CTAs per SM are equal
-  // for every W (contract_api checks it) and W = 3 has the most registers: the v1.14 row.
+  // SM, then most registers; the first such W of 3, 2). On sm_89 the CTAs per SM are equal for
+  // both W (contract_api checks it) and W = 3 has the most registers: the v1.14 row.
   if (is_pack_kernel(kernel)) {
     int32_t best[4] = {0, 0, 0, 0};
-    for (int w = 3; w >= 1; --w) {
+    for (int w = 3; w >= 2; --w) {
       int32_t r[4];
       const cudaError_t e = kernel_occupancy_w(kernel, w, r);
       if (e != cudaSuccess) return e;

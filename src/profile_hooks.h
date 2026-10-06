@@ -24,7 +24,7 @@
  *                         v1.10: CTAs per SM, registers, shared memory bytes and threads of
  *                         kernel IMD_PERF_KERNEL_* (immerdink_host.h). Returns 0, 1 on error.
  *   imd_prof_kernel_occupancy_w(kernel, w, out[4])
- *                         v1.16: the same for one pack-emitter word count w = 1, 2, 3 of a
+ *                         v1.16: the same for one pack-emitter word count w = 2, 3 of a
  *                         pack kernel (KF16, KF4, KL8, KL4, PACK); w = 0: the row above.
  * Process-global, unsynchronized: one benchmark thread only. */
 #ifndef IMMERDINK_PROFILE_HOOKS_H

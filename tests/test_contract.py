@@ -939,24 +939,24 @@ def suite_api(lib, cuda, verbose):
             raise Fail(f"plan status {st}, expected {want}")
     if verbose:
         print(f"  ok  plan-time statuses ({len(checks)} cases)")
-    # v1.16 §3.4.1: the pack kernels' occupancy per emitter word count W. The performance model
+    # v1.16 §3.4.1: the pack kernels' occupancy per emitter word count W (2, 3). The model
     # keeps one row per kernel (the most constrained W); its features use the CTAs per SM, so
     # they must be equal for every W, and the reported row must be the most constrained one.
     names = {1: "kf16", 2: "kf4", 3: "kl8", 4: "kl4", 5: "pack"}   # IMD_PERF_KERNEL_*
     for kern, name in names.items():
-        rows = {w: lib.kernel_occupancy_w(kern, w) for w in (0, 1, 2, 3)}
+        rows = {w: lib.kernel_occupancy_w(kern, w) for w in (0, 2, 3)}
         if any(r is None or r[0] < 1 for r in rows.values()):
             raise Fail(f"occupancy {name}: {rows}")
-        if len({rows[w][0] for w in (1, 2, 3)}) != 1:
+        if len({rows[w][0] for w in (2, 3)}) != 1:
             raise Fail(f"occupancy {name}: CTAs per SM differ by W {rows} (the model needs "
                        "per-W occupancy rows: DESIGN §3.4.1 v1.16)")
-        worst = min((rows[w] for w in (3, 2, 1)), key=lambda r: (r[0], -r[1]))
-        if rows[0] != worst or any(rows[w][2:] != rows[0][2:] for w in (1, 2, 3)):
+        worst = min((rows[w] for w in (3, 2)), key=lambda r: (r[0], -r[1]))
+        if rows[0] != worst or any(rows[w][2:] != rows[0][2:] for w in (2, 3)):
             raise Fail(f"occupancy {name}: reported row {rows[0]} is not the most constrained {rows}")
         if verbose:
-            print(f"  ok  occupancy {name}: {rows[0][0]} CTAs/SM at W = 1, 2, 3; registers "
-                  f"{rows[1][1]} / {rows[2][1]} / {rows[3][1]}")
-    for kern, w in ((0, 1), (5, 4), (5, -1), (14, 2)):    # K0 has no W; W 4 / -1; a K5 kernel
+            print(f"  ok  occupancy {name}: {rows[0][0]} CTAs/SM at W = 2, 3; registers "
+                  f"{rows[2][1]} / {rows[3][1]}")
+    for kern, w in ((0, 2), (5, 1), (5, 4), (5, -1), (14, 2)):   # K0: no W; W 1 / 4 / -1; K5
         if lib.kernel_occupancy_w(kern, w) is not None:
             raise Fail(f"occupancy hook accepted kernel {kern} W {w}")
 
@@ -1123,8 +1123,8 @@ def suite_pad_mutation(lib, cuda, verbose):
 def suite_eps(lib, cuda, verbose):
     """DESIGN v1.14 §3.4.1, the branch-free pack emitter on eps-heavy data (gen_eps): rows
     of subnormals scaled to eps in [32, 77] at N = 17-20 (both word selects of W = 3) and up
-    to 62 at N = 16 (W = 2), eps > 0 at N <= 13 (subnormals; v1.16: W = 1 at N <= 8, eps up to
-    eps_max - 3 at N = 5..8), dominant entries, RN and TRUNC,
+    to 62 at N = 16 (W = 2), eps > 0 at N <= 13 (subnormals; v1.16: eps up to eps_max - 3 at
+    N = 5..8, N = 2), dominant entries, RN and TRUNC,
     g < N; small operands (KF E = 4, moduli parts, gridDim.y > 1), K2/K3, KL (forced, and by
     the rule for k_hat > 1024, E = 8 and, with 64-row tiles, E = 4): every run_case variant
     bit-exact vs the oracle. Fails if the data of the emulated cases (k >= 2; k = 1 is DIRECT)

@@ -343,7 +343,7 @@ def suite_packed(lib, cuda, verbose):
                         beta, N, g, rounding, mode, which, order, rng, verbose, full=t % 4 != 3)
     # DESIGN v1.14 §3.4.1: imd_pack (KL, every byte) on eps-heavy operands (tc.gen_eps): eps up
     # to eps_max at N = 16 (W = 2) and N = 17, 20 (W = 3, both word selects), RN and TRUNC;
-    # v1.16: N = 6, 8 (W = 1, KL E = 8 and E = 4).
+    # v1.16: N = 6, 8 (KL E = 8 and E = 4).
     for t, (N, rounding, m, n, k, ka, kb, which) in enumerate((
             (16, "RN", 11, 9, 40, "sub1", "mix", "A"), (16, "TRUNC", 7, 12, 1100, "mix", "sub1", "B"),
             (17, "RN", 9, 10, 129, "mix", "dominant", "AB"), (20, "TRUNC", 13, 6, 33, "sub1", "sub", "AB"),

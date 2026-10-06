@@ -120,8 +120,7 @@ int main() {
           for (int d = 0; d < 8; ++d) pw8 = (2 * pw8) % p;
         }
       }
-      // v1.14: mod_p_words32<2> on X < 2^kPackXBits2 and <3> on X < 2^kPackXBits3 (v1.16: <1>
-      // on X < 2^kPackXBits1) against
+      // v1.14: mod_p_words32<2> on X < 2^kPackXBits2 and <3> on X < 2^kPackXBits3 against
       // X mod p (u128), edge values and 2^20 pseudo-random X of every bit length.
       {
         __extension__ typedef unsigned __int128 u128;
@@ -148,10 +147,6 @@ int main() {
             const uint32_t x2[2] = {x3[0], x3[1]};
             bytes_bad += imd::device::mod_p_words32<2>(x2, w2, p, m32) != static_cast<uint32_t>(X % p);
           }
-          if (X >> c::kPackXBits1 == 0) {  // v1.16: W = 1 (N <= 8)
-            const uint32_t x1[1] = {x3[0]}, w1[1] = {pwt[0][l]};
-            bytes_bad += imd::device::mod_p_words32<1>(x1, w1, p, m32) != static_cast<uint32_t>(X % p);
-          }
         }
       }
       uint64_t x = 0x9E3779B97F4A7C15ull ^ static_cast<uint64_t>(l);
@@ -176,7 +171,7 @@ int main() {
     }
   }
   std::printf("pack residue by byte weights: weights (A5 and v1.14), reduction over [0, 12*255^2], "
-              "2^20 mu and 2^20 X (mod_p_words32<1>, <2>, <3>) per modulus: %llu mismatches\n",
+              "2^20 mu and 2^20 X (mod_p_words32<2>, <3>) per modulus: %llu mismatches\n",
               static_cast<unsigned long long>(bytes_bad));
   const bool ok = small_bad == 0 && g_bad == 0 && g_done == total && bytes_bad == 0;
   std::printf("%s\n", ok ? "PASS" : "FAIL");

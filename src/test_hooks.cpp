@@ -87,7 +87,7 @@
 //   imd_test_kernel_occupancy_w(kernel, w, out)
 //       v1.16 §3.4.1: the measured occupancy row (CTAs per SM, registers, static shared
 //       memory bytes, threads) of kernel IMD_PERF_KERNEL_* (K4 excepted) for pack-emitter word
-//       count w = 1, 2, 3 (pack kernels KF16, KF4, KL8, KL4, PACK only), w = 0: the row the
+//       count w = 2, 3 (pack kernels KF16, KF4, KL8, KL4, PACK only), w = 0: the row the
 //       performance model's occupancy query reports. Returns 0, or 1 for an invalid argument.
 #include <cstdint>
 #include <vector>

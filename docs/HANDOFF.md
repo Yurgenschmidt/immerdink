@@ -74,7 +74,9 @@ first.
   pJ/op + e_byte^f 301 pJ/B, γ = 1). Open: recollect **all 14** sustained windows on the
   current library (all ran pre-v1.14 commit 0787164; the refit used the 9 N ≤ 14 ones); KF
   N-dependence (N = 8 1.2× slow), K3 pack 1.07–1.20× slow, N = 18–20 hold-out cases
-  (NOTES-B2 §10); W = 1 for N ≤ 8 (NOTES-BFEPS §4).
+  (NOTES-B2 §10). W = 1 for N ≤ 8 was evaluated and not adopted (DESIGN v1.16, branch
+  `emitter-w1`, NOTES-BFEPS §4: pack −2.7 %, below the 3 % bar, for +11 % library size);
+  v1.16 also makes the W = 2 shift defined (PTX shl) and the occupancy query W-aware.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).

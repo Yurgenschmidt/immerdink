@@ -434,7 +434,7 @@ IMD_API int imd_prof_kernel_occupancy(int32_t kernel, int32_t* out) {
   }
   return imd::detail::kernel_occupancy(kernel, out) == cudaSuccess ? 0 : 1;
 }
-// Benchmark-only (v1.16 §3.4.1): one W instantiation (1, 2, 3) of a pack kernel (KF16, KF4,
+// Benchmark-only (v1.16 §3.4.1): one W instantiation (2, 3) of a pack kernel (KF16, KF4,
 // KL8, KL4, PACK); w = 0 is imd_prof_kernel_occupancy's row. Returns 0, 1 on error.
 IMD_API int imd_prof_kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out) {
   if (out == nullptr || kernel < 0 || kernel >= IMD_PERF_KERNEL_COUNT) return 1;
