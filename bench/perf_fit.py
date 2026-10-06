@@ -20,8 +20,9 @@ one rate for the four configurations). Then the call term: sign-free least squar
 re-predicted by the C library with the fitted parameters (the C does the sum / max). BETA (not
 measured by the sweep) takes K5's launch and byte parameters. The effective L2 of the K4
 DRAM term is scanned (a fraction of the recorded L2; --no-l2-scan keeps the nominal size).
-Records with --data dominant (one dominant entry per row) are predicted with their eps fraction
-(record_eps: about 512 / k); the others with the typical-data default. Datasheet peaks: the RTX 4090's, else --peak-dram / --peak-int8 /
+v1.15 (DESIGN §6c.1 "The eps path — retired"): every record is predicted the same way whatever
+its data (the v1.14 pack emitter has no eps path; the op_eps features are 0, so the op_eps
+parameters fit to 0 and are not written). Datasheet peaks: the RTX 4090's, else --peak-dram / --peak-int8 /
 --peak-fp64 are required. numpy only.
 
 v1.10 (DESIGN §6c, format 2): the method-occupancy record gives the occupancy table (else the
@@ -30,9 +31,23 @@ probe, else gpu_after) in the REPEAT cache state, and the clock-bound features a
 reference clock (the median NVML clock of the calls < 1 ms; with --clock-normalize); the chain features
 are fitted like the others (--no-chain drops them, --kernel kf4=4 overrides an occupancy for an
 A/B). Method-sustained records fit the power model (NNLS on the windows' mean power, a scan of
-gamma; a leave-one-case-out check is printed), method-pair records the cache term (L_w scan,
+gamma; a leave-one-case-out check is printed; v1.15 §6c.7: by default the clock-scaled form,
+power.byte_f_pj fitted with power.byte_pj held at --byte-pj, gamma 1; --power-form unscaled is
+the v1.10 fit), method-pair records the cache term (L_w scan,
 Delta by least squares; Delta = 0 when the measured effect is below 3 %). --format1 writes a v1.8
 file. Bands are added by bench/perf_validate.py --bands from the hold-out set.
+
+Host API 10 (DESIGN §6c.3): the metadata strings are checked against the calibration's field
+sizes before anything is written (check_meta: UTF-8 bytes, NUL included, no line break, no
+leading or trailing blank); a --version or --notes that does not fit is an error, the generated
+clocks, version and notes are cut to fit at a UTF-8 boundary (an empty --version / --notes
+means the generated value, as before host API 10). The written file is re-loaded and must
+format back to the same text.
+
+    python3 bench/perf_fit.py --check FILE [FILE ...]
+
+checks existing calibration files (every string line, then the C parser with its reason) and
+exits 1 listing every problem.
 """
 
 import argparse
@@ -52,6 +67,63 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "python"))
 from immerdink import host  # noqa: E402
 
 CALL = "call"
+
+
+# ------------------------------------------------------------------------------------------
+# Generation-time checks (host API 10, DESIGN §6c.3)
+
+def fit_text(text, field):
+    """`text` cut to the calibration string field's capacity (UTF-8 bytes, NUL excluded) at a
+    character boundary: for generated metadata only (a caller's value is checked instead)."""
+    cap = host.CALIB_STRING_FIELDS[field] - 1
+    b = text.encode()
+    if len(b) <= cap:
+        return text
+    return b[:cap].decode(errors="ignore").rstrip(" \t")
+
+
+def check_meta(meta):
+    """The problems of a calibration's metadata strings: [] if every value can be written and
+    parsed back unchanged (fits its field, no line break, no leading / trailing blank)."""
+    probs = []
+    for k, cap in host.CALIB_STRING_FIELDS.items():
+        if k not in meta:
+            continue
+        v = str(meta[k])
+        n = len(v.encode())
+        if n > cap - 1:
+            probs.append(f"{k}: {n} bytes, the calibration field holds {cap - 1}")
+        if "\n" in v or "\r" in v:
+            probs.append(f"{k}: contains a line break")
+        if v != v.strip(" \t"):
+            probs.append(f"{k}: leading or trailing blank (the parser would trim it)")
+    return probs
+
+
+def check_calibration_file(path, lib=None):
+    """The problems of an existing calibration file: every string line against its field
+    (all of them, by line), then the C parser's first error with its reason."""
+    probs = []
+    try:
+        text = open(path, "rb").read()
+    except OSError as e:
+        return [f"{path}: {e}"]
+    for i, raw in enumerate(text.split(b"\n"), 1):
+        line = raw.strip(b" \t\r")
+        if not line or line.startswith(b"#") or b"=" not in line:
+            continue
+        key, val = line.split(b"=", 1)
+        key = key.strip(b" \t").decode(errors="replace")
+        cap = host.CALIB_STRING_FIELDS.get(key)
+        val = val.strip(b" \t\r")
+        if cap is not None and len(val) > cap - 1:
+            probs.append(f"{path}:{i}: {key}: {len(val)} bytes, the calibration field holds "
+                         f"{cap - 1}")
+    try:
+        host.Calibration.load(path, lib)
+    except host.CalibrationError as e:
+        probs.append(str(e))
+    return probs
 
 
 # ------------------------------------------------------------------------------------------
@@ -115,26 +187,6 @@ def record_clock(rec):
 USE_RECORD_CLOCK = True
 
 
-MODULI = [256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199, 197, 193, 191,
-          181, 179, 173]  # DESIGN §2
-
-
-def record_eps(rec, ext, lib=None):
-    """The eps fraction of a record's data: None (the typical-data default) for the normal
-    generator. With one dominant entry per row (2^20 x the others), the tile holding it is on the
-    eps path (512 / k of the tiles) and the others are about 2^-20 T: on the path too once
-    log2 T - 20 - 53 reaches the ramp of the default (DESIGN §6c.1; N = 20 here)."""
-    if rec.get("data") != "dominant":
-        return None
-    N = int(rec.get("N", 8))
-    lt = math.log2(math.isqrt((math.prod(MODULI[:N]) - 1) // 2))
-    if lt < 53:
-        return 0.0
-    lw = host.lowering(rec["spec"], ext, N=N, lib=lib)
-    others = min(1.0, max(0.0, (lt - 20 - 53 + 2.5) / 1.5))
-    return max(others, min(1.0, 512.0 / max(lw.k, 1)))
-
-
 def _aligned(fn, a, lib):
     """fn under the record's K alignment (DESIGN v1.13 §4b.6): libimmerdink_host's test hook
     set to a (0 = AUTO) around the call, AUTO restored after."""
@@ -171,11 +223,10 @@ def samples_from_records(records, lib=None, seed=None):
         cache = "COLD" if "l2=flush" in r.get("variant", "") else "REPEAT"
         if meth == "imd" and "phases" in r:
             o = variant_options(r)
-            eps = record_eps(r, ext, lib)
 
-            def again(calib, state=None, spec=spec, ext=ext, o=o, eps=eps, clk=clk, cache=cache):
+            def again(calib, state=None, spec=spec, ext=ext, o=o, clk=clk, cache=cache):
                 return host.predict(spec, ext, N=o["N"], g=o["g"], vec_mode=o["vec_mode"],
-                                    mode=o["mode"], k4_config=o["k4_config"], eps_fraction=eps,
+                                    mode=o["mode"], k4_config=o["k4_config"],
                                     regime="BURST", cache=state or cache, clock_mhz=clk,
                                     calib=calib, lib=lib)
             again = _aligned(again, ka, lib)
@@ -190,18 +241,17 @@ def samples_from_records(records, lib=None, seed=None):
             N = int(r["N"])
             pk = host.pack_desc_for(spec, ext, operand=which, N=N, lib=lib)   # no sizes: A-free
             packing = (pk, None) if which == 0 else (None, pk)
-            eps = record_eps(r, ext, lib)
             # method packed times imd_pack, the plain and the packed contract interleaved: each
             # finds the L2 holding the other calls' traffic, i.e. COLD for its own inputs
             kw = dict(regime="BURST", clock_mhz=clk, lib=lib)
-            fns = {"plain_": lambda c, st=None, spec=spec, ext=ext, N=N, eps=eps, kw=kw:
-                       host.predict(spec, ext, N=N, eps_fraction=eps, calib=c,
+            fns = {"plain_": lambda c, st=None, spec=spec, ext=ext, N=N, kw=kw:
+                       host.predict(spec, ext, N=N, calib=c,
                                     cache=st or "COLD", **kw),
-                   "packed_": lambda c, st=None, spec=spec, ext=ext, N=N, packing=packing, eps=eps,
-                   kw=kw: host.predict(spec, ext, N=N, packing=packing, eps_fraction=eps, calib=c,
+                   "packed_": lambda c, st=None, spec=spec, ext=ext, N=N, packing=packing,
+                   kw=kw: host.predict(spec, ext, N=N, packing=packing, calib=c,
                                        cache=st or "COLD", **kw),
-                   "pack_": lambda c, st=None, pk=pk, eps=eps, kw=kw: host.predict_pack(
-                       pk, eps_fraction=eps, calib=c, cache=st or "COLD", **kw)}
+                   "pack_": lambda c, st=None, pk=pk, kw=kw: host.predict_pack(
+                       pk, calib=c, cache=st or "COLD", **kw)}
             fns = {key: _aligned(f, ka, lib) for key, f in fns.items()}
             lab = f"{r['case']} pack {r.get('pack')} N={N}"
             for pre, timed in (("plain_", r["contract_ms"] * 1e-3),
@@ -525,40 +575,60 @@ def sustained_rows(records, cal, lib=None):
     return out
 
 
-def fit_power(rows, fref, gammas=(1.0, 2.0, 3.0), idle=60.0):
-    """P = idle + ((e_tc tc + e_alu alu) (f / fref)^gamma + e_byte D) 1e-12 / t over the
-    sustained windows at their measured clock f, time t and power P: NNLS of P - idle on the
-    three energies (relative error), the gamma of the smallest error. The awake idle is held
-    fixed (`idle`): with most windows pinned at the cap, a free intercept absorbs the power
-    (it fitted 366 W on the post-BIOS data). Returns the power.* keys (cap = the records'
-    enforced limit, clock_min = 0.8 x the lowest measured)."""
+POWER_FORMS = ("scaled", "unscaled")
+
+
+def fit_power(rows, fref, gammas=None, idle=60.0, form="scaled", byte_pj=0.0):
+    """The power model over the sustained windows at their measured clock f, time t and power
+    P (NNLS of P - idle, relative in the dynamic power; the gamma of the smallest power error).
+    The awake idle is held fixed (`idle`): with most windows pinned at the cap, a free
+    intercept absorbs the power (it fitted 366 W on the post-BIOS data).
+      form "scaled" (v1.15, DESIGN §6c.7, the default): P = idle + ((e_tc tc + e_alu alu +
+        e_byte^f D) (f / fref)^gamma + e_byte D) 1e-12 / t with e_byte held fixed at `byte_pj`
+        (the two byte columns are collinear on the windows: 0, or a stated prior); fitted
+        e_tc, e_alu, e_byte^f; gammas default (1,).
+      form "unscaled" (v1.10): P = idle + ((e_tc tc + e_alu alu) (f / fref)^gamma + e_byte D)
+        1e-12 / t; fitted e_tc, e_alu, e_byte; gammas default (1, 2, 3).
+    Returns the power.* keys (cap = the records' enforced limit, clock_min = 0.8 x the lowest
+    measured; power.byte_f_pj only for the scaled form)."""
+    if form not in POWER_FORMS:
+        raise ValueError(f"power form {form!r}: one of {POWER_FORMS}")
+    scaled = form == "scaled"
+    if gammas is None:
+        gammas = (1.0,) if scaled else (1.0, 2.0, 3.0)
     best = None
     P = np.array([r["P"] for r in rows])
+    fixed = np.array([byte_pj * r["D"] * 1e-12 / r["t"] for r in rows]) if scaled else 0.0
     for gm in gammas:
         X = np.array([[r["tc"] * (r["f"] / fref) ** gm * 1e-12 / r["t"],
-                       r["alu"] * (r["f"] / fref) ** gm * 1e-12 / r["t"], r["D"] * 1e-12 / r["t"]]
+                       r["alu"] * (r["f"] / fref) ** gm * 1e-12 / r["t"],
+                       r["D"] * ((r["f"] / fref) ** gm if scaled else 1.0) * 1e-12 / r["t"]]
                       for r in rows])
-        th = nnls_relative(X, np.maximum(P - idle, 1e-3))  # relative in the dynamic power
-        err = float(np.sum(((idle + X @ th - P) / P) ** 2))
+        th = nnls_relative(X, np.maximum(P - idle - fixed, 1e-3))  # relative in the dynamic power
+        err = float(np.sum(((idle + fixed + X @ th - P) / P) ** 2))
         if best is None or err < best[0]:
             best = (err, gm, th)
     _, gm, th = best
-    return {"power.clock_eff_mhz": fref, "power.clock_min_mhz": 0.8 * min(r["f"] for r in rows),
-            "power.cap_w": float(np.median([r["cap"] for r in rows])), "power.idle_w": float(idle),
-            "power.tc_pj": float(th[0]), "power.alu_pj": float(th[1]), "power.byte_pj": float(th[2]),
-            "power.gamma": gm}
+    out = {"power.clock_eff_mhz": fref, "power.clock_min_mhz": 0.8 * min(r["f"] for r in rows),
+           "power.cap_w": float(np.median([r["cap"] for r in rows])), "power.idle_w": float(idle),
+           "power.tc_pj": float(th[0]), "power.alu_pj": float(th[1]),
+           "power.byte_pj": float(byte_pj) if scaled else float(th[2]), "power.gamma": gm}
+    if scaled:
+        out["power.byte_f_pj"] = float(th[2])
+    return out
 
 
-def power_validation(rows, meta, params, extra, fref, lib=None, verbose=True, idle=60.0):
-    """Leave-one-case-out: the power model fitted without the window's case, then the window's
-    SUSTAINED prediction (time, clock) against the measured. Returns [(label, t meas, t pred,
-    f meas, f pred, P meas, P pred)]."""
+def power_validation(rows, meta, params, extra, fref, lib=None, verbose=True, idle=60.0,
+                     **power_kw):
+    """Leave-one-case-out: the power model fitted without the window's case (fit_power with
+    power_kw: form, byte_pj, gammas), then the window's SUSTAINED prediction (time, clock)
+    against the measured. Returns [(label, t meas, t pred, f meas, f pred, P meas, P pred)]."""
     out = []
     for case in sorted({r["case"] for r in rows}):
         train = [r for r in rows if r["case"] != case]
         if len(train) < 4:
             continue
-        pw = fit_power(train, fref, idle=idle)
+        pw = fit_power(train, fref, idle=idle, **power_kw)
         cal = host.Calibration.from_values(meta, params, lib, dict(extra, **pw))
         for r in rows:
             if r["case"] != case:
@@ -636,11 +706,17 @@ def fit_warm(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=
 def main(argv=None):
     global USE_RECORD_CLOCK
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("records", nargs="+", help="JSON lines of a calibration sweep")
-    ap.add_argument("-o", "--out", required=True, help="calibration file to write")
+    ap.add_argument("records", nargs="*", help="JSON lines of a calibration sweep (with --check: "
+                    "calibration files to check)")
+    ap.add_argument("-o", "--out", help="calibration file to write")
+    ap.add_argument("--check", action="store_true",
+                    help="check the given calibration files (string fields, the C parser) and "
+                         "exit: 1 if any has a problem")
     ap.add_argument("--lib", default=None, help="libimmerdink_host.so")
-    ap.add_argument("--version", default=None, help="version string (default: the commit)")
-    ap.add_argument("--notes", default=None)
+    ap.add_argument("--version", default=None,
+                    help="version string (default or \"\": the commit, cut to fit)")
+    ap.add_argument("--notes", default=None,
+                    help="notes string (default or \"\": the fit's sample counts, cut to fit)")
     ap.add_argument("--worst", type=int, default=0, help="print the N worst phases per class")
     ap.add_argument("--sm-count", type=int, default=None, help="override the records' sm_count")
     ap.add_argument("--l2-bytes", type=float, default=None,
@@ -664,6 +740,17 @@ def main(argv=None):
                     help="awake-idle board power held fixed in the power fit (W; the 4090: about "
                          "60 W, evaluation workspace findings/energy-20261004.md)")
     ap.add_argument("--clock-ref", type=float, default=None, help="reference SM clock (MHz)")
+    # v1.15 (DESIGN §6c.7)
+    ap.add_argument("--power-form", choices=POWER_FORMS, default="scaled",
+                    help="power model: 'scaled' (v1.15 default: clock-scaled byte energy "
+                         "power.byte_f_pj fitted, power.byte_pj held at --byte-pj) or "
+                         "'unscaled' (the v1.10 fit of power.byte_pj, no byte_f key)")
+    ap.add_argument("--byte-pj", type=float, default=0.0,
+                    help="scaled form: the fixed unscaled byte energy (pJ per DRAM byte; 0, or "
+                         "a stated prior), written as power.byte_pj")
+    ap.add_argument("--power-gammas", default=None,
+                    help="comma-separated gammas scanned by the power residual (default: 1 for "
+                         "the scaled form, 1,2,3 for the unscaled form)")
     ap.add_argument("--no-chain", action="store_true",
                     help="drop the v1.10 chain features of K0, KL, PACK, K5, DIRECT, BETA")
     ap.add_argument("--kernel", action="append", default=[], metavar="NAME=R",
@@ -672,8 +759,26 @@ def main(argv=None):
                     help="write a format-1 file (v1.8 features only; implies --no-clock, "
                          "--no-chain)")
     a = ap.parse_args(argv)
+    if a.check:
+        probs = [p for f in a.records for p in check_calibration_file(f, a.lib)]
+        for p in probs:
+            print(p, file=sys.stderr)
+        if not a.records:
+            ap.error("--check needs calibration files")
+        print(f"{len(a.records)} calibration file(s): "
+              f"{'ok' if not probs else str(len(probs)) + ' problem(s)'}")
+        sys.exit(1 if probs else 0)
+    if not a.records or not a.out:
+        ap.error("records and -o/--out are required (or --check FILE...)")
     if a.format1:
         a.no_clock = a.no_chain = True
+    if a.byte_pj < 0 or not math.isfinite(a.byte_pj):
+        ap.error("--byte-pj must be a finite number >= 0")
+    if a.byte_pj != 0 and a.power_form != "scaled":
+        ap.error("--byte-pj is the scaled form's fixed term")
+    power_kw = dict(form=a.power_form, byte_pj=a.byte_pj,
+                    gammas=tuple(float(x) for x in a.power_gammas.split(","))
+                    if a.power_gammas else None)
     USE_RECORD_CLOCK = a.clock_normalize and not a.no_clock
     records = []
     for f in a.records:
@@ -701,8 +806,11 @@ def main(argv=None):
             peaks[k] = v
     commit = next((r.get("commit") for r in ok if r.get("commit")), "unknown")
     meta = {"gpu": gpu, "sm_count": sms, "date": datetime.date.today().isoformat(),
-            "version": a.version or f"immerdink {commit}, host API {host.API_VERSION}",
-            "clocks": clock_summary(records)[:127], **peaks, "l2_bytes": l2}
+            "version": a.version or fit_text(f"immerdink {commit}, host API {host.API_VERSION}",
+                                             "version"),
+            "clocks": fit_text(clock_summary(records), "clocks"), **peaks, "l2_bytes": l2}
+    if probs := check_meta(meta):  # before the fit: a caller's --version or the records' gpu
+        sys.exit("calibration metadata cannot be written (DESIGN §6c.3):\n  " + "\n  ".join(probs))
     fref = 0.0 if a.no_clock else (a.clock_ref or reference_clock(records))
     fnorm = fref if USE_RECORD_CLOCK else 0.0  # the clock normalization of the fit
     kernels = occupancy_from_records(records, a.lib) or {}
@@ -774,21 +882,33 @@ def main(argv=None):
             best = None
             for fr in [fref - 25 * i for i in range(0, 17)]:
                 out = power_validation(rows, meta, params, extra, fr, a.lib, verbose=False,
-                                       idle=a.idle_w)
+                                       idle=a.idle_w, **power_kw)
                 err = float(np.median([abs(tp - tm) / tm for _, tm, tp, *_ in out]))
                 print(f"  time-model clock {fr:.0f} MHz: sustained LOO median |err| {100 * err:.2f} %")
                 if best is None or err < best[0] - 1e-12:
                     best = (err, fr)
             fr = best[1] if a.clock_ref is None else fref
-            pw = fit_power(rows, fr, idle=a.idle_w)
-            print("power model: " + ", ".join(f"{k} {v:.4g}" for k, v in pw.items()))
-            power_validation(rows, meta, params, extra, fr, a.lib, idle=a.idle_w)
+            pw = fit_power(rows, fr, idle=a.idle_w, **power_kw)
+            print(f"power model ({a.power_form} form" +
+                  (f", power.byte_pj held at {a.byte_pj:g} pJ/B" if a.power_form == "scaled" else "")
+                  + "): " + ", ".join(f"{k} {v:.4g}" for k, v in pw.items()))
+            power_validation(rows, meta, params, extra, fr, a.lib, idle=a.idle_w, **power_kw)
             extra.update(pw)
-    meta["notes"] = (a.notes or f"fit on {len(samples)} calls ({len(ok)} records) by "
-                     f"bench/perf_fit.py")[:127]
+    meta["notes"] = a.notes or fit_text(  # --notes "" (like no --notes): the generated notes
+        f"fit on {len(samples)} calls ({len(ok)} records) by bench/perf_fit.py", "notes")
+    if probs := check_meta(meta):  # a caller's --notes is never cut silently
+        sys.exit("calibration metadata cannot be written (DESIGN §6c.3):\n  " + "\n  ".join(probs))
     cal = host.Calibration.from_values(meta, params, a.lib, extra)
+    text = cal.format()
     with open(a.out, "w") as f:
-        f.write(cal.format())
+        f.write(text)
+    # What was written must load and format back to the same text (DESIGN §6c.3).
+    try:
+        back = host.Calibration.load(a.out, a.lib).format()
+    except host.CalibrationError as e:
+        sys.exit(f"the written calibration does not load: {e}")
+    if back != text:
+        sys.exit(f"{a.out}: the written calibration does not re-load to the same text")
     # The fit's own error on the timed totals (in-sample, the C model).
     errs = [abs(s.again(cal).time_s - s.timed_s) / s.timed_s for s in samples]
     print(f"in-sample total: median |err| {100 * statistics.median(errs):.1f}%, "

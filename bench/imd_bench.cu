@@ -26,7 +26,8 @@
 //             call, in one process (docs/BENCHMARKING.md "Tiny shapes", NOTES-A5 §1.2): both
 //             sides see the same GPU clock / DVFS / host-core state. A side is "default" or
 //             a comma list of N=<n>, vec=generate|resident, g=<g> (0 = N),
-//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule); unset keys keep the plan
+//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule), ka=auto|16|64 (v1.13 §4b:
+//             the side's K alignment, via the test hook at plan creation); unset keys keep the plan
 //             defaults, N defaults to the --N value. Defaults: A = default (the K4 rule),
 //             B = k4=tune (the plan-time K4 autotune); when both pick the same K4
 //             configuration (k4_config in both records) the run is an A/A resolution check.
@@ -452,6 +453,10 @@ struct Options {
   int k_align_hook = 0;  // v1.13 §4b: --k-align (0 = auto) / IMD_BENCH_K_ALIGN
   bool l2_flush = false;
   double sustain_s = 8, sustain_warm_s = 3;
+  // Follow-up (hot clock, NOTES-B2 §9): --sustain-trace-s T adds a time series to method
+  // sustained's record, one point per T seconds of the window: mean s per call, board power,
+  // SM clock, GPU temperature, OR of the clock-event reasons, fan %. 0 = off.
+  double sustain_trace_s = 0;
   uint64_t seed = 1;
   std::string out;
 };
@@ -526,11 +531,13 @@ Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& 
 // elements per thread. Forced k4 / k5 go through the benchmark hooks (profiling build).
 struct DuelSide {
   int N = 14, vec = IMD_VEC_GENERATE, g = 0, k4 = -1, k5 = 0;
+  int ka = -1;  // v1.13 §4b: -1 = the run's --k-align, 0 = AUTO, 16 / 64 = forced (plan-time hook)
   std::string describe() const {
     std::string d = "N=" + std::to_string(N) + " g=" + ((g == 0 || g >= N) ? "N" : std::to_string(g));
     d += vec == IMD_VEC_RESIDENT ? " vec=resident" : " vec=generate";
     d += k4 == -1 ? " k4=rule" : k4 == -2 ? " k4=tune" : " k4=" + std::to_string(k4);
     d += k5 == 0 ? " k5=rule" : " k5=" + std::to_string(k5);
+    if (ka >= 0) d += ka == 0 ? " ka=auto" : " ka=" + std::to_string(ka);
     return d;
   }
 };
@@ -550,8 +557,9 @@ DuelSide parse_duel_side(const std::string& spec, int N) {
     else if (k == "g") d.g = std::stoi(v);
     else if (k == "k4") d.k4 = v == "rule" ? -1 : v == "tune" ? -2 : std::stoi(v);
     else if (k == "k5" && (v == "0" || v == "1" || v == "2" || v == "4")) d.k5 = std::stoi(v);
+    else if (k == "ka" && (v == "auto" || v == "16" || v == "64")) d.ka = v == "auto" ? 0 : std::stoi(v);
     else throw Failure("bad duel side entry '" + kv + "' (N=, vec=generate|resident, g=, "
-                       "k4=rule|tune|0..3, k5=0|1|2|4)");
+                       "k4=rule|tune|0..3, k5=0|1|2|4, ka=auto|16|64)");
   }
   return d;
 }
@@ -574,6 +582,9 @@ struct Nvml {
   int (*power)(void*, unsigned*) = nullptr;
   int (*clock)(void*, int, unsigned*) = nullptr;
   int (*limit)(void*, unsigned*) = nullptr;
+  int (*temp)(void*, int, unsigned*) = nullptr;
+  int (*reasons)(void*, unsigned long long*) = nullptr;
+  int (*fan)(void*, unsigned*) = nullptr;
   bool ok() const { return dev != nullptr; }
   Nvml() {
     lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
@@ -583,11 +594,21 @@ struct Nvml {
     power = reinterpret_cast<int (*)(void*, unsigned*)>(dlsym(lib, "nvmlDeviceGetPowerUsage"));
     clock = reinterpret_cast<int (*)(void*, int, unsigned*)>(dlsym(lib, "nvmlDeviceGetClockInfo"));
     limit = reinterpret_cast<int (*)(void*, unsigned*)>(dlsym(lib, "nvmlDeviceGetEnforcedPowerLimit"));
+    temp = reinterpret_cast<int (*)(void*, int, unsigned*)>(dlsym(lib, "nvmlDeviceGetTemperature"));
+    reasons = reinterpret_cast<int (*)(void*, unsigned long long*)>(
+        dlsym(lib, "nvmlDeviceGetCurrentClocksThrottleReasons"));
+    fan = reinterpret_cast<int (*)(void*, unsigned*)>(dlsym(lib, "nvmlDeviceGetFanSpeed"));
     if (!init || !handle || !power || !clock || init() != 0 || handle(0, &dev) != 0) dev = nullptr;
   }
   double power_w() const { unsigned mw = 0; return ok() && power(dev, &mw) == 0 ? mw * 1e-3 : NAN; }
   double sm_mhz() const { unsigned m = 0; return ok() && clock(dev, 1, &m) == 0 ? double(m) : NAN; }
   double limit_w() const { unsigned mw = 0; return ok() && limit && limit(dev, &mw) == 0 ? mw * 1e-3 : NAN; }
+  double temp_c() const { unsigned t = 0; return ok() && temp && temp(dev, 0, &t) == 0 ? double(t) : NAN; }
+  unsigned long long reason_bits() const {
+    unsigned long long r = 0;
+    return ok() && reasons && reasons(dev, &r) == 0 ? r : 0;
+  }
+  double fan_pct() const { unsigned f = 0; return ok() && fan && fan(dev, &f) == 0 ? double(f) : NAN; }
 };
 
 // Number of elements whose bit patterns differ (method duel: are the two sides' C identical).
@@ -793,6 +814,18 @@ struct Bench {
     Accuracy acc = result_accuracy();
     CU(cudaStreamSynchronize(s));
     Json extra;
+    // C's bits after the timed calls (FNV-1a 64 over the whole C buffer): equal hashes across
+    // builds = bit-identical results (v1.14 A/B).
+    std::string c_hash;
+    {
+      std::vector<unsigned char> hc(dC.bytes);
+      CU(cudaMemcpy(hc.data(), dC.p, dC.bytes, cudaMemcpyDeviceToHost));
+      uint64_t h = 0xcbf29ce484222325ull;
+      for (unsigned char b : hc) h = (h ^ b) * 0x100000001b3ull;
+      char hs[17];
+      snprintf(hs, sizeof hs, "%016llx", static_cast<unsigned long long>(h));
+      c_hash = hs;
+    }
     // DESIGN §6c: the predicted call (shipped calibration) for the K4 configuration the plan runs.
     int32_t k4_plan = -1;
 #ifdef IMD_BENCH_PROFILE
@@ -811,6 +844,7 @@ struct Bench {
     });
 #endif
     extra.integer("plan_device_bytes", (long long)plan_dev).num("plan_create_ms", 1e3 * create_s);
+    extra.str("c_hash", c_hash);
     extra.num("pred_ms", 1e3 * pred.time_s).num("pred_err_pct", 100.0 * (pred.time_s / T.median() - 1));
     const std::string gs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
     extra.integer("g", (long long)((g == 0 || g >= N) ? N : g));
@@ -866,6 +900,14 @@ struct Bench {
     };
     imd_tensor_t A = t(c.A, P->la), B = t(c.B, P->lb), C = t(c.C, P->lc);
     imd_options_t opt{d.N, d.g, IMD_RN, IMD_EMULATE, d.vec, d.k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF};
+    // ka=: the K alignment of this side's sizing, lowering and plan (the host library's test
+    // hook, resolved once at plan creation; the plan keeps its A), restored to the run's
+    // --k-align afterwards. Times A = 16 against A = 64 interleaved in one process.
+    if (d.ka >= 0 && imd_test_set_k_align(d.ka) != 0) throw Failure("imd_test_set_k_align");
+    struct KaRestore {
+      int run; bool on;
+      ~KaRestore() { if (on) imd_test_set_k_align(run); }
+    } ka_restore{o.k_align_hook, d.ka >= 0};
     CI(imd_workspace_size(&A, &B, &C, &opt, &P->wsb));
     P->low.struct_size = sizeof P->low;
     imd_lowering(&A, &B, &C, &opt, &P->low);
@@ -1276,6 +1318,12 @@ struct Bench {
     const double t_est = std::max(1e-6, ms * 1e-3 / 5);
     const long chunk = std::max(1L, long(std::ceil(0.02 / t_est)));
     int cur = 0;
+    // Trace (--sustain-trace-s): host time and calls completed at every chunk boundary of the
+    // window (a chunk's event has completed when the host returns from its synchronize).
+    using clk = std::chrono::steady_clock;
+    clk::time_point tw0;
+    bool tracing = false;
+    std::vector<std::pair<double, long>> done;  // (s since window start, calls completed)
     // Chunks until `seconds` of host time have passed; returns the calls issued.
     auto run_for = [&](double seconds) {
       long calls = 0;
@@ -1285,7 +1333,11 @@ struct Bench {
         for (long i = 0; i < chunk; ++i) call();
         calls += chunk;
         CU(cudaEventRecord(chunk_ev[cur], s));
-        if (!first) CU(cudaEventSynchronize(chunk_ev[cur ^ 1]));  // two chunks in flight
+        if (!first) {
+          CU(cudaEventSynchronize(chunk_ev[cur ^ 1]));  // two chunks in flight
+          if (tracing)
+            done.emplace_back(std::chrono::duration<double>(clk::now() - tw0).count(), calls - chunk);
+        }
         first = false;
         cur ^= 1;
       }
@@ -1293,11 +1345,25 @@ struct Bench {
     };
     run_for(o.sustain_warm_s);
     std::atomic<bool> stop{false};
-    std::vector<double> pw, mhz;
+    std::vector<double> pw, mhz, ts, tc, fanv;
+    std::vector<unsigned long long> rs;
+    const bool trace = o.sustain_trace_s > 0;
+    const double temp0 = nv.temp_c();
+    tw0 = clk::now();
+    tracing = trace;
     std::thread sampler([&] {
+      int i = 0;
       while (!stop.load()) {
         pw.push_back(nv.power_w());
         mhz.push_back(nv.sm_mhz());
+        if (trace) {
+          ts.push_back(std::chrono::duration<double>(clk::now() - tw0).count());
+          rs.push_back(nv.reason_bits());
+          // temperature and fan change slowly: every 10th sample (200 ms)
+          tc.push_back(i % 10 == 0 ? nv.temp_c() : NAN);
+          fanv.push_back(i % 10 == 0 ? nv.fan_pct() : NAN);
+        }
+        ++i;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
       }
     });
@@ -1324,6 +1390,39 @@ struct Bench {
     e.num("power_w_mean", mean(pw)).num("sm_mhz_mean", mean(mhz));
     e.integer("nvml_samples", (long long)pw.size());
     e.num("power_limit_w", nv.limit_w()).num("sustain_warm_s", o.sustain_warm_s);
+    e.num("temp_c_start", temp0).num("temp_c_end", nv.temp_c());
+    if (trace) {
+      // One point per trace_s of the window: [t_mid s, s per call (completed calls between the
+      // chunk boundaries nearest the bin edges), mean W, mean MHz, mean degC, OR of the clock-
+      // event reason bits, mean fan %]. The energy counter is never read.
+      std::string arr = "[";
+      size_t j0 = 0;
+      for (double b0 = 0; b0 < ms * 1e-3; b0 += o.sustain_trace_s) {
+        const double b1 = b0 + o.sustain_trace_s;
+        size_t j1 = j0;
+        while (j1 + 1 < done.size() && done[j1 + 1].first <= b1) ++j1;
+        double spc = NAN;
+        if (j1 > j0 && done[j1].second > done[j0].second)
+          spc = (done[j1].first - done[j0].first) / double(done[j1].second - done[j0].second);
+        double sp = 0, sf = 0, st = 0, sfan = 0;
+        int np = 0, nt = 0;
+        unsigned long long rb = 0;
+        for (size_t i = 0; i < ts.size() && i < pw.size(); ++i) {
+          if (ts[i] < b0 || ts[i] >= b1) continue;
+          if (std::isfinite(pw[i]) && std::isfinite(mhz[i])) sp += pw[i], sf += mhz[i], ++np;
+          if (std::isfinite(tc[i])) st += tc[i], sfan += fanv[i], ++nt;
+          rb |= rs[i];
+        }
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s[%.3f, %s, %s, %s, %s, %llu, %s]", arr.size() > 1 ? ", " : "",
+                 0.5 * (b0 + b1), jnum(spc).c_str(), jnum(np ? sp / np : NAN).c_str(),
+                 jnum(np ? sf / np : NAN).c_str(), jnum(nt ? st / nt : NAN).c_str(), rb,
+                 jnum(nt ? sfan / nt : NAN).c_str());
+        arr += buf;
+        j0 = j1;
+      }
+      e.raw("trace", arr + "]").str("trace_cols", "t_s,s_per_call,power_w,sm_mhz,temp_c,reasons,fan_pct");
+    }
     e.integer("g", (long long)((g == 0 || g >= N) ? N : g));
     std::string vs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
     if (vec_mode == IMD_VEC_RESIDENT) vs += " vec=resident";
@@ -1399,9 +1498,10 @@ void usage() {
           "  [--mode emulate|direct] (method imd) [--data normal|dominant]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
-          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4)\n"
+          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, ka=auto|16|64)\n"
           "  [--clock-probe 0|1] [--l2 repeat|flush] (v1.10: per-call SM clock; L2 evicted\n"
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
+          "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"
           "  [--k-align auto|16|64] (v1.13 §4b: force the K alignment of every plan / pack)\n"
           "  methods: imd,packed,duel,bw,occupancy,sustained,pair (default imd)\n"
           "  [--out file.jsonl]\n");
@@ -1418,7 +1518,7 @@ int main(int argc, char** argv) {
                                       "max-seconds", "samples", "phi", "seed", "phase-reps",
                                       "vec", "g", "k4", "pack", "reuse", "duel-a", "duel-b", "out",
                                       "mode", "data", "clock-probe", "l2", "sustain-s",
-                                      "sustain-warm-s", "k-align"};
+                                      "sustain-warm-s", "sustain-trace-s", "k-align"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -1476,6 +1576,7 @@ int main(int argc, char** argv) {
     }
     if (a.count("sustain-s")) B.o.sustain_s = std::stod(a["sustain-s"]);
     if (a.count("sustain-warm-s")) B.o.sustain_warm_s = std::stod(a["sustain-warm-s"]);
+    if (a.count("sustain-trace-s")) B.o.sustain_trace_s = std::stod(a["sustain-trace-s"]);
     if (a.count("seed")) B.o.seed = std::stoull(a["seed"]);
     // v1.13 §4b: --k-align, else IMD_BENCH_K_ALIGN (tools/calibrate.sh --k-align), set
     // before any plan or pack is created.

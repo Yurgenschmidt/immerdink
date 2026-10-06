@@ -37,8 +37,25 @@
 //       mutation: the check sees the A operand pointer + 8 bytes (the launch is unchanged), so
 //       every checked launch must count as a violation. Returns the violations counted since
 //       the last reset, mode 2 the checked launches, -1 for an unknown mode (debug builds: on
-//       by default, and a violation also fails the call). The K alignment itself is forced by libimmerdink_host's
+//       by default, and a violation also fails the call, checked before anything is queued).
+//       The K alignment itself is forced by libimmerdink_host's
 //       imd_test_set_k_align (src/host/k_hat.cpp).
+//
+//   imd_test_set_pad_mutation(operand)
+//       v1.13 §4b (hygiene): operand 0 / 1 makes the K2 / K3 pack of the post-swap GEMM
+//       operand A / B store k-bar only below ceil(k)_16 (Pipeline neg_a64_pad_old_k3), so an
+//       A = 64 plan leaves [ceil(k)_16, k_hat) of that operand unwritten while the other
+//       operand's zeros keep the result bit-exact: the bug only initcheck on an unpoisoned
+//       workspace can see (the initcheck mutation test). -1 restores production. Applies to
+//       later imd_contract calls of plans packing that operand with K2 / K3 (imd_test_set_fused
+//       (0), or groups after the first). Returns 0, or 1 for another value.
+//
+//   imd_test_pack_mismatch(A, B, C, options, packA, packB, reason)
+//       v1.13 §4b.5 (hygiene): the status of plan creation's analysis of (A, B, C, options)
+//       with these pack handles (NULL: in-line), as imd_plan_create_packed computes it, and
+//       *reason = its IMD_PACK_MISMATCH_* (0 unless PACK_MISMATCH): the reason a
+//       handle-based mismatch has, which imd_lowering_packed (descriptors, resolved with the
+//       plan's own hook snapshot) cannot show. No GPU work, no allocation kept.
 //
 //   imd_test_plan_vec(plan, dev, count)
 //       The plan's resident scatter vectors (IMD_VEC_RESIDENT, DESIGN v1.2): *dev = their
@@ -113,6 +130,36 @@ IMD_API int imd_test_set_k5_elems(int elems) {
   if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
   imd::detail::k5_elems_override() = elems;
   return 0;
+}
+
+IMD_API int imd_test_set_pad_mutation(int operand) {
+  if (operand < -1 || operand > 1) return 1;
+  imd::detail::pad_mutation().store(operand, std::memory_order_relaxed);
+  return 0;
+}
+
+IMD_API imd_status_t imd_test_pack_mismatch(const imd_tensor_t* A, const imd_tensor_t* B,
+                                            const imd_tensor_t* C, const imd_options_t* options,
+                                            imd_pack_t packA, imd_pack_t packB,
+                                            int32_t* reason) {
+  if (reason == nullptr) return IMD_STATUS_INVALID_VALUE;
+  *reason = 0;
+  try {
+    imd::detail::PackSource ps[2];
+    const imd::detail::PackSource* src[2] = {nullptr, nullptr};
+    const imd_pack_t pk[2] = {packA, packB};
+    for (int x = 0; x < 2; ++x) {
+      if (pk[x] == nullptr) continue;
+      ps[x] = imd::detail::pack_source_of(pk[x]);
+      src[x] = &ps[x];
+    }
+    imd::detail::Analysis an;
+    const imd_status_t st = imd::detail::analyze_packed(A, B, C, options, src, &an);
+    *reason = an.packed.mismatch;
+    return st;
+  } catch (...) {
+    return IMD_STATUS_ALLOC_FAILED;
+  }
 }
 
 IMD_API int64_t imd_test_k4_align_check(int mode) {

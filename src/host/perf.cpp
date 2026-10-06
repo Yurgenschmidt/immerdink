@@ -1,7 +1,10 @@
 // The performance model (DESIGN v1.8 / v1.10 §6c): features of every phase from the plan's
 // lowering and the shared launch rules, the calibration file (formats 1 and 2),
-// imd_perf_predict, imd_perf_predict_pack, imd_perf_rank. Pure: no global or static mutable
-// state, no allocation visible to the caller, thread-safe.
+// imd_perf_predict, imd_perf_predict_pack, imd_perf_rank. Pure: no allocation visible to the
+// caller, thread-safe, and no global or static mutable state but one, test-only: the
+// K-alignment hook (k_hat.cpp imd_test_set_k_align, DESIGN v1.13 §4b.5), read once per API
+// call (one KAlignSel snapshot, passed to every analysis of the call). The shipped
+// calibration is parsed once into an immutable function-local static.
 #include "perf.hpp"
 
 #include <algorithm>
@@ -70,6 +73,12 @@ constexpr bool kFormat2Param[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, false, true, false, false},   // direct.chain
     {false, false, true, false, false, false},   // beta.chain
     {}};
+// v1.15 (§6c.1 "The eps path — retired"): the op_eps slots. Their feature is always 0; their
+// keys are optional (absent = 0) in formats 1 and 2 and written only when non-zero.
+constexpr bool optional_param(int cl, int j) {
+  return (cl == IMD_PERF_CLASS_KF && j == 4) || (cl == IMD_PERF_CLASS_KL && j == 4) ||
+         (cl == IMD_PERF_CLASS_PACK && j == 3);
+}
 // v1.10 (§6c.1 "Clock regimes"): the slots whose time scales with the SM clock (ops, chains,
 // L2 traffic, K4's round model); DRAM bytes, launches and the call term do not.
 constexpr bool kClockBound[IMD_PERF_CLASS_COUNT][kP] = {
@@ -99,7 +108,8 @@ static_assert(IMD_PERF_CLASS_K4_128x256 + IMD_K4_64x64 == IMD_PERF_CLASS_K4_64x6
 
 // Version-6 struct sizes (the v7 fields are appended; DESIGN §6c.3).
 constexpr uint32_t kCalibV1Size = offsetof(imd_perf_calib_t, kernel);
-constexpr uint32_t kCalibV7Size = sizeof(imd_perf_calib_t);
+constexpr uint32_t kCalibV7Size = offsetof(imd_perf_calib_t, energy_byte_f_pj);  // v7..v10
+constexpr uint32_t kCalibV11Size = sizeof(imd_perf_calib_t);
 constexpr uint32_t kRequestV1Size = offsetof(imd_perf_request_t, regime);
 constexpr uint32_t kPerfV1Size = offsetof(imd_perf_t, regime);
 constexpr uint32_t kRankRequestV1Size = offsetof(imd_perf_rank_request_t, regime);
@@ -116,7 +126,8 @@ static_assert(kPerfV1Size == 1648, "imd_perf_t v1 layout changed");
 static_assert(kCandidateV1Size == 128, "imd_perf_candidate_t v1 layout changed");
 static_assert(kRankRequestV1Size == 64, "imd_perf_rank_request_t v1 layout changed");
 static_assert(kRequestV1Size == 24, "imd_perf_request_t v1 layout changed");
-static_assert(sizeof(imd_perf_calib_t) == 1232 + 16 * 128 + 8 * 10 + 8 * 6 + 8 * 32 + 8, "v7 calib");
+static_assert(kCalibV7Size == 1232 + 16 * 128 + 8 * 10 + 8 * 6 + 8 * 32 + 8, "v7 calib");
+static_assert(kCalibV11Size == kCalibV7Size + 8, "v11 calib");
 static_assert(kRequestV7Size == 40, "v7 request");
 static_assert(kPerfV7Size == 1648 + 8 + 8 * 5 + 16 * 16, "v7 prediction");
 static_assert(kRankRequestV7Size == 88, "v7 rank request");
@@ -206,7 +217,7 @@ void migrate_v7_fields(imd_perf_calib_t* cal) {
   for (int k = 0; k < IMD_PERF_KERNEL_CAPACITY; ++k)
     cal->kernel[k] = k < IMD_PERF_KERNEL_COUNT ? builtin_kernel(k) : imd_perf_kernel_t{0, 0, 0, 0};
   cal->clock_eff_mhz = cal->clock_min_mhz = cal->power_cap_w = cal->power_idle_w = 0;
-  cal->energy_tc_pj = cal->energy_alu_pj = cal->energy_byte_pj = 0;
+  cal->energy_tc_pj = cal->energy_alu_pj = cal->energy_byte_pj = cal->energy_byte_f_pj = 0;
   cal->energy_gamma = 2;
   cal->warm_l2_bytes = cal->warm_l2byte_ns = 0;
   cal->tie_ratio = 1;
@@ -236,13 +247,6 @@ PerfPhase& add_phase(PerfPhases* P, int32_t phase, int32_t cls, int64_t launches
   return p;
 }
 
-// The eps-path part of feature `slot`: x[slot] += f * ops (f = the call's eps fraction).
-PerfPhase& set_eps(PerfPhase& p, int slot, double ops, double f) {
-  p.eps_x[slot] = ops;
-  p.x[slot] += f * ops;
-  return p;
-}
-
 double dbl(int64_t v) { return static_cast<double>(v); }
 
 // v1.10 (DESIGN §6c.1 "Waves and occupancy"): the busiest SM's per-thread chain of one launch of
@@ -268,8 +272,7 @@ double grid_chain(const imd_perf_calib_t& cal, int32_t kernel, int64_t outputs, 
 
 // KF's per-thread chain on the busiest SM (DESIGN §6c.1): its launch (kf_* rules, shared with
 // contract.cu) has B = tiles x parts blocks; each thread holds E values of a tile and emits the
-// residues of ceil(g / parts) moduli for each of them in sequence. The eps factor (1 + f) is
-// applied by the caller (set_eps).
+// residues of ceil(g / parts) moduli for each of them in sequence (v1.15: no eps factor).
 double kf_chain(const ExecPlan& e, const imd_perf_calib_t& cal) {
   const int32_t sms = cal.sm_count;
   const int lg_tk = kf_lg_tk(e.k_hat);
@@ -296,10 +299,10 @@ double u128_to_double(u128 v) { return static_cast<double>(v); }
 // KL of one operand (rows, padded rows, g moduli of group 1, KL tile): launch, DRAM bytes
 // (read the operand once, write group 1's residues, sigma and the flag), residue ops, the
 // L2 re-read of rows longer than two tiles (passes 2 and 3 re-read the middle chunks), the
-// residue ops in the eps > 0 regime, and (v1.10) the chain of its launch (kl_launch: rows per
+// op_eps slot 0 (v1.15: retired), and (v1.10) the chain of its launch (kl_launch: rows per
 // batch rows_b, radix; lg_rows >= 0 for imd_pack's tile).
 void add_kl(PerfPhases* P, const imd_perf_calib_t& cal, int32_t phase, double rows, double pad,
-            double k, double k_hat, double g, bool along_rows, int64_t k_hat_i, double f,
+            double k, double k_hat, double g, bool along_rows, int64_t k_hat_i,
             int32_t lg_rows, int64_t b, int64_t rows_b, int64_t radix) {
   const double tk = static_cast<double>(int64_t{1} << kl_tile_lg_k(along_rows, k_hat_i));
   const double bytes = 8 * rows * k + g * pad * k_hat + 3 * rows;
@@ -311,10 +314,8 @@ void add_kl(PerfPhases* P, const imd_perf_calib_t& cal, int32_t phase, double ro
       chain_of(L.grid, 1, L.tiles, dbl(L.nc),
                resident_of(cal, L.values == 4 ? IMD_PERF_KERNEL_KL4 : IMD_PERF_KERNEL_KL8),
                cal.sm_count);
-  PerfPhase& p = add_phase(P, phase, IMD_PERF_CLASS_KL, 1, {1, bytes, g * rows * k, l2, 0, wave},
-                           bytes);
-  set_eps(p, 4, g * rows * k, f);
-  p.in_bytes = 8 * rows * k;
+  add_phase(P, phase, IMD_PERF_CLASS_KL, 1, {1, bytes, g * rows * k, l2, 0, wave}, bytes)
+      .in_bytes = 8 * rows * k;
 }
 
 }  // namespace
@@ -325,16 +326,8 @@ double perf_log2_T(int N) {
   return std::log2(t);
 }
 
-double perf_eps_fraction(int N, double k, double req) {
-  const double lt = perf_log2_T(N);
-  if (lt < 53 || k < 1) return 0;  // |a'| <= T < 2^53: eps = 0 everywhere
-  if (req >= 0) return req;
-  const double D = lt - 0.5 * std::log2(k) - 53;
-  return std::min(1.0, std::max(0.0, (D + 2.5) / 1.5));
-}
-
 void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, int32_t k4,
-                          const imd_perf_calib_t& cal, double eps, PerfPhases* out) {
+                          const imd_perf_calib_t& cal, PerfPhases* out) {
   PerfPhases& P = *out;
   P = PerfPhases{};
   if (e.path == Path::kNoop) return;
@@ -377,9 +370,6 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     const double N = e.N, g = e.g;  // g in [1, N]
     const double rows[2] = {b * m, b * n}, pad[2] = {b * m, b * nh};
     const bool inl[2] = {!(e.packed & 1), !(e.packed & 2)};
-    const double f = perf_eps_fraction(e.N, k, eps);
-    P.eps_fraction = f;
-    P.eps_possible = perf_log2_T(e.N) >= 53;
     for (int x = 0; x < 2; ++x)
       if (inl[x]) P.inputs += 8 * rows[x] * k;
     P.inputs += c_in;
@@ -396,16 +386,14 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         in += 8 * rows[x] * k;
       }
       const double chain = kf_chain(e, cal);
-      set_eps(set_eps(add_phase(&P, IMD_PERF_PHASE_KF, IMD_PERF_CLASS_KF, 1,
-                                {1, bytes, ops, r, 0, chain}, bytes),
-                      4, ops, f),
-              5, chain, f)
+      // v1.15: slot 4 (op_eps) is 0 and the chain has no (1 + f) factor (§6c.1)
+      add_phase(&P, IMD_PERF_PHASE_KF, IMD_PERF_CLASS_KF, 1, {1, bytes, ops, r, 0, chain}, bytes)
           .in_bytes = in;
     } else {  // KL per in-line operand (v1.6: every in-line operand without KF)
       for (int x = 0; x < 2; ++x)
         if (inl[x])
           add_kl(&P, cal, x == 0 ? IMD_PERF_PHASE_KL_A : IMD_PERF_PHASE_KL_B, rows[x], pad[x], k,
-                 kh, g, e.pack_along_rows[x], e.k_hat, f, -1, e.b, x == 0 ? e.m : e.n,
+                 kh, g, e.pack_along_rows[x], e.k_hat, -1, e.b, x == 0 ? e.m : e.n,
                  e.pack_radix[x]);
     }
     // K2 / K3: the groups of an in-line operand that KF / KL did not pack (groups 2..G):
@@ -431,12 +419,11 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         // a few blocks per SM cannot hide DRAM latency)
         wave += chain_of(L.grid_x, L.parts, L.tiles, 1.0, resident_of(cal, IMD_PERF_KERNEL_PACK), sms);
       }
-      PerfPhase& p = add_phase(&P, x == 0 ? IMD_PERF_PHASE_PACK_A : IMD_PERF_PHASE_PACK_B,
-                               IMD_PERF_CLASS_PACK, groups * per,
-                               {static_cast<double>(groups * per), bytes, moduli * rows[x] * k, 0,
-                                chain, wave},
-                               bytes);
-      set_eps(set_eps(p, 3, moduli * rows[x] * k, f), 4, chain, f);
+      // v1.15: slot 3 (op_eps) is 0 and the chain has no (1 + f) factor (§6c.1)
+      add_phase(&P, x == 0 ? IMD_PERF_PHASE_PACK_A : IMD_PERF_PHASE_PACK_B, IMD_PERF_CLASS_PACK,
+                groups * per,
+                {static_cast<double>(groups * per), bytes, moduli * rows[x] * k, 0, chain, wave},
+                bytes);
     }
     // K4: the A3 round model of the configuration, over the groups and the K-chunks.
     const int32_t cfg = k4 >= 0 ? k4 : k4_select(e, sms);
@@ -531,8 +518,7 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
             {1, static_cast<double>(P.launches)}, 0);
 }
 
-void perf_pack_phases(const PackLowered& pl, const imd_perf_calib_t& cal, double eps,
-                      PerfPhases* out) {
+void perf_pack_phases(const PackLowered& pl, const imd_perf_calib_t& cal, PerfPhases* out) {
   PerfPhases& P = *out;
   P = PerfPhases{};
   if (pl.layout.total == 0) return;
@@ -550,10 +536,8 @@ void perf_pack_phases(const PackLowered& pl, const imd_perf_calib_t& cal, double
   const int64_t work = std::max<int64_t>(e.vec_count, static_cast<int64_t>((pl.layout.total - planes_end) / 16));
   add_phase(&P, IMD_PERF_PHASE_PACK_PREP, IMD_PERF_CLASS_K0, 1,
             {1, prep, grid_chain(cal, IMD_PERF_KERNEL_PACK_PREP, work, 1)}, prep);
-  P.eps_fraction = perf_eps_fraction(pl.N, k, eps);
-  P.eps_possible = perf_log2_T(pl.N) >= 53;
   add_kl(&P, cal, IMD_PERF_PHASE_PACK_KL, b * r, b * r, k, kh, N, e.pack_along_rows[0], pl.k_hat,
-         P.eps_fraction, pack_kl_lg_rows_for(e.pack_along_rows[0], pl.k_hat), pl.b, pl.r,
+         pack_kl_lg_rows_for(e.pack_along_rows[0], pl.k_hat), pl.b, pl.r,
          e.pack_radix[0]);
   P.launches = 2;
   P.inputs = 8 * b * r * k;
@@ -645,7 +629,8 @@ bool calib_valid(const imd_perf_calib_t& c) {
     if (q.resident < 1 || q.regs < 0 || q.smem_bytes < 0 || q.threads < 0) return false;
   }
   for (const double v : {c.clock_eff_mhz, c.clock_min_mhz, c.power_cap_w, c.power_idle_w,
-                         c.energy_tc_pj, c.energy_alu_pj, c.energy_byte_pj, c.energy_gamma,
+                         c.energy_tc_pj, c.energy_alu_pj, c.energy_byte_pj, c.energy_byte_f_pj,
+                         c.energy_gamma,
                          c.warm_l2_bytes, c.warm_l2byte_ns, c.tie_ratio})
     if (!finite_nonneg(v)) return false;
   if (c.power_cap_w > 0 && !(c.clock_eff_mhz > 0 && c.clock_min_mhz > 0 &&
@@ -681,30 +666,87 @@ constexpr ScalarKey kScalarKeys[] = {
     {"rank.tie_ratio", &imd_perf_calib_t::tie_ratio}};
 constexpr int kScalarKeyCount = sizeof kScalarKeys / sizeof kScalarKeys[0];
 const char* const kBandCallKeys[3] = {"band.call_small", "band.call_mid", "band.call_large"};
+// v1.15 (host API 11, DESIGN §6c.7): the one optional format-2 key (absent = 0).
+constexpr const char* kByteFKey = "power.byte_f_pj";
 
-imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* error_line) {
+// A v7..v10-sized caller has no energy_byte_f_pj: the folded view (DESIGN §6c.2), the
+// unscaled form with the total byte energy. A degraded, unvalidated view (never fitted, not an
+// API-10 library's prediction); only the calibration functions fold, the predictors do not.
+void fold_byte_f(imd_perf_calib_t* cal, uint32_t struct_size) {
+  if (struct_size >= kCalibV7Size && struct_size < kCalibV11Size) {
+    cal->energy_byte_pj += cal->energy_byte_f_pj;
+    cal->energy_byte_f_pj = 0;
+  }
+}
+
+// A rejected calibration (host API 10, DESIGN §6c.3): the line (0: none), the reason
+// (IMD_PERF_CALIB_ERR_*), the key and a message. reason 0 = no error.
+struct CalibErr {
+  int32_t line = 0;
+  int32_t reason = IMD_PERF_CALIB_OK;
+  std::string key;
+  std::string message;
+};
+
+// Text as it may be shown in a message: at most `cap` bytes, non-printable bytes as '?'.
+std::string printable(std::string_view k, size_t cap = 63) {
+  std::string s(k.substr(0, cap));
+  for (char& ch : s)
+    if (static_cast<unsigned char>(ch) < 0x20 || static_cast<unsigned char>(ch) > 0x7e) ch = '?';
+  return s;
+}
+
+imd_status_t calib_fail(CalibErr* e, int32_t line, int32_t reason, std::string_view key,
+                        const std::string& detail) {
+  if (e != nullptr) {
+    e->line = line;
+    e->reason = reason;
+    e->key = printable(key);
+    std::string m;
+    if (line > 0) m = "line " + std::to_string(line) + ": ";
+    if (!e->key.empty()) m += e->key + ": ";
+    e->message = m + detail;
+  }
+  return IMD_STATUS_INVALID_VALUE;
+}
+
+imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr* err) {
   imd_perf_calib_t r;
   std::memset(&r, 0, sizeof r);
   r.struct_size = sizeof r;
-  const auto fail = [&](int32_t line) {
-    if (error_line != nullptr) *error_line = line;
-    return IMD_STATUS_INVALID_VALUE;
-  };
   // Seen keys: 0 format, 1 gpu, 2 sm_count, 3..5 peaks, 6..9 strings, 10 l2_bytes, then the
   // params, then (format 2) the kernels, the scalar keys and the bands.
   constexpr int kFixed = 11;
   constexpr int kKernelSlot = kFixed + IMD_PERF_PARAM_CAPACITY;
   constexpr int kScalarSlot = kKernelSlot + IMD_PERF_KERNEL_COUNT;
   constexpr int kBandSlot = kScalarSlot + kScalarKeyCount;  // 3 call bands, then the classes
-  constexpr int kSeen = kBandSlot + 3 + IMD_PERF_CLASS_COUNT;
-  bool seen[kSeen] = {};
+  constexpr int kOptSlot = kBandSlot + 3 + IMD_PERF_CLASS_COUNT;  // power.byte_f_pj (optional)
+  constexpr int kSeen = kOptSlot + 1;
+  int32_t seen[kSeen] = {};   // the line of each key seen (0: not seen)
   int32_t first_v2_line = 0;  // the first line of a format-2-only key
+  std::string first_v2_key;
   StrField strs[5] = {{"gpu", r.gpu, sizeof r.gpu},
                       {"date", r.date, sizeof r.date},
                       {"version", r.version, sizeof r.version},
                       {"clocks", r.clocks, sizeof r.clocks},
                       {"notes", r.notes, sizeof r.notes}};
   const int str_seen[5] = {1, 6, 7, 8, 9};
+  // The canonical key of a slot (MISSING_KEY names it).
+  const auto slot_key = [&](int slot) -> std::string {
+    static const char* const kFixedKeys[kFixed] = {
+        "format", "gpu", "sm_count", "peak_dram_bytes_per_s", "peak_int8_ops_per_s",
+        "peak_fp64_flops_per_s", "date", "version", "clocks", "notes", "l2_bytes"};
+    if (slot < kFixed) return kFixedKeys[slot];
+    if (slot < kKernelSlot) {
+      const int cl = (slot - kFixed) / kP, j = (slot - kFixed) % kP;
+      return std::string(kClassNames[cl]) + "." + kParamNames[cl][j];
+    }
+    if (slot < kScalarSlot) return std::string("kernel.") + kernel_name(slot - kKernelSlot);
+    if (slot < kBandSlot) return kScalarKeys[slot - kScalarSlot].key;
+    if (slot == kOptSlot) return kByteFKey;
+    const int b = slot - kBandSlot;
+    return b < 3 ? std::string(kBandCallKeys[b]) : std::string("band.") + kClassNames[b - 3];
+  };
   int32_t line = 0;
   size_t pos = 0;
   while (pos <= text.size()) {
@@ -719,22 +761,28 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
       continue;
     }
     const size_t eq = s.find('=');
-    if (eq == std::string_view::npos) return fail(line);
+    if (eq == std::string_view::npos)
+      return calib_fail(err, line, IMD_PERF_CALIB_ERR_SYNTAX, "",
+                        "'" + printable(s, 40) + "' is not 'key = value', a '#' comment or blank");
     const std::string_view key = trim(s.substr(0, eq)), val = trim(s.substr(eq + 1));
+    const auto bad = [&](const char* want) {
+      return calib_fail(err, line, IMD_PERF_CALIB_ERR_VALUE, key,
+                        "invalid value '" + printable(val, 40) + "' (want " + want + ")");
+    };
     int slot = -1;
     bool v2 = false;
     if (key == "format") {
       int64_t f = 0;
-      if (!parse_int(val, &f) || (f != 1 && f != 2)) return fail(line);
+      if (!parse_int(val, &f) || (f != 1 && f != 2)) return bad("1 or 2");
       r.format = static_cast<int32_t>(f), slot = 0;
     } else if (key == "sm_count") {
       int64_t s2 = 0;
-      if (!parse_int(val, &s2) || s2 < 1 || s2 > 1000000) return fail(line);
+      if (!parse_int(val, &s2) || s2 < 1 || s2 > 1000000) return bad("an integer in [1, 1000000]");
       r.sm_count = static_cast<int32_t>(s2), slot = 2;
     } else if (key == "peak_dram_bytes_per_s" || key == "peak_int8_ops_per_s" ||
                key == "peak_fp64_flops_per_s" || key == "l2_bytes") {
       double d = 0;
-      if (!parse_number(val, &d) || !(d > 0)) return fail(line);
+      if (!parse_number(val, &d) || !(d > 0)) return bad("a finite number > 0");
       if (key == "peak_dram_bytes_per_s") r.peak_dram_bytes_per_s = d, slot = 3;
       else if (key == "peak_int8_ops_per_s") r.peak_int8_ops_per_s = d, slot = 4;
       else if (key == "peak_fp64_flops_per_s") r.peak_fp64_flops_per_s = d, slot = 5;
@@ -744,10 +792,10 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
       for (int k = 0; k < IMD_PERF_KERNEL_COUNT && slot < 0; ++k) {
         if (nm != kernel_name(k)) continue;
         double d[4];
-        if (!parse_numbers(val, d, 4)) return fail(line);
-        for (const double q : d)
-          if (q != std::floor(q) || q < 0 || q > 1e9) return fail(line);
-        if (d[0] < 1) return fail(line);
+        bool ok = parse_numbers(val, d, 4) && d[0] >= 1;
+        for (int i = 0; ok && i < 4; ++i)
+          ok = d[i] == std::floor(d[i]) && d[i] >= 0 && d[i] <= 1e9;
+        if (!ok) return bad("4 integers 'resident regs smem threads' <= 1e9, resident >= 1");
         r.kernel[k] = {static_cast<int32_t>(d[0]), static_cast<int32_t>(d[1]),
                        static_cast<int32_t>(d[2]), static_cast<int32_t>(d[3])};
         slot = kKernelSlot + k, v2 = true;
@@ -760,22 +808,31 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
       for (int cl = 0; cl < IMD_PERF_CLASS_COUNT && idx < 0; ++cl)
         if (key.substr(5) == kClassNames[cl]) idx = 3 + cl;
       if (idx >= 0) {
-        if (!parse_numbers(val, d, 2) || !(d[0] > 0) || !(d[0] <= d[1])) return fail(line);
+        if (!parse_numbers(val, d, 2) || !(d[0] > 0) || !(d[0] <= d[1]))
+          return bad("two numbers 'lo hi', 0 < lo <= hi");
         double* dst = idx < 3 ? r.band_call[idx] : r.band_class[idx - 3];
         dst[0] = d[0], dst[1] = d[1];
         slot = kBandSlot + idx, v2 = true;
       }
+    } else if (key == kByteFKey) {
+      double d = 0;
+      if (!parse_number(val, &d) || d < 0) return bad("a finite number >= 0");
+      r.energy_byte_f_pj = d;
+      slot = kOptSlot, v2 = true;
     } else {
       for (int i = 0; i < kScalarKeyCount && slot < 0; ++i)
         if (key == kScalarKeys[i].key) {
           double d = 0;
-          if (!parse_number(val, &d) || d < 0) return fail(line);
+          if (!parse_number(val, &d) || d < 0) return bad("a finite number >= 0");
           r.*(kScalarKeys[i].field) = d;
           slot = kScalarSlot + i, v2 = true;
         }
       for (int i = 0; i < 5 && slot < 0; ++i)
         if (key == strs[i].key) {
-          if (val.size() >= strs[i].cap) return fail(line);
+          if (val.size() >= strs[i].cap)
+            return calib_fail(err, line, IMD_PERF_CALIB_ERR_TOO_LONG, key,
+                              "value is " + std::to_string(val.size()) +
+                                  " bytes, the field holds " + std::to_string(strs[i].cap - 1));
           std::memcpy(strs[i].dst, val.data(), val.size());
           strs[i].dst[val.size()] = '\0';
           slot = str_seen[i];
@@ -788,7 +845,8 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
           for (int j = 0; j < kP; ++j)
             if (kParamNames[cl][j] != nullptr && feat == kParamNames[cl][j]) {
               double d = 0;
-              if (!parse_number(val, &d) || (cl != IMD_PERF_CLASS_CALL && d < 0)) return fail(line);
+              if (!parse_number(val, &d) || (cl != IMD_PERF_CLASS_CALL && d < 0))
+                return bad(cl == IMD_PERF_CLASS_CALL ? "a finite number" : "a finite number >= 0");
               r.param[cl * kP + j] = d;
               slot = kFixed + cl * kP + j;
               v2 = kFormat2Param[cl][j];
@@ -796,29 +854,41 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
         }
       }
     }
-    if (slot < 0 || seen[slot]) return fail(line);  // unknown or repeated key
-    seen[slot] = true;
-    if (v2 && first_v2_line == 0) first_v2_line = line;
+    if (slot < 0) return calib_fail(err, line, IMD_PERF_CALIB_ERR_UNKNOWN_KEY, key, "unknown key");
+    if (seen[slot] != 0)
+      return calib_fail(err, line, IMD_PERF_CALIB_ERR_REPEATED_KEY, key,
+                        "repeated key (first on line " + std::to_string(seen[slot]) + ")");
+    seen[slot] = line;
+    if (v2 && first_v2_line == 0) first_v2_line = line, first_v2_key = std::string(key);
     if (eol == text.size()) break;
   }
-  // Required: format, gpu, sm_count, the peaks and every parameter of the format; format 2
-  // also every kernel, scalar and band key. A format-2 key in a format-1 file is unknown.
+  // Required: format, gpu, sm_count, the peaks and every parameter of the format but the
+  // optional op_eps (v1.15); format 2
+  // also every kernel, scalar and band key. A format-2 key in a format-1 file is rejected.
+  const auto missing = [&](int slot) {
+    return calib_fail(err, 0, IMD_PERF_CALIB_ERR_MISSING_KEY, slot_key(slot), "missing key");
+  };
   for (const int i : {0, 1, 2, 3, 4, 5, 10})
-    if (!seen[i]) return fail(0);
+    if (seen[i] == 0) return missing(i);
   const bool f2 = r.format == 2;
-  if (!f2 && first_v2_line != 0) return fail(first_v2_line);
+  if (!f2 && first_v2_line != 0)
+    return calib_fail(err, first_v2_line, IMD_PERF_CALIB_ERR_FORMAT2_KEY, first_v2_key,
+                      "a format-2 key in a format-1 calibration");
   for (int cl = 0; cl < IMD_PERF_CLASS_COUNT; ++cl)
     for (int j = 0; j < kP; ++j)
       if (kParamNames[cl][j] != nullptr && (f2 || !kFormat2Param[cl][j]) &&
-          !seen[kFixed + cl * kP + j])
-        return fail(0);
+          !optional_param(cl, j) && seen[kFixed + cl * kP + j] == 0)
+        return missing(kFixed + cl * kP + j);
   if (f2) {
-    for (int i = kKernelSlot; i < kSeen; ++i)
-      if (!seen[i]) return fail(0);
+    for (int i = kKernelSlot; i < kOptSlot; ++i)  // power.byte_f_pj is optional
+      if (seen[i] == 0) return missing(i);
     if (r.power_cap_w > 0 && !(r.clock_eff_mhz > 0 && r.clock_min_mhz > 0 &&
                                r.clock_min_mhz <= r.clock_eff_mhz))
-      return fail(0);
-    if (!(r.tie_ratio >= 1 && r.tie_ratio <= 1.25)) return fail(0);
+      return calib_fail(err, 0, IMD_PERF_CALIB_ERR_INCONSISTENT, "power.clock_min_mhz",
+                        "power.cap_w > 0 needs 0 < power.clock_min_mhz <= power.clock_eff_mhz");
+    if (!(r.tie_ratio >= 1 && r.tie_ratio <= 1.25))
+      return calib_fail(err, 0, IMD_PERF_CALIB_ERR_INCONSISTENT, "rank.tie_ratio",
+                        "must be in [1, 1.25]");
     for (int k = IMD_PERF_KERNEL_COUNT; k < IMD_PERF_KERNEL_CAPACITY; ++k) r.kernel[k] = {};
     for (int cl = IMD_PERF_CLASS_COUNT; cl < IMD_PERF_CLASS_CAPACITY; ++cl)
       r.band_class[cl][0] = r.band_class[cl][1] = 1;
@@ -828,9 +898,10 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
   // A caller compiled against version 6 has no room for the v7 fields: it gets a true
   // format-1 view (the format-2 parameters zeroed): a degraded model (DESIGN §6c.3).
   if (out->struct_size < kCalibV7Size) to_format1_params(&r);
+  fold_byte_f(&r, out->struct_size);  // v7..v10 caller (API 11)
   r.struct_size = out->struct_size;
   std::memcpy(out, &r, std::min<size_t>(out->struct_size, sizeof r));
-  if (error_line != nullptr) *error_line = 0;
+  if (err != nullptr) *err = CalibErr{};
   return IMD_STATUS_SUCCESS;
 }
 
@@ -873,6 +944,7 @@ std::string format_calib(const imd_perf_calib_t& c) {
   for (int cl = 0; cl < IMD_PERF_CLASS_COUNT; ++cl)
     for (int j = 0; j < kP; ++j) {
       if (kParamNames[cl][j] == nullptr || (!f2 && kFormat2Param[cl][j])) continue;
+      if (optional_param(cl, j) && c.param[cl * kP + j] == 0) continue;  // v1.15: op_eps
       s += kClassNames[cl];
       s += '.';
       s += kParamNames[cl][j];
@@ -896,6 +968,13 @@ std::string format_calib(const imd_perf_calib_t& c) {
     s += " = ";
     append_number(&s, c.*(sk.field));
     s += '\n';
+    if (sk.field == &imd_perf_calib_t::energy_byte_pj && c.energy_byte_f_pj != 0) {
+      // v1.15: written only when non-zero (the text of a calibration without it is unchanged)
+      s += kByteFKey;
+      s += " = ";
+      append_number(&s, c.energy_byte_f_pj);
+      s += '\n';
+    }
   }
   s += "# Prediction bands (§6c.1): p10 p90 of measured / predicted on the hold-out set.\n";
   const auto band = [&](const std::string& key, const double* b) {
@@ -912,20 +991,29 @@ std::string format_calib(const imd_perf_calib_t& c) {
 }
 
 // The shipped calibration, parsed once (C++11 thread-safe initialization of a function-local
-// static; immutable afterwards, so the model keeps no mutable state). A NULL calibration
-// pointer anywhere means this one, at its full (v7) size: the recommended way to use it.
-const imd_perf_calib_t* shipped_calib() {
-  static const imd_perf_calib_t kShipped = [] {
-    imd_perf_calib_t c;
-    std::memset(&c, 0, sizeof c);
-    c.struct_size = sizeof c;
-    if (parse_calib(std::string_view(kPerfCalibDefault, sizeof kPerfCalibDefault - 1), &c,
-                    nullptr) != IMD_STATUS_SUCCESS)
-      c.format = 0;  // unreachable: the shipped file is tested (perf_calib_shipped)
-    return c;
+// static; immutable afterwards, so the model keeps no mutable state), with its parse error
+// (host API 10: kept, so imd_perf_calib_default_ex can say why; CMake and host_c_api / host_perf
+// make a failure unreachable in a correct build). A NULL calibration pointer anywhere means
+// this one, at its full (v7) size: the recommended way to use it.
+struct Shipped {
+  imd_perf_calib_t cal;
+  CalibErr err;  // reason OK, or why the embedded text did not parse (cal.format = 0)
+};
+const Shipped& shipped() {
+  static const Shipped kShipped = [] {
+    Shipped s;
+    std::memset(&s.cal, 0, sizeof s.cal);
+    s.cal.struct_size = sizeof s.cal;
+    if (parse_calib(std::string_view(kPerfCalibDefault, sizeof kPerfCalibDefault - 1), &s.cal,
+                    &s.err) != IMD_STATUS_SUCCESS) {
+      s.cal.format = 0;
+      s.err.message = "shipped calibration: " + s.err.message;
+    }
+    return s;
   }();
-  return &kShipped;
+  return kShipped;
 }
+const imd_perf_calib_t* shipped_calib() { return &shipped().cal; }
 
 // The calibration a function uses: the shipped one (NULL; no copy), or the caller's,
 // validated and copied into *scratch with the v7 fields of a format-1 or version-6-sized
@@ -954,12 +1042,100 @@ imd_status_t resolve_calib(const imd_perf_calib_t* in, imd_perf_calib_t* scratch
   return IMD_STATUS_SUCCESS;
 }
 
+// ---- the calibration functions (host API 10: with the reason) -----------------------------
+
+static_assert(sizeof(imd_perf_calib_error_t) == 272, "imd_perf_calib_error_t v1 layout");
+constexpr uint32_t kCalibErrMinSize = 16;  // struct_size, line, reason, reserved
+
+imd_status_t calib_default(imd_perf_calib_t* out, CalibErr* e) {
+  if (out == nullptr || out->struct_size < kCalibV1Size)
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_ARGUMENT, "", "out is NULL or undersized");
+  // The parsed-once shipped calibration, the caller's struct_size bytes of it (a version-6
+  // caller gets its format-1 view: the v7 fields do not fit; NULL is the full one).
+  const Shipped& sh = shipped();
+  if (sh.cal.format == 0) {
+    if (e != nullptr) *e = sh.err;
+    return IMD_STATUS_INVALID_VALUE;
+  }
+  imd_perf_calib_t c = sh.cal;
+  if (out->struct_size < kCalibV7Size) to_format1_params(&c);
+  fold_byte_f(&c, out->struct_size);  // v7..v10 caller (API 11)
+  c.struct_size = out->struct_size;
+  std::memcpy(out, &c, std::min<size_t>(out->struct_size, sizeof c));
+  return IMD_STATUS_SUCCESS;
+}
+
+imd_status_t calib_parse(const char* text, size_t length, imd_perf_calib_t* out, CalibErr* e) {
+  if ((text == nullptr && length > 0) || out == nullptr || out->struct_size < kCalibV1Size)
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_ARGUMENT, "",
+                      "text is NULL with length > 0, or out is NULL or undersized");
+  return parse_calib(std::string_view(text == nullptr ? "" : text, length), out, e);
+}
+
+imd_status_t calib_load(const char* path, imd_perf_calib_t* out, CalibErr* e) {
+  if (path == nullptr || out == nullptr || out->struct_size < kCalibV1Size)
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_ARGUMENT, "",
+                      "path or out is NULL, or out is undersized");
+  std::FILE* f = std::fopen(path, "rb");
+  if (f == nullptr)
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_FILE, "",
+                      "cannot open '" + printable(path, 120) + "'");
+  std::string text;
+  char buf[4096];
+  size_t got = 0;
+  while ((got = std::fread(buf, 1, sizeof buf, f)) > 0 && text.size() < (size_t{1} << 20))
+    text.append(buf, got);
+  const bool rd_err = std::ferror(f) != 0;
+  std::fclose(f);
+  if (rd_err)
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_FILE, "",
+                      "read error on '" + printable(path, 120) + "'");
+  if (text.size() >= (size_t{1} << 20))
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_FILE, "",
+                      "'" + printable(path, 120) + "' is 1 MiB or larger");
+  return parse_calib(text, out, e);
+}
+
+// The functions without _ex: the status and error line of f's CalibErr (unchanged results).
+template <class F>
+imd_status_t with_line(int32_t* error_line, F&& f) {
+  if (error_line != nullptr) *error_line = 0;
+  return guarded([&] {
+    CalibErr e;
+    const imd_status_t st = f(&e);
+    if (error_line != nullptr) *error_line = st == IMD_STATUS_SUCCESS ? 0 : e.line;
+    return st;
+  });
+}
+
+// The _ex functions: the same status and *err filled (its struct_size bytes; < 16:
+// INVALID_VALUE, nothing written). An exception (allocation) leaves reason OK.
+template <class F>
+imd_status_t with_error(imd_perf_calib_error_t* err, F&& f) {
+  if (err != nullptr && err->struct_size < kCalibErrMinSize) return IMD_STATUS_INVALID_VALUE;
+  CalibErr e;
+  const imd_status_t st = guarded([&] { return f(&e); });
+  if (err != nullptr) {
+    imd_perf_calib_error_t r;
+    std::memset(&r, 0, sizeof r);
+    r.struct_size = err->struct_size;
+    if (st != IMD_STATUS_SUCCESS) {
+      r.line = e.line;
+      r.reason = e.reason;
+      std::snprintf(r.key, sizeof r.key, "%s", e.key.c_str());
+      std::snprintf(r.message, sizeof r.message, "%s", e.message.c_str());
+    }
+    std::memcpy(err, &r, std::min<size_t>(err->struct_size, sizeof r));
+  }
+  return st;
+}
+
 // ---- prediction ---------------------------------------------------------------------------
 
 // What the request asks beyond the options (v7 fields: DEFAULT, COLD, no clock for a v6 one).
 struct Req {
   int32_t flags = 0, k4 = -1, regime = IMD_PERF_REGIME_DEFAULT, cache = IMD_PERF_CACHE_COLD;
-  double eps = -1, clock = 0;
+  double clock = 0;  // v1.15: the request's eps_fraction is validated, then ignored
   ErrReq err;  // v8 (§6f): the accuracy request (default: NORMWISE, no target)
 };
 
@@ -973,8 +1149,9 @@ double call_seconds(const imd_perf_calib_t& cal, const PerfPhases& P, double sca
   return t;
 }
 
-// The call's average power at clock f (DESIGN §6c.1 "Clock regimes"): idle + (tensor-core and
-// ALU energy scaled by (f / f_ref)^gamma + DRAM energy) / time; 0 without a power model.
+// The call's average power at clock f (DESIGN §6c.1 "Clock regimes", v1.15 §6c.7): idle +
+// ((tensor-core, ALU and clock-scaled byte energy) (f / f_ref)^gamma + DRAM energy) / time; 0
+// without a power model. With energy_byte_f_pj = 0 the added term is +0: bit-identical to v1.10.
 double call_power(const imd_perf_calib_t& cal, const PerfPhases& P, double f, double t) {
   if (!(cal.power_cap_w > 0) || !(cal.clock_eff_mhz > 0)) return 0;
   double tc = 0, alu = 0, bytes = 0;
@@ -988,7 +1165,8 @@ double call_power(const imd_perf_calib_t& cal, const PerfPhases& P, double f, do
       alu += p.x[2];
   }
   const double dyn = std::pow(f / cal.clock_eff_mhz, cal.energy_gamma);
-  const double joules = ((cal.energy_tc_pj * tc + cal.energy_alu_pj * alu) * dyn +
+  const double joules = ((cal.energy_tc_pj * tc + cal.energy_alu_pj * alu +
+                          cal.energy_byte_f_pj * bytes) * dyn +
                          cal.energy_byte_pj * bytes) * 1e-12;
   return cal.power_idle_w + (t > 0 ? joules / t : 0);
 }
@@ -1037,12 +1215,9 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   // is the real effect: up to +16 % for calls whose footprint fits the L2).
   const double res = q.cache == IMD_PERF_CACHE_COLD ? 0.0 : res_repeat;
   const double cache_ns = -res * cal.warm_l2byte_ns;
-  double t = 0, bound = 0, eps_s = 0, lo = 0, hi = 0;
+  double t = 0, bound = 0, lo = 0, hi = 0;
   for (int i = 0; i < P.n; ++i) {
     const PerfPhase& p = P.ph[i];
-    if (P.eps_possible)
-      for (int j = 0; j < kP; ++j)
-        eps_s += cal.param[p.cls * kP + j] * p.eps_x[j] * (kClockBound[p.cls][j] ? scale : 1.0) * 1e-9;
     imd_perf_phase_t& o = r->phase[i];
     o.phase = p.phase, o.cls = p.cls, o.launches = p.launches;
     o.time_s = perf_phase_seconds(cal, p, scale);
@@ -1062,8 +1237,8 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   }
   r->time_s = t;
   r->bound_s = bound;
-  r->eps_s = eps_s;
-  r->eps_fraction = P.eps_fraction;
+  r->eps_s = 0;  // v1.15 (§6c.1): no eps path, the fields are always 0
+  r->eps_fraction = 0;
   r->tflops_eq = t > 0 ? r->flops_eq / t * 1e-12 : 0;
   const double* bc = cal.band_call[band_class_of(t)];
   lo = t * bc[0], hi = t * bc[1];
@@ -1085,14 +1260,16 @@ int32_t dispatch_of(const ExecPlan& e) {
 // The contract prediction of a lowered packing: status, and on SUCCESS *r filled.
 imd_status_t predict_contract(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
                               const imd_options_t* options, const imd_packing_t* packing,
-                              const Req& q, const imd_perf_calib_t& cal, imd_perf_t* r) {
+                              const KAlignSel& sel, const Req& q, const imd_perf_calib_t& cal,
+                              imd_perf_t* r) {
   Analysis an;
-  if (const imd_status_t st = analyze_with(A, B, C, options, packing, &an); st != IMD_STATUS_SUCCESS)
+  if (const imd_status_t st = analyze_with(A, B, C, options, sel, packing, &an);
+      st != IMD_STATUS_SUCCESS)
     return st;
   ExecPlan e;
   if (const imd_status_t st = plan_data(an, &e); st != IMD_STATUS_SUCCESS) return st;
   PerfPhases P;
-  perf_contract_phases(an, e, q.flags, emulates(e) ? q.k4 : -1, cal, q.eps, &P);
+  perf_contract_phases(an, e, q.flags, emulates(e) ? q.k4 : -1, cal, &P);
   r->dispatch = dispatch_of(e);
   r->workspace_bytes = an.layout.total;
   r->plan_device_bytes = e.device_bytes;
@@ -1107,12 +1284,12 @@ imd_status_t predict_contract(const imd_tensor_t* A, const imd_tensor_t* B, cons
   return IMD_STATUS_SUCCESS;
 }
 
-imd_status_t predict_pack(const imd_pack_desc_t& d, const Req& q, const imd_perf_calib_t& cal,
-                          imd_perf_t* r) {
+imd_status_t predict_pack(const imd_pack_desc_t& d, const KAlignSel& sel, const Req& q,
+                          const imd_perf_calib_t& cal, imd_perf_t* r) {
   PackLowered pl;
-  if (const imd_status_t st = pack_lower(d, &pl); st != IMD_STATUS_SUCCESS) return st;
+  if (const imd_status_t st = pack_lower(d, sel, &pl); st != IMD_STATUS_SUCCESS) return st;
   PerfPhases P;
-  perf_pack_phases(pl, cal, q.eps, &P);
+  perf_pack_phases(pl, cal, &P);
   r->dispatch = IMD_DISPATCH_EMULATE;
   r->pack_bytes = pl.layout.total;
   r->pack_ws_bytes = pl.ws_bytes;
@@ -1120,7 +1297,8 @@ imd_status_t predict_pack(const imd_pack_desc_t& d, const Req& q, const imd_perf
   return IMD_STATUS_SUCCESS;
 }
 
-bool eps_valid(double f) { return f < 0 || (f >= 0 && f <= 1); }  // NaN: invalid
+// v1.15: still validated (NaN, > 1: invalid), then ignored
+bool eps_valid(double f) { return f < 0 || (f >= 0 && f <= 1); }
 
 bool v7_valid(int32_t regime, int32_t cache, double clock) {
   return regime >= IMD_PERF_REGIME_DEFAULT && regime <= IMD_PERF_REGIME_SUSTAINED &&
@@ -1135,7 +1313,7 @@ bool request_valid(const imd_perf_request_t* req, Req* q) {
   if ((req->flags & ~(IMD_PERF_BETA_NONZERO | IMD_PERF_ALPHA_ZERO)) != 0) return false;
   if (req->k4_config < -1 || req->k4_config >= IMD_K4_CONFIG_COUNT) return false;
   if (!eps_valid(req->eps_fraction)) return false;
-  q->flags = req->flags, q->k4 = req->k4_config, q->eps = req->eps_fraction;
+  q->flags = req->flags, q->k4 = req->k4_config;
   if (req->struct_size >= kRequestV7Size) {
     if (!v7_valid(req->regime, req->cache, req->clock_mhz)) return false;
     q->regime = req->regime, q->cache = req->cache, q->clock = req->clock_mhz;
@@ -1181,48 +1359,58 @@ const char* imd_perf_phase_name(int32_t phase) {
 const char* imd_perf_kernel_name(int32_t kernel) { return imd::detail::kernel_name(kernel); }
 
 imd_status_t imd_perf_calib_default(imd_perf_calib_t* out) {
-  if (out == nullptr || out->struct_size < imd::detail::kCalibV1Size) return IMD_STATUS_INVALID_VALUE;
-  return imd::detail::guarded([&] {
-    // The parsed-once shipped calibration, the caller's struct_size bytes of it (a version-6
-    // caller gets its format-1 view: the v7 fields do not fit; NULL is the full one).
-    imd_perf_calib_t c = *imd::detail::shipped_calib();
-    if (c.format == 0) return IMD_STATUS_INVALID_VALUE;
-    if (out->struct_size < imd::detail::kCalibV7Size) imd::detail::to_format1_params(&c);
-    c.struct_size = out->struct_size;
-    std::memcpy(out, &c, std::min<size_t>(out->struct_size, sizeof c));
-    return IMD_STATUS_SUCCESS;
+  return imd::detail::with_line(nullptr, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_default(out, e);
+  });
+}
+
+imd_status_t imd_perf_calib_default_ex(imd_perf_calib_t* out, imd_perf_calib_error_t* err) {
+  return imd::detail::with_error(err, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_default(out, e);
   });
 }
 
 imd_status_t imd_perf_calib_parse(const char* text, size_t length, imd_perf_calib_t* out,
                                   int32_t* error_line) {
-  if (error_line != nullptr) *error_line = 0;
-  if ((text == nullptr && length > 0) || out == nullptr ||
-      out->struct_size < imd::detail::kCalibV1Size)
-    return IMD_STATUS_INVALID_VALUE;
-  return imd::detail::guarded([&] {
-    return imd::detail::parse_calib(std::string_view(text == nullptr ? "" : text, length), out,
-                                    error_line);
+  return imd::detail::with_line(error_line, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_parse(text, length, out, e);
+  });
+}
+
+imd_status_t imd_perf_calib_parse_ex(const char* text, size_t length, imd_perf_calib_t* out,
+                                     imd_perf_calib_error_t* err) {
+  return imd::detail::with_error(err, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_parse(text, length, out, e);
   });
 }
 
 imd_status_t imd_perf_calib_load(const char* path, imd_perf_calib_t* out, int32_t* error_line) {
-  if (error_line != nullptr) *error_line = 0;
-  if (path == nullptr || out == nullptr || out->struct_size < imd::detail::kCalibV1Size)
-    return IMD_STATUS_INVALID_VALUE;
-  return imd::detail::guarded([&] {
-    std::FILE* f = std::fopen(path, "rb");
-    if (f == nullptr) return IMD_STATUS_INVALID_VALUE;
-    std::string text;
-    char buf[4096];
-    size_t got = 0;
-    while ((got = std::fread(buf, 1, sizeof buf, f)) > 0 && text.size() < (size_t{1} << 20))
-      text.append(buf, got);
-    const bool err = std::ferror(f) != 0;
-    std::fclose(f);
-    if (err || text.size() >= (size_t{1} << 20)) return IMD_STATUS_INVALID_VALUE;
-    return imd::detail::parse_calib(text, out, error_line);
+  return imd::detail::with_line(error_line, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_load(path, out, e);
   });
+}
+
+imd_status_t imd_perf_calib_load_ex(const char* path, imd_perf_calib_t* out,
+                                    imd_perf_calib_error_t* err) {
+  return imd::detail::with_error(err, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_load(path, out, e);
+  });
+}
+
+const char* imd_perf_calib_error_name(int32_t reason) {
+  static const char* const kNames[IMD_PERF_CALIB_ERR_COUNT] = {
+      "IMD_PERF_CALIB_OK",
+      "IMD_PERF_CALIB_ERR_ARGUMENT",
+      "IMD_PERF_CALIB_ERR_FILE",
+      "IMD_PERF_CALIB_ERR_SYNTAX",
+      "IMD_PERF_CALIB_ERR_UNKNOWN_KEY",
+      "IMD_PERF_CALIB_ERR_REPEATED_KEY",
+      "IMD_PERF_CALIB_ERR_VALUE",
+      "IMD_PERF_CALIB_ERR_TOO_LONG",
+      "IMD_PERF_CALIB_ERR_MISSING_KEY",
+      "IMD_PERF_CALIB_ERR_FORMAT2_KEY",
+      "IMD_PERF_CALIB_ERR_INCONSISTENT"};
+  return reason >= 0 && reason < IMD_PERF_CALIB_ERR_COUNT ? kNames[reason] : nullptr;
 }
 
 imd_status_t imd_perf_calib_format(const imd_perf_calib_t* calib, char* buf, size_t capacity,
@@ -1270,7 +1458,8 @@ imd_status_t imd_perf_predict(const imd_tensor_t* A, const imd_tensor_t* B, cons
     if (const imd_status_t st = imd::detail::resolve_calib(calib, &scratch, &cal);
         st != IMD_STATUS_SUCCESS)
       return st;
-    return imd::detail::predict_contract(A, B, C, options, packing, q, *cal, &r);
+    return imd::detail::predict_contract(A, B, C, options, packing,
+                                         imd::detail::k_align_sel(), q, *cal, &r);
   });
   return imd::detail::finish(r, out);
 }
@@ -1292,7 +1481,7 @@ imd_status_t imd_perf_predict_pack(const imd_pack_desc_t* desc,
     if (const imd_status_t st = imd::detail::resolve_calib(calib, &scratch, &cal);
         st != IMD_STATUS_SUCCESS)
       return st;
-    return imd::detail::predict_pack(*desc, q, *cal, &r);
+    return imd::detail::predict_pack(*desc, imd::detail::k_align_sel(), q, *cal, &r);
   });
   return imd::detail::finish(r, out);
 }
@@ -1314,7 +1503,7 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
       (req->flags & ~IMD_PERF_BETA_NONZERO) != 0 || !eps_valid(req->eps_fraction))
     return IMD_STATUS_INVALID_VALUE;
   Req q;
-  q.flags = req->flags, q.eps = req->eps_fraction;
+  q.flags = req->flags;
   int32_t order = IMD_PERF_ORDER_TIME;  // a version-6 request: the v6 order
   if (req->struct_size >= kRankRequestV7Size) {
     if (!v7_valid(req->regime, req->cache, req->clock_mhz) ||
@@ -1336,6 +1525,8 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
     if (const imd_status_t st = resolve_calib(calib, &scratch, &calp); st != IMD_STATUS_SUCCESS)
       return st;
     const imd_perf_calib_t& cal = *calp;
+    // DESIGN §4b.5: one hook snapshot for every candidate's plan and packs.
+    const KAlignSel sel = k_align_sel();
     const int32_t vec_mask = req->vec_modes != 0 ? req->vec_modes : IMD_PERF_VEC_GENERATE;
     const int32_t pack_mask = req->pack_modes != 0 ? req->pack_modes : IMD_PERF_PACK_NONE;
     struct Cand {
@@ -1378,24 +1569,24 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
               labels[x].assign(static_cast<size_t>(std::max(X->rank, 1)), 0);
               std::memset(&desc[x], 0, sizeof desc[x]);
               desc[x].struct_size = sizeof desc[x];
-              st = imd_pack_desc_for(A, B, C, &o, x, &desc[x], labels[x].data(),
-                                     static_cast<int32_t>(labels[x].size()));
+              st = pack_desc_for(A, B, C, &o, sel, x, &desc[x], labels[x].data(),
+                                 static_cast<int32_t>(labels[x].size()));
             }
             const imd_packing_t packing = {(packed & 1) ? &desc[0] : nullptr,
                                            (packed & 2) ? &desc[1] : nullptr};
             imd_perf_t pr;
             std::memset(&pr, 0, sizeof pr);
             if (st == IMD_STATUS_SUCCESS)
-              st = predict_contract(A, B, C, &o, packed ? &packing : nullptr, q, cal, &pr);
-            double pack_s = 0, pack_eps = 0, pack_lo = 0, pack_hi = 0;
+              st = predict_contract(A, B, C, &o, packed ? &packing : nullptr, sel, q, cal,
+                                    &pr);
+            double pack_s = 0, pack_lo = 0, pack_hi = 0;
             uint64_t pack_bytes = 0, pack_ws = 0;
             for (int x = 0; x < 2 && st == IMD_STATUS_SUCCESS; ++x) {
               if (!(packed & (1 << x))) continue;
               imd_perf_t pp;
               std::memset(&pp, 0, sizeof pp);
-              st = predict_pack(desc[x], q, cal, &pp);
+              st = predict_pack(desc[x], sel, q, cal, &pp);
               pack_s += pp.time_s;
-              pack_eps += pp.eps_s;
               pack_lo += pp.time_lo_s;
               pack_hi += pp.time_hi_s;
               pack_bytes += pp.pack_bytes;
@@ -1407,8 +1598,7 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
               c.contract_s = pr.time_s, c.pack_s = pack_s;
               c.time_s = pr.time_s + pack_s / req->reuse;
               c.tflops_eq = c.time_s > 0 ? pr.flops_eq / c.time_s * 1e-12 : 0;
-              c.eps_s = pr.eps_s + pack_eps / req->reuse;
-              c.eps_fraction = pr.eps_fraction;
+              c.eps_s = 0, c.eps_fraction = 0;  // v1.15 (§6c.1): no eps path
               c.workspace_bytes = pr.workspace_bytes;
               c.plan_device_bytes = pr.plan_device_bytes;
               c.pack_bytes = pack_bytes, c.pack_ws_bytes = pack_ws;

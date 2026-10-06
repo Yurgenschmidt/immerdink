@@ -150,6 +150,11 @@ class Library:
             self.lib.imd_test_k4_align_check.restype = C.c_int64
             self.lib.imd_test_set_k_align.argtypes = [C.c_int32]
             self.lib.imd_test_set_k_align.restype = C.c_int
+            # v1.13 hygiene: the pad mutation (initcheck test) and plan creation's mismatch reason
+            self.lib.imd_test_set_pad_mutation.argtypes = [C.c_int]
+            self.lib.imd_test_set_pad_mutation.restype = C.c_int
+            self.lib.imd_test_pack_mismatch.argtypes = [C.c_void_p] * 6 + [C.POINTER(C.c_int32)]
+            self.lib.imd_test_pack_mismatch.restype = C.c_int
         self.shim = None
 
     def load_alloc_shim(self, path):
@@ -224,6 +229,22 @@ class Library:
         query created afterwards; 0 = AUTO. Only the C library: callers that model the plan
         (params / oracle) set their K_ALIGN_POLICY too (test_contract.k_align)."""
         assert self.lib.imd_test_set_k_align(int(a)) == 0
+
+    def set_pad_mutation(self, operand=-1):
+        """imd_test_set_pad_mutation: 0 / 1 = the K2 / K3 pack of the post-swap GEMM operand A
+        / B stores only k-bar < ceil(k)_16 (one-sided unwritten padding for the initcheck
+        mutation test); -1 = production."""
+        assert self.lib.imd_test_set_pad_mutation(int(operand)) == 0
+
+    def pack_mismatch(self, A, B, Cc, N, packA, packB, g=0, rounding=RN, mode=EMULATE,
+                      vec=VEC_GENERATE):
+        """imd_test_pack_mismatch: (status, IMD_PACK_MISMATCH_* reason) of plan creation's
+        analysis of these pack handles (imd_plan_create_packed's, no plan made)."""
+        reason = C.c_int32(-1)
+        st = self.lib.imd_test_pack_mismatch(C.byref(A), C.byref(B), C.byref(Cc),
+                                             C.byref(Options(N, g, rounding, mode, vec, 0)),
+                                             packA, packB, C.byref(reason))
+        return STATUS[st], reason.value
 
     def k4_align_check(self, mode=-1):
         """imd_test_k4_align_check: 1 = enable the K4 operand-pointer = 0 mod A check and reset

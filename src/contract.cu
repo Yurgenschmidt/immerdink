@@ -19,6 +19,7 @@
 // here (tile shapes, grids, thread mappings) leaves the results bitwise unchanged.
 // M4 measurements and the remaining gaps: docs/NOTES-M4.md.
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 
@@ -27,6 +28,7 @@
 #include "device/constants.cuh"
 #include "host/analysis.hpp"  // kFusedKHatMax
 #include "kernels/numerics.cuh"
+#include "kernels/pack_emitter.cuh"
 #include "plan.hpp"
 #include "profile.hpp"
 
@@ -175,7 +177,7 @@ __global__ void __launch_bounds__(T) k1_scale(ScaleArgs a) {
 // the tile is wider in k-bar instead. Shared memory holds row dl, k-bar hl at
 // dl * pitch + hl + hl / 16 (one pad word per 16: the 16-wide conversion reads of a warp
 // hit distinct banks; pitch is odd, so the along-d reads do too).
-// The tile is generic in what it emits: `PackEmitter` converts 16 values for one modulus
+// The tile is generic in what it emits: `PackEmitterT` converts 16 values for one modulus
 // (an Ozaki-I slice mode would emit slices here and reuse the gather unchanged).
 // B rows n..n_hat-1 (zero) are written by k23_zero_rows.
 
@@ -300,6 +302,7 @@ unsigned k1_blocks(int64_t work_items, double bytes_per_block, int sms) {
 struct PackArgs {
   Operand op;
   int64_t rows_pad, b, k, k_hat;  // rows_pad = m (A) or n_hat (B)
+  int64_t k_store;                // k-bar < k_store are stored: k_hat (pad_mutation: test only)
   const int16_t* sigma;           // [lambda][rows] = [rho]
   int g0, gsize;
   bool trunc;
@@ -309,75 +312,12 @@ struct PackArgs {
   int lg_th;          // tile height th = 2^lg_th rows, tk = kTileElems / th k-bar
 };
 
-// §3.3 + §3.4 for one row's 16 consecutive k-bar: quantize once, then residues per modulus.
-// The residue of |a'| = mu 2^eps is ((mu mod p) (2^eps mod p)) mod p; mu mod p by byte
-// weights and dp4a (device/modp.hpp mod_p_bytes), the rare eps > 0 factor by the pow2_mod
-// table, then the sign and SMod. Same congruence class as §3.4 `residue`, so the same int8.
-template <int E>  // E consecutive k-bar of one row: 16 (one uint4 per modulus) or 4 (one u32)
-struct PackEmitterT {
-  static_assert(E == 16 || E == 8 || E == 4, "16, 8 or 4 values per emitter");
-  uint32_t lo[E], hi[E];  // mu = hi 2^32 + lo < 2^54
-  int eps[E];
-  uint32_t neg = 0, has_eps = 0;  // bit e: a'_e < 0 / eps_e > 0
+// §3.3 + §3.4 for one row's E consecutive k-bar: quantize once, then residues per modulus:
+// PackEmitterT<E, W> (kernels/pack_emitter.cuh, v1.14 §3.4.1: |a'| as W = pack_words(N) u32
+// words, branch-free). Every pack kernel is instantiated for W = 2 and 3; the launch picks W
+// from the plan's N.
 
-  __device__ __forceinline__ void load(const uint64_t* bits, int sigma, bool trunc) {
-#pragma unroll
-    for (int e = 0; e < E; ++e) {
-      uint64_t mu;
-      quantize(bits[e], sigma, trunc, &mu, &eps[e]);  // non-finite / zero -> mu = 0, eps = 0
-      lo[e] = static_cast<uint32_t>(mu);
-      hi[e] = static_cast<uint32_t>(mu >> 32);
-      neg |= static_cast<uint32_t>((bits[e] & kSignBit) != 0) << e;
-      has_eps |= static_cast<uint32_t>(eps[e] != 0) << e;
-    }
-  }
-  // The E int8 residues for modulus l, as E / 4 little-endian u32 words.
-  // Branch-free in the common case: mu mod p by byte weights and one umulhi64 for every
-  // modulus, p = 256 included (its weights are 1, 0, ..., so the dot product is the low byte,
-  // and with magic 2^56 = 2^64 / 256 the quotient is 0: the same value as mod_p_bytes' mask).
-  // The rare eps > 0 factor is applied only when some element of this thread has one.
-  // A5: the byte-weighted sum is reduced with the 32-bit magic (mod_p_bytes32: one
-  // multiply-high, p = 256 included), and the sign is applied after SMod: SMod(-r mod p) =
-  // -SMod(r) for odd p (symmetric range), and for p = 256 both give the byte (-r) & 255 (the
-  // one asymmetric value, r = 128, is the byte 0x80 either way). Same int8 bytes as before.
-  __device__ __forceinline__ void emit(int l, uint32_t (&w)[E / 4]) const {
-    const uint32_t p = c_tables.moduli[l], half = (p + 1) / 2;
-    const uint32_t m32 = imd::device::c_magic32.m[l];
-    const uint32_t wlo = imd::device::c_byte_weights.lo[l], whi = imd::device::c_byte_weights.hi[l];
-    uint32_t r[E];
-#pragma unroll
-    for (int e = 0; e < E; ++e) r[e] = imd::device::mod_p_bytes32(lo[e], hi[e], wlo, whi, p, m32);
-    if (has_eps != 0) {
-      const uint64_t magic = c_tables.epi_magic[l];
-#pragma unroll
-      for (int e = 0; e < E; ++e)
-        if ((has_eps >> e) & 1u)
-          r[e] = imd::device::mod_p_small(r[e] * c_tables.pow2_mod[l][eps[e]], p, magic);
-    }
-#pragma unroll
-    for (int q = 0; q < E / 4; ++q) w[q] = 0;
-#pragma unroll
-    for (int e = 0; e < E; ++e) {
-      const int32_t u = r[e] >= half ? static_cast<int32_t>(r[e]) - static_cast<int32_t>(p)
-                                     : static_cast<int32_t>(r[e]);  // SMod(r)
-      const int32_t sm = (neg >> e) & 1u ? -u : u;  // as an int8 bit pattern (low byte)
-      w[e / 4] |= (static_cast<uint32_t>(sm) & 255u) << (8 * (e % 4));
-    }
-  }
-  // Store the residues for modulus l at dst (aligned to E bytes).
-  __device__ __forceinline__ void store(int l, int8_t* dst) const {
-    uint32_t w[E / 4];
-    emit(l, w);
-    if constexpr (E == 16)
-      *reinterpret_cast<uint4*>(dst) = make_uint4(w[0], w[1], w[2], w[3]);
-    else if constexpr (E == 8)
-      *reinterpret_cast<uint2*>(dst) = make_uint2(w[0], w[1]);
-    else
-      *reinterpret_cast<uint32_t*>(dst) = w[0];
-  }
-};
-using PackEmitter = PackEmitterT<16>;
-
+template <int W>  // v1.14 §3.4.1: pack_words(N)
 __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
   __shared__ uint64_t tile[kTileSmem];
   __shared__ int64_t s_base[kTileRowsMax];  // v_bat[lambda] + v_row[r]
@@ -424,12 +364,12 @@ __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
     __syncthreads();
     // 3. convert and store 16 K-contiguous int8 per modulus
     const int dl = tid >> (lg_tk - 4), hl = (tid & ((tk >> 4) - 1)) * kVec;
-    if (s_valid[dl] && h0 + hl < a.k_hat) {  // k_hat is a multiple of 16
+    if (s_valid[dl] && h0 + hl < a.k_store) {  // k_store = k_hat, a multiple of 16
       uint64_t bits[kVec];
       const uint64_t* src = tile + dl * pitch + hl + hl / kVec;
 #pragma unroll
       for (int e = 0; e < kVec; ++e) bits[e] = src[e];
-      PackEmitter em;
+      PackEmitterT<kVec, W> em;
       em.load(bits, s_sigma[dl], a.trunc);
       int8_t* dst = a.R + s_out[dl] + h0 + hl;
       // Block row y of the grid emits the slots [y gsize / ny, (y + 1) gsize / ny): a small
@@ -856,7 +796,7 @@ __device__ __forceinline__ u128 shfl_xor_u128(u128 v, int d) {
   return (static_cast<u128>(hi) << 64) | lo;
 }
 
-template <int Cap, int E>
+template <int Cap, int E, int W>  // W: v1.14 §3.4.1 pack_words(N)
 __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant__ FusedArgs<Cap> a) {
   constexpr int kLgE = E == 16 ? 4 : 2, kTE = kThreads * E, kLgTE = 8 + kLgE;
   constexpr int kRowsMax = kTE / 16;  // th for tk = 16
@@ -961,7 +901,7 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
     }
     // 5. residues of this part's slots (K padding h in [k, k_hat) is zero in the tile)
     if (valid && hl < a.k_hat) {
-      PackEmitterT<E> em;
+      PackEmitterT<E, W> em;
       em.load(bits, sigma, a.trunc != 0);
       const int64_t plane = a.b * a.rows_pad[x] * a.k_hat;
       int64_t lam, r;
@@ -1001,9 +941,9 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   a.flag[0] = region<uint8_t>(ws, p, Region::fA), a.flag[1] = region<uint8_t>(ws, p, Region::fB);
   a.R[0] = region<int8_t>(ws, p, Region::RA), a.R[1] = region<int8_t>(ws, p, Region::RB);
   a.b = p.b, a.k = p.k, a.k_hat = p.k_hat;
-  const int lg_tk = kf_lg_tk(p.k_hat);  // k_hat <= kKfKMax: lg_tk <= 10
-  // v1.13 §4b.5: one tile row covers the whole padded row (KF writes the zeros [k, k_hat)).
-  if ((int64_t{1} << lg_tk) < p.k_hat) return IMD_STATUS_INVALID_VALUE;  // unreachable
+  // k_hat <= kKfKMax: lg_tk <= 10. v1.13 §4b.5: one tile row covers the whole padded row (KF
+  // writes the zeros [k, k_hat)); plan_data checks this at plan time.
+  const int lg_tk = kf_lg_tk(p.k_hat);
   a.lg_tk = lg_tk;
   a.gsize = std::min(p.g, p.N);
   a.trunc = p.trunc ? 1 : 0;
@@ -1029,13 +969,15 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   int64_t tiles = tiles_for(12);
   // (k5_one_elem_per_sm() == 0, test hook only: no small-problem variants anywhere.)
   const bool small = kf_small(tiles, a.gsize, p.sms) && k5_one_elem_per_sm() != 0;
+  if (small) tiles = tiles_for(10);
+  const dim3 grid(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms));
+  const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1
   if (small) {
-    tiles = tiles_for(10);
-    kf_scale_pack<Cap, 4><<<dim3(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms)),
-                            kThreads, 0, stream>>>(a);
+    if (w2) kf_scale_pack<Cap, 4, 2><<<grid, kThreads, 0, stream>>>(a);
+    else kf_scale_pack<Cap, 4, 3><<<grid, kThreads, 0, stream>>>(a);
   } else {
-    kf_scale_pack<Cap, 16><<<dim3(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms)),
-                             kThreads, 0, stream>>>(a);
+    if (w2) kf_scale_pack<Cap, 16, 2><<<grid, kThreads, 0, stream>>>(a);
+    else kf_scale_pack<Cap, 16, 3><<<grid, kThreads, 0, stream>>>(a);
   }
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
@@ -1082,7 +1024,8 @@ __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl
   else if (finite_nonzero(bits)) gmax = max(gmax, ilogb_bits(bits));
 }
 
-template <int E>  // values per thread: 8 (512 threads, 2 CTAs per SM) or 4 (1024 threads)
+template <int E, int W>  // values per thread: 8 (512 threads, 2 CTAs per SM) or 4 (1024
+                         // threads); W: v1.14 §3.4.1 pack_words(N)
 __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     kl_scale_pack(const __grid_constant__ LargeArgs a) {
   constexpr int T = kTileElems / E, kLgE = E == 16 ? 4 : E == 8 ? 3 : 2;
@@ -1213,7 +1156,7 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     // pass 3: residues of every slot of group 1 (K padding h in [k, k_hat) is zero)
     const auto emit = [&](const uint64_t (&bits)[E], int64_t c) {
       if (valid && (c << lg_tk) + hl < a.k_hat) {  // k_hat is a multiple of 16
-        PackEmitterT<E> em;
+        PackEmitterT<E, W> em;
         em.load(bits, sigma, a.trunc != 0);
         int8_t* dst = a.R + dst_off + (c << lg_tk);
         for (int s = 0; s < a.gsize; ++s) em.store(s, dst + s * plane);
@@ -1276,10 +1219,14 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
   // threads, one CTA per SM, which also keeps the rows in flight at SMs x th x 8 k_hat bytes
   // (r_bigk 32 MB, r_mm 51 MB: inside the L2 budget of K1, A3).
   const unsigned grid = static_cast<unsigned>(L.grid);
-  if (L.values == 4)
-    kl_scale_pack<4><<<grid, kTileElems / 4, 0, stream>>>(a);
-  else
-    kl_scale_pack<8><<<grid, kTileElems / 8, 0, stream>>>(a);
+  const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1 (imd_pack: the pack's N)
+  if (L.values == 4) {
+    if (w2) kl_scale_pack<4, 2><<<grid, kTileElems / 4, 0, stream>>>(a);
+    else kl_scale_pack<4, 3><<<grid, kTileElems / 4, 0, stream>>>(a);
+  } else {
+    if (w2) kl_scale_pack<8, 2><<<grid, kTileElems / 8, 0, stream>>>(a);
+    else kl_scale_pack<8, 3><<<grid, kTileElems / 8, 0, stream>>>(a);
+  }
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
 
@@ -1339,6 +1286,11 @@ int& k5_elems_override() {
   return v;
 }
 
+std::atomic<int>& pad_mutation() {
+  static std::atomic<int> v{-1};  // only the test hook imd_test_set_pad_mutation changes it
+  return v;
+}
+
 imd_status_t k0_generate(const ExecPlan& p, int64_t* vec, cudaStream_t stream) {
   if (p.vec_count == 0) return IMD_STATUS_SUCCESS;
   if (p.vec_desc.modes.size() <= static_cast<size_t>(kK0SmallModes))
@@ -1348,10 +1300,53 @@ imd_status_t k0_generate(const ExecPlan& p, int64_t* vec, cudaStream_t stream) {
   return IMD_STATUS_CUDA_ERROR;  // unreachable: at most 4 * 62 fused modes
 }
 
+namespace {
+
+// The K4 operands of an emulated call: RA / RB (the workspace's slots, or v1.7 a packed
+// operand's residue planes), the W planes, the K4 batch strides (0: the workspace's; a
+// packed operand's r k_hat, §6b.4: the B role reads blocks at the pack's stride) and the
+// offset per modulus of a residue group's first plane (a packed operand: b batch; the
+// workspace's slots: 0, every group reuses them). enqueue_contract's launches and its
+// pointer-check pre-pass (k4_check_call) both use this one computation.
+struct K4Operands {
+  int8_t* R[2] = {nullptr, nullptr};
+  uint8_t* W = nullptr;
+  int64_t batch[2] = {0, 0};
+  int64_t group[2] = {0, 0};
+};
+K4Operands k4_operands(const ExecPlan& p, void* ws, const void* const* packed) {
+  K4Operands o;
+  o.R[0] = region<int8_t>(ws, p, Region::RA);
+  o.R[1] = region<int8_t>(ws, p, Region::RB);
+  o.W = region<uint8_t>(ws, p, Region::W);
+  for (int x = 0; x < 2; ++x) {
+    if (!(p.packed & (1 << x))) continue;
+    auto* base = static_cast<unsigned char*>(const_cast<void*>(packed[x]));
+    o.R[x] = reinterpret_cast<int8_t*>(base + p.pack_off[x][kPackRes]);
+    o.batch[x] = (x == 0 ? p.m : p.n) * p.k_hat;
+    o.group[x] = p.b * o.batch[x];
+  }
+  return o;
+}
+
+}  // namespace
+
 imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, const double* B,
                               double beta, double* C, void* ws, cudaStream_t stream,
                               const void* const* packed) {
   if (p.path == Path::kNoop) return IMD_STATUS_SUCCESS;
+  // v1.13 §4b.5 (hygiene): the K4 operand-pointer check (debug builds, test hook) of the whole
+  // call, before anything is queued: a violation fails the call with nothing launched.
+  K4Operands k4o{};
+  const bool emulated = p.path == Path::kGemm && alpha != 0.0 && p.k >= 2 && p.k4 != nullptr;
+  if (emulated) {
+    k4o = k4_operands(p, ws, packed);
+    if (const imd_status_t st = k4_check_call(*p.k4, p.N, p.g, k4o.R[0], k4o.R[1], k4o.W,
+                                              k4o.group[0], k4o.group[1], k4o.batch[0],
+                                              k4o.batch[1], p.k_align);
+        st != IMD_STATUS_SUCCESS)
+      return st;
+  }
   // K0: generate the scatter vectors into ws.vec (IMD_VEC_GENERATE), or use the plan's
   // resident copy (IMD_VEC_RESIDENT: no K0, no vec region).
   IMD_PROF(stream, "begin");
@@ -1393,28 +1388,22 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
   auto* sB = region<int16_t>(ws, p, Region::sB);
   auto* fA = region<uint8_t>(ws, p, Region::fA);
   auto* fB = region<uint8_t>(ws, p, Region::fB);
-  auto* RA = region<int8_t>(ws, p, Region::RA);
-  auto* RB = region<int8_t>(ws, p, Region::RB);
-  auto* W = region<uint8_t>(ws, p, Region::W);
   // v1.7 (DESIGN §6b): a packed operand's sigma, flags and residues come from its packed
-  // buffer (only read; the workspace has no sX, fX, RX). The B role reads blocks at the
-  // pack's batch stride r k_hat (§6b.4), and a residue group is the slice of planes g0...
-  int64_t batch[2] = {0, 0};  // K4 operand batch strides (0: the workspace's)
+  // buffer (only read; the workspace has no sX, fX, RX); k4_operands (also the pre-pass's).
   for (int x = 0; x < 2; ++x) {
     if (!(p.packed & (1 << x))) continue;
     auto* base = static_cast<unsigned char*>(const_cast<void*>(packed[x]));
-    auto* s = reinterpret_cast<int16_t*>(base + p.pack_off[x][kPackSig]);
-    auto* f = reinterpret_cast<uint8_t*>(base + p.pack_off[x][kPackFlag]);
-    auto* r = reinterpret_cast<int8_t*>(base + p.pack_off[x][kPackRes]);
-    (x == 0 ? sA : sB) = s;
-    (x == 0 ? fA : fB) = f;
-    (x == 0 ? RA : RB) = r;
-    batch[x] = (x == 0 ? p.m : p.n) * p.k_hat;
+    (x == 0 ? sA : sB) = reinterpret_cast<int16_t*>(base + p.pack_off[x][kPackSig]);
+    (x == 0 ? fA : fB) = reinterpret_cast<uint8_t*>(base + p.pack_off[x][kPackFlag]);
   }
+  if (!emulated) k4o = k4_operands(p, ws, packed);  // defensive: here k >= 2 and K4 exists
+  int8_t* const RA = k4o.R[0];
+  int8_t* const RB = k4o.R[1];
+  uint8_t* const W = k4o.W;
+  const int64_t* const batch = k4o.batch;
   // The GEMM operand of group g0: the workspace's slots, or the pack's planes g0...
   const auto operand = [&](int x, int g0) -> const int8_t* {
-    const int8_t* R = x == 0 ? RA : RB;
-    return (p.packed & (1 << x)) ? R + int64_t{g0} * p.b * batch[x] : R;
+    return k4o.R[x] + int64_t{g0} * k4o.group[x];
   };
   const Operand opA{A, out.a_bat, out.a_row, out.a_k, p.m};
   const Operand opB{B, out.b_bat, out.b_col, out.b_k, p.n};
@@ -1449,7 +1438,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
     const int gsize = std::min(p.g, p.N - g0);
     if (use_kf && g0 == 0) {  // group 1 was packed by KF
       if (const imd_status_t st = k4_group(*p.k4, operand(0, g0), operand(1, g0), W, g0, gsize,
-                                           stream, batch[0], batch[1], p.k_align);
+                                           stream, batch[0], batch[1]);
           st != IMD_STATUS_SUCCESS)
         return st;
       continue;
@@ -1463,14 +1452,18 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
       pa.rows_pad = x == 0 ? p.m : p.n_hat;
       pa.sigma = x == 0 ? sA : sB;
       pa.R = x == 0 ? RA : RB;
+      // production: every k-bar < k_hat (zeros past k); the test mutation stops at ceil(k)_16
+      const int mutated = pad_mutation().load(std::memory_order_relaxed);
+      pa.k_store = mutated == x ? (p.k + 15) / 16 * 16 : p.k_hat;
       pa.radix = p.pack_radix[x];
       pa.along_rows = p.pack_along_rows[x];
       // v1.10: host/analysis.hpp pack_launch (shared with the performance model).
       const PackLaunch L = pack_launch(pa.along_rows, p.b, pa.op.rows, pa.radix, p.k_hat, gsize,
                                        p.sms);
       pa.lg_th = L.lg_th;
-      k23_pack<<<dim3(static_cast<unsigned>(L.grid_x), static_cast<unsigned>(L.parts)), kThreads,
-                 0, stream>>>(pa);
+      const dim3 grid(static_cast<unsigned>(L.grid_x), static_cast<unsigned>(L.parts));
+      if (pack_words(p.N) == 2) k23_pack<2><<<grid, kThreads, 0, stream>>>(pa);  // v1.14 §3.4.1
+      else k23_pack<3><<<grid, kThreads, 0, stream>>>(pa);
       if (pa.rows_pad > pa.op.rows)
         k23_zero_rows<<<blocks_for(gsize * p.b * (pa.rows_pad - pa.op.rows) * p.k_hat / kVec),
                         kThreads, 0, stream>>>(pa.R, pa.op.rows, pa.rows_pad, p.b, p.k_hat,
@@ -1479,7 +1472,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
     }
     if (cudaPeekAtLastError() != cudaSuccess) return IMD_STATUS_CUDA_ERROR;
     if (const imd_status_t st = k4_group(*p.k4, operand(0, g0), operand(1, g0), W, g0, gsize,
-                                         stream, batch[0], batch[1], p.k_align);
+                                         stream, batch[0], batch[1]);
         st != IMD_STATUS_SUCCESS)
       return st;
   }
@@ -1615,11 +1608,12 @@ cudaError_t k5_occupancy(int n, int variant, int32_t* out) {
 cudaError_t kernel_occupancy(int32_t kernel, int32_t* out) {
   switch (kernel) {
     case IMD_PERF_KERNEL_K0: return occupancy_of(k0_vec<kK0SmallModes>, kThreads, out);
-    case IMD_PERF_KERNEL_KF16: return occupancy_of(kf_scale_pack<kK0SmallModes, 16>, kThreads, out);
-    case IMD_PERF_KERNEL_KF4: return occupancy_of(kf_scale_pack<kK0SmallModes, 4>, kThreads, out);
-    case IMD_PERF_KERNEL_KL8: return occupancy_of(kl_scale_pack<8>, kTileElems / 8, out);
-    case IMD_PERF_KERNEL_KL4: return occupancy_of(kl_scale_pack<4>, kTileElems / 4, out);
-    case IMD_PERF_KERNEL_PACK: return occupancy_of(k23_pack, kThreads, out);
+    // v1.14 §3.4.1: the pack kernels' W = 3 instantiations (DESIGN §6c is unchanged in v1.14)
+    case IMD_PERF_KERNEL_KF16: return occupancy_of(kf_scale_pack<kK0SmallModes, 16, 3>, kThreads, out);
+    case IMD_PERF_KERNEL_KF4: return occupancy_of(kf_scale_pack<kK0SmallModes, 4, 3>, kThreads, out);
+    case IMD_PERF_KERNEL_KL8: return occupancy_of(kl_scale_pack<8, 3>, kTileElems / 8, out);
+    case IMD_PERF_KERNEL_KL4: return occupancy_of(kl_scale_pack<4, 3>, kTileElems / 4, out);
+    case IMD_PERF_KERNEL_PACK: return occupancy_of(k23_pack<3>, kThreads, out);
     case IMD_PERF_KERNEL_ZERO_ROWS: return occupancy_of(k23_zero_rows, kThreads, out);
     case IMD_PERF_KERNEL_DIRECT: return occupancy_of(k_direct, kThreads, out);
     case IMD_PERF_KERNEL_BETA: return occupancy_of(k5_beta_only, kThreads, out);

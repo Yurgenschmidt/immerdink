@@ -14,10 +14,9 @@ std::atomic<int32_t> g_k_align_hook{0};
 
 int32_t k_align_hook() { return g_k_align_hook.load(std::memory_order_relaxed); }
 
-int32_t k_align_of(int64_t k) {
-  const int32_t h = k_align_hook();
-  return h != 0 ? h : k_align_auto(k);
-}
+KAlignSel k_align_sel() { return KAlignSel{k_align_hook()}; }
+
+int32_t k_align_of(int64_t k) { return k_align_sel().of(k); }
 
 }  // namespace imd::detail
 

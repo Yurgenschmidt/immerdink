@@ -279,6 +279,65 @@ void test_reason_order() {
   }
 }
 
+// Hygiene (stage-2 code review): the hook is read ONCE per API call. KAlignSel is the
+// snapshot; analyze, pack_lower, analyze_packed and analyze_with use the one they are given,
+// never the hook, so every A of a call comes from one hook value. Shown by giving them a
+// snapshot that differs from the current hook: they follow the snapshot.
+void test_one_snapshot() {
+  CHECK((KAlignSel{0}.of(96) == 16 && KAlignSel{0}.of(97) == 64 && KAlignSel{16}.of(1000) == 16 &&
+         KAlignSel{64}.of(5) == 64));
+  for (const int32_t h : {0, 16, 64}) {
+    CHECK(imd_test_set_k_align(h) == 0 && k_align_sel().forced == h);
+  }
+  const Gemm g(200);
+  const imd_options_t o = opts();
+  for (const int32_t hook : {16, 64}) {
+    const KAlignSel other{hook == 16 ? 64 : 16};
+    CHECK(imd_test_set_k_align(hook) == 0);
+    Analysis an;
+    CHECK(analyze(&g.a, &g.b, &g.c, &o, other, &an) == IMD_STATUS_SUCCESS &&
+          an.k_align == other.forced);
+    CHECK(analyze(&g.a, &g.b, &g.c, &o, &an) == IMD_STATUS_SUCCESS && an.k_align == hook);
+    // pack_lower with the snapshot: the pack's format and k_hat follow it
+    Pack pk(g.a);  // under the hook
+    PackLowered pl;
+    CHECK(pack_lower(pk.d, other, &pl) == IMD_STATUS_SUCCESS && pl.k_align == other.forced &&
+          pl.format == pack_format_of(other.forced) && pk.pl.k_align == hook);
+    // analyze_packed with the snapshot: plan and pack agree (the pack lowered with it)
+    PackSource s[2] = {{g.a.rank, g.a.label, &pl}, {}};
+    const PackSource* src[2] = {&s[0], nullptr};
+    CHECK(analyze_packed(&g.a, &g.b, &g.c, &o, other, src, &an) == IMD_STATUS_SUCCESS &&
+          an.k_align == other.forced && an.packed.caller == 1);
+    // ... and with the hook (the overload without a snapshot) the same pack is FORMAT
+    CHECK(analyze_packed(&g.a, &g.b, &g.c, &o, src, &an) == IMD_STATUS_PACK_MISMATCH &&
+          an.packed.mismatch == IMD_PACK_MISMATCH_FORMAT);
+    // analyze_with (a host query with descriptors): plan and descriptor from one snapshot,
+    // analyze once: SUCCESS with the snapshot's A whatever the hook says
+    const imd_packing_t packing{&pk.d, nullptr};
+    CHECK(analyze_with(&g.a, &g.b, &g.c, &o, other, &packing, &an) == IMD_STATUS_SUCCESS &&
+          an.k_align == other.forced && an.packed.caller == 1 && !an.packed.key[0].empty() &&
+          an.packed.key[0][0] == pack_format_of(other.forced));
+    const imd_packing_t none{nullptr, nullptr};
+    CHECK(analyze_with(&g.a, &g.b, &g.c, &o, other, &none, &an) == IMD_STATUS_SUCCESS &&
+          an.k_align == other.forced && an.packed.caller == 0 && an.packed.key[0].empty());
+    // its statuses are analyze's, then the descriptor's own (pack_lower), then match_packs
+    imd_options_t bad = o;
+    bad.num_moduli = 1;
+    CHECK(analyze_with(&g.a, &g.b, &g.c, &bad, other, &packing, &an) ==
+          IMD_STATUS_INVALID_VALUE);
+    Pack pk8(g.a, 8);
+    const imd_packing_t moduli{&pk8.d, nullptr};
+    CHECK(analyze_with(&g.a, &g.b, &g.c, &o, other, &moduli, &an) == IMD_STATUS_PACK_MISMATCH &&
+          an.packed.mismatch == IMD_PACK_MISMATCH_MODULI);
+    // the public queries under the hook: the plan and the descriptor agree (one snapshot)
+    imd_lowering_t lw{};
+    lw.struct_size = sizeof lw;
+    CHECK(imd_lowering_packed(&g.a, &g.b, &g.c, &o, &packing, &lw) == IMD_STATUS_SUCCESS &&
+          lw.pack_mismatch == 0 && lw.k_align == hook);
+  }
+  CHECK(imd_test_set_k_align(0) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -286,6 +345,7 @@ int main() {
   test_plan_paths();
   test_pack_lower();
   test_reason_order();
+  test_one_snapshot();
   imd_test_set_k_align(0);
   if (failures) {
     std::printf("k alignment: %d of %d checks failed\n", failures, checks);

@@ -27,7 +27,7 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 9  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 11 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
@@ -42,7 +42,16 @@ extern "C" {
                                       the requests' accuracy, err_* / infeasible fields;
                                    9: per-plan K alignment (§4b v1.13 stage 2):
                                       imd_lowering_t k_align (k_hat = ceil(k)_k_align),
-                                      IMD_PACK_FORMAT_A16 / _A64, pack format 2 */
+                                      IMD_PACK_FORMAT_A16 / _A64, pack format 2;
+                                  10: explicit calibration parse errors (§6c.3):
+                                      imd_perf_calib_error_t, IMD_PERF_CALIB_ERR_*,
+                                      imd_perf_calib_parse_ex / _load_ex / _default_ex,
+                                      imd_perf_calib_error_name;
+                                  11: clock-scaled byte energy (§6c.7 v1.15):
+                                      imd_perf_calib_t energy_byte_f_pj, optional
+                                      calibration key power.byte_f_pj; the eps path
+                                      retired (§6c.1): eps_fraction ignored, eps_s /
+                                      eps_fraction out 0, op_eps keys optional */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -213,7 +222,12 @@ typedef struct {
   int32_t k_align;         /* the plan's resolved K alignment A (16 or 64): k_hat = ceil(k)_A,
                               the row stride and GEMM K extent of every residue row. AUTO:
                               64 iff k > 96. 16 for a lowering without residue rows (NOOP,
-                              SCALE, DIRECT, K-empty); 0 when lowered = 0                 */
+                              SCALE, DIRECT, K-empty); 0 when lowered = 0.
+                              NOT the pack key: a DIRECT plan with k > 96 reports 16 here
+                              but matches packs of format 2 (A64), the resolved A of its k
+                              (AUTO, or the hook), exactly like the EMULATE plan of the same
+                              tensors (§6b.4 word 1); compare a pack's format with
+                              imd_pack_layout_t.format, never with this field             */
   int32_t reserved6;       /* 0                                                           */
 } imd_lowering_t;
 enum { IMD_FUSED_LARGE_A = 1, IMD_FUSED_LARGE_B = 2 };
@@ -501,6 +515,14 @@ typedef struct {
   double band_class[IMD_PERF_CLASS_CAPACITY][2]; /* [IMD_PERF_CLASS_*] {lo, hi} per phase    */
   double tie_ratio;       /* rank: a feasible candidate within tie_ratio x the best's time is a
                              tie (1 <= tie_ratio <= 1.25; 1: exact ties only)                */
+  /* ---- v11 (DESIGN v1.15 §6c.7). A caller with a v7..v10 struct_size gets the folded view
+   *      energy_byte_pj = byte_pj + byte_f_pj from the calibration functions (default /
+   *      parse / load): a degraded, unvalidated view (never fitted; not an API-10 prediction),
+   *      as the v6 view; such callers should pass NULL. The predictors do not fold: a struct
+   *      of that size is read with energy_byte_f_pj = 0. ---- */
+  double energy_byte_f_pj; /* per DRAM byte, scaled like the ops by (f / clock_eff)^gamma
+                              (SM / L2-side energy of the traffic; key power.byte_f_pj,
+                              optional, 0 when absent)                                       */
 } imd_perf_calib_t;
 
 /* The shipped calibration (RTX 4090, sm_89). out->struct_size must be set; SUCCESS. A
@@ -517,6 +539,45 @@ IMD_API imd_status_t imd_perf_calib_parse(const char* text, size_t length, imd_p
 /* imd_perf_calib_parse of a file's contents; an unreadable file is INVALID_VALUE, line 0. */
 IMD_API imd_status_t imd_perf_calib_load(const char* path, imd_perf_calib_t* out,
                                          int32_t* error_line);
+/* Host API 10 (DESIGN §6c.3): why a calibration was rejected. The _ex functions return the
+ * status of the function without _ex and fill the caller's struct_size bytes of *err: on
+ * SUCCESS line 0, reason IMD_PERF_CALIB_OK, key and message ""; else the first error in file
+ * order (a missing key: line 0, the first missing key in canonical order). The format of the
+ * calibration text is unchanged; the functions without _ex are wrappers. */
+enum { IMD_PERF_CALIB_OK = 0,
+       IMD_PERF_CALIB_ERR_ARGUMENT = 1,     /* NULL / undersized out or err, NULL text        */
+       IMD_PERF_CALIB_ERR_FILE = 2,         /* load: cannot open or read, or >= 1 MiB         */
+       IMD_PERF_CALIB_ERR_SYNTAX = 3,       /* a line not blank, '#' comment or key = value   */
+       IMD_PERF_CALIB_ERR_UNKNOWN_KEY = 4,
+       IMD_PERF_CALIB_ERR_REPEATED_KEY = 5,
+       IMD_PERF_CALIB_ERR_VALUE = 6,        /* not a number, wrong count, out of range        */
+       IMD_PERF_CALIB_ERR_TOO_LONG = 7,     /* a string value does not fit its field (+ NUL)  */
+       IMD_PERF_CALIB_ERR_MISSING_KEY = 8,  /* a key the format requires                      */
+       IMD_PERF_CALIB_ERR_FORMAT2_KEY = 9,  /* a format-2 key in a format-1 calibration       */
+       IMD_PERF_CALIB_ERR_INCONSISTENT = 10 /* a cross-key rule: power clocks, tie_ratio      */ };
+#define IMD_PERF_CALIB_ERR_COUNT 11
+typedef struct {
+  uint32_t struct_size;  /* sizeof(imd_perf_calib_error_t) as the caller compiled it (>= 16) */
+  int32_t line;          /* 1-based line of the error; 0: not tied to a line                */
+  int32_t reason;        /* IMD_PERF_CALIB_OK or IMD_PERF_CALIB_ERR_*                       */
+  int32_t reserved;      /* 0                                                               */
+  char key[64];          /* the offending or missing key (truncated), or ""; NUL-terminated */
+  char message[192];     /* e.g. "line 9: notes: value is 133 bytes, the field holds 127"   */
+} imd_perf_calib_error_t;
+/* imd_perf_calib_parse with the reason; err may be NULL. */
+IMD_API imd_status_t imd_perf_calib_parse_ex(const char* text, size_t length,
+                                             imd_perf_calib_t* out, imd_perf_calib_error_t* err);
+/* imd_perf_calib_load with the reason; err may be NULL. */
+IMD_API imd_status_t imd_perf_calib_load_ex(const char* path, imd_perf_calib_t* out,
+                                            imd_perf_calib_error_t* err);
+/* imd_perf_calib_default with the reason: INVALID_VALUE with the shipped file's own parse
+ * error (message prefixed "shipped calibration: ") if the embedded text did not parse, which
+ * is also why every function given a NULL calibration then returns INVALID_VALUE. */
+IMD_API imd_status_t imd_perf_calib_default_ex(imd_perf_calib_t* out,
+                                               imd_perf_calib_error_t* err);
+/* Static name of a reason ("IMD_PERF_CALIB_OK", "IMD_PERF_CALIB_ERR_TOO_LONG", ...); NULL out
+ * of range. */
+IMD_API const char* imd_perf_calib_error_name(int32_t reason);
 /* The canonical text of a calibration (every key; numbers in the shortest round-trip form,
  * so parse(format(c)) == c bit for bit). *length = its length without the NUL, always;
  * INSUFFICIENT_WORKSPACE if capacity <= *length (nothing useful written). */
@@ -529,29 +590,21 @@ IMD_API const char* imd_perf_class_name(int32_t cls);
 IMD_API const char* imd_perf_param_name(int32_t cls, int32_t j);
 IMD_API const char* imd_perf_phase_name(int32_t phase);
 
-/* The eps path (§6c.1, a property of the DATA, not of the plan). The packs (KF, KL, K2/K3,
- * imd_pack) quantize an element to mu 2^eps; when |a'| >= 2^53 (eps > 0) a residue costs one
- * more modular multiply, and a warp pays it for its whole tile (32 lanes x up to 16 elements)
- * if any element of the tile has eps > 0. eps_fraction = the fraction of the pack work that
- * takes that path. It is 0 whenever T < 2^53 (N <= 13: no |a'| reaches 2^53). The DEFAULT
- * (eps_fraction < 0) is a plan-only estimate for TYPICAL data, i.e. rows of comparable
- * entries such as the benchmark generator's (u - 1/2) exp(g / 2): with the margin
- * D = log2 T - log2(k) / 2 - 53 (T exact, not floor(log2 T)), the fraction of 512-element
- * tiles on the eps path rises from 0 at D = -2.5 to 1 at D = -1 (simulated: a tile's maximum
- * after the row's power-of-two scaling is about 1.6 bits above the row RMS margin; the
- * default is that linear ramp). Rows with one dominant entry have a fraction of about
- * 512 / k; the caller passes its own value then. Every prediction also reports eps_s, the
- * time of the eps terms at fraction 1, so a caller unsure of its data has the exact bracket
- * [time_s - f eps_s, time_s + (1 - f) eps_s] for the fraction f used (eps_fraction out), at a
- * fixed clock (v7: BURST or clock_mhz; under SUSTAINED the eps work also moves the clock). */
+/* The eps path (§6c.1) is RETIRED in host API 11 (DESIGN v1.15): up to v1.14 a pack residue of
+ * an element with |a'| >= 2^53 cost one more modular multiply, so the pack time depended on the
+ * data and the model took the fraction of pack work on that path as an input. The v1.14 pack
+ * emitter (§3.4.1) has no such path: every residue costs the same for every eps. Since API 11
+ * eps_fraction in the requests is validated as before (< 0, or 0..1; NaN or > 1 is
+ * INVALID_VALUE) and then IGNORED; eps_s and eps_fraction in the results are always 0; the
+ * op_eps features (x[4] of kf / kl, x[3] of pack) are always 0. The fields stay for the ABI. */
 
-/* What to predict beyond the options. NULL = flags 0, k4_config -1, eps_fraction -1. */
+/* What to predict beyond the options. NULL = flags 0, k4_config -1, eps_fraction -1 (ignored). */
 typedef struct {
   uint32_t struct_size;  /* sizeof(imd_perf_request_t)                                      */
   int32_t flags;         /* IMD_PERF_BETA_NONZERO (C is read), IMD_PERF_ALPHA_ZERO          */
   int32_t k4_config;     /* -1: the plan-time rule for the calibration's sm_count; else IMD_K4_* */
   int32_t reserved;      /* 0                                                               */
-  double eps_fraction;   /* < 0: the typical-data default; 0..1: the caller's (see above)   */
+  double eps_fraction;   /* < 0 or 0..1, validated and ignored since API 11 (see above)      */
   /* ---- v7 (a struct_size of version 6: DEFAULT, COLD, no clock) ---- */
   int32_t regime;        /* IMD_PERF_REGIME_*                                               */
   int32_t cache;         /* IMD_PERF_CACHE_*                                                */
@@ -564,7 +617,7 @@ typedef struct {
 } imd_perf_request_t;
 
 /* One phase: its features x (the model is sum_j param[cls * 6 + j] x[j]; K4: the max of the
- * terms j != 4 and the term j = 4; the op_eps features already carry the eps fraction), its
+ * terms j != 4 and the term j = 4; the op_eps features are 0 since API 11), its
  * predicted time, and its MEMORY_MODEL §4 lower bound: bound_s = max(bytes / peak DRAM,
  * ops / peak). It has no struct_size: its layout (96 bytes) and IMD_PERF_MAX_PHASES are
  * FROZEN for host API version 6; a change would be a new struct and function names. */
@@ -590,9 +643,8 @@ typedef struct {
   double bound_s;        /* sum of the phase bounds                                         */
   double flops_eq;       /* 2 b m n k (imd_pack: 0)                                         */
   double tflops_eq;      /* flops_eq / time_s / 1e12 (0 when time_s is 0)                   */
-  double eps_s;          /* time of the eps-path terms at fraction 1 (the bracket above);
-                            0 when T < 2^53 (no eps path)                                   */
-  double eps_fraction;   /* the eps fraction used (the default estimate or the request's)  */
+  double eps_s;          /* 0 since API 11 (was: the eps-path terms at fraction 1)          */
+  double eps_fraction;   /* 0 since API 11 (was: the eps fraction used)                     */
   int64_t kernel_launches;
   uint64_t workspace_bytes;   /* imd_workspace_size(_packed) (exact)                        */
   uint64_t plan_device_bytes; /* imd_plan_bytes (exact)                                     */
@@ -629,8 +681,8 @@ IMD_API imd_status_t imd_perf_predict(const imd_tensor_t* A, const imd_tensor_t*
                                       const imd_packing_t* packing,
                                       const imd_perf_request_t* request,
                                       const imd_perf_calib_t* calib, imd_perf_t* out);
-/* Predicted imd_pack of a pack descriptor (imd_pack_layout's status); of the request only
- * eps_fraction is used (NULL: the default). */
+/* Predicted imd_pack of a pack descriptor (imd_pack_layout's status); of the request the
+ * v7 fields are used (flags and k4_config are ignored; eps_fraction validated, ignored). */
 IMD_API imd_status_t imd_perf_predict_pack(const imd_pack_desc_t* desc,
                                            const imd_perf_request_t* request,
                                            const imd_perf_calib_t* calib, imd_perf_t* out);
@@ -650,7 +702,7 @@ typedef struct {
   int32_t reuse;                 /* contractions per imd_pack (amortization), >= 1           */
   int32_t flags;                 /* IMD_PERF_BETA_NONZERO                                    */
   uint64_t budget_bytes;         /* device memory for total_bytes; 0 = no budget             */
-  double eps_fraction;           /* as imd_perf_request_t: < 0 the default, else 0..1        */
+  double eps_fraction;           /* as imd_perf_request_t: validated, ignored (API 11)       */
   /* ---- v7 (a struct_size of version 6: DEFAULT regime, COLD, no clock, ORDER_TIME) ---- */
   int32_t regime, cache;         /* as imd_perf_request_t                                     */
   int32_t order;                 /* IMD_PERF_ORDER_*                                          */
@@ -673,8 +725,8 @@ typedef struct {
   double contract_s;         /* imd_perf_predict                                             */
   double pack_s;             /* sum of imd_perf_predict_pack over the packed operands        */
   double tflops_eq;          /* 2 b m n k / time_s / 1e12                                    */
-  double eps_s;              /* eps-path time at fraction 1: contract + pack / reuse         */
-  double eps_fraction;       /* the eps fraction used                                        */
+  double eps_s;              /* 0 since API 11 (eps path retired)                            */
+  double eps_fraction;       /* 0 since API 11                                               */
   uint64_t workspace_bytes;  /* imd_workspace_size(_packed)                                  */
   uint64_t plan_device_bytes;/* imd_plan_bytes                                               */
   uint64_t pack_bytes;       /* sum of imd_pack_layout pack_bytes                            */

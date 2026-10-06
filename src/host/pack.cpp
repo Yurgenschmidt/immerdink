@@ -125,6 +125,10 @@ int32_t key_mismatch(const std::vector<int64_t>& slot, const std::vector<int64_t
 }
 
 imd_status_t pack_lower(const imd_pack_desc_t& d, PackLowered* out) {
+  return pack_lower(d, k_align_sel(), out);
+}
+
+imd_status_t pack_lower(const imd_pack_desc_t& d, const KAlignSel& sel, PackLowered* out) {
   *out = PackLowered{};
   if (d.struct_size < sizeof(imd_pack_desc_t)) return IMD_STATUS_INVALID_VALUE;
   if (d.num_moduli < c::kNMin || d.num_moduli > c::kNMax ||
@@ -188,9 +192,9 @@ imd_status_t pack_lower(const imd_pack_desc_t& d, PackLowered* out) {
   o.N = d.num_moduli;
   o.rounding = d.rounding;
   o.b = size[kPackL], o.r = size[kPackR], o.k = size[kPackK];
-  // v1.13 §4b.5: the pack's A, resolved once here (the hook if set, else AUTO(k)), then
-  // passed explicitly; its format word follows.
-  o.k_align = k_align_of(o.k);
+  // v1.13 §4b.5: the pack's A, resolved once here from the call's hook snapshot (the hook
+  // if set, else AUTO(k)), then passed explicitly; its format word follows.
+  o.k_align = sel.of(o.k);
   o.format = pack_format_of(o.k_align);
   if (!k_hat_of(o.k, int64_t{o.k_align}, &o.k_hat)) return IMD_STATUS_INVALID_VALUE;
   const auto layout = pack_layout(o.b, o.r, o.k, o.N, o.k_align);

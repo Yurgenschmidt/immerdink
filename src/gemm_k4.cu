@@ -54,9 +54,10 @@ namespace {
 LaunchLimits g_limits = production_launch_limits();
 
 // v1.13 §4b.5: the check that every operand pointer call_of forms is = 0 mod the plan's A (a
-// check against index-arithmetic drift that TLA+ cannot see). On by default in debug builds
-// (a violation fails the call), switched by the test hook imd_test_k4_align_check in any
-// build (a violation is counted). Only plans whose K-chunk is a multiple of A make the claim
+// check against index-arithmetic drift that TLA+ cannot see), as a host pre-pass over the
+// whole call before anything is queued (k4_check_call). On by default in debug builds (a
+// violation fails the call, nothing launched), switched by the test hook
+// imd_test_k4_align_check in any build (a violation is counted). Only plans whose K-chunk is a multiple of A make the claim
 // (the production K_c' = 131008; imd_test_set_limits may choose another chunk).
 #ifdef NDEBUG
 constexpr bool kAlignCheckDefault = false;
@@ -130,14 +131,11 @@ K4Call call_of(const K4Plan& k, const Launch& L, const int8_t* RA, const int8_t*
                 L.z0};
 }
 
-// The launches of one group (prof: the bench's phase marks). k_align: the plan's A (the
-// pointer check; 0 = no check).
+// The launches of one group (prof: the bench's phase marks).
 bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
                int gsize, cudaStream_t stream, bool prof, int64_t batch_a = 0,
-               int64_t batch_b = 0, int32_t k_align = 0) {
+               int64_t batch_b = 0) {
   const K4Ops& ops = k4_ops(k.config);
-  const bool check = k_align > 0 && k.grid.chunk % k_align == 0 &&
-                     g_align_check.load(std::memory_order_relaxed);
   bool ok = true;
   k.for_each_launch(gsize, [&](const Launch& L) {
     if (!ok) return;
@@ -145,19 +143,6 @@ bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, 
     const auto& map = L.k0 == 0 ? k.store : k.add;
     const auto it = map.find(key);
     const K4Call call = call_of(k, L, RA, RB, W, g0, batch_a, batch_b);
-    if (check) g_align_checked.fetch_add(1, std::memory_order_relaxed);
-    if (check &&
-        ((reinterpret_cast<uintptr_t>(call.A) +
-          static_cast<uintptr_t>(g_align_mutation.load(std::memory_order_relaxed))) %
-                 static_cast<uintptr_t>(k_align) !=
-             0 ||
-         reinterpret_cast<uintptr_t>(call.B) % static_cast<uintptr_t>(k_align) != 0)) {
-      g_align_violations.fetch_add(1, std::memory_order_relaxed);
-#ifndef NDEBUG
-      ok = false;  // debug builds: a broken plan contract fails the call
-      return;
-#endif
-    }
     ok = it != map.end() && ops.launch(it->second, L.k0 != 0, call, stream);
     if (prof) IMD_PROF(stream, L.k0 == 0 ? "K4 gemm store" : "K4 gemm add");
   });
@@ -320,11 +305,38 @@ K4Footprint k4_footprint(const K4Plan& k, int N, int g) {
 }
 
 imd_status_t k4_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
-                      int gsize, cudaStream_t stream, int64_t batch_a, int64_t batch_b,
-                      int32_t k_align) {
-  return run_group(k, RA, RB, W, g0, gsize, stream, true, batch_a, batch_b, k_align)
+                      int gsize, cudaStream_t stream, int64_t batch_a, int64_t batch_b) {
+  return run_group(k, RA, RB, W, g0, gsize, stream, true, batch_a, batch_b)
              ? IMD_STATUS_SUCCESS
              : IMD_STATUS_CUDA_ERROR;
+}
+
+imd_status_t k4_check_call(const K4Plan& k, int N, int g, const int8_t* RA, const int8_t* RB,
+                           uint8_t* W, int64_t group_a, int64_t group_b, int64_t batch_a,
+                           int64_t batch_b, int32_t k_align) {
+  if (!(k_align > 0 && k.grid.chunk % k_align == 0 &&
+        g_align_check.load(std::memory_order_relaxed)))
+    return IMD_STATUS_SUCCESS;
+  const auto a = static_cast<uintptr_t>(k_align);
+  const auto mutation = static_cast<uintptr_t>(g_align_mutation.load(std::memory_order_relaxed));
+  int64_t checked = 0, bad = 0;
+  for (int g0 = 0; g0 < N; g0 += g) {
+    const int8_t* ra = RA + int64_t{g0} * group_a;
+    const int8_t* rb = RB + int64_t{g0} * group_b;
+    k.for_each_launch(std::min(g, N - g0), [&](const Launch& L) {
+      const K4Call call = call_of(k, L, ra, rb, W, g0, batch_a, batch_b);
+      ++checked;
+      if ((reinterpret_cast<uintptr_t>(call.A) + mutation) % a != 0 ||
+          reinterpret_cast<uintptr_t>(call.B) % a != 0)
+        ++bad;
+    });
+  }
+  g_align_checked.fetch_add(checked, std::memory_order_relaxed);
+  g_align_violations.fetch_add(bad, std::memory_order_relaxed);
+#ifndef NDEBUG
+  if (bad != 0) return IMD_STATUS_CUDA_ERROR;  // debug builds: a broken plan contract fails
+#endif
+  return IMD_STATUS_SUCCESS;
 }
 
 }  // namespace imd::detail

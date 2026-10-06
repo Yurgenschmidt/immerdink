@@ -47,15 +47,12 @@ c_dir2    | ik,jk->ij | i=1024,j=768,k=128         | imd | 8 | --reps 20 --phase
 c_rmm2g   | ik,jk->ij | i=2000,j=128,k=30000       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1 --g 1,2,4,7
 c_rskin2g | ik,jk->ij | i=32768,j=256,k=2048       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1 --g 1,2,4,7
 c_rkl2g   | ik,jk->ij | i=256,j=256,k=150000       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1 --g 1,2,4,7
-# --- the eps path: N = 15, 16 on both sides of the typical-data threshold, and the same plans
-#     with one dominant entry per row (eps fraction about 512 / k)
+# --- N = 14..17 on mid and large shapes (v1.15: the former eps-path cases; the six
+#     --data dominant cases are dropped: the v1.14 pack emitter has no eps path, DESIGN
+#     §6c.1 "The eps path — retired"; the hold-out keeps its three as a check)
 c_e15a    | ik,jk->ij | i=2048,j=2048,k=4096       | imd | 14,15,16,17 | --reps 10 --phase-reps 5 --max-seconds 1
 c_e15b    | ik,jk->ij | i=512,j=512,k=131000       | imd | 15,16 | --reps 10 --phase-reps 3 --max-seconds 1
 c_e15c    | ik,jk->ij | i=768,j=768,k=768          | imd | 14,15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
-c_d15a    | ik,jk->ij | i=2048,j=2048,k=4096       | imd | 15,16 | --reps 10 --phase-reps 5 --max-seconds 1 --data dominant
-c_d15b    | ik,jk->ij | i=1024,j=1024,k=32768      | imd | 15,16 | --reps 10 --phase-reps 3 --max-seconds 1 --data dominant
-c_d15c    | ik,jk->ij | i=4096,j=256,k=1024        | imd | 15,16 | --reps 50 --phase-reps 10 --max-seconds 1 --data dominant
-c_d15d    | ik,jk->ij | i=768,j=768,k=768          | imd | 15,16,20 | --reps 100 --phase-reps 10 --max-seconds 1 --data dominant
 # --- (2026-10-05, b2-kf-n15) the fused small path KF at N = 15..17 on mid-size shapes
 k_s448    | ik,jk->ij | i=448,j=448,k=448          | imd | 15,16,17 | --reps 200 --phase-reps 10 --max-seconds 1
 k_s576    | ik,jk->ij | i=576,j=576,k=576          | imd | 15,16,17 | --reps 200 --phase-reps 10 --max-seconds 1
@@ -65,8 +62,6 @@ k_r1      | ik,jk->ij | i=2048,j=512,k=640         | imd | 15,16,17 | --reps 100
 k_r2      | ik,jk->ij | i=384,j=1536,k=960         | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
 k_b       | lik,ljk->lij | l=6,i=384,j=384,k=512   | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
 k_cc      | kjbc,kiac->abij | i=8,j=8,k=10,a=64,b=64,c=80 | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
-k_d576    | ik,jk->ij | i=576,j=576,k=576          | imd | 15,16 | --reps 200 --phase-reps 10 --max-seconds 1 --data dominant
-k_dr1     | ik,jk->ij | i=2048,j=512,k=640         | imd | 15,16 | --reps 100 --phase-reps 10 --max-seconds 1 --data dominant
 # --- (v1.10, b2-fidelity) small pack grids (K3 of narrow B: r_mm-like n, groups 2..) and the
 #     K4 partial K tile: k_hat around 768-1088 and 4864-5120 with k_hat mod 64 / 128 varied
 #     (k_hat mod 32 / 64 / 128: 784: 16 / 16 / 16, 800: 0 / 32 / 32, 832: 0 / 0 / 64, 896: 0 / 0 / 0,

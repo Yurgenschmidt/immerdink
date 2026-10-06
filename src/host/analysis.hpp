@@ -40,8 +40,13 @@ struct Analysis {
 // imd_workspace_size's status: null arguments and options (INVALID_VALUE), the §5 legality
 // rows 1-5 in precedence order (index_map lower, then the mode-dependent GemmCoord part),
 // then the §4a layout (uint64 / size_t overflow is row 5). Never the RN acceptance rule.
-// v1.13 §4b.5: the one call of the K-alignment resolver for a plan or sizing query
-// (out->k_align).
+// v1.13 §4b.5: the one resolution of A for a plan or sizing query (out->k_align =
+// sel.of(k)). `sel` is the API call's one hook snapshot (k_align_sel(), taken at the call's
+// entry and passed to every analysis of the call); the overload without it takes the
+// snapshot itself (an entry point with this single analysis).
+IMD_HOST_INTERNAL imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B,
+                                       const imd_tensor_t* C, const imd_options_t* options,
+                                       const KAlignSel& sel, Analysis* out);
 IMD_HOST_INTERNAL imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B,
                                        const imd_tensor_t* C, const imd_options_t* options,
                                        Analysis* out);
@@ -64,14 +69,34 @@ IMD_HOST_INTERNAL imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t
 IMD_HOST_INTERNAL imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B,
                                               const imd_tensor_t* C,
                                               const imd_options_t* options,
+                                              const KAlignSel& sel,
                                               const PackSource* const src[2], Analysis* out);
+IMD_HOST_INTERNAL imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B,
+                                              const imd_tensor_t* C,
+                                              const imd_options_t* options,
+                                              const PackSource* const src[2], Analysis* out);
+
+// analyze_packed after its analyze: `out` holds a SUCCESS analyze of (A, B, C, options); the
+// pack checks, the adopted orders, the slot keys and the packed layout as described above.
+IMD_HOST_INTERNAL imd_status_t match_packs(const imd_tensor_t* A, const imd_tensor_t* B,
+                                           const PackSource* const src[2], Analysis* out);
 
 // The analysis of a host query with an imd_packing_t of pack DESCRIPTORS (host_api.cpp): no
 // packing (or both members NULL) is analyze; otherwise analyze, then each descriptor's own
-// status (pack_lower: imd_pack_layout's INVALID_VALUE / NOT_SUPPORTED), then analyze_packed.
+// status (pack_lower: imd_pack_layout's INVALID_VALUE / NOT_SUPPORTED), then match_packs
+// (analyze runs once). The plan and every descriptor resolve A from the same `sel`.
 IMD_HOST_INTERNAL imd_status_t analyze_with(const imd_tensor_t* A, const imd_tensor_t* B,
                                            const imd_tensor_t* C, const imd_options_t* options,
-                                           const imd_packing_t* packing, Analysis* an);
+                                           const KAlignSel& sel, const imd_packing_t* packing,
+                                           Analysis* an);
+
+// imd_pack_desc_for's body (host_api.cpp) with the caller's hook snapshot (imd_perf_rank
+// builds every candidate's descriptors under its one snapshot).
+IMD_HOST_INTERNAL imd_status_t pack_desc_for(const imd_tensor_t* A, const imd_tensor_t* B,
+                                            const imd_tensor_t* C, const imd_options_t* options,
+                                            const KAlignSel& sel, int32_t operand,
+                                            imd_pack_desc_t* out, int32_t* labels,
+                                            int32_t capacity);
 
 // kappa >= T(N) (§3.2 RN acceptance), exactly.
 IMD_HOST_INTERNAL bool kappa_at_least_T(uint64_t kappa, int N);

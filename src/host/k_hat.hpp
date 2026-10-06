@@ -33,7 +33,18 @@ inline constexpr int32_t k_align_auto(int64_t k) {
 // see the hook). The one test-only exception to §6a's "pure" (DESIGN §4b.5).
 IMD_HOST_INTERNAL int32_t k_align_hook();
 
-// The resolver: the hook if set, else AUTO(k). Call it once per API call (see above).
+// One snapshot of the hook (DESIGN §4b.5, hygiene): taken ONCE at the entry of an API call
+// (k_align_sel) and passed to every analysis of that call (analyze, pack_lower, analyze_with,
+// the perf model's per-candidate analyses), so all of the call's A come from one hook value.
+struct KAlignSel {
+  int32_t forced = 0;  // the hook's value when taken: 0 (AUTO), 16 or 64
+  constexpr int32_t of(int64_t k) const { return forced != 0 ? forced : k_align_auto(k); }
+};
+
+// Reads the hook (once): the selection of this API call.
+IMD_HOST_INTERNAL KAlignSel k_align_sel();
+
+// The resolver of an entry point with a single analysis: k_align_sel().of(k).
 IMD_HOST_INTERNAL int32_t k_align_of(int64_t k);
 
 // The pack format word of alignment a (§6b.4: 1 = A16, 2 = A64), and back (0: unknown format).
