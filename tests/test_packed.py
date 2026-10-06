@@ -342,11 +342,13 @@ def suite_packed(lib, cuda, verbose):
         run_packed_case(lib, cuda, f"packed[{t}] {which} {order}", A, B, Cd, TA, TB, TC, alpha,
                         beta, N, g, rounding, mode, which, order, rng, verbose, full=t % 4 != 3)
     # DESIGN v1.14 §3.4.1: imd_pack (KL, every byte) on eps-heavy operands (tc.gen_eps): eps up
-    # to eps_max at N = 16 (W = 2) and N = 17, 20 (W = 3, both word selects), RN and TRUNC.
+    # to eps_max at N = 16 (W = 2) and N = 17, 20 (W = 3, both word selects), RN and TRUNC;
+    # v1.16: N = 6, 8 (KL E = 8 and E = 4).
     for t, (N, rounding, m, n, k, ka, kb, which) in enumerate((
             (16, "RN", 11, 9, 40, "sub1", "mix", "A"), (16, "TRUNC", 7, 12, 1100, "mix", "sub1", "B"),
             (17, "RN", 9, 10, 129, "mix", "dominant", "AB"), (20, "TRUNC", 13, 6, 33, "sub1", "sub", "AB"),
-            (20, "RN", 5, 8, 1030, "sub", "mix", "A"), (13, "TRUNC", 8, 8, 300, "mix", "mix", "B"))):
+            (20, "RN", 5, 8, 1030, "sub", "mix", "A"), (13, "TRUNC", 8, 8, 300, "mix", "mix", "B"),
+            (8, "RN", 10, 7, 70, "sub1", "mix", "AB"), (6, "TRUNC", 6, 9, 1100, "mix", "sub1", "A"))):
         A, B, Cd = tc.matrix(rng, m, n, k, c_jfast=True)
         TA, TB = tc.gen_eps(rng, (m, k), ka, 1), tc.gen_eps(rng, (k, n), kb, 0)
         run_packed_case(lib, cuda, f"packed eps[{t}] N={N} {rounding} {ka}/{kb} {which}", A, B, Cd,

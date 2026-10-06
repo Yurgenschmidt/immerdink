@@ -13,7 +13,7 @@ measured call (< 100 us, 100 us - 1 ms, >= 1 ms) against the §6c.5 targets; TFL
 time alongside.
 
 v1.10: each record is predicted in the cache state it was measured in (REPEAT: the bench's
-repeat calls; COLD for --l2 flush) in the BURST regime (--record-clock: at its NVML clock, for a
+repeat calls; COLD for --l2 flush, whose phases are REPEAT state, v1.17) in the BURST regime (--record-clock: at its NVML clock, for a
 calibration fitted with perf_fit --clock-normalize). The prediction bands (§6c.1) are checked: the share of calls
 inside their [lo, hi] band, by 2-fold cross-validation over the cases (bands from one half,
 coverage on the other); --bands out.calib writes the calibration with the bands of the whole
@@ -47,7 +47,10 @@ def evaluate(samples, calib, lib=None):
     rows = []
     for s in samples:
         p = s.again(calib)
-        ph = [(q.name, s.measured[q.name], q.time_s, q.cls) for q in p.phases
+        # v1.17: a --l2 flush record's phases are REPEAT state (imd_bench flushes before the
+        # timed calls only); its total is COLD
+        pp = s.again(calib, "REPEAT") if "l2=flush" in s.label else p
+        ph = [(q.name, s.measured[q.name], q.time_s, q.cls) for q in pp.phases
               if q.name in s.measured]
         rows.append((s.label, s.timed_s, p.time_s, p.flops_eq, ph, s.case, p.time_lo_s,
                      p.time_hi_s))

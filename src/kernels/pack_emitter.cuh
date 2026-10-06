@@ -24,6 +24,13 @@ __host__ __device__ constexpr int pack_words(int N) {
   return N <= imd::constants::kPackW2MaxN ? 2 : 3;
 }
 
+// v1.16 §3.4.1: x << n with PTX shl semantics: n >= 64 gives 0, never undefined behaviour.
+__device__ __forceinline__ uint64_t shl_clamped(uint64_t x, uint32_t n) {
+  uint64_t r;
+  asm("shl.b64 %0, %1, %2;" : "=l"(r) : "l"(x), "r"(n));
+  return r;
+}
+
 template <int E, int W>  // E consecutive k-bar of one row: 16 (one uint4 per modulus), 8 or 4
 struct PackEmitterT {
   static_assert(E == 16 || E == 8 || E == 4, "16, 8 or 4 values per emitter");
@@ -44,12 +51,16 @@ struct PackEmitterT {
 #endif
       neg |= static_cast<uint32_t>((bits[e] & kSignBit) != 0) << e;
       if constexpr (W == 2) {
-        const uint64_t X = mu << eps;  // eps <= 62
+        // eps <= 62 in the contract (|a'| <= T). v1.16: PTX shl, whose count is clamped at 64
+        // (result 0), instead of the C++ shift, undefined for eps >= 64: a sigma bug cannot
+        // turn into undefined behaviour in builds without the assert above (wrong bytes).
+        const uint64_t X = shl_clamped(mu, static_cast<uint32_t>(eps));
         x[0][e] = static_cast<uint32_t>(X);
         x[1][e] = static_cast<uint32_t>(X >> 32);
       } else {
         // mu's words shifted by b = eps mod 32, placed by q = eps / 32 in {0, 1, 2} with
         // selects (static indices only: no local memory). Words past x[2] are zero (X < 2^78).
+        // Defined for every eps (v1.16): b <= 31, and q >= 3 selects as q = 2.
         const uint32_t m0 = static_cast<uint32_t>(mu), m1 = static_cast<uint32_t>(mu >> 32);
         const int q = eps >> 5, b = eps & 31;
         const uint32_t s0 = m0 << b;

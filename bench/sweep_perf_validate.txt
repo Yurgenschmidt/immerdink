@@ -40,6 +40,11 @@ v_n15b    | ik,jk->ij | i=640,j=640,k=640          | imd | 15,16,17 | --reps 200
 v_n15c    | kjbc,kiac->abij | i=24,j=24,k=24,a=112,b=112,c=112 | imd | 15,16,17 | --reps 10 --phase-reps 3 --max-seconds 1 --g 0,6
 v_n15d    | ik,jk->ij | i=768,j=768,k=100000       | imd | 15,16 | --reps 10 --phase-reps 3 --max-seconds 1
 v_n15e    | lik,ljk->lij | l=8,i=512,j=512,k=2048  | imd | 15,16,17 | --reps 20 --phase-reps 5 --max-seconds 1
+# --- (v1.17) N = 18-20 (W = 3 pack emitter, DESIGN §3.4.1), disjoint from the fit set
+v_n18a    | ik,jk->ij | i=2304,j=2304,k=2304       | imd | 18,20 | --reps 10 --phase-reps 3 --max-seconds 1 --g 0,7
+v_n18b    | ik,jk->ij | i=736,j=736,k=736          | imd | 18,19,20 | --reps 200 --phase-reps 10 --max-seconds 1
+v_n18c    | kjbc,kiac->abij | i=16,j=16,k=16,a=80,b=80,c=80 | imd | 18,20 | --reps 100 --phase-reps 10 --max-seconds 1
+v_n18d    | ik,jk->ij | i=352,j=352,k=352          | imd | 18,20 | --reps 300 --phase-reps 10 --max-seconds 1
 v_mmg     | ik,jk->ij | i=1500,j=96,k=40000        | imd | 8,14,16 | --reps 10 --phase-reps 3 --max-seconds 1 --g 0,2,5
 v_skg     | ik,jk->ij | i=24576,j=384,k=3072       | imd | 8,14,16 | --reps 10 --phase-reps 3 --max-seconds 1 --g 0,2,7
 v_dom     | ik,jk->ij | i=1536,j=1536,k=6144       | imd | 15,16 | --reps 10 --phase-reps 3 --max-seconds 1 --data dominant

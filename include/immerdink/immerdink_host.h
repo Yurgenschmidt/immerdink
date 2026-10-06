@@ -27,7 +27,7 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 11 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 12 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
@@ -51,7 +51,11 @@ extern "C" {
                                       imd_perf_calib_t energy_byte_f_pj, optional
                                       calibration key power.byte_f_pj; the eps path
                                       retired (§6c.1): eps_fraction ignored, eps_s /
-                                      eps_fraction out 0, op_eps keys optional */
+                                      eps_fraction out 0, op_eps keys optional;
+                                  12: performance model v1.17 (§6c): imd_perf_calib_t
+                                      pack_l2_hit_bytes (key warm.pack_l2_bytes), optional
+                                      keys kf.elem, pack.dram; param names KF 4 "elem",
+                                      PACK 3 "dram", KL 4 NULL; op_eps keys retired */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -399,12 +403,13 @@ IMD_API const char* imd_status_string(imd_status_t status);
 /* Kernel classes (one parameter set each; file key prefix in parentheses). */
 enum {
   IMD_PERF_CLASS_K0 = 0,         /* (k0) K0 vectors, imd_pack's prep: launch, byte, chain   */
-  IMD_PERF_CLASS_KF = 1,         /* (kf) fused small launch: launch, byte, op, row, op_eps,
-                                    chain                                                   */
+  IMD_PERF_CLASS_KF = 1,         /* (kf) fused small launch: launch, byte, op, row, elem
+                                    (v12: the per-element chain), chain                     */
   IMD_PERF_CLASS_KL = 2,         /* (kl) fused large launch, imd_pack: launch, byte, op,
-                                    l2byte, op_eps, wave                                    */
-  IMD_PERF_CLASS_PACK = 3,       /* (pack) K2 / K3, groups 2..: launch, byte, op, op_eps,
-                                    chain, wave (the tile loads in sequence)                 */
+                                    l2byte, -, wave                                         */
+  IMD_PERF_CLASS_PACK = 3,       /* (pack) K2 / K3, groups 2..: launch, byte, op, dram (v12:
+                                    the bytes that are not L2-hit re-reads), chain, wave (the
+                                    tile loads in sequence)                                  */
   IMD_PERF_CLASS_K4_128x256 = 4, /* (k4_128x256) K4: max(round model, byte): round, mac1,
                                     byte (slot 4), mac_ktail (slot 5, in the round model)   */
   IMD_PERF_CLASS_K4_128x128 = 5, /* (k4_128x128) round, mac1, mac2, byte, mac_ktail         */
@@ -523,6 +528,13 @@ typedef struct {
   double energy_byte_f_pj; /* per DRAM byte, scaled like the ops by (f / clock_eff)^gamma
                               (SM / L2-side energy of the traffic; key power.byte_f_pj,
                               optional, 0 when absent)                                       */
+  /* ---- v12 (DESIGN v1.17 §6c.1, §6c.3). A caller with a v7..v11 struct_size is read
+   *      (predictors, imd_perf_calib_format) with pack_l2_hit_bytes = warm_l2_bytes when
+   *      pack.dram > 0, else 0 (no effect then). Exact for the shipped calibration (both
+   *      sizes 0.8 x L2); for another file with pack.dram > 0 a degraded view (pass NULL). */
+  double pack_l2_hit_bytes; /* L_hit: a K2 / K3 re-read of an operand hits L2 when the call's
+                              group working set is at most this (key warm.pack_l2_bytes,
+                              optional, 0 when absent: no hits)                             */
 } imd_perf_calib_t;
 
 /* The shipped calibration (RTX 4090, sm_89). out->struct_size must be set; SUCCESS. A
@@ -584,8 +596,9 @@ IMD_API const char* imd_perf_calib_error_name(int32_t reason);
 IMD_API imd_status_t imd_perf_calib_format(const imd_perf_calib_t* calib, char* buf,
                                            size_t capacity, size_t* length);
 /* Static names: a class's key prefix ("k0", ..., "call"), a parameter's name ("launch",
- * "byte", "op", "row", "l2byte", "chain", "round", "mac1".. "mac3", "flop", "call"; NULL for a slot
- * the class does not use) and a phase's name; NULL out of range. */
+ * "byte", "op", "row", "l2byte", "chain", "round", "mac1".. "mac3", "flop", "call"; v12:
+ * "elem", "dram"; NULL for a slot the class does not use) and a phase's name; NULL out of
+ * range. */
 IMD_API const char* imd_perf_class_name(int32_t cls);
 IMD_API const char* imd_perf_param_name(int32_t cls, int32_t j);
 IMD_API const char* imd_perf_phase_name(int32_t phase);

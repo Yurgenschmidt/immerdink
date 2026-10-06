@@ -83,6 +83,12 @@
 //       slots (bit 0 / 1: the caller's A / B) and the pack bytes of the post-swap A and B
 //       (0 for an in-line operand). The host payload includes the copied slot keys. Returns 0,
 //       or 1 for a null argument; *count as above.
+//
+//   imd_test_kernel_occupancy_w(kernel, w, out)
+//       v1.16 §3.4.1: the measured occupancy row (CTAs per SM, registers, static shared
+//       memory bytes, threads) of kernel IMD_PERF_KERNEL_* (K4 excepted) for pack-emitter word
+//       count w = 2, 3 (pack kernels KF16, KF4, KL8, KL4, PACK only), w = 0: the row the
+//       performance model's occupancy query reports. Returns 0, or 1 for an invalid argument.
 #include <cstdint>
 #include <vector>
 
@@ -253,6 +259,14 @@ IMD_API int imd_test_plan_sizes(imd_plan_t plan, int64_t* out, int64_t cap, int6
   if (out != nullptr && *count <= cap)
     for (size_t i = 0; i < v.size(); ++i) out[i] = v[i];
   return 0;
+}
+
+// v1.16 §3.4.1: the occupancy row of one W instantiation of a pack kernel (w = 0: the reported row).
+IMD_API int imd_test_kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out) {
+  if (out == nullptr || kernel < 0 || kernel >= IMD_PERF_KERNEL_COUNT ||
+      (kernel >= IMD_PERF_KERNEL_K4 && kernel < IMD_PERF_KERNEL_K5))
+    return 1;
+  return imd::detail::kernel_occupancy_w(kernel, w, out) == cudaSuccess ? 0 : 1;
 }
 
 }  // extern "C"

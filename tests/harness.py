@@ -155,6 +155,10 @@ class Library:
             self.lib.imd_test_set_pad_mutation.restype = C.c_int
             self.lib.imd_test_pack_mismatch.argtypes = [C.c_void_p] * 6 + [C.POINTER(C.c_int32)]
             self.lib.imd_test_pack_mismatch.restype = C.c_int
+            # v1.16 §3.4.1: the pack kernels' occupancy per emitter word count W
+            self.lib.imd_test_kernel_occupancy_w.argtypes = [C.c_int32, C.c_int32,
+                                                             C.POINTER(C.c_int32)]
+            self.lib.imd_test_kernel_occupancy_w.restype = C.c_int
         self.shim = None
 
     def load_alloc_shim(self, path):
@@ -201,6 +205,13 @@ class Library:
         """v1.5 K4 configuration of plans created afterwards: -1 the rule (or k4_tune's
         choice), 0..3 that IMD_K4_* configuration."""
         assert self.lib.imd_test_set_k4_config(config) == 0
+
+    def kernel_occupancy_w(self, kernel, w):
+        """[CTAs per SM, registers, static shared bytes, threads] of IMD_PERF_KERNEL_* `kernel`
+        at pack-emitter word count w (2, 3; 0: the row the performance model reads), or
+        None if the hook rejects the arguments."""
+        out = (C.c_int32 * 4)()
+        return list(out) if self.lib.imd_test_kernel_occupancy_w(kernel, w, out) == 0 else None
 
     def plan_sizes(self, plan):
         """The int64 record of src/test_hooks.cpp imd_test_plan_sizes for a real plan."""

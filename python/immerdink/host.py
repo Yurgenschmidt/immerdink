@@ -40,7 +40,7 @@ __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "work
            "ERR_STATUS", "INFEASIBLE", "PACK_FORMAT", "PACK_FORMAT_A16", "PACK_FORMAT_A64",
            "test_set_k_align", "CalibrationError", "CALIB_ERRORS", "CALIB_STRING_FIELDS"]
 
-API_VERSION = 11  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+API_VERSION = 12  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
 # Pack formats (DESIGN v1.13 §4b, host API 9): the format of a pack is that of its k (2 iff
 # k > 96); PACK_FORMAT is the newest format the library writes.
 PACK_FORMAT_A16, PACK_FORMAT_A64 = 1, 2
@@ -76,10 +76,11 @@ ERR_METRICS = {"NORMWISE": 0, "ELEMENTWISE": 1, "ABSOLUTE": 2}
 ERR_BASES = {"BOUND": 0, "TYPICAL": 1}
 ERR_STATUS = ["UNCHECKED", "MET", "MISSED"]
 INFEASIBLE = {"STATUS": 1, "BUDGET": 2, "ACCURACY": 4}  # imd_perf_candidate_t.infeasible bits
-# The parameters new in calibration format 2 (absent from a format-1 file).
+# The parameters new in calibration format 2 (absent from a format-1 file); v12 (DESIGN v1.17
+# §6c.1): kf.elem and pack.dram, optional (absent = 0).
 FORMAT2_PARAMS = frozenset({"k0.chain", "kl.wave", "pack.chain", "pack.wave", "k5.chain",
                             "k5.dram",
-                            "direct.chain", "beta.chain"})
+                            "direct.chain", "beta.chain", "kf.elem", "pack.dram"})
 
 
 # Host API 10 (DESIGN §6c.3): why a calibration was rejected (IMD_PERF_CALIB_*, by value).
@@ -180,7 +181,9 @@ class _PerfCalib(C.Structure):
                 ("band_class", (C.c_double * 2) * _PERF_CLASS_CAPACITY),
                 ("tie_ratio", C.c_double),
                 # v11 (DESIGN v1.15 §6c.7)
-                ("energy_byte_f_pj", C.c_double)]
+                ("energy_byte_f_pj", C.c_double),
+                # v12 (DESIGN v1.17 §6c.1)
+                ("pack_l2_hit_bytes", C.c_double)]
 
 
 # The string fields of a calibration and their capacities in bytes, NUL included (the
@@ -274,7 +277,8 @@ assert C.sizeof(_Lowering) == 192  # version 6 (DESIGN v1.13 §4b; v5 = 184)
 assert _Lowering.k_align.offset == 184
 assert C.sizeof(_Options) == 24
 assert C.sizeof(_PackDesc) == 72 and C.sizeof(_PackLayout) == 136
-assert C.sizeof(_PerfCalib) == 3680 and _PerfCalib.energy_byte_f_pj.offset == 3672 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1976
+assert C.sizeof(_PerfCalib) == 3688 and _PerfCalib.energy_byte_f_pj.offset == 3672 and \
+    _PerfCalib.pack_l2_hit_bytes.offset == 3680 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1976
 assert C.sizeof(_RankRequest) == 96 and C.sizeof(_Candidate) == 192
 assert C.sizeof(_PerfRequest) == 48
 assert C.sizeof(_ErrRequest) == 64 and C.sizeof(_Err) == 72
@@ -809,7 +813,7 @@ class Calibration:
             return {}
         out = {f"kernel.{n}": tuple(r.kernel[k]) for k, n in enumerate(kernel_names(self._lib))}
         out.update(self.power)
-        out.update({"warm.l2_bytes": r.warm_l2_bytes, "warm.l2byte": r.warm_l2byte_ns})
+        out.update(self.warm)
         out.update(self.bands)
         out["rank.tie_ratio"] = r.tie_ratio
         return out
@@ -831,7 +835,8 @@ class Calibration:
 
     @property
     def warm(self):
-        return {"warm.l2_bytes": self._raw.warm_l2_bytes, "warm.l2byte": self._raw.warm_l2byte_ns}
+        return {"warm.l2_bytes": self._raw.warm_l2_bytes, "warm.l2byte": self._raw.warm_l2byte_ns,
+                "warm.pack_l2_bytes": self._raw.pack_l2_hit_bytes}  # v12 (§6c.1; 0: absent)
 
     @property
     def bands(self):
