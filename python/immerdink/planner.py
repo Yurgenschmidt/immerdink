@@ -169,8 +169,8 @@ def _enum_value(k, v):
 
 class Request:
     """A prebuilt imd_perf_request_t (DESIGN §6c.3): beta (C is read), alpha_zero (the
-    beta-only call), k4_config (None: the plan-time rule), eps_fraction (None: the
-    typical-data default), and any other field of the C struct by its name (later host API
+    beta-only call), k4_config (None: the plan-time rule), eps_fraction (validated,
+    ignored since host API 11: the eps path is retired), and any other field of the C struct by its name (later host API
     versions; v7: regime / cache by host.py's names, e.g. "SUSTAINED", "WARM", or their C
     values, clock_mhz; v8: accuracy, a host.Accuracy). Immutable; equal requests compare and
     hash equal."""

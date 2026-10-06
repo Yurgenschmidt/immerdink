@@ -73,6 +73,12 @@ constexpr bool kFormat2Param[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, false, true, false, false},   // direct.chain
     {false, false, true, false, false, false},   // beta.chain
     {}};
+// v1.15 (§6c.1 "The eps path — retired"): the op_eps slots. Their feature is always 0; their
+// keys are optional (absent = 0) in formats 1 and 2 and written only when non-zero.
+constexpr bool optional_param(int cl, int j) {
+  return (cl == IMD_PERF_CLASS_KF && j == 4) || (cl == IMD_PERF_CLASS_KL && j == 4) ||
+         (cl == IMD_PERF_CLASS_PACK && j == 3);
+}
 // v1.10 (§6c.1 "Clock regimes"): the slots whose time scales with the SM clock (ops, chains,
 // L2 traffic, K4's round model); DRAM bytes, launches and the call term do not.
 constexpr bool kClockBound[IMD_PERF_CLASS_COUNT][kP] = {
@@ -241,13 +247,6 @@ PerfPhase& add_phase(PerfPhases* P, int32_t phase, int32_t cls, int64_t launches
   return p;
 }
 
-// The eps-path part of feature `slot`: x[slot] += f * ops (f = the call's eps fraction).
-PerfPhase& set_eps(PerfPhase& p, int slot, double ops, double f) {
-  p.eps_x[slot] = ops;
-  p.x[slot] += f * ops;
-  return p;
-}
-
 double dbl(int64_t v) { return static_cast<double>(v); }
 
 // v1.10 (DESIGN §6c.1 "Waves and occupancy"): the busiest SM's per-thread chain of one launch of
@@ -273,8 +272,7 @@ double grid_chain(const imd_perf_calib_t& cal, int32_t kernel, int64_t outputs, 
 
 // KF's per-thread chain on the busiest SM (DESIGN §6c.1): its launch (kf_* rules, shared with
 // contract.cu) has B = tiles x parts blocks; each thread holds E values of a tile and emits the
-// residues of ceil(g / parts) moduli for each of them in sequence. The eps factor (1 + f) is
-// applied by the caller (set_eps).
+// residues of ceil(g / parts) moduli for each of them in sequence (v1.15: no eps factor).
 double kf_chain(const ExecPlan& e, const imd_perf_calib_t& cal) {
   const int32_t sms = cal.sm_count;
   const int lg_tk = kf_lg_tk(e.k_hat);
@@ -301,10 +299,10 @@ double u128_to_double(u128 v) { return static_cast<double>(v); }
 // KL of one operand (rows, padded rows, g moduli of group 1, KL tile): launch, DRAM bytes
 // (read the operand once, write group 1's residues, sigma and the flag), residue ops, the
 // L2 re-read of rows longer than two tiles (passes 2 and 3 re-read the middle chunks), the
-// residue ops in the eps > 0 regime, and (v1.10) the chain of its launch (kl_launch: rows per
+// op_eps slot 0 (v1.15: retired), and (v1.10) the chain of its launch (kl_launch: rows per
 // batch rows_b, radix; lg_rows >= 0 for imd_pack's tile).
 void add_kl(PerfPhases* P, const imd_perf_calib_t& cal, int32_t phase, double rows, double pad,
-            double k, double k_hat, double g, bool along_rows, int64_t k_hat_i, double f,
+            double k, double k_hat, double g, bool along_rows, int64_t k_hat_i,
             int32_t lg_rows, int64_t b, int64_t rows_b, int64_t radix) {
   const double tk = static_cast<double>(int64_t{1} << kl_tile_lg_k(along_rows, k_hat_i));
   const double bytes = 8 * rows * k + g * pad * k_hat + 3 * rows;
@@ -316,10 +314,8 @@ void add_kl(PerfPhases* P, const imd_perf_calib_t& cal, int32_t phase, double ro
       chain_of(L.grid, 1, L.tiles, dbl(L.nc),
                resident_of(cal, L.values == 4 ? IMD_PERF_KERNEL_KL4 : IMD_PERF_KERNEL_KL8),
                cal.sm_count);
-  PerfPhase& p = add_phase(P, phase, IMD_PERF_CLASS_KL, 1, {1, bytes, g * rows * k, l2, 0, wave},
-                           bytes);
-  set_eps(p, 4, g * rows * k, f);
-  p.in_bytes = 8 * rows * k;
+  add_phase(P, phase, IMD_PERF_CLASS_KL, 1, {1, bytes, g * rows * k, l2, 0, wave}, bytes)
+      .in_bytes = 8 * rows * k;
 }
 
 }  // namespace
@@ -330,16 +326,8 @@ double perf_log2_T(int N) {
   return std::log2(t);
 }
 
-double perf_eps_fraction(int N, double k, double req) {
-  const double lt = perf_log2_T(N);
-  if (lt < 53 || k < 1) return 0;  // |a'| <= T < 2^53: eps = 0 everywhere
-  if (req >= 0) return req;
-  const double D = lt - 0.5 * std::log2(k) - 53;
-  return std::min(1.0, std::max(0.0, (D + 2.5) / 1.5));
-}
-
 void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, int32_t k4,
-                          const imd_perf_calib_t& cal, double eps, PerfPhases* out) {
+                          const imd_perf_calib_t& cal, PerfPhases* out) {
   PerfPhases& P = *out;
   P = PerfPhases{};
   if (e.path == Path::kNoop) return;
@@ -382,9 +370,6 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     const double N = e.N, g = e.g;  // g in [1, N]
     const double rows[2] = {b * m, b * n}, pad[2] = {b * m, b * nh};
     const bool inl[2] = {!(e.packed & 1), !(e.packed & 2)};
-    const double f = perf_eps_fraction(e.N, k, eps);
-    P.eps_fraction = f;
-    P.eps_possible = perf_log2_T(e.N) >= 53;
     for (int x = 0; x < 2; ++x)
       if (inl[x]) P.inputs += 8 * rows[x] * k;
     P.inputs += c_in;
@@ -401,16 +386,14 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         in += 8 * rows[x] * k;
       }
       const double chain = kf_chain(e, cal);
-      set_eps(set_eps(add_phase(&P, IMD_PERF_PHASE_KF, IMD_PERF_CLASS_KF, 1,
-                                {1, bytes, ops, r, 0, chain}, bytes),
-                      4, ops, f),
-              5, chain, f)
+      // v1.15: slot 4 (op_eps) is 0 and the chain has no (1 + f) factor (§6c.1)
+      add_phase(&P, IMD_PERF_PHASE_KF, IMD_PERF_CLASS_KF, 1, {1, bytes, ops, r, 0, chain}, bytes)
           .in_bytes = in;
     } else {  // KL per in-line operand (v1.6: every in-line operand without KF)
       for (int x = 0; x < 2; ++x)
         if (inl[x])
           add_kl(&P, cal, x == 0 ? IMD_PERF_PHASE_KL_A : IMD_PERF_PHASE_KL_B, rows[x], pad[x], k,
-                 kh, g, e.pack_along_rows[x], e.k_hat, f, -1, e.b, x == 0 ? e.m : e.n,
+                 kh, g, e.pack_along_rows[x], e.k_hat, -1, e.b, x == 0 ? e.m : e.n,
                  e.pack_radix[x]);
     }
     // K2 / K3: the groups of an in-line operand that KF / KL did not pack (groups 2..G):
@@ -436,12 +419,11 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         // a few blocks per SM cannot hide DRAM latency)
         wave += chain_of(L.grid_x, L.parts, L.tiles, 1.0, resident_of(cal, IMD_PERF_KERNEL_PACK), sms);
       }
-      PerfPhase& p = add_phase(&P, x == 0 ? IMD_PERF_PHASE_PACK_A : IMD_PERF_PHASE_PACK_B,
-                               IMD_PERF_CLASS_PACK, groups * per,
-                               {static_cast<double>(groups * per), bytes, moduli * rows[x] * k, 0,
-                                chain, wave},
-                               bytes);
-      set_eps(set_eps(p, 3, moduli * rows[x] * k, f), 4, chain, f);
+      // v1.15: slot 3 (op_eps) is 0 and the chain has no (1 + f) factor (§6c.1)
+      add_phase(&P, x == 0 ? IMD_PERF_PHASE_PACK_A : IMD_PERF_PHASE_PACK_B, IMD_PERF_CLASS_PACK,
+                groups * per,
+                {static_cast<double>(groups * per), bytes, moduli * rows[x] * k, 0, chain, wave},
+                bytes);
     }
     // K4: the A3 round model of the configuration, over the groups and the K-chunks.
     const int32_t cfg = k4 >= 0 ? k4 : k4_select(e, sms);
@@ -536,8 +518,7 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
             {1, static_cast<double>(P.launches)}, 0);
 }
 
-void perf_pack_phases(const PackLowered& pl, const imd_perf_calib_t& cal, double eps,
-                      PerfPhases* out) {
+void perf_pack_phases(const PackLowered& pl, const imd_perf_calib_t& cal, PerfPhases* out) {
   PerfPhases& P = *out;
   P = PerfPhases{};
   if (pl.layout.total == 0) return;
@@ -555,10 +536,8 @@ void perf_pack_phases(const PackLowered& pl, const imd_perf_calib_t& cal, double
   const int64_t work = std::max<int64_t>(e.vec_count, static_cast<int64_t>((pl.layout.total - planes_end) / 16));
   add_phase(&P, IMD_PERF_PHASE_PACK_PREP, IMD_PERF_CLASS_K0, 1,
             {1, prep, grid_chain(cal, IMD_PERF_KERNEL_PACK_PREP, work, 1)}, prep);
-  P.eps_fraction = perf_eps_fraction(pl.N, k, eps);
-  P.eps_possible = perf_log2_T(pl.N) >= 53;
   add_kl(&P, cal, IMD_PERF_PHASE_PACK_KL, b * r, b * r, k, kh, N, e.pack_along_rows[0], pl.k_hat,
-         P.eps_fraction, pack_kl_lg_rows_for(e.pack_along_rows[0], pl.k_hat), pl.b, pl.r,
+         pack_kl_lg_rows_for(e.pack_along_rows[0], pl.k_hat), pl.b, pl.r,
          e.pack_radix[0]);
   P.launches = 2;
   P.inputs = 8 * b * r * k;
@@ -882,7 +861,8 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
     if (v2 && first_v2_line == 0) first_v2_line = line, first_v2_key = std::string(key);
     if (eol == text.size()) break;
   }
-  // Required: format, gpu, sm_count, the peaks and every parameter of the format; format 2
+  // Required: format, gpu, sm_count, the peaks and every parameter of the format but the
+  // optional op_eps (v1.15); format 2
   // also every kernel, scalar and band key. A format-2 key in a format-1 file is rejected.
   const auto missing = [&](int slot) {
     return calib_fail(err, 0, IMD_PERF_CALIB_ERR_MISSING_KEY, slot_key(slot), "missing key");
@@ -896,7 +876,7 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
   for (int cl = 0; cl < IMD_PERF_CLASS_COUNT; ++cl)
     for (int j = 0; j < kP; ++j)
       if (kParamNames[cl][j] != nullptr && (f2 || !kFormat2Param[cl][j]) &&
-          seen[kFixed + cl * kP + j] == 0)
+          !optional_param(cl, j) && seen[kFixed + cl * kP + j] == 0)
         return missing(kFixed + cl * kP + j);
   if (f2) {
     for (int i = kKernelSlot; i < kOptSlot; ++i)  // power.byte_f_pj is optional
@@ -963,6 +943,7 @@ std::string format_calib(const imd_perf_calib_t& c) {
   for (int cl = 0; cl < IMD_PERF_CLASS_COUNT; ++cl)
     for (int j = 0; j < kP; ++j) {
       if (kParamNames[cl][j] == nullptr || (!f2 && kFormat2Param[cl][j])) continue;
+      if (optional_param(cl, j) && c.param[cl * kP + j] == 0) continue;  // v1.15: op_eps
       s += kClassNames[cl];
       s += '.';
       s += kParamNames[cl][j];
@@ -1153,7 +1134,7 @@ imd_status_t with_error(imd_perf_calib_error_t* err, F&& f) {
 // What the request asks beyond the options (v7 fields: DEFAULT, COLD, no clock for a v6 one).
 struct Req {
   int32_t flags = 0, k4 = -1, regime = IMD_PERF_REGIME_DEFAULT, cache = IMD_PERF_CACHE_COLD;
-  double eps = -1, clock = 0;
+  double clock = 0;  // v1.15: the request's eps_fraction is validated, then ignored
   ErrReq err;  // v8 (§6f): the accuracy request (default: NORMWISE, no target)
 };
 
@@ -1233,12 +1214,9 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   // is the real effect: up to +16 % for calls whose footprint fits the L2).
   const double res = q.cache == IMD_PERF_CACHE_COLD ? 0.0 : res_repeat;
   const double cache_ns = -res * cal.warm_l2byte_ns;
-  double t = 0, bound = 0, eps_s = 0, lo = 0, hi = 0;
+  double t = 0, bound = 0, lo = 0, hi = 0;
   for (int i = 0; i < P.n; ++i) {
     const PerfPhase& p = P.ph[i];
-    if (P.eps_possible)
-      for (int j = 0; j < kP; ++j)
-        eps_s += cal.param[p.cls * kP + j] * p.eps_x[j] * (kClockBound[p.cls][j] ? scale : 1.0) * 1e-9;
     imd_perf_phase_t& o = r->phase[i];
     o.phase = p.phase, o.cls = p.cls, o.launches = p.launches;
     o.time_s = perf_phase_seconds(cal, p, scale);
@@ -1258,8 +1236,8 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   }
   r->time_s = t;
   r->bound_s = bound;
-  r->eps_s = eps_s;
-  r->eps_fraction = P.eps_fraction;
+  r->eps_s = 0;  // v1.15 (§6c.1): no eps path, the fields are always 0
+  r->eps_fraction = 0;
   r->tflops_eq = t > 0 ? r->flops_eq / t * 1e-12 : 0;
   const double* bc = cal.band_call[band_class_of(t)];
   lo = t * bc[0], hi = t * bc[1];
@@ -1290,7 +1268,7 @@ imd_status_t predict_contract(const imd_tensor_t* A, const imd_tensor_t* B, cons
   ExecPlan e;
   if (const imd_status_t st = plan_data(an, &e); st != IMD_STATUS_SUCCESS) return st;
   PerfPhases P;
-  perf_contract_phases(an, e, q.flags, emulates(e) ? q.k4 : -1, cal, q.eps, &P);
+  perf_contract_phases(an, e, q.flags, emulates(e) ? q.k4 : -1, cal, &P);
   r->dispatch = dispatch_of(e);
   r->workspace_bytes = an.layout.total;
   r->plan_device_bytes = e.device_bytes;
@@ -1310,7 +1288,7 @@ imd_status_t predict_pack(const imd_pack_desc_t& d, const KAlignSel& sel, const 
   PackLowered pl;
   if (const imd_status_t st = pack_lower(d, sel, &pl); st != IMD_STATUS_SUCCESS) return st;
   PerfPhases P;
-  perf_pack_phases(pl, cal, q.eps, &P);
+  perf_pack_phases(pl, cal, &P);
   r->dispatch = IMD_DISPATCH_EMULATE;
   r->pack_bytes = pl.layout.total;
   r->pack_ws_bytes = pl.ws_bytes;
@@ -1318,7 +1296,8 @@ imd_status_t predict_pack(const imd_pack_desc_t& d, const KAlignSel& sel, const 
   return IMD_STATUS_SUCCESS;
 }
 
-bool eps_valid(double f) { return f < 0 || (f >= 0 && f <= 1); }  // NaN: invalid
+// v1.15: still validated (NaN, > 1: invalid), then ignored
+bool eps_valid(double f) { return f < 0 || (f >= 0 && f <= 1); }
 
 bool v7_valid(int32_t regime, int32_t cache, double clock) {
   return regime >= IMD_PERF_REGIME_DEFAULT && regime <= IMD_PERF_REGIME_SUSTAINED &&
@@ -1333,7 +1312,7 @@ bool request_valid(const imd_perf_request_t* req, Req* q) {
   if ((req->flags & ~(IMD_PERF_BETA_NONZERO | IMD_PERF_ALPHA_ZERO)) != 0) return false;
   if (req->k4_config < -1 || req->k4_config >= IMD_K4_CONFIG_COUNT) return false;
   if (!eps_valid(req->eps_fraction)) return false;
-  q->flags = req->flags, q->k4 = req->k4_config, q->eps = req->eps_fraction;
+  q->flags = req->flags, q->k4 = req->k4_config;
   if (req->struct_size >= kRequestV7Size) {
     if (!v7_valid(req->regime, req->cache, req->clock_mhz)) return false;
     q->regime = req->regime, q->cache = req->cache, q->clock = req->clock_mhz;
@@ -1523,7 +1502,7 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
       (req->flags & ~IMD_PERF_BETA_NONZERO) != 0 || !eps_valid(req->eps_fraction))
     return IMD_STATUS_INVALID_VALUE;
   Req q;
-  q.flags = req->flags, q.eps = req->eps_fraction;
+  q.flags = req->flags;
   int32_t order = IMD_PERF_ORDER_TIME;  // a version-6 request: the v6 order
   if (req->struct_size >= kRankRequestV7Size) {
     if (!v7_valid(req->regime, req->cache, req->clock_mhz) ||
@@ -1599,7 +1578,7 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
             if (st == IMD_STATUS_SUCCESS)
               st = predict_contract(A, B, C, &o, packed ? &packing : nullptr, sel, q, cal,
                                     &pr);
-            double pack_s = 0, pack_eps = 0, pack_lo = 0, pack_hi = 0;
+            double pack_s = 0, pack_lo = 0, pack_hi = 0;
             uint64_t pack_bytes = 0, pack_ws = 0;
             for (int x = 0; x < 2 && st == IMD_STATUS_SUCCESS; ++x) {
               if (!(packed & (1 << x))) continue;
@@ -1607,7 +1586,6 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
               std::memset(&pp, 0, sizeof pp);
               st = predict_pack(desc[x], sel, q, cal, &pp);
               pack_s += pp.time_s;
-              pack_eps += pp.eps_s;
               pack_lo += pp.time_lo_s;
               pack_hi += pp.time_hi_s;
               pack_bytes += pp.pack_bytes;
@@ -1619,8 +1597,7 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
               c.contract_s = pr.time_s, c.pack_s = pack_s;
               c.time_s = pr.time_s + pack_s / req->reuse;
               c.tflops_eq = c.time_s > 0 ? pr.flops_eq / c.time_s * 1e-12 : 0;
-              c.eps_s = pr.eps_s + pack_eps / req->reuse;
-              c.eps_fraction = pr.eps_fraction;
+              c.eps_s = 0, c.eps_fraction = 0;  // v1.15 (§6c.1): no eps path
               c.workspace_bytes = pr.workspace_bytes;
               c.plan_device_bytes = pr.plan_device_bytes;
               c.pack_bytes = pack_bytes, c.pack_ws_bytes = pack_ws;

@@ -1031,8 +1031,8 @@ class Prediction:
     bound_s: float
     flops_eq: float
     tflops_eq: float
-    eps_s: float          # eps-path time at fraction 1: bracket [t - f eps_s, t + (1 - f) eps_s]
-    eps_fraction: float   # the eps fraction f used (immerdink_host.h: typical-data default)
+    eps_s: float          # 0 since host API 11 (DESIGN v1.15 §6c.1: the eps path is retired)
+    eps_fraction: float   # 0 since host API 11
     kernel_launches: int
     workspace_bytes: int
     plan_device_bytes: int
@@ -1095,8 +1095,8 @@ def predict(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EM
     returned in .status (with zeros); a bad argument raises. packing = (PackSpec or None,
     PackSpec or None): the packed plan. beta: C is read (beta != 0); alpha_zero: the beta-only
     call; k4_config: force an IMD_K4_* configuration (None: the plan-time rule); eps_fraction:
-    the fraction of pack work on the eps path (None: the typical-data default; see
-    immerdink_host.h). v7: regime "DEFAULT" / "BURST" / "SUSTAINED", cache "COLD" / "WARM" /
+    validated (None, < 0 or 0..1) and ignored since host API 11 (the eps path is retired,
+    DESIGN v1.15 §6c.1). v7: regime "DEFAULT" / "BURST" / "SUSTAINED", cache "COLD" / "WARM" /
     "REPEAT", clock_mhz > 0: predict at that SM clock. v8: accuracy (an Accuracy): err_bound /
     err_typical in its metric and err_status against its target (None: NORMWISE, no target)."""
     h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing)
@@ -1144,8 +1144,8 @@ class Candidate:
     contract_s: float
     pack_s: float
     tflops_eq: float
-    eps_s: float         # eps-path time at fraction 1 (contract + pack / reuse)
-    eps_fraction: float
+    eps_s: float         # 0 since host API 11 (eps path retired)
+    eps_fraction: float  # 0 since host API 11
     workspace_bytes: int
     plan_device_bytes: int
     pack_bytes: int

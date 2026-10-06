@@ -20,8 +20,9 @@ one rate for the four configurations). Then the call term: sign-free least squar
 re-predicted by the C library with the fitted parameters (the C does the sum / max). BETA (not
 measured by the sweep) takes K5's launch and byte parameters. The effective L2 of the K4
 DRAM term is scanned (a fraction of the recorded L2; --no-l2-scan keeps the nominal size).
-Records with --data dominant (one dominant entry per row) are predicted with their eps fraction
-(record_eps: about 512 / k); the others with the typical-data default. Datasheet peaks: the RTX 4090's, else --peak-dram / --peak-int8 /
+v1.15 (DESIGN §6c.1 "The eps path — retired"): every record is predicted the same way whatever
+its data (the v1.14 pack emitter has no eps path; the op_eps features are 0, so the op_eps
+parameters fit to 0 and are not written). Datasheet peaks: the RTX 4090's, else --peak-dram / --peak-int8 /
 --peak-fp64 are required. numpy only.
 
 v1.10 (DESIGN §6c, format 2): the method-occupancy record gives the occupancy table (else the
@@ -186,26 +187,6 @@ def record_clock(rec):
 USE_RECORD_CLOCK = True
 
 
-MODULI = [256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199, 197, 193, 191,
-          181, 179, 173]  # DESIGN §2
-
-
-def record_eps(rec, ext, lib=None):
-    """The eps fraction of a record's data: None (the typical-data default) for the normal
-    generator. With one dominant entry per row (2^20 x the others), the tile holding it is on the
-    eps path (512 / k of the tiles) and the others are about 2^-20 T: on the path too once
-    log2 T - 20 - 53 reaches the ramp of the default (DESIGN §6c.1; N = 20 here)."""
-    if rec.get("data") != "dominant":
-        return None
-    N = int(rec.get("N", 8))
-    lt = math.log2(math.isqrt((math.prod(MODULI[:N]) - 1) // 2))
-    if lt < 53:
-        return 0.0
-    lw = host.lowering(rec["spec"], ext, N=N, lib=lib)
-    others = min(1.0, max(0.0, (lt - 20 - 53 + 2.5) / 1.5))
-    return max(others, min(1.0, 512.0 / max(lw.k, 1)))
-
-
 def _aligned(fn, a, lib):
     """fn under the record's K alignment (DESIGN v1.13 §4b.6): libimmerdink_host's test hook
     set to a (0 = AUTO) around the call, AUTO restored after."""
@@ -242,11 +223,10 @@ def samples_from_records(records, lib=None, seed=None):
         cache = "COLD" if "l2=flush" in r.get("variant", "") else "REPEAT"
         if meth == "imd" and "phases" in r:
             o = variant_options(r)
-            eps = record_eps(r, ext, lib)
 
-            def again(calib, state=None, spec=spec, ext=ext, o=o, eps=eps, clk=clk, cache=cache):
+            def again(calib, state=None, spec=spec, ext=ext, o=o, clk=clk, cache=cache):
                 return host.predict(spec, ext, N=o["N"], g=o["g"], vec_mode=o["vec_mode"],
-                                    mode=o["mode"], k4_config=o["k4_config"], eps_fraction=eps,
+                                    mode=o["mode"], k4_config=o["k4_config"],
                                     regime="BURST", cache=state or cache, clock_mhz=clk,
                                     calib=calib, lib=lib)
             again = _aligned(again, ka, lib)
@@ -261,18 +241,17 @@ def samples_from_records(records, lib=None, seed=None):
             N = int(r["N"])
             pk = host.pack_desc_for(spec, ext, operand=which, N=N, lib=lib)   # no sizes: A-free
             packing = (pk, None) if which == 0 else (None, pk)
-            eps = record_eps(r, ext, lib)
             # method packed times imd_pack, the plain and the packed contract interleaved: each
             # finds the L2 holding the other calls' traffic, i.e. COLD for its own inputs
             kw = dict(regime="BURST", clock_mhz=clk, lib=lib)
-            fns = {"plain_": lambda c, st=None, spec=spec, ext=ext, N=N, eps=eps, kw=kw:
-                       host.predict(spec, ext, N=N, eps_fraction=eps, calib=c,
+            fns = {"plain_": lambda c, st=None, spec=spec, ext=ext, N=N, kw=kw:
+                       host.predict(spec, ext, N=N, calib=c,
                                     cache=st or "COLD", **kw),
-                   "packed_": lambda c, st=None, spec=spec, ext=ext, N=N, packing=packing, eps=eps,
-                   kw=kw: host.predict(spec, ext, N=N, packing=packing, eps_fraction=eps, calib=c,
+                   "packed_": lambda c, st=None, spec=spec, ext=ext, N=N, packing=packing,
+                   kw=kw: host.predict(spec, ext, N=N, packing=packing, calib=c,
                                        cache=st or "COLD", **kw),
-                   "pack_": lambda c, st=None, pk=pk, eps=eps, kw=kw: host.predict_pack(
-                       pk, eps_fraction=eps, calib=c, cache=st or "COLD", **kw)}
+                   "pack_": lambda c, st=None, pk=pk, kw=kw: host.predict_pack(
+                       pk, calib=c, cache=st or "COLD", **kw)}
             fns = {key: _aligned(f, ka, lib) for key, f in fns.items()}
             lab = f"{r['case']} pack {r.get('pack')} N={N}"
             for pre, timed in (("plain_", r["contract_ms"] * 1e-3),

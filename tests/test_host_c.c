@@ -712,10 +712,13 @@ int main(void) {
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
       rq.k4_config = -1, rq.eps_fraction = 1.5; /* a fraction above 1 */
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
-      /* N = 9: T < 2^53, so the eps fraction is 0 whatever the request */
+      /* host API 11 (DESIGN v1.15 §6c.1): the eps path is retired; a valid fraction is ignored
+       * (eps_s and eps_fraction out are 0); NaN is still rejected */
+      { volatile double z = 0.0; rq.eps_fraction = z / z; }
+      CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
       rq.eps_fraction = 1.0;
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_SUCCESS &&
-            pr.eps_fraction == 0.0);
+            pr.eps_fraction == 0.0 && pr.eps_s == 0.0);
       rq.eps_fraction = -1.0;
       back = cal;
       back.format = 3;
