@@ -277,7 +277,9 @@ the lanes' distinct ε. The cost depended on the data (§6c "The eps path").
   `ε < 64 ? μ << ε : 0` up to 112. With PTX shl the W = 2 kernels keep their registers and
   spills and their instruction counts within −2 % / +0.2 % (not byte-identical: the C++
   shift let the compiler assume ε < 64); the W = 3 kernels are byte-identical; C is
-  bit-identical and the timing neutral (the v1.16 changelog). W = 3: the two words of μ shifted by `b = ε mod 32` with
+  bit-identical and the timing neutral (the v1.16 changelog).
+
+  W = 3: the two words of μ shifted by `b = ε mod 32` with
   `__funnelshift_l`, then placed by `q = ⌊ε/32⌋ ∈ {0, 1, 2}` with selects (static indices
   only, no local memory; b ≤ 31 by construction and q ≥ 3 selects as q = 2, so W = 3 has
   no undefined shift). Zero, ±0 and non-finite elements give X = 0 (as μ = 0 before).
@@ -2815,9 +2817,19 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
   - **PACK x₃ = `dram`**, the phase bytes that are not L2 hits: `x₃ = x₁ − hit`, where `hit` =
     the operand re-reads of the phase's launches, `(groups − [x's first group is in this
     phase]) · 8·rows_x·k`, when the call's group working set `S = Σ_{in-line y} (8·rows_y·k +
-    g·pad_y·k̂)` (both operands plus one group's residues: what passes through L2 between two
-    re-reads of x) is at most `L_hit` = `warm.pack_l2_bytes`, and 0 otherwise (always 0 when
-    L_hit = 0). A hit byte costs `pack.byte`, every other byte `pack.byte + pack.dram`.
+    g·pad_y·k̂)` (the in-line operands plus one group's residues) is at most `L_hit` =
+    `warm.pack_l2_bytes`, and 0 otherwise (always 0 when L_hit = 0). A hit byte costs
+    `pack.byte`, every other byte `pack.byte + pack.dram`. [review 2026-10-06] **S is a proxy,
+    not the bytes that pass through L2 between two re-reads of x:** it leaves out the W planes
+    K4 writes for each group (`g·b·m·n̂` bytes, which K4's and K5's terms count) and the
+    per-group residues K4 reads from an operand packed in advance with `imd_pack`. L_hit is
+    fitted on square shapes only, where the planes are a fixed fraction of S; on shapes with
+    large m·n and short k the proxy under-counts the set and predicts hits that miss (4096² ×
+    512 at g = 4: S ≈ 50 MB, with the planes ≈ 117 MB; about 100 MB of re-reads priced at
+    `pack.byte`, roughly 5 % of the call too fast). Counting the planes would put the 4090's
+    step (1472³ ≈ 61 MB, 1792³ ≈ 90 MB with planes) around the physical 75.5 MB L2 instead of
+    0.8 × L2; that is a feature change (a refit), left for when a case with S between 57 and
+    77 MB, a short-k case with large m·n and a pre-packed case at g < N are in the sweep.
     Measured (g = 4, KL path, squares): K3 predicted 1.5–1.7× slow for S ≤ 57 MB (1280³,
     1536³) and 1.15–1.4× fast for S ≥ 77 MB (1792³ … 2560³), at every N; one byte rate
     averaged the two. The 4090 data bound L_hit to [57, 77) MB; `perf_fit.py` sets it to
@@ -2886,7 +2898,8 @@ split into a time model at a given clock and a clock model per regime.
 
 - **Time at clock f.** Each feature is either clock-bound (scales with the SM clock) or not:
   DRAM bytes (every `byte` feature, K4's DRAM term), `launch` and the call term are not; every
-  other feature (op, op_eps, row, chain, l2byte, K4's round model) is; [v1.17] `kf.elem` and
+  other feature (op, row, chain, l2byte, K4's round model; [v1.15] the retired op_eps had
+  no feature) is; [v1.17] `kf.elem` and
   `pack.dram` are not (a tile-load latency and DRAM bytes). With the calibration's
   reference clock `f_ref`: `t_p(f) = Σ_{clock-bound j} θ_j x_j · f_ref / f + Σ_{others} θ_j x_j`
   (K4: `max(rounds · f_ref / f, DRAM term)`). **As calibrated (NOTES-B2 §6):** θ are the costs
@@ -3160,10 +3173,16 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   `imd_perf_calib_format` do not fold: they read such a struct with byte_f = 0 (its bytes end
   before the field), which is the folded struct those functions returned. With byte_f = 0
   (every file before v1.15) the view is the full calibration.
-  **[v1.17] A version-7…11-sized struct** has no `pack_l2_hit_bytes`: every function reads
-  it as 0 (no fold), so the hit rule is off and every PACK byte costs `pack.byte +
-  pack.dram`, the DRAM rate. Another degraded, unvalidated view (pass NULL); with
-  `pack.dram` = 0 (every file before v1.17) it is the full calibration.
+  **[v1.17] A version-7…11-sized struct** has no `pack_l2_hit_bytes`. [review 2026-10-06]
+  The predictors and `imd_perf_calib_format` read it as `warm_l2_bytes` when `pack.dram` > 0
+  and as 0 otherwise (the parse / default / load functions write nothing past the caller's
+  size, as before). With `pack.dram` = 0 (every file before v1.17) L_hit has no effect, so
+  the view is the full calibration and its text gains no key. For the shipped file the
+  fallback is exact (its `warm.l2_bytes` = `warm.pack_l2_bytes` = 60397977.6 B, 0.8 × L2),
+  so an API-7…11 caller predicts as with NULL;
+  for another file with `pack.dram` > 0 it is a degraded, unvalidated view (pass NULL).
+  (v1.17 as first written read it as 0: every PACK byte at the DRAM rate, a worse prediction
+  than the old calibration gave such callers.)
 - **Shipped table.** `src/host/calib/rtx4090_sm89.calib` (the 4090 at stock clocks, as
   shipped: no clock lock; its `clocks` line records the state) is embedded at configure time
   (CMake reads the file into a raw string literal: the file is the one source; editing it
@@ -3745,8 +3764,13 @@ fit). So the hold-out is a check of the long-run state, and of shape only at 163
   was chosen by minimising this same leave-one-out median over 17 candidates, and the capped
   clock is predicted 2–4 % high, the time error being small because the time model's bias
   cancels it (NOTES-B2 §10). [v1.17] Superseded by the v1.17 refit (all 14 windows
-  recollected, f_ref 2491 MHz by the parabola rule, nested leave-one-out 1.19 %; the capped
-  clock is still 1–3 % high; NOTES-B2 §11).
+  recollected, f_ref 2491 MHz by the parabola rule, nested leave-one-out 1.19 %; NOTES-B2
+  §11). [review 2026-10-06] The capped clock is still predicted 0.8–3.4 % high (12288³: 2335
+  vs 2258 MHz) and u_s1024 N = 16 4.3 % low. Every one of the 14 windows ran at the cap
+  (447–450 W), including u_s512 and u_s1024 at 2525–2775 MHz; the model puts four of them
+  below it: u_s512 345 / 371 W (−23 / −17 %), u_s1024 N = 8 423 W (−6 %) and u_rmm 258 W
+  (−43 %). So power is predicted low on every small window that runs at a high clock, not
+  only on r_mm: the power model needs a clock-dependent term for small calls.
 
 ---
 
@@ -4874,7 +4898,8 @@ and host API; every value the same integer (bit-identical, tested on every contr
   capped solve is checked as a bracket at the bisection's 0.05 MHz (§6c.4).
 - **§6c.3 host API 12:** `imd_perf_calib_t.pack_l2_hit_bytes` appended (3688 bytes);
   `imd_perf_param_name` KF 4 `"elem"`, PACK 3 `"dram"`, KL 4 NULL; a v7–v11-sized struct
-  reads L_hit 0. Python `host.API_VERSION` 12.
+  reads L_hit = `warm_l2_bytes` when `pack.dram` > 0, else 0 ([review 2026-10-06]; was 0:
+  §6c.3). Python `host.API_VERSION` 12.
 - **§6c.4 tests:** see §6c.4 [v1.17].
 - **Shipped calibration** (2026-10-06, branch `model-fix`, NOTES-B2 §11): one full refit on
   the current library (all 14 sustained windows recollected, 60 s pre-heat; the cache sweep;
@@ -4883,6 +4908,12 @@ and host API; every value the same integer (bit-identical, tested on every contr
   (189 calls) median / p90 / max: < 100 µs 3.8 / 12.9 / 23.2 %, 100 µs – 1 ms 2.6 / 9.6 /
   13.9 %, ≥ 1 ms 2.2 / 6.6 / 16.8 % (old θ with eps ignored: 5.8 / 13.4 / 21.7, 3.5 / 14.1 /
   21.3, 2.1 / 7.7 / 15.8 %); K3 phase 13.3 / 22.4 → 4.9 / 14.7 %.
+- **Review of `model-fix` (2026-10-06, branch `openitems-final`):** §6c.1 says S is a proxy
+  (no K4 planes, no pre-packed residues; L_hit fitted on squares only), the clock-bound list
+  no longer names `op_eps`, §6c.7 states the clock (0.8–3.4 % high) and power (every small
+  high-clock window low, not only r_mm) gaps, NOTES-B2 §11 the hold-out caveats; §6c.3 the
+  v7–v11 view reads L_hit = `warm_l2_bytes` when `pack.dram` > 0 (exact for the shipped
+  file). §3.4.1 [v1.16]: `shl_clamped` at counts ≥ 64 is tested.
 - **Docs caveats of the 2026-10-06 review** carried into DESIGN: §6c.7's shipped sustained
   figure (u_sq2048 −1.4 %, f_ref chosen on the same metric, capped clock 2–4 % high) and the
   v1.15 changelog's hold-out claim (the gain is the eps retirement, not the refit).

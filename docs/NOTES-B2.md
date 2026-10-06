@@ -1022,12 +1022,18 @@ FREE; profiling `imd_bench` at 7e5ef5d; `tools/calibrate.sh --validate`, BENCH_R
   1.30 %. **f_ref = 2491 MHz** (parabola vertex). **Nested leave-one-case-out median |t err|
   1.19 %** (the folds chose 2405–2500 MHz), the honest figure; the scan's minimum (1.11 %) is
   not.
-- Sustained LOO at 2491 MHz: capped windows −1.3 … +1.6 % (u_rbigk +1.6, u_sq2048 −1.3); the
-  uncapped u_s512 −2.6 / +9.7 % (N = 14 / 16), u_s1024 −6.5 / +5.6 %, u_rmm +6.4 %. The
-  **capped clock is still predicted 1–3 % high** (12288³ 2335 vs 2258 MHz, 8192³ 2328 vs
-  2274, DF 2392 vs 2324), and the time error stays small because the per-call time model's
-  bias cancels it, as in §10. The r_mm power gap stays: 258 W predicted vs 450 W measured
-  (−43 %) with all 14 windows on the current library.
+- Sustained LOO at 2491 MHz: windows predicted capped −1.3 … +1.6 % (u_rbigk +1.6, u_sq2048
+  −1.3); the windows predicted below the cap u_s512 −2.6 / +9.7 % (N = 14 / 16), u_s1024
+  N = 8 −6.5 %, u_rmm +6.4 %; u_s1024 N = 16 (predicted capped) +5.6 %. The **capped clock is
+  still predicted 0.8–3.4 % high** (12288³ 2335 vs 2258 MHz +3.4 %, 8192³ 2328 vs 2274, DF
+  2392 vs 2324; u_s1024 N = 16 is 4.3 % low, 2416 vs 2525), and the time error stays small
+  because the per-call time model's bias cancels it, as in §10.
+- [review 2026-10-06] **Power is predicted low on every small high-clock window, not only on
+  r_mm.** All 14 windows ran at the cap (447–450 W), u_s512 and u_s1024 included (at
+  2525–2775 MHz: they are not "uncapped", their clock is high because their power per clock
+  is low). Predicted: u_s512 345 / 371 W (−23 / −17 %), u_s1024 N = 8 423 W (−6 %), u_rmm
+  258 W (−43 %). A clock-dependent power term for small calls is missing, as well as the r_mm
+  one.
 - `rank.tie_ratio` 1.074 → 1.060; bands (5 / 95, cross-validated coverage 83 %): call < 100 µs
   0.938–1.191, 100 µs – 1 ms 0.891–1.055, ≥ 1 ms 0.932–1.024, kf 0.790–1.325, pack 0.927–1.171.
 
@@ -1050,6 +1056,16 @@ Targets 15 / 30, 10 / 20, 5 / 15 %.
 | N = 18–20 | < 100 µs | 5 | 9.4 / 11.4 / 12.5 | 3.8 / 7.4 / 8.8 | 2.7 / 11.9 / 17.2 |
 | N = 18–20 | 100 µs – 1 ms | 2 | 0.5 / 0.7 / 0.7 | 1.4 / 1.7 / 1.8 | 1.4 / 1.7 / 1.8 |
 | N = 18–20 | ≥ 1 ms | 4 | 1.6 / 3.1 / 3.2 | 2.1 / 2.4 / 2.5 | 1.3 / 2.4 / 2.5 |
+
+[review 2026-10-06] **Two caveats on this hold-out:**
+- It is not fully independent of the design: the open-items analysis chose its features by
+  comparing variants on the same hold-out shapes (the 178 calls other than N = 18–20). Only the
+  11 N = 18–20 calls are shapes nobody had looked at, and on them the < 100 µs p90 / max got
+  worse than both baselines (11.9 / 17.2 % vs 11.4 / 12.5 % for (2) and 7.4 / 8.8 % for (1)).
+- The L2-hit side of the PACK rule is checked in-sample only: no hold-out pack call has S
+  between about 5 and 85 MB (v_s512, 4.2 MB of inputs, is the only one below 85 MB; the next
+  is v_n18a 2304³ at 85 MB of inputs). The K3 gain (13.3 / 22.4 → 4.9 / 14.7 %) comes
+  entirely from cases that miss L2.
 
 Against baseline (2), per size class:
 - < 100 µs: median and p90 better; max +1.5 points (`z_s200` N = 14, −23.2 vs −19.9 %: K4 on a
@@ -1087,6 +1103,11 @@ gain over (2) is the features, not the new data.
 → 3.6 / 13.8; K4 4.8 / 21.2 → 4.6 / 21.4 → 4.3 / 20.5; K5 4.1 / 16.2 → 4.0 / 16.5 → 4.1 /
 16.5. Calibration set (in-sample for the new fit only): K2 2.8 / 53.1 → 7.2 / 43.3 → 5.0 / 9.8,
 K3 15.0 / 32.8 → 17.6 / 28.6 → 5.6 / 12.6, KF 14.8 / 38.8 → 11.0 / 31.1 → 7.5 / 26.4.
+[review 2026-10-06] The calibration set's **calls** at ≥ 1 ms got slightly worse in-sample
+than under (1): 3.0 / 9.5 / 16.1 → 3.5 / 9.1 / 17.8 % (median / p90 / max; 161 calls; (2) 3.2
+/ 10.0 / 16.5 %), while 100 µs – 1 ms improved (3.9 / 11.6 / 32.8 → 2.1 / 8.8 / 27.1 %). The
+fit minimises per-phase error, not call error, so a better phase fit does not have to
+improve the calls.
 
 **Measured / predicted by N** (median per N; (2) / (1) / new):
 
@@ -1111,9 +1132,20 @@ to 1.02–1.09; the remaining +4–9 % is in the miss cases.
   cap of the cache term's REPEAT saving (analysis §3);
 - W = 3 KF on tiny E = 4 shapes (`v_n18d` N = 20);
 - K4 on tiny shapes (`z_s200`, `v_s320` N = 14, −17 to −23 %);
-- the capped-clock bias (1–3 % high) and the r_mm power gap (−43 %), which need memory-bound
-  windows at several clocks (analysis §4) before a power term is chosen;
-- refine L_hit with a case between 57 and 77 MB.
+- the capped-clock bias (0.8–3.4 % high) and the power gaps (r_mm −43 %, the small
+  high-clock windows −6 … −23 %), which need memory-bound and small windows at several clocks
+  (analysis §4) before a power term is chosen;
+- refine L_hit with a case between 57 and 77 MB, a short-k case with large m·n (4096² × 512,
+  g = 4) and a pre-packed operand at g < N; S is a proxy without K4's planes (DESIGN §6c.1
+  [review]), and counting them is a feature change;
+- `pack.byte` fits to 0 and the cost moves to `pack.launch` (0.91 → 3.38 µs) and `pack.wave`
+  (5.58 → 3.87 µs): launch, wave and byte are not separately identifiable; price hits at a
+  prior (e.g. `kl.l2byte`) or a fitted rate of their own;
+- L_hit is not identifiable within the calibration set (the same PACK fit for 0.7–1.0 × L2);
+- `kf.chain` fits to 0, so KF no longer grows with N on tiny E = 4 shapes (`v_n18d` −17 %);
+- the f_ref scan stops at 2405 MHz and the u_rmm fold chose exactly that: extend it down.
+- "Bit-identical to API 11" (absent keys vs 0) is tested within this library only, not
+  against an API-11 build (low risk: the changed terms all have parameter 0 there).
 
 **Design question for the reviewer**: keep calibration format 2 with additive optional
 keys (DESIGN §6c.2 "Why format 2 is kept", §6c.5 amended), or bump to format 3 as the

@@ -88,8 +88,12 @@ first.
   p90 / max), better than old θ (eps ignored) on medians and p90s, maxima +1.5 / +1.0 points
   on single K4-bound calls (within run-to-run noise below 100 µs, borderline at ≥ 1 ms); K3
   phase 13.3 / 22.4 → 4.9 / 14.7 %. Open: KF roofline and cache-term cap, W = 3 KF on tiny
-  E = 4 shapes, K4 on tiny shapes, capped clock 1–3 % high and the r_mm power gap (needs
-  memory-bound windows), L_hit between 57 and 77 MB; reviewer question: format 2 kept vs 3.
+  E = 4 shapes, K4 on tiny shapes, capped clock 0.8–3.4 % high and the power gaps (r_mm −43 %,
+  the small high-clock windows u_s512 / u_s1024 −6 … −23 %; needs memory-bound and small
+  windows at several clocks), L_hit between 57 and 77 MB (S is a proxy without K4's planes);
+  reviewer question: format 2 kept (reviewer: keep it). Hold-out caveats (NOTES-B2 §11
+  [review]): the features were chosen on 178 of the 189 calls; the PACK L2-hit side is
+  checked in-sample only.
   Verified: full `tools/test.sh` 13/13 CPU + 35/35 GPU, `params.py --check` 30/30,
   `test_oracle` all pass. GPU: 56 min of sweep wall time (over the 45 min budget).
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,

@@ -271,6 +271,54 @@ long run_n(int N, bool trunc, int threads, uint64_t seed, Coverage* cov, long* c
   return bad;
 }
 
+// v1.16 §3.4.1 (review 2026-10-06): shl_clamped is PTX shl.b64, x << n for n < 64 and 0 for
+// every n >= 64 (the C++ shift is undefined there). Counts 0..255 and 2^32 - 1 on a few x.
+__global__ void shl_kernel(const uint64_t* x, int nx, const uint32_t* n, int nn, uint64_t* out) {
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= nx * nn) return;
+  out[t] = imd::kernels::shl_clamped(x[t / nn], n[t % nn]);
+}
+
+int check_shl_clamped() {
+  const std::vector<uint64_t> xs = {1, 0x8000000000000000ull, 0xFFFFFFFFFFFFFFFFull,
+                                    0x0123456789ABCDEFull, (1ull << 53) - 1};
+  std::vector<uint32_t> ns;
+  for (uint32_t n = 0; n < 256; ++n) ns.push_back(n);
+  ns.push_back(0xFFFFFFFFu);
+  ns.push_back(0x80000000u);
+  const int nx = static_cast<int>(xs.size()), nn = static_cast<int>(ns.size()), tot = nx * nn;
+  uint64_t *dx, *dout;
+  uint32_t* dn;
+  CUDA_CHECK(cudaMalloc(&dx, sizeof(uint64_t) * nx));
+  CUDA_CHECK(cudaMalloc(&dn, sizeof(uint32_t) * nn));
+  CUDA_CHECK(cudaMalloc(&dout, sizeof(uint64_t) * tot));
+  CUDA_CHECK(cudaMemcpy(dx, xs.data(), sizeof(uint64_t) * nx, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dn, ns.data(), sizeof(uint32_t) * nn, cudaMemcpyHostToDevice));
+  shl_kernel<<<(tot + 255) / 256, 256>>>(dx, nx, dn, nn, dout);
+  CUDA_CHECK(cudaGetLastError());
+  std::vector<uint64_t> out(tot);
+  CUDA_CHECK(cudaMemcpy(out.data(), dout, sizeof(uint64_t) * tot, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaFree(dx));
+  CUDA_CHECK(cudaFree(dn));
+  CUDA_CHECK(cudaFree(dout));
+  int bad = 0;
+  for (int i = 0; i < nx; ++i)
+    for (int j = 0; j < nn; ++j) {
+      const uint64_t want = ns[j] >= 64 ? 0 : xs[i] << ns[j];
+      if (out[i * nn + j] != want) {
+        if (bad < 5)
+          std::printf("shl_clamped(%#llx, %u) = %#llx, want %#llx\n",
+                      static_cast<unsigned long long>(xs[i]), ns[j],
+                      static_cast<unsigned long long>(out[i * nn + j]),
+                      static_cast<unsigned long long>(want));
+        ++bad;
+      }
+    }
+  std::printf("shl_clamped: %d counts x %d values (0..255, 2^31, 2^32 - 1), %d mismatches\n",
+              nn, nx, bad);
+  return bad;
+}
+
 }  // namespace
 
 int main() {
@@ -278,7 +326,7 @@ int main() {
                     imd::kernels::pack_words(17) == 3,
                 "W rule (cert_pack_words)");
   long bad = 0, checked = 0;
-  int fails = 0;
+  int fails = check_shl_clamped() != 0;
   for (int N = c::kNMin; N <= c::kNMax; ++N) {
     Coverage covw[3];  // [W - 1], W = 2, 3 (review L1: "all eps hit" per W)
     for (Coverage& cv : covw) cv.eps.assign(c::kEpsMax + 1, 0);

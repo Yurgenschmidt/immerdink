@@ -528,9 +528,10 @@ typedef struct {
   double energy_byte_f_pj; /* per DRAM byte, scaled like the ops by (f / clock_eff)^gamma
                               (SM / L2-side energy of the traffic; key power.byte_f_pj,
                               optional, 0 when absent)                                       */
-  /* ---- v12 (DESIGN v1.17 §6c.1). A caller with a v7..v11 struct_size is read with
-   *      pack_l2_hit_bytes = 0 (the PACK hit rule off: every pack byte at pack.byte +
-   *      pack.dram): a degraded view when pack.dram > 0; such callers should pass NULL. ---- */
+  /* ---- v12 (DESIGN v1.17 §6c.1, §6c.3). A caller with a v7..v11 struct_size is read
+   *      (predictors, imd_perf_calib_format) with pack_l2_hit_bytes = warm_l2_bytes when
+   *      pack.dram > 0, else 0 (no effect then). Exact for the shipped calibration (both
+   *      sizes 0.8 x L2); for another file with pack.dram > 0 a degraded view (pass NULL). */
   double pack_l2_hit_bytes; /* L_hit: a K2 / K3 re-read of an operand hits L2 when the call's
                               group working set is at most this (key warm.pack_l2_bytes,
                               optional, 0 when absent: no hits)                             */

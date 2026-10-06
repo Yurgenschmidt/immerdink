@@ -429,9 +429,10 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     // K2 / K3: the groups of an in-line operand that KF / KL did not pack (groups 2..G):
     // per group one read of the operand and the group's residues (+ the zero-rows launch of B).
     const int64_t G = (e.N + e.g - 1) / e.g;
-    // v1.17 (§6c.1): the call's group working set, both in-line operands plus one group's
-    // residues: what passes through L2 between two re-reads of an operand. At most L_hit, an
-    // operand's re-reads by its K2 / K3 launches hit L2 (cal.pack_l2_hit_bytes; 0: never).
+    // v1.17 (§6c.1): the call's group working set S, the in-line operands plus one group's
+    // residues. At most L_hit, an operand's re-reads by its K2 / K3 launches hit L2
+    // (cal.pack_l2_hit_bytes; 0: never). A proxy (review 2026-10-06): it leaves out K4's W
+    // planes per group and a pre-packed operand's residues; L_hit is fitted on squares.
     double S = 0;
     for (int y = 0; y < 2; ++y)
       if (inl[y]) S += 8 * rows[y] * k + g * pad[y] * kh;
@@ -719,6 +720,16 @@ void fold_byte_f(imd_perf_calib_t* cal, uint32_t struct_size) {
     cal->energy_byte_pj += cal->energy_byte_f_pj;
     cal->energy_byte_f_pj = 0;
   }
+}
+
+// v1.17 review (DESIGN §6c.3): a v7..v11-sized struct has no pack_l2_hit_bytes. The predictors
+// and imd_perf_calib_format read it as warm_l2_bytes when pack.dram > 0 (exact for the shipped
+// file, whose two L2 sizes are the same 0.8 x L2) and as 0 otherwise (no effect then: every
+// file before v1.17 is unchanged, its text gains no key).
+void v11_pack_l2(imd_perf_calib_t* cal, uint32_t struct_size) {
+  if (struct_size >= kCalibV7Size && struct_size < kCalibV12Size && cal->format == 2)
+    cal->pack_l2_hit_bytes =
+        cal->param[IMD_PERF_CLASS_PACK * kP + 3] > 0 ? cal->warm_l2_bytes : 0;
 }
 
 // A rejected calibration (host API 10, DESIGN §6c.3): the line (0: none), the reason
@@ -1097,6 +1108,7 @@ imd_status_t resolve_calib(const imd_perf_calib_t* in, imd_perf_calib_t* scratch
     if (cal->format != 1 && cal->format != 2) return IMD_STATUS_INVALID_VALUE;
     cal->format = 1;
   }
+  v11_pack_l2(cal, in->struct_size);
   if (!calib_valid(*cal)) return IMD_STATUS_INVALID_VALUE;
   if (cal->format == 1) {
     to_format1_params(cal);
@@ -1486,6 +1498,7 @@ imd_status_t imd_perf_calib_format(const imd_perf_calib_t* calib, char* buf, siz
   std::memset(&c, 0, sizeof c);
   std::memcpy(&c, calib, std::min<size_t>(calib->struct_size, sizeof c));
   if (calib->struct_size < imd::detail::kCalibV7Size && c.format == 2) c.format = 1;
+  imd::detail::v11_pack_l2(&c, calib->struct_size);
   if (!imd::detail::calib_valid(c)) return IMD_STATUS_INVALID_VALUE;
   if (c.format == 1) imd::detail::to_format1_params(&c);
   for (const auto& [p, cap] : {std::pair<const char*, size_t>{c.gpu, sizeof c.gpu},

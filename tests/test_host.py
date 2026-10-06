@@ -1347,6 +1347,9 @@ def suite_perf_v115(cal):
     # read with byte_f = 0 although the poisoned tail is beyond its size
     ex_fold = dict(ex)
     ex_fold.update({"power.byte_pj": 100.0 + 235.5, "power.byte_f_pj": 0.0})
+    # v1.17 review (§6c.3): a v7..v11-sized struct reads L_hit = warm.l2_bytes when pack.dram > 0
+    if cal.params["pack.dram"] > 0:
+        ex_fold["warm.pack_l2_bytes"] = ex_fold["warm.l2_bytes"]
     c_fold = host.Calibration.from_values(cal.meta, cal.params, extra=ex_fold)
     p_fold = preds(c_fold)
     if preds(host.Calibration(v10, h)) != p_fold:
@@ -1407,7 +1410,8 @@ def suite_perf_v117(cal):
     """DESIGN v1.17 §6c.1 / §6c.2 (host API 12): kf.elem, pack.dram and warm.pack_l2_bytes
     optional (absent = 0, written only when non-zero, format-2 keys); the new terms are
     additive (with their parameters 0 the features change but no time does); pack.dram with
-    L_hit 0 charges every byte; a v11-sized struct reads L_hit as 0."""
+    L_hit 0 charges every byte; a v11-sized struct reads L_hit as warm.l2_bytes when
+    pack.dram > 0, else 0 (review 2026-10-06: exact for the shipped calibration)."""
     count = 0
     shapes = [("ik,jk->ij", dict(i=1024, j=1024, k=1024)), ("ik,jk->ij", dict(i=1472, j=1472, k=1472)),
               ("ik,jk->ij", dict(i=1792, j=1792, k=1792)), ("ik,jk->ij", dict(i=1024, j=96, k=4096)),
@@ -1481,19 +1485,39 @@ def suite_perf_v117(cal):
                     raise Fail(f"{kk} {why}: {e.reason} {e.key}")
             count += 1
     # (5) a v11-sized struct: parse / default leave the field alone, and a struct of that size
-    # predicts with L_hit 0
+    # predicts and formats with L_hit = warm.l2_bytes when pack.dram > 0, else 0 (DESIGN §6c.3
+    # [review 2026-10-06])
     data = t2.encode()
     st, v11, _ = _sized_calib("imd_perf_calib_parse_ex", V11_CALIB_SIZE, data, len(data))
     want = host._PerfCalib.from_buffer_copy(bytes(c_hit._raw))
     want.struct_size = V11_CALIB_SIZE
     if st != 0 or bytes(v11)[:V11_CALIB_SIZE] != bytes(want)[:V11_CALIB_SIZE]:
         raise Fail("v11 view (parse)")
-    st, _, _ = _sized_calib("imd_perf_calib_default_ex", V11_CALIB_SIZE)
+    lw = c_hit.warm["warm.l2_bytes"]
+    if not (lw > 0 and lw != 6.04e7):
+        raise Fail(f"v11 view: the test needs warm.l2_bytes > 0 and != L_hit ({lw})")
+    c_lw = host.Calibration.from_values(cal.meta, pd, extra=dict(extra, **{"warm.pack_l2_bytes": lw}))
+    v11c = host.Calibration(v11, host.load())
+    if preds(v11c) != preds(c_lw) or preds(v11c) == preds(c_nohit):
+        raise Fail("a v11-sized struct with pack.dram > 0 does not predict with L_hit = warm.l2_bytes")
+    if v11c.format() != c_lw.format():
+        raise Fail("a v11-sized struct with pack.dram > 0 does not format with L_hit = warm.l2_bytes")
+    count += 2
+    # pack.dram = 0 (every file before v1.17): L_hit 0, the text gains no key
+    data0 = tb.encode()
+    st, v11b, _ = _sized_calib("imd_perf_calib_parse_ex", V11_CALIB_SIZE, data0, len(data0))
+    v11bc = host.Calibration(v11b, host.load())
+    if st != 0 or preds(v11bc) != p0 or v11bc.format() != tb:
+        raise Fail("a v11-sized struct with pack.dram = 0 is not the calibration without the keys")
+    count += 1
+    # the shipped calibration: its v11 default view predicts exactly as NULL (the full one)
+    st, v11d, _ = _sized_calib("imd_perf_calib_default_ex", V11_CALIB_SIZE)
     if st != 0:
         raise Fail("v11 view (default)")
-    if preds(host.Calibration(v11, host.load())) != preds(c_nohit):
-        raise Fail("a v11-sized struct does not predict with L_hit 0")
-    count += 1
+    if cal.params["pack.dram"] > 0 and cal.warm["warm.l2_bytes"] == cal.warm["warm.pack_l2_bytes"]:
+        if preds(host.Calibration(v11d, host.load())) != preds(None):
+            raise Fail("the shipped calibration's v11 view does not predict as NULL")
+        count += 1
     return count
 
 
