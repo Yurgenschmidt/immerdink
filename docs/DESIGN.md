@@ -1,4 +1,4 @@
-# immerdink — design (v1.13)
+# immerdink — design (v1.14)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -46,6 +46,11 @@ count of k̂ ∈ (j·131008, j·131056] changes (+1); changed text is marked **[
 k > 96 and 16 otherwise (a pure function of k), pack format 2 for A = 64, the resolved
 alignment in `imd_lowering_t` (host API 9) and a test hook to force A. Results stay
 bit-identical.
+v1.14 makes the packs' residue step branch-free (§3.4.1): every pack emitter holds |a'| as
+W(N) u32 words (W = 2 for N ≤ 16, 3 for N = 17–20, a per-plan template parameter) and
+reduces it with byte weights, so the ε > 0 multiply, its per-thread branch and its
+lane-divergent table load are gone. The int8 bytes are identical: no semantic, layout,
+pack-format, API, calibration-format or TLA+ change; changed text is marked **[v1.14]**.
 The change lists are at the end.
 
 Sources:
@@ -208,6 +213,95 @@ Why we deviate:
   matters.
 - The int8 store is correct only because `p_l ≤ 256` **[spec: OzakiCRT neg_resbits_p9,
   neg_resbits_p9_store]**.
+- **[v1.14]** The packs (K2/K3, KF, KL, `imd_pack`) compute the same class without the
+  `2^ε mod p_l` table: `SMod(Σ_i b_i·(2^(8i) mod p_l) mod p_l, p_l)` over the bytes `b_i`
+  of `|a'|`, then the sign (§3.4.1).
+
+### 3.4.1 [v1.14] The pack emitter's residue: |a'| as W words (branch-free ε) **[cert: cert_pack_words]**
+
+The pack emitter (`PackEmitterT<E, W>`, src/kernels/pack_emitter.cuh) converts E ∈ {16, 8, 4}
+consecutive k̄ of one row and stores, per modulus, their E int8 residues. It is the only
+residue code of K2/K3 (`k23_pack`), KF (`kf_scale_pack`), KL (`kl_scale_pack`) and so of
+`imd_pack` (KL). Up to v1.13 it reduced μ by byte weights and then, when any of the thread's
+E elements had ε > 0, multiplied by `pow2_mod[l][ε]` and reduced again. That made a warp
+diverge whenever one of its elements had ε > 0, and the table load was serialized across
+the lanes' distinct ε. The cost depended on the data (§6c "The eps path").
+
+**Rule.** The emitter holds `X = |a'| = μ·2^ε` exactly, as `W(N)` little-endian u32 words:
+- `W(N) = 2` for N ≤ 16 and `W(N) = 3` for N = 17–20. **[cert: cert_pack_words]**
+  `T(N) < 2^(32·W(N))` for every N: `⌊log₂T⌋ + 1` = 63 bits at N = 16 and 78 at N = 20
+  (`kPackXBits2 = 63`, `kPackXBits3 = 78`, `kPackW2MaxN = 16`, generated into constants.hpp).
+  W = 1 would do for N ≤ 8 (T < 2³²); it is not used (one more instantiation for one
+  `dp4a` per residue).
+- **Precondition `|a'| ≤ T(N)`**, for RN and TRUNC: each entry is bounded by the row's
+  norm, `|a'_h| ≤ ‖a'‖₂ ≤ T` (§3.2 guarantee, **[cert: cert_shift_rule_guarantee; spec:
+  OzakiScaling]**). cert_pack_words also checks it directly with the §3.2 rule (`shift_u`,
+  the product's `largest_u`) on the rows that maximize ε: one nonzero entry, subnormal
+  entries down to 2⁻¹⁰⁷⁴ (μ = 1, ε up to `eps_max(N)`), dominant entries and random rows,
+  for both roundings and every N. So `bitlen(μ) + ε ≤ kPackXBits[W]` and no bit of X is
+  lost. A debug build asserts this on the device (no NDEBUG; the unit test
+  `pack_emitter` always runs with it).
+- **Construction** (once per element, in `load`, after the unchanged §3.3 `quantize`):
+  W = 2: `X = μ << ε` as one u64. W = 3: the two words of μ shifted by `b = ε mod 32` with
+  `__funnelshift_l`, then placed by `q = ⌊ε/32⌋ ∈ {0, 1, 2}` with selects (static indices
+  only, no local memory). Zero, ±0 and non-finite elements give X = 0 (as μ = 0 before).
+  For N ≤ 13 normal inputs always have ε = 0 (T < 2⁵¹ < 2⁵³ ≤ the smallest μ·2^ε with
+  ε > 0 and a 53-bit μ), so X = μ; there is one emitter for every N, no N ≤ 13 special case.
+- **Residue** of modulus l: `s = Σ_{j<W} dp4a(X_j, w_j(l))`, where the u8 lanes of the
+  weight word `w_j(l)` are `2^(8(4j+i)) mod p_l`, i = 0..3, for the bytes 0..9 of X
+  (bytes 10 and 11, the top lanes of `w_2`, have weight 0; X < 2⁷⁸ keeps them zero anyway).
+  Then `s ≡ X (mod p_l)` and `s ≤ 10·255·255 < 12·255² < 2²⁰`.
+  `r = s − p_l·umulhi(s, ⌈2³²/p_l⌉)` is the non-negative `s mod p_l` for every s < 2²⁴
+  (the A5 `mod_p_bytes32` lemma: s·e < 2³² for e = ⌈2³²/p⌉·p − 2³² < p ≤ 256;
+  `mod_p_words32<W>`, device/modp.hpp). For p = 256 the weights are 1, 0, 0, …, so s is
+  the low byte and the quotient is 0.
+- **Sign and SMod** as before (A5): `SMod(r)`, negated for a' < 0 (SMod(−r mod p) =
+  −SMod(r) for odd p; both give the byte (−r) mod 256 for p = 256).
+- **The weights** (`PackWeights`, src/device/residue.hpp, `__constant__ c_pack_weights`) are
+  derived at compile time from the generated `pow2_mod` table (e = 0..72 ≤ kEpsMax = 77,
+  `static_assert(kEpsMax >= 72)`): no new generated table, about 12 bytes per modulus.
+- **Bytes.** X and μ·2^ε are the same integer and `s ≡ X`, so `r` is `|a'| mod p_l`, the
+  value the v1.13 emitter computed: every stored int8 is unchanged. No pack-format,
+  layout, launch-shape or API change.
+
+**W per plan: a template parameter.** Every pack kernel is instantiated for W = 2 and
+W = 3, and the launch picks the instantiation from the plan's N (`pack_words(N)`). A
+warp-uniform runtime branch on W was the alternative: the kernel's register allocation would
+then be W = 3's at every N (the exploration measured W = 3 everywhere 5–8 % slower at
+N ≤ 16). Cost of the templates, measured (Release, sm_89): see the changelog entry **v1.14**
+(contract.cu compile time and `libimmerdink.so` size, before and after).
+The occupancy query for the performance model (`kernel_occupancy`, §6c) reports the
+W = 3 instantiation of each pack kernel (the model is unchanged in v1.14; §6c).
+
+**Per-residue cost.** W `dp4a`, one `umulhi`, one multiply-subtract, SMod and the sign: the
+same instruction stream for every element and every data. No ε registers (16 fewer live
+registers at E = 16, W = 2), no `has_eps` test per modulus, no table load indexed by a
+per-lane ε. Measured in the exploration (eval findings followup-branchfree, standalone
+reproduction of the emitter): 2.5–3× fewer ps per residue on the old ε path, 12 % fewer at
+N = 13; the product A/B is in the v1.14 changelog entry.
+
+**Verification.**
+- `spec/params.py` **cert_pack_words**: the W rule and `T(N) < 2^(32W)`; `|a'| ≤ T` and
+  `bitlen(μ) + ε ≤ kPackXBits[W]` on the ε-maximizing rows above, RN and TRUNC, every N
+  (with the largest ε reached reported per N); the weight bytes `2^(8i) mod p` for i ≤ 9
+  within `pow2_mod`; `s_max < 2²⁰ ≤ 2²⁴`; the exact `umulhi` quotient for every s < 2²⁴ of
+  every modulus (the e·2²⁴ < 2³² bound) and `Σ b_i w_i ≡ X` on random X of every bit length.
+- `tests/test_mod_exhaustive.cpp` (CPU, the kernels' own `modp.hpp` code): the reduction
+  over the whole range [0, 12·255²] for every modulus; `mod_p_words32<2>` / `<3>` against
+  `X mod p` on edge values and 2²⁰ random X < 2⁶³ / 2⁷⁸ per modulus; the weight table.
+- `tests/test_pack_emitter.cu` (GPU, `pack_emitter`): the emitter itself for E = 16, 8, 4
+  and W = W(N), every N, every ε in 0..eps_max(N) with μ of every bit length allowed by
+  X ≤ T(N) (both word selects q = 1, 2 at N = 17–20; every shift up to 62 at N = 16),
+  ±T, T − 1, 2⁵³ ± 1, 2⁶³ − 1 (N = 16), 2⁶⁴ (N = 17), mixed ε in one warp, RN and TRUNC
+  rounding paths, negative values, zeros and non-finite entries, against an exact host
+  reference (u128 `|a'| mod p`, then SMod and the sign); debug asserts on.
+- `tests/test_contract.py` suite `eps` (GPU, bit-exact vs spec/oracle.py on every launch
+  path of `run_case`: KF E = 16 / E = 4, K2/K3 with moduli parts, KL E = 8 / E = 4): rows of
+  subnormals scaled to ε ∈ [32, 77] at N = 17–20 and up to 62 at N = 16, ε > 0 at N ≤ 13
+  (subnormals), dominant entries, TRUNC; and `test_packed.py` cases of the same data
+  (`imd_pack`, every byte). compute-sanitizer memcheck on a few of them.
+- No TLA+ change: single-thread arithmetic on one element; no protocol, layout, lowering
+  or pack-format change.
 
 ### 3.5 Per-modulus INT8 GEMM with modular epilogue
 - Split canonical k̄ into chunks `c = 0, 1, …` of length `K_c'`. The last chunk may be
@@ -2633,6 +2727,11 @@ BURST or an explicit `clock_mhz`; under SUSTAINED the eps work also changes the 
   identifies op_eps on the same plans with different data (`imd_bench --data dominant`), not
   only through N. Consequence: with the default f, doubling k can lower the predicted time
   (f falls from 1 to 0 as k grows); never below the time without the eps terms (tested).
+  **[v1.14]** The kernels no longer have an eps path (§3.4.1): the pack cost no longer
+  depends on the data. The model is unchanged in v1.14 (`eps_fraction`, `eps_s`, the
+  `op_eps` features and the D-ramp default stay, so its predictions at N ≥ 15 and for
+  dominant-entry data are now high by up to the eps terms); a later calibration change
+  retires them.
 - **K4's DRAM term.** The operands of a group were just written by the packs and stay in L2
   while the group's operands and W planes fit; beyond that K4 streams them from DRAM
   (measured memory-bound: r_mm-like n̂ = 64–128 with long k, skinny m ≫ n). The calibration
@@ -4234,3 +4333,21 @@ and host API; every value the same integer (bit-identical, tested on every contr
   header comment states that it is not a DIRECT plan's pack key. Doc notes: the Python
   `calib=None` exception change and the broken-shipped-calibration path being unreachable
   in a CMake build (§6c.3, changelog above); `perf_fit.py` `--notes ""` / `--version ""`.
+
+## v1.14 (branch-free ε in the pack emitter; no semantic, layout, launch-shape, pack-format, API, calibration-format or TLA+ change)
+
+- **§3.4 / §3.4.1.** The pack emitter (K2/K3, KF, KL, `imd_pack`) holds |a'| = μ·2^ε as
+  W(N) u32 words (W = 2 for N ≤ 16, 3 for N = 17–20) and reduces it with byte weights
+  2^(8i) mod p (bytes 0..9) by W `dp4a`, one `umulhi` and one multiply-subtract; the
+  `pow2_mod` multiply for ε > 0, its per-thread branch and its lane-divergent table load are
+  gone. Same int8 bytes (same congruence class).
+- **Kernels.** `PackEmitterT<E, W>` moved to src/kernels/pack_emitter.cuh; `k23_pack`,
+  `kf_scale_pack` and `kl_scale_pack` take W as a template parameter, chosen per plan from
+  N (`pack_words`). `PackWeights` / `c_pack_weights` (derived from `pow2_mod`) and
+  `mod_p_words32<W>` (device/modp.hpp) are new; `ByteWeights` / `mod_p_bytes32` stay for the
+  exhaustive test of A5's reduction.
+- **Certificates.** New `cert_pack_words`; generated constants `kPackW2MaxN`, `kPackXBits2`,
+  `kPackXBits3`, `kPackWeightBytes`.
+- **Tests.** `mod_exhaustive_cpu` widened to [0, 12·255²] and `mod_p_words32`; new GPU unit
+  test `pack_emitter`; new contract suite `eps` and packed cases with ε-heavy data.
+- **Performance model.** Unchanged (§6c "The eps path", [v1.14] note).
