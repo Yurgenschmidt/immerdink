@@ -174,7 +174,9 @@
  ],
  "generator": "spec/params.py",
  "k_align": "16",
+ "k_align_pad": "64",
  "k_chunk_align": "64",
+ "k_pad64_min": "96",
  "moduli": [
   "256",
   "255",

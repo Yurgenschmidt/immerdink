@@ -186,6 +186,36 @@
 (*                                       r..n̂−1 past the residue region)   *)
 (*   neg_packed_in_flight  NoStaleRead  (imd_pack still running: the       *)
 (*                                       caller's RAW edge is necessary)   *)
+(*   v1.13 §4b stage 2 (designed): A = 64 plans, AlignK = TileK = 8 =     *)
+(*   4·AlignN (64 = 4·16 really; AlignWS 32 = 4·TileK as 256 = 4·64),      *)
+(*   ChunkLen = 8 (131008: a multiple of TileK), k = 9: k̂ = 16, i.e. 7    *)
+(*   padding columns, 6 of them beyond the old quantum ⌈9⌉_2 = 10, and two *)
+(*   K-chunks (the second ends at k̂). Every model above has AlignK =      *)
+(*   AlignN (A = 16). Added invariants EveryRowByteWritten and             *)
+(*   RowPhaseAlignedK4 (= RowPhaseAligned(TileK)). GemmAligned with        *)
+(*   AlignK = 8 checks the operand pointers at the 64-byte analog.         *)
+(*   pos_a64_g2          K2/K3, g = 2, z split (MaxZ = 1)                  *)
+(*   pos_a64_batch2      b = 2, m = 2, n = 1, g = 2, MaxZ = 3              *)
+(*   pos_a64_ysplit      the n̂ split: TileN = 2, MaxY = 1 (two y launches) *)
+(*   pos_a64_fused       KF with two moduli parts, m = n = 1               *)
+(*   pos_a64_large       KL for A and B, g = 1                             *)
+(*   pos_a64_packed_a / _b / _both  format-2 packs (B: the k̂-wide tail)    *)
+(*   pos_a64_forced_small  k = 3 forced to A = 64 (k̂ = 8, one chunk), KF   *)
+(*   neg_a64_pad_old        NoStaleRead          K2/K3 pad A and B only to *)
+(*                                               ⌈k⌉_AlignN                *)
+(*   neg_a64_pad_old_k3 / _kf / _kl  EveryRowByteWritten  the B side only  *)
+(*                          (K3, KF's B rows, KL_B): NoStaleRead still     *)
+(*                          holds (A is zero there) but K4 reads bytes     *)
+(*                          nothing wrote (initcheck)                      *)
+(*   neg_a64_pack_pad_old   EveryRowByteWritten  imd_pack pads to the old  *)
+(*                                               quantum, B in-line        *)
+(*   neg_a64_pack_pad_old_both  NoStaleRead      the same, both packed     *)
+(*   neg_a64_pack_tail_old  AccessesSafe         the tail sized with the   *)
+(*                                               old k̂: the B role reads   *)
+(*                                               past the residue region   *)
+(*   neg_a64_chunk_old      RowPhaseAlignedK4    K_c' = 14 ≡ 6 mod 8 (the  *)
+(*                          131056 ≡ 48 analog): chunk 0's residue tile    *)
+(*                          shifts its main loop (constant-level)          *)
 (* (GemmAligned, RegionsAligned, LaunchGridOK, LaunchGridYOK, LayoutExact *)
 (*  are constant-                                                          *)
 (*  level; TLC reports them as "The invariant of X is equal to FALSE".)   *)
@@ -194,4 +224,9 @@ EXTENDS Pipeline
 
 WsExact  == WorkspaceSize          \* ON the boundary ws_bytes >= workspace_size
 WsMinus1 == WorkspaceSize - 1      \* boundary + 1
+
+\* v1.13 §4b: K4's threadblock K tile, 64 int8 really, scaled with AlignN
+\* (16 -> 2) to 8; the stage-2 models set AlignK = TileK (A = 64 plans).
+TileK == 8
+RowPhaseAlignedK4 == RowPhaseAligned(TileK)
 =============================================================================

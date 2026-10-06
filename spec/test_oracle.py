@@ -1401,6 +1401,90 @@ def test_packed():
     RESULTS["packed"] = ", ".join(f"{k} {v}" for k, v in stats.items())
 
 
+def test_k_align():
+    """DESIGN v1.13 §4b stage 2 (designed; the library still runs A = 16): the oracle's
+    k-alignment rule equals params.py's; format-2 layouts equal params.pack_layout; a
+    format-2 pack holds format 1's sigma, flags and residues at row stride ceil(k)_64 with
+    zero K padding and a zero tail; contractions through format-1 or format-2 packs (A, B,
+    both; across the AUTO threshold and forced) are bit-identical to the in-line run (A
+    changes no value); the key's FORMAT word is the format; a pack whose A differs from the
+    plan's is MISMATCH_FORMAT, which under AUTO cannot happen (pack and plan resolve A from
+    the same k) and is reached only by forcing A (the library's test hook)."""
+    import params as pp
+    for k in range(0, 1500):
+        for pol in ("A16", "AUTO", 16, 64):
+            assert o.k_align_of(k, pol) == pp.k_align_of(k, pol), (k, pol)
+    assert [o.k_align_of(k, "AUTO") for k in (0, 1, 96, 97, 10**9)] == [16, 16, 16, 64, 64]
+    for fmt in (o.PACK_FORMAT_A16, o.PACK_FORMAT_A64):
+        for N in (2, 9, 20):
+            for b in (0, 1, 3):
+                for r in (0, 1, 17, 32):
+                    for k in (0, 1, 5, 16, 96, 97, 144, 131057):
+                        regs, total = o.pack_layout(b, r, k, N, fmt)
+                        pregs, ptotal = pp.pack_layout(b, r, k, N, fmt)
+                        assert total == ptotal and {nm: (off, nb) for nm, off, nb in pregs} == regs
+    rng = random.Random(1131)
+    i, j, kk, l = 1, 2, 3, 4
+    n_runs = n_mis = 0
+    for k in (2, 5, 33, 96, 97, 112, 113, 144, 145, 200):
+        N = rng.choice((2, 3, 9))
+        rnd = rng.choice(("RN", "TRUNC"))
+        X = o.Desc([3, k, 2], [2 * k, 1, k], [i, kk, l])     # X[i, k, l]
+        Y = o.Desc([k, 5, 2], [1, k, 5 * k], [kk, j, l])     # Y[k, j, l]
+        Cd = o.Desc([3, 5, 2], [5, 1, 15], [i, j, l])
+        TX, TY, TC = tensor_for(X, rng, 0.05), tensor_for(Y, rng), tensor_for(Cd, rng)
+        try:
+            plain = o.contract_tensor(TX, TY, TC, -0.5, 1.25, N, rnd, 2)
+        except o.NotSupported:                               # RN kappa >= T at N = 2
+            continue
+        pdX = o.PackDesc(X, N, rnd, o.ORDER_AUTO, [kk], [l])
+        pdY = o.PackDesc(Y, N, rnd, o.ORDER_AUTO, [kk], [l])
+        v1 = o.pack_lower(pdX, o.PACK_FORMAT_A16)
+        d1 = o.pack(TX, pdX, fmt=o.PACK_FORMAT_A16)
+        for pol in ("A16", "AUTO", 16, 64):
+            fmt = o.pack_format_for(k, pol)
+            A = o.PACK_FORMAT_ALIGN[fmt]
+            vX, dX = o.pack_lower(pdX, fmt), o.pack(TX, pdX, fmt=fmt)
+            dY = o.pack(TY, pdY, fmt=fmt)
+            assert vX.format == fmt and vX.key[0] == fmt and vX.k_hat == -(-k // A) * A
+            assert vX.key[1:] == v1.key[1:]            # only the FORMAT word depends on A
+            # same sigma / flags / residues as format 1; zero K padding, tail and gaps
+            for lam in range(vX.b):
+                assert o.pack_rows(vX, dX, lam, vX.r) == o.pack_rows(v1, d1, lam, v1.r)
+            ro, plane = vX.regs["res"][0], vX.b * vX.r * vX.k_hat
+            for lidx in range(N):
+                for row in range(vX.b * vX.r):
+                    base = ro + lidx * plane + row * vX.k_hat
+                    assert all(x == 0 for x in dX[base + k:base + vX.k_hat]), "K padding"
+            tail0 = ro + N * plane
+            assert all(x == 0 for x in dX[tail0:]), "tail and gap"
+            for packs in (((pdX, dX), None), (None, (pdY, dY)), ((pdX, dX), (pdY, dY))):
+                pk = tuple(o.PackedOperand(p[0], p[1], fmt) if p else None for p in packs)
+                got = o.contract_tensor(TX, TY, TC, -0.5, 1.25, N, rnd, 2, packs=pk, k_align=pol)
+                assert all(same_bits(a, c) for a, c in zip(got, plain)), (k, pol, packs is None)
+                n_runs += 1
+        # pack and plan alignments differ: only by forcing one of them (the test hook)
+        for pack_pol, plan_pol in (("AUTO", 16), ("AUTO", 64), (16, "AUTO"), (64, "AUTO"), (16, 64)):
+            pf = o.pack_format_for(k, pack_pol)
+            want = o.MISMATCH_FORMAT if pf != o.pack_format_for(k, plan_pol) else 0
+            try:
+                o.lower_packed(X, Y, Cd, o.EMULATE, (pdX, None), N, rnd, fmts=(pf, None),
+                               k_align=plan_pol)
+                got = 0
+            except o.PackMismatch as e:
+                got = e.reason
+            assert got == want, (k, pack_pol, plan_pol, got)
+            n_mis += want != 0
+        # under AUTO the pack and the plan always agree (both resolve A from the same k)
+        o.lower_packed(X, Y, Cd, o.EMULATE, (pdX, pdY), N, rnd,
+                       fmts=(o.pack_format_for(k, "AUTO"),) * 2, k_align="AUTO")
+    assert n_runs > 90 and n_mis > 10, (n_runs, n_mis)
+    # the logical k feeds kappa and the error estimates; nothing there sees A (DESIGN §4b)
+    for k in (97, 1000):
+        assert o.ceil_sqrt(k) == pp.kappa(k)
+    RESULTS["k_align"] = f"{n_runs} packed contractions over formats 1/2 bit-exact, {n_mis} FORMAT mismatches"
+
+
 def check_fusion(v, g):
     """§5 step 9 on group g of view v: the fused modes split the canonical order into
     consecutive runs; each run is a chain (s_X(q) = s_X(p) e(p) for every tensor X), runs
@@ -1516,14 +1600,15 @@ def main():
                      ("stats (6)", test_stats),
                      ("dgemm-like (7)", test_dgemm_like), ("tensor front end (8)", test_tensor),
                      ("lazy lowering (9)", test_lazy_lower),
-                     ("packed operands (10)", test_packed)):
+                     ("packed operands (10)", test_packed),
+                     ("k alignment (11, v1.13 §4b)", test_k_align)):
         t1 = time.time()
         fn()
         print(f"PASS  {name:24s} {time.time() - t1:7.1f}s", flush=True)
     hi, hi_rn, lo = sigma_extremes()
     print()
     print("moduli source:", o.MODULI_SOURCE)
-    for key in ("tensor", "packed", "params_crosscheck", "fma_checked", "crt_L128_N17_overflows", "neg_rn_without_kappa",
+    for key in ("tensor", "packed", "k_align", "params_crosscheck", "fma_checked", "crt_L128_N17_overflows", "neg_rn_without_kappa",
                 "rn_boundary_N2_k32041", "sweep_runs", "determinism_runs"):
         print(f"{key}: {RESULTS[key]}")
     print(f"bound tightness: max |emul-exact|/l1-bound = {BOUND_STATS['l1_max_ratio']:.3f}; "

@@ -41,6 +41,11 @@ v1.13 starts §4b, K4 load alignment. Its stage 1 sets the K-chunk length to `K_
 ⌊K_c/64⌋·64` (it was 131056), so every full chunk is a whole number of K4's 64-wide K tiles.
 Results stay bit-identical; there is no layout, pack format or API change. Only the chunk
 count of k̂ ∈ (j·131008, j·131056] changes (+1); changed text is marked **[v1.13]**.
+§4b also holds the final design of **stage 2** (designed, not yet implemented; marked
+**[stage 2]**): `k̂ = ⌈k⌉_A` as row stride and GEMM K extent, with `A = 64` iff the logical
+k > 96 and 16 otherwise (a pure function of k), pack format 2 for A = 64, the resolved
+alignment in `imd_lowering_t` (host API 9) and a test hook to force A. Results stay
+bit-identical.
 The change lists are at the end.
 
 Sources:
@@ -539,7 +544,8 @@ Properties checked by **[spec: Pipeline]**:
 - int8 `mma.sync.m16n8k32`, `OpMultiplyAddSaturate` (`.satfinite`; measured free against
   the wrapping form, docs/NOTES-A2.md).
 - TN layout: A RowMajor, B ColumnMajor, both K-contiguous. Alignment is 16, hence
-  `k̂ = ⌈k⌉₁₆` and `n̂ = ⌈n⌉₁₆`.
+  `k̂ = ⌈k⌉₁₆` and `n̂ = ⌈n⌉₁₆`. **[stage 2]** `k̂ = ⌈k⌉_A`, A = 64 for k > 96 (§4b: K4's
+  64-byte load phase); 16-byte alignment stays the correctness rule.
 - Persistent CTAs (grid = SMs × occupancy) over the launch's tiles in swizzle-8 order;
   each CTA issues the next tile's cp.async prologue before the current tile's epilogue.
 - Epilogue in registers: each thread reduces its accumulators with §3.5's exact reduction
@@ -617,6 +623,7 @@ Properties checked by **[spec: Pipeline]**:
 
 ```
 align(x) = ⌈x⌉₂₅₆      k̂ = ⌈k⌉₁₆      n̂ = ⌈n⌉₁₆      g ∈ [1, N]
+[stage 2, §4b] k̂ = ⌈k⌉_A,  A = 64 if k > 96 else 16 (k̂ = ⌈k⌉₁₆ for every k ≤ 96)
 
 region      bytes                       contents
 sA          2·b·m                       int16 shifts σ  (A rows)
@@ -651,15 +658,25 @@ neg_resident_ws_vec, neg_resident_reads_ws]**
 
 ---
 
-## 4b. K4 load alignment [v1.13] (stage 1 of a staged plan; NOTES-K4ALIGN)
+## 4b. K4 load alignment [v1.13] (NOTES-K4ALIGN, ROADMAP A6)
 
-**Mechanism (measured; CUTLASS `predicated_tile_access_iterator.h:204-213, 514-523`).**
+**Status.** Stage 0 (one `k_hat_of`) and stage 1 (`K_c' = 131008`) are implemented. Stage 2
+(per-plan K alignment `A ∈ {16, 64}`, resolved from k alone) is **designed here, not yet
+implemented**: this section is its final design (the rulings of the independent review of
+2026-10-05 are binding; the threshold is frozen from the 2026-10-05 sweep). Until the stage-2
+commit every plan and pack has A = 16, `spec/params.py` and `spec/oracle.py` run with
+`K_ALIGN_POLICY = "A16"`, and their AUTO paths are exercised explicitly by the
+certificates and the oracle suite. Text marked **[stage 2]** elsewhere in this document
+describes the designed behaviour.
+
+### 4b.1 Mechanism (measured; CUTLASS `predicated_tile_access_iterator.h:204-213, 514-523`)
+
 - K4 (CUTLASS 2.x, int8 A row-major and B column-major, alignment 16, threadblock K tile 64)
   reads RA/RB rows with row stride `lda = ldb = k̂` (the region and pack bases are
   256-aligned).
 - A launch covers the K-chunk `[k0, k0 + kc)`. It loads the chunk's residue tile
-  (`kc mod 64` elements) **first**. Every later main-loop load of row r therefore starts at
-  phase
+  (`R = ((kc − 1) mod 64) + 1` elements) **first**, at `row + k0`, then full tiles at
+  `row + k0 + R + 64·i`. Every main-loop load of row r therefore starts at phase
 
   `φ(r, c) = (r·k̂ + e_c) mod 64`, where `e_c = k0 + kc` is the chunk end.
 
@@ -676,12 +693,18 @@ neg_resident_ws_vec, neg_resident_reads_ws]**
 
   These cover 2048² and 16384×512, N = 8 and 14. ncu shows more L2 requests and sectors and
   more shared-memory store wavefronts; DRAM reads are flat.
+- **Class 32 is a 128-byte line crossing (measured, ncu, 64×64, 2048², N = 8):** at
+  k̂ = 1056 one 64-byte segment in four starts at offset 96 of a 128-byte line, which
+  predicts +25 % L2 requests at an unchanged sector count; measured +27 % requests, sectors
+  1.000× per k, tensor pipe 46 → 38.5 %, time per k 1.22×. Class 16 (k̂ = 1040) reproduces
+  the 128×256 pattern (1.91× requests, 1.51× sectors per k).
 - Two facts are measured but **not** explained by the phase rule:
   - class 48 is 5–15 % slower than class 16, although both have the same set of phases;
   - the sector multipliers are 1.5× with half of the rows misaligned and 2.0× with all of
     them (a 64-byte segment touching 3 sectors instead of 2 predicts at most 1.5×).
 
-**Stage 1 (this version): `K_c' = ⌊K_c/64⌋·64 = 131008`** **[cert: cert_kc, cert_row_phase]**.
+### 4b.2 Stage 1 (implemented): `K_c' = ⌊K_c/64⌋·64 = 131008` **[cert: cert_kc, cert_row_phase]**
+
 - Every full chunk has `k0 ≡ kc ≡ 0 (mod 64)`, so its phase is `r·k̂ mod 64`. With 131056
   it was `r·k̂ + 48·(c+1)`. The last chunk ends at k̂ and does not depend on K_c'.
 - The phase class therefore depends on k̂ alone, and no chunk gets worse:
@@ -710,20 +733,311 @@ neg_resident_ws_vec, neg_resident_reads_ws]**
   - Odd multiples of 16 (196624, 262160): unchanged within 2 %.
   - Window cases (k̂ = 131040 and 131056, now two chunks): the call is unchanged within
     1 %; K4 changes by −2 to +3 %.
-
-**Later stages (not in v1.13 stage 1; DESIGN text before code, review 2026-10-05):**
-- Stage 0, done with stage 1, is a refactor with no behaviour change. `k̂ = ⌈k⌉_A` has one
+- Stage 0 (done with stage 1) is a refactor with no behaviour change: `k̂ = ⌈k⌉_A` has one
   definition, `k_hat_of(k, A)`, in libimmerdink_host (`src/host/k_hat.hpp`), mirrored by
-  `spec/params.py k_hat_of`. A = 16 for every plan.
-- Stage 2: `k̂ = ⌈k⌉_A` with A ∈ {16, 64}, a pure function of k
-  (`A = 64 iff k > K_PAD64_MIN`, the threshold frozen from a sweep).
-  - k̂ is both the row stride and the GEMM K extent, with a zero tail.
-  - It adds no `imd_options_t` field. A test hook forces A, and `imd_lowering_t` reports
-    the resolved alignment (additive, host API 9).
-  - The pack format word carries A (1 = A16, 2 = A64).
-  - Padding only the stride while the K extent stays ⌈k⌉₁₆ is **rejected**: with the
-    residue tile loaded first, it misaligns every row of every full chunk.
-- The W/n̂ stride (`ldw = n̂`, ≡ 16 mod 32 possible) is excluded here and unmeasured.
+  `spec/params.py k_hat_of`.
+
+### 4b.3 Stage 2: the rule **[stage 2]** **[cert: cert_k_align; spec: K4Align, Pipeline RowPhaseAligned, EveryRowByteWritten; PackedOperand]**
+
+```
+A(k)  = 64  if k > K_PAD64_MIN = 96      (AUTO; k = the logical contraction length after
+        16  otherwise                     §5 lowering, the k of imd_lowering_t)
+k̂     = ⌈k⌉_A                            row stride of RA, RB and the packed residues,
+                                          AND the GEMM K extent K4 runs (zero tail)
+K_c'  = 131008                            (stage 1)
+```
+- **A is a pure function of k.** It does not depend on N, g, the shape, the device, the
+  data, the calibration or any option. A plan and a pack of the same k always resolve the
+  same A, so a packed plan and its pack never disagree (PackedOperand `AutoFormatsAgree`).
+  `K_PAD64_MIN` is defined in `spec/params.py` and generated into `constants.hpp`
+  (`kKPad64Min`, with `kKAlignPad = 64`).
+- **Why it fixes the loads.** With `k̂ ≡ 0 (mod 64)` every row starts on a multiple of 64
+  (bases are 256-aligned; every row start is base + an integer times k̂, including the z0
+  batch offset of a gridDim.z part, the j0 row offset of a gridDim.y part, the plane offset
+  `g₀·b·r·k̂` of a residue group in a pack and the B role's rows past r); every full chunk
+  starts and ends on a multiple of 64 (stage 1); the last chunk ends at k̂. So every load in
+  CUTLASS's residue-first order is 64-aligned, residue tile included. K4Align checks this on
+  the explicit address sequence; `cert_k_align` at the real values (k up to 524033, bases,
+  z0 and j0 offsets).
+- **What does not change** (`cert_k_align`): the launch structure. K_c', KF's and KL's tile
+  lengths (powers of two ≥ 64) and the K4 tile are multiples of 64, so `⌈x/t⌉` is the same
+  for x = ⌈k⌉₁₆ and ⌈k⌉₆₄: `k_chunks`, the K4 main-loop iterations per chunk, the KF / KL
+  decisions (`k̂ ≤ 1024 ⇔ k ≤ 1024`), KL's tile and chunk count `nc`, and (k > 64) KF's tile
+  `tk = pow2 ≥ k̂`. The K4 MMA work is the same too: CUTLASS computes a chunk's residue tile
+  as a full 64-wide zero-filled tile either way. A changes only **bytes**: per residue row,
+  `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆ ∈ {0, 16, 32, 48}` more bytes are written by the producers and read by
+  K4. Relative to ⌈k⌉₁₆ that is at most **1/3** (k = 129…144, ⌈k⌉₁₆ = 144 → 192), at most
+  48/1040 = 4.6 % for k > 1024, and 0 for ⌈k⌉₁₆ ≡ 0 mod 64. (The threshold note's "43 % at
+  k = 97–112" is an arithmetic slip: k = 97…112 pads 112 → 128, +14 %.)
+- **Why 96** (sweep 2026-10-05, immerdink-eval `findings/k4align-threshold.md`; k = 16…1024
+  step 16, N ∈ {8, 14}, 2048², 16384×512, a DF-like `Qia,Qjb->iajb` (2304² × Q), 512²; A = 64
+  emulated by running ⌈k⌉₆₄ and counting the logical 2mnk):
+  - k̂ ≤ 64 has no main loop (only the residue tile), so padding is pure cost there
+    (k = 16 → 64: −6 to −12 %; k = 32: −1 to −9 %; k = 48: about 0). Hence K_PAD64_MIN ≥ 64.
+  - Mean call-time loss against the per-k best choice, over the 8 shape × N cases and all
+    k: 96 → 0.30 %, 128 → 0.35 %, 64 → 0.36 %, 192 → 0.47 %, 512 → 1.30 %, never pad →
+    3.80 %. 96 is the per-case optimum in 5 of 8 cases and within 0.03 pp in 7 of 8 (the
+    exception, 16384×512 at N = 14, prefers 288 and loses 0.25 pp).
+  - Against never padding, 96 makes the average call over k = 16…1024 +2.8 to +5.6 %
+    faster (useful TFLOPS-eq). Example, 2048², N = 14: k = 1008 runs at 18.24 instead of
+    15.70 TFLOPS-eq (0.464 instead of 0.539 ms, +16 %); k = 112: +3.4 %.
+  - The worst single-k loss under 96 is 2.3–6.8 % on the large shapes (k = 144–208, classes
+    16 / 32 under 128×256) and 10–12 % on 512² (k = 144 / 160, where the rule's
+    configuration changes).
+  - A rule that also looks at k̂ mod 64 reaches 0.26 %; not worth a second parameter.
+- **Rejected:**
+  - *Stride-only padding* (row stride ⌈k⌉₆₄, GEMM K extent ⌈k⌉₁₆): the residue tile of
+    `extent mod 64` elements shifts every main-loop load; with the old K_c' it misaligns
+    every row of every full chunk (K4Align `neg_stride_only`, `neg_partial_landing`:
+    the row and residue-tile starts stay aligned, the main loop does not).
+  - *A = 32 with K_c' = 131040*: leaves class 32 (+3 % on 128×256, +10–19 % on the smaller
+    configurations; `neg_a32`, `neg_kc32`).
+  - *A chosen by the performance model*: sizing must stay GPU-free and independent of the
+    calibration (§6a, §6c); a k-only rule keeps `imd_workspace_size` a closed form.
+  - *An `imd_options_t.k_align` field*: `imd_options_t` has no `struct_size`, so a trailing
+    field is undefined behaviour for version-8 callers (§4b.5).
+  - *A pack override forcing A = 16 for k > 96* (footprint-tight packs): it saves at most
+    1/3 of the residue bytes (≤ 4.6 % for k > 1024) and would need an `imd_pack_desc_t`
+    field. Not now.
+  - *P2, a K4 "realign" variant* (deferred, §4b.10).
+
+### 4b.4 Layout and footprint (exact) **[stage 2]** **[cert: cert_workspace, cert_pack_layout, cert_k_align; spec: Pipeline LayoutExact, PackLayoutExact, AccessesSafe at AlignK = 4·AlignN]**
+
+Every formula of §4a and §6b.4 keeps its form with `k̂ = ⌈k⌉_A`, `A = A(k)`; `n̂ = ⌈n⌉₁₆`
+and the pack tail's row rounding `⌈r⌉₁₆` are unchanged:
+```
+RA             g·b·m·k̂                     RB   g·b·n̂·k̂
+pack res       N·b·r·k̂ + (⌈r⌉₁₆ − r)·k̂      (sig 2·b·r, flag b·r: unchanged)
+k4_tune_bytes  align(g·b·m·k̂) + align(g·b·n̂·k̂) + align(g·b·m·n̂)
+sA sB fA fB vec W: unchanged; every region still at a 256-aligned offset (later offsets
+shift by the aligned difference)
+```
+Against A = 16, with `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆`:
+`ΔRA = g·b·m·δ`, `ΔRB = g·b·n̂·δ`, `Δres = (N·b·r + ⌈r⌉₁₆ − r)·δ`, `Δk4_tune = g·b·(m + n̂)·δ`
+(before the 256-alignment of each region).
+- **A = 16 for k ≤ 96**: every such workspace and pack is byte-for-byte the v1.13 stage-1
+  one. The hand-computed literals of `tests/test_host_c.c` (k ≤ 33) are unchanged; the
+  k = 180² = 32400 case (`test_host_c.c:166`, ≡ 16 mod 64) becomes k̂ = 32448: its sizes
+  change, so its assertions are recomputed, not copied.
+- Hand-computed examples (typed into `cert_workspace` / `cert_pack_layout`):
+  - workspace (m, n, k, b, N, g) = (17, 33, 5, 3, 9, 2), A forced to 64: k̂ = 64, n̂ = 48;
+    RA 6528 at 2048, RB 18432 at 8704, W 22032 at 27136; total **49408** (A = 16: 30720);
+  - (1000, 3, 200, 2, 20, 7), AUTO (200 > 96): k̂ = 256; RA 3584000 at 26112, RB 57344 at
+    3610112, W 640000 at 3667456; total **4307456**;
+  - pack (b, r, k, N) = (1, 1, 1000, 14), AUTO: k̂ = 1024, res 14·1024 + 15·1024 = 29696 at
+    512; total **30208** (format 1: 29952);
+  - pack (3, 17, 5, 9) forced to format 2: res 29376 + 960 = 30336; total **30976** (AUTO:
+    format 1, 8192).
+- **The W / n̂ stride is excluded.** `ldw = n̂` (≡ 16 mod 32 possible) in the K4 epilogue's
+  read-modify-write and in K5 is not changed or measured here. It is a later item of its
+  own; it would need its own pack-format value (the B-role tail depends on ⌈r⌉₁₆), which
+  the format-carries-alignment scheme makes cheap.
+
+### 4b.5 Host API 9, pack format 2, the test hook **[stage 2]**
+
+- **`IMD_HOST_API_VERSION` 8 → 9**, additive only:
+  - `imd_lowering_t` version 6 (192 bytes; v5 is 184) appends `int32_t k_align` (the
+    resolved A: 16 or 64; 0 when `lowered = 0`) and `int32_t reserved6` (0). It is
+    `struct_size`-versioned and "writes only the fields that fit", so v8 callers are
+    unaffected.
+  - **`k_hat` changes meaning**: it is `⌈k⌉_{k_align}` (it was always ⌈k⌉₁₆). Callers that
+    recomputed k̂ themselves must read it instead; sizing goes only through
+    libimmerdink_host (the integration contract, §6a).
+  - `imd_options_t` does not change (no `struct_size`; a deliberate later break may give
+    it one, and then an explicit `k_align` if wanted, before ehrenfest's B2 integration).
+  - `imd_pack_desc_t` and `imd_pack_layout_t` do not change layout. `imd_pack_layout_t
+    .format` reports the pack's format and `.k_hat` its ⌈k⌉_A.
+- **Pack format 2** (§6b.4 with k̂ = ⌈k⌉₆₄). `IMD_PACK_FORMAT_A16 = 1` and
+  `IMD_PACK_FORMAT_A64 = 2` are new constants; **`IMD_PACK_FORMAT` becomes "the newest
+  format this library writes" (2)**, no longer the only one. `imd_pack_create` resolves the
+  pack's A by AUTO(k) of the pack's k, so packs with k ≤ 96 are format 1, byte-identical
+  to every earlier pack, and packs with k > 96 are format 2.
+  - The key keeps its words; word 0 is the format: the pack's own, and for a plan's slot
+    key the format of the plan's resolved A. k is already in the key, so k̂ follows.
+  - **Format 1 stays valid**: nothing that a v9 library would pack as format 1 changes, and
+    a format-1 pack is read by a format-1 plan exactly as before. A pack made by an older
+    library for k > 96 (format 1) is rejected by a v9 plan of that k with PACK_MISMATCH,
+    reason FORMAT: never misread. Pack bytes are not to be persisted across library
+    versions (the integration contract and the release note say so).
+  - The reason codes keep their order; FORMAT is the first key word, so a pack of another
+    k on the other side of K_PAD64_MIN reports FORMAT rather than EXTENTS (rejected
+    either way).
+- **The test hook** `imd_test_set_k_align(int32_t a)`: a test-only export of
+  **libimmerdink_host** (not in a public header; ctypes, like the `imd_test_*` hooks of
+  libimmerdink). `a = 0` restores AUTO; 16 or 64 forces A for every sizing query, lowering,
+  plan and pack created afterwards in the process (an atomic process-global, read once per
+  call; libimmerdink plans call the host library's resolver, so device-side plans follow);
+  anything else returns 1 and changes nothing. It is in the host library because the
+  sizing lives there: a hook in libimmerdink alone would let `imd_workspace_size` and the
+  plan disagree. Setting it between `imd_pack_create` and plan creation is the only way to
+  make a pack and a plan disagree (PACK_MISMATCH FORMAT, tested).
+- **One resolver.** `k_align_of(k)` in `src/host/k_hat.hpp`: the hook if set, else AUTO(k).
+  Every k̂ in libimmerdink_host is `k_hat_of(k, k_align_of(k))`: workspace sizing
+  (`workspace.cpp`), the plan's GEMM view (`analysis.cpp plan_data`), the pack layout and
+  lowering (`pack.cpp`, two sites), `k4_tune_bytes` (`k4_config.cpp`) and the perf model
+  (through the plan's k̂). `spec/params.py k_align_of` / `oracle.k_align_of` mirror it.
+- **Device code: no logic change.** Every kernel already indexes by the plan's k̂ and
+  writes zeros on `[k, k̂)` (KF, K2/K3, KL, the B zero rows, imd_pack; the zero tile:
+  h ≥ k gives μ = 0, residue 0). New asserts: `gemm_k4.cu` `k̂ % 16 == 0` (correctness)
+  and `k̂ % A == 0` (plan contract); the KF launch `(1 << lg_tk) ≥ k̂`.
+- **Python**: `python/immerdink/host.py` mirrors gain the lowering's `k_align` (struct
+  v6) and the format constants; the `planner` fast path (§6e) calls C and follows. A
+  `host.test_set_k_align(a)` helper binds the hook for tests.
+
+### 4b.6 Numerics, accuracy and the performance model **[stage 2]**
+
+- **Bit-identical results for every A.** The zero tail contributes 0 to every product,
+  CRT and add-mod do not depend on the chunking, and A changes no K order. The oracle's
+  in-line path stays values-only; `oracle.pack()` takes the format (`fmt`, default the
+  policy's), `pack_lower`, `pack_layout`, `pack_key` and `lower_packed` take the format /
+  the plan's alignment. `test_oracle` checks contractions through format-1 and format-2
+  packs (A, B, both; k across the threshold, and forced) bit-exact against the in-line run.
+- **Accuracy and κ use the logical k** (§3.2 κ = ⌈√k⌉, §6f `imd_err_*`): identical across
+  A. Test: the `err_*` fields and `kappa` of predict / rank / lowering are the same with
+  the hook at 16 and at 64.
+- **Performance model (§6c).** Its K4 `tile_macs` and byte terms use the plan's k̂ (the
+  padded one: what the GEMM tiles and the bytes actually moved), so throughput must keep
+  counting the **logical 2mnk** (TFLOPS-eq, `bench/summarize.py`, the useful flops of
+  `imd_perf_predict`); the padded k̂ never enters a useful-flop count.
+  - **No calibration format bump.** Format 2's slow-chunk rule ("slow iff k̂ mod 32 ≠ 0",
+    exact since stage 1) stays exact: an A = 64 plan has k̂ ≡ 0 mod 64 (never slow), an
+    A = 16 plan (k ≤ 96) is unchanged. The `perf.cpp:449-456` comments are corrected. θ was
+    fitted on misaligned data; it is **refit** (`tools/calibrate.sh`) after stage 2, and
+    `k4_select`'s preference for 128×256 is re-checked then (the smaller configurations
+    gain the most from A = 64).
+
+### 4b.7 Spec (TLA+, certificates, oracle) **[stage 2]**
+
+- **K4Align** (new, constant-level): CUTLASS's residue-first address sequence is modelled
+  explicitly (residue tile at `start + k0`, then `start + k0 + R + T·i`), with every
+  operand's absolute row start built from the real index arithmetic: §4a region offsets
+  (256-aligned sums, k̂-dependent), z0 batch offsets of gridDim.z parts, j0 row offsets of
+  gridDim.y parts, pack planes per residue group, the B role's rows past r. Invariants:
+  `Aligned16` (every plan), `TileStartsAligned`, `MainLoopAligned` (A = 64 plans),
+  `ExtentOK`, `PadBounded`. Negatives, each failing for its stated reason (the correctness
+  invariants listed first, a companion positive shows each mutant is still correct):
+  `neg_stride_only` and `neg_partial_landing` (MainLoopAligned: the tile starts stay
+  aligned), `neg_kc32` / `neg_kc_old` (131040 / 131056 analogs: MainLoopAligned),
+  `neg_a32` and `neg_base16` (TileStartsAligned); witnesses: A = 16 plans are misaligned,
+  multi-chunk A = 64 plans are reached. Scaled TileK 64 → 8, 16 → 2, 256 → 32, K_c 131071 →
+  23 (K_c' 16, alternatives 20 and 22), K_PAD64_MIN 96 → 12, k = 1…40.
+- **Pipeline**: the stage-2 models set `AlignK = TileK = 4·AlignN` (A = 64 against the
+  16-quantum n̂), k = 9 (k̂ = 16: 7 padding columns, 6 of them beyond the old quantum),
+  K_c' = 8 (two chunks), on every producer path: K2/K3 (`pos_a64_g2`, with z split),
+  batches (`pos_a64_batch2`), the n̂ split (`pos_a64_ysplit`), KF (`pos_a64_fused`), KL
+  (`pos_a64_large`), packed A / B (B-role tail) / both (`pos_a64_packed_*`) and a forced
+  small k (`pos_a64_forced_small`). New invariants: **`EveryRowByteWritten`** (every byte
+  K4 reads, any K position < k̂, any column < n̂, was written in this call or by imd_pack:
+  §4 "every byte the GEMM reads is written", stronger than NoStaleRead) and
+  **`RowPhaseAligned(TileK)`** (CUTLASS's load sequence over Pipeline's own §4a / §6b.4
+  addresses). Negatives: producers padding only to the old quantum (`neg_a64_pad_old`:
+  NoStaleRead; its B-side-only variants on K3, KF and KL: NoStaleRead holds but
+  EveryRowByteWritten fails), imd_pack padding to the old quantum (`neg_a64_pack_pad_old`
+  EveryRowByteWritten, `_both` NoStaleRead), the pack tail sized with the old k̂
+  (`neg_a64_pack_tail_old`: AccessesSafe) and K_c' ≡ 48 (`neg_a64_chunk_old`).
+- **PackedOperand**: the format carries A (format 2 = 4·KAlign); the plan and the pack
+  resolve it by AUTO(k) or the hook. Format-2 positives (σ, W, C equal; the B-role tail),
+  `AutoFormatsAgree`, `FormatMismatchRejected` (hook-forced mismatches are PACK_MISMATCH)
+  and negatives without the key check (an A16 pack read by an A64 plan and the reverse:
+  CEqual).
+- **IndexMap** is unchanged: its single `PadQ` stays (its claims are about the lowering;
+  the mixed quanta of the workspace and pack layout are Pipeline's, at AlignK ≠ AlignN, and
+  `params.py`'s at the real values).
+- **params.py**: `K_PAD64_MIN`, `K_ALIGN_PAD`, `k_align_auto` / `k_align_of(k, policy)`,
+  `PACK_FORMATS`, `pack_format_of`, `k4_load_addresses`; `workspace_size`,
+  `region_offsets` (`k_align=`) and `pack_layout` (`fmt=`) take A; `cert_workspace` and
+  `cert_pack_layout` run over both A with hand-computed A = 64 examples; **`cert_k_align`**
+  (new): AUTO, every CUTLASS load 16-aligned (A16) / 64-aligned (A64) over the boundary k
+  list and 0…1100 with bases, z0 and j0 offsets, each rejected alternative misaligned,
+  launch counts independent of A, the exact footprint deltas and the 1/3 overhead bound.
+  `cert_row_phase` (stage 1) is unchanged.
+
+### 4b.8 Test plan (stage 2; GPU parts only while the machine is otherwise idle)
+
+- **Poisoned workspace over the AUTO range, every producer path** (`test_contract`, new
+  `test_k_align`): fill the whole workspace (and, for packs, the pack buffer before
+  `imd_pack`) with 0xA5, then the call must be bit-exact against the oracle and
+  `compute-sanitizer --tool initcheck` clean:
+  - KF at k ∈ {97, 112, 600, 1000} (A = 64) and k ∈ {33, 96} (A = 16, unchanged);
+  - KL at k ∈ {1040, 4080} (and `imd_test_set_fused(3)`: KL tiles of 64 rows, so rows
+    span several chunks);
+  - K2/K3 (`imd_test_set_fused(0)`) at k ∈ {97, 144, 1040} with g < N (later groups
+    repacked over poisoned slots);
+  - packed A, packed B (role B: the tail, b > 1, j0 > 0 through `imd_test_set_limits`
+    max_n_tiles) and both packed, at k ∈ {97, 1000};
+  - two chunks: k ∈ {131009, 131072} (k̂ = 131072, chunks 131008 + 64) on 512² and a skinny
+    shape, and with `imd_test_set_limits(k_chunk = 64·j)` on small shapes.
+- **Boundary k** for host queries (`test_host.py`, `gen_workspace_vectors.py`, vs
+  `params.py` with `K_ALIGN_POLICY = "AUTO"`): k ∈ {1, 16, 17, 64, 65, 95, 96, 97, 112, 113,
+  128, 129, 144, 145, 1023, 1024, 1025, 1040, 4080, 131008, 131009, 131072, 196608,
+  196624}: `k_hat`, `k_align`, workspace and pack layouts, `k_chunks`, `gemm_launches`,
+  `fused`, `fused_large`, `kernel_launches`, `k4_tune_bytes`, plan bytes. The hook at 16 and
+  64 for the same k.
+- `test_host_c.c`: the existing literals stay (k ≤ 33); new hand-computed cases at k = 200
+  (AUTO 64) and k = 5 forced to 64 (KF tk = 64); the 180² case recomputed.
+- `test_packed`: format-1 and format-2 packs byte-exact against `oracle.pack(fmt)`; packed
+  contractions bit-exact; **PACK_MISMATCH FORMAT** when the hook changes between
+  `imd_pack_create` and plan creation (both directions); `imd_pack_layout.format`.
+- `test_contract` / `test_frontend`: every K4 configuration (`imd_test_set_k4_config`) at
+  A ∈ {16, 64} (hook) for k ∈ {1, 16, 17, 48, 97, 1008, 1040, 4080, 196624}, bit-exact; the
+  results of the hook at 16 and at 64 are identical.
+- Accuracy: `err_bound`, `err_typical`, `kappa` identical across A.
+- `compute-sanitizer --tool memcheck` on the last row / batch of RA, RB and the pack at
+  A = 64 (k = 1000, 4080).
+- TLA+ and certificates as in §4b.7; the oracle suite (`test_k_align`).
+- Bench: re-run the threshold sweep's grid on the real implementation (no emulation)
+  and confirm the gains below within noise, then recalibrate (§4b.6).
+
+### 4b.9 Expected gain (sweep, emulated; useful TFLOPS-eq per call, time alongside)
+
+| case | k | A = 16 | A = 64 | gain |
+|---|---|---|---|---|
+| 2048², N = 14 | 1008 | 15.70 TFLOPS-eq (0.539 ms) | 18.24 (0.464 ms) | +16 % |
+| 2048², N = 8 | 1008 | 24.08 (0.351 ms) | 28.23 (0.300 ms) | +17 % |
+| 16384×512, N = 14 | 1008 | 13.03 (1.298 ms) | 15.37 (1.101 ms) | +18 % |
+| DF 2304² × Q, N = 14 | 1008 | 15.63 (0.685 ms) | 18.52 (0.578 ms) | +18.5 % |
+| 2048², N = 14 | 112 | 4.96 (0.189 ms) | 5.13 (0.183 ms) | +3.4 % |
+| 512², N = 8 | 176 | 3.34 (0.0276 ms) | 4.10 (0.0225 ms) | +23 % |
+| 16384×512, N = 14 | 144 | 5.11 (0.473 ms) | 4.79 (0.505 ms) | −6.4 % (worst large-shape case) |
+
+Mean over k = 16…1024: +2.8 to +5.6 % per call against never padding. Larger k (4080 → 4096,
+2048², N = 14, 128×256, measured): 21.0 → 26.2 TFLOPS-eq (+24 %); 64×64 at 4080: +61 %.
+The emulation reads ⌈k⌉₆₄ real columns in KF, so the gains are slightly understated.
+
+### 4b.10 Risks and deferred items
+
+- **Partial landing** (stride padded, extent or K_c' not) is worse than today; the one
+  `k_hat_of(k, k_align_of(k))` site per use, `cert_k_align`, K4Align's negatives and the
+  poisoned-workspace test guard it.
+- **Resolver drift**: any site computing ⌈k⌉₁₆ directly would size or address the wrong
+  rows; there is no such site after stage 0, and the boundary-k host tests compare every
+  reported value with `params.py`.
+- **The process-global test hook** makes host queries depend on test state; it is test-only,
+  atomic, and every test that sets it restores AUTO.
+- **Threshold**: a policy constant, not a format: moving it changes which packs are format
+  2 (the key catches every disagreement), workspace sizes for the moved k, and nothing
+  numerical.
+- **P2, a K4 "realign" kernel (deferred).** A K4 variant that loads the residue tile last
+  (or shifts it into shared memory) would remove the chunk-end term without padding, but
+  still needs the stride padded, needs a custom `MmaMultistage` (ring buffer, wait depth,
+  per-lane ldmatrix offsets) with zero-fill as the only out-of-bounds guard, and its gain is
+  unmeasured. It stays a possible later option for A = 16 plans (k ≤ 96) if that range
+  turns out to matter.
+- **The W / n̂ stride** (excluded, §4b.4) and **an `imd_options_t` `struct_size` break**
+  (with an explicit `k_align` option if wanted) are later items.
+
+### 4b.11 Design questions (open)
+
+1. **Old format-1 packs for k > 96.** This design rejects them (PACK_MISMATCH FORMAT)
+   instead of adopting the pack's format; adoption would make a packed plan's A depend on
+   the pack (and its workspace on the pack descriptor), which the review's "AUTO only" rule
+   avoids. Confirm rejection.
+2. **The hook's home.** The hook is exported by libimmerdink_host (where the resolver is),
+   not by libimmerdink (where the other `imd_test_*` hooks are). Confirm.
+3. **The FORMAT reason for a k straddling K_PAD64_MIN.** The key compares word 0 first, so
+   a pack of k = 96 offered to a plan of k = 97 reports FORMAT, not EXTENTS. Keep the key
+   order (simplest; the pack is rejected either way), or compare the format after the
+   extents for a more specific reason?
 
 ---
 
@@ -1001,7 +1315,7 @@ imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
 const char*  imd_status_string(imd_status_t);
 
 typedef struct {               /* 136 bytes in version 1, 152 in v2 [v1.4], 168 in v3 [v1.5],
-                                  176 in v4 [v1.6], 184 in v5 [v1.7] */
+                                  176 in v4 [v1.6], 184 in v5 [v1.7], 192 in v6 [stage 2] */
   uint32_t struct_size;        /* in: sizeof(imd_lowering_t) as the caller compiled it  */
   int32_t  status, lowered, dispatch, swapped, num_moduli, residue_group, num_groups;
   int64_t  m, n, k, b, n_hat, k_hat, vec_entries, k_chunks, gemm_launches;
@@ -1015,6 +1329,9 @@ typedef struct {               /* 136 bytes in version 1, 152 in v2 [v1.4], 168 
   int32_t  reserved4;          /* version 4: 0 */
   int32_t  packed;             /* version 5 [v1.7]: bit 0 / 1: the caller's A / B packed (§6b) */
   int32_t  pack_mismatch;      /* version 5: IMD_PACK_MISMATCH_* of a PACK_MISMATCH */
+  int32_t  k_align;            /* version 6 [stage 2, §4b]: the resolved A (16 | 64); k_hat =
+                                  ceil(k)_A */
+  int32_t  reserved6;          /* version 6: 0 */
 } imd_lowering_t;
 enum { IMD_DISPATCH_NOOP, IMD_DISPATCH_EMULATE, IMD_DISPATCH_DIRECT, IMD_DISPATCH_SCALE };
 enum { IMD_K4_128x256, IMD_K4_128x128, IMD_K4_64x128, IMD_K4_64x64, IMD_K4_CONFIG_COUNT };
@@ -1090,6 +1407,11 @@ Semantics:
   - **[v1.7] Version 5** appends `packed` and `pack_mismatch` (§6b.5): 0 from `imd_lowering`;
     `imd_lowering_packed` fills them (and every other field for the packed plan). A
     version-4 caller gets exactly the version-4 fields.
+  - **[stage 2] Version 6** (host API 9, §4b.5) appends `k_align`, the plan's resolved K
+    alignment (16, or 64 for k > 96), and `reserved6`. **`k_hat` is ⌈k⌉_{k_align}** from
+    API 9 on (it was ⌈k⌉₁₆): a deliberate, documented change of meaning (review
+    2026-10-05). A caller must take k̂ (and every size) from the library, never recompute
+    ⌈k⌉₁₆: sizing goes only through libimmerdink_host.
   - `dispatch`: NOOP (b·m·n = 0), EMULATE (K0–K5; EMULATE mode, k ≥ 2), DIRECT (K0 + the
     native kernel; DIRECT mode or K-empty), SCALE (k = 0: K0 + the β kernel, §3.7). A call
     with α = 0 also runs only K0 and the β kernel; that is per call, not per plan.
@@ -1098,7 +1420,9 @@ Semantics:
 - **No GPU, no CUDA runtime, no driver.** The functions are **pure** (outputs depend only on
   the arguments; no allocation visible to the caller, no global or static mutable state)
   and **thread-safe** (any number of threads, concurrently with each other and with
-  libimmerdink). They read the descriptor arrays only during the call.
+  libimmerdink). They read the descriptor arrays only during the call. **[stage 2]** The one
+  exception is test-only: `imd_test_set_k_align` (§4b.5), an atomic process-global that
+  tests set and restore; production never sets it.
 - The K4 launch structure used for `k_chunks`, `gemm_launches` and the host bytes is the
   production one (K_c' chunks, 65535 batches, 65535 N-tiles of 256); the test-only
   launch-limit hook changes only libimmerdink's plans. **[v1.5]** It does not depend on
@@ -1118,7 +1442,12 @@ there is no budget option (BENCHMARKS "Residue-group size g" gives the speed sid
   fields it knows; a newer caller's larger struct keeps its unknown trailing fields
   untouched. Callers check `imd_host_api_version() >= ` the version they need.
 - `imd_tensor_t` and `imd_options_t` are §6's; `imd_options_t` has no size field (v1.2 grew
-  it; a further change would need a rebuild, as v1.2 did).
+  it; a further change would need a rebuild, as v1.2 did). That is why stage 2 (§4b) adds
+  no option: its K alignment is a function of k.
+- **Integration contract [stage 2].** Callers size workspaces and packs only through
+  libimmerdink_host (never by mirroring §4a), and never persist pack bytes across library
+  versions (a pack is valid for the library that made it and for any later one with the
+  same format for that k; §6b.5).
 - Internal C++ entry points of the host library (lowering, layout, plan data) are exported
   for libimmerdink and the tests only; they are not in `include/` and carry no ABI promise
   (both libraries are built together).
@@ -1165,7 +1494,7 @@ X's share of KF) and the workspace regions sX, fX, RX. It costs the caller
 Notation: X has three label classes as seen by the pack — **K** (contracted: X's labels not
 in C), **L** (batch: in C and in the partner) and **R** (rows: the rest); `b`, `r`, `k` are
 their extent products after §5 steps 2 and 4 (diagonals merged, extent-1 modes dropped),
-`k̂ = ⌈k⌉₁₆`.
+`k̂ = ⌈k⌉₁₆` (**[stage 2]** `⌈k⌉_A`, A = 64 iff k > 96: the pack's format, §4b.5).
 
 ### 6b.2 What the packed bytes depend on (compatibility analysis)
 
@@ -1235,7 +1564,9 @@ words, computed by `imd_pack_create` from the pack descriptor and by plan creati
 packed slot from its own lowering, and compared **word for word**:
 1. `IMD_PACK_FORMAT` (1): fixes k̂ = ⌈k⌉₁₆, the regions and their alignment, the strides,
    the tail, the zero-padding rule and the moduli table. Bumped by any change to the bytes
-   (e.g. if D4 or E1 needs another K alignment).
+   (e.g. if D4 or E1 needs another K alignment). **[stage 2]** The format word carries the
+   K alignment: 1 = A16 (k̂ = ⌈k⌉₁₆), 2 = A64 (k̂ = ⌈k⌉₆₄); a pack's format is AUTO(k) of its
+   k, a slot key's that of the plan's resolved A (§4b.5).
 2. N and rounding.
 3. b, r, k.
 4. The **FP64 element map**: for each class in the order L, R, K, the fused modes
@@ -1297,7 +1628,8 @@ pack_bytes = Σ align₂₅₆(region) in this order;  0 if b·r·k = 0
 - **K padding is zero** in every pack. Numerically one zero side suffices, but two packed
   operands meet with no in-line partner to supply it **[spec: neg_nopad]**.
 - **Alignment**: k̂ is a multiple of 16, so every row is 16-byte aligned (CUTLASS); the
-  buffer must be 256-byte aligned (MISALIGNED).
+  buffer must be 256-byte aligned (MISALIGNED). **[stage 2] Format 2** is this layout with
+  k̂ = ⌈k⌉₆₄ (k > 96): every row and every K4 load is then 64-byte aligned (§4b).
 - The packed buffer replaces the workspace regions sX, fX and RX of the operand's
   post-swap role: those have 0 bytes in the packed plan's §4a layout (§6b.6).
 
@@ -1449,7 +1781,9 @@ imd_status_t imd_contract_packed(imd_plan_t, double alpha, const imd_operand_t* 
 `IMD_PACK_*` enums and `imd_lowering_t` v5; `imd_pack_desc_t` and `imd_pack_layout_t` carry
 `struct_size` (trailing fields may be added; older callers get what they know). Nothing
 existing changes. The **packed bytes are versioned by `IMD_PACK_FORMAT`**, which is part of
-the key: a pack is valid for any library version with the same format.
+the key: a pack is valid for any library version with the same format. **[stage 2]**
+`IMD_PACK_FORMAT_A16 = 1`, `IMD_PACK_FORMAT_A64 = 2`; `IMD_PACK_FORMAT` becomes the newest
+format written (2), and which format a pack has is a function of its k (§4b.5).
 
 ### 6b.6 Workspace and plan bytes with packed operands
 
@@ -2087,6 +2421,10 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
     own.
   - The calibration format is unchanged (review 2026-10-05). The shipped θ was fitted with
     the old chunk length, and a later step refits it.
+  - **[stage 2]** (§4b.6) The rule stays exact with per-plan alignment: an A = 64 plan has
+    k̂ ≡ 0 mod 64 and is never "slow"; A = 16 plans (k ≤ 96) are unchanged. No format bump;
+    θ is refit after stage 2 and `k4_select` re-checked. The model's K4 and byte terms use
+    the plan's (padded) k̂; useful flops stay the logical 2mnk.
 
 - **The eps path** (the `op_eps` features, reviewed 2026-10-05). The packs quantize an
   element to `μ·2^ε`; a residue costs one more modular multiply when ε > 0, i.e. |a'| ≥ 2⁵³
@@ -3445,3 +3783,34 @@ and host API; every value the same integer (bit-identical, tested on every contr
   Int32Chunk change; no TLC model changes. `params.cert_row_phase` (new) covers the boundary
   k list and the 131008 / 131056 windows. Lean `Chunk.lean` (≤ 131056) covers 131008
   a fortiori and was not re-instantiated.
+
+## v1.13 stage 2 (designed, not yet implemented: per-plan K alignment; host API 9, pack format 2; no semantic change)
+
+- **§4b (final design, replacing the draft).** `k̂ = ⌈k⌉_A` is the row stride and the GEMM
+  K extent of every residue row, with `A = 64` iff the logical k > `K_PAD64_MIN = 96`
+  (frozen from the 2026-10-05 threshold sweep: mean call-time loss 0.30 % against the
+  per-k best, +2.8 to +5.6 % per call against never padding), else 16. A pure function of
+  k: no option, no calibration, no device. Every K4 load of an A = 64 plan is 64-aligned
+  (with K_c' = 131008 and 256-aligned bases); launches, MMA work and results are unchanged;
+  per residue row `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆` more bytes (≤ 1/3 relative, at k = 129…144; ≤ 4.6 %
+  for k > 1024). All review rulings of 2026-10-05 are folded in (§4b.3–§4b.10).
+- **§4a, §6b.4.** The layout formulas with `k̂ = ⌈k⌉_A`; byte-identical for k ≤ 96. Format 2
+  = the format-1 layout at k̂ = ⌈k⌉₆₄.
+- **§6a / §6b.5 (host API 9, additive).** `imd_lowering_t` v6: `k_align`, `reserved6`
+  (192 bytes); `k_hat` means ⌈k⌉_{k_align}. `IMD_PACK_FORMAT_A16 = 1`,
+  `IMD_PACK_FORMAT_A64 = 2`, `IMD_PACK_FORMAT` = the newest format (2); a pack's format is
+  AUTO(k); the key's word 0 is the format (the plan's for a slot key). No `imd_options_t`,
+  `imd_pack_desc_t` or `imd_pack_layout_t` layout change. The test-only hook
+  `imd_test_set_k_align` (libimmerdink_host) forces A. The integration contract: sizing only
+  through libimmerdink_host, pack bytes not persisted across library versions.
+- **§6c.** No calibration format bump; the format-2 rule stays exact; θ to be refit and
+  `k4_select` re-checked after stage 2.
+- **Spec.** New module `K4Align` (CUTLASS's residue-first address sequence over absolute
+  addresses; 8 positive and 8 negative models). Pipeline: `EveryRowByteWritten` and
+  `RowPhaseAligned(T)`, four stage-2 producer bugs, 9 positive and 8 negative A = 64 models.
+  PackedOperand: the format carries A (AUTO or hook), `AutoFormatsAgree`,
+  `FormatMismatchRejected`, 9 positive and 3 negative models. `params.py`: `K_PAD64_MIN`,
+  `k_align_of`, sizing by A, `cert_k_align` (new), `cert_workspace` / `cert_pack_layout`
+  over both A with hand-computed A = 64 examples. `oracle.py`: `pack(fmt=)`, the format in
+  `pack_lower` / `pack_layout` / `pack_key` / `lower_packed`; `test_oracle.test_k_align`.
+  Both stay at `K_ALIGN_POLICY = "A16"` until the implementation commit flips it.

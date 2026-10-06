@@ -41,6 +41,21 @@
 (*                                 padded rows of the last block overrun   *)
 (*   neg_nopad          WEqual     both packs leave K padding junk         *)
 (*   neg_noflags        CEqual     pack stores no non-finite flags         *)
+(* v1.13 §4b (pack FORMAT carries the K alignment; A resolved from k):    *)
+(*   pos_fmt2 / pos_fmt2_rn3 / pos_fmt2_both / pos_fmt2_flags  as pos_rn2, *)
+(*                 pos_rn3, pos_both, pos_flags in format 2 (AUTO, kpmin 3 *)
+(*                 < k = 4): σ, W, C equal, no OOB read (B-role tail at    *)
+(*                 the format-2 k̂); AutoFormatsAgree                       *)
+(*   pos_key_check_fmt2  pos_key_check in format 2 ("kalign" = format 1)   *)
+(*   pos_hook_check      hook: an A16 pack (format 1), the plan forced to  *)
+(*                 A64: rejected (FormatMismatchRejected)                  *)
+(*   pos_hook_check_rev  hook: a format-2 pack, the AUTO plan format 1     *)
+(*   pos_hook_check_both both packed in format 2, the plan format 1        *)
+(*   pos_hook_agree      both forced to format 2: accepted, equal results  *)
+(*   neg_fmt_hook        CEqual  the A16 pack read by an A64 plan without  *)
+(*                               the key check (the FORMAT word matters)   *)
+(*   neg_fmt_hook_rev    CEqual  a format-2 pack read by a format-1 plan   *)
+(*   neg_witness_hook_reject  NeverMismatch (pos_hook_check rejects)       *)
 (* Witnesses (must fail: the positives are not vacuous):                   *)
 (*   neg_witness_mismatch      NeverMismatch    (pos_key_check rejects)    *)
 (*   neg_witness_native_order  NativeOrderFree  (pos_flags: a flagged      *)
@@ -70,9 +85,12 @@ VXa   == {-3, 1, 2}
 VYa   == {3, -2, 1}
 VXinf == {-3, 2, INF}
 
+\* kpmin: the toy K_PAD64_MIN (k = 4 here; 8: AUTO gives format 1, 3: format
+\* 2); hookPlan / hookPack: 0 = AUTO, 1 / 2 = the format forced by the test hook
 CmpBase == [N |-> 2, rnd |-> "RN", roles |-> {"A", "B"}, gs |-> {1, 2},
             defOrder |-> "21", both |-> FALSE, muts |-> {"none"},
-            check |-> FALSE, vx |-> VXa, vy |-> VYa]
+            check |-> FALSE, vx |-> VXa, vy |-> VYa,
+            kpmin |-> 8, hookPlan |-> 0, hookPack |-> 0]
 CmpTrunc2   == [CmpBase EXCEPT !.rnd = "TRUNC"]
 CmpRN3      == [CmpBase EXCEPT !.N = 3, !.gs = {1, 2, 3}]
 CmpBoth     == [CmpBase EXCEPT !.both = TRUE]
@@ -91,6 +109,19 @@ CmpBrole    == [CmpBase EXCEPT !.roles = {"B"}, !.muts = {"brole"}]
 CmpNotail   == [CmpBase EXCEPT !.roles = {"B"}, !.muts = {"notail"}]
 CmpNopad    == [CmpBoth EXCEPT !.muts = {"nopad"}]
 CmpNoflags  == [CmpFlags EXCEPT !.muts = {"noflags"}]
+\* v1.13 §4b: format 2 (A64: k̂ = ⌈4⌉_32 = 32, 28 padding positions; the B
+\* role's tail is (n̂ − r)·32) under AUTO, and the test hook forcing formats
+CmpFmt2      == [CmpBase EXCEPT !.kpmin = 3]
+CmpFmt2Rn3   == [CmpRN3 EXCEPT !.kpmin = 3]
+CmpFmt2Both  == [CmpBoth EXCEPT !.kpmin = 3]
+CmpFmt2Flags == [CmpFlags EXCEPT !.kpmin = 3]
+CmpKeyCheckFmt2 == [CmpKeyCheck EXCEPT !.kpmin = 3]
+CmpHookCheck    == [CmpBase EXCEPT !.check = TRUE, !.hookPack = 1, !.hookPlan = 2]
+CmpHookCheckRev == [CmpBase EXCEPT !.check = TRUE, !.hookPack = 2]
+CmpHookCheckBoth == [CmpBoth EXCEPT !.check = TRUE, !.hookPack = 2]
+CmpHookAgree    == [CmpBase EXCEPT !.check = TRUE, !.hookPack = 2, !.hookPlan = 2]
+CmpHookNoCheck  == [CmpBase EXCEPT !.hookPack = 1, !.hookPlan = 2]
+CmpHookNoCheckRev == [CmpBase EXCEPT !.hookPack = 2]
 
 \* streams: pack, c1, c2, the later write (post) on postSt
 StrmSame    == [pack |-> 1, c1 |-> 1, c2 |-> 1, postSt |-> 1, post |-> "repack",

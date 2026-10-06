@@ -244,6 +244,15 @@ Bugs == {"none",
          "packedNoTail",  \* D1: the packed buffer has no zeroed tail
          "packInFlight",  \* D1: the pack is still being written when the
                           \* call starts (the caller's RAW edge missing)
+         \* v1.13 §4b stage 2 (k̂ = ⌈k⌉_A with A = AlignK > AlignN: padding
+         \* wider than the old 16-element quantum, which AlignN stands for):
+         "padOldQuantum", \* every in-line producer (K2/K3, KF, KL; A and B,
+                          \* incl. the zero rows n..n̂) writes K padding only
+                          \* up to ⌈k⌉_AlignN: [⌈k⌉_AlignN, k̂) never written
+         "padOldQuantumB",\* the same for the B-side producers only (K3, KF's
+                          \* B rows, KL_B, the zero rows)
+         "packPadOld",    \* imd_pack writes K padding only up to ⌈k⌉_AlignN
+         "packTailOld",   \* the pack's tail sized (⌈r⌉ − r)·⌈k⌉_AlignN
          "padMinimal"}    \* HARMLESS: K padding only in A and only by the
                           \* first group's pack; B rows n..n̂ never written
 \* Deviations from DESIGN that are shown NOT to break anything (positive models).
@@ -414,7 +423,9 @@ PlanBytes == IF VecResident /\ ~Empty THEN 8 * VecLen ELSE 0
 PR(X)       == IF X = "A" THEN m ELSE n
 PRows(X)    == Bs \X (0..(PR(X) - 1))
 PTailRow    == <<-1, -1>>                       \* pw index of the tail
-PTail(X)    == IF Bug = "packedNoTail" THEN 0 ELSE (RoundUp(PR(X), AlignN) - PR(X)) * KHat
+PTail(X)    == CASE Bug = "packedNoTail" -> 0
+                 [] Bug = "packTailOld"  -> (RoundUp(PR(X), AlignN) - PR(X)) * RoundUp(k, AlignN)
+                 [] OTHER                -> (RoundUp(PR(X), AlignN) - PR(X)) * KHat
 PSubs       == <<"sig", "flag", "res">>
 PSubBytes(X, s) == CASE s = "sig"  -> 2 * b * PR(X)
                      [] s = "flag" -> b * PR(X)
@@ -695,6 +706,12 @@ WellFormed ==
     /\ Bug \in {"packedWsFull", "packedK1", "packedPack", "packedReadsWs", "packedSigmaWs",
                 "packedBStrideNh", "packedNoTail", "packInFlight"} => Packed # {}
     /\ Bug \in {"packedBStrideNh", "packedNoTail"} => "B" \in Packed
+    \* v1.13 §4b: the stage-2 producer bugs need a padding wider than the old
+    \* quantum (A > AlignN) and, for the pack ones, a packed operand.
+    /\ Bug \in {"padOldQuantum", "padOldQuantumB", "packPadOld", "packTailOld"}
+          => RoundUp(k, AlignN) < KHat
+    /\ Bug \in {"packPadOld", "packTailOld"} => Packed # {}
+    /\ Bug = "packTailOld" => "B" \in Packed
     /\ Bug \in {"fusedReadsVec", "fusedSharedSigma", "fusedNoVec", "fusedNoSigma",
                 "fusedAllGroups", "largeWithK0", "largeRowSplit", "largeNoSigma",
                 "largeAllGroups"} => Packed = {}
@@ -742,7 +759,8 @@ vars    == <<pc, done, retired, alpha0, beta0, flagA, flagB, aDirty, bDirty,
 inputs  == <<alpha0, beta0, flagA, flagB, pw>>
 
 Zero     == -1                            \* ra/rb tag of zero padding
-ErrKinds == {"stale", "gamma", "plane", "dup", "reuse", "oob", "readC", "readAB", "clobber"}
+ErrKinds == {"stale", "gamma", "plane", "dup", "reuse", "oob", "readC", "readAB", "clobber",
+             "unwritten"}
 CTags    == {"orig", "zero", "betaC", "native", "crt"}
 
 Init ==
@@ -842,11 +860,16 @@ SigmaStep(t) ==
 \* Positions a pack writes: real ones (h < k, residues) and padding (zeros).
 RealHs == {h \in KHs : h < k}
 PadHs  == {h \in KHs : h >= k}
+\* v1.13 §4b negatives: a producer that still pads to the old quantum
+\* (⌈k⌉_AlignN; AlignN = 16 really) instead of to k̂ = ⌈k⌉_AlignK (64).
+OldPadEnd == RoundUp(k, AlignN)
+PadHsOld  == {h \in KHs : k <= h /\ h < OldPadEnd}
 
 \* The residue / padding writes of one pack CTA for A row (λ, ī) or B column
 \* (λ, ĵ) over the slots `slots`; slot s receives modulus ModOf(gs(s), s),
 \* i.e. the residues of group gs(s).
-PadA(gi) == IF Bug = "noPad" \/ (Bug = "padMinimal" /\ gi > 1) THEN {} ELSE PadHs
+PadA(gi) == IF Bug = "noPad" \/ (Bug = "padMinimal" /\ gi > 1) THEN {}
+            ELSE IF Bug = "padOldQuantum" THEN PadHsOld ELSE PadHs
 RAWrite(lam, i, slots, gs(_)) ==
     [x \in RADom |->
        IF x[2] = lam /\ x[3] = i /\ x[1] \in slots
@@ -858,6 +881,8 @@ RACells(lam, i, slots, gs(_)) ==
     \cup UNION {{AccRA(s, lam, i, h) : h \in PadA(gs(s))} : s \in slots}
 BRes(j) == IF j < n THEN RealHs ELSE {}                               \* residues
 BPad(j) == IF Bug \in {"noPad", "padMinimal"} THEN {}
+           ELSE IF Bug \in {"padOldQuantum", "padOldQuantumB"}
+           THEN (IF j < n THEN PadHsOld ELSE {h \in KHs : h < OldPadEnd})
            ELSE IF j < n THEN PadHs ELSE KHs                           \* zeros
 RBWrite(lam, j, slots, gs(_)) ==
     [x \in RBDom |->
@@ -1014,7 +1039,9 @@ PContent(X, rel) ==
     ELSE LET l == rel \div pl + 1  q == rel % pl  row == q \div KHat  h == q % KHat
              lam == row \div r  rho == row % r
          IN  IF ~pw[X][<<lam, rho>>] THEN PJunk
-             ELSE IF h < k THEN <<l, lam, rho>> ELSE PZero
+             ELSE IF h < k THEN <<l, lam, rho>>
+             ELSE IF Bug = "packPadOld" /\ h >= RoundUp(k, AlignN) THEN PJunk
+             ELSE PZero
 \* K4 / K5 read operand X from its packed buffer (else from the workspace;
 \* "packedReadsWs" / "packedSigmaWs": from the absent workspace regions).
 K4Pack(X) == X \in Packed /\ Bug # "packedReadsWs"
@@ -1036,6 +1063,12 @@ GemmStep(kr, t) ==
         badIn == \E j \in Js \cap Ns, h \in hs :
                    IF h < k THEN ~RealA(h) \/ ~RealB(j, h)
                    ELSE ~ZeroA(h) /\ ~ZeroB(j, h)
+        \* v1.13 §4b EveryRowByteWritten: a byte K4 reads (any K position of the
+        \* chunk, any column j < n̂ incl. the padding rows) that nothing in this
+        \* call (or imd_pack, for a packed operand) has written
+        UnwrA(h)    == IF pkA THEN PA(h) = PJunk ELSE ra[<<s, lam, i, h>>] = 0
+        UnwrB(j, h) == IF pkB THEN PB(j, h) = PJunk ELSE rb[<<s, lam, j, h>>] = 0
+        unwr  == \E h \in hs : UnwrA(h) \/ \E j \in Js : UnwrB(j, h)
         accA == IF pkA THEN {AccPRes("A", PK4Rel("A", l, lam, i, h)) : h \in hs}
                 ELSE {AccRA(s, lam, i, h) : h \in hs}
         accB == IF pkB THEN {AccPRes("B", PK4Rel("B", l, lam, j, h)) : j \in Js, h \in hs}
@@ -1051,7 +1084,8 @@ GemmStep(kr, t) ==
                ELSE w[x]]
     /\ Access(accA \cup accB \cup {AccW(l, lam, i, j) : j \in Js},
               Stale(badIn \/ badW) \cup (IF dbl THEN {"plane"} ELSE {})
-              \cup (IF dup THEN {"dup"} ELSE {}))
+              \cup (IF dup THEN {"dup"} ELSE {})
+              \cup (IF unwr THEN {"unwritten"} ELSE {}))
     /\ UNCHANGED <<vecV, sfA, sfB, ra, rb, cw, cval, aDirty, bDirty>>
 
 \* K5 (and the DIRECT kernel) for C element e = (λ, ī, j̄). Writing C[e]
@@ -1187,6 +1221,15 @@ TypeOK ==
 \* call / group / chunk, never junk or a later group's residues; a K-padding
 \* product always has a zero operand.
 NoStaleRead == "stale" \notin err
+
+\* v1.13 §4b (stage 2): every byte K4 reads of either operand, for every
+\* K position of [0, k̂) (incl. the K padding up to k̂ = ⌈k⌉_A, A = AlignK) and
+\* every column of [0, n̂) (incl. the B padding rows), was written in this call
+\* by the producer of that operand (K2/K3, KF, KL, the zero-row launches) or,
+\* for a packed operand, by imd_pack. Stronger than NoStaleRead (one zero side
+\* suffices numerically; pos_pad_minimal): it is DESIGN §4's "every byte the
+\* GEMM reads is written in this call" (compute-sanitizer initcheck clean).
+EveryRowByteWritten == "unwritten" \notin err
 
 \* §4 K1 split: σ/τ are final before any pack or K5 reads them (sA/sB hold
 \* K1a's γ until K1b retires; nothing but K1b reads γ).
@@ -1338,6 +1381,32 @@ GemmAligned ==
            /\ \A X \in Packed : \A q \in 0..(NYParts - 1) :
                 LET r0 == IF X = "B" THEN YStart(q) ELSE 0 IN
                 (PSubOff(X, "res") + PK4Rel(X, ModOf(gi, s), lam, r0, c * ChunkLen)) % AlignK = 0
+
+\* v1.13 §4b, the K4 load phase (a performance contract; K4Align checks the
+\* rule and its alternatives). CUTLASS 2.x loads a chunk's residue tile
+\* (((kc − 1) mod T) + 1 elements) first, at row start + k0, then full tiles
+\* of T: K4Loads is that address sequence for one row. RowPhaseAligned(T):
+\* every load of every row K4 reads (RA rows ī < m, RB rows ĵ < n̂, a packed
+\* operand's rows at its §6b.4 offsets: role B up to n̂ into the next block or
+\* the tail), every group, batch and chunk, at the §4a / §6b.4 offsets (the
+\* workspace and pack pointers are AlignWS-aligned), is a multiple of T.
+\* MC_Pipeline instantiates T = TileK (64 really); checked in the models with
+\* AlignK = TileK (A = 64 plans).
+K4Res(kc, T) == ((kc - 1) % T) + 1
+K4Loads(start, c, T) ==
+    LET k0 == c * ChunkLen  kc == Cardinality(Chunk(c))  R == K4Res(kc, T) IN
+    {start + k0} \cup {start + k0 + R + T * i : i \in 0..((kc - R) \div T - 1)}
+RowPhaseAligned(T) ==
+    FullWs =>
+      \A gi \in 1..NG : \A c \in AllChunks, z \in 0..(NZ(gi) - 1) :
+        LET s == z \div b  lam == z % b IN
+        /\ "A" \notin Packed =>
+             \A i \in Ms : \A a \in K4Loads(AddrRA(s, lam, i, 0), c, T) : a % T = 0
+        /\ "B" \notin Packed =>
+             \A j \in NHs : \A a \in K4Loads(AddrRB(s, lam, j, 0), c, T) : a % T = 0
+        /\ \A X \in Packed : \A rho \in (IF X = "A" THEN Ms ELSE NHs) :
+             \A a \in K4Loads(PSubOff(X, "res") + PK4Rel(X, ModOf(gi, s), lam, rho, 0), c, T) :
+                a % T = 0
 
 \* §4 DIRECT path / §4a: "K-empty -> DIRECT is documented dispatch by
 \* descriptor". The DIRECT kernel is launched iff the output is non-empty
