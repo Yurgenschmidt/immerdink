@@ -18,7 +18,7 @@ Every step of DESIGN §3 is implemented literally and in exact integer arithmeti
                          plan-time NOT_SUPPORTED when kappa >= T in RN mode
   §3.3  quantization     quantize(): a' = RN_even / trunc (a 2^sigma) held as mu * 2^eps
   §3.4  residues         residue(): SMod((mu mod p) * (2^eps mod p), p)
-  §3.5  INT8 GEMM        modular_gemm(): K-chunks of length `chunk` (default 131056),
+  §3.5  INT8 GEMM        modular_gemm(): K-chunks of length `chunk` (default 131008),
                          int32 accumulation with an asserted no-saturation bound,
                          store-mod (first chunk) / add-mod (later chunks) into u8 planes
   §3.6  CRT              crt(): division-free running reduction, asserted word bound
@@ -35,7 +35,7 @@ math.ldexp from an already-rounded <= 54-bit integer, which is exact.
 Design choices that DESIGN.md leaves open are marked ORACLE-CHOICE below (and reported):
   * native-path accumulator starts at +0.0 (NATIVE_ACC_INIT);
   * the emulated path returns +0.0 for z = 0 (an exact integer zero has no sign);
-  * any K-chunk length 1..K_c is accepted (the 16-alignment of 131056 is a device concern),
+  * any K-chunk length 1..K_c is accepted (the 64-alignment of 131008 is a device concern),
     so determinism across chunkings can be tested with small chunks.
 
 The residue-group size g only changes the ORDER in which planes are produced here (each
@@ -65,7 +65,7 @@ F = 60                                   # §3.2 fixed-point fraction bits of S
 INT32_MAX = 2**31 - 1
 RESIDUE_ABS_MAX = 128                    # |r| <= 128 for every modulus (p = 256: -128)
 K_C = INT32_MAX // RESIDUE_ABS_MAX**2    # §2: 131071, max K-chunk with no saturation
-K_C_ALIGNED = (K_C // 16) * 16           # §3.5: 131056, default chunk length
+K_C_ALIGNED = (K_C // 64) * 64           # §3.5 (v1.13): 131008, default chunk length
 INT16_MIN, INT16_MAX = -2**15, 2**15 - 1
 N_MIN, N_MAX = 2, 20
 K_ALIGN = 16                             # §4: the plan's K alignment A (every plan today)

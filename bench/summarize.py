@@ -16,7 +16,7 @@ from collections import OrderedDict
 # RTX 4090 datasheet peaks (boost clock): 1008 GB/s GDDR6X, 660.6 dense INT8 TOPS.
 PEAK_BW = 1008e9
 PEAK_INT8 = 660.6e12
-KCHUNK = 131056
+KCHUNK = 131008  # spec/params.py K_C_PRIME (DESIGN v1.13 §3.5)
 
 
 def load(path):

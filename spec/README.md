@@ -75,7 +75,8 @@ Current status:
     exceeded, and that without the conditional subtraction x ≥ P;
   - `Int32Chunk`: any partial sum of ≤ 131071 products with |r·s| ≤ 128² stays in int32,
     and 131072 does not;
-  - `Epilogue`: W + acc stays in int32 for K_c' = 131056, and the maximum is reached.
+  - `Epilogue`: W + acc stays in int32 for K_c' = 131008 (DESIGN v1.13), and the maximum
+    2146435327 is reached.
 
   Apalache runs one check at a time inside `tools/memcap.sh` with `JVM_ARGS=-Xmx4g`
   (knobs: `APA_JOBS`, `APA_TIMEOUT`). It is at `tools/apalache/bin/apalache-mc`

@@ -16,7 +16,7 @@
 (*                     c = 131072, acc = 131072 * 128^2 = 2^31, the sum of *)
 (*                     131072 products (-128)*(-128): plainly reachable    *)
 (*                     (every step may pick r = s = -128), so K_c is tight.*)
-(* (K_c' = 131056, the chunk length used, is checked with the epilogue in  *)
+(* (K_c' = 131008, the chunk length used, is checked with the epilogue in  *)
 (* Epilogue.tla.)                                                          *)
 (* Exact products are used (r*s, both symbolic), so the bounds -16256*c <= *)
 (* acc <= 16384*c are the true extremes, not an over-approximation.        *)

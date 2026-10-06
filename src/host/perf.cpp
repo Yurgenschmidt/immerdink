@@ -448,11 +448,15 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     // The K-chunk kinds: full chunks with aligned / misaligned rows, then the last chunk.
     // The slow K-chunks (mac_ktail): format 1 (v1.8) took a chunk whose length is not a
     // multiple of the 64-wide K tile (CUTLASS's predicated residue tile); format 2 (v1.10,
-    // NOTES-B2 §6) one whose residue rows start mid-sector: K4 reads chunk c of a row at
-    // row * k_hat + c * K_c' (lda = k_hat, gemm_k4.cu), so the rows are 32-byte aligned iff
-    // k_hat and the chunk offset c * K_c' are multiples of 32 (K_c' = 131056 = 16 mod 32: the
-    // odd chunks are misaligned when k_hat is aligned). That explains k_hat = 1008 / 5008
-    // (slow) and 800 (not slow) alike.
+    // NOTES-B2 §6) one whose rows are misaligned, by the rule "k_hat and the chunk offset
+    // c * K_c' are multiples of 32". The measured mechanism (DESIGN v1.13 §4b, NOTES-K4ALIGN):
+    // CUTLASS loads a chunk's residue tile (kc mod 64) first, so row r's main-loop loads sit at
+    // phase (r k_hat + chunk end) mod 64. Since v1.13 K_c' = 131008 = 0 mod 64: every chunk
+    // end is 0 mod 64 or k_hat, the c * K_c' term is always 0 mod 32, and the format-2 rule
+    // reduces to "slow iff k_hat mod 32 != 0", which is exact for the phase classes 16 / 48
+    // (class 32, +3 % to +19 % measured, is not a separate term; calibration format 2 is
+    // unchanged and was fitted with K_c' = 131056). That explains k_hat = 1008 / 5008 (slow)
+    // and 800 (not slow) alike.
     const int64_t nfull = kc.k_chunks - 1;
     bool last_slow;
     int64_t full_slow;

@@ -32,7 +32,8 @@ What is checked (numbers refer to the oracle task list, sections to DESIGN.md):
            overflows; L_w=127 (2P <= 2^127) never does.
         A6 §3.7 beta epilogue is ONE fma (constructed 2^-104 case + random triples).
         A7 §3.7 native path canonical k order ([MAX, MAX, -Inf].[2, 2, 1] = NaN).
-        A8 §3.5 default chunk 131056 actually splits (k = 131057) and add-mod is exact.
+        A8 §3.5 default chunk 131008 actually splits (k = 131009, and 131056 in the v1.13
+           window) and add-mod is exact.
   NB residue-group size g cannot influence the oracle's result by construction (each plane
   is computed independently from the same quantized operands); g-independence of the real
   buffer schedule is the Pipeline spec's job. The g loop in (3) only checks plumbing.
@@ -112,7 +113,7 @@ def test_primitives():
     rng = random.Random(1)
     # §2 constants
     assert o.MODULI == o.DESIGN_MODULI
-    assert o.K_C == 131071 and o.K_C_ALIGNED == 131056
+    assert o.K_C == 131071 and o.K_C_ALIGNED == 131008 == 2047 * 64
     assert 128**2 * o.K_C <= 2**31 - 1 < 128**2 * (o.K_C + 1)
     for N in range(2, 21):
         pl = o.Plan(N, 1)
@@ -836,22 +837,23 @@ def test_adversarial():
     assert math.isnan(out[0][0]) and out[1][0] == -math.inf, out
     res["A7 native canonical order"] = "[MAX,MAX,-Inf].[2,2,1] = NaN (reversed order would give -Inf); [-Inf,MAX,MAX].[2,2,1] = -Inf"
 
-    # A8 §3.5 default chunk K_c' = 131056 really splits at k = 131057: add-mod is exact and
-    # matches an unsplit run (chunk = K_c = 131071).  Last entry nonzero so chunk 2 matters.
-    k = o.K_C_ALIGNED + 1
-    a = [rng.choice((-1.0, 1.0)) * (1 + rng.random()) for _ in range(k)]
-    b = [rng.choice((-1.0, 1.0)) * (1 + rng.random()) for _ in range(k)]
-    A, B = [a], [[x] for x in b]
-    for N in (3, 5):
-        t1, t2 = {}, {}
-        c1 = o.contract(A, B, None, 1.0, 0.0, N, "TRUNC", trace=t1)
-        c2 = o.contract(A, B, None, 1.0, 0.0, N, "TRUNC", trace=t2, chunk=o.K_C)
-        exq = sum(o.qvalue(x) * o.qvalue(y) for x, y in zip(t1["QA"][0], t1["QB"][0]))
-        last = o.qvalue(t1["QA"][0][-1]) * o.qvalue(t1["QB"][0][-1])
-        assert last != 0 and any(last % p for p in t1["plan"].p)
-        assert t1["z"][0][0] == exq == t2["z"][0][0] and t1["W"] == t2["W"]
-        assert o.bits(c1[0][0]) == o.bits(c2[0][0])
-    res["A8 k=131057 split vs unsplit"] = "identical W planes, z exact (N=3, 5)"
+    # A8 §3.5 default chunk K_c' = 131008 (v1.13) really splits at k = 131009 and at
+    # k = 131056 (one chunk under the old 131056, two now): add-mod is exact and matches an
+    # unsplit run (chunk = K_c = 131071).  Last entry nonzero so chunk 2 matters.
+    for k in (o.K_C_ALIGNED + 1, 131056):
+        a = [rng.choice((-1.0, 1.0)) * (1 + rng.random()) for _ in range(k)]
+        b = [rng.choice((-1.0, 1.0)) * (1 + rng.random()) for _ in range(k)]
+        A, B = [a], [[x] for x in b]
+        for N in (3, 5):
+            t1, t2 = {}, {}
+            c1 = o.contract(A, B, None, 1.0, 0.0, N, "TRUNC", trace=t1)
+            c2 = o.contract(A, B, None, 1.0, 0.0, N, "TRUNC", trace=t2, chunk=o.K_C)
+            exq = sum(o.qvalue(x) * o.qvalue(y) for x, y in zip(t1["QA"][0], t1["QB"][0]))
+            last = o.qvalue(t1["QA"][0][-1]) * o.qvalue(t1["QB"][0][-1])
+            assert last != 0 and any(last % p for p in t1["plan"].p)
+            assert t1["z"][0][0] == exq == t2["z"][0][0] and t1["W"] == t2["W"]
+            assert o.bits(c1[0][0]) == o.bits(c2[0][0])
+    res["A8 k=131009, 131056 split vs unsplit"] = "identical W planes, z exact (N=3, 5)"
 
     RESULTS["adversarial"] = "\n".join(f"  {key}: {val}" for key, val in res.items())
 

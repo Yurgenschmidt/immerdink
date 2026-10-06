@@ -58,7 +58,8 @@ ACC_BITS = 32                        # int32 MMA accumulator (.satfinite: no wra
 INT32_MAX = 2**31 - 1
 INT32_MIN = -2**31
 K_C = 131071                         # §2  floor((2^31-1)/128^2)
-K_C_PRIME = 131056                   # §3.5 floor(K_c/16)*16
+K_CHUNK_ALIGN = 64                   # v1.13 §4b: K4's threadblock K tile (64 int8 = 64 B)
+K_C_PRIME = (K_C // K_CHUNK_ALIGN) * K_CHUNK_ALIGN   # §3.5 131008 = 2047*64 (v1.13; was 131056)
 F_BITS = 60                          # §3.2 fixed-point fraction bits of S
 MANT = 53                            # FP64 significand bits
 GAMMA_MIN, GAMMA_MAX = -1074, 1023   # ilogb range of nonzero finite FP64
@@ -861,11 +862,17 @@ def cert_crt_roundtrip():
 
 @check("§2/§3.5 K_c, K_c'")
 def cert_kc():
-    """128^2 K_c <= 2^31-1 < 128^2 (K_c+1); K_c' = floor(K_c/16)*16; epilogue W+acc fits int32."""
+    """128^2 K_c <= 2^31-1 < 128^2 (K_c+1); K_c' = floor(K_c/64)*64 (v1.13 §4b: a multiple of
+    K4's 64-wide K tile, so every full chunk starts and ends on a 64-byte phase; a multiple of
+    16 too, the CUTLASS pointer rule) and maximal under that rule; epilogue W+acc fits int32."""
     need(128 * 128 * K_C <= INT32_MAX < 128 * 128 * (K_C + 1), "K_c")
     need(K_C == INT32_MAX // (128 * 128), "K_c formula")
-    need(K_C_PRIME % 16 == 0 and K_C_PRIME <= K_C and K_C_PRIME == (K_C // 16) * 16, "K_c'")
-    need(K_C - K_C_PRIME < 16, "K_c' maximal")
+    need(K_C_PRIME % 16 == 0 and K_C_PRIME % K_CHUNK_ALIGN == 0 and K_C_PRIME <= K_C and
+         K_C_PRIME == (K_C // K_CHUNK_ALIGN) * K_CHUNK_ALIGN, "K_c'")
+    need(K_C - K_C_PRIME < K_CHUNK_ALIGN, "K_c' maximal")
+    need(K_C_PRIME == 131008 == 2047 * 64, "K_c' value (DESIGN §2 table)")
+    # the pinned extremes of the 256 GEMM's epilogue input (DESIGN §3.5, PROOFS L-epilogue)
+    need(epilogue_range(256) == (-2129666048, 2146435327), "v range p=256 literal")
     for p in REAL_MODULI:
         lo, hi = epilogue_range(p)
         need(INT32_MIN <= lo and hi <= INT32_MAX, f"p={p} epilogue range [{lo},{hi}] not int32")
@@ -885,6 +892,59 @@ def cert_kc():
             h = (p - 1) // 2
             need(epilogue_range(p) == (-h * h * K_C_PRIME, h * h * K_C_PRIME + p - 1), f"closed form p={p}")
     return f"K_c={K_C}, K_c'={K_C_PRIME}, max W+acc = {epilogue_range(256)[1]}"
+
+
+# v1.13 §4b boundary k list: around one, two and four K_c' (old and new), the measured long-k
+# shapes (196608, 196624) and the one-chunk windows k_hat in (j K_c', j 131056].
+K_BOUNDARY = [1, 16, 17, 64, 65, 131007, 131008, 131009, 131040, 131041, 131056, 131057,
+              131071, 131072, 131073, 196608, 196624, 262016, 262017, 262112, 262113, 262144,
+              262160, 262200, 393024, 393025, 393168, 524032, 524033]
+
+
+def k_chunk_list(k_hat, chunk=K_C_PRIME):
+    """§3.5 the K-chunks of a row: [(k0, kc)], k0 = c chunk, the last one ending at k_hat."""
+    return [(k0, min(chunk, k_hat - k0)) for k0 in range(0, k_hat, chunk)]
+
+
+def k4_row_phase(row_base, k_hat, k0, kc, tile=K_CHUNK_ALIGN):
+    """v1.13 §4b: the byte phase (mod 64) of row r's main-loop K4 loads in the chunk
+    [k0, k0 + kc). CUTLASS 2.x loads the chunk's residue tile (kc mod 64 elements) first, so
+    every later 64-element load starts at row_base + k0 + (kc mod 64) + 64 t, i.e. at phase
+    (row_base + chunk end) mod 64 with row_base = r k_hat (mod 64) for 256-aligned regions."""
+    return (row_base + k0 + kc % tile) % tile
+
+
+@check("v1.13 §4b K4 row phase")
+def cert_row_phase():
+    """With K_c' = 131008 every full K-chunk starts and ends on a multiple of 64, so the
+    main-loop load phase of row r in chunk c, (r k_hat + e_c) mod 64 with e_c the chunk end,
+    is r k_hat mod 64 in a full chunk and (r + 1) k_hat mod 64 in the last one (e_c = k_hat):
+    the set of phases over the rows, hence the phase class, depends on k_hat alone. The old
+    K_c' = 131056 shifted chunk c by 48 (c + 1) (the measured slow chunk 0 of k_hat = 196608).
+    k_chunks gains one exactly in the windows k_hat in (j K_c', j 131056]."""
+    n = 0
+    for k in K_BOUNDARY + list(range(1, 2000, 7)):
+        kh = k_hat_of(k)
+        chunks = k_chunk_list(kh)
+        need(len(chunks) == ceil_div(kh, K_C_PRIME) and sum(c[1] for c in chunks) == kh, f"k={k}")
+        for ci, (k0, kc) in enumerate(chunks):
+            need(k0 % 16 == 0 and kc % 16 == 0, f"k={k} chunk {ci}: CUTLASS 16-B rule")
+            if ci < len(chunks) - 1:
+                need(kc == K_C_PRIME and k0 % 64 == 0 and (k0 + kc) % 64 == 0, f"k={k} full chunk {ci}")
+            end = kh if ci == len(chunks) - 1 else 0     # e_c mod 64: 0 for a full chunk
+            for r in range(8):
+                need(k4_row_phase(r * kh, kh, k0, kc) == (r * kh + end) % 64, f"k={k} chunk {ci} row {r}")
+                n += 1
+        old = k_chunk_list(kh, 131056)
+        if len(old) > 1:   # the old chunk length shifts chunk 0's phase by 48 (not by k_hat)
+            need(k4_row_phase(0, kh, *old[0]) == 48, f"k={k}: old chunk 0 phase")
+        win = any(j * K_C_PRIME < kh <= j * 131056 for j in range(1, 5))
+        need((len(chunks) == len(old) + 1) == win and len(chunks) - len(old) in (0, 1), f"k={k} window")
+    # the measured long-k case (k4align measurements): 196608 = 3 * 2^16, two chunks
+    need(k4_row_phase(0, 196608, *k_chunk_list(196608, 131056)[0]) == 48 and
+         k4_row_phase(0, 196608, *k_chunk_list(196608, 131056)[1]) == 0, "196608 old phases")
+    need([k4_row_phase(0, 196608, *c) for c in k_chunk_list(196608)] == [0, 0], "196608 new phases")
+    return f"{len(K_BOUNDARY)} boundary k + 286 small k, {n} (row, chunk) phases = (r k_hat + e_c) mod 64, e_c = 0 or k_hat"
 
 
 @check("§3.5 mod reduction realization")
@@ -1516,7 +1576,7 @@ def cert_scaled_tla():
     """scaled_constants reproduces the real constants at (8, 32) and the parameters the
     TLA+ model headers state (MC_OzakiCRT, MC_CRTRealization, MC_OzakiScaling);
     it refuses accumulators too narrow for one product (K_c = 0)."""
-    real = scaled_constants(RES_BITS, ACC_BITS, N_MAX, limb_bits=LIMB, k_align=K_ALIGN)
+    real = scaled_constants(RES_BITS, ACC_BITS, N_MAX, limb_bits=LIMB, k_align=K_CHUNK_ALIGN)
     need(real["moduli"] == REAL_MODULI and real["K_c"] == K_C and real["K_c_prime"] == K_C_PRIME,
          "real-width scaled_constants")
     for N in range(N_MIN, N_MAX + 1):
@@ -1569,7 +1629,7 @@ def cert_workspace():
     """Closed form = sum of aligned regions; regions disjoint, 256-aligned, in order;
     sub-buffer strides 16-B aligned; zero/DIRECT/k=0 rules; monotone in every argument."""
     ms = [0, 1, 15, 16, 17, 100, 257]
-    ks = [0, 1, 2, 15, 16, 17, 131056, 131057, 262200]
+    ks = [0, 1, 2, 15, 16, 17, 131008, 131009, 131056, 131057, 196624, 262200]
     bs = [0, 1, 3]
     n_cases = 0
     for N in (2, 9, 14, 20):
@@ -1651,7 +1711,7 @@ def cert_pack_layout():
     for N in (2, 9, 14, 20):
         for b in (0, 1, 3, 7):
             for r in (0, 1, 15, 16, 17, 33):
-                for k in (0, 1, 2, 15, 16, 17, 131056, 131057):
+                for k in (0, 1, 2, 15, 16, 17, 131008, 131009, 131056, 131057, 131072):
                     regs, total = pack_layout(b, r, k, N)
                     n_cases += 1
                     if b * r * k == 0:
@@ -1677,6 +1737,8 @@ def cert_pack_layout():
                                 for c in range(ceil_div(k, K_C_PRIME)):
                                     a = res0 + l * b * r * kh + (lam * r + rho) * kh + c * K_C_PRIME
                                     need(a % 16 == 0, "K4 pointer alignment")
+                                    # v1.13 §4b: the chunk offset keeps the row's 64-B phase
+                                    need((a - c * K_C_PRIME) % 64 == a % 64, "chunk phase")
                     # role B: the last byte K4 can read (plane N-1, batch b-1, row n_hat-1,
                     # k_hat-1) is inside res; the bound is tight (the tail is exactly needed)
                     last = res0 + (N - 1) * b * r * kh + ((b - 1) * r + nh - 1) * kh + kh - 1
@@ -1757,7 +1819,8 @@ def _check_layout(m, n, k, b, N, g, mode, ws, regs, vec=VEC_GENERATE):
     if mode == EMULATE and k > 1:
         # CUTLASS alignment 16: every operand/aux pointer the K4 launches form
         # (workspace base is 256-aligned, §5) is 16-B aligned: plane (l, lambda)
-        # base + row i/j + chunk c*K_c' for A' (RA), B' (RB) and W planes.
+        # base + row i/j + chunk c*K_c' for A' (RA), B' (RB) and W planes; and (v1.13 §4b, a
+        # performance contract) c*K_c' is a multiple of 64.
         off = {r[0]: r[1] for r in regs}
         kh, nh = ceil_div(k, 16) * 16, ceil_div(n, 16) * 16
         rows_a = sorted({0, 1, m - 1})
@@ -1766,6 +1829,8 @@ def _check_layout(m, n, k, b, N, g, mode, ws, regs, vec=VEC_GENERATE):
         for lam in sorted({0, b - 1}):
             for l in sorted({0, gg - 1}):
                 for c in chunks:
+                    # v1.13 §4b: a chunk start leaves the row's 64-B load phase unchanged
+                    need((c * K_C_PRIME) % K_CHUNK_ALIGN == 0, "chunk start 64-B phase")
                     for i in rows_a:
                         need((off["RA"] + ((l * b + lam) * m + i) * kh + c * K_C_PRIME) % 16 == 0, "A' ptr")
                     for j in rows_b:
@@ -1840,6 +1905,7 @@ def build_json():
         "K_c": S(K_C), "K_c_prime": S(K_C_PRIME), "F": S(F_BITS),
         "term_max": S(TERM_MAX), "gamma_range": [S(GAMMA_MIN), S(GAMMA_MAX)],
         "region_align": S(REGION_ALIGN), "k_align": S(K_ALIGN), "n_align": S(N_ALIGN),
+        "k_chunk_align": S(K_CHUNK_ALIGN),
         "workspace_regions": [r[0] for r in _REGIONS],
         "pow2_mod": {S(p): [S(t) for t in pow2_table(p, emax)] for p in REAL_MODULI},
         "epilogue_note": ("v = W + acc in [v_min, v_max]; p = 256: v & 255; else n = v + bias "
@@ -1916,7 +1982,8 @@ def build_header():
     w(f"inline constexpr int kMaxLimbs = {max_limbs};          // L32 at N = kNMax")
     w(f"inline constexpr int kF = {F_BITS};                  // §3.2 fraction bits of S")
     w(f"inline constexpr int64_t kKc = {K_C};          // §2 max exact K-chunk (.satfinite)")
-    w(f"inline constexpr int64_t kKcPrime = {K_C_PRIME};     // §2/§3.5 chunk length used")
+    w(f"inline constexpr int64_t kKcPrime = {K_C_PRIME};     // §3.5 chunk length used, floor(K_c/64)*64")
+    w(f"inline constexpr int kKChunkAlign = {K_CHUNK_ALIGN};       // v1.13 §4b K_c' multiple (K4 K tile)")
     w(f"inline constexpr int kRegionAlign = {REGION_ALIGN};       // §4a align(x) = ceil(x)_256")
     w(f"inline constexpr int kKAlign = {K_ALIGN};            // §4 k_hat = ceil(k)_16")
     w(f"inline constexpr int kNAlign = {N_ALIGN};            // §4 n_hat = ceil(n)_16")

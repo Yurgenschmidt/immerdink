@@ -133,7 +133,12 @@ void check_per_n() {
 
 void check_epilogue() {
   const auto& t = c::kTables;
-  CHECK(c::kKc == ((int64_t{1} << 31) - 1) / (128 * 128) && c::kKcPrime == c::kKc / 16 * 16, "K_c, K_c'");
+  // v1.13 §4b: K_c' = floor(K_c/64)*64 = 131008, the largest multiple of the 64-wide K tile
+  CHECK(c::kKc == ((int64_t{1} << 31) - 1) / (128 * 128) && c::kKChunkAlign == 64 &&
+            c::kKcPrime == c::kKc / c::kKChunkAlign * c::kKChunkAlign && c::kKcPrime == 131008 &&
+            c::kKcPrime % 16 == 0 && c::kKc - c::kKcPrime < c::kKChunkAlign,
+        "K_c, K_c'");
+  CHECK(t.epi_vmin[0] == -2129666048 && t.epi_vmax[0] == 2146435327, "p=256 range literals");
   for (int l = 0; l < c::kNMax; ++l) {
     const int64_t p = t.moduli[l];
     const int64_t lo = -(p / 2), hi = (p + 1) / 2 - 1;  // §3.4 symmetric residue range

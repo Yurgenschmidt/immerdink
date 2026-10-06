@@ -169,7 +169,7 @@ def matrix(m, n, k, b):
 
 def grid():
     ms = [0, 1, 15, 16, 17, 100, 257]
-    ks = [0, 1, 2, 15, 16, 17, 131056, 131057, 262200]
+    ks = [0, 1, 2, 15, 16, 17, 131008, 131009, 131056, 131057, 262200]
     for N, g in ((2, 1), (2, 2), (9, 2), (14, 0), (14, 7), (20, 20)):
         for mode in (EMULATE, DIRECT):
             for vec in (VEC_GENERATE, VEC_RESIDENT):

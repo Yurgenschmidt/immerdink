@@ -585,25 +585,45 @@ def suite_tensor(lib, cuda, verbose):
 
 
 def suite_bigk(lib, cuda, verbose):
-    """k > K_c' = 131056: two and three K-chunks (store-mod, then add-mod)."""
+    """k > K_c' = 131008 (v1.13): two and three K-chunks (store-mod, then add-mod), including the
+    windows k_hat in (j K_c', j 131056] that gained a chunk with v1.13."""
+    KP = o.K_C_ALIGNED
     rng = random.Random(404)
-    k = 131056 + 37
+    k = KP + 37
     A, B, C = matrix(rng, 2, 3, k, a_kfast=True, b_kfast=False)
     TA, TB = gen(rng, (2, k), "phi"), gen(rng, (k, 3), "uniform")
     TB[5, 1] = math.inf
     run_case(lib, cuda, "bigk 2 chunks (2x3, N=3 RN)", A, B, C, TA, TB, gen(rng, (2, 3), "uniform"),
              1.0, 0.5, 3, 0, "RN", rng=rng, expect_kind="GEMM", verbose=verbose)
-    k = 2 * 131056 + 100
+    k = 2 * KP + 100
     A, B, C = matrix(rng, 2, 2, k)
     TA, TB = gen(rng, (2, k), "wide"), gen(rng, (k, 2), "phi")
     TA[1, 7] = math.nan
     run_case(lib, cuda, "bigk 3 chunks (2x2, N=9 g=4 RN)", A, B, C, TA, TB, np.zeros((2, 2)),
              -1.0, 0.0, 9, 4, "RN", rng=rng, expect_kind="GEMM", verbose=verbose)
-    k = 2 * 131056 + 5
+    k = 2 * KP + 5
     A, B, C = matrix(rng, 1, 1, k)
     TA, TB = gen(rng, (1, k), "uniform"), gen(rng, (k, 1), "uniform")
     run_case(lib, cuda, "bigk 3 chunks (1x1, N=2 TRUNC)", A, B, C, TA, TB, np.zeros((1, 1)),
              1.0, 0.0, 2, 0, "TRUNC", rng=rng, expect_kind="GEMM", verbose=verbose)
+    # v1.13 §4b windows: k_hat in (K_c', 131056] is two chunks (131008 + a 16..48 tail; one
+    # chunk before v1.13), k_hat = K_c' exactly is one; k_hat in (2 K_c', 2 * 131056] is three.
+    # Both operands both ways round (K-fast and not), every case bit-exact vs the oracle.
+    for (m, n, k, N, g, rnd, a_kf, b_kf) in (
+            (3, 2, KP, 8, 3, "RN", True, False),            # one chunk, 2047 whole K tiles
+            (2, 3, KP + 1, 9, 4, "RN", False, True),        # k_hat = KP + 16: tail 16
+            (3, 3, 131040, 3, 0, "TRUNC", True, True),      # tail 32
+            (2, 2, 131050, 14, 5, "RN", False, False),      # k_hat = 131056: tail 48
+            (1, 2, 131056, 2, 0, "TRUNC", True, False),
+            (2, 1, 2 * KP + 48, 8, 0, "RN", False, True)):  # k_hat = 262064: three chunks
+        A, B, C = matrix(rng, m, n, k, a_kfast=a_kf, b_kfast=b_kf)
+        TA, TB = gen(rng, (m, k), "phi"), gen(rng, (k, n), "wide")
+        if k % 2 == 0:
+            TB[k - 1, 0] = -math.inf          # in the last chunk's tail
+        chunks = -(-params.k_hat_of(k) // KP)
+        run_case(lib, cuda, f"bigk window k={k} ({chunks} chunks, {m}x{n}, N={N} g={g} {rnd})", A, B,
+                 C, TA, TB, gen(rng, (m, n), "uniform"), 1.0, 0.25, N, g, rnd, rng=rng,
+                 expect_kind="GEMM", verbose=verbose)
     # A4: long rows with more rows than K1's L2-capped grid (k = 32768: 160 rows in flight),
     # so K1 takes two 512-thread blocks per SM (contract.cu launch_k1).
     k = 32768

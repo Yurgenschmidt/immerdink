@@ -149,7 +149,7 @@ CONSTANTS
     b, m, n, k,          \* GEMM view (§1.1): batches, rows, cols, contraction length
     N,                   \* number of moduli
     g,                   \* moduli per residue group (1..N)
-    ChunkLen,            \* K_c' (real 131056); K-chunk length in k̂ elements
+    ChunkLen,            \* K_c' (real 131008, v1.13); K-chunk length in k̂ elements
     MaxZ,                \* CUTLASS gridDim.z limit (real 65535)
     TileN,               \* CUTLASS threadblock N (real TB::kN, 128 / 256)
     MaxY,                \* CUTLASS gridDim.y limit in N tiles (real 65535)

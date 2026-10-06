@@ -658,12 +658,28 @@ def suite_host(args):
                 raise Fail(f"kappa k={k} {rnd}: {st}, expected {want}")
     # Multi-chunk K, batch split, n-hat split, large shapes (closed-form K4 counts).
     big = [(1, 2, 262200, 1), (3, 17, 131057, 2), (1, 1, 393168, 1), (2, 3, 5, 70000),
+           (3, 2, 131056, 2), (1, 3, 131009, 1), (2, 1, 262112, 1),
            (1, 2**24 + 16, 2, 1), (5, 7, 300000, 40000)]
     for (m, n, k, b) in big:
         descs = [([m, k, b], [k * b, b, 1], [1, 3, 4]), ([k, n, b], [n * b, b, 1], [3, 2, 4]),
                  ([m, n, b], [n * b, b, 1], [1, 2, 4])]
         for g in (1, 3, 20):
             check_case(direct, descs, (20, g, TRUNC, "EMULATE", "GENERATE"), f"big {m},{n},{k},{b}")
+    # v1.13 §4b K_c' = 131008: the lowering's K-chunks and K4 launches at the boundary k (one
+    # more chunk exactly for k_hat in (j K_c', j 131056]), vs params and vs literals.
+    want_chunks = {131008: 1, 131009: 2, 131050: 2, 131056: 2, 131057: 2, 131072: 2,
+                   196608: 2, 262016: 2, 262017: 3, 262112: 3, 262113: 3, 393024: 3, 393025: 4}
+    for k, chunks in want_chunks.items():
+        descs = [([3, k], [k, 1], [1, 3]), ([k, 5], [5, 1], [3, 2]), ([3, 5], [5, 1], [1, 2])]
+        for g in (1, 4, 9):
+            st, _ = check_case(direct, descs, (9, g, TRUNC, "EMULATE", "GENERATE"), f"K_c' k={k} g={g}")
+            lw = host.lowering(descs, N=9, g=g, rounding=TRUNC)
+            ngroups = -(-9 // g)
+            if st != "SUCCESS" or lw.k_chunks != chunks or \
+                    lw.k_chunks != -(-params.k_hat_of(k) // params.K_C_PRIME) or \
+                    lw.gemm_launches != chunks * ngroups:
+                raise Fail(f"K_c' boundary k={k} g={g}: {st}, k_chunks {lw.k_chunks} (want {chunks}), "
+                           f"gemm_launches {lw.gemm_launches} (want {chunks * ngroups})")
     # The einsum front end == explicit descriptors; g_tradeoff == params for every g.
     spec, ext = "kjbc,kiac->abij", dict(a=24, b=20, c=16, i=12, j=10, k=8)
     descs = host.contraction(spec, ext)
@@ -690,7 +706,7 @@ def suite_host(args):
             raise Fail(f"negative extent: {e.status}") from e
     if args.verbose:
         print(f"  ok  {args.cases} random cases {by}, {n_sweep} g/vec sweep cases, kappa "
-              f"boundary, {len(big)} K4-split shapes, einsum front end, g_tradeoff; packed "
+              f"boundary, {len(big)} K4-split shapes, {len(want_chunks)} K_c' boundary k, einsum front end, g_tradeoff; packed "
               f"queries {packed_seen}")
 
 
@@ -700,7 +716,7 @@ def suite_host(args):
 L32 = [0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]  # §2: CRT limbs per N
 MODULI = [256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199, 197, 193, 191,
           181, 179, 173]  # DESIGN §2
-K_C_PRIME = 131056
+K_C_PRIME = params.K_C_PRIME  # §3.5 131008 (v1.13)
 
 
 def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks, l2, tail_mod=64):
@@ -1428,6 +1444,7 @@ def suite_plan(args):
                 one(descs, (N, g, TRUNC, "EMULATE", vec), f"sweep[{t}] g={g} {vec}")
     # K-chunked, batch-split and n-hat-split plans (no data is touched by plan creation).
     for (m, n, k, b) in [(1, 2, 262200, 1), (3, 17, 131057, 2), (2, 3, 5, 70000),
+                         (3, 2, 131056, 2), (1, 3, 131009, 1), (2, 1, 262112, 1),
                          (1, 2**24 + 16, 2, 1), (5, 7, 300000, 40000)]:
         descs = [([m, k, b], [k * b, b, 1], [1, 3, 4]), ([k, n, b], [n * b, b, 1], [3, 2, 4]),
                  ([m, n, b], [n * b, b, 1], [1, 2, 4])]
