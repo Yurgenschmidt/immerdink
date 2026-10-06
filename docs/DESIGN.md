@@ -3417,9 +3417,8 @@ changes.
 Status: measured (NOTES-B2 §9, branch `followup-hotclock`), decided (independent reviewer,
 2026-10-06, the questions at the end) and **implemented** (2026-10-06, branch `hotclock`,
 host API 11: the key, the folded view, `call_power`, `perf_fit.py`, the 60 s pre-heat sweep;
-"Implementation" below). The shipped calibration is **not** refit here: it has no
-`power.byte_f_pj` and predicts exactly as before; the combined refit writes the key from the
-new 60 s pre-heat windows.
+"Implementation" below). The shipped calibration was refit with the key in the combined refit
+(`followups-combined`, NOTES-B2 §10).
 
 **Measured (2026-10-06, stock clocks, 450 W cap; `imd_bench --methods sustained
 --sustain-trace-s 2`).** Six windows of 2–4 min, N = 14, from a cold card (≈ 45 °C idle; the
@@ -3580,6 +3579,11 @@ fit). So the hold-out is a check of the long-run state, and of shape only at 163
   on the new windows (all at 73–77 °C), as Q3 expects: no THERMAL regime.
 - **Not shipped:** no refit here. The combined refit runs `perf_fit.py` (scaled form, γ = 1,
   `--byte-pj 0`) with these windows (`--sustained`) and writes `power.byte_f_pj`.
+- **Shipped (combined refit, 2026-10-06, branch `followups-combined`, NOTES-B2 §10):** fitted
+  on the 9 windows of this run with N ≤ 14 (the 5 N = 16 windows ran the pre-v1.14 pack
+  emitter with its eps path and were left out): e_tc 0.708 pJ/op, e_byte 0, e_byte^f 301
+  pJ/B, γ = 1, f_ref 2480 MHz; sustained leave-one-case-out median 0.8 % (capped windows
+  −0.6 … +0.8 %).
 
 ---
 
@@ -4626,9 +4630,14 @@ and host API; every value the same integer (bit-identical, tested on every contr
   `--byte-pj` fixed term, default 0; γ = 1, `--power-gammas`) / `unscaled` (v1.10).
   `bench/sweep_sustained.txt`: 60 s pre-heat and a 2 s trace; `tools/calibrate.sh
   --sustained-only`. Python `host.API_VERSION` 11, `Calibration.power["power.byte_f_pj"]`.
-  Tests: §6c.4 [v1.15]. **The shipped calibration is unchanged** (no key); new 60 s pre-heat
-  windows and the redone form comparison are in §6c.7 "Implementation"; the combined refit
+  Tests: §6c.4 [v1.15]. New 60 s pre-heat windows and the redone form comparison are in
+  §6c.7 "Implementation". **Shipped calibration:** the combined refit (below, NOTES-B2 §10)
   writes the key.
+- **Combined refit** (`followups-combined`, NOTES-B2 §10): `src/host/calib/rtx4090_sm89.calib`
+  refit on the v1.14 kernels with the eps path retired (no `op_eps` keys) and the clock-scaled
+  byte energy (`power.byte_f_pj` 301 pJ/B, e_tc 0.708 pJ/op, γ = 1, f_ref 2480 MHz); hold-out
+  targets met in every size class (as shipped before: < 1 ms classes missed on the v1.14
+  kernels, N = 15–17 medians 25–29 %).
 - **§6c.1 / §6c.2 / §6c.3 / §6c.4: the eps path retired** (combined branch
   `followups-combined`, part of host API 11's change set; no struct layout change). The
   v1.14 pack emitter has no eps path, so: `op_eps` features 0 and the chains without the

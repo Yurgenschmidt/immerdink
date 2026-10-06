@@ -5,7 +5,8 @@ ROADMAP B2. A CUDA-free model in libimmerdink_host (host API version 6): `imd_pe
 `imd_perf_rank` (N × g × vec mode × packed operands, ranked by predicted time inside a memory
 budget, with exact footprints), and the calibration (`imd_perf_calib_*`, a `key = value` text
 file; the RTX 4090 one is embedded). Design reviewed 2026-10-05 (roofline K4 accepted; eps
-path as a data input; effective L2 and the fitter's seed calibration). All numbers below are
+path as a data input, retired in DESIGN v1.15 after the branch-free pack emitter, §10;
+effective L2 and the fitter's seed calibration). All numbers below are
 immerdink's own, on the RTX 4090 at stock clocks (not locked; SM 2460–2820 MHz after calls,
 450 W cap), through the quiet gate and the shared GPU lock.
 
@@ -864,4 +865,77 @@ refit needs GPU. Implemented in v1.15 (§9.1).
   pipeline LOO capped time 0.64 % (unscaled: 1.98 %); settled hold-out (six 2–4 min windows)
   median / max 0.69 / 1.0 % (unscaled: 0.62 / 2.9 %, with 16384³ −2.7 / −2.9 %). γ = 2 is
   worse on every check (1.37 % LOO, 1.01 % settled). γ = 1 and byte_pj = 0 confirmed.
-- No refit shipped: the combined refit uses these windows.
+- No refit shipped here: the combined refit (§10) uses the N ≤ 14 windows of this run.
+
+## 10. Combined refit: bf-eps kernels, eps path retired, clock-scaled byte energy (2026-10-06, branch `followups-combined`; DESIGN v1.14 §3.4.1, v1.15 §6c.1 / §6c.7)
+
+`followups-combined` = followup-integration + `bf-eps` (v1.14, branch-free ε pack emitter,
+docs/NOTES-BFEPS.md) + `hotclock` (v1.15 §6c.7, `power.byte_f_pj`, host API 11; renumbered
+from its draft "v1.14"). With the v1.14 kernels the pack time no longer depends on ε, so the
+model's eps path is retired (DESIGN §6c.1 "The eps path — retired": `op_eps` features 0,
+`eps_fraction` validated and ignored, `eps_s` / `eps_fraction` out 0, `op_eps` keys optional,
+format 2 kept; the six `--data dominant` calibration cases dropped, the three hold-out ones
+kept as a check). Then one recalibration of everything.
+
+**Data** (RTX 4090, stock clocks, quiet gate and shared GPU lock, `ehrenfest_busy.sh` FREE;
+profiling `imd_bench` at baec447; `tools/calibrate.sh --validate`, 14:15–14:52, 37 min of wall
+time including the bench build and quiet waits):
+- calibration sweep 14:15–14:36, 434 timed calls; cache sweep fresh (14:36–14:37);
+- sustained windows **reused** from the `hotclock` run (2026-10-06 13:05, 60 s pre-heat) but
+  **only the 9 windows with N ≤ 14**: they ran the pre-v1.14 pack emitter, which has no eps
+  work at N ≤ 14 for typical data with these k (and the large capped windows are K4-bound),
+  while the 5 N = 16 windows had the old eps path in their packs and would bias the power fit.
+  Offline check on the same calibration records: 14 windows → e_tc 0.700 pJ/op, e_byte^f 305
+  pJ/B, f_ref 2430 MHz; 9 windows → 0.701, 298, 2455 MHz. Recollecting the N = 16 windows
+  (≈ 7 min) would have overrun the 35 min GPU budget; it is the first thing to do at the next
+  sustained run;
+- hold-out 14:37–14:52, 178 calls (same sweep as §8 plus the comment on the dominant cases).
+- Raw records, logs and scripts: immerdink-eval `results/followups2/combined/`.
+
+**Fit** (shipped as `src/host/calib/rtx4090_sm89.calib`, version baec447, host API 11):
+- no `op_eps` keys (fitted 0: all-zero feature columns); `kf.chain` 23.9 → 11.1 ns, `pack.op`
+  0.226 → 0.126 ps/op (the old θ carried part of the eps work in the plain terms);
+- power, scaled form (§6c.7), γ = 1, byte_pj held at 0: e_tc 0.6498 → **0.708** pJ/op,
+  e_byte 335 → **0**, e_byte^f **301** pJ/B, f_ref (`clock_eff_mhz`) 2455 → 2480 MHz. Sustained
+  leave-one-case-out: median 0.8 % (capped windows −0.6 … +0.8 %; the uncapped 512³ / 1024³ /
+  r_mm windows +7.5 / −11.5 / +4.8 %, as before: they run above f_ref);
+- `rank.tie_ratio` 1.078 → 1.074; bands (5 / 95 hold-out quantiles, cross-validated coverage
+  82 %): call < 100 µs 0.897–1.213, 100 µs – 1 ms 0.881–1.104, ≥ 1 ms 0.932–1.046.
+- `k23_pack` occupancy: the occupancy query measures the W = 3 instantiation (117 registers,
+  2 CTAs / SM); W = 2 has 84 registers but the same 2 CTAs / SM (40 768 B static shared memory
+  per CTA), so `kernel.pack = 2 …` holds for every N. K4 features are unchanged, so
+  `k4_select` was not re-checked.
+
+**Hold-out, same 178 calls, BURST, REPEAT** (median / p90 / max |error| of the call time).
+"Before (as shipped)": followup-integration's library and calibration (its eps path on);
+"before θ, eps ignored": the old θ in this library; "after": the shipped refit.
+
+| subset | measured call | calls | before (as shipped) | before θ, eps ignored | after | target |
+|---|---|---|---|---|---|---|
+| all | < 100 µs | 56 | 9.6 / 31.3 / 35.2 % ✗ | 6.1 / 12.5 / 22.9 % | 6.4 / 14.5 / 28.8 % | 15 / 30 % |
+| all | 100 µs – 1 ms | 58 | 6.5 / 29.4 / 43.0 % ✗ | 3.7 / 14.7 / 22.9 % | 2.9 / 11.2 / 18.0 % | 10 / 20 % |
+| all | ≥ 1 ms | 64 | 3.2 / 11.1 / 24.2 % | 2.0 / 7.7 / 15.2 % | 2.1 / 7.3 / 15.7 % | 5 / 15 % |
+| N = 15–17 | < 100 µs | 18 | 28.9 / 33.1 / 35.2 % | 3.8 / 6.9 / 7.2 % | 2.9 / 8.7 / 12.8 % | |
+| N = 15–17 | 100 µs – 1 ms | 16 | 24.6 / 38.6 / 43.0 % | 6.2 / 16.5 / 19.1 % | 2.3 / 11.3 / 13.4 % | |
+| N = 15–17 | ≥ 1 ms | 22 | 10.4 / 16.5 / 24.2 % | 2.6 / 7.3 / 15.2 % | 2.6 / 6.6 / 15.7 % | |
+
+Per phase on calls ≥ 1 ms (median / p90, as shipped → after): KL A 8.3 / 32.4 → 2.1 / 12.2 %,
+KL B 6.2 / 29.5 → 3.4 / 14.9 %, K2 5.0 / 17.2 → 4.1 / 11.3 %, K3 8.1 / 19.0 → 14.9 / 23.5 %,
+K4 5.0 / 13.0 → 4.8 / 13.1 %, K5 4.5 / 19.2 → 3.4 / 18.6 %, KF 8.4 / 16.3 → 4.6 / 11.4 % (4 calls).
+
+- The model as shipped before this branch misses the < 1 ms targets on the v1.14 kernels: its
+  eps terms price N ≥ 15 packs up to 2× too slow. Retiring them alone (old θ) meets every
+  target; the refit improves the 100 µs – 1 ms class and N = 15–17 further. K3 (B pack at
+  g < N) got worse in the per-phase view (14.9 % median); its share of those calls is small
+  and the call totals are within target.
+- **Dominant data no longer matter** (measured): `w_d800` vs `w_s800` (800³) 0.0918 vs 0.0922
+  ms at N = 15 and 0.1052 vs 0.1034 ms at N = 16; `w_dr1` vs `w_r1` (1200 × 400 × 700) 0.0798
+  vs 0.0781 and 0.0819 vs 0.0797 ms (+2–3 %, within tiny-call noise). The model predicts the
+  same time for both; `v_dom` (1536² × 6144) is within +0.8 / −0.4 %.
+- Examples (TFLOPS-eq measured / predicted; time measured / predicted): 8192³ N = 14 36.58 /
+  36.95 (30.05 / 29.76 ms); 5000³ N = 16 27.97 / 27.75 (8.94 / 9.01 ms); 1536² × 6144 dominant
+  N = 15 22.25 / 22.09 (1.303 / 1.313 ms); 800³ N = 16 9.90 / 9.59 (103.4 / 106.7 µs). Largest
+  remaining errors: 1024³ N = 14 +16 / +18 % (predicted slow; 1024³ N = 8 −6 %) and the tiny CC call `v_cc12` N = 8 −29 % (45.8
+  vs 32.6 µs, the < 100 µs maximum).
+- SUSTAINED examples (60 s pre-heat windows): 8192³ N = 14 35.01 / 34.95 TFLOPS-eq (31.40 /
+  31.46 ms, 2282 / 2325 MHz); 12288³ N = 14 36.85 / 36.86 (100.69 / 100.68 ms).

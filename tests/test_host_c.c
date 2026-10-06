@@ -447,11 +447,18 @@ int main(void) {
     /* host API 11 (DESIGN v1.15 §6c.7): the optional power.byte_f_pj, and the folded view
      * energy_byte_pj = byte + byte_f of a v7..v10-sized struct (nothing written beyond it) */
     {
-      static char t2[16600];
-      static imd_perf_calib_t full, v10;
+      static char t0[16600], t2[16600];
+      static imd_perf_calib_t base, full, v10;
       const uint32_t v10_size = (uint32_t)offsetof(imd_perf_calib_t, energy_byte_f_pj);
-      CHECK(cal.energy_byte_f_pj == 0 && strstr(text, "power.byte_f_pj") == NULL);
-      const int n2 = snprintf(t2, sizeof t2, "%spower.byte_f_pj = 7.5\n", text);
+      /* the shipped calibration with byte_f = 0 (the combined refit ships byte_f > 0): its
+       * text has no key */
+      base = cal;
+      base.energy_byte_f_pj = 0;
+      size_t n0 = 0;
+      CHECK(imd_perf_calib_format(&base, t0, sizeof t0, &n0) == IMD_STATUS_SUCCESS &&
+            strstr(t0, "power.byte_f_pj") == NULL);
+      CHECK(cal.energy_byte_f_pj == 0 || strstr(text, "\npower.byte_f_pj = ") != NULL);
+      const int n2 = snprintf(t2, sizeof t2, "%spower.byte_f_pj = 7.5\n", t0);
       full.struct_size = sizeof full;
       CHECK(imd_perf_calib_parse(t2, (size_t)n2, &full, &line) == IMD_STATUS_SUCCESS &&
             full.energy_byte_f_pj == 7.5 && full.energy_byte_pj == cal.energy_byte_pj);
@@ -464,7 +471,7 @@ int main(void) {
       memset(&v10, 0x5a, sizeof v10);
       v10.struct_size = v10_size;
       CHECK(imd_perf_calib_default(&v10) == IMD_STATUS_SUCCESS &&
-            v10.energy_byte_pj == cal.energy_byte_pj && tail[0] == 0x5a);
+            v10.energy_byte_pj == cal.energy_byte_pj + cal.energy_byte_f_pj && tail[0] == 0x5a);
       /* format: the key only when non-zero; round trip */
       static char t3[16600];
       size_t len3 = 0;

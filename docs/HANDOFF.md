@@ -62,6 +62,16 @@ first.
   Done 2026-10-06: the A/B sweep (eval findings), the θ refit and the `k4_select` re-check
   (rule unchanged; branch `k4-align-s2-refit`, NOTES-B2 §8). A caller
   that persists pack bytes must persist `format` and `pack_bytes` and re-pack on a change.
+- **Follow-ups combined (2026-10-06, branch `followups-combined`, not pushed):**
+  followup-integration + `bf-eps` (DESIGN v1.14 §3.4.1, ROADMAP A7, docs/NOTES-BFEPS.md:
+  branch-free ε pack emitter, same bytes, N ≥ 15 packs −20 to −41 %) + `hotclock` (DESIGN
+  v1.15 §6c.7, host API 11: `power.byte_f_pj`; its draft "v1.14" renumbered to v1.15). v1.15
+  also retires the model's eps path (§6c.1: `op_eps` features 0, request `eps_fraction`
+  validated then ignored, `eps_s` / `eps_fraction` out 0, `op_eps` keys optional, format 2
+  kept; no ABI change). The shipped calibration is the combined refit (NOTES-B2 §10;
+  hold-out targets met, scaled power form e_tc 0.708 pJ/op + e_byte^f 301 pJ/B, γ = 1).
+  Open: recollect the 5 N = 16 sustained windows (the refit used the 9 N ≤ 14 windows of
+  the hotclock run); W = 1 for N ≤ 8 (NOTES-BFEPS §4).
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
