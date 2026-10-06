@@ -102,7 +102,8 @@ static_assert(IMD_PERF_CLASS_K4_128x256 + IMD_K4_64x64 == IMD_PERF_CLASS_K4_64x6
 
 // Version-6 struct sizes (the v7 fields are appended; DESIGN §6c.3).
 constexpr uint32_t kCalibV1Size = offsetof(imd_perf_calib_t, kernel);
-constexpr uint32_t kCalibV7Size = sizeof(imd_perf_calib_t);
+constexpr uint32_t kCalibV7Size = offsetof(imd_perf_calib_t, energy_byte_f_pj);  // v7..v10
+constexpr uint32_t kCalibV11Size = sizeof(imd_perf_calib_t);
 constexpr uint32_t kRequestV1Size = offsetof(imd_perf_request_t, regime);
 constexpr uint32_t kPerfV1Size = offsetof(imd_perf_t, regime);
 constexpr uint32_t kRankRequestV1Size = offsetof(imd_perf_rank_request_t, regime);
@@ -119,7 +120,8 @@ static_assert(kPerfV1Size == 1648, "imd_perf_t v1 layout changed");
 static_assert(kCandidateV1Size == 128, "imd_perf_candidate_t v1 layout changed");
 static_assert(kRankRequestV1Size == 64, "imd_perf_rank_request_t v1 layout changed");
 static_assert(kRequestV1Size == 24, "imd_perf_request_t v1 layout changed");
-static_assert(sizeof(imd_perf_calib_t) == 1232 + 16 * 128 + 8 * 10 + 8 * 6 + 8 * 32 + 8, "v7 calib");
+static_assert(kCalibV7Size == 1232 + 16 * 128 + 8 * 10 + 8 * 6 + 8 * 32 + 8, "v7 calib");
+static_assert(kCalibV11Size == kCalibV7Size + 8, "v11 calib");
 static_assert(kRequestV7Size == 40, "v7 request");
 static_assert(kPerfV7Size == 1648 + 8 + 8 * 5 + 16 * 16, "v7 prediction");
 static_assert(kRankRequestV7Size == 88, "v7 rank request");
@@ -209,7 +211,7 @@ void migrate_v7_fields(imd_perf_calib_t* cal) {
   for (int k = 0; k < IMD_PERF_KERNEL_CAPACITY; ++k)
     cal->kernel[k] = k < IMD_PERF_KERNEL_COUNT ? builtin_kernel(k) : imd_perf_kernel_t{0, 0, 0, 0};
   cal->clock_eff_mhz = cal->clock_min_mhz = cal->power_cap_w = cal->power_idle_w = 0;
-  cal->energy_tc_pj = cal->energy_alu_pj = cal->energy_byte_pj = 0;
+  cal->energy_tc_pj = cal->energy_alu_pj = cal->energy_byte_pj = cal->energy_byte_f_pj = 0;
   cal->energy_gamma = 2;
   cal->warm_l2_bytes = cal->warm_l2byte_ns = 0;
   cal->tie_ratio = 1;
@@ -648,7 +650,8 @@ bool calib_valid(const imd_perf_calib_t& c) {
     if (q.resident < 1 || q.regs < 0 || q.smem_bytes < 0 || q.threads < 0) return false;
   }
   for (const double v : {c.clock_eff_mhz, c.clock_min_mhz, c.power_cap_w, c.power_idle_w,
-                         c.energy_tc_pj, c.energy_alu_pj, c.energy_byte_pj, c.energy_gamma,
+                         c.energy_tc_pj, c.energy_alu_pj, c.energy_byte_pj, c.energy_byte_f_pj,
+                         c.energy_gamma,
                          c.warm_l2_bytes, c.warm_l2byte_ns, c.tie_ratio})
     if (!finite_nonneg(v)) return false;
   if (c.power_cap_w > 0 && !(c.clock_eff_mhz > 0 && c.clock_min_mhz > 0 &&
@@ -684,6 +687,17 @@ constexpr ScalarKey kScalarKeys[] = {
     {"rank.tie_ratio", &imd_perf_calib_t::tie_ratio}};
 constexpr int kScalarKeyCount = sizeof kScalarKeys / sizeof kScalarKeys[0];
 const char* const kBandCallKeys[3] = {"band.call_small", "band.call_mid", "band.call_large"};
+// v1.14 (host API 11, DESIGN §6c.7): the one optional format-2 key (absent = 0).
+constexpr const char* kByteFKey = "power.byte_f_pj";
+
+// A v7..v10-sized caller has no energy_byte_f_pj: the folded view (DESIGN §6c.2), the
+// unscaled form with the total byte energy (an API-10 library's prediction).
+void fold_byte_f(imd_perf_calib_t* cal, uint32_t struct_size) {
+  if (struct_size >= kCalibV7Size && struct_size < kCalibV11Size) {
+    cal->energy_byte_pj += cal->energy_byte_f_pj;
+    cal->energy_byte_f_pj = 0;
+  }
+}
 
 // A rejected calibration (host API 10, DESIGN §6c.3): the line (0: none), the reason
 // (IMD_PERF_CALIB_ERR_*), the key and a message. reason 0 = no error.
@@ -726,7 +740,8 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
   constexpr int kKernelSlot = kFixed + IMD_PERF_PARAM_CAPACITY;
   constexpr int kScalarSlot = kKernelSlot + IMD_PERF_KERNEL_COUNT;
   constexpr int kBandSlot = kScalarSlot + kScalarKeyCount;  // 3 call bands, then the classes
-  constexpr int kSeen = kBandSlot + 3 + IMD_PERF_CLASS_COUNT;
+  constexpr int kOptSlot = kBandSlot + 3 + IMD_PERF_CLASS_COUNT;  // power.byte_f_pj (optional)
+  constexpr int kSeen = kOptSlot + 1;
   int32_t seen[kSeen] = {};   // the line of each key seen (0: not seen)
   int32_t first_v2_line = 0;  // the first line of a format-2-only key
   std::string first_v2_key;
@@ -748,6 +763,7 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
     }
     if (slot < kScalarSlot) return std::string("kernel.") + kernel_name(slot - kKernelSlot);
     if (slot < kBandSlot) return kScalarKeys[slot - kScalarSlot].key;
+    if (slot == kOptSlot) return kByteFKey;
     const int b = slot - kBandSlot;
     return b < 3 ? std::string(kBandCallKeys[b]) : std::string("band.") + kClassNames[b - 3];
   };
@@ -818,6 +834,11 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
         dst[0] = d[0], dst[1] = d[1];
         slot = kBandSlot + idx, v2 = true;
       }
+    } else if (key == kByteFKey) {
+      double d = 0;
+      if (!parse_number(val, &d) || d < 0) return bad("a finite number >= 0");
+      r.energy_byte_f_pj = d;
+      slot = kOptSlot, v2 = true;
     } else {
       for (int i = 0; i < kScalarKeyCount && slot < 0; ++i)
         if (key == kScalarKeys[i].key) {
@@ -878,7 +899,7 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
           seen[kFixed + cl * kP + j] == 0)
         return missing(kFixed + cl * kP + j);
   if (f2) {
-    for (int i = kKernelSlot; i < kSeen; ++i)
+    for (int i = kKernelSlot; i < kOptSlot; ++i)  // power.byte_f_pj is optional
       if (seen[i] == 0) return missing(i);
     if (r.power_cap_w > 0 && !(r.clock_eff_mhz > 0 && r.clock_min_mhz > 0 &&
                                r.clock_min_mhz <= r.clock_eff_mhz))
@@ -896,6 +917,7 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
   // A caller compiled against version 6 has no room for the v7 fields: it gets a true
   // format-1 view (the format-2 parameters zeroed): a degraded model (DESIGN §6c.3).
   if (out->struct_size < kCalibV7Size) to_format1_params(&r);
+  fold_byte_f(&r, out->struct_size);  // v7..v10 caller (API 11)
   r.struct_size = out->struct_size;
   std::memcpy(out, &r, std::min<size_t>(out->struct_size, sizeof r));
   if (err != nullptr) *err = CalibErr{};
@@ -964,6 +986,13 @@ std::string format_calib(const imd_perf_calib_t& c) {
     s += " = ";
     append_number(&s, c.*(sk.field));
     s += '\n';
+    if (sk.field == &imd_perf_calib_t::energy_byte_pj && c.energy_byte_f_pj != 0) {
+      // v1.14: written only when non-zero (the text of a calibration without it is unchanged)
+      s += kByteFKey;
+      s += " = ";
+      append_number(&s, c.energy_byte_f_pj);
+      s += '\n';
+    }
   }
   s += "# Prediction bands (§6c.1): p10 p90 of measured / predicted on the hold-out set.\n";
   const auto band = [&](const std::string& key, const double* b) {
@@ -1048,6 +1077,7 @@ imd_status_t calib_default(imd_perf_calib_t* out, CalibErr* e) {
   }
   imd_perf_calib_t c = sh.cal;
   if (out->struct_size < kCalibV7Size) to_format1_params(&c);
+  fold_byte_f(&c, out->struct_size);  // v7..v10 caller (API 11)
   c.struct_size = out->struct_size;
   std::memcpy(out, &c, std::min<size_t>(out->struct_size, sizeof c));
   return IMD_STATUS_SUCCESS;
@@ -1137,8 +1167,9 @@ double call_seconds(const imd_perf_calib_t& cal, const PerfPhases& P, double sca
   return t;
 }
 
-// The call's average power at clock f (DESIGN §6c.1 "Clock regimes"): idle + (tensor-core and
-// ALU energy scaled by (f / f_ref)^gamma + DRAM energy) / time; 0 without a power model.
+// The call's average power at clock f (DESIGN §6c.1 "Clock regimes", v1.14 §6c.7): idle +
+// ((tensor-core, ALU and clock-scaled byte energy) (f / f_ref)^gamma + DRAM energy) / time; 0
+// without a power model. With energy_byte_f_pj = 0 the added term is +0: bit-identical to v1.10.
 double call_power(const imd_perf_calib_t& cal, const PerfPhases& P, double f, double t) {
   if (!(cal.power_cap_w > 0) || !(cal.clock_eff_mhz > 0)) return 0;
   double tc = 0, alu = 0, bytes = 0;
@@ -1152,7 +1183,8 @@ double call_power(const imd_perf_calib_t& cal, const PerfPhases& P, double f, do
       alu += p.x[2];
   }
   const double dyn = std::pow(f / cal.clock_eff_mhz, cal.energy_gamma);
-  const double joules = ((cal.energy_tc_pj * tc + cal.energy_alu_pj * alu) * dyn +
+  const double joules = ((cal.energy_tc_pj * tc + cal.energy_alu_pj * alu +
+                          cal.energy_byte_f_pj * bytes) * dyn +
                          cal.energy_byte_pj * bytes) * 1e-12;
   return cal.power_idle_w + (t > 0 ? joules / t : 0);
 }

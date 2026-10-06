@@ -27,7 +27,7 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 10 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 11 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
@@ -46,7 +46,10 @@ extern "C" {
                                   10: explicit calibration parse errors (§6c.3):
                                       imd_perf_calib_error_t, IMD_PERF_CALIB_ERR_*,
                                       imd_perf_calib_parse_ex / _load_ex / _default_ex,
-                                      imd_perf_calib_error_name */
+                                      imd_perf_calib_error_name;
+                                  11: clock-scaled byte energy (§6c.7 v1.14):
+                                      imd_perf_calib_t energy_byte_f_pj, optional
+                                      calibration key power.byte_f_pj */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -510,6 +513,13 @@ typedef struct {
   double band_class[IMD_PERF_CLASS_CAPACITY][2]; /* [IMD_PERF_CLASS_*] {lo, hi} per phase    */
   double tie_ratio;       /* rank: a feasible candidate within tie_ratio x the best's time is a
                              tie (1 <= tie_ratio <= 1.25; 1: exact ties only)                */
+  /* ---- v11 (DESIGN v1.14 §6c.7). A caller with a v7..v10 struct_size gets the folded view
+   *      energy_byte_pj = byte_pj + byte_f_pj from the calibration functions (the unscaled
+   *      form with the total byte energy: an API-10 prediction); a struct of that size is
+   *      read with energy_byte_f_pj = 0. ---- */
+  double energy_byte_f_pj; /* per DRAM byte, scaled like the ops by (f / clock_eff)^gamma
+                              (SM / L2-side energy of the traffic; key power.byte_f_pj,
+                              optional, 0 when absent)                                       */
 } imd_perf_calib_t;
 
 /* The shipped calibration (RTX 4090, sm_89). out->struct_size must be set; SUCCESS. A

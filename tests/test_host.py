@@ -29,6 +29,7 @@ import math
 import os
 import random
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -1211,6 +1212,157 @@ def suite_perf_v110(cal, names, rng):
     return count
 
 
+def _sized_calib(fn, size, *args):
+    """Call a C calibration function (host API 10 _ex form) with a struct whose struct_size is
+    `size` (a caller compiled against an older API): the bytes beyond it are poisoned and must
+    stay untouched. Returns (status, raw, error)."""
+    h = host.load()
+    raw = host._PerfCalib()
+    C.memset(C.byref(raw), 0x5A, C.sizeof(raw))
+    raw.struct_size = size
+    e = host._PerfCalibError()
+    e.struct_size = C.sizeof(e)
+    st = getattr(h.lib, fn)(*args, C.byref(raw), C.byref(e))
+    tail = bytes(raw)[size:]
+    if tail != b"\x5a" * len(tail):
+        raise Fail(f"{fn} wrote beyond struct_size {size}")
+    return st, raw, e
+
+
+V10_CALIB_SIZE = 3672  # sizeof(imd_perf_calib_t) of host API 7..10 (v9 and v10: the same)
+
+
+def suite_perf_v114(cal):
+    """DESIGN v1.14 §6c.7 (host API 11): the optional power.byte_f_pj, the folded v7..v10 view,
+    identity at byte_f = 0, monotonicity of the SUSTAINED clock."""
+    count = 0
+    shapes = [("ik,jk->ij", dict(i=512, j=512, k=512)), ("ik,jk->ij", dict(i=1500, j=96, k=40000)),
+              ("ik,jk->ij", dict(i=4096, j=4096, k=4096)), ("ik,jk->ij", dict(i=8192, j=8192, k=8192)),
+              ("ik,jk->ij", dict(i=12288, j=384, k=1040)),
+              ("acQ,bdQ->acbd", dict(a=64, b=64, c=64, d=64, Q=2048))]
+    regimes = (("BURST", 0.0), ("SUSTAINED", 0.0), ("DEFAULT", 0.0), ("DEFAULT", 2200.0))
+
+    def preds(c):
+        return [host.predict(sp, ex, N=N, regime=rg, clock_mhz=ck, cache=cc, calib=c)
+                for sp, ex in shapes for N in (8, 14, 16) for rg, ck in regimes
+                for cc in ("COLD", "REPEAT")]
+
+    # (1) the shipped file has no byte_f key; an explicit 0 is the same calibration, bit for
+    # bit, formats to the same text and predicts identically (every regime, cache, shape).
+    t0 = cal.format()
+    if "power.byte_f_pj" in t0 or cal.power["power.byte_f_pj"] != 0.0:
+        raise Fail("the shipped calibration has power.byte_f_pj")
+    c0 = host.Calibration.parse(t0.replace("power.gamma = ", "power.byte_f_pj = 0\npower.gamma = "))
+    if bytes(c0._raw) != bytes(cal._raw) or c0.format() != t0:
+        raise Fail("power.byte_f_pj = 0 is not the calibration without the key")
+    p_ship = preds(None)
+    if preds(c0) != p_ship or preds(cal) != p_ship:
+        raise Fail("byte_f = 0 does not predict bit-identically to the shipped calibration")
+    count += len(p_ship)
+    # (2) round trip with the key (format -> parse bit-exact; written after power.byte_pj)
+    ex = dict(cal.extra)
+    ex.update({"power.byte_pj": 100.0, "power.byte_f_pj": 235.5})
+    c2 = host.Calibration.from_values(cal.meta, cal.params, extra=ex)
+    t2 = c2.format()
+    if "power.byte_pj = 100\npower.byte_f_pj = 235.5\n" not in t2:
+        raise Fail("power.byte_f_pj is not written after power.byte_pj")
+    back = host.Calibration.parse(t2)
+    if bytes(back._raw) != bytes(c2._raw) or back.format() != t2 or \
+            back.power["power.byte_f_pj"] != 235.5:
+        raise Fail("power.byte_f_pj round trip")
+    # (3) parse errors: format 1, negative, repeated, not a number
+    v6 = host.Calibration.load(os.path.join(ROOT, "tests/data/perf_calib_v6_format1.calib"))
+    bad = {"format-2 key in format 1": (v6.format() + "power.byte_f_pj = 1\n", "FORMAT2_KEY"),
+           "negative": (t0 + "power.byte_f_pj = -1\n", "VALUE"),
+           "not a number": (t0 + "power.byte_f_pj = x\n", "VALUE"),
+           "repeated": (t2 + "power.byte_f_pj = 1\n", "REPEATED_KEY")}
+    for why, (t, reason) in bad.items():
+        try:
+            host.Calibration.parse(t)
+            raise Fail(f"accepted power.byte_f_pj: {why}")
+        except host.CalibrationError as e:
+            if e.reason != reason or e.key != "power.byte_f_pj":
+                raise Fail(f"power.byte_f_pj {why}: {e.reason} {e.key}")
+        count += 1
+    # (4) the folded view of a v7..v10-sized struct: energy_byte_pj = byte + byte_f, the rest
+    # the same bytes; parse, load and default (byte_f = 0: the full calibration's prefix).
+    h = host.load()
+    data = t2.encode()
+    want = host._PerfCalib.from_buffer_copy(bytes(c2._raw))
+    want.energy_byte_pj = 100.0 + 235.5
+    want.struct_size = V10_CALIB_SIZE
+    st, v10, _ = _sized_calib("imd_perf_calib_parse_ex", V10_CALIB_SIZE, data, len(data))
+    if st != 0 or bytes(v10)[:V10_CALIB_SIZE] != bytes(want)[:V10_CALIB_SIZE]:
+        raise Fail("folded v10 view (parse)")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "f.calib")
+        with open(path, "w") as f:
+            f.write(t2)
+        st, v10l, _ = _sized_calib("imd_perf_calib_load_ex", V10_CALIB_SIZE, os.fsencode(path))
+        if st != 0 or bytes(v10l)[:V10_CALIB_SIZE] != bytes(want)[:V10_CALIB_SIZE]:
+            raise Fail("folded v10 view (load)")
+    st, v10d, _ = _sized_calib("imd_perf_calib_default_ex", V10_CALIB_SIZE)
+    full = host._PerfCalib.from_buffer_copy(bytes(cal._raw))
+    full.struct_size = V10_CALIB_SIZE
+    if st != 0 or bytes(v10d)[:V10_CALIB_SIZE] != bytes(full)[:V10_CALIB_SIZE]:
+        raise Fail("v10 view of the shipped calibration (byte_f = 0) differs from the full one")
+    # its predictions = the unscaled form with e_byte = byte + byte_f (a file without the key);
+    # read with byte_f = 0 although the poisoned tail is beyond its size
+    ex_fold = dict(ex)
+    ex_fold.update({"power.byte_pj": 100.0 + 235.5, "power.byte_f_pj": 0.0})
+    c_fold = host.Calibration.from_values(cal.meta, cal.params, extra=ex_fold)
+    p_fold = preds(c_fold)
+    if preds(host.Calibration(v10, h)) != p_fold:
+        raise Fail("the v10 view does not predict as the folded (unscaled) calibration")
+    if preds(c2) == p_fold:
+        raise Fail("byte_f > 0 predicts as the folded calibration (no capped shape?)")
+    # imd_perf_calib_format of a v10-sized struct: read with byte_f = 0 (no key written)
+    if host.Calibration(v10, h).format() != c_fold.format():
+        raise Fail("format of a v10-sized struct")
+    count += len(p_fold)
+    # (5) monotonicity of the SUSTAINED clock (gamma = 1; f_s < f_ref: the scaled term is the
+    # smaller one there): moving byte energy into byte_f never lowers the clock, raising byte_f
+    # never raises it, and the 2026-10-05 refit pair lowers it for tensor-core-heavy calls.
+    def mk(tc, byte, byte_f):
+        e = dict(cal.extra)
+        e.update({"power.tc_pj": tc, "power.byte_pj": byte, "power.byte_f_pj": byte_f,
+                  "power.gamma": 1.0})
+        return host.Calibration.from_values(cal.meta, cal.params, extra=e)
+
+    tc0, b0 = cal.power["power.tc_pj"], cal.power["power.byte_pj"]
+    fref, cmin = cal.power["power.clock_eff_mhz"], cal.power["power.clock_min_mhz"]
+    for sp, ext in shapes:
+        for N in (8, 14, 16):
+            def sus(c):
+                return host.predict(sp, ext, N=N, regime="SUSTAINED", cache="COLD", calib=c)
+            moved = [sus(mk(tc0, b0 * (1 - a), b0 * a)) for a in (0.0, 0.25, 0.5, 0.75, 1.0)]
+            for x, y in zip(moved, moved[1:]):
+                if y.clock_mhz < x.clock_mhz or y.time_s > x.time_s * (1 + 1e-12):
+                    raise Fail(f"moving e_byte to e_byte^f lowered the clock: {sp} {ext} N={N}")
+            raised = [sus(mk(tc0, b0, bf)) for bf in (0.0, 50.0, 150.0, 400.0, 1000.0)]
+            for x, y in zip(raised, raised[1:]):
+                if y.clock_mhz > x.clock_mhz or y.time_s < x.time_s * (1 - 1e-12):
+                    raise Fail(f"raising e_byte^f raised the clock: {sp} {ext} N={N}")
+            # a capped solve brackets the cap within the bisection's 0.05 MHz
+            for bf in (150.0, 1000.0):
+                c = mk(tc0, b0, bf)
+                q = sus(c)
+                if cmin < q.clock_mhz < fref:
+                    lo, hi = (host.predict(sp, ext, N=N, clock_mhz=q.clock_mhz + d, cache="COLD",
+                                           calib=c).power_w for d in (-0.05, 0.05))
+                    if not lo <= 450.0 <= hi:
+                        raise Fail(f"SUSTAINED clock {q.clock_mhz} MHz does not meet the cap "
+                                   f"({lo} .. {hi} W) with byte_f {bf}")
+            count += 10
+    for ext in (dict(i=8192, j=8192, k=8192), dict(i=16384, j=16384, k=16384)):
+        old = host.predict("ik,jk->ij", ext, N=14, regime="SUSTAINED", calib=mk(0.6498, 335.0, 0.0))
+        new = host.predict("ik,jk->ij", ext, N=14, regime="SUSTAINED", calib=mk(0.691, 0.0, 296.0))
+        if not (old.clock_mhz < fref and new.clock_mhz < old.clock_mhz and new.time_s > old.time_s):
+            raise Fail(f"refit pair: clock {old.clock_mhz} -> {new.clock_mhz} at {ext}")
+        count += 1
+    return count
+
+
 def suite_calib_errors(cal, lib_path):
     """Host API 10 (DESIGN §6c.3): every calibration rejection as a CalibrationError with its
     line, reason, key and message; the shipped calibration loads (no error kept); the
@@ -1550,6 +1702,10 @@ def suite_perf(args):
     if args.verbose:
         print(f"  ok  v1.10: {n_v110} checks (format 1 = v6, format 2, regimes, cache, bands, "
               f"rank ties)")
+    n_v114 = suite_perf_v114(cal)  # DESIGN v1.14 §6c.7 (host API 11)
+    if args.verbose:
+        print(f"  ok  v1.14: {n_v114} checks (power.byte_f_pj optional, round trip, errors, "
+              f"folded v10 view, identity at 0, clock monotonicity)")
     if args.verbose:
         print(f"  ok  calibration round trip, {n_feat} feature transcriptions, K4 == A3 "
               f"estimate, {mono} monotonicity pairs, statuses, packed, {n_rank} ranked "

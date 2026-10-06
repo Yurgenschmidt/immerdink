@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Calibrate the performance model (DESIGN v1.8 §6c.2) on this machine's GPU.
 #   tools/calibrate.sh [-o out.calib] [--validate] [--results DIR] [--k-align auto|16|64]
-#                      [--sustained FILE] [--cache FILE]
+#                      [--sustained FILE] [--cache FILE] [--sustained-only]
 # 1. builds the profiling imd_bench (bench/build.sh, via bench/run_sweep.sh);
 # 2. runs the calibration sweep bench/sweep_calib.txt through bench/run_sweep.sh (quiet gate,
 #    shared GPU lock, warm-up; ~12 min of GPU time on an RTX 4090) into DIR/calib-<stamp>.jsonl;
@@ -24,13 +24,16 @@
 # bench/sweep_cache.txt run instead of measuring them again (~13 min of GPU). Only valid when
 # those sweeps' plans are unchanged since (v1.13 stage 2: every case there has k = 0 mod 64,
 # so A = 16 and A = 64 give the same k_hat).
+# --sustained-only (v1.14, DESIGN §6c.7): run only bench/sweep_sustained.txt (60 s pre-heat
+# windows, ~17 min of GPU), print the records' path and exit (no fit; reuse them later with
+# --sustained FILE).
 # Results default to bench/results/ (git-ignored). Never changes GPU clocks.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
 env_dir="${IMMERDINK_ENV:-$HOME/miniforge3/envs/immerdink}"
 build="${IMMERDINK_BENCH_BUILD:-$root/build/bench}"
-out="" validate=0 results="$root/bench/results" sdata="" cdata=""
+out="" validate=0 results="$root/bench/results" sdata="" cdata="" sonly=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
@@ -38,9 +41,10 @@ while [ $# -gt 0 ]; do
     --results) results="$2"; shift 2 ;;
     --sustained) sdata="$2"; shift 2 ;;
     --cache) cdata="$2"; shift 2 ;;
+    --sustained-only) sonly=1; shift ;;
     --k-align) case "$2" in auto|0|16|64) export IMD_BENCH_K_ALIGN="$2" ;;
                *) echo "--k-align auto|16|64" >&2; exit 2 ;; esac; shift 2 ;;
-    *) echo "usage: tools/calibrate.sh [-o out.calib] [--validate] [--results DIR] [--k-align auto|16|64] [--sustained FILE] [--cache FILE]" >&2; exit 2 ;;
+    *) echo "usage: tools/calibrate.sh [-o out.calib] [--validate] [--results DIR] [--k-align auto|16|64] [--sustained FILE] [--cache FILE] [--sustained-only]" >&2; exit 2 ;;
   esac
 done
 for f in "$sdata" "$cdata"; do
@@ -54,6 +58,13 @@ hostlib="$build/immerdink/libimmerdink_host.so"
 
 # v1.10: every timed record carries the SM clock of its calls (the per-call clock probe).
 export IMD_BENCH_CLOCK=1
+if [ "$sonly" = 1 ]; then
+  [ -z "$sdata" ] || { echo "calibrate: --sustained-only measures; --sustained FILE reuses" >&2; exit 2; }
+  sdata="$results/sustained-$stamp.jsonl"
+  "$root/bench/run_sweep.sh" "$root/bench/sweep_sustained.txt" "$sdata" || exit $?
+  echo "sustained records: $sdata"
+  exit 0
+fi
 data="$results/calib-$stamp.jsonl"
 "$root/bench/run_sweep.sh" "$root/bench/sweep_calib.txt" "$data" || exit $?
 # v1.10 (DESIGN §6c.1): sustained windows (power model) and the cache-state pairs.

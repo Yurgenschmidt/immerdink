@@ -1,4 +1,4 @@
-# immerdink — design (v1.13)
+# immerdink — design (v1.14)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -46,9 +46,10 @@ count of k̂ ∈ (j·131008, j·131056] changes (+1); changed text is marked **[
 k > 96 and 16 otherwise (a pure function of k), pack format 2 for A = 64, the resolved
 alignment in `imd_lowering_t` (host API 9) and a test hook to force A. Results stay
 bit-identical.
-§6c.7 is a **[v1.14 draft]**: measurements of long hot runs and a proposed clock-scaled
-byte energy in the power model (host API 11). It is not implemented; its design questions
-are decided (independent reviewer, 2026-10-06) and the refit needs new GPU windows.
+v1.14 (§6c.7): measurements of long hot runs and a clock-scaled byte energy in the power
+model, `power.byte_f_pj` (host API 11, optional calibration key: absent = 0 predicts exactly
+as before). Implemented 2026-10-06; its design questions were decided by the independent
+reviewer. The shipped calibration does not use the key yet (the combined refit writes it).
 The change lists are at the end.
 
 Sources:
@@ -2714,6 +2715,10 @@ split into a time model at a given clock and a clock model per regime.
   the 4090, the windows span 2300–2800 MHz only). P(f) rises monotonically with f (numerator
   up, t(f) down). The coefficients are effective: e_byte (335 pJ/B on the 4090) carries the SM
   power of memory-bound work too, e_alu fitted to 0.
+  **[v1.14, §6c.7]** With the optional `power.byte_f_pj` (e_byte^f, SM/L2-side energy per
+  modelled DRAM byte, clock-scaled): `P(f) = P_idle + [ (e_tc·O_tc + e_alu·O_alu +
+  e_byte^f·D)·(f/f_ref)^γ + e_byte·D ] / t(f)`. e_byte^f = 0 (absent) is the form above, bit
+  for bit; P(f) stays monotone in f.
 - **Regimes.** `BURST`: f = f_ref. `SUSTAINED`: f = f_ref if P(f_ref) ≤ P_cap, else the f in
   [f_min, f_ref] with P(f) = P_cap (bisection, deterministic), f_min if even that is above the
   cap. An explicit `clock_mhz` in the request overrides both (e.g. a locked clock, or the
@@ -2734,6 +2739,10 @@ split into a time model at a given clock and a clock model per regime.
   never read, so nothing perturbs the window). Each window gives one linear equation in
   (P_idle, e_tc, e_alu, e_byte) at its measured clock. A calibration without a power model
   (format 1, or `power.cap_w = 0`) predicts SUSTAINED = BURST.
+  **[v1.14, §6c.7]** `bench/perf_fit.py` fits the clock-scaled form by default: e_byte held
+  fixed (`--byte-pj`, default 0, printed with the fit), NNLS of e_tc, e_alu, e_byte^f, γ = 1
+  (`--power-gammas` scans other values by the power residual); `--power-form unscaled` is the
+  v1.10 fit. The sustained windows get a 60 s pre-heat.
 - **Default: SUSTAINED** (accepted, review 2026-10-05: ehrenfest runs long sequences; for calls
   below the cap both regimes coincide, so the default only changes the large, tensor-core-heavy
   calls, which in a sequence do run at the capped clock). Two known biases: **pessimistic** for a
@@ -2870,7 +2879,8 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   carries `sm_mhz_median`, the SM clock right after each timed call (the one-warp
   `%globaltimer` / `clock64` probe, outside the timed window; ~11 % below NVML, a relative
   indicator) besides NVML's clock after the loop (`gpu_after`). `bench/sweep_sustained.txt`
-  (sustained windows with 15 s pre-heat, ≈ 7 min) feeds the power fit, `bench/sweep_cache.txt` (flush / repeat /
+  (sustained windows with 15 s pre-heat, ≈ 7 min; [v1.14] 60 s pre-heat, ≈ 17 min, and a
+  2 s trace) feeds the power fit (`tools/calibrate.sh --sustained-only` runs just this sweep), `bench/sweep_cache.txt` (flush / repeat /
   pair, ≈ 2 min) the cache fit; `tools/calibrate.sh` runs all three.
 - **File format 2** [v1.10] (written by v7; format 1 is still read). Format 1 plus, all
   required:
@@ -2884,6 +2894,11 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   - `warm.l2_bytes`, `warm.l2byte` (≥ 0); `rank.tie_ratio` (1 … 1.25);
   - `band.call_small`, `band.call_mid`, `band.call_large` and `band.<class>` for every class
     = `lo hi` (two factors, 0 < lo ≤ hi; `1 1`: no band).
+  - **[v1.14, host API 11] optional:** `power.byte_f_pj` (≥ 0; absent = 0), the clock-scaled
+    byte energy of §6c.7. It is the only optional key; in a format-1 file it is a format-2 key
+    (rejected). A library older than API 11 rejects a file containing it (unknown key).
+    `imd_perf_calib_format` writes it only when it is non-zero, so the text of a calibration
+    without it is unchanged and format → parse stays bit-exact.
   A value of several numbers is separated by blanks. **Reading format 1** migrates: the new
   parameters 0, the built-in occupancy table, no power model, Δ = 0, bands `1 1`; such a
   calibration predicts exactly as host API 6 did (tested). `imd_perf_calib_format` writes the
@@ -2896,6 +2911,13 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   bands. It equals the parse of its own format-1 text (tested), but it is a **degraded,
   unvalidated model** (the format-2 θ were fitted with those terms): such callers should pass
   NULL (the full shipped calibration).
+  **[v1.14] A version-7…10-sized struct** (a caller compiled against host API 7–10) has no
+  `energy_byte_f_pj`: `imd_perf_calib_default`, `_parse`, `_load` (and the `_ex` forms) give
+  it the **folded view** `energy_byte_pj := byte_pj + byte_f_pj` (byte_f dropped), the
+  unscaled form with the total byte energy: it predicts as an API-10 library would with such a
+  calibration. The predictors and `imd_perf_calib_format` read such a struct with
+  byte_f = 0 (its bytes end before the field). With byte_f = 0 (every file before v1.14) the
+  view is the full calibration.
 - **Shipped table.** `src/host/calib/rtx4090_sm89.calib` (the 4090 at stock clocks, as
   shipped: no clock lock; its `clocks` line records the state) is embedded at configure time
   (CMake reads the file into a raw string literal: the file is the one source; editing it
@@ -3147,6 +3169,7 @@ enum { IMD_PERF_ORDER_TIME = 0, IMD_PERF_ORDER_TIES_BY_FOOTPRINT = 1 };
   double band_call[3][2];                                    /* {lo, hi} per size class      */
   double band_class[16][2];                                  /* per IMD_PERF_CLASS_*         */
   double tie_ratio;                                          /* rank tie window, 1 ... 1.25  */
+  double energy_byte_f_pj;  /* [v1.14, API 11] clock-scaled byte energy (power.byte_f_pj)   */
 /* imd_perf_request_t, appended (v6: 24 bytes, v7: 40):                                      */
   int32_t regime, cache;          /* IMD_PERF_REGIME_*, IMD_PERF_CACHE_*                    */
   double  clock_mhz;              /* > 0: NVML-scale clock, clamped to clock_eff (overrides
@@ -3173,6 +3196,10 @@ enum { IMD_PERF_ORDER_TIME = 0, IMD_PERF_ORDER_TIES_BY_FOOTPRINT = 1 };
   (the format-2 parameters zeroed, built-in occupancy, no power model, Δ = 0, no bands; §6c.2),
   whatever its `format` field says. `calib_valid` for format 2: resident ≥ 1, every power / warm value ≥ 0
   and finite, 0 < lo ≤ hi in every band, 1 ≤ tie_ratio ≤ 1.25.
+- **[v1.14] host API 11:** `imd_perf_calib_t` grows by `energy_byte_f_pj` (8 bytes, 3672 →
+  3680). A struct of the v7–v10 size (3672) is read with byte_f = 0 and receives the folded
+  view from the calibration functions (§6c.2). Python: `Calibration.power` has
+  `"power.byte_f_pj"`; `host.API_VERSION` 11.
 - `imd_perf_predict_pack` uses the request's regime, cache (its input is X: WARM serves X from
   L2 up to L_w) and clock as `imd_perf_predict`.
 - Python (`host.py`): `predict(..., regime=, cache=, clock_mhz=)`, `Prediction.regime`,
@@ -3208,6 +3235,18 @@ it; rank: ties = the feasible candidates within tie_ratio of the best's time, or
 `raw_rank` is a permutation reproducing the v6 order, `order = TIME` and a v6-sized request give
 the v6 order. `host_c_api`: the v7 sizes, v6-sized structs still accepted. The kernel-side launch
 refactor (rules moved to `analysis.hpp`) is covered by the existing bit-exact GPU tests.
+
+[v1.14] `host_perf` (C and Python) adds, for `power.byte_f_pj`: parse / format round trip with
+the key (bit-exact) and the shipped text unchanged without it; the key optional in format 2
+(absent = 0), rejected in format 1, negative rejected, repeated rejected; the folded view of a
+v10-sized (and v9-sized: the same size) struct from default / parse / load (`byte_pj + byte_f`,
+byte_f absent) and its predictions equal to the full struct's with e_byte = byte + byte_f,
+byte_f = 0; predictions with an explicit `byte_f_pj = 0` bit-identical to the file without the
+key (every regime, a set of shapes); monotonicity: with γ = 1 and f_s < f_ref, moving byte
+energy from e_byte into e_byte^f never lowers the SUSTAINED clock, raising e_byte^f never
+raises it, and the 2026-10-05 refit pair (e_tc 0.650 + e_byte 335 vs e_tc 0.691 + e_byte^f
+296) lowers the solved clock of tensor-core-heavy calls (8192³, 16384³) as §6c.7 expects;
+a capped solve with byte_f > 0 brackets the cap: P(f_s − 0.05 MHz) ≤ cap ≤ P(f_s + 0.05 MHz).
 
 ### 6c.5 Validation (hold-out)
 
@@ -3256,11 +3295,14 @@ calibration; the launch rules that moved to `analysis.hpp` produce the same laun
 refactor of launch-shape arithmetic, covered by the bit-exact GPU tests), so no Pipeline action
 changes.
 
-### 6c.7 Long hot runs and clock-scaled DRAM energy **[v1.14 draft: proposal, not implemented]**
+### 6c.7 Long hot runs and clock-scaled DRAM energy **[v1.14]**
 
-Status: measured and proposed (NOTES-B2 §9, branch `followup-hotclock`); nothing below is in
-the library yet. The design questions at the end are decided (independent reviewer,
-2026-10-06); code follows the combined refit's new sustained windows.
+Status: measured (NOTES-B2 §9, branch `followup-hotclock`), decided (independent reviewer,
+2026-10-06, the questions at the end) and **implemented** (2026-10-06, branch `hotclock`,
+host API 11: the key, the folded view, `call_power`, `perf_fit.py`, the 60 s pre-heat sweep;
+"Implementation" below). The shipped calibration is **not** refit here: it has no
+`power.byte_f_pj` and predicts exactly as before; the combined refit writes the key from the
+new 60 s pre-heat windows.
 
 **Measured (2026-10-06, stock clocks, 450 W cap; `imd_bench --methods sustained
 --sustain-trace-s 2`).** Six windows of 2–4 min, N = 14, from a cold card (≈ 45 °C idle; the
@@ -3331,7 +3373,7 @@ fit). So the hold-out is a check of the long-run state, and of shape only at 163
 - BURST and every explicit `clock_mhz` are unchanged by construction, so the hold-out
   (bench/perf_validate.py, BURST) is unaffected.
 
-**Proposal (smallest extension).**
+**Design (the smallest extension; implemented as below).**
 1. **Clock-scaled byte energy.** Add one calibration key, `power.byte_f_pj`: the SM/L2-side
    energy per modelled DRAM byte, which scales with the SM clock (the memory clock is fixed at
    10251 MHz, so DRAM's own energy per byte does not). Then
