@@ -340,7 +340,9 @@ Full write-up: immerdink-eval `findings/followup-threshold.md`; raw data and `an
   `imd_test_set_k_align` hook around that side's sizing, lowering and plan creation; the plan
   keeps its A), so A = 16 and A = 64 are timed interleaved call by call in one process
   (no cross-process noise). 7 shapes (2048², 16384×512, 512×16384, 4096×1024, 1024², 512²,
-  DF `Qia,Qjb->iajb` 2304² × Q; K4 configurations 0, 1, 2 as the rule picks), N ∈ {8, 14},
+  DF `Qia,Qjb->iajb` 2304² × Q; K4 configurations 0, 1, 2 as the rule picks, the same on
+  both sides except 512², N = 8, k = 385: configuration 2 at k̂ = 400, 1 at k̂ = 448, so part
+  of that cell's +16.4 % is the configuration switch, not the alignment), N ∈ {8, 14},
   k = 65…385 (every ⌈k⌉₁₆ class 80…400 that a fraction rule could treat differently),
   up to 1000 pairs per duel; the class-32 k repeated with sides swapped. Noise: A/A
   controls (⌈k⌉₁₆ ≡ 0) −0.6 … +1.2 %, pass-to-pass median 0.25 %. All C bit-identical.
@@ -354,7 +356,7 @@ Full write-up: immerdink-eval `findings/followup-threshold.md`; raw data and `an
   64 −0.02 %; 80 −0.03 %; 112…160 about −0.24 %; 256 −0.93 %; padding-fraction bounds
   0.07…0.25 −1.2 … −0.04 % (they un-pad class 16, which nets a gain); "never pad class 32"
   +0.03 … +0.05 % (within noise, and class 32 gains a little at large k); per-k oracle
-  +0.08 %; per-case oracle knowing (m, n, N) +0.29 %.
+  +0.065 % (mean loss vs the per-case best 0.228 %); per-case oracle knowing (m, n, N) +0.29 %.
 - **Agreement.** A pack resolves A from (N, b, r, k) with r its own free extent; K4 reads
   RA and RB with one k̂. A rule in m or n can make the A and B packs (or a pack and the
   native partner) of one contraction disagree, and a pack reused against partners of

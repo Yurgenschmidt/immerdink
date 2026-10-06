@@ -809,7 +809,8 @@ K_c'  = 131008                            (stage 1)
   - **Re-checked with the real A = 64** (follow-up 2026-10-06, docs/NOTES-K4ALIGN.md §11;
     immerdink-eval `findings/followup-threshold.md`): A = 16 against A = 64 interleaved in one
     process (`imd_bench` duel `ka=`), 7 shapes × N ∈ {8, 14} × k = 65…385. **96 stays.** The
-    best k-only rule on that data (a per-k oracle) is +0.08 % mean, "never pad class 32"
+    best k-only rule on that data (a per-k oracle) is +0.065 % mean (mean loss vs the per-case
+    best 0.228 %, against 0.29 % for 96), "never pad class 32"
     +0.03 to +0.05 %; padding-fraction rules (pad iff (⌈k⌉₆₄ − ⌈k⌉₁₆) ≤ f·⌈k⌉₁₆) lose 0.04
     to 1.2 % because class 16 is the most misaligned class and nets a gain; cuts 112…320
     lose 0.24 to 1.1 %. Even a per-case oracle knowing (m, n, N) gains only 0.29 %. The
