@@ -262,9 +262,11 @@ long run(int N, bool trunc, int threads, uint64_t seed, Coverage& cov, long* che
 }
 
 template <int E>
-long run_n(int N, bool trunc, int threads, uint64_t seed, Coverage& cov, long* checked) {
-  long bad = run<E, 3>(N, trunc, threads, seed, cov, checked);  // W = 3 is valid for every N
-  if (imd::kernels::pack_words(N) == 2) bad += run<E, 2>(N, trunc, threads, seed + 1, cov, checked);
+long run_n(int N, bool trunc, int threads, uint64_t seed, Coverage* cov, long* checked) {
+  // cov[0]: the W = 3 run, cov[1]: the W = 2 run (N <= 16); coverage is checked per W.
+  long bad = run<E, 3>(N, trunc, threads, seed, cov[0], checked);  // W = 3 is valid for every N
+  if (imd::kernels::pack_words(N) == 2)
+    bad += run<E, 2>(N, trunc, threads, seed + 1, cov[1], checked);
   return bad;
 }
 
@@ -276,20 +278,32 @@ int main() {
   long bad = 0, checked = 0;
   int fails = 0;
   for (int N = c::kNMin; N <= c::kNMax; ++N) {
-    Coverage cov;
-    cov.eps.assign(c::kEpsMax + 1, 0);
+    Coverage covw[2];  // [0]: W = 3, [1]: W = 2 (review L1: "all eps hit" per W)
+    for (Coverage& cv : covw) cv.eps.assign(c::kEpsMax + 1, 0);
+    const int n_w = imd::kernels::pack_words(N) == 2 ? 2 : 1;
     long bn = 0;
     for (int tr = 0; tr < 2; ++tr) {
       const bool trunc = tr == 1;
       const uint64_t seed = 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(4 * N + tr + 1);
-      bn += run_n<16>(N, trunc, 3 * 1024, seed, cov, &checked);
-      bn += run_n<8>(N, trunc, 3 * 512, seed ^ 0x1234, cov, &checked);
-      bn += run_n<4>(N, trunc, 3 * 512, seed ^ 0x5678, cov, &checked);
+      bn += run_n<16>(N, trunc, 3 * 1024, seed, covw, &checked);
+      bn += run_n<8>(N, trunc, 3 * 512, seed ^ 0x1234, covw, &checked);
+      bn += run_n<4>(N, trunc, 3 * 512, seed ^ 0x5678, covw, &checked);
     }
     int missing = 0;
-    for (int e = 0; e <= c::kTables.eps_max[N]; ++e) missing += cov.eps[e] == 0;
-    const bool cov_ok = missing == 0 && cov.top > 0 && cov.rounding > 0 && cov.ties > 0 &&
-                        (N < 9 || cov.q1 > 0) && (N < 17 || cov.q2 > 0);
+    bool cov_ok = true;
+    for (int w = 0; w < n_w; ++w) {
+      const Coverage& cv = covw[w];
+      int miss_w = 0;
+      for (int e = 0; e <= c::kTables.eps_max[N]; ++e) miss_w += cv.eps[e] == 0;
+      missing += miss_w;
+      cov_ok = cov_ok && miss_w == 0 && cv.top > 0 && cv.rounding > 0 && cv.ties > 0 &&
+               (N < 9 || cv.q1 > 0) && (N < 17 || cv.q2 > 0);
+    }
+    Coverage cov = covw[0];  // the report: both W summed
+    if (n_w == 2) {
+      cov.q1 += covw[1].q1, cov.q2 += covw[1].q2, cov.top += covw[1].top;
+      cov.rounding += covw[1].rounding, cov.ties += covw[1].ties;
+    }
     std::printf("N=%2d W=%d: %ld mismatches; eps 0..%d all hit: %s (q=1: %ld, q=2: %ld, |a'| at "
                 "bitlen T: %ld, rounding path: %ld, ties: %ld)\n",
                 N, imd::kernels::pack_words(N), bn, c::kTables.eps_max[N], missing ? "NO" : "yes",

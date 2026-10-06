@@ -670,7 +670,8 @@ const char* const kBandCallKeys[3] = {"band.call_small", "band.call_mid", "band.
 constexpr const char* kByteFKey = "power.byte_f_pj";
 
 // A v7..v10-sized caller has no energy_byte_f_pj: the folded view (DESIGN §6c.2), the
-// unscaled form with the total byte energy (an API-10 library's prediction).
+// unscaled form with the total byte energy. A degraded, unvalidated view (never fitted, not an
+// API-10 library's prediction); only the calibration functions fold, the predictors do not.
 void fold_byte_f(imd_perf_calib_t* cal, uint32_t struct_size) {
   if (struct_size >= kCalibV7Size && struct_size < kCalibV11Size) {
     cal->energy_byte_pj += cal->energy_byte_f_pj;

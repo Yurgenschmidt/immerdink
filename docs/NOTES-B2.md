@@ -887,8 +887,13 @@ time including the bench build and quiet waits):
   while the 5 N = 16 windows had the old eps path in their packs and would bias the power fit.
   Offline check on the same calibration records: 14 windows → e_tc 0.700 pJ/op, e_byte^f 305
   pJ/B, f_ref 2430 MHz; 9 windows → 0.701, 298, 2455 MHz. Recollecting the N = 16 windows
-  (≈ 7 min) would have overrun the 35 min GPU budget; it is the first thing to do at the next
-  sustained run;
+  (≈ 7 min) would have overrun the 35 min GPU budget. [review 2026-10-06] **All 14** hotclock
+  windows (not only the 5 at N = 16) ran commit 0787164, before the v1.14 emitter (a491220)
+  and the v1.15 eps retirement, so the next sustained run recollects **all 14** on the
+  current library. Dropping the N = 16 windows also removed u_rbigk and u_tcc, the only
+  big-k and contraction windows: e_byte^f now rests mostly on r_mm and u_tdf (weakly
+  identified; the uncapped r_mm power is 248 W predicted vs 449 W measured, −45 %, in every
+  fit including the 14- and 9-window offline fits);
 - hold-out 14:37–14:52, 178 calls (same sweep as §8 plus the comment on the dominant cases).
 - Raw records, logs and scripts: immerdink-eval `results/followups2/combined/`.
 
@@ -897,8 +902,14 @@ time including the bench build and quiet waits):
   0.226 → 0.126 ps/op (the old θ carried part of the eps work in the plain terms);
 - power, scaled form (§6c.7), γ = 1, byte_pj held at 0: e_tc 0.6498 → **0.708** pJ/op,
   e_byte 335 → **0**, e_byte^f **301** pJ/B, f_ref (`clock_eff_mhz`) 2455 → 2480 MHz. Sustained
-  leave-one-case-out: median 0.8 % (capped windows −0.6 … +0.8 %; the uncapped 512³ / 1024³ /
-  r_mm windows +7.5 / −11.5 / +4.8 %, as before: they run above f_ref);
+  leave-one-case-out time error: median 0.8 % (capped windows −1.4 … +0.8 %: u_sq2048 −1.4 %,
+  the others −0.6 … +0.8 %; the uncapped 512³ / 1024³ / r_mm windows +7.5 / −11.5 / +4.8 %, as
+  before: they run above f_ref). **Not an independent figure** [review 2026-10-06]: f_ref was
+  chosen by minimising this same leave-one-out median over 17 candidates (2405–2805 MHz in
+  25 MHz steps), and the scan is not monotone near the minimum (2530: 0.88 %, 2505: 0.97 %,
+  2480: 0.78 %, 2455: 1.07 %). The **capped clock is predicted 2–4 % high** (leave-one-out:
+  8192³ 2331 vs 2282 MHz measured, 12288³ 2350 vs 2266; in-sample 2325 / 2335) and the time
+  error is small only because the per-call time model's bias cancels it;
 - `rank.tie_ratio` 1.078 → 1.074; bands (5 / 95 hold-out quantiles, cross-validated coverage
   82 %): call < 100 µs 0.897–1.213, 100 µs – 1 ms 0.881–1.104, ≥ 1 ms 0.932–1.046.
 - `k23_pack` occupancy: the occupancy query measures the W = 3 instantiation (117 registers,
@@ -924,10 +935,23 @@ KL B 6.2 / 29.5 → 3.4 / 14.9 %, K2 5.0 / 17.2 → 4.1 / 11.3 %, K3 8.1 / 19.0 
 K4 5.0 / 13.0 → 4.8 / 13.1 %, K5 4.5 / 19.2 → 3.4 / 18.6 %, KF 8.4 / 16.3 → 4.6 / 11.4 % (4 calls).
 
 - The model as shipped before this branch misses the < 1 ms targets on the v1.14 kernels: its
-  eps terms price N ≥ 15 packs up to 2× too slow. Retiring them alone (old θ) meets every
-  target; the refit improves the 100 µs – 1 ms class and N = 15–17 further. K3 (B pack at
-  g < N) got worse in the per-phase view (14.9 % median); its share of those calls is small
-  and the call totals are within target.
+  eps terms price N ≥ 15 packs up to 2× too slow. **Almost all of the improvement comes from
+  retiring the eps terms, not from the refit** [review 2026-10-06]: the old θ with eps ignored
+  (the fair baseline, `val-before.log`) already meets every target. Against that baseline the
+  refit is
+  - **worse on < 100 µs calls**: p90 12.5 → 14.5 %, max 22.9 → 28.8 % (N = 15–17: p90 6.9 →
+    8.7 %, max 7.2 → 12.8 %);
+  - neutral on ≥ 1 ms calls (median / p90 2.0 / 7.7 → 2.1 / 7.3 %);
+  - better on 100 µs – 1 ms calls (3.7 / 14.7 → 2.9 / 11.2 %; N = 15–17 6.2 / 16.5 → 2.3 /
+    11.3 %).
+  Per phase the refit is worse for **KF at N = 8** (measured / predicted on the hold-out 1.11
+  → 1.195; 1.22 in-sample, against 0.99 at N = 14 and 0.96 at N = 20: the v1.14 emitter's
+  per-element |a'| → W-word cost does not scale with the residue count, and `kf.op` / `kf.row`
+  fitted to 0 while `kf.chain` went 23.9 → 11.1) and for **K3** (B pack at g < N; measured /
+  predicted 1.07–1.20 on the hold-out, 1.13–1.20 in-sample, old θ 1.04–1.15; `pack.op` 0.226
+  → 0.126 and `band.pack` lo 0.98; K2 and K3 share the PACK class). The call totals are within
+  target. W is not a model feature, and W = 3 is barely validated out of sample (the hold-out
+  stops at N = 17; 17 of its pack-phase rows are W = 3): add N = 18–20 hold-out cases.
 - **Dominant data no longer matter** (measured): `w_d800` vs `w_s800` (800³) 0.0918 vs 0.0922
   ms at N = 15 and 0.1052 vs 0.1034 ms at N = 16; `w_dr1` vs `w_r1` (1200 × 400 × 700) 0.0798
   vs 0.0781 and 0.0819 vs 0.0797 ms (+2–3 %, within tiny-call noise). The model predicts the

@@ -3007,6 +3007,13 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
     (rejected). A library older than API 11 rejects a file containing it (unknown key).
     `imd_perf_calib_format` writes it only when it is non-zero, so the text of a calibration
     without it is unchanged and format → parse stays bit-exact.
+  - **[v1.15] Not backward-readable.** The format number stays 2, but a format-2 file written
+    by an API-11 library generally **does not load in an API ≤ 10 library**: it omits the
+    `op_eps` keys when they are 0 (every file fitted after v1.15, the shipped one included),
+    which API ≤ 10 requires (MISSING_KEY), and it contains `power.byte_f_pj` when non-zero
+    (unknown key). Only a file that still carries all three `op_eps` keys and no `byte_f`
+    loads in both. "Format 2" names the key grammar this library reads, not a promise that
+    older libraries read every file it writes.
   A value of several numbers is separated by blanks. **Reading format 1** migrates: the new
   parameters 0, the built-in occupancy table, no power model, Δ = 0, bands `1 1`; such a
   calibration predicts exactly as host API 6 did (tested). `imd_perf_calib_format` writes the
@@ -3021,11 +3028,18 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   NULL (the full shipped calibration).
   **[v1.15] A version-7…10-sized struct** (a caller compiled against host API 7–10) has no
   `energy_byte_f_pj`: `imd_perf_calib_default`, `_parse`, `_load` (and the `_ex` forms) give
-  it the **folded view** `energy_byte_pj := byte_pj + byte_f_pj` (byte_f dropped), the
-  unscaled form with the total byte energy: it predicts as an API-10 library would with such a
-  calibration. The predictors and `imd_perf_calib_format` read such a struct with
-  byte_f = 0 (its bytes end before the field). With byte_f = 0 (every file before v1.15) the
-  view is the full calibration.
+  it the **folded view** `energy_byte_pj := byte_pj + byte_f_pj` (byte_f dropped): the
+  unscaled power form with the total byte energy at the scaled fit's e_tc and f_ref. Like the
+  v6 view, it is a **degraded, unvalidated view**: that combination was never fitted (an
+  unscaled fit of the same windows selects its own e_tc, e_byte and γ, not the folded
+  0.708 pJ/op / 301 pJ/B at γ = 1 and f_ref 2480 MHz), it is not what an API-10 library would
+  predict (an API-10 library cannot load a v1.15 file at all, see the format note above, and
+  would apply its eps terms), and its clock solve for capped calls is not measured. Such
+  callers should pass NULL (the full shipped calibration). The fold happens **only** in
+  `imd_perf_calib_default`, `_parse`, `_load` (and the `_ex` forms); the predictors and
+  `imd_perf_calib_format` do not fold: they read such a struct with byte_f = 0 (its bytes end
+  before the field), which is the folded struct those functions returned. With byte_f = 0
+  (every file before v1.15) the view is the full calibration.
 - **Shipped table.** `src/host/calib/rtx4090_sm89.calib` (the 4090 at stock clocks, as
   shipped: no clock lock; its `clocks` line records the state) is embedded at configure time
   (CMake reads the file into a raw string literal: the file is the one source; editing it
@@ -3502,10 +3516,11 @@ fit). So the hold-out is a check of the long-run state, and of shape only at 163
      a file that contains it (unknown key: a loud parse error, acceptable).
    - **Older callers (v9/v10 view).** A caller whose `struct_size` is below the API-11 size
      has no room for `energy_byte_f_pj`. `imd_perf_calib_default`, `imd_perf_calib_parse` and
-     the predictors give it a folded view, `energy_byte_pj := byte_pj + byte_f_pj` (the
-     shipped, unscaled form with the total byte energy), in the same way as the v6 view
-     (`to_format1_params`, perf.cpp:830). It predicts as an API-10 library would with such a
-     calibration, not as API 11.
+     `imd_perf_calib_load` (and the `_ex` forms) give it a folded view,
+     `energy_byte_pj := byte_pj + byte_f_pj` (the unscaled form with the total byte energy),
+     in the same way as the v6 view (`to_format1_params`). The predictors do not fold; they
+     read such a struct with byte_f = 0 (§6c.2). [review 2026-10-06] The folded view is a
+     degraded, unvalidated view, not an API-10 prediction (§6c.2): callers should pass NULL.
    - **Fit:** `power.byte_pj` and `power.byte_f_pj` are collinear on the windows (D·(f/f_ref)^γ
      and D differ only through the 2300–2800 MHz clock spread), so `bench/perf_fit.py` holds
      `byte_pj` fixed (0, or a stated prior written into the fit record) and fits three NNLS
@@ -4649,3 +4664,15 @@ and host API; every value the same integer (bit-identical, tested on every contr
   its six `--data dominant` cases; the hold-out keeps its three as a check. Python
   docstrings and `host.Prediction` / `host.Candidate` comments updated. Tests: §6c.4 [v1.15,
   eps retired].
+- **Review fixes (2026-10-06, `followups-final`; docs and tests only).** §6c.2: the folded
+  v7–v10 view is a degraded, unvalidated view (never fitted; not an API-10 prediction; pass
+  NULL), and only the calibration functions fold (the predictors read byte_f = 0); §6c.7
+  item 1 corrected accordingly (it said the predictors fold). §6c.2: format 2 is **not
+  backward-readable**: API-11 files omit zero `op_eps` keys and may carry `power.byte_f_pj`,
+  so they do not load in API ≤ 10 (pinned by a `host_perf` check on the shipped file).
+  NOTES-B2 §10: the hold-out gain is attributed to the eps retirement (the refit vs old θ
+  with eps ignored: worse on < 100 µs, neutral ≥ 1 ms, better at 100 µs – 1 ms; KF at N = 8
+  and K3 worse), the sustained figure is stated with u_sq2048 −1.4 %, the f_ref selection on
+  the same leave-one-out metric and the 2–4 % high capped clock, and all 14 hotclock windows
+  are to be recollected. `test_contract` suite eps: the eps-reach check counts only
+  emulated (k ≥ 2) cases.

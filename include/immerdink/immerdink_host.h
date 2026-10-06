@@ -516,9 +516,10 @@ typedef struct {
   double tie_ratio;       /* rank: a feasible candidate within tie_ratio x the best's time is a
                              tie (1 <= tie_ratio <= 1.25; 1: exact ties only)                */
   /* ---- v11 (DESIGN v1.15 §6c.7). A caller with a v7..v10 struct_size gets the folded view
-   *      energy_byte_pj = byte_pj + byte_f_pj from the calibration functions (the unscaled
-   *      form with the total byte energy: an API-10 prediction); a struct of that size is
-   *      read with energy_byte_f_pj = 0. ---- */
+   *      energy_byte_pj = byte_pj + byte_f_pj from the calibration functions (default /
+   *      parse / load): a degraded, unvalidated view (never fitted; not an API-10 prediction),
+   *      as the v6 view; such callers should pass NULL. The predictors do not fold: a struct
+   *      of that size is read with energy_byte_f_pj = 0. ---- */
   double energy_byte_f_pj; /* per DRAM byte, scaled like the ops by (f / clock_eff)^gamma
                               (SM / L2-side energy of the traffic; key power.byte_f_pj,
                               optional, 0 when absent)                                       */

@@ -1106,7 +1106,8 @@ def suite_eps(lib, cuda, verbose):
     to 62 at N = 16 (W = 2), eps > 0 at N <= 13 (subnormals), dominant entries, RN and TRUNC,
     g < N; small operands (KF E = 4, moduli parts, gridDim.y > 1), K2/K3, KL (forced, and by
     the rule for k_hat > 1024, E = 8 and, with 64-row tiles, E = 4): every run_case variant
-    bit-exact vs the oracle. Fails if the data did not reach the intended eps."""
+    bit-exact vs the oracle. Fails if the data of the emulated cases (k >= 2; k = 1 is DIRECT)
+    did not reach the intended eps."""
     rng = random.Random(1414)
     reach = {}
     shapes = ((9, 13, 1, "sub1", "sub1"), (17, 12, 5, "sub", "mix"), (24, 20, 33, "mix", "sub1"),
@@ -1122,7 +1123,9 @@ def suite_eps(lib, cuda, verbose):
         TA, TB = gen_eps(rng, (m, k), ka, 1), gen_eps(rng, (k, n), kb, 0)
         if t == 3:
             inject(rng, TB, 0.02)
-        e = eps_reached(TA, 1, N, rounding) + eps_reached(TB, 0, N, rounding)
+        # Only emulated cases count toward the reach check: k = 1 takes Path::kDirect (no pack
+        # emitter runs), so its subnormal rows must not satisfy the thresholds (review S1).
+        e = eps_reached(TA, 1, N, rounding) + eps_reached(TB, 0, N, rounding) if k >= 2 else []
         r = reach.setdefault(N, {"max": 0, "ge32": 0, "ge64": 0, "pos": 0})
         r["max"] = max([r["max"]] + e)
         r["ge32"] += sum(x >= 32 for x in e)

@@ -1695,7 +1695,16 @@ def suite_perf(args):
         if bytes(host.Calibration.parse(tb)._raw) != bytes(base._raw):
             raise Fail("op_eps keys: round trip")
         n_eps += 1
-    print(f"  ok  eps retired (v1.15): {n_eps} predictions independent of eps_fraction / op_eps; "
+    # DESIGN v1.15 §6c.2 "Not backward-readable" (review 2026-10-06): the shipped file omits
+    # the op_eps keys (MISSING_KEY in API <= 10) and carries power.byte_f_pj (unknown key in
+    # API <= 10); if either changes, the format note in §6c.2 must be revisited.
+    with open(os.path.join(ROOT, "src/host/calib/rtx4090_sm89.calib")) as f:
+        shipped_keys = {l.split(" = ")[0].strip() for l in f if " = " in l and not l.startswith("#")}
+    if shipped_keys & set(opk) or "power.byte_f_pj" not in shipped_keys:
+        raise Fail("shipped calibration: op_eps / byte_f keys differ from DESIGN §6c.2's "
+                   "backward-readability note")
+    n_eps += 1
+    print(f"  ok  eps retired (v1.15):{n_eps} predictions independent of eps_fraction / op_eps; "
           "op_eps keys optional")
     # --- statuses: kappa >= T (N = 2, T = 180) gives the plan-time status and no time -------
     p = host.predict("ik,jk->ij", dict(i=3, j=5, k=180 * 180), N=2)

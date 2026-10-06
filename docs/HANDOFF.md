@@ -68,10 +68,13 @@ first.
   v1.15 §6c.7, host API 11: `power.byte_f_pj`; its draft "v1.14" renumbered to v1.15). v1.15
   also retires the model's eps path (§6c.1: `op_eps` features 0, request `eps_fraction`
   validated then ignored, `eps_s` / `eps_fraction` out 0, `op_eps` keys optional, format 2
-  kept; no ABI change). The shipped calibration is the combined refit (NOTES-B2 §10;
-  hold-out targets met, scaled power form e_tc 0.708 pJ/op + e_byte^f 301 pJ/B, γ = 1).
-  Open: recollect the 5 N = 16 sustained windows (the refit used the 9 N ≤ 14 windows of
-  the hotclock run); W = 1 for N ≤ 8 (NOTES-BFEPS §4).
+  kept but API-11 files do not load in API ≤ 10 (§6c.2); no ABI change). The shipped
+  calibration is the combined refit (NOTES-B2 §10; hold-out targets met, almost entirely by
+  retiring eps: the refit is worse than old θ on < 100 µs calls; scaled power form e_tc 0.708
+  pJ/op + e_byte^f 301 pJ/B, γ = 1). Open: recollect **all 14** sustained windows on the
+  current library (all ran pre-v1.14 commit 0787164; the refit used the 9 N ≤ 14 ones); KF
+  N-dependence (N = 8 1.2× slow), K3 pack 1.07–1.20× slow, N = 18–20 hold-out cases
+  (NOTES-B2 §10); W = 1 for N ≤ 8 (NOTES-BFEPS §4).
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
