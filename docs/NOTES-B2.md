@@ -840,4 +840,24 @@ with byte_pj fixed (collinear) and tc, alu, byte_f free. No THERMAL regime. **De
 (independent reviewer, 2026-10-06): Q1 split key with byte_pj fixed, Q2 keep γ = 1, Q3 no
 THERMAL regime with the drift documented and the calibration windows on `--sustain-warm-s
 60`. The form comparison and γ are redone on those windows in the combined refit, so the
-refit needs GPU. Not implemented yet.
+refit needs GPU. Implemented in v1.14 (§9.1).
+
+### 9.1 Implementation and the 60 s pre-heat windows (2026-10-06, branch `hotclock`; DESIGN v1.14 §6c.7)
+
+- Host API 11: `imd_perf_calib_t.energy_byte_f_pj`, optional `power.byte_f_pj` (absent = 0,
+  bit-identical predictions, written only when non-zero), the folded view for v7–v10-sized
+  structs, `perf_fit.py --power-form scaled` (default; `--byte-pj`, γ = 1). Tests:
+  `host_perf` suite v1.14, `host_c_api`.
+- New windows: `tools/calibrate.sh --sustained-only` (sweep_sustained.txt with
+  `--sustain-warm-s 60 --sustain-trace-s 2`), 14 windows, about 20 min of GPU including the
+  quiet waits, ehrenfest FREE. Raw: immerdink-eval
+  `results/followups2/hotclock/sustained-20261006-1305.jsonl`; analysis `compare.py` /
+  `compare.log`; report `findings/hotclock-implementation.md`.
+- The windows end at 73–77 °C (median 75 °C; the 15 s windows of 2026-10-05: 67–74, median
+  73). Capped calls are 0.8–1.5 % slower than in those windows (8192³ N = 14: 31.40 vs
+  31.02 ms, 2282 vs 2312 MHz; 12288³: 100.69 vs 99.23 ms).
+- Fit on the new windows, scaled form, γ = 1, byte_pj 0: e_tc 0.707 pJ/op, e_byte^f 308 pJ/B;
+  pipeline LOO capped time 0.64 % (unscaled: 1.98 %); settled hold-out (six 2–4 min windows)
+  median / max 0.69 / 1.0 % (unscaled: 0.62 / 2.9 %, with 16384³ −2.7 / −2.9 %). γ = 2 is
+  worse on every check (1.37 % LOO, 1.01 % settled). γ = 1 and byte_pj = 0 confirmed.
+- No refit shipped: the combined refit uses these windows.

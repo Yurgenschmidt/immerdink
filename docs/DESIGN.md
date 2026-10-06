@@ -3428,6 +3428,42 @@ fit). So the hold-out is a check of the long-run state, and of shape only at 163
   `clock_mhz` recipe, and use `--sustain-warm-s 60` for the calibration windows; the form
   comparison and γ are redone on those windows in the combined refit (GPU).
 
+**Implementation (2026-10-06, branch `hotclock`; host API 11; NOTES-B2 §9.1).**
+- Library: the key, `call_power`, the folded view and the format rule as in the Design list
+  above (§6c.2, §6c.3); tests §6c.4 [v1.14]. Nothing else changes; with the shipped file
+  (no key) every prediction is bit-identical to host API 10.
+- `bench/perf_fit.py --power-form scaled` (default; `--byte-pj` = the fixed e_byte, default
+  0, printed with the fit and written as `power.byte_pj`; γ = 1, `--power-gammas` to scan by
+  the power residual) / `--power-form unscaled` (v1.10). On the 2026-10-05 windows it
+  reproduces e_tc 0.691 pJ/op, e_byte^f 296 pJ/B (and 0.6498 + 335 unscaled).
+- `bench/sweep_sustained.txt`: `--sustain-warm-s 60 --sustain-trace-s 2`;
+  `tools/calibrate.sh --sustained-only` measures just that sweep.
+- **New windows (60 s pre-heat, 14 windows, 2026-10-06, ~20 min of GPU):** they end at
+  73–77 °C (median 75; the 15 s windows: 67–74, median 73), i.e. at the settled state of
+  long hot runs. Capped windows run 0.8–1.5 % slower than on 2026-10-05.
+- **Form comparison on the new windows** (fit on them; leave-one-case-out, and the six
+  2–4 min settled windows of 2026-10-05 as a hold-out):
+
+  | form (fit on the 60 s windows) | γ | e_tc pJ/op | e_byte (^f) pJ/B | power LOO med | capped time LOO med (C pipeline) | settled hold-out med / max |err| |
+  |---|---|---|---|---|---|---|
+  | unscaled (shipped form) | 1 | 0.663 | 345 | 3.6 % | 1.98 % | 0.62 / 2.9 % (16384³ −2.7, −2.9) |
+  | unscaled | 2 | 0.722 | 322 | 3.5 % | (0.96 %) | 0.91 / 1.7 % |
+  | **scaled** (byte_pj 0) | **1** | **0.707** | **308** | **2.0 %** | **0.64 %** (0.40) | **0.69 / 1.0 %** |
+  | scaled | 2 | 0.806 | 254 | 2.6 % | 1.37 % (1.37) | 1.01 / 1.5 % |
+  | split (byte free) | 1 | 0.707 | 0 + 308 | 2.0 % | (0.40 %) | 0.69 / 1.0 % |
+  | split | 2 | 0.787 | 72 + 198 | 2.4 % | (1.01 %) | 0.85 / 1.4 % |
+
+  (Capped-time LOO: the perf_fit pipeline with the C model; in parentheses the follow-up's
+  analyze.py, which solves the clock at the measured windows' rows.) **γ = 1 is confirmed
+  (Q2):** best power residual and best LOO; on the hot windows γ = 2 is no longer better on
+  the settled hold-out (1.01 vs 0.69 %), so the 2026-10-05 γ = 2 advantage was the cool
+  windows' bias. The split form fits e_byte = 0 at γ = 1 again, so `--byte-pj 0` stays.
+  The scaled form removes the 16384³ bias (−2.9 → −0.9 %); the settled hold-out is now
+  centred (−0.9 … +1.0 %), with no residual sign by shape. A leakage term is not identifiable
+  on the new windows (all at 73–77 °C), as Q3 expects: no THERMAL regime.
+- **Not shipped:** no refit here. The combined refit runs `perf_fit.py` (scaled form, γ = 1,
+  `--byte-pj 0`) with these windows (`--sustained`) and writes `power.byte_f_pj`.
+
 ---
 
 ## 6e. Hot-path planner queries from Python [v1.11]
@@ -4415,7 +4451,7 @@ and host API; every value the same integer (bit-identical, tested on every contr
   `calib=None` exception change and the broken-shipped-calibration path being unreachable
   in a CMake build (§6c.3, changelog above); `perf_fit.py` `--notes ""` / `--version ""`.
 
-## v1.14 draft (proposal only: §6c.7 long hot runs and clock-scaled DRAM energy; nothing implemented in the library)
+## v1.14 (§6c.7 long hot runs and clock-scaled byte energy; host API 11, calibration format 2 with one optional key; no semantic, layout, launch, pack-format or spec change)
 
 - **§6c.7 (new, draft).** Long sustained windows (2–4 min, NVML traces, energy counter never
   read) on 16384³, 8192³ and a DF 96⁴ × 3000 at N = 14 settle at 74–75 °C and 2240–2310
@@ -4431,3 +4467,16 @@ and host API; every value the same integer (bit-identical, tested on every contr
   bias are corrected to the measured values (most likely a single post-loop NVML sample).
 - Bench only: `imd_bench --sustain-trace-s T` (time series in method sustained's record)
   and `temp_c_start` / `temp_c_end` in every sustained record.
+- **[implemented 2026-10-06, branch `hotclock`] host API 11.** `imd_perf_calib_t.energy_byte_f_pj`
+  (appended; 3672 → 3680 bytes); format-2 key `power.byte_f_pj`, optional (absent = 0, ≥ 0,
+  rejected in format 1, written by `imd_perf_calib_format` only when non-zero);
+  `call_power` adds `e_byte^f·D·(f/f_ref)^γ` (+0 at e_byte^f = 0: every existing file
+  predicts bit-identically, tested over shapes × regimes × cache states); a v7–v10-sized
+  struct gets the folded view `energy_byte_pj = byte + byte_f` from default / parse / load and
+  is read with byte_f = 0 (§6c.2, §6c.3). `bench/perf_fit.py --power-form scaled` (default;
+  `--byte-pj` fixed term, default 0; γ = 1, `--power-gammas`) / `unscaled` (v1.10).
+  `bench/sweep_sustained.txt`: 60 s pre-heat and a 2 s trace; `tools/calibrate.sh
+  --sustained-only`. Python `host.API_VERSION` 11, `Calibration.power["power.byte_f_pj"]`.
+  Tests: §6c.4 [v1.14]. **The shipped calibration is unchanged** (no key); new 60 s pre-heat
+  windows and the redone form comparison are in §6c.7 "Implementation"; the combined refit
+  writes the key.
