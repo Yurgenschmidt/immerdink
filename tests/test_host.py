@@ -1056,7 +1056,7 @@ def synthetic_v2(cal, names, rng):
     """A format-2 calibration: the shipped parameters, random chain parameters, a power model
     (cap 450 W), a cache term and bands."""
     params = dict(cal.params)
-    for key in host.FORMAT2_PARAMS:
+    for key in sorted(host.FORMAT2_PARAMS):  # sorted: independent of the string hash seed
         params[key] = rng.choice((0.0, rng.random() * 0.05))
     extra = {f"kernel.{n}": (v[0] + rng.randint(0, 2), 64, 4096, v[3])
              for n, v in cal.kernels.items()}
@@ -1167,8 +1167,15 @@ def suite_perf_v110(cal, names, rng):
             if pb.power_w <= 450.0:
                 if ps.clock_mhz != 2800.0 or not close(ps.time_s, pb.time_s):
                     raise Fail("SUSTAINED below the cap differs from BURST")
-            elif ps.clock_mhz > 1400.0 and not close(ps.power_w, 450.0, 1e-9):
-                raise Fail(f"SUSTAINED power {ps.power_w} W at {ps.clock_mhz} MHz")
+            elif ps.clock_mhz > 1400.0:
+                # v1.17: the bisection stops at 0.05 MHz, so the solved clock brackets the cap
+                # (a 1e-9 equality held only by chance for flat P(f); with the random v1.17
+                # terms it does not)
+                lo, hi = (host.predict(spec, ext, clock_mhz=ps.clock_mhz + d, cache="COLD",
+                                       **kw).power_w for d in (-0.05, 0.05))
+                if not (lo <= 450.0 <= hi and abs(ps.power_w - 450.0) <= hi - lo):
+                    raise Fail(f"SUSTAINED power {ps.power_w} W at {ps.clock_mhz} MHz "
+                               f"({lo} .. {hi} W)")
             cold, rep, warm = (host.predict(spec, ext, regime="BURST", cache=c, **kw).time_s
                                for c in ("COLD", "REPEAT", "WARM"))
             if not (cold >= rep * (1 - 1e-12) and close(rep, warm)):  # WARM = REPEAT

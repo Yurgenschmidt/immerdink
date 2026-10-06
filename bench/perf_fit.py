@@ -836,6 +836,9 @@ def main(argv=None):
                          "the scaled form, 1,2,3 for the unscaled form)")
     ap.add_argument("--no-chain", action="store_true",
                     help="drop the v1.10 chain features of K0, KL, PACK, K5, DIRECT, BETA")
+    ap.add_argument("--drop", action="append", default=[], metavar="CLASS.FEATURE",
+                    help="force a parameter to 0 (its feature column dropped from the fit; for "
+                         "an A/B of a feature, e.g. --drop kf.elem)")
     ap.add_argument("--kernel", action="append", default=[], metavar="NAME=R",
                     help="override a kernel's CTAs per SM (e.g. kf4=4, the v1.8 built-in)")
     # v1.17 (DESIGN §6c.1, §6c.2)
@@ -917,7 +920,7 @@ def main(argv=None):
               ", ".join(f"{n} {extra['kernel.' + n][0]}" for n in
                         ("k0", "kf16", "kf4", "kl8", "kl4", "pack", "k5_n14_e4", "k5b_n14")))
     params0 = base_params(a.lib) if extra is not None else host.Calibration.default(a.lib).params
-    drop = NEW_CHAINS if a.no_chain else ()
+    drop = (NEW_CHAINS if a.no_chain else ()) + tuple(a.drop)
     # The seed: the measured device's sm_count and L2 with the shipped parameters (features
     # depend only on sm_count, l2_bytes and the occupancy table).
     seed = host.Calibration.from_values(meta, params0, a.lib, extra)

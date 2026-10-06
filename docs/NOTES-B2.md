@@ -963,3 +963,159 @@ K4 5.0 / 13.0 → 4.8 / 13.1 %, K5 4.5 / 19.2 → 3.4 / 18.6 %, KF 8.4 / 16.3 �
   vs 32.6 µs, the < 100 µs maximum).
 - SUSTAINED examples (60 s pre-heat windows): 8192³ N = 14 35.01 / 34.95 TFLOPS-eq (31.40 /
   31.46 ms, 2282 / 2325 MHz); 12288³ N = 14 36.85 / 36.86 (100.69 / 100.68 ms).
+
+## 11. Model fix: KF element chain, PACK L2-hit re-reads, f_ref rule, full refit (2026-10-06, branch `model-fix`; DESIGN v1.17 §6c, host API 12)
+
+The open items of §10 (KF N-dependence, K3 predicted fast, all 14 sustained windows on the
+current library, N = 18–20 hold-out cases, an overfit f_ref) after the open-items analysis
+(evaluation workspace `findings/openitems-model-analysis.md`).
+
+**Design** (DESIGN v1.17 §6c.1 / §6c.2; decided here, design question below):
+- **`kf.elem`** (KF slot 4): the busiest SM's per-element chain, `kf.chain` with u = E (one
+  launch-shape helper for both). Each moduli part loads, quantizes and reduces its tile once,
+  whatever its residue count. Not clock-bound.
+- **`pack.dram`** (PACK slot 3): the bytes that are not L2-hit re-reads. A K2 / K3 re-read
+  hits L2 when the call's group working set S = Σ_y (8 rows_y k + g pad_y k̂) ≤ L_hit
+  (`warm.pack_l2_bytes`, set by `perf_fit.py` to 0.8 × nominal L2 = 60.4 MB; the 4090 data
+  bound the step to [57, 77) MB). A hit byte costs `pack.byte`, every other byte
+  `pack.byte + pack.dram`. Not clock-bound.
+- **Additive, format 2 kept**: every existing key keeps its meaning, the three new keys are
+  optional (absent = 0, predicts bit-identically) and API ≤ 11 rejects a file with them, so no
+  file is read with features it was not fitted with. The `op_eps` keys are retired (accepted,
+  discarded). Host API 12: `imd_perf_calib_t.pack_l2_hit_bytes`.
+- **Not adopted**: the analysis's KF read / write byte split (residue writes ~1/3 of a read
+  per byte). It needs a seventh KF slot or retiring `kf.op` / `kf.row`, i.e. a format bump. On
+  the combined refit's records it moved no hold-out statistic by more than 1 point over the
+  two features above.
+- **f_ref**: the vertex of a least-squares parabola through the leave-one-out scan within
+  ±100 MHz of its argmin (was the argmin), and the **nested** leave-one-out figure (f_ref
+  chosen inside each fold) is printed and reported.
+- **Latent bug fixed**: a `--l2 flush` record's phases are REPEAT state (the phase reps are
+  not flushed); `perf_fit.py` now raises them to COLD and `perf_validate.py` compares them
+  in REPEAT. No record used `--l2 flush`.
+- **Offline check first** (CPU only, the combined refit's records): the implementation
+  reproduces the analysis's `kf1p1` variant exactly (hold-out 4.2 / 12.5 / 20.1 · 2.8 / 10.1
+  / 15.2 · 2.1 / 7.2 / 15.7 %).
+
+**Data** (RTX 4090, stock clocks, quiet gate and shared GPU lock, `ehrenfest_busy.sh`
+FREE; profiling `imd_bench` at 7e5ef5d; `tools/calibrate.sh --validate`, BENCH_RETRIES = 1):
+- calibration sweep 17:46–18:07 (442 timed calls; new: `c_l2s1472` N = 8 / 14 / 20 and
+  `c_l2s1792` N = 14 at g = 4, `c_k3hit` / `c_k3miss` at g = 2);
+- **all 14 sustained windows recollected** on the current library, 60 s pre-heat
+  (18:07–18:25);
+- cache sweep (18:25–18:27);
+- hold-out 18:27–18:42, 189 calls (new: `v_n18a` … `v_n18d`, N = 18–20).
+- GPU time: 56 min of sweep wall time (including the per-case quiet gate and warm-up), over
+  the 45 min budget: the calibration sweep took 21 min as in §10 although retries were off.
+- Raw records, logs, scripts and comparisons: immerdink-eval `results/openitems/model-fix/`.
+
+**Fit** (shipped as `src/host/calib/rtx4090_sm89.calib`, version 7e5ef5d, host API 12):
+- KF: launch 5.54 µs, byte 0.813 ps/B, **elem 534 ns per tile step**, op / row / chain 0.
+- PACK: launch 3.38 µs, byte 0 (an L2-hit re-read is hidden), **dram 0.844 ps/B**
+  (1.18 TB/s), chain 0, wave 3.87 µs.
+- The PACK fit error by L_hit (diagnostic): 0: 16.9 / 30.7 %, 0.6 × L2 (45 MB): 6.8 / 19.4 %,
+  0.7–1.0 × L2: 5.3 / 11.0 % (median / p90). The new cases put the step above 45 MB; nothing
+  in the sweep lies between 52 and 77 MB, so 0.8 is not refined.
+- In-sample phases: kf 6.1 / 24.9 %, pack 5.3 / 11.0 % (median / p90).
+- Power (scaled form, γ = 1, byte_pj 0, 14 windows): e_tc 0.721 pJ/op, e_byte^f 289 pJ/B.
+  The scan (2405–2805 MHz) has its argmin at 2505 MHz (1.11 %), with 2480: 1.22 % and 2455:
+  1.30 %. **f_ref = 2491 MHz** (parabola vertex). **Nested leave-one-case-out median |t err|
+  1.19 %** (the folds chose 2405–2500 MHz), the honest figure; the scan's minimum (1.11 %) is
+  not.
+- Sustained LOO at 2491 MHz: capped windows −1.3 … +1.6 % (u_rbigk +1.6, u_sq2048 −1.3); the
+  uncapped u_s512 −2.6 / +9.7 % (N = 14 / 16), u_s1024 −6.5 / +5.6 %, u_rmm +6.4 %. The
+  **capped clock is still predicted 1–3 % high** (12288³ 2335 vs 2258 MHz, 8192³ 2328 vs
+  2274, DF 2392 vs 2324), and the time error stays small because the per-call time model's
+  bias cancels it, as in §10. The r_mm power gap stays: 258 W predicted vs 450 W measured
+  (−43 %) with all 14 windows on the current library.
+- `rank.tie_ratio` 1.074 → 1.060; bands (5 / 95, cross-validated coverage 83 %): call < 100 µs
+  0.938–1.191, 100 µs – 1 ms 0.891–1.055, ≥ 1 ms 0.932–1.024, kf 0.790–1.325, pack 0.927–1.171.
+
+**Hold-out, the same 189 new calls for each calibration, all evaluated with this library**,
+BURST, REPEAT (median / p90 / max |error| of the call time, %). (2) = the reviewer's fair
+baseline: the pre-refit θ (18baccc) with ε ignored. (1) = the shipped combined refit (§10).
+Targets 15 / 30, 10 / 20, 5 / 15 %.
+
+| subset | measured call | calls | (2) old θ, ε ignored | (1) shipped refit | new |
+|---|---|---|---|---|---|
+| all | < 100 µs | 61 | 5.8 / 13.4 / 21.7 | 5.5 / 13.7 / 27.7 | **3.8 / 12.9 / 23.2** |
+| all | 100 µs – 1 ms | 60 | 3.5 / 14.1 / 21.3 | 2.7 / 10.5 / 16.4 | **2.6 / 9.6 / 13.9** |
+| all | ≥ 1 ms | 68 | 2.1 / 7.7 / 15.8 | 2.2 / 7.4 / 16.2 | **2.2 / 6.6 / 16.8** |
+| N ≤ 14 | < 100 µs | 38 | 6.0 / 18.8 / 21.7 | 7.5 / 19.4 / 27.7 | 5.2 / 14.9 / 23.2 |
+| N ≤ 14 | 100 µs – 1 ms | 42 | 2.8 / 13.4 / 21.3 | 3.0 / 10.3 / 16.4 | 2.5 / 9.9 / 13.9 |
+| N ≤ 14 | ≥ 1 ms | 42 | 1.9 / 7.8 / 11.3 | 1.5 / 7.9 / 10.1 | 1.9 / 6.8 / 8.9 |
+| N = 15–17 | < 100 µs | 18 | 4.8 / 7.5 / 9.9 | 2.1 / 10.0 / 13.7 | 2.6 / 9.0 / 10.5 |
+| N = 15–17 | 100 µs – 1 ms | 16 | 6.5 / 16.0 / 17.9 | 2.6 / 10.8 / 12.3 | 2.8 / 8.2 / 9.5 |
+| N = 15–17 | ≥ 1 ms | 22 | 2.6 / 7.3 / 15.8 | 2.6 / 6.6 / 16.2 | 2.3 / 6.3 / 16.8 |
+| N = 18–20 | < 100 µs | 5 | 9.4 / 11.4 / 12.5 | 3.8 / 7.4 / 8.8 | 2.7 / 11.9 / 17.2 |
+| N = 18–20 | 100 µs – 1 ms | 2 | 0.5 / 0.7 / 0.7 | 1.4 / 1.7 / 1.8 | 1.4 / 1.7 / 1.8 |
+| N = 18–20 | ≥ 1 ms | 4 | 1.6 / 3.1 / 3.2 | 2.1 / 2.4 / 2.5 | 1.3 / 2.4 / 2.5 |
+
+Against baseline (2), per size class:
+- < 100 µs: median and p90 better; max +1.5 points (`z_s200` N = 14, −23.2 vs −19.9 %: K4 on a
+  tiny shape, 6.3 µs predicted vs 9.2 measured under every calibration).
+- 100 µs – 1 ms: better on every statistic.
+- ≥ 1 ms: p90 better, median +0.1, max +1.0 point (`v_n15d` N = 16, 768² × 100000: −16.8 vs
+  −15.8 %, a K4 / K5 call at −16 % under all three calibrations; the new features do not
+  touch it).
+- **Noise**: the same hold-out calls measured in the §10 run and in this run differ by
+  median / p90 / max 1.3 / 6.5 / 12.0 % below 100 µs, 0.3 / 1.1 / 4.9 % at 100 µs – 1 ms and
+  0.2 / 0.5 / 1.6 % at ≥ 1 ms. The < 100 µs max is within that noise. The ≥ 1 ms max is one
+  call and within the run-to-run maximum, but above the p90; it is borderline.
+- The N = 18–20 subset is 11 calls. Its < 100 µs max is `v_n18d` N = 20 (352³, 31.7 µs):
+  −17.2 % new vs −7.0 % (2). KF there is 15.8 µs measured and 10.9 µs predicted: the E = 4 KF
+  path at N = 20 grows with N (11.3 µs at N = 18), which `kf.elem` does not model and
+  `kf.chain` (fitted 0) no longer carries. W = 3 KF on tiny shapes is the remaining gap.
+
+Which features help, the same new records (offline refits, `--drop`; hold-out median / p90 /
+max %):
+
+| variant | < 100 µs | 100 µs – 1 ms | ≥ 1 ms |
+|---|---|---|---|
+| both (shipped) | 3.8 / 12.9 / 23.2 | 2.6 / 9.6 / 13.9 | 2.2 / 6.6 / 16.8 |
+| without `kf.elem` | 5.8 / 15.1 / 29.0 | 2.7 / 10.4 / 16.5 | 2.2 / 7.1 / 16.8 |
+| without `pack.dram` | 3.8 / 12.9 / 23.2 | 2.6 / 9.6 / 13.9 | 2.5 / 7.1 / 16.8 |
+| neither (a plain refit) | 5.6 / 15.0 / 29.0 | 2.7 / 10.4 / 16.5 | 2.5 / 8.0 / 16.8 |
+
+Each feature helps where it should (`kf.elem` the small calls, `pack.dram` the ≥ 1 ms
+calls), and a plain refit on the new data reproduces the §10 regression below 100 µs. So the
+gain over (2) is the features, not the new data.
+
+**Per phase, hold-out, all calls** (median / p90 |error|, %; (2) → (1) → new): KF 9.6 / 27.8
+→ 14.5 / 33.6 → 9.8 / 25.1; K2 3.4 / 8.9 → 5.4 / 12.1 → 4.4 / 7.9; **K3 9.6 / 18.9 → 13.3 /
+22.4 → 4.9 / 14.7**; KL A 4.3 / 14.0 → 3.0 / 12.3 → 3.4 / 12.7; KL B 3.7 / 11.9 → 4.4 / 14.0
+→ 3.6 / 13.8; K4 4.8 / 21.2 → 4.6 / 21.4 → 4.3 / 20.5; K5 4.1 / 16.2 → 4.0 / 16.5 → 4.1 /
+16.5. Calibration set (in-sample for the new fit only): K2 2.8 / 53.1 → 7.2 / 43.3 → 5.0 / 9.8,
+K3 15.0 / 32.8 → 17.6 / 28.6 → 5.6 / 12.6, KF 14.8 / 38.8 → 11.0 / 31.1 → 7.5 / 26.4.
+
+**Measured / predicted by N** (median per N; (2) / (1) / new):
+
+| N | KF hold-out | KF calibration set | K3 hold-out | K3 calibration set |
+|---|---|---|---|---|
+| 8 | 1.107 / 1.188 / 1.126 (27) | 1.089 / 1.199 / 1.082 (81) | 1.042 / 1.066 / 1.019 (8) | 1.091 / 1.136 / 1.056 (29) |
+| 14 | 0.920 / 1.011 / 1.053 (23) | 0.893 / 0.981 / 0.982 (51) | 1.086 / 1.139 / 1.040 (8) | 1.084 / 1.136 / 1.036 (29) |
+| 15 | 0.958 / 1.131 / 1.075 (10) | 0.887 / 1.039 / 1.004 (9) | 1.129 / 1.173 / 1.065 (1) | |
+| 16 | 0.937 / 1.122 / 1.046 (12) | 0.870 / 0.994 / 1.009 (40) | 1.143 / 1.193 / 1.094 (6) | 1.133 / 1.184 / 1.072 (5) |
+| 17 | 0.927 / 1.111 / 1.055 (7) | 0.877 / 1.021 / 1.064 (10) | 1.124 / 1.174 / 1.062 (1) | 1.211 / 1.261 / 1.126 (1) |
+| 18 | 0.831 / 0.951 / 1.036 (2) | | 1.086 / 1.133 / 1.041 (1) | |
+| 20 | 0.941 / 1.070 / 1.212 (2) | 0.903 / 0.952 / 0.999 (31) | 1.109 / 1.162 / 1.063 (1) | 1.004 / 1.086 / 0.986 (11) |
+
+(phase counts in parentheses). The KF trend from N = 8 to 20 is gone on the calibration set
+(1.08 → 1.00 instead of 1.20 → 0.95). On the hold-out KF stays 1.13× slow-predicted at N = 8
+(the 1024³-like REPEAT shapes, §3 of the analysis: the cache term's REPEAT saving is too
+large there) and 1.21 at N = 20 (2 phases, the tiny E = 4 case above). K3 goes from 1.07–1.19
+to 1.02–1.09; the remaining +4–9 % is in the miss cases.
+
+**Remaining** (not done here):
+- the KF roofline (latency and bandwidth terms overlap; max instead of sum) and a per-phase
+  cap of the cache term's REPEAT saving (analysis §3);
+- W = 3 KF on tiny E = 4 shapes (`v_n18d` N = 20);
+- K4 on tiny shapes (`z_s200`, `v_s320` N = 14, −17 to −23 %);
+- the capped-clock bias (1–3 % high) and the r_mm power gap (−43 %), which need memory-bound
+  windows at several clocks (analysis §4) before a power term is chosen;
+- refine L_hit with a case between 57 and 77 MB.
+
+**Design question for the reviewer**: keep calibration format 2 with additive optional
+keys (DESIGN §6c.2 "Why format 2 is kept", §6c.5 amended), or bump to format 3 as the
+analysis suggested? The additive form needs no misreading rule; a format 3 would only be
+needed for the not-adopted KF read / write split.

@@ -70,7 +70,7 @@ k_cc      | kjbc,kiac->abij | i=8,j=8,k=10,a=64,b=64,c=80 | imd | 15,16,17 | --r
 p_k3a     | ik,jk->ij | i=4096,j=96,k=8192         | imd | 8,14,16 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,2,5
 p_k3b     | ik,jk->ij | i=8192,j=192,k=3000        | imd | 8,16 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,3,7
 p_k3c     | ik,jk->ij | i=1536,j=320,k=1536        | imd | 14,16 | --reps 50 --phase-reps 10 --max-seconds 1 --g 0,4
-# --- (v1.17, DESIGN §6c.1) the PACK L2-hit step: K2 / K3 re-reads hit L2 while the call's group
+# --- (v1.17, DESIGN §6c.1) the PACK L2-hit step: K2 / K3 re-reads hit L2 while the group
 #     working set S = 8(m + n)k + g(m + n_hat)k_hat fits (the 4090: the step lies in [57, 77) MB,
 #     L_hit = 60.4 MB): 1472^3 at g = 4 (S = 52 MB, hit), 1792^3 at g = 4 (77 MB, miss), and a
 #     narrow B with a medium (hit, 46 MB) and a large A (miss, ~150 MB) at g = 2

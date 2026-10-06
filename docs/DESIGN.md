@@ -2826,8 +2826,9 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
   - Not adopted: the analysis's KF read / write byte split (residue writes cost ~1/3 of an
     input read per byte: they stay in L2 until K4). It needs a seventh KF slot, or a
     retirement of `kf.op` / `kf.row` (both fit 0 on the 4090, but retiring them changes the
-    meaning of existing keys, which needs a format bump); offline it moved the hold-out by
-    ≤ 0.9 points per statistic over `elem` + `dram` (NOTES-B2 §11).
+    meaning of existing keys, which needs a format bump); offline, on the combined refit's
+    records, it moved no hold-out statistic (median, p90, max per size class) by more than
+    1 point over `elem` + `dram` (NOTES-B2 §11).
 - **K4's DRAM term.** The operands of a group were just written by the packs and stay in L2
   while the group's operands and W planes fit; beyond that K4 streams them from DRAM
   (measured memory-bound: r_mm-like n̂ = 64–128 with long k, skinny m ≫ n). The calibration
@@ -3480,7 +3481,7 @@ on the random descriptors; a format-1 calibration (the v6 shipped file, kept as 
 predicts bit-identically to the v6 formulas (chain parameters 0, no clock scaling) and round-
 trips as format 1; format-2 parse errors (a missing `kernel.` line, a band with p10 > p90,
 resident 0); BURST at `clock_mhz = f_ref` equals BURST; SUSTAINED ≤ BURST in speed (never
-faster) and = BURST when P(f_ref) ≤ cap; P(f_s) = cap within 1e-9 relative when capped; a
+faster) and = BURST when P(f_ref) ≤ cap; P(f_s) = cap within 1e-9 relative when capped ([v1.17]: P(f_s ∓ 0.05 MHz) brackets the cap, the bisection's resolution); a
 larger clock never predicts a longer time; COLD ≥ WARM; bands contain the time and scale with
 it; rank: ties = the feasible candidates within tie_ratio of the best's time, ordered by total_bytes,
 `raw_rank` is a permutation reproducing the v6 order, `order = TIME` and a v6-sized request give
@@ -3744,7 +3745,8 @@ fit). So the hold-out is a check of the long-run state, and of shape only at 163
   was chosen by minimising this same leave-one-out median over 17 candidates, and the capped
   clock is predicted 2–4 % high, the time error being small because the time model's bias
   cancels it (NOTES-B2 §10). [v1.17] Superseded by the v1.17 refit (all 14 windows
-  recollected, f_ref by the parabola rule, nested figure reported; NOTES-B2 §11).
+  recollected, f_ref 2491 MHz by the parabola rule, nested leave-one-out 1.19 %; the capped
+  clock is still 1–3 % high; NOTES-B2 §11).
 
 ---
 
@@ -4866,12 +4868,21 @@ and host API; every value the same integer (bit-identical, tested on every contr
   only when non-zero, format-2 keys); the `op_eps` keys retired (accepted, discarded, never
   written); format 2 kept, with the reason (no file is read with features it was not fitted
   with; §6c.5 amended). `perf_fit.py`: L_hit = 0.8 × the nominal L2 in the seed, CLOCK_BOUND
-  kf (2, 3, 5) / pack (2, 4). Sweeps: the L2-step cases in the calibration sweep, N = 18–20
-  in the hold-out.
+  kf (2, 3, 5) / pack (2, 4), `--drop CLASS.FEATURE` for feature A/Bs. Sweeps: the L2-step
+  cases in the calibration sweep, N = 18–20 in the hold-out. `host_perf`: the synthetic
+  calibration iterates its keys sorted (it depended on the string hash seed) and the
+  capped solve is checked as a bracket at the bisection's 0.05 MHz (§6c.4).
 - **§6c.3 host API 12:** `imd_perf_calib_t.pack_l2_hit_bytes` appended (3688 bytes);
   `imd_perf_param_name` KF 4 `"elem"`, PACK 3 `"dram"`, KL 4 NULL; a v7–v11-sized struct
   reads L_hit 0. Python `host.API_VERSION` 12.
 - **§6c.4 tests:** see §6c.4 [v1.17].
+- **Shipped calibration** (2026-10-06, branch `model-fix`, NOTES-B2 §11): one full refit on
+  the current library (all 14 sustained windows recollected, 60 s pre-heat; the cache sweep;
+  the hold-out with N = 18–20): `kf.elem` 534 ns, `pack.dram` 0.844 ps/B, L_hit 60.4 MB,
+  f_ref 2491 MHz (nested leave-one-out 1.19 %), e_tc 0.721 pJ/op, e_byte^f 289 pJ/B. Hold-out
+  (189 calls) median / p90 / max: < 100 µs 3.8 / 12.9 / 23.2 %, 100 µs – 1 ms 2.6 / 9.6 /
+  13.9 %, ≥ 1 ms 2.2 / 6.6 / 16.8 % (old θ with eps ignored: 5.8 / 13.4 / 21.7, 3.5 / 14.1 /
+  21.3, 2.1 / 7.7 / 15.8 %); K3 phase 13.3 / 22.4 → 4.9 / 14.7 %.
 - **Docs caveats of the 2026-10-06 review** carried into DESIGN: §6c.7's shipped sustained
   figure (u_sq2048 −1.4 %, f_ref chosen on the same metric, capped clock 2–4 % high) and the
   v1.15 changelog's hold-out claim (the gain is the eps retirement, not the refit).
