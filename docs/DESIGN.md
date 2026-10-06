@@ -268,8 +268,8 @@ the lanes' distinct ε. The cost depended on the data (§6c "The eps path").
 W = 3, and the launch picks the instantiation from the plan's N (`pack_words(N)`). A
 warp-uniform runtime branch on W was the alternative: the kernel's register allocation would
 then be W = 3's at every N (the exploration measured W = 3 everywhere 5–8 % slower at
-N ≤ 16). Cost of the templates, measured (Release, sm_89): see the changelog entry **v1.14**
-(contract.cu compile time and `libimmerdink.so` size, before and after).
+N ≤ 16). Cost of the templates, measured (Release, sm_89, one compile job): contract.cu
+16.8 → 18.5 s (+10 %), `libimmerdink.so` 5.83 → 6.60 MB (+13 %). Accepted.
 The occupancy query for the performance model (`kernel_occupancy`, §6c) reports the
 W = 3 instantiation of each pack kernel (the model is unchanged in v1.14; §6c).
 
@@ -4351,3 +4351,16 @@ and host API; every value the same integer (bit-identical, tested on every contr
 - **Tests.** `mod_exhaustive_cpu` widened to [0, 12·255²] and `mod_p_words32`; new GPU unit
   test `pack_emitter`; new contract suite `eps` and packed cases with ε-heavy data.
 - **Performance model.** Unchanged (§6c "The eps path", [v1.14] note).
+- **Measured** (RTX 4090; eval workspace `results/followups2/bf-eps/`, bench/sweep_bf_eps.txt,
+  two interleaved before/after rounds, C bit-identical by hash in every case):
+  - Registers (ptxas): `k23_pack` 114 → 84 (W = 2) / 117 (W = 3); KF and KL stay at their
+    launch-bound caps (128 / 64) and their spills drop (KF E = 16: 8 B → 0; KL E = 8:
+    28 / 52 B stores / loads → 4–8 / 4–12 B).
+  - Pack phases at N ≥ 15: 1024³ −38 to −41 % (call TFLOPS-eq 13.65 → 15.65 at N = 15,
+    9.33 → 11.19 at N = 20); 1024² × 16384 −21 to −32 % at N = 16–20 (call 15.81 → 18.07
+    at N = 16); `imd_pack` 2048² −18 to −25 % at N = 16–20; DF-like acQ,bdQ −4 to −17 %;
+    4096³ −5 to −15 % at N = 16–20 (call +1–5 %); r_mm-like 16384×256×4096 −5 to −7 % (call +3–5 %).
+    Dominant-entry data now costs what typical data costs (it was the slow case at N = 14
+    for k = 1024: pack −19 to −22 %).
+  - N ≤ 13: no regression beyond 1 % (large and medium shapes 0–6 % faster; tiny calls
+    of 12–16 µs, three rounds of 3000 calls: median ratio 1.000–1.008).
