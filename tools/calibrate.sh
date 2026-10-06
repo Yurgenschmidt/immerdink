@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Calibrate the performance model (DESIGN v1.8 §6c.2) on this machine's GPU.
-#   tools/calibrate.sh [-o out.calib] [--validate] [--results DIR]
+#   tools/calibrate.sh [-o out.calib] [--validate] [--results DIR] [--k-align auto|16|64]
 # 1. builds the profiling imd_bench (bench/build.sh, via bench/run_sweep.sh);
 # 2. runs the calibration sweep bench/sweep_calib.txt through bench/run_sweep.sh (quiet gate,
 #    shared GPU lock, warm-up; ~12 min of GPU time on an RTX 4090) into DIR/calib-<stamp>.jsonl;
@@ -15,6 +15,10 @@
 # Environment: as bench/run_sweep.sh (IMMERDINK_ENV, IMMERDINK_CUTLASS_DIR, BENCH_RETRIES, ...);
 # PERF_FIT_ARGS: extra bench/perf_fit.py arguments (a GPU other than the RTX 4090 needs its
 # datasheet peaks: PERF_FIT_ARGS="--peak-dram 1.0e12 --peak-int8 6.6e14 --peak-fp64 1.3e12").
+# --k-align (DESIGN v1.13 §4b.6): force the K alignment of every plan of the sweeps (imd_bench
+# IMD_BENCH_K_ALIGN; default auto). A single sweep line can force it with "--k-align 16" too
+# (the A = 16-forced cases at k > 96 the refit needs); every record carries k_align_hook and
+# bench/perf_fit.py models each record at its alignment.
 # Results default to bench/results/ (git-ignored). Never changes GPU clocks.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -27,7 +31,9 @@ while [ $# -gt 0 ]; do
     -o) out="$2"; shift 2 ;;
     --validate) validate=1; shift ;;
     --results) results="$2"; shift 2 ;;
-    *) echo "usage: tools/calibrate.sh [-o out.calib] [--validate] [--results DIR]" >&2; exit 2 ;;
+    --k-align) case "$2" in auto|0|16|64) export IMD_BENCH_K_ALIGN="$2" ;;
+               *) echo "--k-align auto|16|64" >&2; exit 2 ;; esac; shift 2 ;;
+    *) echo "usage: tools/calibrate.sh [-o out.calib] [--validate] [--results DIR] [--k-align auto|16|64]" >&2; exit 2 ;;
   esac
 done
 mkdir -p "$results"

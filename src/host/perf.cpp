@@ -454,9 +454,11 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     // phase (r k_hat + chunk end) mod 64. Since v1.13 K_c' = 131008 = 0 mod 64: every chunk
     // end is 0 mod 64 or k_hat, the c * K_c' term is always 0 mod 32, and the format-2 rule
     // reduces to "slow iff k_hat mod 32 != 0", which is exact for the phase classes 16 / 48
-    // (class 32, +3 % to +19 % measured, is not a separate term; calibration format 2 is
-    // unchanged and was fitted with K_c' = 131056). That explains k_hat = 1008 / 5008 (slow)
-    // and 800 (not slow) alike.
+    // (class 32, +3 % to +19 % measured, is not a separate term). v1.13 stage 2 (§4b.6): an
+    // A = 64 plan (AUTO: k > 96) has k_hat = 0 mod 64 and is never slow; only A = 16 plans
+    // (k <= 96, or forced by the test hook) can be. Calibration format 2 is unchanged; its
+    // theta was fitted on misaligned data with K_c' = 131056 and is to be refit (A = 16-forced
+    // cases at k > 96 through --k-align keep the slow term determined).
     const int64_t nfull = kc.k_chunks - 1;
     bool last_slow;
     int64_t full_slow;
@@ -471,7 +473,12 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
       for (int64_t c = 0; c < nfull; ++c) full_slow += misaligned(c) ? 1 : 0;
       last_slow = misaligned(nfull);
     }
-    const int64_t ksz[3] = {chunk, chunk, last}, kcnt[3] = {nfull - full_slow, full_slow, 1};
+    // v1.13 §4b.6: the MMA work of a chunk is ceil(kc)_64 (CUTLASS runs its residue tile as a
+    // full zero-filled 64-wide tile), whatever A: the same for A = 16 and A = 64 plans. Only the
+    // byte terms use the padded k_hat.
+    const auto mma_k = [](int64_t len) { return (len + kK4TileK - 1) / kK4TileK * kK4TileK; };
+    const int64_t ksz[3] = {mma_k(chunk), mma_k(chunk), mma_k(last)},
+                  kcnt[3] = {nfull - full_slow, full_slow, 1};
     const bool kslow[3] = {false, true, last_slow};
     double x[kP] = {0, 0, 0, 0, 0, 0};
     const int occ = kK4Configs[cfg].ctas_per_sm;
@@ -496,7 +503,7 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
       const double group = gi * b * (m + nh) * kh + gi * b * m * nh * (2.0 * kc.k_chunks - 1);
       dram += static_cast<double>(gcnt[i]) * std::max(0.0, group - l2);
     }
-    const double k4_ops = 2 * N * b * m * nh * kh;
+    const double k4_ops = 2 * N * b * m * nh * static_cast<double>(nfull * ksz[0] + ksz[2]);
     add_phase(&P, IMD_PERF_PHASE_K4, IMD_PERF_CLASS_K4_128x256 + cfg, kc.launches,
               {x[0], x[1], x[2], x[3], dram, x[kK4TailSlot]}, k4_bytes, k4_ops, 1);
     // K5: the N planes, sigma / tau and the flags read, C written (and read if beta != 0);

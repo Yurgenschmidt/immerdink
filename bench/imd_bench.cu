@@ -34,6 +34,11 @@
 //             t_a / t_b (> 1: B faster), its p10 / p90, and whether the two C are bit-identical
 //   bw        device-to-device copy of A (achievable DRAM bandwidth; a hardware reference)
 //
+// --k-align auto|16|64 (DESIGN v1.13 §4b.6): the K alignment of every plan and pack the run
+// creates (libimmerdink_host's test hook imd_test_set_k_align; auto = the library's rule, A =
+// 64 iff k > 96). For the stage-2 A/B sweep and the A = 16-forced calibration cases; every
+// imd / duel record carries the plan's k_align.
+//
 // Accuracy: for --samples output elements (all of them if C is smaller), the reference
 // is a double-double (Dot2) dot product computed on the device; the host holds only the
 // samples (no operand copies), so host RSS is small for every shape. Reported: max |c - r| / |r| and the
@@ -65,6 +70,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+// libimmerdink_host's test-only K-alignment hook (src/host/k_hat.cpp; not in a public header).
+extern "C" int imd_test_set_k_align(int32_t a);
 
 namespace {
 
@@ -441,6 +449,7 @@ struct Options {
   // the timed window: the COLD state; default repeat); --sustain-s / --sustain-warm-s: method
   // sustained's measured window and warm-up.
   bool clock_probe = false;
+  int k_align_hook = 0;  // v1.13 §4b: --k-align (0 = auto) / IMD_BENCH_K_ALIGN
   bool l2_flush = false;
   double sustain_s = 8, sustain_warm_s = 3;
   uint64_t seed = 1;
@@ -729,6 +738,7 @@ struct Bench {
     meta.str("gemm_view", cA + "," + cB + "->" + cC);
     meta.raw("perm_needed", std::string("\"") + (needA ? "A" : "") + (needB ? "B" : "") + (needC ? "C" : "") + "\"");
     meta.num("phi", o.phi).integer("seed", (long long)o.seed);
+    meta.integer("k_align_hook", o.k_align_hook);  // v1.13 §4b: 0 = AUTO, else forced A
     meta.str("data", o.dominant ? "dominant" : "normal");
     meta.str("gpu", p.name).integer("sm_count", p.multiProcessorCount);
     meta.integer("l2_bytes", (long long)p.l2CacheSize);
@@ -811,7 +821,8 @@ struct Bench {
 #endif
     extra.integer("k4_rule", low.k4_config).integer("k4_config", k4_run)
         .integer("k4_tune_bytes", (long long)low.k4_tune_bytes)
-        .integer("fused", low.fused).integer("fused_large", low.fused_large);
+        .integer("fused", low.fused).integer("fused_large", low.fused_large)
+        .integer("k_align", low.k_align).integer("k_hat", (long long)low.k_hat);
     std::string vs = vec_mode == IMD_VEC_RESIDENT ? gs + " vec=resident" : gs;
     if (o.mode == IMD_DIRECT) vs += " mode=direct";
     if (k4 == -2) vs += " k4=tune";
@@ -958,6 +969,7 @@ struct Bench {
       e.integer("k4_rule", p.low.k4_config).integer("k4_config", p.k4_run);
       e.integer("kernel_launches", p.low.kernel_launches);
       e.integer("fused", p.low.fused).integer("fused_large", p.low.fused_large);
+      e.integer("k_align", p.low.k_align).integer("k_hat", (long long)p.low.k_hat);
       return e;
     };
     Json ea = side_extra(*pa, "a"), eb = side_extra(*pb, "b");
@@ -1390,6 +1402,7 @@ void usage() {
           "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4)\n"
           "  [--clock-probe 0|1] [--l2 repeat|flush] (v1.10: per-call SM clock; L2 evicted\n"
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
+          "  [--k-align auto|16|64] (v1.13 §4b: force the K alignment of every plan / pack)\n"
           "  methods: imd,packed,duel,bw,occupancy,sustained,pair (default imd)\n"
           "  [--out file.jsonl]\n");
 }
@@ -1405,7 +1418,7 @@ int main(int argc, char** argv) {
                                       "max-seconds", "samples", "phi", "seed", "phase-reps",
                                       "vec", "g", "k4", "pack", "reuse", "duel-a", "duel-b", "out",
                                       "mode", "data", "clock-probe", "l2", "sustain-s",
-                                      "sustain-warm-s"};
+                                      "sustain-warm-s", "k-align"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -1464,6 +1477,15 @@ int main(int argc, char** argv) {
     if (a.count("sustain-s")) B.o.sustain_s = std::stod(a["sustain-s"]);
     if (a.count("sustain-warm-s")) B.o.sustain_warm_s = std::stod(a["sustain-warm-s"]);
     if (a.count("seed")) B.o.seed = std::stoull(a["seed"]);
+    // v1.13 §4b: --k-align, else IMD_BENCH_K_ALIGN (tools/calibrate.sh --k-align), set
+    // before any plan or pack is created.
+    if (!a.count("k-align") && getenv("IMD_BENCH_K_ALIGN")) a["k-align"] = getenv("IMD_BENCH_K_ALIGN");
+    if (a.count("k-align")) {
+      const std::string& v = a["k-align"];
+      if (v != "auto" && v != "0" && v != "16" && v != "64") throw Failure("--k-align auto|16|64");
+      B.o.k_align_hook = v == "auto" ? 0 : std::stoi(v);
+      if (imd_test_set_k_align(B.o.k_align_hook) != 0) throw Failure("imd_test_set_k_align");
+    }
     B.o.min_reps = std::min(B.o.min_reps, B.o.reps);
     if (a.count("out")) {
       B.out = fopen(a["out"].c_str(), "a");

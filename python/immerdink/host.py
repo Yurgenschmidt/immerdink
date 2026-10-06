@@ -29,6 +29,7 @@ system search path.
 import ctypes as C
 import ctypes.util
 import os
+import sys
 from dataclasses import dataclass
 
 __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "workspace_size",
@@ -36,9 +37,14 @@ __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "work
            "pack_desc_for", "REGIONS", "STATUS", "PACK_MISMATCH", "Calibration", "predict",
            "predict_pack", "rank", "param_names", "PERF_CLASSES", "PERF_PHASES", "Accuracy",
            "ErrEstimate", "err_estimate", "min_moduli", "ERR_METRICS", "ERR_BASES",
-           "ERR_STATUS", "INFEASIBLE"]
+           "ERR_STATUS", "INFEASIBLE", "PACK_FORMAT", "PACK_FORMAT_A16", "PACK_FORMAT_A64",
+           "test_set_k_align"]
 
-API_VERSION = 8  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+API_VERSION = 9  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+# Pack formats (DESIGN v1.13 §4b, host API 9): the format of a pack is that of its k (2 iff
+# k > 96); PACK_FORMAT is the newest format the library writes.
+PACK_FORMAT_A16, PACK_FORMAT_A64 = 1, 2
+PACK_FORMAT = PACK_FORMAT_A64
 
 STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT_WORKSPACE",
           "MISALIGNED", "CUDA_ERROR", "ALLOC_FAILED", "PACK_MISMATCH"]
@@ -114,7 +120,8 @@ class _Lowering(C.Structure):
                 ("fused", C.c_int32), ("reserved", C.c_int32), ("kernel_launches", C.c_int64),
                 ("sm_count", C.c_int32), ("k4_config", C.c_int32), ("k4_tune_bytes", C.c_uint64),
                 ("fused_large", C.c_int32), ("reserved4", C.c_int32),
-                ("packed", C.c_int32), ("pack_mismatch", C.c_int32)]
+                ("packed", C.c_int32), ("pack_mismatch", C.c_int32),
+                ("k_align", C.c_int32), ("reserved6", C.c_int32)]   # v6 (DESIGN v1.13 §4b)
 
 
 class _PackDesc(C.Structure):
@@ -233,7 +240,8 @@ class _Candidate(C.Structure):
                 ("err_status", C.c_int32), ("infeasible", C.c_int32)]
 
 
-assert C.sizeof(_Lowering) == 184  # version 5 (DESIGN §6b v1.7)
+assert C.sizeof(_Lowering) == 192  # version 6 (DESIGN v1.13 §4b; v5 = 184)
+assert _Lowering.k_align.offset == 184
 assert C.sizeof(_Options) == 24
 assert C.sizeof(_PackDesc) == 72 and C.sizeof(_PackLayout) == 136
 assert C.sizeof(_PerfCalib) == 3672 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1976
@@ -332,6 +340,23 @@ class HostLibrary:
 
 
 _loaded = {}  # path (None: the default search) -> HostLibrary
+
+
+def test_set_k_align(a, *, lib=None):
+    """TEST ONLY (DESIGN v1.13 §4b.5): libimmerdink_host's imd_test_set_k_align. a = 0
+    restores AUTO (A = 64 iff k > 96); 16 or 64 forces the K alignment of every sizing query,
+    lowering, plan and pack created afterwards in this process (device plans follow).
+    ValueError for another value. The plan cache key does not include the hook, so this also
+    clears immerdink.device's default PlanCache (when that module is loaded); tests that set
+    the hook use fresh caches (PlanCache, planner.Memo) and restore AUTO afterwards."""
+    h = load(lib) if not isinstance(lib, HostLibrary) else lib
+    f = h.lib.imd_test_set_k_align
+    f.restype, f.argtypes = C.c_int, [C.c_int32]
+    if f(int(a)) != 0:
+        raise ValueError(f"k alignment {a!r}: 0 (AUTO), 16 or 64")
+    dev = sys.modules.get(__package__ + ".device") if __package__ else None
+    if dev is not None:
+        dev.default_plan_cache.clear()
 
 
 def load(path=None):
@@ -547,6 +572,8 @@ class Lowering:
     reserved4: int
     packed: int            # v5: bit 0 / bit 1: the caller's A / B read from a pack
     pack_mismatch: str     # v5: the PACK_MISMATCH reason ("NONE" otherwise)
+    k_align: int           # v6: the plan's K alignment A (16 / 64), k_hat = ceil(k)_A
+    reserved6: int
 
 
 def lowering(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",

@@ -90,8 +90,9 @@ def device_pack(lib, cuda, od, data_want, pX, name, stream=None):
         raise Fail(f"{name}: imd_pack_bytes {pb}, {pw}; oracle {pv.pack_bytes}, {pv.pack_ws}")
     dP = cuda.malloc(pb + 2 * GUARD)
     dW = cuda.malloc(pw + 2 * GUARD)
-    cuda.memset(dP, 0xA5, pb + 2 * GUARD)   # poison: every byte must be written
-    cuda.memset(dW, 0x5A, pw + 2 * GUARD)
+    if tc.POISON:   # poison: every byte must be written (else initcheck's fresh memory)
+        cuda.memset(dP, 0xA5, pb + 2 * GUARD)
+        cuda.memset(dW, 0x5A, pw + 2 * GUARD)
     try:
         allocs, launches = lib.alloc_count(), lib.launch_count()
         st = lib.pack(h, pX, dP.value + GUARD, pb, dW.value + GUARD if pw else None, pw, stream)
@@ -106,9 +107,9 @@ def device_pack(lib, cuda, od, data_want, pX, name, stream=None):
         cuda.download(got, dP)
         wsg = np.empty(pw + 2 * GUARD, dtype=np.uint8)
         cuda.download(wsg, dW)
-        if (got[:GUARD] != 0xA5).any() or (got[GUARD + pb:] != 0xA5).any():
+        if tc.POISON and ((got[:GUARD] != 0xA5).any() or (got[GUARD + pb:] != 0xA5).any()):
             raise Fail(f"{name}: imd_pack wrote outside the packed buffer")
-        if (wsg[:GUARD] != 0x5A).any() or (wsg[GUARD + pw:] != 0x5A).any():
+        if tc.POISON and ((wsg[:GUARD] != 0x5A).any() or (wsg[GUARD + pw:] != 0x5A).any()):
             raise Fail(f"{name}: imd_pack wrote outside its workspace")
         want = np.frombuffer(bytes(data_want), dtype=np.uint8)
         bad = np.nonzero(got[GUARD:GUARD + pb] != want)[0]
@@ -186,10 +187,14 @@ def run_packed_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, 
                                                          f"{name} [pack {'AB'[x]}]")
         emulated = kind == "GEMM"
         fmodes = (-1, 0, 1, 2, 3) if (full and lib.has_test_hooks and emulated) else (-1,)
+        if tc.QUICK:
+            fmodes = tuple(f for f in fmodes if f in (-1, 0, 3))
         runs = [(vec, pvec, fm, -1) for vec, pvec in ((hz.VEC_GENERATE, params.VEC_GENERATE),
                                                        (hz.VEC_RESIDENT, params.VEC_RESIDENT))
                 for fm in fmodes] if full else [(hz.VEC_GENERATE, params.VEC_GENERATE, -1, -1)]
-        if full and lib.has_test_hooks and emulated:
+        if tc.QUICK:
+            runs = [r for r in runs if r[0] == hz.VEC_GENERATE]
+        elif full and lib.has_test_hooks and emulated:
             runs += [(hz.VEC_GENERATE, params.VEC_GENERATE, -1, c)
                      for c in list(range(tc.K4_CONFIGS)) + ["tune"]]
         pk_arg, keep = packing_arg(ods)
@@ -237,7 +242,8 @@ def run_packed_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, 
                     if bits != want_bits or (pbA, pbB) != (by_role.get("A", 0), by_role.get("B", 0)):
                         raise Fail(f"{vname}: plan packed slots {bits} {pbA} {pbB}")
                 cuda.upload(dC, bufC)
-                cuda.memset(dW, 0xA5, ws_bytes + 2 * GUARD)
+                if tc.POISON:
+                    cuda.memset(dW, 0xA5, ws_bytes + 2 * GUARD)
                 opA = hz.Operand(pA, dPs[0].value + GUARD if dPs[0] else None, pbs[0], handles[0])
                 opB = hz.Operand(pB, dPs[1].value + GUARD if dPs[1] else None, pbs[1], handles[1])
                 allocs, launches0 = lib.alloc_count(), lib.launch_count()
@@ -273,7 +279,8 @@ def run_packed_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, 
                 cuda.download(got, dC)
                 wsg = np.empty(ws_bytes + 2 * GUARD, dtype=np.uint8)
                 cuda.download(wsg, dW)
-                if (wsg[:GUARD] != 0xA5).any() or (wsg[GUARD + ws_bytes:] != 0xA5).any():
+                if tc.POISON and ((wsg[:GUARD] != 0xA5).any() or
+                                  (wsg[GUARD + ws_bytes:] != 0xA5).any()):
                     raise Fail(f"{vname}: bytes outside [ws, ws + workspace_size) were written")
             finally:
                 cuda.free(dW)
@@ -409,6 +416,116 @@ def suite_packed(lib, cuda, verbose):
         raise Fail(f"native K order through a pack: {out}")
     if STATS["roles"] != {"A", "B"} or STATS["flagged"] < 5 or STATS["orders_differ"] < 3:
         raise Fail(f"coverage: {STATS}")
+
+
+def suite_k_align(lib, cuda, verbose):
+    """DESIGN v1.13 §4b.8 (stage 2): packs of format 1 and 2 (A forced to 16 / 64 through
+    libimmerdink_host's hook) byte-exact vs oracle.pack(fmt) on a 0xA5-poisoned pack buffer,
+    and packed A, packed B (the post-swap B role: the tail rows, b > 1, an n_hat split so
+    j0 > 0) and both packed, bit-exact vs the oracle on every producer path and identical
+    across A; PACK_MISMATCH when the hook changes between imd_pack_create and plan creation
+    (both directions), and in imd_contract_packed for a handle of the other alignment; the K4
+    operand-pointer check (= 0 mod A) with no violation."""
+    if not lib.has_test_hooks:
+        raise Fail("suite k_align needs the test hooks")
+    rng = random.Random(1713)
+
+    def T(ext, lab, order=None):
+        return o.Desc(ext, tc.layout(rng, ext, order=order), lab)
+
+    lib.k4_align_check(1)
+    n_runs = 0
+    try:
+        shapes = [  # (label, A, B, C, N, g, rounding, which, n-tile limit)
+            ("matrix k=97", T([5, 97], [I, K]), T([97, 7], [K, J]), T([5, 7], [I, J]), 9, 0,
+             "RN", ("A", "B", "AB"), 0),
+            ("matrix k=1000", T([4, 1000], [I, K]), T([1000, 6], [K, J]), T([4, 6], [I, J]), 8, 3,
+             "TRUNC", ("A", "B", "AB"), 0),
+            # C i-fastest: the role swap, the caller's A in the post-swap B role; n = 300 rows of
+            # B role: n_hat 304 reads the tail; b = 2; 256-column n-hat parts: j0 = 256
+            ("B role tail k=97 b=2", T([300, 97, 2], [I, K, L]), T([97, 3, 2], [K, J, L]),
+             T([300, 3, 2], [I, J, L], order=[0, 1, 2]), 9, 0, "RN", ("A", "AB"), 1),
+            ("B role tail k=1000 b=2", T([3, 1000, 2], [I, K, L]), T([1000, 300, 2], [K, J, L]),
+             T([3, 300, 2], [I, J, L], order=[1, 0, 2]), 8, 0, "TRUNC", ("B", "AB"), 1),
+            ("k=96 (format 1 either way)", T([6, 96], [I, K]), T([96, 5], [K, J]), T([6, 5], [I, J]),
+             9, 0, "RN", ("AB",), 0),
+        ]
+        for label, A, B, Cd, N, g, rnd, whiches, ntiles in shapes:
+            TA, TB = tc.gen(rng, A.extent, "phi"), tc.gen(rng, B.extent, "wide")
+            tc.inject(rng, TA, 0.01)
+            TC = tc.gen(rng, Cd.extent, "uniform")
+            for which in whiches:
+                out = {}
+                for a in (16, 64):
+                    if ntiles:
+                        lib.set_limits(max_n_tiles=ntiles)
+                    try:
+                        with tc.k_align(lib, a):
+                            for x, Xd in enumerate((A, B)):
+                                if "AB"[x] in which:
+                                    fmt = o.pack_lower(pack_descs(A, B, Cd, o.EMULATE, N, rnd,
+                                                                  which, "auto")[x]).format
+                                    if fmt != (2 if a == 64 else 1):
+                                        raise Fail(f"{label}: pack format {fmt} at A = {a}")
+                            out[a] = run_packed_case(lib, cuda, f"k_align {label} [{which}, A={a}]",
+                                                     A, B, Cd, TA, TB, TC, 1.0, 0.5, N, g, rnd,
+                                                     o.EMULATE, which, "auto", random.Random(7),
+                                                     verbose)
+                    finally:
+                        if ntiles:
+                            lib.set_limits()
+                    n_runs += 1
+                if not np.array_equal(out[16].view(np.uint64), out[64].view(np.uint64)):
+                    raise Fail(f"{label} [{which}]: C differs between A = 16 and A = 64")
+        bad = lib.k4_align_check(-1)
+        if bad:
+            raise Fail(f"K4 operand pointers not = 0 mod A: {bad} launches")
+    finally:
+        lib.k4_align_check(0)
+    # FORMAT: a pack and a plan of different A (only through the hook)
+    A, B, Cd = T([5, 200], [I, K]), T([200, 7], [K, J]), T([5, 7], [I, J])
+    tA, tB, tC = (hz.make_tensor(d.extent, d.stride, d.label) for d in (A, B, Cd))
+    n_mis = 0
+    for pack_a, plan_a in ((16, 64), (64, 16), (16, 0), (0, 16), (64, 64), (0, 0)):
+        ods = pack_descs(A, B, Cd, o.EMULATE, 9, "RN", "AB", "auto")
+        with tc.k_align(lib, pack_a):
+            hs = [lib.pack_create(hz.make_pack_desc(od)) for od in ods]
+        if any(st != "SUCCESS" for st, _ in hs):
+            raise Fail(f"imd_pack_create {hs}")
+        try:
+            want = "SUCCESS" if (pack_a or 64) == (plan_a or 64) else "PACK_MISMATCH"
+            with tc.k_align(lib, plan_a):
+                for pa, pb in ((hs[0][1], None), (None, hs[1][1]), (hs[0][1], hs[1][1])):
+                    st, plan = lib.plan_create_packed(tA, tB, tC, 9, pa, pb)
+                    if st == "SUCCESS":
+                        lib.plan_destroy(plan)
+                    if st != want:
+                        raise Fail(f"pack A={pack_a}, plan A={plan_a}: {st}, want {want}")
+                    n_mis += st == "PACK_MISMATCH"
+            # a plan made against handles of one alignment, called with a handle of the other
+            if want == "PACK_MISMATCH":
+                with tc.k_align(lib, plan_a):
+                    hp = lib.pack_create(hz.make_pack_desc(ods[0]))
+                    st, plan = lib.plan_create_packed(tA, tB, tC, 9, hp[1], None)
+                try:
+                    if st != "SUCCESS":
+                        raise Fail(f"plan of the handle's own alignment: {st}")
+                    pb_ = lib.pack_bytes(hs[0][1])[0]
+                    opA = hz.Operand(1 << 20, 1 << 21, pb_, hs[0][1])   # never dereferenced
+                    opB = hz.Operand(1 << 22, None, 0, None)
+                    st = lib.contract_packed(plan, 1.0, opA, opB, 0.0, 1 << 23, None, 0)
+                    if st != "PACK_MISMATCH":
+                        raise Fail(f"imd_contract_packed with a handle of A={pack_a}: {st}")
+                    n_mis += 1
+                finally:
+                    lib.plan_destroy(plan)
+                    lib.pack_destroy(hp[1])
+        finally:
+            for _, h in hs:
+                lib.pack_destroy(h)
+    if n_mis < 12:
+        raise Fail(f"too few FORMAT mismatches: {n_mis}")
+    STATS["k_align"] = (n_runs, n_mis)
 
 
 def suite_reuse(lib, cuda, verbose):
@@ -684,7 +801,8 @@ def suite_api(lib, cuda, verbose):
               f"imd_contract_packed and imd_pack check orders)")
 
 
-SUITES = {"packed": suite_packed, "reuse": suite_reuse, "api": suite_api}
+SUITES = {"packed": suite_packed, "reuse": suite_reuse, "api": suite_api,
+          "k_align": suite_k_align}
 
 
 def main():

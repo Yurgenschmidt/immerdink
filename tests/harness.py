@@ -144,6 +144,12 @@ class Library:
             self.lib.imd_test_plan_sizes.argtypes = [C.c_void_p, C.POINTER(C.c_int64), C.c_int64,
                                                      C.POINTER(C.c_int64)]
             self.lib.imd_test_plan_sizes.restype = C.c_int
+            # v1.13 §4b: the K4 operand-pointer check (libimmerdink) and the K-alignment hook
+            # (libimmerdink_host, found through libimmerdink's dependency tree).
+            self.lib.imd_test_k4_align_check.argtypes = [C.c_int]
+            self.lib.imd_test_k4_align_check.restype = C.c_int64
+            self.lib.imd_test_set_k_align.argtypes = [C.c_int32]
+            self.lib.imd_test_set_k_align.restype = C.c_int
         self.shim = None
 
     def load_alloc_shim(self, path):
@@ -212,6 +218,17 @@ class Library:
         first two are -1 without K4 (v1.5)."""
         v = self.plan_sizes(plan)
         return v[34], v[35], v[36]
+
+    def set_k_align(self, a=0):
+        """DESIGN v1.13 §4b.5: force the K alignment A (16 / 64) of every plan, pack and host
+        query created afterwards; 0 = AUTO. Only the C library: callers that model the plan
+        (params / oracle) set their K_ALIGN_POLICY too (test_contract.k_align)."""
+        assert self.lib.imd_test_set_k_align(int(a)) == 0
+
+    def k4_align_check(self, mode=-1):
+        """imd_test_k4_align_check: 1 = enable the K4 operand-pointer = 0 mod A check and reset
+        its count, 0 = disable, -1 = query. Returns the violations since the last reset."""
+        return self.lib.imd_test_k4_align_check(mode)
 
     def set_limits(self, k_chunk=0, max_batch=0, max_n_tiles=0):
         """Override K4's launch limits (0 = production value); see src/test_hooks.cpp."""

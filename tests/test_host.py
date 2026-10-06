@@ -40,6 +40,25 @@ from immerdink import host  # noqa: E402
 
 STATUS = host.STATUS
 RN, TRUNC = "RN", "TRUNC"
+# DESIGN v1.13 §4b: the K-alignment policy the C library runs and the spec side models.
+# "AUTO" (the library's rule) unless a test forces A with set_k_align (the C hook
+# imd_test_set_k_align and params / oracle.K_ALIGN_POLICY move together).
+HOOK = "AUTO"
+
+
+def set_k_align(a):
+    """Force A (16 / 64) or restore AUTO ("AUTO" / 0) in the C library AND in params / oracle,
+    so every spec default (k_hat_of, workspace_size, pack_layout, lower_packed) follows."""
+    global HOOK
+    a = "AUTO" if a in (0, "AUTO") else int(a)
+    host.test_set_k_align(0 if a == "AUTO" else a)
+    HOOK = params.K_ALIGN_POLICY = oracle.K_ALIGN_POLICY = a
+
+
+def plan_k_align(k, dispatch):
+    """The lowering's k_align (§4b.5): the resolved A of a plan with residue rows (EMULATE),
+    16 for NOOP, SCALE, DIRECT and K-empty."""
+    return params.k_align_of(k, HOOK) if dispatch == "EMULATE" else 16
 
 
 class Fail(Exception):
@@ -64,9 +83,9 @@ LOWERING_FIELDS = ["status", "lowered", "dispatch", "swapped", "num_moduli", "re
                    "k_chunks", "gemm_launches", "kappa", "workspace_bytes",
                    "plan_device_bytes", "plan_host_bytes", "fused", "kernel_launches",
                    "sm_count", "k4_config", "k4_tune_bytes", "fused_large", "packed",
-                   "pack_mismatch"]
-# sizeof(imd_lowering_t) per host API version (DESIGN §6a; v5: §6b)
-V1, V2, V3, V4, V5 = 136, 152, 168, 176, 184
+                   "pack_mismatch", "k_align"]
+# sizeof(imd_lowering_t) per host API version (DESIGN §6a; v5: §6b; v6: v1.13 §4b)
+V1, V2, V3, V4, V5, V6 = 136, 152, 168, 176, 184, 192
 
 
 class CPD(C.Structure):
@@ -149,9 +168,9 @@ class Direct:
         del keep
         return st, tot.value, [(buf[2 * r], buf[2 * r + 1]) for r in range(8)]
 
-    def lowering(self, descs, opts, size=V5, sm_count=0, packing=None):
+    def lowering(self, descs, opts, size=V6, sm_count=0, packing=None):
         """imd_lowering (imd_lowering_packed with `packing`) into a raw struct of `size`
-        bytes (184: version 5; 176 / 168 / 152 / 136: a version-4 / -3 / -2 / -1 caller,
+        bytes (192: version 6; 184 / 176 / 168 / 152 / 136: a version-5 / -4 / -3 / -2 / -1 caller,
         whose struct must come back with its fields only). sm_count: the v3 input field
         (written only into a struct of version 3 or later)."""
         raw = (C.c_uint8 * (size + 16))(*([0xEE] * (size + 16)))
@@ -169,7 +188,7 @@ class Direct:
         i32 = [C.c_int32.from_buffer(raw, 4 * i).value for i in range(8)]
         i64 = [C.c_int64.from_buffer(raw, 32 + 8 * i).value for i in range(9)]
         u64 = [C.c_uint64.from_buffer(raw, 104 + 8 * i).value for i in range(4)]
-        v2, v3, v4, v5 = [], [], [], []
+        v2, v3, v4, v5, v6 = [], [], [], [], []
         if size >= V2:
             v2 = [C.c_int32.from_buffer(raw, 136).value, C.c_int64.from_buffer(raw, 144).value]
         if size >= V3:
@@ -181,7 +200,11 @@ class Direct:
                 raise Fail("imd_lowering: reserved4 != 0")
         if size >= V5:
             v5 = [C.c_int32.from_buffer(raw, 176).value, C.c_int32.from_buffer(raw, 180).value]
-        return st, dict(zip(LOWERING_FIELDS, i32[1:] + i64 + u64 + v2 + v3 + v4 + v5))
+        if size >= V6:
+            v6 = [C.c_int32.from_buffer(raw, 184).value]
+            if C.c_int32.from_buffer(raw, 188).value != 0:
+                raise Fail("imd_lowering: reserved6 != 0")
+        return st, dict(zip(LOWERING_FIELDS, i32[1:] + i64 + u64 + v2 + v3 + v4 + v5 + v6))
 
 
 # ---------------------------------------------------------------------------------------
@@ -199,21 +222,24 @@ def spec_expect(descs, N, g, rnd, mode, vec):
         return "NOT_SUPPORTED", None
     pmode = params.EMULATE if mode == "EMULATE" else params.DIRECT
     pvec = params.VEC_GENERATE if vec == "GENERATE" else params.VEC_RESIDENT
+    A_res = params.k_align_of(v.k, HOOK)   # v1.13 §4b.5: resolved once per call
     try:
-        ws = params.workspace_size(v.m, v.n, v.k, v.b, N, g, pmode, pvec)
+        ws = params.workspace_size(v.m, v.n, v.k, v.b, N, g, pmode, pvec, k_align=A_res)
     except OverflowError:
         return "INVALID_VALUE", None
     m, n, k, b = v.m, v.n, v.k, v.b
     gg = N if g == 0 else g
-    k_hat, n_hat = params.k_hat_of(k), params.align_up(n, 16)
     noop = b * m * n == 0
     dispatch = ("NOOP" if noop else "SCALE" if k == 0 else
                 "DIRECT" if (mode == "DIRECT" or k == 1) else "EMULATE")
+    k_align = plan_k_align(k, dispatch)
+    k_hat, n_hat = params.k_hat_of(k, k_align), params.align_up(n, 16)
     exp = dict(m=m, n=n, k=k, b=b, swapped=bool(v.swapped), n_hat=n_hat, k_hat=k_hat,
+               k_align=k_align,
                kappa=oracle.ceil_sqrt(k) if k > 0 else 0, workspace_bytes=ws,
                dispatch=dispatch, num_moduli=N, residue_group=gg,
                vec_entries=0 if noop else 2 * m + 2 * n + 2 * k + 3 * b,
-               regions=params.region_offsets(m, n, k, b, N, g, pmode, pvec),
+               regions=params.region_offsets(m, n, k, b, N, g, pmode, pvec, k_align=A_res),
                plan_device_bytes=params.plan_device_bytes(m, n, k, b, pvec),
                num_groups=0, k_chunks=0, gemm_launches=0)
     status = "SUCCESS"
@@ -363,6 +389,9 @@ def check_case(direct, descs, opts, what):
     st_2, low_2 = direct.lowering(descs, co, size=V2)
     st_3, low_3 = direct.lowering(descs, co, size=V3)
     st_4, low_4 = direct.lowering(descs, co, size=V4)
+    st_5, low_5 = direct.lowering(descs, co, size=V5)
+    if st_5 != st_c or any(low_5[f] != low_c[f] for f in low_5) or "k_align" in low_5:
+        raise Fail(f"{what}: a version-5 imd_lowering_t differs from version 6")
     if st_1 != st_c or any(low_1[f] != low_c[f] for f in low_1):
         raise Fail(f"{what}: a version-1 imd_lowering_t differs from version 5")
     if st_2 != st_c or any(low_2[f] != low_c[f] for f in low_2):
@@ -419,7 +448,7 @@ def check_case(direct, descs, opts, what):
     for f in ("m", "n", "k", "b", "n_hat", "k_hat", "kappa", "workspace_bytes", "num_moduli",
               "residue_group", "vec_entries", "num_groups", "k_chunks", "gemm_launches",
               "fused", "kernel_launches", "sm_count", "k4_config", "k4_tune_bytes",
-              "fused_large"):
+              "fused_large", "k_align"):
         if low_c[f] != exp[f]:
             raise Fail(f"{what}: {f} = {low_c[f]}, spec {exp[f]}")
     if exp["dispatch"] == "EMULATE":   # the rule for other devices (sm_count is an input)
@@ -473,11 +502,13 @@ def check_pack_layout(p, what):
         return want_st, None
     if lay.status != want_st:
         raise Fail(f"{what}: imd_pack_layout {lay.status}, oracle {want_st}")
-    regs, total = params.pack_layout(lay.b, lay.r, lay.k, p.num_moduli)
+    A = params.k_align_of(lay.k, HOOK)        # v1.13 §4b: the pack's resolved A and format
+    fmt = params.pack_format_of(A)
+    regs, total = params.pack_layout(lay.b, lay.r, lay.k, p.num_moduli, fmt)
     want_regs = {n: (o, nb) for n, o, nb in regs} or {n: (0, 0) for n in ("sig", "flag", "res")}
     if lay.regions != want_regs or lay.pack_bytes != total or \
             lay.pack_ws_bytes != params.pack_ws_bytes(lay.b, lay.r, lay.k) or \
-            lay.k_hat != params.k_hat_of(lay.k) or lay.format != 1:
+            lay.k_hat != params.k_hat_of(lay.k, A) or lay.format != fmt:
         raise Fail(f"{what}: pack layout {lay} vs params {regs} {total}")
     if want_st == "SUCCESS":
         if (lay.b, lay.r, lay.k, lay.kappa) != (pv.b, pv.r, pv.k, pv.kappa) or \
@@ -585,8 +616,11 @@ def check_packed(direct, descs, opts, rng, what):
             continue
         pmode = params.EMULATE if mode == "EMULATE" else params.DIRECT
         pvec = params.VEC_GENERATE if vec == "GENERATE" else params.VEC_RESIDENT
-        want_ws = params.workspace_size(v.m, v.n, v.k, v.b, N, g, pmode, pvec, packed=roles)
-        want_regs = params.region_offsets(v.m, v.n, v.k, v.b, N, g, pmode, pvec, packed=roles)
+        A_res = params.k_align_of(v.k, HOOK)
+        want_ws = params.workspace_size(v.m, v.n, v.k, v.b, N, g, pmode, pvec, packed=roles,
+                                        k_align=A_res)
+        want_regs = params.region_offsets(v.m, v.n, v.k, v.b, N, g, pmode, pvec, packed=roles,
+                                          k_align=A_res)
         if ws != want_ws or lay_tot != want_ws or low["workspace_bytes"] != want_ws or \
                 host.workspace_size(descs, packing=packing, **kw) != want_ws:
             raise Fail(f"{what}: packed workspace {ws} / {lay_tot}, params {want_ws}")
@@ -594,8 +628,10 @@ def check_packed(direct, descs, opts, rng, what):
                 [tuple(x) for x in want_regs]:
             raise Fail(f"{what}: packed regions {lay}, params {want_regs}")
         # launches and fused paths of the packed plan (DESIGN §6b.5)
-        n_hat, k_hat = params.align_up(v.n, 16), params.k_hat_of(v.k)
         emu = mode == "EMULATE" and not v.empty_output() and v.k > 1
+        if low["lowered"] and low["k_align"] != (A_res if emu else 16):
+            raise Fail(f"{what}: packed k_align {low['k_align']}, want {A_res if emu else 16}")
+        n_hat, k_hat = params.align_up(v.n, 16), params.k_hat_of(v.k, A_res)
         pbits = (1 if "A" in roles else 0) | (2 if "B" in roles else 0)
         fused = emu and k_hat <= 1024 and pbits != 3
         fl = (3 & ~pbits) if emu and not fused else 0
@@ -675,8 +711,8 @@ def suite_host(args):
             st, _ = check_case(direct, descs, (9, g, TRUNC, "EMULATE", "GENERATE"), f"K_c' k={k} g={g}")
             lw = host.lowering(descs, N=9, g=g, rounding=TRUNC)
             ngroups = -(-9 // g)
-            if st != "SUCCESS" or lw.k_chunks != chunks or \
-                    lw.k_chunks != -(-params.k_hat_of(k) // params.K_C_PRIME) or \
+            if st != "SUCCESS" or lw.k_chunks != chunks or lw.k_align != params.k_align_of(k) or \
+                    lw.k_chunks != -(-params.k_hat_of(k, lw.k_align) // params.K_C_PRIME) or \
                     lw.gemm_launches != chunks * ngroups:
                 raise Fail(f"K_c' boundary k={k} g={g}: {st}, k_chunks {lw.k_chunks} (want {chunks}), "
                            f"gemm_launches {lw.gemm_launches} (want {chunks * ngroups})")
@@ -704,10 +740,132 @@ def suite_host(args):
     except host.ImmerdinkError as e:
         if e.status != "INVALID_VALUE":
             raise Fail(f"negative extent: {e.status}") from e
+    n_kal = suite_k_align(direct, rng, max(args.cases // 10, 40))
     if args.verbose:
         print(f"  ok  {args.cases} random cases {by}, {n_sweep} g/vec sweep cases, kappa "
               f"boundary, {len(big)} K4-split shapes, {len(want_chunks)} K_c' boundary k, einsum front end, g_tradeoff; packed "
-              f"queries {packed_seen}")
+              f"queries {packed_seen}; k alignment (v1.13 §4b): {n_kal}")
+
+
+# ---------------------------------------------------------------------------------------
+# DESIGN v1.13 §4b stage 2: the per-plan K alignment in the host queries
+
+K_ALIGN_BOUNDARY = (1, 16, 17, 64, 65, 95, 96, 97, 112, 113, 128, 129, 144, 145, 1023, 1024,
+                    1025, 1040, 4080, 131008, 131009, 131072, 196608, 196624, 262017, 392961,
+                    393008, 393009)
+
+
+def gemm_descs(m, n, k, b=1):
+    """C[i,j,l] = A[i,k,l] B[k,j,l], dense, last mode fastest (l fastest: no role swap)."""
+    return [([m, k, b], [k * b, b, 1], [1, 3, 4]), ([k, n, b], [n * b, b, 1], [3, 2, 4]),
+            ([m, n, b], [n * b, b, 1], [1, 2, 4])]
+
+
+def suite_k_align(direct, rng, n_random):
+    """Every host query under AUTO and with the hook at 16 and 64 vs params / oracle at the same
+    policy: random cases and packed queries, the boundary k list, the k_align of every
+    dispatch, the add-key merge (393008), the k4_tune cap, a k = 96 pack against a k = 97 plan
+    (EXTENTS), the v5 / v6 struct mirror, and accuracy / kappa independent of A."""
+    counts = {}
+    co = lambda o: c_opts(*o)  # noqa: E731
+    if (host._Lowering.k_align.offset, host._Lowering.reserved6.offset,
+            C.sizeof(host._Lowering)) != (184, 188, V6):
+        raise Fail("host.py imd_lowering_t v6 mirror")
+    if (host.PACK_FORMAT_A16, host.PACK_FORMAT_A64, host.PACK_FORMAT) != (1, 2, 2) or \
+            params.PACK_FORMAT != 2 or oracle.PACK_FORMAT != 2:
+        raise Fail("pack format constants")
+    try:
+        host.test_set_k_align(32)
+        raise Fail("hook accepted 32")
+    except ValueError:
+        pass
+    try:
+        for hook in (16, 64, "AUTO"):
+            set_k_align(hook)
+            for t in range(n_random):
+                descs, opts = random_descs(rng, legal_bias=1.0), random_opts(rng)
+                st, _ = check_case(direct, descs, opts, f"hook {hook} random[{t}]")
+                counts[st] = counts.get(st, 0) + 1
+                if t % 3 == 0:
+                    for key in check_packed(direct, descs, opts, rng, f"hook {hook} random[{t}] packed"):
+                        counts["packed " + key] = counts.get("packed " + key, 0) + 1
+            for k in K_ALIGN_BOUNDARY:
+                for (m, n, b, g) in ((3, 5, 1, 1), (17, 33, 2, 4)):
+                    if k > 4096 and (m, n, b) != (3, 5, 1):
+                        continue
+                    descs = gemm_descs(m, n, k, b)
+                    for opts in ((9, g, TRUNC, "EMULATE", "GENERATE"),
+                                 (9, g, TRUNC, "DIRECT", "RESIDENT")):
+                        st, exp = check_case(direct, descs, opts, f"hook {hook} k={k} {opts[3]}")
+                        want = plan_k_align(k, "EMULATE" if opts[3] == "EMULATE" and k > 1 else "DIRECT")
+                        if st != "SUCCESS" or exp["k_align"] != want or \
+                                host.lowering(descs, N=9, g=g, rounding=TRUNC,
+                                              mode=opts[3]).k_align != want:
+                            raise Fail(f"hook {hook} k={k}: {st}, k_align {exp and exp['k_align']}")
+                        counts["boundary"] = counts.get("boundary", 0) + 1
+            # K-empty, SCALE and NOOP: k_align 16 whatever the hook
+            for descs, disp in (([([3], [1], [1]), ([5], [1], [2]), ([3, 5], [5, 1], [1, 2])], "DIRECT"),
+                                (gemm_descs(3, 5, 0), "SCALE"), (gemm_descs(0, 5, 200), "NOOP")):
+                st, exp = check_case(direct, descs, (9, 0, RN, "EMULATE", "GENERATE"),
+                                     f"hook {hook} {disp}")
+                lw = host.lowering(descs, N=9)
+                if lw.dispatch != disp or lw.k_align != 16 or exp["k_align"] != 16:
+                    raise Fail(f"hook {hook} {disp}: k_align {lw.k_align}")
+            # accuracy and kappa use the logical k: identical across A
+            acc = host.Accuracy(metric="NORMWISE", target=1e-12)
+            for k in (97, 1000, 4080):
+                p = host.predict(gemm_descs(64, 48, k), N=14, accuracy=acc)
+                r = host.rank(gemm_descs(64, 48, k), N=[8, 14], accuracy=acc)
+                lw = host.lowering(gemm_descs(64, 48, k), N=14)
+                key = (p.err_bound, p.err_typical, p.err_status, lw.kappa,
+                       tuple((c.num_moduli, c.err_bound, c.err_typical, c.feasible) for c in r))
+                prev = counts.setdefault(("acc", k), key)
+                if prev != key:
+                    raise Fail(f"hook {hook} k={k}: accuracy / kappa differ across A: {key} vs {prev}")
+    finally:
+        set_k_align("AUTO")
+    # add-key merge (DESIGN §4b.3): k = 393008 has one add-mod shape key fewer at A = 64;
+    # 393009 and 262016 do not differ. Plan host bytes per add key: kK4AddEntryBytes = 280.
+    for k, diff in ((393008, 280), (392961, 280), (393009, 0), (392960, 0), (262016, 0)):
+        hb = {}
+        for hook in (16, 64):
+            set_k_align(hook)
+            hb[hook] = host.plan_bytes(gemm_descs(3, 5, k), N=9, rounding=TRUNC)[1]
+            if hook == 64 and params.k4_add_chunk_keys(params.k_hat_of(k, 16)) - \
+                    params.k4_add_chunk_keys(params.k_hat_of(k, 64)) != diff // 280:
+                raise Fail(f"params add keys at k={k}")
+        set_k_align("AUTO")
+        if hb[16] - hb[64] != diff:
+            raise Fail(f"k={k}: plan host bytes A16 {hb[16]} - A64 {hb[64]} != {diff}")
+    # the k4_tune cap: post-swap (m, n, k, b, g) = (2000000, 1 or 2 (n_hat 16), 97, 1, 1):
+    # 256001792 B at A = 16, over 256 MiB (0) at A = 64 (j fastest in C: no swap)
+    tdescs = [([2000000, 97], [97, 1], [1, 3]), ([97, 2], [2, 1], [3, 2]),
+              ([2000000, 2], [2, 1], [1, 2])]
+    tune = {}
+    for hook in (16, 64, "AUTO"):
+        set_k_align(hook)
+        lw = host.lowering(tdescs, N=2, g=1, rounding=TRUNC)
+        tune[hook] = lw.k4_tune_bytes
+        if (lw.m, lw.n_hat) != (2000000, 16) or \
+                lw.k4_tune_bytes != params.k4_tune_bytes(lw.m, lw.n, lw.k_hat, lw.b, 1):
+            raise Fail(f"k4_tune cap view {lw}")
+    set_k_align("AUTO")
+    if tune != {16: 256001792, 64: 0, "AUTO": 0}:
+        raise Fail(f"k4_tune cap: {tune}")
+    # a pack of k = 96 (format 1) offered to a plan of k = 97 (format 2): EXTENTS, not FORMAT
+    for kp, kq in ((96, 97), (97, 96)):
+        X = host.Desc((3, kp, 1), (kp, 1, 1), (1, 3, 4))
+        pk = host.PackSpec(X, 9, RN, "AUTO", (3,), (4,))
+        if host.pack_layout(pk).format != (2 if kp > 96 else 1):
+            raise Fail(f"pack format at k={kp}")
+        lw = host.lowering(gemm_descs(3, 5, kq), N=9, packing=(pk, None))
+        st, low = direct.lowering(gemm_descs(3, 5, kq), co((9, 0, RN, "EMULATE", "GENERATE")),
+                                  packing=(pk, None))
+        if lw.status != "PACK_MISMATCH" or lw.pack_mismatch != "EXTENTS" or \
+                low["pack_mismatch"] != 5:
+            raise Fail(f"k={kp} pack, k={kq} plan: {lw.status} {lw.pack_mismatch}")
+    counts["acc"] = len([k for k in counts if isinstance(k, tuple)])
+    return {k: v for k, v in counts.items() if not isinstance(k, tuple)}
 
 
 # ---------------------------------------------------------------------------------------
@@ -732,15 +890,18 @@ def spec_k4_features(c, m, n_hat, k_hat, b, N, g, sms, k_chunks, l2, tail_mod=64
             tiles = -(-m // tm) * -(-n_hat // tn) * gs * b
             j = -(-tiles // sms)
             full, rest = divmod(j, occ)
+            # v1.13 §4b.6: a chunk's MMA work is ceil(kc)_64 (CUTLASS runs the residue tile as a
+            # full zero-filled 64-wide tile), the same for A = 16 and A = 64
+            mma = -(-kc // 64) * 64
             x[0] += full + (1 if rest else 0)
-            x[occ] += full * occ * tm * tn * kc
+            x[occ] += full * occ * tm * tn * mma
             if rest:
-                x[rest] += rest * tm * tn * kc
+                x[rest] += rest * tm * tn * mma
             # format 1: a partial 64-wide K tile; format 2 (v1.10): the chunk's residue rows
             # start mid-sector (row stride k_hat, chunk offset ci K_c'): the MACs again
             slow = kc % 64 if tail_mod == 64 else (k_hat % 32 or (ci * K_C_PRIME) % 32)
             if slow:
-                x[5] += (full * occ + rest) * tm * tn * kc
+                x[5] += (full * occ + rest) * tm * tn * mma
     for gs in groups:  # the DRAM term: a group's operands and W planes beyond L2
         x[4] += max(0, gs * b * (m + n_hat) * k_hat + gs * b * m * n_hat * (2 * k_chunks - 1)
                     - l2)

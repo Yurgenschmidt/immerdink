@@ -20,6 +20,8 @@ struct WorkspaceShape {
   bool vec_resident = false;           // vec_mode = IMD_VEC_RESIDENT (v1.2): no vec region
   int32_t packed = 0;                  // v1.7 (§6b.6): bit 0 / 1 = the post-swap A / B is read
                                        // from a packed operand: no sX, fX, RX region
+  int32_t k_align = 0;                 // v1.13 §4b: the plan's resolved A (16 or 64; analyze
+                                       // passes it, never a default): k_hat = ceil(k)_A
 };
 
 struct WorkspaceLayout {
@@ -33,6 +35,7 @@ struct WorkspaceLayout {
 //   DIRECT, k = 0, k = 1       -> vec only (k = 1 after lowering means K is empty)
 //   otherwise                  -> sA sB fA fB vec RA RB W at cumulative 256-aligned offsets
 //   vec_resident               -> the same without vec (DIRECT, k = 0, k = 1: no regions)
+// k_align not 16 or 64 -> nullopt (a caller that forgot to pass the resolved A).
 IMD_HOST_INTERNAL std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s);
 
 }  // namespace imd::detail

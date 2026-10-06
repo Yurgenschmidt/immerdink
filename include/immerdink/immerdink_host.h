@@ -27,7 +27,7 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 8  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 9  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
@@ -39,7 +39,10 @@ extern "C" {
                                       occupancy (imd_perf_kernel_t, imd_perf_kernel_name),
                                       clock regimes, cache state, intervals, rank ties;
                                    8: accuracy-aware planning (§6f v1.12): imd_err_*,
-                                      the requests' accuracy, err_* / infeasible fields */
+                                      the requests' accuracy, err_* / infeasible fields;
+                                   9: per-plan K alignment (§4b v1.13 stage 2):
+                                      imd_lowering_t k_align (k_hat = ceil(k)_k_align),
+                                      IMD_PACK_FORMAT_A16 / _A64, pack format 2 */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -171,7 +174,8 @@ typedef struct {
   int32_t residue_group; /* g, normalized to [1, N]                                */
   int32_t num_groups;    /* residue groups ceil(N / g) on EMULATE, else 0          */
   int64_t m, n, k, b;    /* post-swap GEMM view (§1.1, §5)                         */
-  int64_t n_hat, k_hat;  /* ceil(n)_16, ceil(k)_16                                 */
+  int64_t n_hat, k_hat;  /* ceil(n)_16, ceil(k)_A with A = k_align (v6; host API < 9:
+                            always ceil(k)_16). Read it; never recompute it (§4b)  */
   int64_t vec_entries;   /* int64 scatter-vector entries 2m + 2n + 2k + 3b (0 on NOOP) */
   int64_t k_chunks;      /* K4 K-chunks per group (§3.5) on EMULATE, else 0        */
   int64_t gemm_launches; /* K4 kernel launches per imd_contract on EMULATE, else 0 */
@@ -205,6 +209,12 @@ typedef struct {
   int32_t packed;          /* bit 0 / bit 1: the CALLER's A / B is read from a packed operand
                               (imd_lowering_packed; 0 from imd_lowering)                    */
   int32_t pack_mismatch;   /* 0, or the IMD_PACK_MISMATCH_* reason of a PACK_MISMATCH status */
+  /* Version 6 (192 bytes; §4b v1.13 stage 2, host API 9). Valid when lowered = 1. */
+  int32_t k_align;         /* the plan's resolved K alignment A (16 or 64): k_hat = ceil(k)_A,
+                              the row stride and GEMM K extent of every residue row. AUTO:
+                              64 iff k > 96. 16 for a lowering without residue rows (NOOP,
+                              SCALE, DIRECT, K-empty); 0 when lowered = 0                 */
+  int32_t reserved6;       /* 0                                                           */
 } imd_lowering_t;
 enum { IMD_FUSED_LARGE_A = 1, IMD_FUSED_LARGE_B = 2 };
 
@@ -219,7 +229,9 @@ IMD_API imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
 /* ---- Packed operands (DESIGN v1.7 §6b, host API version 5) ------------------------------
  *
  * A packed operand X holds, per row, the shift sigma and the non-finite flag and the int8
- * residues of ALL N moduli over the whole canonical K, in the §6b.4 byte layout (format 1):
+ * residues of ALL N moduli over the whole canonical K, in the §6b.4 byte layout (format 1:
+ * k_hat = ceil(k)_16; format 2, host API 9: k_hat = ceil(k)_64; a pack's format is that of
+ * its k, 2 iff k > 96, §4b):
  *   sig   int16 sigma of row (lambda, rho) at index lambda r + rho
  *   flag  u8 flag, same index
  *   res   int8 residue of plane l, row (lambda, rho), k-bar at l b r k_hat + (lambda r + rho)
@@ -229,14 +241,23 @@ IMD_API imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
  * fixes its canonical orders of K, L (batch) and R (X's rows); a plan adopts them.
  * Compatibility: a key of int64 words (format, N, rounding, b, r, k, then per class L, R, K
  * the fused modes (extent, stride in X) fused over X's strides alone), compared word for
- * word. */
-#define IMD_PACK_FORMAT 1
+ * word.
+ * The pack bytes carry no header: a caller that persists them must persist the layout's
+ * format and pack_bytes with them and re-pack when a fresh imd_pack_layout of the same
+ * descriptor reports another format or size (bytes saved under host API <= 8 for k > 96 are
+ * format 1 and NOT valid for a version-9 handle, which is format 2; nothing detects it). */
+#define IMD_PACK_FORMAT_A16 1  /* k_hat = ceil(k)_16 (k <= 96; every pack before host API 9) */
+#define IMD_PACK_FORMAT_A64 2  /* k_hat = ceil(k)_64 (k > 96; host API 9)                     */
+#define IMD_PACK_FORMAT 2      /* the newest format this library writes (1 before API 9)    */
 enum { IMD_PACK_ORDER_AUTO = 0, IMD_PACK_ORDER_GIVEN = 1 };
-/* imd_lowering_t.pack_mismatch: the first differing part, checked per packed operand (the
- * caller's A, then B) in this order, then ORDER, then the keys' extents and strides. */
+/* imd_lowering_t.pack_mismatch: the first differing part. An unknown format word first; then
+ * per packed operand (the caller's A, then B) MODULI, ROUNDING, CLASSES; then ORDER; then the
+ * keys' extents and strides of both packs; then (host API 9) a format 1 vs 2 difference: the
+ * same tensor in the other K alignment (in-process only through a test hook). */
 enum {
   IMD_PACK_MISMATCH_NONE = 0,
-  IMD_PACK_MISMATCH_FORMAT = 1,   /* another IMD_PACK_FORMAT                                  */
+  IMD_PACK_MISMATCH_FORMAT = 1,   /* an unknown format, or the pack's format (1 / 2) is not the
+                                     plan's own (k alignment)                                 */
   IMD_PACK_MISMATCH_MODULI = 2,   /* the pack's N != options.num_moduli                       */
   IMD_PACK_MISMATCH_ROUNDING = 3, /* the pack's rounding != options.rounding                  */
   IMD_PACK_MISMATCH_CLASSES = 4,  /* the pack's labels do not map onto X's by mode position, or
@@ -269,10 +290,10 @@ typedef struct {
 typedef struct {
   uint32_t struct_size;          /* in: sizeof(imd_pack_layout_t) as the caller compiled it  */
   int32_t status;                /* as returned                                              */
-  int32_t format;                /* IMD_PACK_FORMAT                                          */
+  int32_t format;                /* IMD_PACK_FORMAT_A16 (k <= 96) or _A64 (k > 96)           */
   int32_t num_moduli, rounding;  /* N, IMD_RN | IMD_TRUNC                                    */
   int32_t reserved;              /* 0                                                        */
-  int64_t b, r, k, k_hat;        /* batches, rows, contraction length, ceil(k)_16            */
+  int64_t b, r, k, k_hat;        /* batches, rows, contraction length, ceil(k)_A (format's A) */
   uint64_t kappa;                /* ceil(sqrt(k)) (0 for k = 0)                              */
   imd_region_t sig, flag, res;   /* offsets and bytes in the packed buffer (0: empty pack)   */
   uint64_t pack_bytes;           /* §6b.4 total: the packed buffer's bytes                   */

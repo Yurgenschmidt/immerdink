@@ -23,6 +23,13 @@ if(Python3_FOUND)
   add_dependencies(test_workspace workspace_vectors)
   add_test(NAME workspace_vs_params COMMAND test_workspace "${vectors}")
 
+  # DESIGN v1.13 §4b stage 2: the K-alignment resolver and its test hook, A passed explicitly,
+  # the pack format word and analyze_packed's PACK_MISMATCH reason order (FORMAT via the hook,
+  # an unknown format word, the k_hat drift check). CPU only.
+  add_executable(test_k_align test_k_align.cpp)
+  target_link_libraries(test_k_align PRIVATE imd_host_internal imd_warnings)
+  add_test(NAME host_k_align COMMAND test_k_align)
+
   # The Python wrapper (python/immerdink/host.py) over libimmerdink_host vs the C ABI and
   # vs spec/params.py and spec/oracle.py (lowering summary, sizes, g sweep). CPU only.
   add_test(NAME host_python
@@ -126,7 +133,7 @@ if(Python3_FOUND)
   # contract_highrank (operand ranks 6-12) has hard size guards; run it alone with
   # `tools/test.sh -R contract_highrank`, or skip it with `-E contract_highrank`.
   set(shim "$<TARGET_FILE:imd_alloc_shim>")
-  foreach(suite api stages e2e tensor bigk replay every_n)
+  foreach(suite api stages e2e tensor bigk replay every_n k_align)
     add_test(NAME contract_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                      --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
@@ -143,7 +150,7 @@ if(Python3_FOUND)
   set_tests_properties(contract_highrank PROPERTIES TIMEOUT 300)
   # DESIGN v1.7 §6b packed operands: imd_pack (every byte) and imd_contract_packed vs
   # spec/oracle.py, bit for bit, with the allocation shim; reuse; statuses.
-  foreach(suite packed reuse api)
+  foreach(suite packed reuse api k_align)
     add_test(NAME packed_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_packed.py"
                      --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)

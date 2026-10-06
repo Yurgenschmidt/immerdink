@@ -17,10 +17,18 @@ input bits, then compares:
       K4  W        u8 planes of all N moduli, j < n;    zero for j >= n
       K5  C        (above)
 Suites: stages (random matrices, stage checks), e2e (random shapes/options/data), tensor
-(strided / permuted / batched / diagonal / K-empty / k = 0 / batch split), bigk (k > K_c').
+(strided / permuted / batched / diagonal / K-empty / k = 0 / batch split), bigk (k > K_c'),
+k_align (DESIGN v1.13 §4b stage 2: every producer path at A = 16 and A = 64, forced through
+libimmerdink_host's hook; results identical across A; the K4 operand-pointer check).
+
+Environment (DESIGN v1.13 §4b.8): IMD_TEST_POISON=0 leaves every workspace a fresh,
+unwritten cudaMalloc (for compute-sanitizer --tool initcheck: a 0xA5 memset counts as
+initialised; the guard-zone check is skipped); IMD_TEST_QUICK=1 runs each case in the
+production rule, unfused (K2/K3) and KL with 64-row tiles only (sanitizer runs).
 """
 
 import argparse
+import contextlib
 import math
 import os
 import random
@@ -37,6 +45,8 @@ import oracle as o  # noqa: E402
 import params  # noqa: E402
 import harness as hz  # noqa: E402
 
+POISON = os.environ.get("IMD_TEST_POISON", "1") != "0"
+QUICK = os.environ.get("IMD_TEST_QUICK", "0") == "1"
 RND = {"RN": hz.RN, "TRUNC": hz.TRUNC}
 MODE = {o.EMULATE: hz.EMULATE, o.DIRECT: hz.DIRECT}
 STATS = {"cases": 0, "elements": 0, "stage_bytes": 0, "kinds": {}, "k4": {}}
@@ -129,10 +139,27 @@ def scatter(T, desc, fill):
 # One case
 # ---------------------------------------------------------------------------------------
 
-def k4_tune_bytes(view, N, g):
+@contextlib.contextmanager
+def k_align(lib, a):
+    """DESIGN v1.13 §4b.5: A forced to 16 / 64 (0 / "AUTO": the rule) in the library (the hook
+    imd_test_set_k_align) and in the spec side (params / oracle K_ALIGN_POLICY: every default
+    k_hat_of, workspace_size, region_offsets, pack follows); AUTO restored on exit."""
+    a = 0 if a in (0, "AUTO") else int(a)
+    lib.set_k_align(a)
+    params.K_ALIGN_POLICY = o.K_ALIGN_POLICY = "AUTO" if a == 0 else a
+    try:
+        yield
+    finally:
+        lib.set_k_align(0)
+        params.K_ALIGN_POLICY = o.K_ALIGN_POLICY = "AUTO"
+
+
+def k4_tune_bytes(view, N, g, kh=None):
     """DESIGN v1.5 §6 k4_tune: group 1's RA, RB and W planes, each 256-aligned, in one
-    temporary allocation; 0 (no tuning) above 256 MiB."""
-    kh, nh, gb = params.k_hat_of(view.k), -(-view.n // 16) * 16, min(g, N) * view.b
+    temporary allocation; 0 (no tuning) above 256 MiB. kh: the plan's k_hat (default: the
+    policy's A for view.k, v1.13 §4b)."""
+    kh = params.k_hat_of(view.k, params.k_align_of(view.k)) if kh is None else kh
+    nh, gb = -(-view.n // 16) * 16, min(g, N) * view.b
     regs = [gb * view.m * kh, gb * nh * kh, gb * view.m * nh]
     total = sum(-(-r // 256) * 256 for r in regs)
     return 0 if max(regs) > 256 << 20 or total > 256 << 20 else total
@@ -207,15 +234,22 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
     # both operands of every emulated case, fmode 3 the same with 64-row KL tiles, so rows
     # longer than 64 span several chunks (registers, shared memory and re-read chunks).
     fmodes = ((-1, 0, 1) + ((2, 3) if kind == "GEMM" else ())) if lib.has_test_hooks else (-1,)
+    if QUICK:
+        fmodes = tuple(f for f in fmodes if f in (-1, 0, 3))
     # v1.5 (DESIGN §4 "K4 configurations"): k4 -1 is the plan-time rule; with the test hooks
     # every emulated case also runs once in each K4 configuration (forced) and once with the
     # k4_tune plan option: all bit-exact vs the oracle and bit-identical to each other.
     runs = [(vec, pvec, fm, -1) for vec, pvec in ((hz.VEC_GENERATE, params.VEC_GENERATE),
                                                  (hz.VEC_RESIDENT, params.VEC_RESIDENT))
             for fm in fmodes]
-    if lib.has_test_hooks and kind == "GEMM":
+    if QUICK:
+        runs = [r for r in runs if r[0] == hz.VEC_GENERATE]
+    elif lib.has_test_hooks and kind == "GEMM":
         runs += [(hz.VEC_GENERATE, params.VEC_GENERATE, -1, c)
                  for c in list(range(K4_CONFIGS)) + ["tune"]]
+    # v1.13 §4b: the plan's K alignment (the policy's A for view.k; DIRECT etc.: no residue rows)
+    A_plan = params.k_align_of(view.k)
+    kh_plan = params.k_hat_of(view.k, A_plan)
     for vec, pvec, fmode, k4 in runs:
         vname = f"{name} [{pvec}{ {-1: '', 0: ', unfused', 1: ', large launches', 2: ', KL', 3: ', KL 64-row tiles'}[fmode]}" \
                 f"{'' if k4 == -1 else f', K4 {k4}'}]"
@@ -247,7 +281,7 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
         # allocation of k4_tune_bytes (freed before imd_plan_create returns) when nonzero.
         if allocs0 is not None:
             want_allocs = 1 if (pvec == params.VEC_RESIDENT and not view.empty_output()) else 0
-            if k4 == "tune" and k4_tune_bytes(view, N, gg) > 0:
+            if k4 == "tune" and k4_tune_bytes(view, N, gg, kh_plan) > 0:
                 want_allocs += 1
             if lib.alloc_count() - allocs0 != want_allocs:
                 raise Fail(f"{vname}: imd_plan_create made {lib.alloc_count() - allocs0} CUDA "
@@ -259,6 +293,9 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
                 lib.plan_destroy(plan)
                 raise Fail(f"{vname}: plan K4 configuration {cfg} / {k4p_cfg}, wanted {k4}")
             STATS["k4"][cfg] = STATS["k4"].get(cfg, 0) + 1
+            if lib.plan_sizes(plan)[7] != kh_plan:   # v1.13 §4b: the real plan's k_hat
+                lib.plan_destroy(plan)
+                raise Fail(f"{vname}: plan k_hat {lib.plan_sizes(plan)[7]}, want {kh_plan}")
             if k4_expect is not None:
                 v = lib.plan_sizes(plan)
                 got_k4 = {"k_hat": v[7], "store": v[28], "add": v[29], "launches": v[30]}
@@ -283,7 +320,8 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
             cuda.upload(dA, bufA)
             cuda.upload(dB, bufB)
             cuda.upload(dC, bufC)
-            cuda.memset(dW, 0xA5, ws_bytes + 2 * GUARD)   # poison: every byte read must be written
+            if POISON:   # poison: every byte read must be written (else initcheck's fresh memory)
+                cuda.memset(dW, 0xA5, ws_bytes + 2 * GUARD)
             pA = (dA.value or 0) + 8 * baseA
             pB = (dB.value or 0) + 8 * baseB
             pC = (dC.value or 0) + 8 * baseC
@@ -327,7 +365,7 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
             cuda.download(got, dC)
             wsg = np.empty(ws_bytes + 2 * GUARD, dtype=np.uint8)
             cuda.download(wsg, dW)
-            if (wsg[:GUARD] != 0xA5).any() or (wsg[GUARD + ws_bytes:] != 0xA5).any():
+            if POISON and ((wsg[:GUARD] != 0xA5).any() or (wsg[GUARD + ws_bytes:] != 0xA5).any()):
                 raise Fail(f"{vname}: bytes outside [ws, ws + workspace_size) were written")
             ws = wsg[GUARD:GUARD + max(ws_bytes, 1)]
         finally:
@@ -337,7 +375,7 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
         if plan_vec is not None and not np.array_equal(plan_vec, np.array(view.vec_region(), np.int64)):
             raise Fail(f"{vname}: resident scatter vectors differ from the oracle's")
         if kind == "GEMM":
-            check_stages(vname, view, trace, ws, N, gg, pvec)
+            check_stages(vname, view, trace, ws, N, gg, pvec, A_plan)
         bad = bit_mismatches(got, want)
         if len(bad):
             i = bad[0]
@@ -359,12 +397,17 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
     return got
 
 
-def check_stages(name, view, trace, ws, N, g, vec=params.VEC_GENERATE):
+def check_stages(name, view, trace, ws, N, g, vec=params.VEC_GENERATE, A=None):
     """Compare every workspace region with the oracle's intermediates (see module doc). With
-    vec = RESIDENT there is no vec region (run_case checks the plan's copy instead)."""
+    vec = RESIDENT there is no vec region (run_case checks the plan's copy instead). A: the
+    plan's K alignment (v1.13 §4b; None: the policy's for k); RA / RB rows are k_hat = ceil(k)_A
+    and their K padding [k, k_hat) must be zero (whichever producer wrote the last group: KF,
+    KL, K2 / K3)."""
     m, n, k, b = view.m, view.n, view.k, view.b
-    kh, nh = params.k_hat_of(k), -(-n // 16) * 16
-    regs = {r: (s, e) for r, s, e in params.region_offsets(m, n, k, b, N, g, params.EMULATE, vec)}
+    A = params.k_align_of(k) if A is None else A
+    kh, nh = params.k_hat_of(k, A), -(-n // 16) * 16
+    regs = {r: (s, e) for r, s, e in params.region_offsets(m, n, k, b, N, g, params.EMULATE, vec,
+                                                           k_align=A)}
 
     def reg(r, dtype, shape):
         s, e = regs[r]
@@ -618,6 +661,16 @@ def suite_bigk(lib, cuda, verbose):
     # v1.13 §4b windows: k_hat in (K_c', 131056] is two chunks (131008 + a 16..48 tail; one
     # chunk before v1.13), k_hat = K_c' exactly is one; k_hat in (2 K_c', 2 * 131056] is three.
     # Both operands both ways round (K-fast and not), every case bit-exact vs the oracle.
+    # Stage 2 (must-fix 7): no multiple of 64 lies in the windows, so under AUTO these would
+    # be 64-aligned tails; the windows are A = 16 rows, pinned through the hook.
+    with k_align(lib, 16):
+        bigk_windows(lib, cuda, rng, verbose)
+    bigk_full_chunks(lib, cuda, rng, verbose)
+    bigk_long_rows(lib, cuda, rng, verbose)
+
+
+def bigk_windows(lib, cuda, rng, verbose):
+    KP = o.K_C_ALIGNED
     for (m, n, k, N, g, rnd, a_kf, b_kf) in (
             (3, 2, KP, 8, 3, "RN", True, False),            # one chunk, 2047 whole K tiles
             (2, 3, KP + 1, 9, 4, "RN", False, True),        # k_hat = KP + 16: tail 16
@@ -629,10 +682,19 @@ def suite_bigk(lib, cuda, verbose):
         TA, TB = gen(rng, (m, k), "phi"), gen(rng, (k, n), "wide")
         if k % 2 == 0:
             TB[k - 1, 0] = -math.inf          # in the last chunk's tail
-        chunks = -(-params.k_hat_of(k) // KP)
+        chunks = -(-params.k_hat_of(k, 16) // KP)
+        gg = N if g == 0 else g
+        groups = [gg] * (N // gg) + ([N % gg] if N % gg else [])
+        expect = {"k_hat": params.k_hat_of(k, 16), "store": len(set(groups)),
+                  "add": len(set(groups)) * params.k4_add_chunk_keys(params.k_hat_of(k, 16)),
+                  "launches": chunks * len(groups)}
         run_case(lib, cuda, f"bigk window k={k} ({chunks} chunks, {m}x{n}, N={N} g={g} {rnd})", A, B,
                  C, TA, TB, gen(rng, (m, n), "uniform"), 1.0, 0.25, N, g, rnd, rng=rng,
-                 expect_kind="GEMM", verbose=verbose)
+                 expect_kind="GEMM", verbose=verbose, k4_expect=expect)
+
+
+def bigk_full_chunks(lib, cuda, rng, verbose):
+    KP = o.K_C_ALIGNED
     # Review 2026-10-05: whole-chunk multiples of K_c'. k_hat = 2 K_c' is two full chunks, so
     # the add-mod launch has the store-mod kc (131008); k_hat = 3 K_c' is three full chunks,
     # and the add-mod shape of the last chunk dedupes with the full one (one add-mod shape
@@ -642,8 +704,9 @@ def suite_bigk(lib, cuda, verbose):
             (2, 1, 2, 3, 0, "RN", True, False),             # k_hat = 262016
             (1, 2, 3, 4, 3, "TRUNC", False, True)):         # k_hat = 393024, groups 3 + 1
         k = nch * KP
-        chunks = params.k_chunk_list(params.k_hat_of(k))
-        if params.k_hat_of(k) != k or chunks != [(c * KP, KP) for c in range(nch)]:
+        A_k = params.k_align_of(k)            # v1.13 §4b: k = 0 mod 64, k_hat = k for any A
+        chunks = params.k_chunk_list(params.k_hat_of(k, A_k))
+        if params.k_hat_of(k, A_k) != k or chunks != [(c * KP, KP) for c in range(nch)]:
             raise Fail(f"bigk k={k}: chunks {chunks}, expected {nch} full chunks of {KP}")
         gg = N if g == 0 else g
         groups = [gg] * (N // gg) + ([N % gg] if N % gg else [])
@@ -655,6 +718,9 @@ def suite_bigk(lib, cuda, verbose):
         run_case(lib, cuda, f"bigk k={k} ({nch} full chunks, {m}x{n}, N={N} g={g} {rnd})", A, B,
                  C, TA, TB, gen(rng, (m, n), "uniform"), 1.0, -0.5, N, g, rnd, rng=rng,
                  expect_kind="GEMM", verbose=verbose, k4_expect=expect)
+
+
+def bigk_long_rows(lib, cuda, rng, verbose):
     # A4: long rows with more rows than K1's L2-capped grid (k = 32768: 160 rows in flight),
     # so K1 takes two 512-thread blocks per SM (contract.cu launch_k1).
     k = 32768
@@ -683,6 +749,87 @@ def suite_bigk(lib, cuda, verbose):
                  verbose=verbose)
     finally:
         MAX_HOST_BUFFER = saved
+
+
+def suite_k_align(lib, cuda, verbose):
+    """DESIGN v1.13 §4b.8 (stage 2): every producer path at A = 16 and A = 64 (forced through
+    libimmerdink_host's hook imd_test_set_k_align), each run bit-exact vs the oracle on a
+    0xA5-poisoned workspace with the K padding [k, k_hat) checked zero (run_case's fused
+    modes: the rule (KF for k_hat <= 1024, else KL), unfused K2 / K3 with set_fused(0), KL
+    forced and KL with 64-row tiles; every K4 configuration and k4_tune), and the results of
+    A = 16 and A = 64 identical bit for bit. Also: the K-chunk limit at multiples of 64 and at
+    an odd multiple of 16 (correctness only), and the K4 operand-pointer check (= 0 mod A)
+    with no violation."""
+    if not lib.has_test_hooks:
+        raise Fail("suite k_align needs the test hooks")
+    KP = o.K_C_ALIGNED
+    lib.k4_align_check(1)
+    cases = [  # (label, m, n, k, b, N, g, rounding, a_kfast, b_kfast, k_chunk)
+        ("KF A16", 7, 9, 33, 1, 8, 0, "RN", True, False, 0),
+        ("KF A16 edge", 6, 5, 96, 1, 9, 0, "TRUNC", False, True, 0),
+        ("KF", 7, 9, 97, 1, 8, 0, "RN", True, True, 0),
+        ("KF", 5, 11, 112, 2, 14, 0, "TRUNC", False, False, 0),
+        ("KF", 9, 4, 600, 1, 9, 0, "RN", True, False, 0),
+        ("KF", 3, 17, 1000, 2, 8, 0, "RN", False, True, 0),
+        ("KF 1008", 4, 6, 1008, 1, 8, 0, "TRUNC", True, True, 0),
+        ("KL", 5, 6, 1040, 1, 9, 0, "RN", True, False, 0),
+        ("KL", 3, 18, 4080, 1, 8, 0, "TRUNC", False, True, 0),
+        ("K2/K3 g<N", 7, 20, 97, 1, 9, 4, "RN", False, False, 0),
+        ("K2/K3 g<N", 5, 3, 144, 2, 9, 2, "TRUNC", True, True, 0),
+        ("K2/K3 g<N", 4, 33, 1040, 1, 9, 4, "RN", True, False, 0),
+        ("small k", 4, 5, 1, 1, 8, 0, "RN", True, True, 0),
+        ("small k", 4, 5, 16, 1, 8, 0, "RN", False, True, 0),
+        ("small k", 4, 5, 17, 1, 8, 0, "TRUNC", True, False, 0),
+        ("small k", 4, 5, 48, 1, 8, 0, "RN", True, True, 0),
+        ("k_chunk 192", 6, 5, 1000, 1, 8, 3, "RN", True, False, 192),
+        ("k_chunk 64", 3, 4, 300, 1, 3, 0, "TRUNC", False, True, 64),
+        ("k_chunk 208 (16 odd)", 6, 5, 1000, 1, 8, 0, "RN", False, False, 208),
+        ("two chunks", 2, 3, KP + 1, 1, 3, 0, "RN", True, False, 0),       # k_hat64 131072
+        ("two chunks", 1, 2, 131072, 1, 2, 0, "TRUNC", False, True, 0),
+        ("two chunks", 1, 2, 196608, 1, 3, 0, "RN", True, True, 0),        # 131008 + 65600
+        ("two chunks", 1, 2, 196624, 1, 3, 0, "TRUNC", True, False, 0),
+        ("three chunks", 1, 1, 262017, 1, 2, 0, "TRUNC", True, True, 0),   # k_hat64 = 2 K_c' + 64
+    ]
+    n = 0
+    try:
+        for t, (label, m, nn, k, b, N, g, rnd, a_kf, b_kf, kc) in enumerate(cases):
+            seed = 5000 + t
+            rng = random.Random(seed)
+            if b == 1:
+                A, B, Cd = matrix(rng, m, nn, k, a_kfast=a_kf, b_kfast=b_kf)
+                TA, TB = gen(rng, (m, k), "phi"), gen(rng, (k, nn), "wide")
+                TC = gen(rng, (m, nn), "uniform")
+            else:
+                A = o.Desc([m, k, b], layout(rng, [m, k, b]), [I, K, L])
+                B = o.Desc([k, nn, b], layout(rng, [k, nn, b]), [K, J, L])
+                Cd = o.Desc([m, nn, b], layout(rng, [m, nn, b]), [I, J, L])
+                TA, TB = gen(rng, A.extent, "phi"), gen(rng, B.extent, "wide")
+                TC = gen(rng, Cd.extent, "uniform")
+            if k > 2:
+                inject(rng, TA, 0.01)
+            out = {}
+            for a in (16, 64):
+                if kc:
+                    lib.set_limits(k_chunk=kc)
+                try:
+                    with k_align(lib, a):
+                        out[a] = run_case(lib, cuda, f"k_align {label} k={k} {m}x{nn} b={b} N={N} "
+                                          f"g={g} {rnd} [A={a}]", A, B, Cd, TA, TB, TC, 1.0, 0.5, N,
+                                          g, rnd, rng=random.Random(seed), verbose=verbose,
+                                          chunk=kc or KP,
+                                          expect_kind="GEMM" if k > 1 else None)
+                finally:
+                    if kc:
+                        lib.set_limits()
+                n += 1
+            if not np.array_equal(out[16].view(np.uint64), out[64].view(np.uint64)):
+                raise Fail(f"k_align {label} k={k}: C differs between A = 16 and A = 64")
+        bad = lib.k4_align_check(-1)
+        if bad:
+            raise Fail(f"K4 operand pointers not = 0 mod A: {bad} launches")
+    finally:
+        lib.k4_align_check(0)
+    STATS["k_align_runs"] = n
 
 
 def suite_api(lib, cuda, verbose):
@@ -769,7 +916,7 @@ def suite_replay(lib, cuda, verbose):
 
 
 SUITES = {"api": suite_api, "replay": suite_replay, "stages": suite_stages, "e2e": suite_e2e, "tensor": suite_tensor,
-          "bigk": suite_bigk, "every_n": suite_every_n}
+          "bigk": suite_bigk, "every_n": suite_every_n, "k_align": suite_k_align}
 
 
 def main():

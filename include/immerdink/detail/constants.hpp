@@ -22,7 +22,11 @@ inline constexpr int64_t kKc = 131071;          // §2 max exact K-chunk (.satfi
 inline constexpr int64_t kKcPrime = 131008;     // §3.5 chunk length used, floor(K_c/64)*64
 inline constexpr int kKChunkAlign = 64;       // v1.13 §4b K_c' multiple (K4 K tile)
 inline constexpr int kRegionAlign = 256;       // §4a align(x) = ceil(x)_256
-inline constexpr int kKAlign = 16;            // §4 k_hat = ceil(k)_16
+inline constexpr int kKAlign = 16;            // §4 k_hat = ceil(k)_A: A = 16 ...
+inline constexpr int kKAlignPad = 64;         // v1.13 §4b ... or 64 (AUTO: k > kKPad64Min)
+inline constexpr int64_t kKPad64Min = 96;     // v1.13 §4b AUTO(k) = 64 iff k > 96
+inline constexpr int kPackFormatA16 = 1;      // §6b.4 format 1: k_hat = ceil(k)_16
+inline constexpr int kPackFormatA64 = 2;      // v1.13 §4b format 2: k_hat = ceil(k)_64
 inline constexpr int kNAlign = 16;            // §4 n_hat = ceil(n)_16
 inline constexpr int kGammaMin = -1074;       // §3.2 ilogb range, finite nonzero FP64
 inline constexpr int kGammaMax = 1023;

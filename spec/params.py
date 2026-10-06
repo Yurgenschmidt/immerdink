@@ -77,12 +77,12 @@ PACK_FORMAT_A16 = 1                  # §6b.4 format 1: k_hat = ceil(k)_16 (v1.7
 PACK_FORMAT_A64 = 2                  # v1.13 §4b stage 2, format 2: k_hat = ceil(k)_64
 PACK_FORMATS = {PACK_FORMAT_A16: K_ALIGN, PACK_FORMAT_A64: K_ALIGN_PAD}   # format -> A
 # The K-alignment policy of the library this file describes. "A16": every plan and pack uses
-# A = 16 (implemented through v1.13 stage 1); "AUTO": A = k_align_auto(k) (v1.13 §4b stage 2,
-# designed). The stage-2 implementation flips this one switch (and oracle.K_ALIGN_POLICY):
-# every default follows it (k_hat_of, workspace_size, region_offsets, pack_layout and
-# PACK_FORMAT, the newest format written); every sizing function also takes an explicit A
-# (the library's test hook). Callers that model a plan whose A was forced must pass it.
-K_ALIGN_POLICY = "A16"
+# A = 16 (v1.7 .. v1.13 stage 1); "AUTO": A = k_align_auto(k) (v1.13 §4b stage 2, implemented).
+# This one switch (with oracle.K_ALIGN_POLICY) moves every default (k_hat_of, workspace_size,
+# region_offsets, pack_layout and PACK_FORMAT, the newest format written); every sizing
+# function also takes an explicit A (the library's test hook imd_test_set_k_align). Callers
+# that model a plan whose A was forced must pass it.
+K_ALIGN_POLICY = "AUTO"
 N_ALIGN = 16                         # §4  n_hat = ceil(n)_16
 UNIT_ROUNDOFF = Fraction(1, 2**53)   # u in §3.8
 KMAX_CERT = 2**40                    # k range for the int16 shift certificate
@@ -2240,7 +2240,11 @@ def build_header():
     w(f"inline constexpr int64_t kKcPrime = {K_C_PRIME};     // §3.5 chunk length used, floor(K_c/64)*64")
     w(f"inline constexpr int kKChunkAlign = {K_CHUNK_ALIGN};       // v1.13 §4b K_c' multiple (K4 K tile)")
     w(f"inline constexpr int kRegionAlign = {REGION_ALIGN};       // §4a align(x) = ceil(x)_256")
-    w(f"inline constexpr int kKAlign = {K_ALIGN};            // §4 k_hat = ceil(k)_16")
+    w(f"inline constexpr int kKAlign = {K_ALIGN};            // §4 k_hat = ceil(k)_A: A = 16 ...")
+    w(f"inline constexpr int kKAlignPad = {K_ALIGN_PAD};         // v1.13 §4b ... or 64 (AUTO: k > kKPad64Min)")
+    w(f"inline constexpr int64_t kKPad64Min = {K_PAD64_MIN};     // v1.13 §4b AUTO(k) = 64 iff k > 96")
+    w(f"inline constexpr int kPackFormatA16 = {PACK_FORMAT_A16};      // §6b.4 format 1: k_hat = ceil(k)_16")
+    w(f"inline constexpr int kPackFormatA64 = {PACK_FORMAT_A64};      // v1.13 §4b format 2: k_hat = ceil(k)_64")
     w(f"inline constexpr int kNAlign = {N_ALIGN};            // §4 n_hat = ceil(n)_16")
     w(f"inline constexpr int kGammaMin = {GAMMA_MIN};       // §3.2 ilogb range, finite nonzero FP64")
     w(f"inline constexpr int kGammaMax = {GAMMA_MAX};")

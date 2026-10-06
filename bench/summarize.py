@@ -17,6 +17,7 @@ from collections import OrderedDict
 PEAK_BW = 1008e9
 PEAK_INT8 = 660.6e12
 KCHUNK = 131008  # spec/params.py K_C_PRIME (DESIGN v1.13 §3.5)
+K_PAD64_MIN = 96  # spec/params.py K_PAD64_MIN (DESIGN v1.13 §4b: A = 64 iff k > 96)
 
 
 def load(path):
@@ -113,8 +114,9 @@ def nsweep(recs, names):
 def phases(m, n, k, b, N):
     """MEMORY_MODEL §4 lower bounds (g = N, beta = 0, rho = 1), seconds at PEAK_BW/PEAK_INT8,
     plus the byte and op counts."""
-    kh, nh = -(-k // 16) * 16, -(-n // 16) * 16
-    nch = -(-k // KCHUNK)
+    A = 64 if k > K_PAD64_MIN else 16      # DESIGN v1.13 §4b AUTO (the library's default)
+    kh, nh = -(-k // A) * A, -(-n // 16) * 16
+    nch = -(-kh // KCHUNK)
     s = 8
     k1 = s * b * (m * k + k * n)
     k23 = s * b * (m * k + k * n) + N * b * (m * kh + nh * kh)

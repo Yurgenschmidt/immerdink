@@ -28,6 +28,10 @@ struct PackedSlots {
 
 struct Analysis {
   imd_options_t options{};  // residue_group normalized to [1, N]
+  // v1.13 §4b.5: the K alignment A, resolved ONCE per API call by analyze (k_align_of of the
+  // lowered k: the test hook if set, else AUTO) and passed explicitly from then on: the
+  // workspace layout, the slot keys' format, plan_data (ExecPlan::k_align).
+  int32_t k_align = 0;
   Lowered lowered;
   WorkspaceLayout layout;
   PackedSlots packed;       // v1.7: none unless analyze_packed found packs
@@ -36,20 +40,27 @@ struct Analysis {
 // imd_workspace_size's status: null arguments and options (INVALID_VALUE), the §5 legality
 // rows 1-5 in precedence order (index_map lower, then the mode-dependent GemmCoord part),
 // then the §4a layout (uint64 / size_t overflow is row 5). Never the RN acceptance rule.
+// v1.13 §4b.5: the one call of the K-alignment resolver for a plan or sizing query
+// (out->k_align).
 IMD_HOST_INTERNAL imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B,
                                        const imd_tensor_t* C, const imd_options_t* options,
                                        Analysis* out);
 
 // v1.7 (DESIGN §6b.5): imd_workspace_size's checks (analyze), then, for each caller operand
 // with a pack (src[x] non-null), the plan-time compatibility check: PACK_MISMATCH (reason in
-// out->packed.mismatch) if the pack's N or rounding differ from the options, if its labels
-// do not map onto X's by mode position, if the plan's K, L or X-row classes differ from the
-// pack's (a K label only in the partner included), or (both packed) if the two packs' K or L
-// orders differ; then the plan ADOPTS the packs' orders of K, L and each packed operand's
-// row class (adopt_order: fusion redone) and each slot key, computed from the adopted
-// lowering restricted to X, must equal the pack's key (EXTENTS / STRIDES). The workspace
-// layout omits sX, fX, RX of every packed post-swap role (also when the status is
-// PACK_MISMATCH). With no pack it is analyze. Never the §3.2 kappa rule.
+// out->packed.mismatch), in this order (DESIGN v1.13 §4b.5 / §6b.5, the oracle's
+// lower_packed, PackedOperand Reason): per pack (the caller's A, then B) an unknown format
+// word (FORMAT), N or rounding differing from the options (MODULI, ROUNDING), labels that do
+// not map onto X's by mode position or plan K, L or X-row classes other than the pack's (a K
+// label only in the partner included: CLASSES); (both packed) the two packs' K or L orders
+// differing (ORDER); then the plan ADOPTS the packs' orders of K, L and each packed
+// operand's row class (adopt_order: fusion redone), and each slot key, computed from the
+// adopted lowering restricted to X with the PLAN's own format word (of out->k_align), must
+// equal the pack's key: the other words of both packs first (EXTENTS / STRIDES), then a
+// format 1 vs 2 difference of either (FORMAT); after a match, the pack's k_hat must equal the
+// plan's (FORMAT; a drift check). The workspace layout omits sX, fX, RX of every packed
+// post-swap role (also when the status is PACK_MISMATCH). With no pack it is analyze. Never
+// the §3.2 kappa rule.
 IMD_HOST_INTERNAL imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B,
                                               const imd_tensor_t* C,
                                               const imd_options_t* options,
@@ -261,8 +272,10 @@ IMD_HOST_INTERNAL uint64_t ceil_sqrt_u64(uint64_t k);
 // the §3.2 step 4 constants, the pack and K5 mappings, the K0 fused-mode descriptor and the
 // plan's device bytes. Leaves sms, k4, vec_resident and vec_dev to libimmerdink. Returns
 // SUCCESS, NOT_SUPPORTED, or INVALID_VALUE (more than kMaxVecModes fused modes:
-// unreachable). The GEMM view (m, n, k, b, n_hat, k_hat, N, g, swapped, trunc), the path
-// and the layout are set whatever the status.
+// unreachable). The GEMM view (m, n, k, b, n_hat, k_hat, N, g, swapped, trunc), the path,
+// k_align and the layout are set whatever the status. v1.13 §4b: k_align = an.k_align for a
+// plan with residue rows (EMULATE, non-empty output, k >= 2), else 16 (NOOP, SCALE, DIRECT,
+// K-empty, whatever the hook says); k_hat = ceil(k)_k_align.
 IMD_HOST_INTERNAL imd_status_t plan_data(const Analysis& an, ExecPlan* e);
 
 // The K4 launch counts of a plan (EMULATE path; zeros otherwise) under `lim`.
@@ -273,7 +286,8 @@ IMD_HOST_INTERNAL K4Counts plan_k4_counts(const ExecPlan& e, const LaunchLimits&
 // m = r, n = 0, k, b, k_hat, N, the §3.2 step 4 constants of (N, k, rounding), the pack
 // pivot of X (pack_pivot over X's R and L modes), and the fused-mode descriptor of X's
 // classes R (as I), K and L with X's strides in slot A; vec_count = r + k + b (the rows, k
-// and batch vectors only). Requires a SUCCESS pack_lower. Its device bytes are 0.
+// and batch vectors only); k_align = the pack's. Requires a SUCCESS pack_lower. Its device
+// bytes are 0.
 IMD_HOST_INTERNAL void pack_exec(const PackLowered& pl, ExecPlan* e);
 
 // The plan's host payload (DESIGN §6a "plan host bytes"), for a plan built from these

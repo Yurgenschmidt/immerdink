@@ -41,7 +41,7 @@ v1.13 starts §4b, K4 load alignment. Its stage 1 sets the K-chunk length to `K_
 ⌊K_c/64⌋·64` (it was 131056), so every full chunk is a whole number of K4's 64-wide K tiles.
 Results stay bit-identical; there is no layout, pack format or API change. Only the chunk
 count of k̂ ∈ (j·131008, j·131056] changes (+1); changed text is marked **[v1.13]**.
-§4b also holds the final design of **stage 2** (designed, not yet implemented; marked
+§4b also holds **stage 2** (implemented 2026-10-06, host API 9; marked
 **[stage 2]**): `k̂ = ⌈k⌉_A` as row stride and GEMM K extent, with `A = 64` iff the logical
 k > 96 and 16 otherwise (a pure function of k), pack format 2 for A = 64, the resolved
 alignment in `imd_lowering_t` (host API 9) and a test hook to force A. Results stay
@@ -661,14 +661,16 @@ neg_resident_ws_vec, neg_resident_reads_ws]**
 ## 4b. K4 load alignment [v1.13] (NOTES-K4ALIGN, ROADMAP A6)
 
 **Status.** Stage 0 (one `k_hat_of`) and stage 1 (`K_c' = 131008`) are implemented. Stage 2
-(per-plan K alignment `A ∈ {16, 64}`, resolved from k alone) is **designed here, not yet
-implemented**: this section is its final design (the rulings of the independent review of
+(per-plan K alignment `A ∈ {16, 64}`, resolved from k alone) is **implemented** (2026-10-06,
+branch `k4-align-s2`) as designed here (the rulings of the independent review of
 2026-10-05 and the must-fixes of the adversarial review of the design, same day, are
-binding; the threshold is frozen from the 2026-10-05 sweep). Until the stage-2
-commit every plan and pack has A = 16, `spec/params.py` and `spec/oracle.py` run with
-`K_ALIGN_POLICY = "A16"`, and their AUTO paths are exercised explicitly by the
-certificates and the oracle suite. Text marked **[stage 2]** elsewhere in this document
-describes the designed behaviour.
+binding; the threshold is frozen from the 2026-10-05 sweep). `spec/params.py` and
+`spec/oracle.py` run with `K_ALIGN_POLICY = "AUTO"`; their A16 paths stay exercised by the
+certificates and the oracle suite. Text marked **[stage 2]** elsewhere in this document is
+the implemented behaviour; the implementation notes (the one rule fixed for two packs, the
+places where the code had a choice) are in the v1.13 stage 2 change list. Still open: the
+θ refit and the `k4_select` re-check (§4b.6), and the real-implementation A/B sweep (§4b.8
+"Bench").
 
 ### 4b.1 Mechanism (measured; CUTLASS `predicated_tile_access_iterator.h:204-213, 514-523`)
 
@@ -3935,7 +3937,7 @@ and host API; every value the same integer (bit-identical, tested on every contr
   k list and the 131008 / 131056 windows. Lean `Chunk.lean` (≤ 131056) covers 131008
   a fortiori and was not re-instantiated.
 
-## v1.13 stage 2 (designed, not yet implemented: per-plan K alignment; host API 9, pack format 2; no semantic change)
+## v1.13 stage 2 (implemented 2026-10-06: per-plan K alignment; host API 9, pack format 2; no semantic change)
 
 - **§4b (final design, replacing the draft).** `k̂ = ⌈k⌉_A` is the row stride and the GEMM
   K extent of every residue row, with `A = 64` iff the logical k > `K_PAD64_MIN = 96`
@@ -3966,7 +3968,7 @@ and host API; every value the same integer (bit-identical, tested on every contr
   `k_align_of`, sizing by A, `cert_k_align` (new), `cert_workspace` / `cert_pack_layout`
   over both A with hand-computed A = 64 examples. `oracle.py`: `pack(fmt=)`, the format in
   `pack_lower` / `pack_layout` / `pack_key` / `lower_packed`; `test_oracle.test_k_align`.
-  Both stay at `K_ALIGN_POLICY = "A16"` until the implementation commit flips it.
+  The implementation commit flips both to `K_ALIGN_POLICY = "AUTO"`.
 - **Adversarial review of the stage-2 design (2026-10-05), must-fixes applied.**
   (1) "Never misread" was false: the format lives only in the handle key, pack bytes have
   no header; the hazard is caller-persisted v8 bytes in a v9 handle (silent wrong stride);
@@ -3988,3 +3990,50 @@ and host API; every value the same integer (bit-identical, tested on every contr
   `pl.k_hat == e.k_hat` and the `call_of` ≡ 0 mod A debug check; `tile_macs` from
   Σ⌈kc⌉₆₄; A = 16-forced calibration cases and `--k-align`; the v5-size lowering test;
   `k_align = 16` for DIRECT / K-empty; `k_align` in `ExecPlan`, not `K4Plan`.
+- **Implementation (2026-10-06, branch `k4-align-s2`).** As designed (§4b.3–§4b.8); the
+  kernels needed no logic change (they index by the plan's k̂ and write the zeros [k, k̂)).
+  Where the design left the code a choice, or the oracle and the model differed:
+  - *Two packed operands: one reason rule.* The design and PackedOperand `Reason` compare
+    the 1-vs-2 FORMAT after the other key words of **both** packs; the design-branch oracle
+    compared each pack's full key in turn. `oracle.lower_packed` now uses the model's rule,
+    and `analysis.cpp analyze_packed` the same: pack A differing only in its format and
+    pack B in a stride is STRIDES (`test_oracle.test_k_align`, `tests/test_k_align.cpp`).
+    No TLA+ change.
+  - *The slot key of a DIRECT plan.* `imd_lowering_t.k_align` is 16 for a lowering without
+    residue rows, but the slot key's format is that of the resolved A of the plan's k (as
+    in the oracle), so a DIRECT plan accepts a matching pack of any k (§6b.2: the mode is
+    not in the key); the `pl.k_hat` drift check compares with ⌈k⌉ of that resolved A.
+  - *Where A lives.* `Analysis::k_align` (the one resolution in `analyze`),
+    `WorkspaceShape::k_align` and `pack_layout(…, k_align)` (no default: a missing A is a
+    layout failure), `ExecPlan::k_align` (in the padding after `trunc`: `sizeof(ExecPlan)`
+    and the plan host bytes unchanged), `PackLowered::k_align / format` (the one resolution
+    in `pack_lower`). A host query with pack descriptors resolves once in `analyze` and
+    once per descriptor's `pack_lower` (each a pack of its own).
+  - *The unknown-format branch* stays as a defensive check. It is tested only in the
+    internal unit test `tests/test_k_align.cpp`, on a copy of the pack's lowering with key
+    word 0 = 3 or 0 (FORMAT before MODULI), like the k̂ drift check.
+  - *The `call_of` check* (`gemm_k4.cu`): every K4 operand pointer ≡ 0 mod A, for plans whose
+    K-chunk is a multiple of A (the production K_c'; `imd_test_set_limits` may choose
+    another). On by default in debug builds (a violation fails the call), and through the
+    test hook `imd_test_k4_align_check` (libimmerdink) in any build (a violation is
+    counted). 0 violations in `contract_k_align` and `packed_k_align`.
+  - *`k4_select`* keeps its estimate over the plan's k̂ (unchanged for every A = 16 plan);
+    only the performance model's K4 MMA term and its ops count use Σ⌈kc⌉₆₄ (§4b.6). An
+    A = 16-forced plan of k > 96 may therefore pick another K4 configuration than the
+    A = 64 plan of the same k (results are identical). To be re-checked with the refit.
+  - *Tests (§4b.8):* `host_k_align` (new, CPU); `host_c_api` (the hand-computed A = 64
+    cases, the 180² case recomputed, a v5-size caller); `host_python` (`suite_k_align`: the
+    boundary k list, every query at the hook's 16 and 64 against params / oracle at the
+    same policy, the add-key merge at 393008 and 392961, the tune cap, a k = 96 pack against
+    a k = 97 plan, accuracy and κ across A); `workspace_vs_params` (the boundary k);
+    `contract_k_align` and `packed_k_align` (new, GPU: every producer path at A = 16 and 64
+    on a 0xA5-poisoned workspace and pack buffer with the padding check, identical C
+    across A, PACK_MISMATCH when the hook changes between pack and plan, both directions,
+    and in `imd_contract_packed`). The stage-1 window tests pin A = 16. initcheck and
+    memcheck run the two `k_align` suites with `IMD_TEST_POISON=0` (fresh, never-written
+    allocations) and `IMD_TEST_QUICK=1`. The two-chunk cases run on skinny shapes only
+    (the pure-Python oracle cannot do 512² × 131072 within the test's size guard).
+  - *Bench and calibration:* `imd_bench --k-align auto|16|64` (or `IMD_BENCH_K_ALIGN`);
+    every record carries `k_align_hook`, imd / duel records also `k_align` and `k_hat`;
+    `tools/calibrate.sh --k-align`; `bench/perf_fit.py` models each record at its
+    alignment (records without the field ran at A = 16: they predate stage 2). No refit yet.

@@ -1402,7 +1402,7 @@ def test_packed():
 
 
 def test_k_align():
-    """DESIGN v1.13 §4b stage 2 (designed; the library still runs A = 16): the oracle's
+    """DESIGN v1.13 §4b stage 2 (implemented; K_ALIGN_POLICY = "AUTO"): the oracle's
     k-alignment rule equals params.py's; format-2 layouts equal params.pack_layout; a
     format-2 pack holds format 1's sigma, flags and residues at row stride ceil(k)_64 with
     zero K padding and a zero tail; contractions through format-1 or format-2 packs (A, B,
@@ -1411,7 +1411,8 @@ def test_k_align():
     plan's is MISMATCH_FORMAT, which under AUTO cannot happen (pack and plan resolve A from
     the same k) and is reached only by forcing A (the library's test hook). Reason order: an
     unknown format word first, the 1-vs-2 difference last (k = 96 pack, k = 97 plan: EXTENTS;
-    FORMAT with N also differing: MODULI). Every default follows the policy."""
+    FORMAT with N also differing: MODULI; both packed: the other words of both packs before
+    the FORMAT of either). Every default follows the policy."""
     import params as pp
     for k in range(0, 1500):
         for pol in ("A16", "AUTO", 16, 64):
@@ -1517,6 +1518,30 @@ def test_k_align():
                     got = e.reason
                 assert got == want, (kq, pN, got, want)
                 n_order += 1
+            # both packed (v1.13 stage 2, one rule with analysis.cpp and PackedOperand Reason):
+            # the other key words of BOTH packs before the FORMAT of either. Pack A differs
+            # only in its format, pack B in a stride: STRIDES; B in nothing: FORMAT.
+            pd.N = N
+            Y2 = o.Desc([kq, 5, 2], [5, 1, 5 * kq], [kk, j, l])          # other strides
+            for Ypk, want in ((Y2, o.MISMATCH_STRIDES), (Yq, o.MISMATCH_FORMAT)):
+                pdq = o.PackDesc(Ypk, N, rnd, o.ORDER_AUTO, [kk], [l])
+                for swap in (False, True):
+                    packs = (pdq, pd) if swap else (pd, pdq)
+                    fm = [3 - o.pack_format_for(kq, "AUTO"), o.pack_format_for(kq, "AUTO")]
+                    fm = tuple(reversed(fm)) if swap else tuple(fm)
+                    Aq, Bq = (Ypk if swap else Xq), (Xq if swap else Ypk)
+                    # the plan's own operand for the B-side pack: Yq (the plan's strides)
+                    Bplan = Xq if swap else Yq
+                    Aplan = Yq if swap else Xq
+                    Cq = o.Desc([5, 3, 2], [1, 5, 15], [j, i, l]) if swap else Cd
+                    try:
+                        o.lower_packed(Aplan, Bplan, Cq, o.EMULATE, packs, N, rnd, fmts=fm,
+                                       k_align="AUTO")
+                        got = 0
+                    except o.PackMismatch as e:
+                        got = e.reason
+                    assert got == want, (kq, swap, got, want)
+                    n_order += 1
             # an unknown format word (a foreign key layout) is FORMAT before MODULI
             real = o.pack_lower
 

@@ -134,12 +134,33 @@ def record_eps(rec, ext, lib=None):
     return max(others, min(1.0, 512.0 / max(lw.k, 1)))
 
 
+def _aligned(fn, a, lib):
+    """fn under the record's K alignment (DESIGN v1.13 §4b.6): libimmerdink_host's test hook
+    set to a (0 = AUTO) around the call, AUTO restored after."""
+    def wrapped(*args, **kw):
+        if a == 0:
+            return fn(*args, **kw)
+        host.test_set_k_align(a, lib=lib)
+        try:
+            return fn(*args, **kw)
+        finally:
+            host.test_set_k_align(0, lib=lib)
+    return wrapped
+
+
+def record_k_align(rec):
+    """The K-alignment hook a record ran under: its k_align_hook (imd_bench, v1.13 stage 2:
+    0 = AUTO), else 16 (records from before stage 2 ran every plan at A = 16)."""
+    return int(rec.get("k_align_hook", 16))
+
+
 def samples_from_records(records, lib=None, seed=None):
     """seed: the calibration whose sm_count / l2_bytes the features use (the measured GPU)."""
     out = []
     for r in records:
         if r.get("status") != "ok":
             continue
+        ka = record_k_align(r)
         meth = r.get("method")
         spec, ext = r.get("spec"), r.get("ext")
         if not spec or not ext:
@@ -156,6 +177,7 @@ def samples_from_records(records, lib=None, seed=None):
                                     mode=o["mode"], k4_config=o["k4_config"], eps_fraction=eps,
                                     regime="BURST", cache=state or cache, clock_mhz=clk,
                                     calib=calib, lib=lib)
+            again = _aligned(again, ka, lib)
             p = again(seed)
             if p.status != "SUCCESS":
                 continue
@@ -165,7 +187,7 @@ def samples_from_records(records, lib=None, seed=None):
         elif meth == "packed" and "packed_phases" in r:
             which = 0 if r.get("pack") == "A" else 1
             N = int(r["N"])
-            pk = host.pack_desc_for(spec, ext, operand=which, N=N, lib=lib)
+            pk = host.pack_desc_for(spec, ext, operand=which, N=N, lib=lib)   # no sizes: A-free
             packing = (pk, None) if which == 0 else (None, pk)
             eps = record_eps(r, ext, lib)
             # method packed times imd_pack, the plain and the packed contract interleaved: each
@@ -179,6 +201,7 @@ def samples_from_records(records, lib=None, seed=None):
                                        cache=st or "COLD", **kw),
                    "pack_": lambda c, st=None, pk=pk, eps=eps, kw=kw: host.predict_pack(
                        pk, eps_fraction=eps, calib=c, cache=st or "COLD", **kw)}
+            fns = {key: _aligned(f, ka, lib) for key, f in fns.items()}
             lab = f"{r['case']} pack {r.get('pack')} N={N}"
             for pre, timed in (("plain_", r["contract_ms"] * 1e-3),
                                ("packed_", r["contract_packed_ms"] * 1e-3),

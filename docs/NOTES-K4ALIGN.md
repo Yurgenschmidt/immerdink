@@ -6,12 +6,14 @@ Stage 0 and stage 1 are done (2026-10-05):
 - **Stage 0:** one `k_hat_of(k, A)` in libimmerdink_host, with A = 16.
 - **Stage 1:** K_c' = 131008.
 
-Stage 2 is designed in DESIGN §4b (final, 2026-10-05; not yet implemented): k̂ = ⌈k⌉_A,
-A = 64 iff k > `K_PAD64_MIN` = 96, else 16; pack format 2; host API 9 (`imd_lowering_t
-.k_align`); the test hook `imd_test_set_k_align`. The threshold was frozen from the sweep
-in §8. The rulings of the independent review (2026-10-05) are binding and listed below.
-The TLA+ models (K4Align, Pipeline and PackedOperand additions) and the certificates are
-in DESIGN §4b.7; the test plan in §4b.8.
+Stage 2 is implemented (2026-10-06, branch `k4-align-s2`; DESIGN §4b, final design of
+2026-10-05): k̂ = ⌈k⌉_A, A = 64 iff k > `K_PAD64_MIN` = 96, else 16; pack format 2; host
+API 9 (`imd_lowering_t.k_align`); the test hook `imd_test_set_k_align`. The threshold was
+frozen from the sweep in §8. The rulings of the independent review (2026-10-05) are binding
+and listed below. The TLA+ models (K4Align, Pipeline and PackedOperand additions) and the
+certificates are in DESIGN §4b.7; the test plan in §4b.8; the implementation notes in §9
+and in DESIGN's v1.13 stage 2 change list. Open: the real-implementation A/B sweep, the θ
+refit (with A = 16-forced cases at k > 96) and the `k4_select` re-check.
 
 The measurements in §2–§5 were taken before any change (origin/dev ca7141c), and the A/B in
 §6 after it. All used the profiling build of `imd_bench` and the repo's gated runner (quiet
@@ -263,3 +265,41 @@ the gains are slightly understated). Raw data and scripts: immerdink-eval
   1024: L2 requests 1.27× per k, sectors 1.000×, tensor pipe 46 → 38.5 %, time per k 1.22×
   (one segment in four crosses a line: +25 % predicted). Class 16 (k̂ = 1040): requests
   1.91×, sectors 1.51× per k, time per k 1.74×. DRAM reads flat.
+
+## 9. Stage 2 implementation (2026-10-06, branch `k4-align-s2`)
+
+What the code does, in the terms of DESIGN §4b.5 (the full list of choices is in DESIGN's
+v1.13 stage 2 change list, "Implementation"):
+
+- **One resolver, once per API call.** `k_align_of(k)` (`src/host/k_hat.cpp`: the hook if
+  set, else AUTO) is called in `analyze` (stored in `Analysis::k_align`) and in `pack_lower`
+  (`PackLowered::k_align`, `format`). From there A is an argument: `WorkspaceShape::k_align`,
+  `pack_layout(…, k_align)`, `pack_key(format, …)`, `ExecPlan::k_align` (set by
+  `plan_data`: the resolved A for an emulating plan, 16 for NOOP / SCALE / DIRECT /
+  K-empty). libimmerdink never calls the resolver; `k4_prepare` checks `k̂ % A == 0`.
+- **The hook** `imd_test_set_k_align` is an `extern "C"` export of libimmerdink_host; its
+  state is one `std::atomic<int32_t>` in `k_hat.cpp`, read through `k_align_hook()`.
+  Python: `host.test_set_k_align` (clears `device.default_plan_cache`); the C tests and
+  `imd_bench --k-align` bind it directly; `tests/harness.py` reaches it through
+  libimmerdink's dependency tree.
+- **Reason order** (`analysis.cpp analyze_packed`): per pack an unknown format word, MODULI,
+  ROUNDING, CLASSES; ORDER; the slot keys (with the plan's own format word) of both packs,
+  every non-format difference first, then the 1-vs-2 FORMAT of either; then the k̂ drift
+  check. `key_mismatch` compares word 0 last. The oracle's `lower_packed` was changed to
+  the same both-packs rule (the design branch compared one pack's whole key at a time); it
+  is the rule PackedOperand `Reason` models.
+- **The `call_of` check** in `gemm_k4.cu` (debug builds by default; `imd_test_k4_align_check`
+  in any build) counts K4 launches whose A or B operand pointer is not ≡ 0 mod A, for plans
+  whose K-chunk is a multiple of A.
+- **Performance model:** the K4 MMA term (`tile_macs`) and the K4 ops count use Σ⌈kc⌉₆₄ over
+  the plan's chunks (A-independent); bytes use the padded k̂. `k4_select` is unchanged (its
+  estimate uses the plan's k̂). No calibration change; θ is to be refit.
+- **Kernels:** no change; KF's launch asserts `2^lg_tk ≥ k̂`.
+
+Tests (all passing, see the commit message for counts): `host_k_align` (new),
+`host_c_api`, `host_python` (`suite_k_align`), `workspace_vs_params`, `contract_k_align`
+and `packed_k_align` (new; every producer path at A = 16 and 64 on poisoned buffers,
+identical C across A, PACK_MISMATCH through the hook), the stage-1 window tests pinned to
+A = 16, `spec/params.py --check`, `spec/test_oracle.py`. compute-sanitizer initcheck (fresh,
+never-written allocations: `IMD_TEST_POISON=0`) and memcheck over the two `k_align` suites
+(`IMD_TEST_QUICK=1`): clean.

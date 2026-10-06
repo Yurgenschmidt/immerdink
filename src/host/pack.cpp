@@ -32,13 +32,14 @@ PackLabel* find(std::vector<PackLabel>& labs, int32_t label) {
 
 }  // namespace
 
-std::optional<PackLayout> pack_layout(int64_t b, int64_t r, int64_t k, int N) {
+std::optional<PackLayout> pack_layout(int64_t b, int64_t r, int64_t k, int N, int32_t k_align) {
   PackLayout L;
+  if (k_align != kKAlign16 && k_align != kKAlign64) return std::nullopt;
   if (b == 0 || r == 0 || k == 0) return L;  // an empty pack: 0 bytes
   const auto ub = static_cast<uint64_t>(b), ur = static_cast<uint64_t>(r),
              uk = static_cast<uint64_t>(k);
   uint64_t kh = 0, rh = 0, br = 0, sig = 0, res = 0, tail = 0;
-  if (!k_hat_of(uk, uint64_t{kKHatAlign}, &kh) || !align_u64(ur, c::kNAlign, &rh) ||
+  if (!k_hat_of(uk, static_cast<uint64_t>(k_align), &kh) || !align_u64(ur, c::kNAlign, &rh) ||
       !mul_u64(ub, ur, &br) || !mul_u64(br, 2, &sig) ||
       !mul_u64(br, kh, &res) || !mul_u64(res, static_cast<uint64_t>(N), &res) ||
       !mul_u64(rh - ur, kh, &tail) || !add_u64(res, tail, &res))
@@ -73,10 +74,10 @@ void pack_fuse_append(std::vector<PackMode>& f, int64_t extent, int64_t stride) 
     f.push_back({extent, stride});
 }
 
-std::vector<int64_t> pack_key(int N, int32_t rounding, int64_t b, int64_t r, int64_t k,
-                              const std::vector<PackMode>& L, const std::vector<PackMode>& R,
-                              const std::vector<PackMode>& K) {
-  std::vector<int64_t> w = {kPackFormat, N, rounding == IMD_TRUNC ? 1 : 0, b, r, k};
+std::vector<int64_t> pack_key(int64_t format, int N, int32_t rounding, int64_t b, int64_t r,
+                              int64_t k, const std::vector<PackMode>& L,
+                              const std::vector<PackMode>& R, const std::vector<PackMode>& K) {
+  std::vector<int64_t> w = {format, N, rounding == IMD_TRUNC ? 1 : 0, b, r, k};
   for (const std::vector<PackMode>* f : {&L, &R, &K}) {
     w.push_back(static_cast<int64_t>(f->size()));
     for (const PackMode& m : *f) {
@@ -115,10 +116,12 @@ int32_t key_mismatch(const std::vector<int64_t>& slot, const std::vector<int64_t
     }
     p += 1 + 2 * static_cast<size_t>(cnt);
   }
+  // Word 0 (the format) last: FORMAT means "the same tensor in the other K alignment".
   const size_t n = std::min({slot.size(), pack.size(), kind.size()});
-  for (size_t i = 0; i < n; ++i)
+  for (size_t i = 1; i < n; ++i)
     if (slot[i] != pack[i]) return kind[i];
-  return IMD_PACK_MISMATCH_EXTENTS;  // one is a prefix of the other: a count differed
+  if (slot.size() != pack.size()) return IMD_PACK_MISMATCH_EXTENTS;  // a count differed
+  return IMD_PACK_MISMATCH_FORMAT;
 }
 
 imd_status_t pack_lower(const imd_pack_desc_t& d, PackLowered* out) {
@@ -185,8 +188,12 @@ imd_status_t pack_lower(const imd_pack_desc_t& d, PackLowered* out) {
   o.N = d.num_moduli;
   o.rounding = d.rounding;
   o.b = size[kPackL], o.r = size[kPackR], o.k = size[kPackK];
-  if (!k_hat_of(o.k, kKHatAlign, &o.k_hat)) return IMD_STATUS_INVALID_VALUE;
-  const auto layout = pack_layout(o.b, o.r, o.k, o.N);
+  // v1.13 §4b.5: the pack's A, resolved once here (the hook if set, else AUTO(k)), then
+  // passed explicitly; its format word follows.
+  o.k_align = k_align_of(o.k);
+  o.format = pack_format_of(o.k_align);
+  if (!k_hat_of(o.k, int64_t{o.k_align}, &o.k_hat)) return IMD_STATUS_INVALID_VALUE;
+  const auto layout = pack_layout(o.b, o.r, o.k, o.N, o.k_align);
   const auto ws = pack_ws_bytes(o.b, o.r, o.k);
   if (!layout || !ws) return IMD_STATUS_INVALID_VALUE;  // §6b.4 sizes exceed uint64
   o.layout = *layout;
@@ -225,7 +232,7 @@ imd_status_t pack_lower(const imd_pack_desc_t& d, PackLowered* out) {
       pack_fuse_append(o.fused[cl], l->extent, l->stride);
     }
   }
-  o.key = pack_key(o.N, o.rounding, o.b, o.r, o.k, o.fused[kPackL], o.fused[kPackR],
+  o.key = pack_key(o.format, o.N, o.rounding, o.b, o.r, o.k, o.fused[kPackL], o.fused[kPackR],
                    o.fused[kPackK]);
   return IMD_STATUS_SUCCESS;
 }

@@ -20,6 +20,7 @@
 // (k4_prepare: SM count, occupancy, smem attribute, Params); imd_contract copies them, sets
 // its pointers and launches. No CUTLASS device-level host state is used.
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -51,6 +52,19 @@ const K4Ops& k4_ops(int cfg) {
 namespace {
 
 LaunchLimits g_limits = production_launch_limits();
+
+// v1.13 §4b.5: the check that every operand pointer call_of forms is = 0 mod the plan's A (a
+// check against index-arithmetic drift that TLA+ cannot see). On by default in debug builds
+// (a violation fails the call), switched by the test hook imd_test_k4_align_check in any
+// build (a violation is counted). Only plans whose K-chunk is a multiple of A make the claim
+// (the production K_c' = 131008; imd_test_set_limits may choose another chunk).
+#ifdef NDEBUG
+constexpr bool kAlignCheckDefault = false;
+#else
+constexpr bool kAlignCheckDefault = true;
+#endif
+std::atomic<bool> g_align_check{kAlignCheckDefault};
+std::atomic<int64_t> g_align_violations{0};
 
 // One K4 launch of a call (host/k4_launches.hpp K4Launch). Its kernel parameters depend
 // only on the shape key (kc, zc, nc; store-mod for chunk 0, add-mod after); the pointers and
@@ -111,19 +125,30 @@ K4Call call_of(const K4Plan& k, const Launch& L, const int8_t* RA, const int8_t*
                 L.z0};
 }
 
-// The launches of one group (prof: the bench's phase marks).
+// The launches of one group (prof: the bench's phase marks). k_align: the plan's A (the
+// pointer check; 0 = no check).
 bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
                int gsize, cudaStream_t stream, bool prof, int64_t batch_a = 0,
-               int64_t batch_b = 0) {
+               int64_t batch_b = 0, int32_t k_align = 0) {
   const K4Ops& ops = k4_ops(k.config);
+  const bool check = k_align > 0 && k.grid.chunk % k_align == 0 &&
+                     g_align_check.load(std::memory_order_relaxed);
   bool ok = true;
   k.for_each_launch(gsize, [&](const Launch& L) {
     if (!ok) return;
     const ShapeKey key{L.kc, L.zc, L.nc};
     const auto& map = L.k0 == 0 ? k.store : k.add;
     const auto it = map.find(key);
-    ok = it != map.end() &&
-         ops.launch(it->second, L.k0 != 0, call_of(k, L, RA, RB, W, g0, batch_a, batch_b), stream);
+    const K4Call call = call_of(k, L, RA, RB, W, g0, batch_a, batch_b);
+    if (check && (reinterpret_cast<uintptr_t>(call.A) % static_cast<uintptr_t>(k_align) != 0 ||
+                  reinterpret_cast<uintptr_t>(call.B) % static_cast<uintptr_t>(k_align) != 0)) {
+      g_align_violations.fetch_add(1, std::memory_order_relaxed);
+#ifndef NDEBUG
+      ok = false;  // debug builds: a broken plan contract fails the call
+      return;
+#endif
+    }
+    ok = it != map.end() && ops.launch(it->second, L.k0 != 0, call, stream);
     if (prof) IMD_PROF(stream, L.k0 == 0 ? "K4 gemm store" : "K4 gemm add");
   });
   return ok;
@@ -133,6 +158,12 @@ bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, 
 
 LaunchLimits& launch_limits() { return g_limits; }
 LaunchLimits default_launch_limits() { return production_launch_limits(); }
+
+int64_t k4_align_check(int mode) {
+  if (mode == 1) g_align_violations.store(0, std::memory_order_relaxed);
+  if (mode == 0 || mode == 1) g_align_check.store(mode == 1, std::memory_order_relaxed);
+  return g_align_violations.load(std::memory_order_relaxed);
+}
 
 int& k4_config_override() {
   static int v = -1;  // only the test / benchmark hooks change it
@@ -155,8 +186,10 @@ imd_status_t k4_prepare(const ExecPlan& p, int cfg, std::shared_ptr<const K4Plan
   }
   if (occ_store < 1 || occ_add < 1) return IMD_STATUS_NOT_SUPPORTED;
   // GEMM sizes are ints (DESIGN §4 launch limits: m, n_hat <= 2^31 - 1, kc <= K_c'); k_hat
-  // and n_hat are multiples of 16, so every 128-bit access is aligned.
-  bool ok = k->m >= 1 && k->m <= INT32_MAX && k->n_hat % 16 == 0 && k->k_hat % 16 == 0;
+  // and n_hat are multiples of 16, so every 128-bit access is aligned (correctness), and
+  // (v1.13 §4b) k_hat is a multiple of the plan's A (the plan contract: 64-aligned loads).
+  bool ok = k->m >= 1 && k->m <= INT32_MAX && k->n_hat % 16 == 0 && k->k_hat % 16 == 0 &&
+            (p.k_align == 16 || p.k_align == 64) && k->k_hat % p.k_align == 0;
   for (int g0 = 0; ok && g0 < p.N; g0 += p.g) {
     k->for_each_launch(std::min(p.g, p.N - g0), [&](const Launch& L) {
       const ShapeKey key{L.kc, L.zc, L.nc};
@@ -270,8 +303,9 @@ K4Footprint k4_footprint(const K4Plan& k, int N, int g) {
 }
 
 imd_status_t k4_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
-                      int gsize, cudaStream_t stream, int64_t batch_a, int64_t batch_b) {
-  return run_group(k, RA, RB, W, g0, gsize, stream, true, batch_a, batch_b)
+                      int gsize, cudaStream_t stream, int64_t batch_a, int64_t batch_b,
+                      int32_t k_align) {
+  return run_group(k, RA, RB, W, g0, gsize, stream, true, batch_a, batch_b, k_align)
              ? IMD_STATUS_SUCCESS
              : IMD_STATUS_CUDA_ERROR;
 }

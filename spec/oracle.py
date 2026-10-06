@@ -71,11 +71,11 @@ N_MIN, N_MAX = 2, 20
 K_ALIGN = 16                             # §4: the plan's K alignment A: 16 ...
 K_ALIGN_PAD = 64                         # §4b (v1.13 stage 2): ... or 64 for k > K_PAD64_MIN
 K_PAD64_MIN = 96                         # §4b: AUTO(k) = 64 iff k > 96
-# The library's K-alignment policy (§4b): "A16" = every plan and pack at A = 16 (implemented
-# through v1.13 stage 1); "AUTO" = stage 2 (designed). The stage-2 implementation flips this
-# switch (with params.K_ALIGN_POLICY): every default follows it (k_hat_of, pack_layout,
-# pack_key, pack, PACK_FORMAT); every function also takes an explicit A / format.
-K_ALIGN_POLICY = "A16"
+# The library's K-alignment policy (§4b): "A16" = every plan and pack at A = 16 (v1.7 ..
+# v1.13 stage 1); "AUTO" = stage 2 (implemented). One switch (with params.K_ALIGN_POLICY):
+# every default follows it (k_hat_of, pack_layout, pack_key, pack, PACK_FORMAT); every
+# function also takes an explicit A / format.
+K_ALIGN_POLICY = "AUTO"
 
 
 def k_hat_of(k, A=None):
@@ -1317,7 +1317,7 @@ def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN", build
             for c, lst in o.items():
                 orders.setdefault(c, lst)
     v = lower(A, B, C, mode, build_vec=build_vec, orders=orders)
-    keys = [None, None]
+    keys, reasons = [None, None], [0, 0]
     for x in (0, 1):
         if pvs[x] is None:
             continue
@@ -1327,9 +1327,16 @@ def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN", build
                  for c, g in (("L", "L"), ("R", rowcls), ("K", "K"))}
         keys[x] = pack_key(N, rounding, v.b, v.m if role == "A" else v.n, v.k, fused,
                            pack_format_for(v.k, k_align))
-        reason = key_mismatch(keys[x], pvs[x].key)
-        if reason:
-            raise PackMismatch(reason, f"operand {x}: slot key differs (reason {reason})")
+        reasons[x] = key_mismatch(keys[x], pvs[x].key)
+    # Both packs' other key words first, then the 1-vs-2 FORMAT of either (v1.13 stage 2: the
+    # one rule of DESIGN §4b.5 / §6b.5, PackedOperand Reason, analysis.cpp analyze_packed).
+    for x in (0, 1):
+        if reasons[x] and reasons[x] != MISMATCH_FORMAT:
+            raise PackMismatch(reasons[x], f"operand {x}: slot key differs (reason {reasons[x]})")
+    for x in (0, 1):
+        if reasons[x]:
+            raise PackMismatch(reasons[x], f"operand {x}: pack format {pvs[x].key[0]} != the "
+                               f"plan's {keys[x][0]}")
     packed_roles = {roles[x] for x in (0, 1) if pvs[x] is not None}
     return v, {"views": pvs, "keys": keys, "roles": roles, "packed_roles": packed_roles,
                "orders": orders}
