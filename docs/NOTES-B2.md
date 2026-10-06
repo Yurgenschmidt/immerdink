@@ -427,8 +427,8 @@ change per-query costs: in `planner_overhead`, predict takes 1.6–1.8 µs and r
   and TLA+ work first. **Superseded by DESIGN v1.13 §4b.** Class 32 is also slow on the
   smaller tiles, so the target is K_c' = 131008 (done in v1.13 stage 1) and k̂ padded to 64 as
   both the stride and the K extent (stage 2).
-- A **settled-clock / hot calibration point** for long thermal runs (16384³ at ~1950 MHz).
-- A **clock-scaled e_byte** in the power model.
+- A **settled-clock / hot calibration point** for long thermal runs (16384³ at ~1950 MHz). **Measured in §9:** no THERMAL regime (the thermal part is ≈ 1–1.8 %; documented as +1–2 % drift for minute-scale runs).
+- A **clock-scaled e_byte** in the power model. **Proposed in §9 / DESIGN §6c.7.**
 
 ### 6.9 Open
 
@@ -437,7 +437,7 @@ change per-query costs: in `planner_overhead`, predict takes 1.6–1.8 µs and r
 - The power coefficients are effective values: e_byte absorbs the SM power of memory-bound
   work. A sequence-level solve for mixed sequences is left to the caller, from `power_w` per
   call. Thermal history beyond the 15 s pre-heat is not modeled: 16384³ long runs were seen at
-  ~1950 MHz, while the model predicts 2385 MHz.
+  ~1950 MHz, while the model predicts 2385 MHz. **Superseded by §9:** measured settled 2240–2270 MHz, time −3.7 % vs SUSTAINED.
 - In small sustained windows, back-to-back calls overlap launch latency that the call term
   charges (+10 % at 512³). A "queued" call term would fix this if it matters.
 
@@ -782,3 +782,62 @@ rate, so the question was whether the smaller tiles now win where the rule keeps
 - Caveat: an A = 16-forced plan (test hook only) is estimated over its unpadded k̂ and may
   pick another configuration than the AUTO plan of the same k. This affects calibration
   and tests, not production.
+
+## 9. Long hot runs and the power model's e_byte (2026-10-06, branch `followup-hotclock`; DESIGN §6c.7 draft)
+
+The question: the SUSTAINED regime predicted 2385 MHz for long 16384³ runs, where §6.3 and
+§6.9 had ~1950 MHz. And is e_byte's missing clock scaling what makes the clock bisection
+optimistic (solved clock too high)?
+
+**Method.**
+- `imd_bench --methods sustained --sustain-warm-s 0 --sustain-trace-s 2` (new option: a
+  time series in the record).
+- Windows: 240 s / 120 s on 16384³, 180 s / 120 s on 8192³, and 150 s / 150 s on a DF
+  `acQ,bdQ->acbd` with a = b = c = d = 96 and Q = 3000. All at N = 14, stock clocks.
+- Each group started from a card at ≤ 45 °C idle; the second window of a group followed the
+  first.
+- NVML power, clock, temperature, clock-event reasons and fan were sampled every 20 ms. The
+  energy counter was never read (immerdink-eval findings/energy-20261004.md §2).
+- Two mixed calls ran with a 15 s pre-heat: 8192³ at g = 2, and 12288 × 384 × 1040.
+- GPU time: about 23 min, ehrenfest FREE throughout, through the quiet gate and the shared
+  GPU lock. Raw records and analysis: immerdink-eval `results/followups/hotclock/`; report:
+  `findings/followup-hotclock.md`.
+
+**Settled state** (last 30 s; TFLOPS-eq, time per call, NVML SM clock, die temperature):
+- 16384³: 37.7 TFLOPS-eq, 233.3 ms, 2251 MHz, 74.4 °C. The hot repeat: 233.8 ms, 2241 MHz.
+- 8192³: 35.0 TFLOPS-eq, 31.42 ms, 2280 MHz, 75.1 °C.
+- DF: 31.7 TFLOPS-eq, 16.08 ms, 2306 MHz, 75.5 °C.
+
+The cap (reason 0x4) is active throughout, with no thermal reason. The fan ends at 57–63 %,
+still rising slowly.
+
+- **Heat-up:** +0.15 … +0.22 % time per °C, clock −3.4 … −5 MHz per °C. From the first seconds
+  (60–64 °C) to settled that is +1.3 … +2.7 %; from the calibration windows' 67–74 °C
+  (end-of-window readings) it is ≈ 1–1.8 %.
+- **~1950 MHz is not reproduced.** It was most likely a single NVML read after a loop: the
+  16384³ hot window's post-loop read was 2085 MHz against a 2251 MHz mean.
+
+**Shipped SUSTAINED vs settled:** 16384³ −3.7 / −3.9 %, 8192³ −1.8 / −1.4 %, DF −0.9 /
+−0.6 %. For 8192³ and DF this is mostly the thermal ≈ 1–1.8 %; for 16384³ roughly half
+thermal and half a fit bias of the unscaled form: it fits e_tc 0.650 pJ/op (vs 0.691
+clock-scaled) and e_byte 335 pJ/B (vs 296), so a tensor-core-heavy call gets too little
+power, the solved clock is too high and the prediction is optimistic.
+- Hold-out caveat: none of the six long windows is in the fit, but 8192³ N = 14 is a
+  calibration shape and the DF call is in the `u_tdf` family; only 16384³ is a new shape.
+- A clock-scaled e_byte, fitted on the same 14 calibration windows (e_tc 0.691 pJ/op,
+  e_byte 296 pJ/B × f/f_ref, γ = 1), predicts the six settled windows with a median |error|
+  of 0.72 %, against 1.58 % shipped (16384³ −1.8 %). At γ = 2 it is 0.30 %.
+- On the calibration windows' own leave-one-case-out check, the capped-time median goes from
+  1.63 to 0.50 % at γ = 1.
+- A leakage term a·(T − 70) adds about +0.8 % to the settled predictions (a ≈ 1.5–2 W per °C).
+- Mixed calls are neutral: 8192³ g = 2 −0.4 → −0.2 %. 12288 × 384 × 1040 −7.7 → −9.2 %; that
+  call is dominated by the time model's −7 … −10 % on this shape (§8).
+
+**Proposal** (DESIGN §6c.7): `power.byte_f_pj`, the SM/L2-side energy per modelled DRAM
+byte (memory clock fixed at 10251 MHz); host API 11 (followup-hygiene takes 10); optional
+format-2 key (absent = 0); v9/v10 callers get `energy_byte_pj := byte_pj + byte_f_pj`; fit
+with byte_pj fixed (collinear) and tc, alu, byte_f free. No THERMAL regime. **Decided**
+(independent reviewer, 2026-10-06): Q1 split key with byte_pj fixed, Q2 keep γ = 1, Q3 no
+THERMAL regime with the drift documented and the calibration windows on `--sustain-warm-s
+60`. The form comparison and γ are redone on those windows in the combined refit, so the
+refit needs GPU. Not implemented yet.
