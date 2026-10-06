@@ -111,11 +111,12 @@ def nsweep(recs, names):
                   f"{err(r.get('max_normerr'))} |")
 
 
-def phases(m, n, k, b, N):
+def phases(m, n, k, b, N, k_align=None, k_hat=None):
     """MEMORY_MODEL §4 lower bounds (g = N, beta = 0, rho = 1), seconds at PEAK_BW/PEAK_INT8,
-    plus the byte and op counts."""
-    A = 64 if k > K_PAD64_MIN else 16      # DESIGN v1.13 §4b AUTO (the library's default)
-    kh, nh = -(-k // A) * A, -(-n // 16) * 16
+    plus the byte and op counts. k_hat / k_align: the record's own (imd_bench records them,
+    also under a forced alignment, --k-align); else the AUTO rule of DESIGN v1.13 §4b."""
+    A = k_align or (64 if k > K_PAD64_MIN else 16)
+    kh, nh = k_hat or -(-k // A) * A, -(-n // 16) * 16
     nch = -(-kh // KCHUNK)
     s = 8
     k1 = s * b * (m * k + k * n)
@@ -137,7 +138,7 @@ def phase_table(recs, names, N):
         for r in rs:
             if r["method"] != "imd" or r.get("status") != "ok" or r["N"] != N:
                 continue
-            ph = phases(r["m"], r["n"], r["k"], r["b"], N)
+            ph = phases(r["m"], r["n"], r["k"], r["b"], N, r.get("k_align"), r.get("k_hat"))
             cells, tot = [], 0.0
             for _, (by, ops) in ph.items():
                 t = max(by / PEAK_BW, ops / PEAK_INT8)

@@ -25,6 +25,8 @@ Environment (DESIGN v1.13 §4b.8): IMD_TEST_POISON=0 leaves every workspace a fr
 unwritten cudaMalloc (for compute-sanitizer --tool initcheck: a 0xA5 memset counts as
 initialised; the guard-zone check is skipped); IMD_TEST_QUICK=1 runs each case in the
 production rule, unfused (K2/K3) and KL with 64-row tiles only (sanitizer runs).
+IMD_TEST_PAD_MUTATION = none / A / B: the mutation of suite pad_mutation under
+IMD_TEST_POISON=0 (tests/initcheck_pad_mutation.sh: the initcheck mutation test).
 """
 
 import argparse
@@ -86,6 +88,53 @@ def gen(rng, shape, kind):
     else:
         raise ValueError(kind)
     return np.array(v, dtype=np.float64).reshape(shape)
+
+
+def gen_eps(rng, shape, kind, kaxis):
+    """DESIGN v1.14 §3.4.1: eps-heavy operands. Every vector along the contracted axis `kaxis`
+    (a row of the GEMM view, scaled by its own sigma) is one of
+      sub1      one nonzero subnormal m 2^-1074 (m of 1..52 bits) at a random position: the
+                row's sigma puts it near T, so the device's eps reaches eps_max(N) - bits + 1
+      sub       subnormals of up to 1..20 bits in every entry (about 20 % zero)
+      dominant  (u - 1/2) exp(g / 2) 2^s (s per row in [-20, 20)) with one entry x 2^20
+                (imd_bench --data dominant; eps up to bitlen(T) - 53 on the dominant entry)
+      phi       gen()'s phi = 4 data
+    and `mix` picks one of them per vector."""
+    k = shape[kaxis]
+    rest = [d for i, d in enumerate(shape) if i != kaxis]
+    flat = np.zeros((int(np.prod(rest)) if rest else 1, k))
+    for r in range(flat.shape[0]):
+        kd = rng.choice(("sub1", "sub", "dominant", "phi")) if kind == "mix" else kind
+        if kd == "sub1":
+            L = rng.randint(1, 52)
+            m = rng.getrandbits(L) | (1 << (L - 1))
+            flat[r, rng.randrange(k)] = math.ldexp(m, -1074) * rng.choice((1, -1))
+        elif kd == "sub":
+            L = rng.randint(1, 20)
+            for h in range(k):
+                if rng.random() >= 0.2:
+                    flat[r, h] = math.ldexp(rng.getrandbits(L) | 1, -1074) * rng.choice((1, -1))
+        elif kd == "dominant":
+            sc = math.ldexp(1.0, rng.randint(-20, 19))
+            for h in range(k):
+                flat[r, h] = (rng.random() - 0.5) * math.exp(0.5 * rng.gauss(0, 1)) * sc
+            flat[r, rng.randrange(k)] *= 2.0**20
+        else:
+            flat[r] = gen(rng, (k,), "phi")
+    X = flat.reshape(rest + [k])
+    return np.moveaxis(X, -1, kaxis).copy()
+
+
+def eps_reached(T, kaxis, N, rounding):
+    """The device's eps (src/kernels/numerics.cuh quantize) of every nonzero quantized entry
+    of T's vectors along kaxis, with the §3.2 rule's sigma (spec/params.py scale_row)."""
+    out = []
+    X = np.moveaxis(T, kaxis, -1).reshape(-1, T.shape[kaxis])
+    for row in X:
+        vals = [float(v) if math.isfinite(v) else 0.0 for v in row]
+        sig, _, _ = params.scale_row(vals, N, rounding)
+        out += [params._dev_eps(v, sig) for v in vals if params.quantize(v, sig, rounding)[0] != 0]
+    return out
 
 
 def inject(rng, T, rate):
@@ -953,8 +1002,151 @@ def suite_replay(lib, cuda, verbose):
         print(f"  ok  {done} of {len(calls)} recorded oracle-test contractions replayed bit-exact")
 
 
+def suite_pad_mutation(lib, cuda, verbose):
+    """DESIGN v1.13 §4b.8 / hygiene: the initcheck mutation test for ONE-SIDED padding. The
+    test hook imd_test_set_pad_mutation(x) makes the K2 / K3 pack of the post-swap GEMM operand
+    x store k-bar only below ceil(k)_16 (Pipeline neg_a64_pad_old_k3), so with A = 64 the bytes
+    [ceil(k)_16, k_hat) of x's residue rows are never written while the other operand's are
+    zeros. The call stays BIT-EXACT (the zeros cancel the garbage): only initcheck on an
+    unpoisoned workspace can see it (tests/initcheck_pad_mutation.sh, ctest
+    contract_initcheck_pad). This suite runs the case: with the poisoned workspace (default) for
+    no mutation, A and B, each bit-exact vs the oracle, and the workspace shows the mutation
+    took effect (x's padding still 0xA5, the other operand's 0); with IMD_TEST_POISON=0 (the
+    initcheck driver) only the mutation IMD_TEST_PAD_MUTATION = A / B / none, bit-exact."""
+    if not lib.has_test_hooks:
+        raise Fail("suite pad_mutation needs the test hooks")
+    env = os.environ.get("IMD_TEST_PAD_MUTATION", "none")
+    if env not in ("none", "A", "B"):
+        raise Fail(f"IMD_TEST_PAD_MUTATION={env!r}: none, A or B")
+    rng = random.Random(4242)
+    m, n, k, N = 7, 9, 97, 8
+    A, B, Cd = matrix(rng, m, n, k, a_kfast=True, b_kfast=True)
+    TA, TB, TC = gen(rng, (m, k), "phi"), gen(rng, (k, n), "wide"), gen(rng, (m, n), "uniform")
+    lenA, _ = buffer_for(A)
+    lenB, _ = buffer_for(B)
+    lenC, _ = buffer_for(Cd)
+    bufA, baseA = scatter(TA, A, gen(rng, (lenA,), "uniform"))
+    bufB, baseB = scatter(TB, B, gen(rng, (lenB,), "uniform"))
+    bufC, baseC = scatter(TC, Cd, gen(rng, (lenC,), "uniform"))
+    k16, k_hat = -(-k // 16) * 16, -(-k // 64) * 64    # 112, 128
+    with k_align(lib, 64):
+        want = np.array(o.contract_tensor(o.Tensor(bufA.tolist(), baseA, A),
+                                          o.Tensor(bufB.tolist(), baseB, B),
+                                          o.Tensor(bufC.tolist(), baseC, Cd), 1.0, 0.5, N, "RN",
+                                          N, o.EMULATE), dtype=np.float64)
+        tA, tB, tC = (hz.make_tensor(d.extent, d.stride, d.label) for d in (A, B, Cd))
+        runs = ("none", "A", "B") if POISON else (env,)
+        lib.set_fused(0)                   # K1 + K2 / K3 for every group (no KF, no KL)
+        try:
+            st, plan = lib.plan_create(tA, tB, tC, N, N)
+        finally:
+            lib.set_fused()
+        if st != "SUCCESS":
+            raise Fail(f"pad mutation: imd_plan_create {st}")
+        try:
+            v = lib.plan_sizes(plan)
+            if v[1] != 0 or v[7] != k_hat or v[9] != N:
+                raise Fail(f"pad mutation: plan swapped {v[1]}, k_hat {v[7]}, g {v[9]}")
+            ws_bytes = v[10]
+            off = {x: (v[11 + 2 * r], v[12 + 2 * r]) for x, r in ((0, 5), (1, 6))}  # RA, RB
+            rows = {0: m, 1: -(-n // 16) * 16}     # rows held: m, n_hat (B's n.. are zero rows)
+            real = {0: m, 1: n}
+            for which in runs:
+                x = {"none": -1, "A": 0, "B": 1}[which]
+                dA, dB, dC = (cuda.malloc(b.nbytes) for b in (bufA, bufB, bufC))
+                dW = cuda.malloc(ws_bytes)        # fresh; with POISON filled with 0xA5
+                try:
+                    cuda.upload(dA, bufA)
+                    cuda.upload(dB, bufB)
+                    cuda.upload(dC, bufC)
+                    if POISON:
+                        cuda.memset(dW, 0xA5, ws_bytes)
+                    lib.set_pad_mutation(x)
+                    try:
+                        st = lib.contract(plan, 1.0, dA.value + 8 * baseA, dB.value + 8 * baseB,
+                                          0.5, dC.value + 8 * baseC, dW.value, ws_bytes)
+                    finally:
+                        lib.set_pad_mutation(-1)
+                    if st != "SUCCESS":
+                        raise Fail(f"pad mutation {which}: imd_contract {st}")
+                    cuda.sync()
+                    got = np.empty_like(bufC)
+                    cuda.download(got, dC)
+                    if POISON:
+                        ws = np.empty(ws_bytes, dtype=np.uint8)
+                        cuda.download(ws, dW)
+                finally:
+                    for p in (dA, dB, dC, dW):
+                        cuda.free(p)
+                bad = bit_mismatches(got, want)
+                if len(bad):
+                    raise Fail(f"pad mutation {which}: {len(bad)} C elements differ from the "
+                               "oracle (the other operand's zero padding should cancel it)")
+                if POISON:
+                    for y in (0, 1):
+                        o_, nb = off[y]
+                        R = ws[o_:o_ + nb].reshape(N, rows[y], k_hat)   # [s][row][k_hat], b = 1
+                        pad = R[:, :real[y], k16:k_hat]
+                        if (R[:, real[y]:, :] != 0).any():
+                            raise Fail(f"pad mutation {which}: operand {y}'s zero rows")
+                        if y == x and not (pad == 0xA5).all():
+                            raise Fail(f"pad mutation {which}: operand {y}'s padding was written")
+                        if y != x and (pad != 0).any():
+                            raise Fail(f"pad mutation {which}: operand {y}'s padding not zero")
+                if verbose:
+                    print(f"  ok  pad mutation {which}: bit-exact"
+                          f"{', padding [112, 128) unwritten on that side only' if POISON and x >= 0 else ''}")
+        finally:
+            lib.plan_destroy(plan)
+
+
+def suite_eps(lib, cuda, verbose):
+    """DESIGN v1.14 §3.4.1, the branch-free pack emitter on eps-heavy data (gen_eps): rows
+    of subnormals scaled to eps in [32, 77] at N = 17-20 (both word selects of W = 3) and up
+    to 62 at N = 16 (W = 2), eps > 0 at N <= 13 (subnormals), dominant entries, RN and TRUNC,
+    g < N; small operands (KF E = 4, moduli parts, gridDim.y > 1), K2/K3, KL (forced, and by
+    the rule for k_hat > 1024, E = 8 and, with 64-row tiles, E = 4): every run_case variant
+    bit-exact vs the oracle. Fails if the data of the emulated cases (k >= 2; k = 1 is DIRECT)
+    did not reach the intended eps."""
+    rng = random.Random(1414)
+    reach = {}
+    shapes = ((9, 13, 1, "sub1", "sub1"), (17, 12, 5, "sub", "mix"), (24, 20, 33, "mix", "sub1"),
+              (12, 30, 129, "dominant", "mix"), (20, 16, 300, "mix", "dominant"))
+    cases = [(N, t, sh) for N in (8, 13, 14, 15, 16, 17, 18, 19, 20) for t, sh in enumerate(shapes)
+             if not (t == 4 and N in (14, 15, 18, 19))]
+    cases += [(16, 5, (6, 5, 1100, "mix", "sub1")), (20, 6, (5, 7, 1100, "sub1", "mix")),
+              (17, 7, (4, 4, 2100, "mix", "sub"))]
+    for N, t, (m, n, k, ka, kb) in cases:
+        rounding = ("RN", "TRUNC")[(N + t) % 2]
+        g = (0, 1, 3, 0, 5, 0, 4, 0)[t]
+        A, B, C = matrix(rng, m, n, k)
+        TA, TB = gen_eps(rng, (m, k), ka, 1), gen_eps(rng, (k, n), kb, 0)
+        if t == 3:
+            inject(rng, TB, 0.02)
+        # Only emulated cases count toward the reach check: k = 1 takes Path::kDirect (no pack
+        # emitter runs), so its subnormal rows must not satisfy the thresholds (review S1).
+        e = eps_reached(TA, 1, N, rounding) + eps_reached(TB, 0, N, rounding) if k >= 2 else []
+        r = reach.setdefault(N, {"max": 0, "ge32": 0, "ge64": 0, "pos": 0})
+        r["max"] = max([r["max"]] + e)
+        r["ge32"] += sum(x >= 32 for x in e)
+        r["ge64"] += sum(x >= 64 for x in e)
+        r["pos"] += sum(x > 0 for x in e)
+        run_case(lib, cuda, f"eps[N={N} {m}x{n}x{k} {ka}/{kb} g={g} {rounding}]", A, B, C, TA, TB,
+                 gen(rng, (m, n), "uniform"), rng.choice((1.0, -0.75)), 0.0, N, g, rounding,
+                 rng=rng, verbose=verbose)
+    for N in sorted(reach):
+        r = reach[N]
+        if verbose:
+            print(f"  eps reached N={N}: max {r['max']} (eps_max {params.constants(N)['eps_max']}), "
+                  f"{r['pos']} entries eps > 0, {r['ge32']} >= 32, {r['ge64']} >= 64")
+        if r["pos"] == 0 or (N >= 13 and r["ge32"] == 0) or (N >= 17 and r["ge64"] == 0) or \
+                (N == 16 and r["max"] < 60) or (N >= 17 and r["max"] < params.constants(N)["eps_max"] - 3):
+            raise Fail(f"suite eps: N={N} did not reach the intended eps ({r})")
+
+
 SUITES = {"api": suite_api, "replay": suite_replay, "stages": suite_stages, "e2e": suite_e2e, "tensor": suite_tensor,
-          "bigk": suite_bigk, "every_n": suite_every_n, "k_align": suite_k_align}
+          "bigk": suite_bigk, "every_n": suite_every_n, "k_align": suite_k_align,
+          "pad_mutation": suite_pad_mutation, "eps": suite_eps}
 
 
 def main():

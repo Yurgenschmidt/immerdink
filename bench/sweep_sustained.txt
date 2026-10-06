@@ -3,15 +3,17 @@
 # and boost history move the settled clock by up to 10 %), 6-10 s measured; mean time per
 # call, board power and SM clock from NVML). Capped (large, tensor-core heavy) and uncapped
 # (small, memory-bound) mixes; the power fit's leave-one-case-out check uses every case once.
-# About 7 min of GPU time on an RTX 4090.
+# v1.15 (DESIGN §6c.7): 60 s pre-heat (the windows start nearer the settled 74-75 C die of
+# long hot runs; was 15 s) and a 2 s trace (time series per window, temperatures).
+# About 17 min of GPU time on an RTX 4090 (was 7 min).
 # name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
-u_s512    | ik,jk->ij | i=512,j=512,k=512          | sustained | 14,16 | --sustain-s 6 --sustain-warm-s 15
-u_s1024   | ik,jk->ij | i=1024,j=1024,k=1024       | sustained | 8,16 | --sustain-s 6 --sustain-warm-s 15
-u_sq2048  | ik,jk->ij | i=2048,j=2048,k=2048       | sustained | 14 | --sustain-s 8 --sustain-warm-s 15
-u_sq4096  | ik,jk->ij | i=4096,j=4096,k=4096       | sustained | 8,14 | --sustain-s 8 --sustain-warm-s 15
-u_sq8192  | ik,jk->ij | i=8192,j=8192,k=8192       | sustained | 14,16 | --sustain-s 8 --sustain-warm-s 15
-u_sq12k   | ik,jk->ij | i=12288,j=12288,k=12288    | sustained | 14 | --sustain-s 10 --sustain-warm-s 15
-u_rmm     | ik,jk->ij | i=1500,j=96,k=40000        | sustained | 14 | --sustain-s 6 --sustain-warm-s 15
-u_rbigk   | ik,jk->ij | i=2048,j=2048,k=32768      | sustained | 16 | --sustain-s 8 --sustain-warm-s 15
-u_tcc     | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | sustained | 16 | --sustain-s 8 --sustain-warm-s 15
-u_tdf     | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | sustained | 14 | --sustain-s 8 --sustain-warm-s 15
+u_s512    | ik,jk->ij | i=512,j=512,k=512          | sustained | 14,16 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+u_s1024   | ik,jk->ij | i=1024,j=1024,k=1024       | sustained | 8,16 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+u_sq2048  | ik,jk->ij | i=2048,j=2048,k=2048       | sustained | 14 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2
+u_sq4096  | ik,jk->ij | i=4096,j=4096,k=4096       | sustained | 8,14 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2
+u_sq8192  | ik,jk->ij | i=8192,j=8192,k=8192       | sustained | 14,16 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2
+u_sq12k   | ik,jk->ij | i=12288,j=12288,k=12288    | sustained | 14 | --sustain-s 10 --sustain-warm-s 60 --sustain-trace-s 2
+u_rmm     | ik,jk->ij | i=1500,j=96,k=40000        | sustained | 14 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+u_rbigk   | ik,jk->ij | i=2048,j=2048,k=32768      | sustained | 16 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2
+u_tcc     | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | sustained | 16 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2
+u_tdf     | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | sustained | 14 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2

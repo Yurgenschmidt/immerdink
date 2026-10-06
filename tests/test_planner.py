@@ -18,7 +18,9 @@ requests (beta, alpha_zero, k4_config, eps_fraction, synthetic calibrations):
     exactly the serial results; the memo never exceeds its bound;
   - argument errors: ValueError for bad option names, ImmerdinkError statuses as host.py;
   - v8 (DESIGN v1.12 §6f): predict / Request / rank with a random Accuracy (valid and invalid
-    statistics, both bases, targets) and Query.min_moduli == host.py's, bit for bit.
+    statistics, both bases, targets) and Query.min_moduli == host.py's, bit for bit;
+  - DESIGN v1.13 §4b.5: host.test_set_k_align clears device.default_plan_cache; a Memo keeps
+    old-A hits across a hook change until clear() (documented: caller-owned).
 """
 
 import argparse
@@ -535,6 +537,47 @@ def check_review_fixes(lib, spec, ext, q):
         raise Fail("array field view")
 
 
+def check_k_align_hook(lib, verbose):
+    """DESIGN v1.13 §4b.5 (hygiene): host.test_set_k_align clears immerdink.device's
+    default_plan_cache (library-owned; its key has no A); a planner.Memo is caller-owned and is
+    NOT cleared: a hit after a hook change returns the result computed under the old A, and
+    Memo.clear() / a fresh Memo / no Memo give the new one. A Query itself caches no A."""
+    from types import SimpleNamespace
+    from immerdink import device
+    spec, ext = "ik,kj->ij", dict(i=8, j=8, k=200)   # k > 96: AUTO A = 64, k_hat 256 / 208
+    try:
+        for a in (16, 64, 0):
+            device.default_plan_cache._plans[("test", a)] = SimpleNamespace(
+                options={"vec_mode": "GENERATE"})
+            host.test_set_k_align(a, lib=lib)
+            if device.default_plan_cache._plans:
+                raise Fail(f"test_set_k_align({a}) left default_plan_cache non-empty")
+        memo = planner.Memo(16)
+        q = planner.Query(spec, ext, memo=memo, lib=lib)
+        bare = planner.Query(spec, ext, lib=lib)
+        host.test_set_k_align(64, lib=lib)
+        lw64 = q.lowering(8)
+        if (lw64.k_align, lw64.k_hat) != (64, 256) or bare.lowering(8).k_hat != 256:
+            raise Fail(f"A = 64: {lw64.k_align}, {lw64.k_hat}")
+        host.test_set_k_align(16, lib=lib)
+        hit = q.lowering(8)
+        if hit is not lw64 or hit.k_hat != 256:
+            raise Fail("Memo under the hook: a hit after the change is the old-A result")
+        if (bare.lowering(8).k_align, bare.lowering(8).k_hat) != (16, 208):
+            raise Fail("a Query without a Memo follows the hook")
+        if planner.Query(spec, ext, memo=planner.Memo(16), lib=lib).lowering(8).k_hat != 208:
+            raise Fail("a fresh Memo follows the hook")
+        memo.clear()
+        if q.lowering(8).k_hat != 208:
+            raise Fail("Memo.clear() then the new A")
+        if q.workspace_size(8) != host.workspace_size(spec, ext, N=8, lib=lib):
+            raise Fail("workspace_size under the hook")
+    finally:
+        host.test_set_k_align(0, lib=lib)
+    if verbose:
+        print("  k_align hook: default_plan_cache cleared; Memo keeps old-A hits until clear()")
+
+
 def check_threads(rng, lib, verbose, threads=8, per_thread=300):
     shapes = [("kjbc,kiac->abij", dict(a=64, b=64, c=64, i=32, j=32, k=32)),
               ("Qia,Qjb->iajb", dict(Q=256, i=16, j=16, a=64, b=64)),
@@ -620,6 +663,7 @@ def main():
         check_rank(rng, lib, cals, max(a.cases // 5, 20), a.verbose)
         check_planner_memo(rng, lib, a.verbose)
         check_threads(rng, lib, a.verbose)
+        check_k_align_hook(lib, a.verbose)
     except Fail as e:
         print(f"FAIL {e}")
         return 1

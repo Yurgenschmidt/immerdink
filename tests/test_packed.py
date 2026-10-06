@@ -341,6 +341,17 @@ def suite_packed(lib, cuda, verbose):
         order = ("desc_for", "auto")[(t // 3) % 2]
         run_packed_case(lib, cuda, f"packed[{t}] {which} {order}", A, B, Cd, TA, TB, TC, alpha,
                         beta, N, g, rounding, mode, which, order, rng, verbose, full=t % 4 != 3)
+    # DESIGN v1.14 §3.4.1: imd_pack (KL, every byte) on eps-heavy operands (tc.gen_eps): eps up
+    # to eps_max at N = 16 (W = 2) and N = 17, 20 (W = 3, both word selects), RN and TRUNC.
+    for t, (N, rounding, m, n, k, ka, kb, which) in enumerate((
+            (16, "RN", 11, 9, 40, "sub1", "mix", "A"), (16, "TRUNC", 7, 12, 1100, "mix", "sub1", "B"),
+            (17, "RN", 9, 10, 129, "mix", "dominant", "AB"), (20, "TRUNC", 13, 6, 33, "sub1", "sub", "AB"),
+            (20, "RN", 5, 8, 1030, "sub", "mix", "A"), (13, "TRUNC", 8, 8, 300, "mix", "mix", "B"))):
+        A, B, Cd = tc.matrix(rng, m, n, k, c_jfast=True)
+        TA, TB = tc.gen_eps(rng, (m, k), ka, 1), tc.gen_eps(rng, (k, n), kb, 0)
+        run_packed_case(lib, cuda, f"packed eps[{t}] N={N} {rounding} {ka}/{kb} {which}", A, B, Cd,
+                        TA, TB, tc.gen(rng, (m, n), "uniform"), 1.0, 0.0, N, 0, rounding,
+                        o.EMULATE, which, "desc_for", rng, verbose, full=t % 2 == 0)
 
     def T(ext, lab, order=None, neg=0.0, pad=0.0):
         return o.Desc(ext, tc.layout(rng, ext, order=order, neg=neg, pad=pad), lab)
@@ -510,6 +521,25 @@ def suite_k_align(lib, cuda, verbose):
                     if st != want:
                         raise Fail(f"pack A={pack_a}, plan A={plan_a}: {st}, want {want}")
                     n_mis += st == "PACK_MISMATCH"
+                    # hygiene (stage-2 code review): the reason is FORMAT (= 1; plan creation's
+                    # own analysis of the handles, imd_test_pack_mismatch), 0 on SUCCESS
+                    st2, why = lib.pack_mismatch(tA, tB, tC, 9, pa, pb)
+                    if st2 != st or why != (1 if st != "SUCCESS" else 0):
+                        raise Fail(f"pack A={pack_a}, plan A={plan_a}: reason {st2} {why}, "
+                                   f"want {st} FORMAT")
+                # imd_lowering_packed with the descriptors resolves the plan and the packs from
+                # ONE hook snapshot (DESIGN §4b.5): never FORMAT, whatever the handles had
+                raw = (C.c_uint8 * 192)()
+                C.c_uint32.from_buffer(raw, 0).value = 192
+                pk_arg, keep = packing_arg(tuple(ods))
+                lst = lib.lib.imd_lowering_packed(C.byref(tA), C.byref(tB), C.byref(tC),
+                                                  C.byref(hz.Options(9, 0, hz.RN)), pk_arg, raw)
+                if (hz.STATUS[lst] != "SUCCESS" or C.c_int32.from_buffer(raw, 180).value != 0 or
+                        C.c_int32.from_buffer(raw, 184).value != (plan_a or 64)):
+                    raise Fail(f"imd_lowering_packed under hook {plan_a}: {hz.STATUS[lst]}, "
+                               f"reason {C.c_int32.from_buffer(raw, 180).value}, k_align "
+                               f"{C.c_int32.from_buffer(raw, 184).value}")
+                del keep
             # a plan made against handles of one alignment, called with a handle of the other
             if want == "PACK_MISMATCH":
                 with tc.k_align(lib, plan_a):

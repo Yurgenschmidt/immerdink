@@ -3,6 +3,7 @@
 // in libimmerdink_host (src/host/plan_data.hpp); C++17 (it is included by nvcc TUs).
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -83,11 +84,21 @@ int& k4_config_override();
 // (gridDim.y <= 65535). Copies the prepared parameters, sets this call's pointers and
 // launches; reads `k4` only. Returns SUCCESS or CUDA_ERROR. batch_a / batch_b (v1.7, a packed
 // operand, DESIGN §6b.4): the operand's batch stride z -> z * batch (0: the workspace's
-// m k_hat / n_hat k_hat). k_align (v1.13 §4b): the plan's A, for the operand-pointer check
-// (k4_align_check; 0 = none).
+// m k_hat / n_hat k_hat).
 imd_status_t k4_group(const K4Plan& k4, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
-                      int gsize, cudaStream_t stream, int64_t batch_a, int64_t batch_b,
-                      int32_t k_align);
+                      int gsize, cudaStream_t stream, int64_t batch_a, int64_t batch_b);
+
+// v1.13 §4b.5 (hygiene): the operand-pointer check (k4_align_check) of a whole call, run on
+// the host BEFORE anything of the call is queued: for every residue group g0 (groups of g of
+// N moduli) and every K4 launch, the A and B pointers call_of forms from RA + g0 group_a and
+// RB + g0 group_b (group_x: the per-modulus offset of a packed operand's planes, b batch_x;
+// 0 for the workspace's slots) are = 0 mod k_align. Only when the check
+// is on (debug builds, or the test hook) and the plan's K-chunk is a multiple of k_align;
+// counts every checked launch. SUCCESS, or CUDA_ERROR on a violation in a debug build (the
+// call then fails with nothing queued; release builds only count it).
+imd_status_t k4_check_call(const K4Plan& k4, int N, int g, const int8_t* RA, const int8_t* RB,
+                           uint8_t* W, int64_t group_a, int64_t group_b, int64_t batch_a,
+                           int64_t batch_b, int32_t k_align);
 
 // v1.13 §4b.5 (gemm_k4.cu; test hook imd_test_k4_align_check): mode 1 = enable the check that
 // every K4 operand pointer is = 0 mod the plan's A and reset its counts, 0 = disable, -1 =
@@ -107,9 +118,19 @@ int64_t& k5_one_elem_per_sm();
 // A5: K5's elements per thread forced to 1, 2 or 4 (0: the launch rule), read by
 // imd_contract; changed only by the hooks imd_test_set_k5_elems / imd_prof_set_k5_elems.
 int& k5_elems_override();
+// v1.13 §4b (hygiene; contract.cu, test hook imd_test_set_pad_mutation): -1 (production) or
+// the post-swap operand x (0 = the GEMM's A, 1 = its B) whose K2 / K3 pack stores only k-bar
+// < ceil(k)_16 (Pipeline neg_a64_pad_old_k3: [ceil(k)_16, k_hat) left unwritten on one side
+// only, which the bit-exact check cannot see; initcheck must). Read by imd_contract with a
+// relaxed load (an atomic so a hook call racing a contract on another thread is not a data race).
+std::atomic<int>& pad_mutation();
 
 // The execution data of a plan (api.cpp), for the test hooks; nullptr for a null plan.
 const ExecPlan* exec_of(imd_plan_t plan);
+
+// A pack handle as plan creation's analysis sees it (api.cpp): its labels by position and its
+// lowering. The handle must be non-null and outlive the PackSource.
+PackSource pack_source_of(imd_pack_t pack);
 
 // The K4 parameter sets a plan holds (gemm_k4.cu): store-mod and add-mod shape keys, the
 // launches of one call, and the host payload of the K4Plan (sizeof(K4Plan) plus its map

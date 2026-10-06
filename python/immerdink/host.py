@@ -38,9 +38,9 @@ __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "work
            "predict_pack", "rank", "param_names", "PERF_CLASSES", "PERF_PHASES", "Accuracy",
            "ErrEstimate", "err_estimate", "min_moduli", "ERR_METRICS", "ERR_BASES",
            "ERR_STATUS", "INFEASIBLE", "PACK_FORMAT", "PACK_FORMAT_A16", "PACK_FORMAT_A64",
-           "test_set_k_align"]
+           "test_set_k_align", "CalibrationError", "CALIB_ERRORS", "CALIB_STRING_FIELDS"]
 
-API_VERSION = 9  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+API_VERSION = 11  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
 # Pack formats (DESIGN v1.13 §4b, host API 9): the format of a pack is that of its k (2 iff
 # k > 96); PACK_FORMAT is the newest format the library writes.
 PACK_FORMAT_A16, PACK_FORMAT_A64 = 1, 2
@@ -80,6 +80,23 @@ INFEASIBLE = {"STATUS": 1, "BUDGET": 2, "ACCURACY": 4}  # imd_perf_candidate_t.i
 FORMAT2_PARAMS = frozenset({"k0.chain", "kl.wave", "pack.chain", "pack.wave", "k5.chain",
                             "k5.dram",
                             "direct.chain", "beta.chain"})
+
+
+# Host API 10 (DESIGN §6c.3): why a calibration was rejected (IMD_PERF_CALIB_*, by value).
+CALIB_ERRORS = ("OK", "ARGUMENT", "FILE", "SYNTAX", "UNKNOWN_KEY", "REPEATED_KEY", "VALUE",
+                "TOO_LONG", "MISSING_KEY", "FORMAT2_KEY", "INCONSISTENT")
+
+
+class CalibrationError(ValueError):
+    """A calibration the C parser rejected (host API 10): .line (1-based; 0: not tied to a
+    line), .reason (a CALIB_ERRORS name, e.g. "TOO_LONG"), .key (the offending or missing key,
+    or "") and the library's message."""
+
+    def __init__(self, line, reason, key, message, what=""):
+        self.line, self.key, self.message = int(line), key, message
+        self.reason = CALIB_ERRORS[reason] if 0 <= reason < len(CALIB_ERRORS) else f"<{reason}>"
+        super().__init__(f"{what}{': ' if what else ''}invalid calibration "
+                         f"[{self.reason}] {message}")
 
 
 class ImmerdinkError(RuntimeError):
@@ -161,7 +178,20 @@ class _PerfCalib(C.Structure):
                 ("warm_l2_bytes", C.c_double), ("warm_l2byte_ns", C.c_double),
                 ("band_call", (C.c_double * 2) * 3),
                 ("band_class", (C.c_double * 2) * _PERF_CLASS_CAPACITY),
-                ("tie_ratio", C.c_double)]
+                ("tie_ratio", C.c_double),
+                # v11 (DESIGN v1.15 §6c.7)
+                ("energy_byte_f_pj", C.c_double)]
+
+
+# The string fields of a calibration and their capacities in bytes, NUL included (the
+# generation-time check of bench/perf_fit.py reads them from here).
+CALIB_STRING_FIELDS = {n: getattr(_PerfCalib, n).size for n in ("gpu", "date", "version",
+                                                                  "clocks", "notes")}
+
+
+class _PerfCalibError(C.Structure):  # host API 10 (DESIGN §6c.3)
+    _fields_ = [("struct_size", C.c_uint32), ("line", C.c_int32), ("reason", C.c_int32),
+                ("reserved", C.c_int32), ("key", C.c_char * 64), ("message", C.c_char * 192)]
 
 
 class _ErrRequest(C.Structure):  # v8 (DESIGN §6f)
@@ -244,7 +274,7 @@ assert C.sizeof(_Lowering) == 192  # version 6 (DESIGN v1.13 §4b; v5 = 184)
 assert _Lowering.k_align.offset == 184
 assert C.sizeof(_Options) == 24
 assert C.sizeof(_PackDesc) == 72 and C.sizeof(_PackLayout) == 136
-assert C.sizeof(_PerfCalib) == 3672 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1976
+assert C.sizeof(_PerfCalib) == 3680 and _PerfCalib.energy_byte_f_pj.offset == 3672 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1976
 assert C.sizeof(_RankRequest) == 96 and C.sizeof(_Candidate) == 192
 assert C.sizeof(_PerfRequest) == 48
 assert C.sizeof(_ErrRequest) == 64 and C.sizeof(_Err) == 72
@@ -313,6 +343,14 @@ class HostLibrary:
                                               C.POINTER(C.c_int32)]),
             "imd_perf_calib_format": (C.c_int, [C.POINTER(_PerfCalib), C.c_char_p, C.c_size_t,
                                                 C.POINTER(C.c_size_t)]),
+            # v10 (DESIGN §6c.3): calibration parse errors with the reason
+            "imd_perf_calib_parse_ex": (C.c_int, [C.c_char_p, C.c_size_t, C.POINTER(_PerfCalib),
+                                                  C.POINTER(_PerfCalibError)]),
+            "imd_perf_calib_load_ex": (C.c_int, [C.c_char_p, C.POINTER(_PerfCalib),
+                                                 C.POINTER(_PerfCalibError)]),
+            "imd_perf_calib_default_ex": (C.c_int, [C.POINTER(_PerfCalib),
+                                                    C.POINTER(_PerfCalibError)]),
+            "imd_perf_calib_error_name": (C.c_char_p, [C.c_int32]),
             "imd_perf_class_name": (C.c_char_p, [C.c_int32]),
             "imd_perf_param_name": (C.c_char_p, [C.c_int32, C.c_int32]),
             "imd_perf_phase_name": (C.c_char_p, [C.c_int32]),
@@ -337,6 +375,20 @@ class HostLibrary:
         self.version = lib.imd_host_api_version()
         if self.version < API_VERSION:
             raise OSError(f"{path}: host API version {self.version} < {API_VERSION}")
+        # Host API 10 (DESIGN §6c.3): whether the shipped calibration parses, checked once.
+        # If not, every query with calib=None (the C library's NULL) would only say
+        # INVALID_VALUE: predict / predict_pack / rank / planner.Query raise this instead.
+        c, e = _PerfCalib(), _PerfCalibError(C.sizeof(_PerfCalibError))
+        c.struct_size = C.sizeof(_PerfCalib)
+        st = lib.imd_perf_calib_default_ex(C.byref(c), C.byref(e))
+        self.shipped_calib_error = None if st == 0 else CalibrationError(
+            e.line, e.reason, e.key.decode(errors="replace"),
+            e.message.decode(errors="replace"), path)
+
+    def check_shipped_calib(self):
+        """Raise the shipped calibration's CalibrationError, if it has one."""
+        if self.shipped_calib_error is not None:
+            raise self.shipped_calib_error
 
 
 _loaded = {}  # path (None: the default search) -> HostLibrary
@@ -683,34 +735,47 @@ class Calibration:
         c.struct_size = C.sizeof(_PerfCalib)
         return c
 
+    @staticmethod
+    def _raise(st, e, what):
+        """CalibrationError from a failed _ex call (an INVALID_VALUE with a reason), else
+        ImmerdinkError (allocation failure)."""
+        if st == 1 and e.reason != 0:
+            raise CalibrationError(e.line, e.reason, e.key.decode(errors="replace"),
+                                   e.message.decode(errors="replace"), what)
+        raise ImmerdinkError(st, what)
+
     @classmethod
     def default(cls, lib=None):
+        """The shipped calibration (imd_perf_calib_default_ex); CalibrationError with the
+        embedded file's own parse error if it does not parse (DESIGN §6c.3)."""
         h = load(lib) if not isinstance(lib, HostLibrary) else lib
-        c = cls._new()
-        st = h.lib.imd_perf_calib_default(C.byref(c))
+        c, e = cls._new(), _PerfCalibError(C.sizeof(_PerfCalibError))
+        st = h.lib.imd_perf_calib_default_ex(C.byref(c), C.byref(e))
         if st != 0:
-            raise ImmerdinkError(st, "imd_perf_calib_default")
+            cls._raise(st, e, "imd_perf_calib_default")
         return cls(c, h)
 
     @classmethod
     def parse(cls, text, lib=None):
-        """Parse format-1 text; ValueError (with the line) if it is invalid."""
+        """Parse calibration text (format 1 or 2); CalibrationError (a ValueError: line,
+        reason, key, message) if it is invalid."""
         h = load(lib) if not isinstance(lib, HostLibrary) else lib
         data = text.encode() if isinstance(text, str) else bytes(text)
-        c, line = cls._new(), C.c_int32(0)
-        st = h.lib.imd_perf_calib_parse(data, len(data), C.byref(c), C.byref(line))
+        c, e = cls._new(), _PerfCalibError(C.sizeof(_PerfCalibError))
+        st = h.lib.imd_perf_calib_parse_ex(data, len(data), C.byref(c), C.byref(e))
         if st != 0:
-            raise ValueError(f"invalid calibration (line {line.value}): IMD_STATUS_{STATUS[st]}")
+            cls._raise(st, e, "")
         return cls(c, h)
 
     @classmethod
     def load(cls, path, lib=None):
+        """Load a calibration file; CalibrationError (a ValueError) if it is unreadable or
+        invalid."""
         h = load(lib) if not isinstance(lib, HostLibrary) else lib
-        c, line = cls._new(), C.c_int32(0)
-        st = h.lib.imd_perf_calib_load(os.fsencode(path), C.byref(c), C.byref(line))
+        c, e = cls._new(), _PerfCalibError(C.sizeof(_PerfCalibError))
+        st = h.lib.imd_perf_calib_load_ex(os.fsencode(path), C.byref(c), C.byref(e))
         if st != 0:
-            raise ValueError(f"{path}: invalid calibration (line {line.value}): "
-                             f"IMD_STATUS_{STATUS[st]}")
+            cls._raise(st, e, os.fsdecode(path))
         return cls(c, h)
 
     @classmethod
@@ -761,7 +826,8 @@ class Calibration:
         return {"power.clock_eff_mhz": r.clock_eff_mhz, "power.clock_min_mhz": r.clock_min_mhz,
                 "power.cap_w": r.power_cap_w, "power.idle_w": r.power_idle_w,
                 "power.tc_pj": r.energy_tc_pj, "power.alu_pj": r.energy_alu_pj,
-                "power.byte_pj": r.energy_byte_pj, "power.gamma": r.energy_gamma}
+                "power.byte_pj": r.energy_byte_pj, "power.gamma": r.energy_gamma,
+                "power.byte_f_pj": r.energy_byte_f_pj}  # v11 (§6c.7; 0: absent)
 
     @property
     def warm(self):
@@ -965,8 +1031,8 @@ class Prediction:
     bound_s: float
     flops_eq: float
     tflops_eq: float
-    eps_s: float          # eps-path time at fraction 1: bracket [t - f eps_s, t + (1 - f) eps_s]
-    eps_fraction: float   # the eps fraction f used (immerdink_host.h: typical-data default)
+    eps_s: float          # 0 since host API 11 (DESIGN v1.15 §6c.1: the eps path is retired)
+    eps_fraction: float   # 0 since host API 11
     kernel_launches: int
     workspace_bytes: int
     plan_device_bytes: int
@@ -1029,8 +1095,8 @@ def predict(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EM
     returned in .status (with zeros); a bad argument raises. packing = (PackSpec or None,
     PackSpec or None): the packed plan. beta: C is read (beta != 0); alpha_zero: the beta-only
     call; k4_config: force an IMD_K4_* configuration (None: the plan-time rule); eps_fraction:
-    the fraction of pack work on the eps path (None: the typical-data default; see
-    immerdink_host.h). v7: regime "DEFAULT" / "BURST" / "SUSTAINED", cache "COLD" / "WARM" /
+    validated (None, < 0 or 0..1) and ignored since host API 11 (the eps path is retired,
+    DESIGN v1.15 §6c.1). v7: regime "DEFAULT" / "BURST" / "SUSTAINED", cache "COLD" / "WARM" /
     "REPEAT", clock_mhz > 0: predict at that SM clock. v8: accuracy (an Accuracy): err_bound /
     err_typical in its metric and err_status against its target (None: NORMWISE, no target)."""
     h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing)
@@ -1042,6 +1108,8 @@ def predict(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EM
     r = _Perf()
     r.struct_size = C.sizeof(_Perf)
     pk = C.byref(call.packing) if packing is not None else None
+    if calib is None:
+        h.check_shipped_calib()
     st = h.lib.imd_perf_predict(*call.args(), pk, C.byref(req), _calib_arg(calib), C.byref(r))
     return _prediction(r, st)
 
@@ -1055,6 +1123,8 @@ def predict_pack(pack, *, eps_fraction=None, regime="DEFAULT", cache="COLD", clo
     r.struct_size = C.sizeof(_Perf)
     req = _PerfRequest(C.sizeof(_PerfRequest), 0, -1, 0, _eps(eps_fraction),
                        PERF_REGIMES[regime], PERF_CACHES[cache], float(clock_mhz))
+    if calib is None:
+        h.check_shipped_calib()
     st = h.lib.imd_perf_predict_pack(C.byref(arg.d), C.byref(req), _calib_arg(calib), C.byref(r))
     return _prediction(r, st)
 
@@ -1074,8 +1144,8 @@ class Candidate:
     contract_s: float
     pack_s: float
     tflops_eq: float
-    eps_s: float         # eps-path time at fraction 1 (contract + pack / reuse)
-    eps_fraction: float
+    eps_s: float         # 0 since host API 11 (eps path retired)
+    eps_fraction: float  # 0 since host API 11
     workspace_bytes: int
     plan_device_bytes: int
     pack_bytes: int
@@ -1120,6 +1190,8 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
                        PERF_REGIMES[regime], PERF_CACHES[cache], PERF_ORDERS[order], 0,
                        float(clock_mhz), _accuracy_ptr(accuracy))
     count = C.c_int32(0)
+    if calib is None:
+        h.check_shipped_calib()
     st = h.lib.imd_perf_rank(*call.args(), C.byref(req), _calib_arg(calib), None, 0,
                              C.byref(count))
     if st != 0:

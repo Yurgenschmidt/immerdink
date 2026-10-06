@@ -404,8 +404,10 @@ int main(void) {
   {
     CHECK(IMD_HOST_API_VERSION >= 7);
     /* v8 sizes (v7: 3672, 1952, 168, 88, 40; v6: 1232, 96, 1648, 128, 64, 24; the older
-     * prefixes are unchanged) */
-    CHECK(sizeof(imd_perf_calib_t) == 3672 && sizeof(imd_perf_phase_t) == 96 &&
+     * prefixes are unchanged); v11: imd_perf_calib_t 3680 (energy_byte_f_pj at 3672) */
+    CHECK(sizeof(imd_perf_calib_t) == 3680 && offsetof(imd_perf_calib_t, energy_byte_f_pj) == 3672 &&
+          IMD_HOST_API_VERSION >= 11);
+    CHECK(sizeof(imd_perf_phase_t) == 96 &&
           sizeof(imd_perf_t) == 1976 && sizeof(imd_perf_candidate_t) == 192 &&
           sizeof(imd_perf_rank_request_t) == 96 && sizeof(imd_perf_request_t) == 48);
     CHECK(offsetof(imd_perf_t, err_bound) == 1952 && offsetof(imd_perf_candidate_t, err_bound) == 168 &&
@@ -442,6 +444,40 @@ int main(void) {
     CHECK(strcmp(back.gpu, cal.gpu) == 0 && strcmp(back.clocks, cal.clocks) == 0);
     CHECK(back.sm_count == cal.sm_count &&
           memcmp(&back.peak_dram_bytes_per_s, &cal.peak_dram_bytes_per_s, 4 * sizeof(double)) == 0);
+    /* host API 11 (DESIGN v1.15 §6c.7): the optional power.byte_f_pj, and the folded view
+     * energy_byte_pj = byte + byte_f of a v7..v10-sized struct (nothing written beyond it) */
+    {
+      static char t0[16600], t2[16600];
+      static imd_perf_calib_t base, full, v10;
+      const uint32_t v10_size = (uint32_t)offsetof(imd_perf_calib_t, energy_byte_f_pj);
+      /* the shipped calibration with byte_f = 0 (the combined refit ships byte_f > 0): its
+       * text has no key */
+      base = cal;
+      base.energy_byte_f_pj = 0;
+      size_t n0 = 0;
+      CHECK(imd_perf_calib_format(&base, t0, sizeof t0, &n0) == IMD_STATUS_SUCCESS &&
+            strstr(t0, "power.byte_f_pj") == NULL);
+      CHECK(cal.energy_byte_f_pj == 0 || strstr(text, "\npower.byte_f_pj = ") != NULL);
+      const int n2 = snprintf(t2, sizeof t2, "%spower.byte_f_pj = 7.5\n", t0);
+      full.struct_size = sizeof full;
+      CHECK(imd_perf_calib_parse(t2, (size_t)n2, &full, &line) == IMD_STATUS_SUCCESS &&
+            full.energy_byte_f_pj == 7.5 && full.energy_byte_pj == cal.energy_byte_pj);
+      memset(&v10, 0x5a, sizeof v10);
+      v10.struct_size = v10_size;
+      CHECK(imd_perf_calib_parse(t2, (size_t)n2, &v10, &line) == IMD_STATUS_SUCCESS &&
+            v10.struct_size == v10_size && v10.energy_byte_pj == cal.energy_byte_pj + 7.5);
+      const unsigned char* tail = (const unsigned char*)&v10.energy_byte_f_pj;
+      for (size_t i = 0; i < sizeof v10.energy_byte_f_pj; ++i) CHECK(tail[i] == 0x5a);
+      memset(&v10, 0x5a, sizeof v10);
+      v10.struct_size = v10_size;
+      CHECK(imd_perf_calib_default(&v10) == IMD_STATUS_SUCCESS &&
+            v10.energy_byte_pj == cal.energy_byte_pj + cal.energy_byte_f_pj && tail[0] == 0x5a);
+      /* format: the key only when non-zero; round trip */
+      static char t3[16600];
+      size_t len3 = 0;
+      CHECK(imd_perf_calib_format(&full, t3, sizeof t3, &len3) == IMD_STATUS_SUCCESS &&
+            strstr(t3, "\npower.byte_f_pj = 7.5\n") != NULL);
+    }
     /* parse errors, with their lines */
     {
       static char bad[16600];
@@ -481,6 +517,166 @@ int main(void) {
             back.param[IMD_PERF_CLASS_CALL * IMD_PERF_MAX_PARAMS + 1] == -2.5);
       CHECK(imd_perf_calib_load("/nonexistent/x.calib", &back, &line) == IMD_STATUS_INVALID_VALUE &&
             line == 0);
+    }
+    /* host API 10 (DESIGN §6c.3): every rejection with its reason, key and message (the _ex
+     * functions), the same status and line as the functions without _ex. */
+    {
+      CHECK(IMD_HOST_API_VERSION >= 10 && sizeof(imd_perf_calib_error_t) == 272);
+      static char bad[16800];
+      static imd_perf_calib_t tmp;
+      imd_perf_calib_error_t e;
+      int32_t lines = 0;
+      for (size_t i = 0; i < len; ++i) lines += text[i] == '\n';
+      /* parse_ex vs parse: same status, same line; returns the reason */
+#define PARSE_EX(txt, n, want_reason, want_line, want_key, want_msg)                          \
+      do {                                                                                    \
+        memset(&e, 0x5a, sizeof e);                                                           \
+        e.struct_size = sizeof e;                                                             \
+        tmp.struct_size = sizeof tmp;                                                         \
+        int32_t l_old = -1;                                                                   \
+        const imd_status_t s_old = imd_perf_calib_parse((txt), (n), &tmp, &l_old);            \
+        const imd_status_t s_ex = imd_perf_calib_parse_ex((txt), (n), &tmp, &e);              \
+        CHECK(s_old == s_ex && e.struct_size == sizeof e && e.reserved == 0);                 \
+        CHECK(e.reason == (want_reason) && e.line == (want_line) && l_old == e.line);         \
+        CHECK(strcmp(e.key, (want_key)) == 0 && strstr(e.message, (want_msg)) != NULL);       \
+        CHECK((s_ex == IMD_STATUS_SUCCESS) == ((want_reason) == IMD_PERF_CALIB_OK));          \
+      } while (0)
+      PARSE_EX(text, len, IMD_PERF_CALIB_OK, 0, "", "");
+      CHECK(e.message[0] == '\0');
+      /* the notes line over its field (the failure that broke a shipped calibration):
+       * 127 bytes fit, 128 do not */
+      for (int over = 0; over < 2; ++over) {
+        char notes[160];
+        memset(notes, 'x', sizeof notes);
+        notes[127 + over] = '\0';
+        int n = snprintf(bad, sizeof bad, "notes = %s\n%s", notes, text);
+        char* p = strstr(bad + 1, "\nnotes = ");
+        CHECK(p != NULL);
+        if (p) p[1] = '#'; /* the canonical notes line: commented out */
+        if (over) {
+          PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_TOO_LONG, 1, "notes",
+                   "line 1: notes: value is 128 bytes, the field holds 127");
+        } else {
+          PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_OK, 0, "", "");
+          CHECK(strlen(tmp.notes) == 127);
+        }
+      }
+      {
+        char gpu[80];
+        memset(gpu, 'g', sizeof gpu);
+        gpu[64] = '\0';
+        int n = snprintf(bad, sizeof bad, "gpu = %s\n%s", gpu, text);
+        PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_TOO_LONG, 1, "gpu", "the field holds 63");
+      }
+      int n = snprintf(bad, sizeof bad, "%sbogus.key = 1\n", text);
+      PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_UNKNOWN_KEY, lines + 1, "bogus.key",
+               "unknown key");
+      n = snprintf(bad, sizeof bad, "%sk5.byte = 1\n", text);
+      PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_REPEATED_KEY, lines + 1, "k5.byte",
+               "repeated key (first on line ");
+      n = snprintf(bad, sizeof bad, "%s", text);
+      char* p = strstr(bad, "k5.byte = ");
+      CHECK(p != NULL);
+      if (p) p[0] = '#';
+      PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_MISSING_KEY, 0, "k5.byte", "missing key");
+      n = snprintf(bad, sizeof bad, "%s", text);
+      p = strstr(bad, "\nkernel.k0 = ");
+      CHECK(p != NULL);
+      if (p) p[1] = '#';
+      PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_MISSING_KEY, 0, "kernel.k0", "missing key");
+      n = snprintf(bad, sizeof bad, "%s", text);
+      p = strstr(bad, "\nformat = ");
+      if (p) p[10] = '3';
+      PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_VALUE, 3, "format", "(want 1 or 2)");
+      const char* vals[] = {"kl.byte = -1\n", "kl.byte = 1x\n", "kl.byte = nan\n"};
+      for (int i = 0; i < 3; ++i) {
+        n = snprintf(bad, sizeof bad, "%s%s", vals[i], text);
+        PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_VALUE, 1, "kl.byte", "invalid value");
+      }
+      n = snprintf(bad, sizeof bad, "kl.byte\n%s", text);
+      PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_SYNTAX, 1, "", "line 1: 'kl.byte' is not");
+      n = snprintf(bad, sizeof bad, "kernel.k0 = 0 1 2 3\n%s", text);
+      PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_VALUE, 1, "kernel.k0", "resident >= 1");
+      n = snprintf(bad, sizeof bad, "band.call_small = 2 1\n%s", text);
+      PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_VALUE, 1, "band.call_small", "lo <= hi");
+      /* a non-printable key byte is shown as '?' */
+      n = snprintf(bad, sizeof bad, "bo\x01gus = 1\n%s", text);
+      PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_UNKNOWN_KEY, 1, "bo?gus", "unknown key");
+      /* a format-2 key in a format-1 calibration: the first one's line */
+      if (cal.format == 2) {
+        n = snprintf(bad, sizeof bad, "%s", text);
+        p = strstr(bad, "\nformat = 2");
+        if (p) p[10] = '1';
+        int32_t first_v2 = 0, l = 1;
+        const char* q = bad;
+        while (first_v2 == 0 && *q) {
+          if (strncmp(q, "k0.chain", 8) == 0 || strncmp(q, "kernel.", 7) == 0 ||
+              strncmp(q, "power.", 6) == 0)
+            first_v2 = l;
+          const char* nl = strchr(q, '\n');
+          if (!nl) break;
+          q = nl + 1;
+          ++l;
+        }
+        CHECK(first_v2 > 0);
+        memset(&e, 0, sizeof e);
+        e.struct_size = sizeof e;
+        tmp.struct_size = sizeof tmp;
+        CHECK(imd_perf_calib_parse_ex(bad, (size_t)n, &tmp, &e) == IMD_STATUS_INVALID_VALUE);
+        CHECK(e.reason == IMD_PERF_CALIB_ERR_FORMAT2_KEY && e.line > 0 && e.line <= first_v2 &&
+              strstr(e.message, "a format-2 key in a format-1 calibration") != NULL);
+        /* cross-key rules: line 0 */
+        n = snprintf(bad, sizeof bad, "%s", text);
+        p = strstr(bad, "\nrank.tie_ratio = ");
+        CHECK(p != NULL);
+        if (p) p[1] = '#';
+        n = snprintf(bad + n, sizeof bad - (size_t)n, "rank.tie_ratio = 2\n") + n;
+        PARSE_EX(bad, (size_t)n, IMD_PERF_CALIB_ERR_INCONSISTENT, 0, "rank.tie_ratio",
+                 "must be in [1, 1.25]");
+      }
+      /* load_ex: a missing file; ARGUMENT */
+      memset(&e, 0x5a, sizeof e);
+      e.struct_size = sizeof e;
+      CHECK(imd_perf_calib_load_ex("/nonexistent/x.calib", &tmp, &e) == IMD_STATUS_INVALID_VALUE &&
+            e.reason == IMD_PERF_CALIB_ERR_FILE && e.line == 0 && e.key[0] == '\0' &&
+            strstr(e.message, "cannot open '/nonexistent/x.calib'") != NULL);
+      memset(&e, 0x5a, sizeof e);
+      e.struct_size = sizeof e;
+      CHECK(imd_perf_calib_parse_ex(text, len, NULL, &e) == IMD_STATUS_INVALID_VALUE &&
+            e.reason == IMD_PERF_CALIB_ERR_ARGUMENT);
+      CHECK(imd_perf_calib_load_ex(NULL, &tmp, &e) == IMD_STATUS_INVALID_VALUE &&
+            e.reason == IMD_PERF_CALIB_ERR_ARGUMENT);
+      /* err may be NULL; err->struct_size < 16: INVALID_VALUE, nothing written; 16: only the
+       * first 16 bytes */
+      CHECK(imd_perf_calib_parse_ex(text, len, &tmp, NULL) == IMD_STATUS_SUCCESS);
+      memset(&e, 0x5a, sizeof e);
+      e.struct_size = 12;
+      CHECK(imd_perf_calib_parse_ex(text, len, &tmp, &e) == IMD_STATUS_INVALID_VALUE &&
+            e.line == 0x5a5a5a5a);
+      memset(&e, 0x5a, sizeof e);
+      e.struct_size = 16;
+      n = snprintf(bad, sizeof bad, "%sbogus.key = 1\n", text);
+      CHECK(imd_perf_calib_parse_ex(bad, (size_t)n, &tmp, &e) == IMD_STATUS_INVALID_VALUE &&
+            e.struct_size == 16 && e.line == lines + 1 &&
+            e.reason == IMD_PERF_CALIB_ERR_UNKNOWN_KEY && e.reserved == 0 &&
+            (unsigned char)e.key[0] == 0x5a);
+      /* the shipped calibration parses: reason OK */
+      memset(&e, 0x5a, sizeof e);
+      e.struct_size = sizeof e;
+      tmp.struct_size = sizeof tmp;
+      CHECK(imd_perf_calib_default_ex(&tmp, &e) == IMD_STATUS_SUCCESS &&
+            e.reason == IMD_PERF_CALIB_OK && e.line == 0 && e.message[0] == '\0' &&
+            memcmp(tmp.param, cal.param, sizeof cal.param) == 0);
+      CHECK(imd_perf_calib_default_ex(NULL, &e) == IMD_STATUS_INVALID_VALUE &&
+            e.reason == IMD_PERF_CALIB_ERR_ARGUMENT);
+      CHECK(strcmp(imd_perf_calib_error_name(IMD_PERF_CALIB_OK), "IMD_PERF_CALIB_OK") == 0 &&
+            strcmp(imd_perf_calib_error_name(IMD_PERF_CALIB_ERR_TOO_LONG),
+                   "IMD_PERF_CALIB_ERR_TOO_LONG") == 0 &&
+            strcmp(imd_perf_calib_error_name(IMD_PERF_CALIB_ERR_INCONSISTENT),
+                   "IMD_PERF_CALIB_ERR_INCONSISTENT") == 0 &&
+            imd_perf_calib_error_name(IMD_PERF_CALIB_ERR_COUNT) == NULL &&
+            imd_perf_calib_error_name(-1) == NULL);
+#undef PARSE_EX
     }
     CHECK(strcmp(imd_perf_class_name(IMD_PERF_CLASS_KL), "kl") == 0);
     CHECK(strcmp(imd_perf_param_name(IMD_PERF_CLASS_K4_64x64, 3), "mac3") == 0);
@@ -523,10 +719,13 @@ int main(void) {
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
       rq.k4_config = -1, rq.eps_fraction = 1.5; /* a fraction above 1 */
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
-      /* N = 9: T < 2^53, so the eps fraction is 0 whatever the request */
+      /* host API 11 (DESIGN v1.15 §6c.1): the eps path is retired; a valid fraction is ignored
+       * (eps_s and eps_fraction out are 0); NaN is still rejected */
+      { volatile double z = 0.0; rq.eps_fraction = z / z; }
+      CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_INVALID_VALUE);
       rq.eps_fraction = 1.0;
       CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &rq, &cal, &pr) == IMD_STATUS_SUCCESS &&
-            pr.eps_fraction == 0.0);
+            pr.eps_fraction == 0.0 && pr.eps_s == 0.0);
       rq.eps_fraction = -1.0;
       back = cal;
       back.format = 3;

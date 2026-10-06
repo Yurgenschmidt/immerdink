@@ -29,6 +29,7 @@ import math
 import os
 import random
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -968,9 +969,9 @@ def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod
                                      grid_chain("direct", b * m * n, k), 0, 0]))
         return ph + [("call", 0, [1, lw.kernel_launches, 0, 0, 0, 0])]
     rows, pad = [b * m, b * n], [b * m, b * nh]
-    # the typical-data eps fraction (immerdink_host.h): exact log2 T, the margin ramp
-    lt = math.log2(math.isqrt((math.prod(MODULI[:N]) - 1) // 2))
-    wide = 0.0 if lt < 53 else min(1.0, max(0.0, (lt - 0.5 * math.log2(k) - 53 + 2.5) / 1.5))
+    # v1.15 (DESIGN §6c.1 "The eps path — retired"): no eps fraction; the op_eps slots are 0
+    # and the chains carry no (1 + f) factor (wide = 0 keeps the v1.10 transcription's shape)
+    wide = 0.0
     if not lw.fused and not res:
         ph.append(k0)
     if lw.fused:
@@ -1211,6 +1212,288 @@ def suite_perf_v110(cal, names, rng):
     return count
 
 
+def _sized_calib(fn, size, *args):
+    """Call a C calibration function (host API 10 _ex form) with a struct whose struct_size is
+    `size` (a caller compiled against an older API): the bytes beyond it are poisoned and must
+    stay untouched. Returns (status, raw, error)."""
+    h = host.load()
+    raw = host._PerfCalib()
+    C.memset(C.byref(raw), 0x5A, C.sizeof(raw))
+    raw.struct_size = size
+    e = host._PerfCalibError()
+    e.struct_size = C.sizeof(e)
+    st = getattr(h.lib, fn)(*args, C.byref(raw), C.byref(e))
+    tail = bytes(raw)[size:]
+    if tail != b"\x5a" * len(tail):
+        raise Fail(f"{fn} wrote beyond struct_size {size}")
+    return st, raw, e
+
+
+V10_CALIB_SIZE = 3672  # sizeof(imd_perf_calib_t) of host API 7..10 (v9 and v10: the same)
+
+
+def suite_perf_v115(cal):
+    """DESIGN v1.15 §6c.7 (host API 11): the optional power.byte_f_pj, the folded v7..v10 view,
+    identity at byte_f = 0, monotonicity of the SUSTAINED clock."""
+    count = 0
+    shapes = [("ik,jk->ij", dict(i=512, j=512, k=512)), ("ik,jk->ij", dict(i=1500, j=96, k=40000)),
+              ("ik,jk->ij", dict(i=4096, j=4096, k=4096)), ("ik,jk->ij", dict(i=8192, j=8192, k=8192)),
+              ("ik,jk->ij", dict(i=12288, j=384, k=1040)),
+              ("acQ,bdQ->acbd", dict(a=64, b=64, c=64, d=64, Q=2048))]
+    regimes = (("BURST", 0.0), ("SUSTAINED", 0.0), ("DEFAULT", 0.0), ("DEFAULT", 2200.0))
+
+    def preds(c):
+        return [host.predict(sp, ex, N=N, regime=rg, clock_mhz=ck, cache=cc, calib=c)
+                for sp, ex in shapes for N in (8, 14, 16) for rg, ck in regimes
+                for cc in ("COLD", "REPEAT")]
+
+    # The shipped calibration of the combined refit (NOTES-B2 §10) carries power.byte_f_pj:
+    # it formats with the key and parses back bit-exactly; the checks below use its byte_f = 0
+    # variant (the calibration without the key) as their base.
+    ship = cal
+    if ship.power["power.byte_f_pj"] != 0.0:
+        ts = ship.format()
+        if "power.byte_f_pj = " not in ts or bytes(host.Calibration.parse(ts)._raw) != bytes(ship._raw):
+            raise Fail("the shipped power.byte_f_pj does not round trip")
+        e0 = dict(ship.extra)
+        e0["power.byte_f_pj"] = 0.0
+        cal = host.Calibration.from_values(ship.meta, ship.params, extra=e0)
+        count += 1
+    # (1) without byte_f the text has no key; an explicit 0 is the same calibration, bit for
+    # bit, formats to the same text and predicts identically (every regime, cache, shape).
+    t0 = cal.format()
+    if "power.byte_f_pj" in t0 or cal.power["power.byte_f_pj"] != 0.0:
+        raise Fail("a calibration with byte_f = 0 writes power.byte_f_pj")
+    c0 = host.Calibration.parse(t0.replace("power.gamma = ", "power.byte_f_pj = 0\npower.gamma = "))
+    if bytes(c0._raw) != bytes(cal._raw) or c0.format() != t0:
+        raise Fail("power.byte_f_pj = 0 is not the calibration without the key")
+    p_ship = preds(cal) if ship is not cal else preds(None)
+    if preds(c0) != p_ship or preds(cal) != p_ship:
+        raise Fail("byte_f = 0 does not predict bit-identically to the shipped calibration")
+    count += len(p_ship)
+    # (2) round trip with the key (format -> parse bit-exact; written after power.byte_pj)
+    ex = dict(cal.extra)
+    ex.update({"power.byte_pj": 100.0, "power.byte_f_pj": 235.5})
+    c2 = host.Calibration.from_values(cal.meta, cal.params, extra=ex)
+    t2 = c2.format()
+    if "power.byte_pj = 100\npower.byte_f_pj = 235.5\n" not in t2:
+        raise Fail("power.byte_f_pj is not written after power.byte_pj")
+    back = host.Calibration.parse(t2)
+    if bytes(back._raw) != bytes(c2._raw) or back.format() != t2 or \
+            back.power["power.byte_f_pj"] != 235.5:
+        raise Fail("power.byte_f_pj round trip")
+    # (3) parse errors: format 1, negative, repeated, not a number
+    v6 = host.Calibration.load(os.path.join(ROOT, "tests/data/perf_calib_v6_format1.calib"))
+    bad = {"format-2 key in format 1": (v6.format() + "power.byte_f_pj = 1\n", "FORMAT2_KEY"),
+           "negative": (t0 + "power.byte_f_pj = -1\n", "VALUE"),
+           "not a number": (t0 + "power.byte_f_pj = x\n", "VALUE"),
+           "repeated": (t2 + "power.byte_f_pj = 1\n", "REPEATED_KEY")}
+    for why, (t, reason) in bad.items():
+        try:
+            host.Calibration.parse(t)
+            raise Fail(f"accepted power.byte_f_pj: {why}")
+        except host.CalibrationError as e:
+            if e.reason != reason or e.key != "power.byte_f_pj":
+                raise Fail(f"power.byte_f_pj {why}: {e.reason} {e.key}")
+        count += 1
+    # (4) the folded view of a v7..v10-sized struct: energy_byte_pj = byte + byte_f, the rest
+    # the same bytes; parse, load and default (byte_f = 0: the full calibration's prefix).
+    h = host.load()
+    data = t2.encode()
+    want = host._PerfCalib.from_buffer_copy(bytes(c2._raw))
+    want.energy_byte_pj = 100.0 + 235.5
+    want.struct_size = V10_CALIB_SIZE
+    st, v10, _ = _sized_calib("imd_perf_calib_parse_ex", V10_CALIB_SIZE, data, len(data))
+    if st != 0 or bytes(v10)[:V10_CALIB_SIZE] != bytes(want)[:V10_CALIB_SIZE]:
+        raise Fail("folded v10 view (parse)")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "f.calib")
+        with open(path, "w") as f:
+            f.write(t2)
+        st, v10l, _ = _sized_calib("imd_perf_calib_load_ex", V10_CALIB_SIZE, os.fsencode(path))
+        if st != 0 or bytes(v10l)[:V10_CALIB_SIZE] != bytes(want)[:V10_CALIB_SIZE]:
+            raise Fail("folded v10 view (load)")
+    st, v10d, _ = _sized_calib("imd_perf_calib_default_ex", V10_CALIB_SIZE)
+    full = host._PerfCalib.from_buffer_copy(bytes(ship._raw))
+    full.struct_size = V10_CALIB_SIZE
+    full.energy_byte_pj = ship.power["power.byte_pj"] + ship.power["power.byte_f_pj"]
+    if st != 0 or bytes(v10d)[:V10_CALIB_SIZE] != bytes(full)[:V10_CALIB_SIZE]:
+        raise Fail("v10 view of the shipped calibration differs from its folded view")
+    # its predictions = the unscaled form with e_byte = byte + byte_f (a file without the key);
+    # read with byte_f = 0 although the poisoned tail is beyond its size
+    ex_fold = dict(ex)
+    ex_fold.update({"power.byte_pj": 100.0 + 235.5, "power.byte_f_pj": 0.0})
+    c_fold = host.Calibration.from_values(cal.meta, cal.params, extra=ex_fold)
+    p_fold = preds(c_fold)
+    if preds(host.Calibration(v10, h)) != p_fold:
+        raise Fail("the v10 view does not predict as the folded (unscaled) calibration")
+    if preds(c2) == p_fold:
+        raise Fail("byte_f > 0 predicts as the folded calibration (no capped shape?)")
+    # imd_perf_calib_format of a v10-sized struct: read with byte_f = 0 (no key written)
+    if host.Calibration(v10, h).format() != c_fold.format():
+        raise Fail("format of a v10-sized struct")
+    count += len(p_fold)
+    # (5) monotonicity of the SUSTAINED clock (gamma = 1; f_s < f_ref: the scaled term is the
+    # smaller one there): moving byte energy into byte_f never lowers the clock, raising byte_f
+    # never raises it, and the 2026-10-05 refit pair lowers it for tensor-core-heavy calls.
+    def mk(tc, byte, byte_f):
+        e = dict(cal.extra)
+        e.update({"power.tc_pj": tc, "power.byte_pj": byte, "power.byte_f_pj": byte_f,
+                  "power.gamma": 1.0})
+        return host.Calibration.from_values(cal.meta, cal.params, extra=e)
+
+    tc0, b0 = cal.power["power.tc_pj"], cal.power["power.byte_pj"]
+    fref, cmin = cal.power["power.clock_eff_mhz"], cal.power["power.clock_min_mhz"]
+    for sp, ext in shapes:
+        for N in (8, 14, 16):
+            def sus(c):
+                return host.predict(sp, ext, N=N, regime="SUSTAINED", cache="COLD", calib=c)
+            moved = [sus(mk(tc0, b0 * (1 - a), b0 * a)) for a in (0.0, 0.25, 0.5, 0.75, 1.0)]
+            for x, y in zip(moved, moved[1:]):
+                if y.clock_mhz < x.clock_mhz or y.time_s > x.time_s * (1 + 1e-12):
+                    raise Fail(f"moving e_byte to e_byte^f lowered the clock: {sp} {ext} N={N}")
+            raised = [sus(mk(tc0, b0, bf)) for bf in (0.0, 50.0, 150.0, 400.0, 1000.0)]
+            for x, y in zip(raised, raised[1:]):
+                if y.clock_mhz > x.clock_mhz or y.time_s < x.time_s * (1 - 1e-12):
+                    raise Fail(f"raising e_byte^f raised the clock: {sp} {ext} N={N}")
+            # a capped solve brackets the cap within the bisection's 0.05 MHz
+            for bf in (150.0, 1000.0):
+                c = mk(tc0, b0, bf)
+                q = sus(c)
+                if cmin < q.clock_mhz < fref:
+                    lo, hi = (host.predict(sp, ext, N=N, clock_mhz=q.clock_mhz + d, cache="COLD",
+                                           calib=c).power_w for d in (-0.05, 0.05))
+                    if not lo <= 450.0 <= hi:
+                        raise Fail(f"SUSTAINED clock {q.clock_mhz} MHz does not meet the cap "
+                                   f"({lo} .. {hi} W) with byte_f {bf}")
+            count += 10
+    for ext in (dict(i=8192, j=8192, k=8192), dict(i=16384, j=16384, k=16384)):
+        old = host.predict("ik,jk->ij", ext, N=14, regime="SUSTAINED", calib=mk(0.6498, 335.0, 0.0))
+        new = host.predict("ik,jk->ij", ext, N=14, regime="SUSTAINED", calib=mk(0.691, 0.0, 296.0))
+        if not (old.clock_mhz < fref and new.clock_mhz < old.clock_mhz and new.time_s > old.time_s):
+            raise Fail(f"refit pair: clock {old.clock_mhz} -> {new.clock_mhz} at {ext}")
+        count += 1
+    return count
+
+
+def suite_calib_errors(cal, lib_path):
+    """Host API 10 (DESIGN §6c.3): every calibration rejection as a CalibrationError with its
+    line, reason, key and message; the shipped calibration loads (no error kept); the
+    generation-time checks of bench/perf_fit.py (check_meta, fit_text, --check) on a notes
+    value one byte over its field and on other malformed metadata."""
+    import tempfile
+    sys.path.insert(0, os.path.join(ROOT, "bench"))
+    import perf_fit
+    n = 0
+    text = cal.format()
+    lines = text.split("\n")
+    nl = len(lines)            # the line after the last ("...\n" ends with an empty item)
+    ln = {l.split(" = ")[0]: i + 1 for i, l in enumerate(lines) if " = " in l}
+    notes128 = "n" * 128
+
+    def drop(key):
+        return "\n".join(l for l in lines if not l.startswith(key + " = "))
+
+    def subst(key, value):
+        return "\n".join((f"{key} = {value}" if l.startswith(key + " = ") else l) for l in lines)
+
+    cases = [  # (text, reason, line, key, message part)
+        (subst("notes", notes128), "TOO_LONG", ln["notes"], "notes",
+         "notes: value is 128 bytes, the field holds 127"),
+        (subst("gpu", "g" * 64), "TOO_LONG", ln["gpu"], "gpu", "the field holds 63"),
+        (subst("clocks", "§" * 64), "TOO_LONG", ln["clocks"], "clocks",
+         "value is 128 bytes"),    # UTF-8 bytes, not characters
+        (text + "bogus.key = 1\n", "UNKNOWN_KEY", nl, "bogus.key", "unknown key"),
+        (text + "k5.byte = 1\n", "REPEATED_KEY", nl, "k5.byte",
+         f"repeated key (first on line {ln['k5.byte']})"),
+        (drop("k5.byte"), "MISSING_KEY", 0, "k5.byte", "missing key"),
+        (drop("band.call_mid"), "MISSING_KEY", 0, "band.call_mid", "missing key"),
+        (drop("gpu"), "MISSING_KEY", 0, "gpu", "missing key"),
+        (subst("format", "3"), "VALUE", ln["format"], "format", "(want 1 or 2)"),
+        (subst("kl.byte", "-1"), "VALUE", ln["kl.byte"], "kl.byte", "invalid value '-1'"),
+        (subst("sm_count", "0"), "VALUE", ln["sm_count"], "sm_count", "[1, 1000000]"),
+        (subst("band.call_mid", "1.2 1.1"), "VALUE", ln["band.call_mid"], "band.call_mid",
+         "lo <= hi"),
+        ("kl.byte\n" + text, "SYNTAX", 1, "", "'kl.byte' is not"),
+        (subst("rank.tie_ratio", "2"), "INCONSISTENT", 0, "rank.tie_ratio", "[1, 1.25]"),
+    ]
+    if cal.power["power.cap_w"] > 0:
+        cases.append((subst("power.clock_min_mhz", "1e9"), "INCONSISTENT", 0,
+                      "power.clock_min_mhz", "power.cap_w > 0 needs"))
+    if cal.file_format == 2:
+        cases.append((subst("format", "1"), "FORMAT2_KEY", None, None,
+                      "a format-2 key in a format-1 calibration"))
+    for t, reason, line, key, msg in cases:
+        try:
+            host.Calibration.parse(t)
+            raise Fail(f"accepted a calibration ({reason}, {key})")
+        except host.CalibrationError as e:
+            if (e.reason != reason or (line is not None and e.line != line) or
+                    (key is not None and e.key != key) or msg not in e.message or
+                    not isinstance(e, ValueError) or msg not in str(e)):
+                raise Fail(f"{reason} {key}: got {e.reason} line {e.line} key {e.key!r}: "
+                           f"{e.message!r}")
+        n += 1
+    # 127 bytes fit
+    if host.Calibration.parse(subst("notes", "n" * 127)).meta["notes"] != "n" * 127:
+        raise Fail("a 127-byte notes value")
+    # load: a missing file, the committed over-long test vector (line 9)
+    try:
+        host.Calibration.load("/nonexistent/x.calib")
+        raise Fail("loaded a missing file")
+    except host.CalibrationError as e:
+        if e.reason != "FILE" or e.line != 0 or "cannot open" not in e.message:
+            raise Fail(f"missing file: {e}")
+    vec = os.path.join(ROOT, "tests/data/perf_calib_notes_too_long.calib")
+    try:
+        host.Calibration.load(vec)
+        raise Fail("loaded the over-long notes vector")
+    except host.CalibrationError as e:
+        if (e.reason, e.line, e.key) != ("TOO_LONG", 9, "notes"):
+            raise Fail(f"over-long notes vector: {e}")
+    # the shipped calibration parses: nothing kept, predict with calib=None works
+    h = host.load(lib_path)
+    if h.shipped_calib_error is not None:
+        raise Fail(f"shipped calibration: {h.shipped_calib_error}")
+    h.check_shipped_calib()
+    n += 4
+    # perf_fit: the generation-time checks
+    good = dict(cal.meta)
+    if perf_fit.check_meta(good):
+        raise Fail(f"check_meta on the shipped metadata: {perf_fit.check_meta(good)}")
+    bad_meta = {"notes": notes128, "gpu": "a\nb", "version": " v", "clocks": "§" * 64,
+                "date": "2026-10-06 "}
+    probs = perf_fit.check_meta(bad_meta)
+    for want in ("notes: 128 bytes, the calibration field holds 127", "gpu: contains a line break",
+                 "version: leading or trailing blank", "clocks: 128 bytes",
+                 "date: leading or trailing blank"):
+        if not any(want in p for p in probs):
+            raise Fail(f"check_meta missed {want!r}: {probs}")
+    cut = perf_fit.fit_text("§" * 100, "notes")      # 200 bytes -> 63 characters, 126 bytes
+    if cut != "§" * 63 or perf_fit.fit_text("short", "notes") != "short":
+        raise Fail(f"fit_text: {cut!r}")
+    if perf_fit.check_meta({"notes": perf_fit.fit_text("x" * 500 + " ", "notes")}):
+        raise Fail("fit_text output does not pass check_meta")
+    with tempfile.TemporaryDirectory() as d:
+        ok_path = os.path.join(d, "ok.calib")
+        with open(ok_path, "w") as f:
+            f.write(text)
+        if perf_fit.check_calibration_file(ok_path, lib_path):
+            raise Fail(f"--check on a good file: {perf_fit.check_calibration_file(ok_path)}")
+        probs = perf_fit.check_calibration_file(vec, lib_path)
+        if (len(probs) != 2 or ":9: notes: 128 bytes" not in probs[0] or
+                "[TOO_LONG]" not in probs[1]):
+            raise Fail(f"--check on the over-long vector: {probs}")
+        for argv, code in ((["--check", ok_path], 0), (["--check", ok_path, vec], 1)):
+            try:
+                perf_fit.main(argv + ["--lib", lib_path])
+                raise Fail(f"perf_fit {argv}: no exit")
+            except SystemExit as e:
+                if e.code != code:
+                    raise Fail(f"perf_fit {argv}: exit {e.code}, want {code}")
+    return n + 8
+
+
 def suite_perf(args):
     host.load(args.host_lib)
     os.environ["IMMERDINK_HOST_LIB"] = args.host_lib
@@ -1242,6 +1525,10 @@ def suite_perf(args):
             raise Fail(f"accepted an invalid calibration: {bad[-40:]!r}")
         except ValueError:
             pass
+    n_err = suite_calib_errors(cal, args.host_lib)  # host API 10 (DESIGN §6c.3)
+    if args.verbose:
+        print(f"  ok  calibration errors: {n_err} checks (reasons, lines, keys, messages; "
+              f"perf_fit generation checks and --check)")
     # --- features == the independent transcription; K4 == the A3 estimate ----------------
     cases = [  # spec, extents, along_rows (A, B) of the post-swap operands
         ("ik,jk->ij", dict(i=64, j=64, k=64), (False, False)),
@@ -1308,10 +1595,8 @@ def suite_perf(args):
             if q.cls != host.PERF_CLASSES[4 + c] or not close(ns, est, 1e-9):
                 raise Fail(f"K4 {m},{n},{k},{b} config {c}: {ns} ns vs A3 estimate {est} ns")
     # --- monotonicity: a bigger shape never takes less time (same K4 configuration, path) -
-    # Against the shipped (fitted) calibration and a synthetic one with a large eps-path cost.
-    # With a fixed eps fraction the time never drops; with the default fraction it may drop
-    # when k doubles (the typical-data estimate falls from 1 to 0 as k grows, DESIGN §6c.1),
-    # but never below the time without the eps terms.
+    # Against the shipped (fitted) calibration and a synthetic one with large op_eps values
+    # (v1.15: they have no effect; every request eps fraction predicts the same time).
     heavy = dict(cal.params)
     for key in ("kf.op_eps", "kl.op_eps", "pack.op_eps"):
         heavy[key] = 50 * (heavy[key] + 1e-4)
@@ -1336,7 +1621,7 @@ def suite_perf(args):
                                        eps_fraction=eps, calib=cb)
                     if big.status != "SUCCESS":
                         continue
-                    floor = base.time_s - (base.eps_fraction * base.eps_s if eps is None else 0)
+                    floor = base.time_s
                     if big.time_s < floor * (1 - 1e-12):
                         raise Fail(f"monotonicity ({which}, eps {eps}): {ext} N={N} g={g}: "
                                    f"{big.time_s} < {floor} ({m},{n},{k})")
@@ -1346,19 +1631,81 @@ def suite_perf(args):
                                 k4_config=more_n.k4_config, calib=cb)
             if more_n.status == same.status == "SUCCESS" and more_n.time_s < same.time_s:
                 raise Fail(f"monotonicity in N ({which}): {m},{n},{k} N={N}")
-    # the eps bracket: time at fraction f = time at 0 + f eps_s; the default ramp
-    for N, k in ((14, 300), (15, 4096), (16, 50000), (17, 2048), (13, 64)):
-        ext = dict(i=256, j=256, k=k)
-        # (at a fixed clock: under SUSTAINED the eps work also moves the settled clock)
-        p0, p1 = (host.predict("ik,jk->ij", ext, N=N, eps_fraction=f, regime="BURST")
-                  for f in (0.0, 1.0))
-        pd = host.predict("ik,jk->ij", ext, N=N, regime="BURST")
-        lt = math.log2(math.isqrt((math.prod(MODULI[:N]) - 1) // 2))
-        want = 0.0 if lt < 53 else min(1.0, max(0.0, (lt - 0.5 * math.log2(k) - 53 + 2.5) / 1.5))
-        if not close(pd.eps_fraction, want, 1e-9) or \
-                not close(pd.time_s, p0.time_s + pd.eps_fraction * pd.eps_s) or \
-                not close(p1.time_s, p0.time_s + p0.eps_s) or (lt < 53 and p1.eps_fraction != 0):
-            raise Fail(f"eps bracket N={N} k={k}: {pd.eps_fraction} vs {want}")
+    # v1.15 (DESIGN §6c.1 "The eps path — retired", §6c.4): every request fraction predicts
+    # bit-identically, eps_s / eps_fraction are 0, the op_eps slots are 0, and op_eps values in
+    # the calibration have no effect (the heavy calibration above predicts as the shipped one).
+    hv = host.Calibration.from_values(cal.meta, heavy, extra=cal.extra or None)
+    zero = dict(cal.params)
+    for key in ("kf.op_eps", "kl.op_eps", "pack.op_eps"):
+        zero[key] = 0.0
+    zc = host.Calibration.from_values(cal.meta, zero, extra=cal.extra or None)
+    op_eps_slot = {"kf": 4, "kl": 4, "pack": 3}
+    n_eps = 0
+    for N in range(2, 21):
+        for k in (16, 64, 300, 1024, 4096, 50000):
+            ext = dict(i=256, j=192, k=k)
+            for rg in ("BURST", "SUSTAINED"):
+                ref = host.predict("ik,jk->ij", ext, N=N, regime=rg, calib=zc)
+                if ref.status != "SUCCESS":
+                    continue
+                for f in (None, -1.0, 0.0, 0.5, 1.0):
+                    for cb in (None, hv, zc):
+                        p = host.predict("ik,jk->ij", ext, N=N, eps_fraction=f, regime=rg, calib=cb)
+                        if repr(p) != repr(ref):
+                            raise Fail(f"eps retired: N={N} k={k} {rg} f={f}: prediction differs")
+                        if p.eps_s != 0 or p.eps_fraction != 0:
+                            raise Fail(f"eps retired: eps_s {p.eps_s} / eps_fraction {p.eps_fraction}")
+                        for q in p.phases:
+                            j = op_eps_slot.get(q.cls)
+                            if j is not None and q.x[j] != 0:
+                                raise Fail(f"eps retired: {q.cls} op_eps feature {q.x[j]}")
+                        n_eps += 1
+            pk = host.pack_desc_for("ik,jk->ij", ext, operand=0, N=N)
+            pp = [host.predict_pack(pk, eps_fraction=f, regime="BURST", calib=zc)
+                  for f in (None, 0.0, 1.0)]
+            if pp[0].status == "SUCCESS" and (repr(pp[1]) != repr(pp[0]) or repr(pp[2]) != repr(pp[0])
+                                               or pp[0].eps_s != 0):
+                raise Fail(f"eps retired: predict_pack N={N} k={k}")
+    rk = [host.rank("ik,jk->ij", dict(i=512, j=512, k=2048), N=[14, 16], packs=("NONE", "A"),
+                    eps_fraction=f, calib=hv) for f in (None, 0.0, 1.0)]
+    if repr(rk[0]) != repr(rk[1]) or repr(rk[0]) != repr(rk[2]) or any(c.eps_s != 0 or c.eps_fraction != 0 for c in rk[0]):
+        raise Fail("eps retired: rank depends on eps_fraction or reports eps terms")
+    for bad in (1.5, float("nan")):
+        try:
+            st = host.predict("ik,jk->ij", dict(i=8, j=8, k=8), N=16, eps_fraction=bad).status
+        except Exception:
+            continue
+        if st == "INVALID_VALUE":
+            continue
+        raise Fail(f"eps retired: eps_fraction {bad} accepted (still validated)")
+    # the op_eps keys: optional (absent = 0) in formats 1 and 2, written only when non-zero
+    opk = ("kf.op_eps", "kl.op_eps", "pack.op_eps")
+
+    def strip_op_eps(t):
+        return "\n".join(l for l in t.split("\n") if l.split(" = ")[0] not in opk)
+    for base in (cal, hv, host.Calibration.load(os.path.join(ROOT,
+                                                             "tests/data/perf_calib_v6_format1.calib"))):
+        tb = base.format()
+        nz = {kk for kk in opk if base.params[kk] != 0}
+        if {kk for kk in opk if f"\n{kk} = " in tb} != nz:
+            raise Fail("op_eps keys: written iff non-zero")
+        back = host.Calibration.parse(strip_op_eps(tb))
+        if any(back.params[kk] != 0 for kk in opk) or any(f"\n{kk} = " in back.format() for kk in opk):
+            raise Fail("op_eps keys: absent is not 0 / not omitted")
+        if bytes(host.Calibration.parse(tb)._raw) != bytes(base._raw):
+            raise Fail("op_eps keys: round trip")
+        n_eps += 1
+    # DESIGN v1.15 §6c.2 "Not backward-readable" (review 2026-10-06): the shipped file omits
+    # the op_eps keys (MISSING_KEY in API <= 10) and carries power.byte_f_pj (unknown key in
+    # API <= 10); if either changes, the format note in §6c.2 must be revisited.
+    with open(os.path.join(ROOT, "src/host/calib/rtx4090_sm89.calib")) as f:
+        shipped_keys = {l.split(" = ")[0].strip() for l in f if " = " in l and not l.startswith("#")}
+    if shipped_keys & set(opk) or "power.byte_f_pj" not in shipped_keys:
+        raise Fail("shipped calibration: op_eps / byte_f keys differ from DESIGN §6c.2's "
+                   "backward-readability note")
+    n_eps += 1
+    print(f"  ok  eps retired (v1.15):{n_eps} predictions independent of eps_fraction / op_eps; "
+          "op_eps keys optional")
     # --- statuses: kappa >= T (N = 2, T = 180) gives the plan-time status and no time -------
     p = host.predict("ik,jk->ij", dict(i=3, j=5, k=180 * 180), N=2)
     if p.status != "NOT_SUPPORTED" or p.time_s != 0 or p.phases:
@@ -1428,6 +1775,10 @@ def suite_perf(args):
     if args.verbose:
         print(f"  ok  v1.10: {n_v110} checks (format 1 = v6, format 2, regimes, cache, bands, "
               f"rank ties)")
+    n_v115 = suite_perf_v115(cal)  # DESIGN v1.15 §6c.7 (host API 11)
+    if args.verbose:
+        print(f"  ok  v1.15: {n_v115} checks (power.byte_f_pj optional, round trip, errors, "
+              f"folded v10 view, identity at 0, clock monotonicity)")
     if args.verbose:
         print(f"  ok  calibration round trip, {n_feat} feature transcriptions, K4 == A3 "
               f"estimate, {mono} monotonicity pairs, statuses, packed, {n_rank} ranked "

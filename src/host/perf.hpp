@@ -23,8 +23,6 @@ struct PerfPhase {
   double x[IMD_PERF_MAX_PARAMS] = {0, 0, 0, 0, 0, 0};
   double bytes = 0, ops = 0;
   int peak = 0;
-  // The eps-path part of each feature at eps fraction 1 (x[j] carries f * eps_x[j] of it).
-  double eps_x[IMD_PERF_MAX_PARAMS] = {0, 0, 0, 0, 0, 0};
   double in_bytes = 0;  // v1.10: the call's input bytes this phase reads first
 };
 struct PerfPhases {
@@ -32,8 +30,6 @@ struct PerfPhases {
   int32_t n = 0;
   int32_t k4_config = IMD_K4_128x256;  // the K4 configuration of the K4 phase
   int64_t launches = 0;                // kernel launches of the call
-  double eps_fraction = 0;             // the eps-path fraction the features carry
-  bool eps_possible = false;           // T >= 2^53: the eps path exists (else eps_s = 0)
   // v1.10 (COLD / WARM): the call's input bytes I and its footprint F (inputs + workspace /
   // pack buffers + the output), DESIGN §6c.1 "Cache state".
   double inputs = 0, footprint = 0;
@@ -43,21 +39,18 @@ struct PerfPhases {
 // order, the call term last. flags: IMD_PERF_BETA_NONZERO / IMD_PERF_ALPHA_ZERO; k4: -1 =
 // k4_select for the calibration's sm_count, else that configuration; the calibration gives the
 // SM count, the L2 of K4's DRAM term and the occupancy of the chains (cal.kernel, resolved:
-// see perf_resolve_calib); eps: the eps-path fraction (< 0: perf_eps_fraction's default).
+// see perf_resolve_calib). v1.15 (DESIGN §6c.1 "The eps path — retired"): no eps fraction (the
+// v1.14 pack emitter costs the same for every eps; the op_eps slots are 0).
 IMD_HOST_INTERNAL void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags,
-                                            int32_t k4, const imd_perf_calib_t& cal, double eps,
+                                            int32_t k4, const imd_perf_calib_t& cal,
                                             PerfPhases* out);
 
 // The phases of one imd_pack of a SUCCESS pack lowering (none for an empty pack).
 IMD_HOST_INTERNAL void perf_pack_phases(const PackLowered& pl, const imd_perf_calib_t& cal,
-                                        double eps, PerfPhases* out);
+                                        PerfPhases* out);
 
 // log2 T(N), exactly from the §2 table (not floor(log2 T)).
 IMD_HOST_INTERNAL double perf_log2_T(int N);
-// The eps-path fraction (immerdink_host.h, §6c.1): 0 when T < 2^53; else the request's
-// (req in [0, 1]) or, for req < 0, the typical-data default: the margin D = log2 T -
-// log2(k) / 2 - 53 mapped linearly from 0 at D = -2.5 to 1 at D = -1.
-IMD_HOST_INTERNAL double perf_eps_fraction(int N, double k, double req);
 
 // Predicted time of a phase in seconds under calibration c, its clock-bound terms multiplied
 // by `scale` (= f_ref / f; 1 at the reference clock).

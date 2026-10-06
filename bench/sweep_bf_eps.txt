@@ -1,0 +1,20 @@
+# DESIGN v1.14 §3.4.1 A/B (branch-free eps pack emitter): bench/run_ab.sh before / after on
+# typical (--data normal) and dominant-entry data (--data dominant), per-phase times (KF / KL /
+# K2 / K3 / imd_pack's KL) and call TFLOPS-eq, C's hash (c_hash) for bit identity. Covers KF
+# E = 16 and E = 4 (small), K2/K3 with moduli parts (gridDim.y > 1, g < N), KL E = 8 and E = 4
+# (long rows), large squares, r_mm-like skinny n, k-heavy, a DF-like tensor.
+# name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
+e_s64     | ik,jk->ij | i=64,j=64,k=64             | imd | 8,13,14,15,16,17,20 | --reps 300 --phase-reps 20 --max-seconds 0.5
+e_s256g   | ik,jk->ij | i=256,j=256,k=256          | imd | 8,13,14,15,16,17,20 | --reps 300 --phase-reps 20 --max-seconds 0.5 --g 0,3
+e_s256gd  | ik,jk->ij | i=256,j=256,k=256          | imd | 8,13,16,17,20 | --reps 300 --phase-reps 20 --max-seconds 0.5 --g 0,3 --data dominant
+e_sq1024  | ik,jk->ij | i=1024,j=1024,k=1024       | imd | 8,13,14,15,16,17,20 | --reps 100 --phase-reps 10 --max-seconds 0.5 --g 0,4
+e_sq1024d | ik,jk->ij | i=1024,j=1024,k=1024       | imd | 8,13,14,15,16,17,20 | --reps 100 --phase-reps 10 --max-seconds 0.5 --data dominant
+e_sq4096  | ik,jk->ij | i=4096,j=4096,k=4096       | imd | 8,13,14,15,16,17,20 | --reps 10 --phase-reps 3 --max-seconds 1
+e_sq4096d | ik,jk->ij | i=4096,j=4096,k=4096       | imd | 8,13,16,17,20 | --reps 10 --phase-reps 3 --max-seconds 1 --data dominant
+e_kh      | ik,jk->ij | i=1024,j=1024,k=16384      | imd | 8,13,14,15,16,17,20 | --reps 20 --phase-reps 5 --max-seconds 0.5
+e_khd     | ik,jk->ij | i=1024,j=1024,k=16384      | imd | 8,13,16,17,20 | --reps 20 --phase-reps 5 --max-seconds 0.5 --data dominant
+e_rmm     | ik,jk->ij | i=16384,j=256,k=4096       | imd | 8,13,14,15,16,17,20 | --reps 20 --phase-reps 5 --max-seconds 0.5
+e_rmmd    | ik,jk->ij | i=16384,j=256,k=4096       | imd | 8,13,16,17,20 | --reps 20 --phase-reps 5 --max-seconds 0.5 --data dominant
+e_df      | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | imd | 8,13,14,15,16,17,20 | --reps 20 --phase-reps 5 --max-seconds 0.5
+e_dfd     | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | imd | 8,13,16,17,20 | --reps 20 --phase-reps 5 --max-seconds 0.5 --data dominant
+e_pack    | ik,jk->ij | i=2048,j=2048,k=2048       | packed | 8,13,16,17,20 | --reps 30 --phase-reps 5 --max-seconds 0.5 --pack A --reuse 1
