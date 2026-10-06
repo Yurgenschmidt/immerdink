@@ -56,6 +56,15 @@
 (*                               the key check (the FORMAT word matters)   *)
 (*   neg_fmt_hook_rev    CEqual  a format-2 pack read by a format-1 plan   *)
 (*   neg_witness_hook_reject  NeverMismatch (pos_hook_check rejects)       *)
+(* v1.13 §4b PACK_MISMATCH reason order (review 2026-10-05, must-fix 4):   *)
+(*   pos_reason_order    every key mutation in format 2 (kpmin 3): a       *)
+(*                 reason iff mismatch; FORMAT only for the same tensor    *)
+(*                 ("kset" straddles kpmin: CLASSES, not FORMAT)           *)
+(*   pos_reason_hook     format-1 plan, format-2 pack (hook) with N / rnd  *)
+(*                 / kset / order mutations: the other reason wins         *)
+(*   pos_reason_both     both packed, formats forced apart                 *)
+(*   neg_reason_fmt_first  FormatMeansSameTensor  the pre-review order     *)
+(*                 (FORMAT word first) reports FORMAT for "kset"           *)
 (* Witnesses (must fail: the positives are not vacuous):                   *)
 (*   neg_witness_mismatch      NeverMismatch    (pos_key_check rejects)    *)
 (*   neg_witness_native_order  NativeOrderFree  (pos_flags: a flagged      *)
@@ -90,7 +99,7 @@ VXinf == {-3, 2, INF}
 CmpBase == [N |-> 2, rnd |-> "RN", roles |-> {"A", "B"}, gs |-> {1, 2},
             defOrder |-> "21", both |-> FALSE, muts |-> {"none"},
             check |-> FALSE, vx |-> VXa, vy |-> VYa,
-            kpmin |-> 8, hookPlan |-> 0, hookPack |-> 0]
+            kpmin |-> 8, hookPlan |-> 0, hookPack |-> 0, fmtFirst |-> FALSE]
 CmpTrunc2   == [CmpBase EXCEPT !.rnd = "TRUNC"]
 CmpRN3      == [CmpBase EXCEPT !.N = 3, !.gs = {1, 2, 3}]
 CmpBoth     == [CmpBase EXCEPT !.both = TRUE]
@@ -122,6 +131,11 @@ CmpHookCheckBoth == [CmpBoth EXCEPT !.check = TRUE, !.hookPack = 2]
 CmpHookAgree    == [CmpBase EXCEPT !.check = TRUE, !.hookPack = 2, !.hookPlan = 2]
 CmpHookNoCheck  == [CmpBase EXCEPT !.hookPack = 1, !.hookPlan = 2]
 CmpHookNoCheckRev == [CmpBase EXCEPT !.hookPack = 2]
+\* reason order (review 2026-10-05): every key mutation in format 2, the
+\* hook-forced format mismatches, and the pre-review FORMAT-first order
+CmpReasonHook   == [CmpKeyCheck EXCEPT !.hookPack = 2, !.muts = {"none", "N", "rnd", "kset", "order"}]
+CmpReasonBoth   == [CmpKeyCheckBoth EXCEPT !.kpmin = 3, !.hookPack = 1]
+CmpReasonOld    == [CmpKeyCheckFmt2 EXCEPT !.fmtFirst = TRUE]
 
 \* streams: pack, c1, c2, the later write (post) on postSt
 StrmSame    == [pack |-> 1, c1 |-> 1, c2 |-> 1, postSt |-> 1, post |-> "repack",

@@ -191,6 +191,31 @@ refit is an open item, to be done with stage 2.
 - **Deferred.** The realign-kernel alternative stays one deferred paragraph. The ncu check of
   class 32 on 64×64 is wanted, but not as a gate.
 
+### 7a. Adversarial review of the stage-2 design (2026-10-05, applied)
+
+The design (d60201f) was judged sound to build once nine must-fixes were applied; they are
+folded into DESIGN §4b.3–§4b.11, §6a and §6b.5 (changelog "Adversarial review"):
+- the format lives only in the handle key; the hazard is **caller-persisted pack bytes**
+  (v8 format-1 bytes in a v9 format-2 handle: silent wrong stride), so callers persisting
+  bytes persist `format` and `pack_bytes` and re-pack on a difference;
+- A is resolved **once per API call** (`analyze`, `pack_lower`) and passed explicitly
+  (`WorkspaceShape`, `pack_layout`, `ExecPlan.k_align`); libimmerdink never resolves;
+- the hook is one out-of-line atomic in libimmerdink_host (hidden visibility would
+  duplicate a header static per `.so`);
+- PACK_MISMATCH: an unknown format word first, the 1-vs-2 difference **last** (k = 96 pack,
+  k = 97 plan: EXTENTS), against the plan's own format; the oracle does this now, and
+  PackedOperand models the order (`neg_reason_fmt_first` fails);
+- `k_hat_of` defaults to the policy and `PACK_FORMAT` is derived, so the policy flip is one
+  switch; the test call sites that rely on a default are listed in DESIGN §4b.8;
+- initcheck on unpoisoned fresh allocations; the [k, k̂) zero check over KL and K2/K3;
+- the stage-1 window tests pin A = 16; 196608 and 262017 are added;
+- with A = 64 the last add-mod shape key can merge (k ∈ (n·K_c' − 64, n·K_c' − 16], n ≥ 3,
+  e.g. 393008: plan host bytes differ) and the 256 MiB `k4_tune` cap can be crossed;
+- `host.test_set_k_align` clears the Python plan cache.
+The review's three questions are resolved in DESIGN §4b.11 (reject; hook in
+libimmerdink_host; FORMAT after the other words). Full text: immerdink-eval
+`findings/k4align-s2-review.md`.
+
 ## 8. The AUTO threshold `K_PAD64_MIN` (sweep, 2026-10-05)
 
 Setup: origin/dev ca7141c, profiling `imd_bench`, the gated runner (quiet gate, shared GPU

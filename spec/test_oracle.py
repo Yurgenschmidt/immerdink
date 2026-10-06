@@ -1409,7 +1409,9 @@ def test_k_align():
     both; across the AUTO threshold and forced) are bit-identical to the in-line run (A
     changes no value); the key's FORMAT word is the format; a pack whose A differs from the
     plan's is MISMATCH_FORMAT, which under AUTO cannot happen (pack and plan resolve A from
-    the same k) and is reached only by forcing A (the library's test hook)."""
+    the same k) and is reached only by forcing A (the library's test hook). Reason order: an
+    unknown format word first, the 1-vs-2 difference last (k = 96 pack, k = 97 plan: EXTENTS;
+    FORMAT with N also differing: MODULI). Every default follows the policy."""
     import params as pp
     for k in range(0, 1500):
         for pol in ("A16", "AUTO", 16, 64):
@@ -1479,10 +1481,78 @@ def test_k_align():
         o.lower_packed(X, Y, Cd, o.EMULATE, (pdX, pdY), N, rnd,
                        fmts=(o.pack_format_for(k, "AUTO"),) * 2, k_align="AUTO")
     assert n_runs > 90 and n_mis > 10, (n_runs, n_mis)
+    # reason order (DESIGN §6b.5, review 2026-10-05 must-fix 4): the 1-vs-2 FORMAT difference
+    # is compared after every other check and key word; an unknown format word comes first
+    n_order = 0
+    for N, rnd in ((3, "RN"), (9, "TRUNC")):
+        for kp, kq in ((96, 97), (97, 96), (64, 200), (200, 64)):   # pack k, plan k (AUTO)
+            Xp = o.Desc([3, kp, 2], [2 * kp, 1, kp], [i, kk, l])
+            Xq = o.Desc([3, kq, 2], [2 * kq, 1, kq], [i, kk, l])
+            Yq = o.Desc([kq, 5, 2], [1, kq, 5 * kq], [kk, j, l])
+            Cd = o.Desc([3, 5, 2], [5, 1, 15], [i, j, l])
+            assert o.pack_format_for(kp, "AUTO") != o.pack_format_for(kq, "AUTO")
+            cases = (  # (pack N, pack rounding, pack format policy, plan policy) -> reason
+                ((N, rnd, "AUTO", "AUTO"), o.MISMATCH_EXTENTS),     # k straddles: not FORMAT
+                ((N + 1, rnd, "AUTO", "AUTO"), o.MISMATCH_MODULI),
+                ((N, "RN" if rnd == "TRUNC" else "TRUNC", "AUTO", "AUTO"), o.MISMATCH_ROUNDING))
+            for (pN, prnd, ppol, qpol), want in cases:
+                pd = o.PackDesc(Xp, pN, prnd, o.ORDER_AUTO, [kk], [l])
+                try:
+                    o.lower_packed(Xq, Yq, Cd, o.EMULATE, (pd, None), N, rnd,
+                                   fmts=(o.pack_format_for(kp, ppol), None), k_align=qpol)
+                    got = 0
+                except o.PackMismatch as e:
+                    got = e.reason
+                assert got == want, (kp, kq, pN, prnd, got, want)
+                n_order += 1
+            # same tensor, other alignment (the hook): FORMAT; with N also differing: MODULI
+            pd = o.PackDesc(Xq, N, rnd, o.ORDER_AUTO, [kk], [l])
+            for pN, want in ((N, o.MISMATCH_FORMAT), (N + 1, o.MISMATCH_MODULI)):
+                pd.N = pN
+                try:
+                    o.lower_packed(Xq, Yq, Cd, o.EMULATE, (pd, None), N, rnd,
+                                   fmts=(3 - o.pack_format_for(kq, "AUTO"), None), k_align="AUTO")
+                    got = 0
+                except o.PackMismatch as e:
+                    got = e.reason
+                assert got == want, (kq, pN, got, want)
+                n_order += 1
+            # an unknown format word (a foreign key layout) is FORMAT before MODULI
+            real = o.pack_lower
+
+            def foreign(pd_, f=None):
+                v = real(pd_, f)
+                v.key = (3,) + tuple(v.key[1:])
+                return v
+            o.pack_lower = foreign
+            try:
+                pd.N = N + 1
+                o.lower_packed(Xq, Yq, Cd, o.EMULATE, (pd, None), N, rnd, k_align="AUTO")
+                raise AssertionError("foreign format accepted")
+            except o.PackMismatch as e:
+                assert e.reason == o.MISMATCH_FORMAT, e.reason
+            finally:
+                o.pack_lower = real
+            n_order += 1
+    # every default follows the policy (must-fix 5): no silent A = 16
+    for k in (1, 96, 97, 200, 4080):
+        assert o.k_hat_of(k) == o.k_hat_of(k, o.k_align_of(k)) == pp.k_hat_of(k)
+        assert o.pack_layout(1, 3, k, 9) == o.pack_layout(1, 3, k, 9, o.pack_format_for(k))
+    assert o.PACK_FORMAT == pp.PACK_FORMAT == o.pack_format_for(o.K_PAD64_MIN + 1)
+    saved = (o.K_ALIGN_POLICY, pp.K_ALIGN_POLICY)
+    try:
+        o.K_ALIGN_POLICY = pp.K_ALIGN_POLICY = "AUTO"            # the stage-2 switch
+        assert o.k_hat_of(200) == pp.k_hat_of(200) == 256 and o.k_hat_of(96) == 96
+        assert pp.workspace_size(17, 33, 200, 3, 9, 2) == pp.workspace_size(17, 33, 200, 3, 9, 2,
+                                                                              k_align=64)
+        assert o.pack_layout(1, 1, 1000, 14)[1] == pp.pack_layout(1, 1, 1000, 14)[1] == 30208
+    finally:
+        o.K_ALIGN_POLICY, pp.K_ALIGN_POLICY = saved
     # the logical k feeds kappa and the error estimates; nothing there sees A (DESIGN §4b)
     for k in (97, 1000):
         assert o.ceil_sqrt(k) == pp.kappa(k)
-    RESULTS["k_align"] = f"{n_runs} packed contractions over formats 1/2 bit-exact, {n_mis} FORMAT mismatches"
+    RESULTS["k_align"] = (f"{n_runs} packed contractions over formats 1/2 bit-exact, {n_mis} FORMAT "
+                          f"mismatches, {n_order} reason-order cases")
 
 
 def check_fusion(v, g):

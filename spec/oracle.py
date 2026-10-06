@@ -73,13 +73,17 @@ K_ALIGN_PAD = 64                         # §4b (v1.13 stage 2): ... or 64 for k
 K_PAD64_MIN = 96                         # §4b: AUTO(k) = 64 iff k > 96
 # The library's K-alignment policy (§4b): "A16" = every plan and pack at A = 16 (implemented
 # through v1.13 stage 1); "AUTO" = stage 2 (designed). The stage-2 implementation flips this
-# switch (with params.K_ALIGN_POLICY); every function also takes an explicit A / format.
+# switch (with params.K_ALIGN_POLICY): every default follows it (k_hat_of, pack_layout,
+# pack_key, pack, PACK_FORMAT); every function also takes an explicit A / format.
 K_ALIGN_POLICY = "A16"
 
 
-def k_hat_of(k, A=K_ALIGN):
+def k_hat_of(k, A=None):
     """§4: k_hat = ceil(k)_A, the residue row stride and K extent (typed from DESIGN;
-    test_oracle cross-checks it with params.k_hat_of)."""
+    test_oracle cross-checks it with params.k_hat_of). A = None: k_align_of(k), the policy's
+    A (§4b; never a silent 16)."""
+    if A is None:
+        A = k_align_of(k)
     return -(-k // A) * A
 
 
@@ -961,7 +965,6 @@ def contract_tensor(A: Tensor, B: Tensor, C: Tensor, alpha: float, beta: float, 
 
 PACK_FORMAT_A16, PACK_FORMAT_A64 = 1, 2   # §6b.4 FORMAT word: k_hat = ceil(k)_16 / ceil(k)_64
 PACK_FORMAT_ALIGN = {PACK_FORMAT_A16: 16, PACK_FORMAT_A64: 64}
-PACK_FORMAT = PACK_FORMAT_A16              # the newest format written (stage 2: 2)
 ORDER_AUTO, ORDER_GIVEN = "AUTO", "GIVEN"
 
 
@@ -969,6 +972,10 @@ def pack_format_for(k, policy=None):
     """§4b / §6b.4: the format of a pack (or of a plan's slot key) of contraction length k:
     1 for A = 16, 2 for A = 64, A = k_align_of(k, policy)."""
     return PACK_FORMAT_A64 if k_align_of(k, policy) == 64 else PACK_FORMAT_A16
+
+
+# the newest format written: a large k's format under the policy (A16: 1, AUTO: 2)
+PACK_FORMAT = pack_format_for(K_PAD64_MIN + 1)
 # PACK_MISMATCH reasons (imd_lowering_t v5 pack_mismatch, immerdink_host.h IMD_PACK_MISMATCH_*)
 (MISMATCH_FORMAT, MISMATCH_MODULI, MISMATCH_ROUNDING, MISMATCH_CLASSES, MISMATCH_EXTENTS,
  MISMATCH_STRIDES, MISMATCH_ORDER) = range(1, 8)
@@ -1014,9 +1021,11 @@ def _fuse_x(modes):
     return out
 
 
-def pack_key(N, rounding, b, r, k, fused, fmt=PACK_FORMAT_A16):
-    """§6b.2 compatibility key: FORMAT (§4b: 1 = A16, 2 = A64), N, rounding (RN 0, TRUNC 1),
-    b, r, k, then per class L, R, K the number of fused modes and their (extent, stride in X)."""
+def pack_key(N, rounding, b, r, k, fused, fmt=None):
+    """§6b.2 compatibility key: FORMAT (§4b: 1 = A16, 2 = A64; None: the policy's for k), N,
+    rounding (RN 0, TRUNC 1), b, r, k, then per class L, R, K the number of fused modes and
+    their (extent, stride in X)."""
+    fmt = pack_format_for(k) if fmt is None else fmt
     words = [fmt, N, 0 if rounding == "RN" else 1, b, r, k]
     for c in ("L", "R", "K"):
         words.append(len(fused[c]))
@@ -1039,14 +1048,20 @@ def _key_kinds(key):
 
 def key_mismatch(slot_key, pack_key_):
     """0 if equal, else the reason code of the first differing word (by the slot key's
-    structure; if one key is a prefix of the other, a count differed first: EXTENTS)."""
+    structure; if one key is a prefix of the other, a count differed first: EXTENTS), the
+    FORMAT word 0 compared LAST (§6b.5, v1.13 §4b review 2026-10-05): FORMAT then means "the
+    same tensor in another K alignment" (in-process only through the test hook), and a pack
+    of another k across K_PAD64_MIN (k = 96 against a plan of k = 97) is EXTENTS. An unknown
+    format word is rejected earlier (lower_packed)."""
     if slot_key == pack_key_:
         return 0
     kinds = _key_kinds(slot_key)
-    for i, (x, y) in enumerate(zip(slot_key, pack_key_)):
+    for i, (x, y) in enumerate(zip(slot_key[1:], pack_key_[1:]), 1):
         if x != y:
             return kinds[i]
-    return MISMATCH_EXTENTS
+    if len(slot_key) != len(pack_key_):
+        return MISMATCH_EXTENTS
+    return MISMATCH_FORMAT
 
 
 def fnv1a64(words):
@@ -1058,13 +1073,14 @@ def fnv1a64(words):
     return h
 
 
-def pack_layout(b, r, k, N, fmt=PACK_FORMAT_A16):
+def pack_layout(b, r, k, N, fmt=None):
     """§6b.4 format fmt (1: k_hat = ceil(k)_16; 2, §4b: ceil(k)_64), typed from DESIGN
     (independently of params.pack_layout, which test_oracle cross-checks): {region: (offset,
     bytes)} for sig, flag, res and pack_bytes; ({}, 0) for b r k = 0. InvalidValue past
-    uint64."""
+    uint64. fmt None: the policy's format for k."""
     if b * r * k == 0:
         return {}, 0
+    fmt = pack_format_for(k) if fmt is None else fmt
     kh = k_hat_of(k, PACK_FORMAT_ALIGN[fmt])
     sizes = (("sig", 2 * b * r), ("flag", b * r),
              ("res", N * b * r * kh + (-(-r // 16) * 16 - r) * kh))
@@ -1256,8 +1272,12 @@ def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN", build
     equal the pack's key (EXTENTS / STRIDES: the first differing word). Returns (view, info).
     §4b: fmts = each pack's format (None: the policy's for its k); the slot key's FORMAT word
     is the PLAN's format, of its own resolved A (k_align: a policy or a forced 16 / 64, None =
-    K_ALIGN_POLICY), so a pack of another format is FORMAT (impossible under AUTO: both
-    resolve A from the same k; reachable through the test hook)."""
+    K_ALIGN_POLICY), never "the newest format". Reason order (DESIGN §6b.5, the same in
+    analysis.cpp, review 2026-10-05 must-fix 4): an UNKNOWN format word (not 1 or 2) is FORMAT
+    first, before MODULI; a known format of the other alignment is compared LAST, after every
+    other key word (key_mismatch), so FORMAT means "the same tensor in the other alignment"
+    (impossible under AUTO: both resolve A from the same k; reachable through the test hook)
+    and a pack of k = 96 offered to a plan of k = 97 is EXTENTS."""
     v0 = lower(A, B, C, mode, build_vec=False)
     pvs = [pack_lower(pd, f) if pd is not None else None for pd, f in zip(packs, fmts)]
     adopted = [None, None]
@@ -1265,6 +1285,8 @@ def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN", build
     for x, (Xd, pd, pv) in enumerate(zip((A, B), packs, pvs)):
         if pd is None:
             continue
+        if pv.key[0] not in PACK_FORMAT_ALIGN:      # a future / foreign key layout
+            raise PackMismatch(MISMATCH_FORMAT, f"operand {x}: unknown pack format {pv.key[0]}")
         if pv.N != N:
             raise PackMismatch(MISMATCH_MODULI, f"operand {x}: pack N {pv.N} != {N}")
         if pv.rounding != rounding:

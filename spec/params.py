@@ -78,8 +78,10 @@ PACK_FORMAT_A64 = 2                  # v1.13 §4b stage 2, format 2: k_hat = cei
 PACK_FORMATS = {PACK_FORMAT_A16: K_ALIGN, PACK_FORMAT_A64: K_ALIGN_PAD}   # format -> A
 # The K-alignment policy of the library this file describes. "A16": every plan and pack uses
 # A = 16 (implemented through v1.13 stage 1); "AUTO": A = k_align_auto(k) (v1.13 §4b stage 2,
-# designed). The stage-2 implementation flips this one switch (and oracle.K_ALIGN_POLICY);
-# every sizing function also takes an explicit A (the library's test hook).
+# designed). The stage-2 implementation flips this one switch (and oracle.K_ALIGN_POLICY):
+# every default follows it (k_hat_of, workspace_size, region_offsets, pack_layout and
+# PACK_FORMAT, the newest format written); every sizing function also takes an explicit A
+# (the library's test hook). Callers that model a plan whose A was forced must pass it.
 K_ALIGN_POLICY = "A16"
 N_ALIGN = 16                         # §4  n_hat = ceil(n)_16
 UNIT_ROUNDOFF = Fraction(1, 2**53)   # u in §3.8
@@ -101,10 +103,13 @@ def align_up(x, a):
     return ceil_div(x, a) * a
 
 
-def k_hat_of(k, A=K_ALIGN):
+def k_hat_of(k, A=None):
     """DESIGN §4: k_hat = ceil(k)_A, the residue row stride and K4's GEMM K extent; A a power
-    of two >= 16 (16 or 64 in a plan, §4b). Mirrors libimmerdink_host's k_hat_of
+    of two >= 16 (16 or 64 in a plan, §4b). A = None: k_align_of(k), the policy's A (never a
+    silent 16: review 2026-10-05, must-fix 5). Mirrors libimmerdink_host's k_hat_of
     (src/host/k_hat.hpp), the one rounding site there."""
+    if A is None:
+        A = k_align_of(k)
     if A < 16 or A & (A - 1):
         raise ValueError(f"A={A}: a power of two >= 16")
     return align_up(k, A)
@@ -121,7 +126,9 @@ def k_align_of(k, policy=None):
     """The resolved K alignment A of a plan or pack of contraction length k under `policy`:
     "A16" (16 for every k), "AUTO" (k_align_auto), or 16 / 64 (the library's test hook,
     imd_test_set_k_align, forcing A). None = K_ALIGN_POLICY. libimmerdink_host's k_align_of
-    (src/host/k_hat.hpp, stage 2) is the one resolver there."""
+    (stage 2) is the one resolver there; it is called once per API call (analyze for a plan
+    or a sizing query, pack_lower for a pack) and its A is passed explicitly from then on
+    (WorkspaceShape, pack_layout, ExecPlan.k_align), as this file's functions take it."""
     policy = K_ALIGN_POLICY if policy is None else policy
     if policy == "A16":
         return K_ALIGN
@@ -663,7 +670,9 @@ def region_offsets(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE, packed=(), 
 # ---------------------------------------------------------------------------
 # §6b.4 packed operand, byte layout format 1 (DESIGN v1.7, D1)
 
-PACK_FORMAT = PACK_FORMAT_A16   # the newest format the library writes (stage 2: 2)
+# The newest format the library writes: the format of a large k under the policy ("A16": 1,
+# "AUTO": 2). Derived, so the policy switch moves it (review 2026-10-05, must-fix 5).
+PACK_FORMAT = pack_format_of(k_align_of(K_PAD64_MIN + 1))
 _PACK_REGIONS = ("sig", "flag", "res")
 
 
@@ -947,7 +956,7 @@ def cert_kc():
 # shapes (196608, 196624) and the one-chunk windows k_hat in (j K_c', j 131056].
 K_BOUNDARY = [1, 16, 17, 64, 65, 131007, 131008, 131009, 131040, 131041, 131056, 131057,
               131071, 131072, 131073, 196608, 196624, 262016, 262017, 262112, 262113, 262144,
-              262160, 262200, 393024, 393025, 393168, 524032, 524033]
+              262160, 262200, 392961, 393008, 393009, 393024, 393025, 393168, 524032, 524033]
 
 
 def k_chunk_list(k_hat, chunk=K_C_PRIME):
@@ -975,7 +984,7 @@ def cert_row_phase():
     checked list (j < 5); beyond that the counts can differ by more than one."""
     n = 0
     for k in K_BOUNDARY + list(range(1, 2000, 7)):
-        kh = k_hat_of(k)
+        kh = k_hat_of(k, K_ALIGN)                    # stage 1: the A = 16 rows (the windows)
         chunks = k_chunk_list(kh)
         need(len(chunks) == ceil_div(kh, K_C_PRIME) and sum(c[1] for c in chunks) == kh, f"k={k}")
         for ci, (k0, kc) in enumerate(chunks):
@@ -1026,6 +1035,33 @@ def _k4_all_aligned(kh, extent, chunk, bases, rows, T):
     return True
 
 
+def k4_add_chunk_keys(k_hat, chunk=K_C_PRIME):
+    """The number of distinct add-mod chunk lengths of a K4 plan (src/host/k4_launches.hpp
+    k4_counts): chunks 1.. are add-mod launches; the full length counts if there are >= 3
+    chunks, the last one if there are >= 2 chunks and it is not itself a full chunk of a
+    >= 3-chunk plan (then the two keys merge). add_shapes = this times the z and n-part
+    size counts (independent of A)."""
+    nch = ceil_div(k_hat, chunk)
+    last = k_hat - (nch - 1) * chunk
+    return (nch >= 3) + (nch >= 2 and not (nch >= 3 and last == chunk))
+
+
+K4_TUNE_MAX_BYTES = 256 << 20        # src/host/k4_config.hpp kK4TuneMaxBytes
+
+
+def k4_tune_bytes(m, n, k_hat, b, g):
+    """src/host/k4_config.cpp k4_tune_bytes for an emulating plan: align(g b m k_hat) +
+    align(g b n_hat k_hat) + align(g b m n_hat), 0 (tuning off) when a region or the sum
+    exceeds K4_TUNE_MAX_BYTES."""
+    nh, total = align_up(n, N_ALIGN), 0
+    for x in (m * k_hat, nh * k_hat, m * nh):
+        r = g * b * x
+        if r > K4_TUNE_MAX_BYTES:
+            return 0
+        total += align_up(r, REGION_ALIGN)
+    return total if total <= K4_TUNE_MAX_BYTES else 0
+
+
 @check("v1.13 §4b stage 2 K alignment")
 def cert_k_align():
     """Stage 2 (designed): k_hat = ceil(k)_A, A = AUTO(k) = 64 iff k > K_PAD64_MIN = 96, is the
@@ -1035,7 +1071,11 @@ def cert_k_align():
     alternative fails: the stride padded but the extent not (stride-only), K_c' = 131040,
     A = 32, a 16-aligned base. A changes no launch count: k_chunks, the K4 main-loop
     iterations per chunk, the KF / KL decisions and KL's tile and chunk count are the same for
-    A = 16 and 64. Footprint deltas are exact (delta = ceil(k)_64 - ceil(k)_16 per row)."""
+    A = 16 and 64. Footprint deltas are exact (delta = ceil(k)_64 - ceil(k)_16 per row).
+    Two plan-level differences are NOT launch counts (review 2026-10-05, must-fix 8): the
+    add-mod shape keys merge for A = 64 exactly when ceil(k)_64 = n K_c' (n >= 3) and
+    ceil(k)_16 < ceil(k)_64 (one fewer add key: plan host bytes and add_shapes differ;
+    e.g. k = 393008), and k4_tune_bytes can cross its 256 MiB cap (tuning off for A = 64)."""
     need(K_ALIGN_PAD == K_CHUNK_ALIGN == 64 and K_PAD64_MIN == 96, "stage-2 constants")
     need(PACK_FORMATS == {1: 16, 2: 64}, "pack formats")
     need(all(k_align_auto(k) == 16 for k in range(0, 97)) and
@@ -1106,9 +1146,27 @@ def cert_k_align():
             p64 = {x[0]: x[2] for x in pack_layout(b, r, k, N, PACK_FORMAT_A64)[0]}
             need(p64["res"] - p16["res"] == (N * b * r + align_up(r, 16) - r) * d and
                  p64["sig"] == p16["sig"] and p64["flag"] == p16["flag"], f"pack delta {r, k}")
+    # add-mod shape keys: they differ exactly when ceil(k)_64 is n >= 3 full chunks and
+    # ceil(k)_16 is below it (the last A = 64 chunk is full: its key merges with the full one)
+    n_key = 0
+    kk = sorted(set(ks + [j * K_C_PRIME - d for j in range(1, 6) for d in range(0, 80)]))
+    for k in kk:
+        a16, a64 = k4_add_chunk_keys(k_hat_of(k, 16)), k4_add_chunk_keys(k_hat_of(k, 64))
+        k64 = k_hat_of(k, 64)
+        merge = k64 % K_C_PRIME == 0 and k64 // K_C_PRIME >= 3 and k_hat_of(k, 16) < k64
+        need(a16 - a64 == (1 if merge else 0), f"k={k}: add keys {a16} / {a64}")
+        n_key += merge
+    need(k4_add_chunk_keys(k_hat_of(393008, 16)) == 2 and k4_add_chunk_keys(k_hat_of(393008, 64)) == 1
+         and k4_add_chunk_keys(k_hat_of(393009, 16)) == k4_add_chunk_keys(k_hat_of(393009, 64)) == 1
+         and k4_add_chunk_keys(k_hat_of(262016, 16)) == k4_add_chunk_keys(k_hat_of(262016, 64)) == 1,
+         "add-key examples 393008 (merge), 393009 / 262016 (none)")
+    # k4_tune's 256 MiB cap: (m, n, k, b, g) = (2000000, 1, 97, 1, 1) tunes at A = 16 only
+    t16, t64 = (k4_tune_bytes(2000000, 1, k_hat_of(97, A), 1, 1) for A in (16, 64))
+    need(t16 == 224000000 + 1792 + 32000000 and t64 == 0, f"tune cap {t16} / {t64}")
     return (f"{len(ks)} k x A in {{16, 64}}: {n} layouts, every CUTLASS load 16-B (A16) / 64-B "
             f"(A64) aligned; stride-only, K_c' 131040 / 131056, A = 32, base 16 each misaligned; "
-            f"launches independent of A; max overhead 1/3 at k_hat16 = 144")
+            f"launches independent of A; max overhead 1/3 at k_hat16 = 144; {n_key} k with one "
+            f"fewer add key at A = 64 (e.g. 393008); tune cap crossed at (2e6, 1, 97)")
 
 
 @check("§3.5 mod reduction realization")

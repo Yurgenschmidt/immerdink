@@ -663,7 +663,8 @@ neg_resident_ws_vec, neg_resident_reads_ws]**
 **Status.** Stage 0 (one `k_hat_of`) and stage 1 (`K_c' = 131008`) are implemented. Stage 2
 (per-plan K alignment `A ∈ {16, 64}`, resolved from k alone) is **designed here, not yet
 implemented**: this section is its final design (the rulings of the independent review of
-2026-10-05 are binding; the threshold is frozen from the 2026-10-05 sweep). Until the stage-2
+2026-10-05 and the must-fixes of the adversarial review of the design, same day, are
+binding; the threshold is frozen from the 2026-10-05 sweep). Until the stage-2
 commit every plan and pack has A = 16, `spec/params.py` and `spec/oracle.py` run with
 `K_ALIGN_POLICY = "A16"`, and their AUTO paths are exercised explicitly by the
 certificates and the oracle suite. Text marked **[stage 2]** elsewhere in this document
@@ -749,7 +750,11 @@ K_c'  = 131008                            (stage 1)
 ```
 - **A is a pure function of k.** It does not depend on N, g, the shape, the device, the
   data, the calibration or any option. A plan and a pack of the same k always resolve the
-  same A, so a packed plan and its pack never disagree (PackedOperand `AutoFormatsAgree`).
+  same A, so a packed plan and its pack never disagree in-process. The guarantee is that k
+  is a key word (a pack and a slot of different k never match) and that A is resolved once
+  per API call and then passed explicitly (§4b.5 "One resolver"); PackedOperand
+  `AutoFormatsAgree` is only a sanity check of that (the model applies the same rule to
+  the same k by construction).
   `K_PAD64_MIN` is defined in `spec/params.py` and generated into `constants.hpp`
   (`kKPad64Min`, with `kKAlignPad = 64`).
 - **Why it fixes the loads.** With `k̂ ≡ 0 (mod 64)` every row starts on a multiple of 64
@@ -770,6 +775,19 @@ K_c'  = 131008                            (stage 1)
   K4. Relative to ⌈k⌉₁₆ that is at most **1/3** (k = 129…144, ⌈k⌉₁₆ = 144 → 192), at most
   48/1040 = 4.6 % for k > 1024, and 0 for ⌈k⌉₁₆ ≡ 0 mod 64. (The threshold note's "43 % at
   k = 97–112" is an arithmetic slip: k = 97…112 pads 112 → 128, +14 %.)
+- **Two plan-level differences that are not launch counts** (review 2026-10-05, must-fix 8;
+  `cert_k_align`, `params.k4_add_chunk_keys` / `k4_tune_bytes`):
+  - *Add-mod shape keys.* `k4_counts` (`k4_launches.hpp`) merges the last chunk's add key
+    into the full-chunk key when the last chunk is itself full (≥ 3 chunks). With A = 64
+    that happens for k̂ = ⌈k⌉₆₄ = n·K_c', n ≥ 3, while ⌈k⌉₁₆ < n·K_c' has a short last
+    chunk: the A = 64 plan has **one add shape key fewer** per (z, n-part) size, so
+    `add_shapes` and the plan host bytes differ (smaller). Exactly the k in
+    (n·K_c' − 64, n·K_c' − 16], n ≥ 3; e.g. **k = 393008** (A = 16: chunks 131008, 131008,
+    130992, two add keys; A = 64: 3 × 131008, one). k = 393009 and 262016 do not differ.
+  - *The `k4_tune` cap.* `k4_tune_bytes` is 0 (no tuning) above 256 MiB
+    (`kK4TuneMaxBytes`); the padded k̂ can cross it, so an A = 64 plan may not tune where
+    the A = 16 plan did. Example (m, n, k, b, g) = (2000000, 1, 97, 1, 1): 256001792 B at
+    A = 16, over the cap (0) at A = 64.
 - **Why 96** (sweep 2026-10-05, immerdink-eval `findings/k4align-threshold.md`; k = 16…1024
   step 16, N ∈ {8, 14}, 2048², 16384×512, a DF-like `Qia,Qjb->iajb` (2304² × Q), 512²; A = 64
   emulated by running ⌈k⌉₆₄ and counting the logical 2mnk):
@@ -838,9 +856,11 @@ Against A = 16, with `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆`:
 
 - **`IMD_HOST_API_VERSION` 8 → 9**, additive only:
   - `imd_lowering_t` version 6 (192 bytes; v5 is 184) appends `int32_t k_align` (the
-    resolved A: 16 or 64; 0 when `lowered = 0`) and `int32_t reserved6` (0). It is
-    `struct_size`-versioned and "writes only the fields that fit", so v8 callers are
-    unaffected.
+    resolved A: 16 or 64; 0 when `lowered = 0`; **16** for a lowering without residue rows,
+    i.e. NOOP, SCALE (k = 0), DIRECT and K-empty, whatever the hook says) and `int32_t
+    reserved6` (0). It is `struct_size`-versioned and "writes only the fields that fit", so
+    v8 callers are unaffected (tested: a caller passing the v5 size, 184, gets nothing
+    written past it and no `k_align`).
   - **`k_hat` changes meaning**: it is `⌈k⌉_{k_align}` (it was always ⌈k⌉₁₆). Callers that
     recomputed k̂ themselves must read it instead; sizing goes only through
     libimmerdink_host (the integration contract, §6a).
@@ -856,13 +876,29 @@ Against A = 16, with `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆`:
   - The key keeps its words; word 0 is the format: the pack's own, and for a plan's slot
     key the format of the plan's resolved A. k is already in the key, so k̂ follows.
   - **Format 1 stays valid**: nothing that a v9 library would pack as format 1 changes, and
-    a format-1 pack is read by a format-1 plan exactly as before. A pack made by an older
-    library for k > 96 (format 1) is rejected by a v9 plan of that k with PACK_MISMATCH,
-    reason FORMAT: never misread. Pack bytes are not to be persisted across library
-    versions (the integration contract and the release note say so).
-  - The reason codes keep their order; FORMAT is the first key word, so a pack of another
-    k on the other side of K_PAD64_MIN reports FORMAT rather than EXTENTS (rejected
-    either way).
+    a format-1 pack is read by a format-1 plan exactly as before.
+  - **Where the format lives, and the one real hazard** (review 2026-10-05, must-fix 1).
+    The format exists only in the handle's key: pack bytes carry no header, and there is
+    no way to import pack bytes into a handle (`immerdink.h`: a handle is made only by
+    `imd_pack_create`). So a v9 plan never meets a pre-v9 handle, and inside one process a
+    handle and a plan disagree only through the test hook (then PACK_MISMATCH FORMAT).
+    The hazard is **pack bytes saved by the caller** under v8 (format 1, k̂ = ⌈k⌉₁₆) and
+    later filled into a v9 handle of the same descriptor: for k > 96 that handle is
+    format 2, the plan accepts it, and the old bytes are read with the wrong row stride,
+    **silently**. Nothing in the library can detect this. Contract (§6a integration
+    contract, §6b.5, release note): **a caller that persists pack bytes must persist
+    `imd_pack_layout_t.format` and `.pack_bytes` with them, compare both with a fresh
+    `imd_pack_layout` of the same descriptor before reuse, and re-pack on any difference.**
+  - **Reason order** (must-fix 4; question 3). An **unknown** format word (not 1 or 2: a
+    future or foreign key layout) is reported first, before MODULI. The 1-vs-2 difference
+    is compared **last**, after every other check and key word of both packs (MODULI,
+    ROUNDING, CLASSES, ORDER, then EXTENTS / STRIDES word by word). FORMAT therefore means
+    "the same tensor in the other alignment" (in-process: only the hook), and a pack of
+    k = 96 offered to a plan of k = 97 reports **EXTENTS**. The slot key's format is the
+    **plan's own** (of its resolved A), never `kPackFormat` / `IMD_PACK_FORMAT`. DESIGN
+    §6b.5, `oracle.lower_packed` / `key_mismatch` (done) and `analysis.cpp` (stage 2) use
+    this one order; PackedOperand `ReasonIffMismatch`, `FormatMeansSameTensor` and
+    `neg_reason_fmt_first` (the FORMAT-first order fails) check it.
 - **The test hook** `imd_test_set_k_align(int32_t a)`: a test-only export of
   **libimmerdink_host** (not in a public header; ctypes, like the `imd_test_*` hooks of
   libimmerdink). `a = 0` restores AUTO; 16 or 64 forces A for every sizing query, lowering,
@@ -870,17 +906,38 @@ Against A = 16, with `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆`:
   call; libimmerdink plans call the host library's resolver, so device-side plans follow);
   anything else returns 1 and changes nothing. It is in the host library because the
   sizing lives there: a hook in libimmerdink alone would let `imd_workspace_size` and the
-  plan disagree. Setting it between `imd_pack_create` and plan creation is the only way to
-  make a pack and a plan disagree (PACK_MISMATCH FORMAT, tested).
-- **One resolver.** `k_align_of(k)` in `src/host/k_hat.hpp`: the hook if set, else AUTO(k).
-  Every k̂ in libimmerdink_host is `k_hat_of(k, k_align_of(k))`: workspace sizing
-  (`workspace.cpp`), the plan's GEMM view (`analysis.cpp plan_data`), the pack layout and
-  lowering (`pack.cpp`, two sites), `k4_tune_bytes` (`k4_config.cpp`) and the perf model
-  (through the plan's k̂). `spec/params.py k_align_of` / `oracle.k_align_of` mirror it.
+  plan disagree (review: confirmed, question 2). Setting it between `imd_pack_create` and
+  plan creation is the only way to make a pack and a plan disagree (PACK_MISMATCH FORMAT,
+  tested). It is the one exception to §6a's "pure" (documented there).
+  - **Where its state lives** (must-fix 3). Both libraries build with hidden visibility
+    (`CXX_VISIBILITY_PRESET hidden`, `VISIBILITY_INLINES_HIDDEN`), so an inline variable
+    or a function-local static in a header (`k_hat.hpp`) would exist once per `.so` and
+    libimmerdink would never see the hook. The state is **one out-of-line
+    `std::atomic<int32_t>` in a libimmerdink_host source file** (`src/host/k_hat.cpp`),
+    read only through an `IMD_HOST_INTERNAL` accessor (`k_align_hook()`); the header
+    declares the accessor, never the variable.
+- **One resolver, once per API call** (must-fix 2). `k_align_of(k)` (`src/host/k_hat.cpp`):
+  the hook if set, else AUTO(k). It is called **once** per API call, at the top:
+  - in `analyze` (every sizing query, lowering and plan: `workspace_layout`, `plan_data`)
+    and in `pack_lower` (`imd_pack_layout`, `imd_pack_create`, and per packed operand of a
+    packed plan);
+  - from then on A is an explicit argument: `WorkspaceShape` and `pack_layout` take A (as
+    `params.workspace_size(k_align=)` / `pack_layout(fmt=)` do), `ExecPlan` gains an
+    `int32_t k_align` field (in `ExecPlan`, **not** `K4Plan`: `static_assert(sizeof(K4Plan)
+    == kK4PlanBytes)` feeds the plan host bytes), and `k4_tune_bytes`, the perf model and
+    `imd_lowering` read it (and `k_hat`) from the plan;
+  - **libimmerdink never calls the resolver**: device-side plans take A and k̂ from the
+    host library's `ExecPlan`, so a plan cannot see two values of the hook.
+  `spec/params.py k_align_of` / `oracle.k_align_of` mirror it.
 - **Device code: no logic change.** Every kernel already indexes by the plan's k̂ and
   writes zeros on `[k, k̂)` (KF, K2/K3, KL, the B zero rows, imd_pack; the zero tile:
   h ≥ k gives μ = 0, residue 0). New asserts: `gemm_k4.cu` `k̂ % 16 == 0` (correctness)
-  and `k̂ % A == 0` (plan contract); the KF launch `(1 << lg_tk) ≥ k̂`.
+  and `k̂ % A == 0` (plan contract, A from `ExecPlan.k_align`); the KF launch
+  `(1 << lg_tk) ≥ k̂`. Two checks against code drift that TLA+ cannot see:
+  - after a packed slot's key matches, `pl.k_hat == e.k_hat` (the handle's k̂ equals the
+    plan's; `analysis.cpp` after the key comparison) or PACK_MISMATCH FORMAT;
+  - a debug check (debug builds and a test) that every operand pointer `call_of` forms in
+    `gemm_k4.cu` is ≡ 0 mod A.
 - **Python**: `python/immerdink/host.py` mirrors gain the lowering's `k_align` (struct
   v6) and the format constants; the `planner` fast path (§6e) calls C and follows. A
   `host.test_set_k_align(a)` helper binds the hook for tests.
@@ -906,6 +963,14 @@ Against A = 16, with `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆`:
     fitted on misaligned data; it is **refit** (`tools/calibrate.sh`) after stage 2, and
     `k4_select`'s preference for 128×256 is re-checked then (the smaller configurations
     gain the most from A = 64).
+  - **MMA work before the refit.** `tile_macs ∝ k̂` (`k4_config.cpp`) undercounts A = 16
+    plans: CUTLASS runs ⌈kc/64⌉ full 64-wide tiles per chunk either way. The model's MMA
+    term uses **Σ_c ⌈kc⌉₆₄** over the plan's chunks (A-independent MMA work); only the
+    byte terms use the padded k̂.
+  - **The refit needs A = 16 cases.** After stage 2 the slow-chunk term is exercised only
+    by k ≤ 96, so it would be poorly determined. `tools/calibrate.sh` and `imd_bench` get
+    a `--k-align {0,16,64}` flag (the hook) and the calibration grid includes A = 16-forced
+    cases at k > 96. The real-implementation A/B sweep (§4b.8) uses the same flag.
 
 ### 4b.7 Spec (TLA+, certificates, oracle) **[stage 2]**
 
@@ -938,27 +1003,48 @@ Against A = 16, with `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆`:
   (`neg_a64_pack_tail_old`: AccessesSafe) and K_c' ≡ 48 (`neg_a64_chunk_old`).
 - **PackedOperand**: the format carries A (format 2 = 4·KAlign); the plan and the pack
   resolve it by AUTO(k) or the hook. Format-2 positives (σ, W, C equal; the B-role tail),
-  `AutoFormatsAgree`, `FormatMismatchRejected` (hook-forced mismatches are PACK_MISMATCH)
-  and negatives without the key check (an A16 pack read by an A64 plan and the reverse:
-  CEqual).
+  `AutoFormatsAgree` (a sanity check only, §4b.3), `FormatMismatchRejected` (hook-forced
+  mismatches are PACK_MISMATCH) and negatives without the key check (an A16 pack read by
+  an A64 plan and the reverse: CEqual). **Reason order** (review 2026-10-05): `Reason`
+  models §6b.5's order (early checks of every pack, then the key words, the 1-vs-2 FORMAT
+  last); `ReasonIffMismatch` and `FormatMeansSameTensor` (FORMAT only when every other
+  key part is equal) on `pos_reason_order` (format 2, every key mutation: a pack of
+  another k across K_PAD64_MIN is CLASSES in the toy), `pos_reason_hook`,
+  `pos_reason_both` and the key-check positives; `neg_reason_fmt_first` (the FORMAT-first
+  order) violates `FormatMeansSameTensor`.
 - **IndexMap** is unchanged: its single `PadQ` stays (its claims are about the lowering;
   the mixed quanta of the workspace and pack layout are Pipeline's, at AlignK ≠ AlignN, and
   `params.py`'s at the real values).
 - **params.py**: `K_PAD64_MIN`, `K_ALIGN_PAD`, `k_align_auto` / `k_align_of(k, policy)`,
-  `PACK_FORMATS`, `pack_format_of`, `k4_load_addresses`; `workspace_size`,
-  `region_offsets` (`k_align=`) and `pack_layout` (`fmt=`) take A; `cert_workspace` and
-  `cert_pack_layout` run over both A with hand-computed A = 64 examples; **`cert_k_align`**
-  (new): AUTO, every CUTLASS load 16-aligned (A16) / 64-aligned (A64) over the boundary k
-  list and 0…1100 with bases, z0 and j0 offsets, each rejected alternative misaligned,
-  launch counts independent of A, the exact footprint deltas and the 1/3 overhead bound.
-  `cert_row_phase` (stage 1) is unchanged.
+  `PACK_FORMATS`, `pack_format_of`, `k4_load_addresses`, `k4_add_chunk_keys`,
+  `k4_tune_bytes`; `workspace_size`, `region_offsets` (`k_align=`) and `pack_layout`
+  (`fmt=`) take A; `cert_workspace` and `cert_pack_layout` run over both A with
+  hand-computed A = 64 examples; **`cert_k_align`** (new): AUTO, every CUTLASS load
+  16-aligned (A16) / 64-aligned (A64) over the boundary k list and 0…1100 with bases, z0
+  and j0 offsets, each rejected alternative misaligned, launch counts independent of A,
+  the exact footprint deltas, the 1/3 overhead bound, the add-key merge (exactly the k of
+  §4b.3, e.g. 393008) and the `k4_tune` cap crossing. `cert_row_phase` (stage 1) pins
+  A = 16 (its windows are A = 16 rows).
+- **The policy switch is one switch** (must-fix 5). `params.k_hat_of` / `oracle.k_hat_of`
+  have no silent A = 16: A = None means the policy's A for k; every other default
+  (`workspace_size`, `region_offsets`, `pack_layout`, `pack_key`, `pack`) follows the
+  policy, and `PACK_FORMAT` (params, oracle: "the newest format written") is derived
+  from it (1 under "A16", 2 under "AUTO"). The C++ constants move in the same commit:
+  `pack.hpp kPackFormat` → the plan's own format at each use, `IMD_PACK_FORMAT` 1 → 2
+  (`IMD_PACK_FORMAT_A16` / `_A64` added). `test_oracle.test_k_align` checks the defaults
+  under both policies.
 
 ### 4b.8 Test plan (stage 2; GPU parts only while the machine is otherwise idle)
 
 - **Poisoned workspace over the AUTO range, every producer path** (`test_contract`, new
   `test_k_align`): fill the whole workspace (and, for packs, the pack buffer before
-  `imd_pack`) with 0xA5, then the call must be bit-exact against the oracle and
-  `compute-sanitizer --tool initcheck` clean:
+  `imd_pack`) with 0xA5, then the call must be bit-exact against the oracle. **initcheck
+  is a separate run** (must-fix 6): a `cudaMemset` of 0xA5 counts as initialised, which
+  defeats initcheck, and the bit-exact check alone misses padding left unwritten on one
+  side only (the other side's zeros cancel it: Pipeline `neg_a64_pad_old_k3`, `_kf`,
+  `_kl`). So the same cases also run under `compute-sanitizer --tool initcheck` on an
+  **unpoisoned fresh allocation** (workspace and pack buffer from a fresh `cudaMalloc`,
+  never memset), which must be clean. The cases:
   - KF at k ∈ {97, 112, 600, 1000} (A = 64) and k ∈ {33, 96} (A = 16, unchanged);
   - KL at k ∈ {1040, 4080} (and `imd_test_set_fused(3)`: KL tiles of 64 rows, so rows
     span several chunks);
@@ -967,15 +1053,43 @@ Against A = 16, with `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆`:
   - packed A, packed B (role B: the tail, b > 1, j0 > 0 through `imd_test_set_limits`
     max_n_tiles) and both packed, at k ∈ {97, 1000};
   - two chunks: k ∈ {131009, 131072} (k̂ = 131072, chunks 131008 + 64) on 512² and a skinny
-    shape, and with `imd_test_set_limits(k_chunk = 64·j)` on small shapes.
+    shape; **two and three chunks whose last chunk is a multiple of 64** (a full 64-wide
+    residue tile; must-fix 7): k = 196608 (two chunks, 131008 + 65600) and k = 262017
+    (k̂ = 262080: three chunks, 131008 + 131008 + 64); and with `imd_test_set_limits(k_chunk = 64·j)` on small shapes. With A = 64, also
+    `set_limits(k_chunk = 16·odd)` for correctness only (it breaks the 64-alignment of
+    the full chunks, so no alignment claim).
+- **The all-zero padding check** of `check_stages` over [k, k̂) (`test_contract.py`, today
+  reached only by `suite_stages`' KF) is extended (must-fix 6) to **KL** (k ∈ {1040, 4080})
+  and to **K2/K3** with `imd_test_set_fused(0)`, at A = 16 and A = 64.
+- **The stage-1 window tests pin A = 16** (must-fix 7). No multiple of 64 lies in
+  (j·131008, j·131056], so under AUTO the window cases of `test_contract.py` (`contract_bigk`
+  k̂ = 131024, 131040, 131056, 262064) would silently become 64-aligned tails. They set
+  `imd_test_set_k_align(16)` (and restore AUTO); `run_case(k4_expect=...)` then still checks
+  the window chunk counts.
 - **Boundary k** for host queries (`test_host.py`, `gen_workspace_vectors.py`, vs
   `params.py` with `K_ALIGN_POLICY = "AUTO"`): k ∈ {1, 16, 17, 64, 65, 95, 96, 97, 112, 113,
   128, 129, 144, 145, 1023, 1024, 1025, 1040, 4080, 131008, 131009, 131072, 196608,
-  196624}: `k_hat`, `k_align`, workspace and pack layouts, `k_chunks`, `gemm_launches`,
-  `fused`, `fused_large`, `kernel_launches`, `k4_tune_bytes`, plan bytes. The hook at 16 and
-  64 for the same k.
-- `test_host_c.c`: the existing literals stay (k ≤ 33); new hand-computed cases at k = 200
-  (AUTO 64) and k = 5 forced to 64 (KF tk = 64); the 180² case recomputed.
+  196624, 262017, 392961, 393008, 393009}: `k_hat`, `k_align`, workspace and pack layouts,
+  `k_chunks`, `gemm_launches`, `fused`, `fused_large`, `kernel_launches`, `k4_tune_bytes`,
+  plan bytes and `add_shapes` (393008: one add key fewer at A = 64, §4b.3); the tune cap
+  at (2000000, 1, 97, 1, 1). The hook at 16 and 64 for the same k. DIRECT, SCALE and
+  K-empty lowerings report `k_align = 16`; a v5-size (184) lowering caller gets nothing
+  past byte 184. The `host.py` struct v6 mirror is checked against `sizeof` and offsets.
+- **Test call sites that compute k̂ or the format themselves** (must-fix 5) pass A
+  explicitly: the plan's `k_align` from the lowering, or the hook's value. Today they rely
+  on a default (line numbers of this branch):
+  `tests/test_contract.py:135` (`check_stages` k̂), `:366` (stage padding), `:632`, `:645`,
+  `:646` (`contract_bigk` chunk lists); `tests/test_host.py:208`, `:480` (`lay.format != 1`
+  becomes "the format of `k_align_of(lay.k)`"), `:597`, `:679`;
+  `tests/test_host_c.c:225` (`pl.format == IMD_PACK_FORMAT` for a k = 5 pack: format 1,
+  but `IMD_PACK_FORMAT` becomes 2; the check becomes `== IMD_PACK_FORMAT_A16`).
+- `test_host_c.c`: the hand-computed size literals stay (k ≤ 33), but the line-225 format
+  check changes as above; new hand-computed cases at k = 200 (AUTO 64) and k = 5 forced
+  to 64 (KF tk = 64); the 180² case recomputed.
+- **Python `PlanCache` and the hook** (must-fix 9). The cache key (`device.py`: spec,
+  shapes, strides, options, packs, device) does not include the hook, so after
+  `test_set_k_align` it would return a plan of the old A. `host.test_set_k_align` clears
+  the default `PlanCache` on every call, and the hook tests use fresh caches.
 - `test_packed`: format-1 and format-2 packs byte-exact against `oracle.pack(fmt)`; packed
   contractions bit-exact; **PACK_MISMATCH FORMAT** when the hook changes between
   `imd_pack_create` and plan creation (both directions); `imd_pack_layout.format`.
@@ -1007,14 +1121,16 @@ The emulation reads ⌈k⌉₆₄ real columns in KF, so the gains are slightly 
 
 ### 4b.10 Risks and deferred items
 
-- **Partial landing** (stride padded, extent or K_c' not) is worse than today; the one
-  `k_hat_of(k, k_align_of(k))` site per use, `cert_k_align`, K4Align's negatives and the
-  poisoned-workspace test guard it.
-- **Resolver drift**: any site computing ⌈k⌉₁₆ directly would size or address the wrong
-  rows; there is no such site after stage 0, and the boundary-k host tests compare every
-  reported value with `params.py`.
+- **Partial landing** (stride padded, extent or K_c' not) is worse than today; the single
+  resolution per API call with A passed explicitly (§4b.5), `cert_k_align`, K4Align's
+  negatives, the `call_of` debug check and the poisoned-workspace test guard it.
+- **Resolver drift**: any site computing ⌈k⌉₁₆ directly, or calling the resolver a second
+  time, would size or address the wrong rows; there is no such site after stage 0, the
+  resolver runs only in `analyze` / `pack_lower`, `pl.k_hat == e.k_hat` is checked after a
+  key match, and the boundary-k host tests compare every reported value with `params.py`.
 - **The process-global test hook** makes host queries depend on test state; it is test-only,
-  atomic, and every test that sets it restores AUTO.
+  atomic, one variable in libimmerdink_host (§4b.5), and every test that sets it restores
+  AUTO (and the Python plan cache is cleared).
 - **Threshold**: a policy constant, not a format: moving it changes which packs are format
   2 (the key catches every disagreement), workspace sizes for the moved k, and nothing
   numerical.
@@ -1027,18 +1143,18 @@ The emulation reads ⌈k⌉₆₄ real columns in KF, so the gains are slightly 
 - **The W / n̂ stride** (excluded, §4b.4) and **an `imd_options_t` `struct_size` break**
   (with an explicit `k_align` option if wanted) are later items.
 
-### 4b.11 Design questions (open)
+### 4b.11 Design questions (resolved by the adversarial review of 2026-10-05)
 
-1. **Old format-1 packs for k > 96.** This design rejects them (PACK_MISMATCH FORMAT)
-   instead of adopting the pack's format; adoption would make a packed plan's A depend on
-   the pack (and its workspace on the pack descriptor), which the review's "AUTO only" rule
-   avoids. Confirm rejection.
-2. **The hook's home.** The hook is exported by libimmerdink_host (where the resolver is),
-   not by libimmerdink (where the other `imd_test_*` hooks are). Confirm.
-3. **The FORMAT reason for a k straddling K_PAD64_MIN.** The key compares word 0 first, so
-   a pack of k = 96 offered to a plan of k = 97 reports FORMAT, not EXTENTS. Keep the key
-   order (simplest; the pack is rejected either way), or compare the format after the
-   extents for a more specific reason?
+1. **Format mismatch: reject or adopt.** Reject (PACK_MISMATCH FORMAT). Adoption cannot be
+   implemented anyway: the plan cannot see the format of caller-held bytes. The question
+   rested on a case that cannot happen (a v9 plan never meets a pre-v9 handle); the real
+   hazard is caller-persisted bytes, handled by the contract of §4b.5.
+2. **The hook's home.** libimmerdink_host (where the sizing is), with its state as one
+   out-of-line atomic there and A resolved once per API call (§4b.5); the one documented
+   exception to §6a's "pure".
+3. **FORMAT vs EXTENTS.** An early FORMAT check only for an unknown format word; the 1-vs-2
+   difference after every other key word, so k = 96 against k = 97 reports EXTENTS
+   (§4b.5 "Reason order", §6b.5).
 
 ---
 
@@ -1409,7 +1525,8 @@ Semantics:
     `imd_lowering_packed` fills them (and every other field for the packed plan). A
     version-4 caller gets exactly the version-4 fields.
   - **[stage 2] Version 6** (host API 9, §4b.5) appends `k_align`, the plan's resolved K
-    alignment (16, or 64 for k > 96), and `reserved6`. **`k_hat` is ⌈k⌉_{k_align}** from
+    alignment (16, or 64 for k > 96; 16 for NOOP, SCALE, DIRECT and K-empty, which have no
+    residue rows), and `reserved6`. **`k_hat` is ⌈k⌉_{k_align}** from
     API 9 on (it was ⌈k⌉₁₆): a deliberate, documented change of meaning (review
     2026-10-05). A caller must take k̂ (and every size) from the library, never recompute
     ⌈k⌉₁₆: sizing goes only through libimmerdink_host.
@@ -1422,8 +1539,10 @@ Semantics:
   the arguments; no allocation visible to the caller, no global or static mutable state)
   and **thread-safe** (any number of threads, concurrently with each other and with
   libimmerdink). They read the descriptor arrays only during the call. **[stage 2]** The one
-  exception is test-only: `imd_test_set_k_align` (§4b.5), an atomic process-global that
-  tests set and restore; production never sets it.
+  exception is test-only: `imd_test_set_k_align` (§4b.5), one out-of-line atomic
+  process-global in a libimmerdink_host source file (behind an `IMD_HOST_INTERNAL`
+  accessor; never a header inline or static, which hidden visibility would duplicate per
+  `.so`), read once per API call; tests set and restore it, production never sets it.
 - The K4 launch structure used for `k_chunks`, `gemm_launches` and the host bytes is the
   production one (K_c' chunks, 65535 batches, 65535 N-tiles of 256); the test-only
   launch-limit hook changes only libimmerdink's plans. **[v1.5]** It does not depend on
@@ -1446,9 +1565,11 @@ there is no budget option (BENCHMARKS "Residue-group size g" gives the speed sid
   it; a further change would need a rebuild, as v1.2 did). That is why stage 2 (§4b) adds
   no option: its K alignment is a function of k.
 - **Integration contract [stage 2].** Callers size workspaces and packs only through
-  libimmerdink_host (never by mirroring §4a), and never persist pack bytes across library
-  versions (a pack is valid for the library that made it and for any later one with the
-  same format for that k; §6b.5).
+  libimmerdink_host (never by mirroring §4a). Pack bytes carry no format header: a caller
+  that **persists pack bytes** (across processes or library versions) must persist
+  `imd_pack_layout_t.format` and `.pack_bytes` with them and re-pack whenever a fresh
+  `imd_pack_layout` of the same descriptor reports a different format or size (k > 96
+  moves from format 1 to 2 in API 9; the library cannot detect stale bytes; §4b.5, §6b.5).
 - Internal C++ entry points of the host library (lowering, layout, plan data) are exported
   for libimmerdink and the tests only; they are not in `include/` and carry no ABI promise
   (both libraries are built together).
@@ -1567,7 +1688,9 @@ packed slot from its own lowering, and compared **word for word**:
    the tail, the zero-padding rule and the moduli table. Bumped by any change to the bytes
    (e.g. if D4 or E1 needs another K alignment). **[stage 2]** The format word carries the
    K alignment: 1 = A16 (k̂ = ⌈k⌉₁₆), 2 = A64 (k̂ = ⌈k⌉₆₄); a pack's format is AUTO(k) of its
-   k, a slot key's that of the plan's resolved A (§4b.5).
+   k, a slot key's that of the plan's resolved A (§4b.5). It is word 0, but a known format
+   (1 or 2) is **compared last** (§6b.5 plan-time order); only an unknown word is
+   rejected first.
 2. N and rounding.
 3. b, r, k.
 4. The **FP64 element map**: for each class in the order L, R, K, the fused modes
@@ -1782,9 +1905,14 @@ imd_status_t imd_contract_packed(imd_plan_t, double alpha, const imd_operand_t* 
 `IMD_PACK_*` enums and `imd_lowering_t` v5; `imd_pack_desc_t` and `imd_pack_layout_t` carry
 `struct_size` (trailing fields may be added; older callers get what they know). Nothing
 existing changes. The **packed bytes are versioned by `IMD_PACK_FORMAT`**, which is part of
-the key: a pack is valid for any library version with the same format. **[stage 2]**
+the handle's key: a handle's pack is valid for any library version with the same format.
+The bytes themselves carry no header and cannot be imported into a handle, so a caller that
+persists them must persist the format with them (§6a integration contract). **[stage 2]**
 `IMD_PACK_FORMAT_A16 = 1`, `IMD_PACK_FORMAT_A64 = 2`; `IMD_PACK_FORMAT` becomes the newest
-format written (2), and which format a pack has is a function of its k (§4b.5).
+format written (2), and which format a pack has is a function of its k (§4b.5): bytes saved
+from a v8 handle of k > 96 (format 1) are **not** valid for a v9 handle of the same
+descriptor (format 2), and the library cannot tell; the caller compares `format` and
+`pack_bytes` and re-packs.
 
 ### 6b.6 Workspace and plan bytes with packed operands
 
@@ -1922,14 +2050,18 @@ What §6b left to the implementation, as implemented (libimmerdink_host `src/hos
 - **Plan-time order** (imd_plan_create_packed, imd_lowering_packed): the argument checks and
   §5 rows 1–5 of (A, B, C, options); for the host queries then each pack **descriptor's** own
   status (imd_pack_layout's INVALID_VALUE / NOT_SUPPORTED: a handle is valid by
-  construction); then per packed operand, the caller's A first: `_FORMAT`, `_MODULI`,
+  construction); then per packed operand, the caller's A first: `_FORMAT` (**[stage 2]**
+  only an unknown format word, not 1 or 2), `_MODULI`,
   `_ROUNDING`, `_CLASSES` (position map; a K label X does not carry is `_CLASSES` by the
   §6b.10 #10 policy, checked explicitly: a pack with an equal stride-0 mode would otherwise
   match, soundly); then, both packed, `_ORDER` (the mapped K or L orders differ); then the
   plan adopts the orders (K and L from the packs, each packed operand's row class from its
   pack; §5 step 9 fusion redone in them) and compares each slot key word for word:
-  `_EXTENTS` (b, r, k, a mode count or extent) or `_STRIDES`, the first differing word;
-  then §3.2 RN acceptance last. imd_workspace_size_packed / _layout_packed stop before the
+  `_EXTENTS` (b, r, k, a mode count or extent) or `_STRIDES`, the first differing word
+  after word 0; **[stage 2]** then, every other word of both keys equal, `_FORMAT` if the
+  pack's known format differs from the **plan's own** (never compared with
+  `IMD_PACK_FORMAT`), then `pl.k_hat == e.k_hat` (else `_FORMAT`: a drift check); then
+  §3.2 RN acceptance last. The same order is `oracle.lower_packed` / `key_mismatch`. imd_workspace_size_packed / _layout_packed stop before the
   RN rule. A plan whose C has an extent-0 C-only label (lowered to I, §5 step 7) has that
   label in its I class: `_CLASSES` for a pack of the A side (empty output; conservative; the
   IndexMap model makes the same choice, witness `pk_conly0`).
@@ -3821,15 +3953,38 @@ and host API; every value the same integer (bit-identical, tested on every contr
   AUTO(k); the key's word 0 is the format (the plan's for a slot key). No `imd_options_t`,
   `imd_pack_desc_t` or `imd_pack_layout_t` layout change. The test-only hook
   `imd_test_set_k_align` (libimmerdink_host) forces A. The integration contract: sizing only
-  through libimmerdink_host, pack bytes not persisted across library versions.
+  through libimmerdink_host; a caller persisting pack bytes persists `format` and
+  `pack_bytes` with them and re-packs on a difference.
 - **§6c.** No calibration format bump; the format-2 rule stays exact; θ to be refit and
   `k4_select` re-checked after stage 2.
 - **Spec.** New module `K4Align` (CUTLASS's residue-first address sequence over absolute
   addresses; 8 positive and 8 negative models). Pipeline: `EveryRowByteWritten` and
   `RowPhaseAligned(T)`, four stage-2 producer bugs, 9 positive and 8 negative A = 64 models.
   PackedOperand: the format carries A (AUTO or hook), `AutoFormatsAgree`,
-  `FormatMismatchRejected`, 9 positive and 3 negative models. `params.py`: `K_PAD64_MIN`,
+  `FormatMismatchRejected`, the reason order (`ReasonIffMismatch`,
+  `FormatMeansSameTensor`), 12 positive and 4 negative models. `params.py`: `K_PAD64_MIN`,
   `k_align_of`, sizing by A, `cert_k_align` (new), `cert_workspace` / `cert_pack_layout`
   over both A with hand-computed A = 64 examples. `oracle.py`: `pack(fmt=)`, the format in
   `pack_lower` / `pack_layout` / `pack_key` / `lower_packed`; `test_oracle.test_k_align`.
   Both stay at `K_ALIGN_POLICY = "A16"` until the implementation commit flips it.
+- **Adversarial review of the stage-2 design (2026-10-05), must-fixes applied.**
+  (1) "Never misread" was false: the format lives only in the handle key, pack bytes have
+  no header; the hazard is caller-persisted v8 bytes in a v9 handle (silent wrong stride);
+  contract: persist `format` and `pack_bytes`, re-pack on a difference (§4b.5, §6a, §6b.5).
+  (2) A is resolved once per API call (`analyze`, `pack_lower`) and passed explicitly:
+  `WorkspaceShape` / `pack_layout` take A, `ExecPlan.k_align`, libimmerdink never calls
+  the resolver. (3) The hook state is one out-of-line atomic in libimmerdink_host behind
+  an `IMD_HOST_INTERNAL` accessor; the §6a "pure" exception is documented. (4) Reason
+  order: early FORMAT only for an unknown word, 1-vs-2 last against the plan's own format
+  (k = 96 pack, k = 97 plan: EXTENTS); DESIGN §6b.5, the oracle and (stage 2) C++ agree;
+  PackedOperand `Reason`, `ReasonIffMismatch`, `FormatMeansSameTensor`, 3 positive and 1
+  negative models. (5) The policy switch is one switch: `k_hat_of` defaults to the policy,
+  `PACK_FORMAT` is derived; the test call sites relying on a default are listed. (6)
+  initcheck runs on unpoisoned fresh allocations; the padding check covers KL and K2/K3.
+  (7) Stage-1 window tests pin A = 16; 196608 and 262017 added. (8) A = 64 can merge the
+  last add shape key (k = 393008) and cross the 256 MiB `k4_tune` cap (`cert_k_align`,
+  `params.k4_add_chunk_keys`, `k4_tune_bytes`). (9) `host.test_set_k_align` clears the
+  Python plan cache. Later items folded in: `AutoFormatsAgree` is a sanity check;
+  `pl.k_hat == e.k_hat` and the `call_of` ≡ 0 mod A debug check; `tile_macs` from
+  Σ⌈kc⌉₆₄; A = 16-forced calibration cases and `--k-align`; the v5-size lowering test;
+  `k_align = 16` for DIRECT / K-empty; `k_align` in `ExecPlan`, not `K4Plan`.

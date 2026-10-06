@@ -221,6 +221,32 @@ Status(mut) ==
     ELSE IF Key(XPack(mut)) # SlotKey(mut)
             \/ (Cmp.both /\ Key(YPack(mut)) # SlotKey(mut))
          THEN "PACK_MISMATCH" ELSE "SUCCESS"
+\* v1.13 §4b (review 2026-10-05, must-fix 4): the PACK_MISMATCH REASON, in
+\* the order of DESIGN §6b.5 = oracle.lower_packed = analysis.cpp (stage 2).
+\* (An unknown format word, not 1 or 2, is FORMAT before everything; the toy
+\* has formats 1 and 2 only, so it is not modelled.) Then each pack's early
+\* checks (MODULI, ROUNDING, CLASSES: the toy's K set), then the key words
+\* (the toy's K order: ORDER) of every pack, and the 1-vs-2 FORMAT
+\* difference LAST (after the other words of BOTH keys).
+\* Cmp.fmtFirst = TRUE is the pre-review C++ order (FORMAT word first).
+Early(pc, s) == IF pc.n # s.n THEN "MODULI"
+                ELSE IF pc.rnd # s.rnd THEN "ROUNDING"
+                ELSE IF pc.k2 # s.k2 THEN "CLASSES" ELSE "NONE"
+Late(pc, s)  == IF pc.order # s.order THEN "ORDER" ELSE "NONE"
+FmtOnly(pc, s) == IF pc.fmt # s.fmt THEN "FORMAT" ELSE "NONE"
+Reason(mut) ==
+    LET s  == SlotKey(mut)
+        kx == Key(XPack(mut))
+        ky == Key(YPack(mut))
+        ps == IF Cmp.both THEN <<kx, ky>> ELSE <<kx>>
+        np == Len(ps)
+        early == [i \in 1..np |-> Early(ps[i], s)]
+        late  == [i \in 1..np |-> Late(ps[i], s)]
+        first == [i \in 1..np |-> FmtOnly(ps[i], s)]
+        flat  == IF Cmp.fmtFirst THEN first \o early \o late ELSE early \o late \o first
+        hits  == {j \in DOMAIN flat : flat[j] # "NONE"}
+    IN IF hits = {} THEN "NONE"
+       ELSE flat[CHOOSE j \in hits : \A i \in hits : j <= i]
 
 (* ----------------------------------------------------------------------- *)
 (* Contraction: in-line reference and packed path                          *)
@@ -345,6 +371,18 @@ AutoFormatsAgree ==
 FormatMismatchRejected ==
     Cmp.check /\ (XPack(mut).fmt # PlanFmt \/ (Cmp.both /\ YPack(mut).fmt # PlanFmt))
         => Status(mut) = "PACK_MISMATCH"
+\* AutoFormatsAgree is a sanity check, not the guarantee: plan and pack apply
+\* the same AutoFmt to the same k here by construction. The real guarantee is
+\* that k is a key word and A is resolved once per API call (DESIGN §4b.5).
+\* Reason order (must-fix 4): a reason is reported iff the key differs, and
+\* FORMAT only for the same tensor in the other alignment (every other key
+\* part equal), so a pack of another k across K_PAD64_MIN ("kset" with
+\* kpmin = 3: pack k = 2, format 1; plan k = 4, format 2) is CLASSES.
+ReasonIffMismatch == Cmp.check => ((Reason(mut) # "NONE") <=> (Status(mut) = "PACK_MISMATCH"))
+FormatMeansSameTensor ==
+    Cmp.check /\ Reason(mut) = "FORMAT" =>
+        /\ [Key(XPack(mut)) EXCEPT !.fmt = PlanFmt] = SlotKey(mut)
+        /\ Cmp.both => [Key(YPack(mut)) EXCEPT !.fmt = PlanFmt] = SlotKey(mut)
 \* witnesses (expected to FAIL on positive configurations)
 NeverMismatch   == OK(mut)
 NativeOrderFree == Same(Inline("12").out, Inline("21").out)
