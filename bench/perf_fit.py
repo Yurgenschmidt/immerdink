@@ -21,8 +21,7 @@ re-predicted by the C library with the fitted parameters (the C does the sum / m
 measured by the sweep) takes K5's launch and byte parameters. The effective L2 of the K4
 DRAM term is scanned (a fraction of the recorded L2; --no-l2-scan keeps the nominal size).
 v1.15 (DESIGN §6c.1 "The eps path — retired"): every record is predicted the same way whatever
-its data (the v1.14 pack emitter has no eps path; the op_eps features are 0, so the op_eps
-parameters fit to 0 and are not written). Datasheet peaks: the RTX 4090's, else --peak-dram / --peak-int8 /
+its data (the v1.14 pack emitter has no eps path; v1.17: the op_eps keys are retired). Datasheet peaks: the RTX 4090's, else --peak-dram / --peak-int8 /
 --peak-fp64 are required. numpy only.
 
 v1.10 (DESIGN §6c, format 2): the method-occupancy record gives the occupancy table (else the
@@ -36,6 +35,14 @@ power.byte_f_pj fitted with power.byte_pj held at --byte-pj, gamma 1; --power-fo
 the v1.10 fit), method-pair records the cache term (L_w scan,
 Delta by least squares; Delta = 0 when the measured effect is below 3 %). --format1 writes a v1.8
 file. Bands are added by bench/perf_validate.py --bands from the hold-out set.
+
+v1.17 (DESIGN §6c.1, host API 12): KF's per-element chain (kf.elem) and the PACK bytes that are
+not L2-hit re-reads (pack.dram) are fitted like the other features; L_hit (warm.pack_l2_bytes)
+is --pack-l2-frac (0.8) x the records' nominal L2, set in the seed so the features of the fit
+are the prediction's (the PACK error over 0.6-1.0 x L2 is printed as a diagnostic); the
+effective clock is the vertex of a parabola through the LOO scan near its argmin (--fref-rule),
+and the nested leave-one-out error of that choice is printed; the phases of --l2 flush records
+(REPEAT state: imd_bench flushes before the timed calls only) are raised to COLD.
 
 Host API 10 (DESIGN §6c.3): the metadata strings are checked against the calibration's field
 sizes before anything is written (check_meta: UTF-8 bytes, NUL included, no line break, no
@@ -166,7 +173,9 @@ class Sample:
 # v1.10 (DESIGN §6c.1 "Clock regimes"): the feature slots whose time scales with the SM clock,
 # per class (perf.cpp kClockBound; host_perf checks the two agree through predictions).
 CLOCK_BOUND = {
-    "k0": (2,), "kf": (2, 3, 4, 5), "kl": (2, 3, 4), "pack": (2, 3, 4),  # not wave (slot 5): memory latency
+    # v1.17: kf.elem (slot 4) and pack.dram (slot 3) are not clock-bound (tile-load latency,
+    # DRAM bytes); kl slot 4 is the retired op_eps
+    "k0": (2,), "kf": (2, 3, 5), "kl": (2, 3), "pack": (2, 4),  # not wave (slot 5): memory latency
     "k4_128x256": (0, 1, 2, 3, 5), "k4_128x128": (0, 1, 2, 3, 5), "k4_64x128": (0, 1, 2, 3, 5),
     "k4_64x64": (0, 1, 2, 3, 5), "k5": (2, 3), "direct": (2, 3), "beta": (2,), "call": ()}
 
@@ -446,8 +455,8 @@ def fit(samples, seed, lib=None, verbose=True, worst=0, k4_shared_dram=False, fr
     # The call term: (t_timed - the C model's phases with these parameters, call term 0) on
     # (1, kernel_launches).
     params["call.call"], params["call.launch"] = 0.0, 0.0
-    if seed.file_format == 1:  # a format-1 calibration has none of the v1.10 chain parameters
-        for k in NEW_CHAINS:
+    if seed.file_format == 1:  # a format-1 calibration has none of the format-2 parameters
+        for k in host.FORMAT2_PARAMS:
             params.pop(k, None)
     trial = host.Calibration.from_values(seed.meta, params, lib, seed.extra or None)
     Xc, rc, tc = [], [], []
@@ -501,7 +510,9 @@ def clock_summary(records):
             f"post-warm-up power {pw[0] if pw else '?'}-{pw[-1] if pw else '?'} W")
 
 
-NEW_CHAINS = tuple(sorted(host.FORMAT2_PARAMS))  # the v1.10 chain parameters (format 2)
+# the v1.10 chain parameters (format 2; --no-chain drops them); v1.17's kf.elem / pack.dram
+# are format-2 parameters but not chains of v1.10
+NEW_CHAINS = tuple(sorted(host.FORMAT2_PARAMS - {"kf.elem", "pack.dram"}))
 
 
 def occupancy_from_records(records, lib=None):
@@ -522,9 +533,11 @@ def reference_clock(records):
     return float(statistics.median(clk)) if clk else 0.0
 
 
-def seed_extra(lib, kernels=None, fref=0.0, base=None):
+def seed_extra(lib, kernels=None, fref=0.0, base=None, pack_l2=0.0):
     """The format-2 keys of a seed calibration: the occupancy table (measured, else the
-    built-in one), the reference clock without a power model, no cache term, bands 1."""
+    built-in one), the reference clock without a power model, no cache term, bands 1, and
+    (v1.17) L_hit of the PACK hit rule (pack_l2 bytes; it shapes the features, so the seed
+    carries it from the start)."""
     ref = host.Calibration.default(lib)
     ex = {f"kernel.{n}": v for n, v in ref.kernels.items()}
     if kernels:
@@ -533,7 +546,8 @@ def seed_extra(lib, kernels=None, fref=0.0, base=None):
     ex.update({"power.clock_eff_mhz": fref, "power.clock_min_mhz": fref, "power.cap_w": 0.0,
                "power.idle_w": 0.0, "power.tc_pj": 0.0, "power.alu_pj": 0.0,
                "power.byte_pj": 0.0, "power.gamma": 2.0,
-               "warm.l2_bytes": 0.0, "warm.l2byte": 0.0, "rank.tie_ratio": 1.0})
+               "warm.l2_bytes": 0.0, "warm.l2byte": 0.0, "rank.tie_ratio": 1.0,
+               "warm.pack_l2_bytes": float(pack_l2)})
     ex.update({k: (1.0, 1.0) for k in ref.bands})
     if base:
         ex.update(base)
@@ -643,6 +657,75 @@ def power_validation(rows, meta, params, extra, fref, lib=None, verbose=True, id
             print(f"{lab[:44]:<44} {'':>9} {1e3 * tm:>8.3f}ms {1e3 * tp:>8.3f}ms "
                   f"{100 * (tp - tm) / tm:>+6.1f}% {fm:>7.0f} {fp:>7.0f} {pm:>7.1f} {pp:>7.1f}")
     return out
+
+
+def fref_scan(rows, meta, params, extra, fref, lib, idle, power_kw, step=25.0, count=17):
+    """[(f, LOO median |t err|)] over the candidates fref, fref - step, ... (DESIGN §6c.1)."""
+    out = []
+    for fr in [fref - step * i for i in range(count)]:
+        val = power_validation(rows, meta, params, extra, fr, lib, verbose=False, idle=idle,
+                               **power_kw)
+        if val:
+            out.append((fr, float(np.median([abs(tp - tm) / tm for _, tm, tp, *_ in val]))))
+    return out
+
+
+def fref_select(scan, rule="vertex", half_window=100.0):
+    """v1.17 (DESIGN §6c.1): the effective clock from a LOO scan. "argmin": the candidate with
+    the smallest error (v1.10). "vertex": the vertex of the least-squares parabola through the
+    candidates within +-half_window of the argmin, clamped to them; the argmin if there are
+    fewer than 5 such candidates or the parabola is not convex."""
+    f0 = min(scan, key=lambda q: q[1])[0]
+    if rule == "argmin":
+        return f0
+    pts = [(f, e) for f, e in scan if abs(f - f0) <= half_window + 1e-9]
+    if len(pts) < 5:
+        return f0
+    f = np.array([q[0] for q in pts]) - f0
+    e = np.array([q[1] for q in pts])
+    a, b, _ = np.polyfit(f, e, 2)
+    if not a > 0:
+        return f0
+    return float(round(f0 + float(np.clip(-b / (2 * a), f.min(), f.max()))))  # whole MHz
+
+
+def nested_fref_validation(rows, meta, params, extra, fref, lib, idle, power_kw, rule):
+    """v1.17: the honest figure of the f_ref choice. Per case: the scan and the rule on the
+    other cases (their own leave-one-out), the power fit on them at that f_ref, then the case's
+    SUSTAINED prediction. [(label, t meas, t pred, f meas, f pred, P meas, P pred, fold f_ref)]."""
+    out = []
+    cases = sorted({r["case"] for r in rows})
+    for case in cases:
+        train = [r for r in rows if r["case"] != case]
+        if len({r["case"] for r in train}) < 5:
+            continue
+        scan = fref_scan(train, meta, params, extra, fref, lib, idle, power_kw)
+        if not scan:
+            continue
+        fr = fref_select(scan, rule)
+        pw = fit_power(train, fr, idle=idle, **power_kw)
+        cal = host.Calibration.from_values(meta, params, lib, dict(extra, **pw))
+        for r in rows:
+            if r["case"] == case:
+                p = host.predict(r["spec"], r["ext"], N=r["N"], g=r["g"], vec_mode=r["vec"],
+                                 regime="SUSTAINED", cache="REPEAT", calib=cal, lib=lib)
+                out.append((r["label"], r["t"], p.time_s, r["f"], p.clock_mhz, r["P"],
+                            p.power_w, fr))
+    return out
+
+
+def class_error(samples, cls, lib=None, fref=0.0):
+    """(phases, median, p90, relative SSE) of one non-K4 class's NNLS fit on these samples."""
+    names = host.param_names(lib)
+    data = phase_rows(samples, fref).get(cls, [])
+    if not data:
+        return 0, 0.0, 0.0, 0.0
+    used = [j for j, n in enumerate(names[cls]) if n]
+    X = np.array([d[0][used] for d in data])
+    t = np.array([d[1] for d in data])
+    th = nnls_relative(X, t)
+    err = np.abs(X @ th - t) / t
+    return len(data), float(np.median(err)), float(np.percentile(err, 90)), float(np.sum(err ** 2))
 
 
 # ---- v1.10: the cache term (DESIGN §6c.1 "Cache state") ------------------------------------
@@ -755,6 +838,14 @@ def main(argv=None):
                     help="drop the v1.10 chain features of K0, KL, PACK, K5, DIRECT, BETA")
     ap.add_argument("--kernel", action="append", default=[], metavar="NAME=R",
                     help="override a kernel's CTAs per SM (e.g. kf4=4, the v1.8 built-in)")
+    # v1.17 (DESIGN §6c.1, §6c.2)
+    ap.add_argument("--pack-l2-frac", type=float, default=0.8,
+                    help="L_hit of the PACK hit rule (warm.pack_l2_bytes) as a fraction of the "
+                         "records' nominal L2 (default 0.8: 60.4 MB on the RTX 4090; 0: no hit "
+                         "rule)")
+    ap.add_argument("--fref-rule", choices=("vertex", "argmin"), default="vertex",
+                    help="effective clock from the sustained LOO scan: the vertex of a parabola "
+                         "within +-100 MHz of the argmin (v1.17 default) or the argmin (v1.10)")
     ap.add_argument("--format1", action="store_true",
                     help="write a format-1 file (v1.8 features only; implies --no-clock, "
                          "--no-chain)")
@@ -818,7 +909,9 @@ def main(argv=None):
         n, r = kv.split("=")
         old = kernels.get(n) or host.Calibration.default(a.lib).kernels[n]
         kernels[n] = (int(r),) + tuple(old[1:])
-    extra = None if a.format1 else seed_extra(a.lib, kernels, fref)
+    if not 0 <= a.pack_l2_frac <= 4:
+        ap.error("--pack-l2-frac must be in [0, 4]")
+    extra = None if a.format1 else seed_extra(a.lib, kernels, fref, pack_l2=a.pack_l2_frac * l2)
     if extra is not None:
         print(f"reference clock {fref:.0f} MHz; occupancy: " +
               ", ".join(f"{n} {extra['kernel.' + n][0]}" for n in
@@ -859,8 +952,10 @@ def main(argv=None):
             calw = host.Calibration.from_values(meta, params0, a.lib, extra)
             added = []
             for s in samples:
-                if "l2=flush" in s.label or " pack " in s.label:
-                    continue  # measured COLD already (flushed, or method packed's interleaving)
+                # v1.17: a flushed record's phases are REPEAT state (imd_bench flushes before
+                # the timed calls only, not the phase reps), so they are raised like the others
+                if " pack " in s.label:
+                    continue  # measured COLD already (method packed's interleaving)
                 cold, rep = s.again(calw, "COLD"), s.again(calw, "REPEAT")
                 for qc, qr in zip(cold.phases, rep.phases):
                     if qc.name in s.measured and qc.time_s != qr.time_s:
@@ -869,6 +964,17 @@ def main(argv=None):
             print(f"cache term: REPEAT phases raised to COLD by {100 * np.median(added):.1f} % "
                   f"(median), {100 * max(added):.1f} % (max) of the call")
         seed = host.Calibration.from_values(meta, seed.params, a.lib, extra)
+    if extra is not None and extra["warm.pack_l2_bytes"] > 0:
+        # v1.17 diagnostic (no selection): the PACK class's fitted error against L_hit
+        print(f"PACK L2-hit rule: L_hit = {a.pack_l2_frac:.2f} x {l2 / 2**20:.0f} MiB = "
+              f"{extra['warm.pack_l2_bytes'] / 1e6:.1f} MB; PACK fit error by L_hit (diagnostic):")
+        for frac in (0.0, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 1.0):
+            sd = host.Calibration.from_values(meta, seed.params, a.lib,
+                                              dict(extra, **{"warm.pack_l2_bytes": frac * l2}))
+            n, med, p90, sse = class_error(samples_from_records(records, a.lib, sd), "pack",
+                                           a.lib, fnorm)
+            print(f"  L_hit {frac:.2f} x L2 ({frac * l2 / 1e6:5.1f} MB): {n} phases, median "
+                  f"{100 * med:.1f} %, p90 {100 * p90:.1f} %, relative SSE {sse:.3f}")
     params = fit(samples, seed, a.lib, worst=a.worst, k4_shared_dram=a.k4_shared_dram,
                  fref=fnorm, drop=drop)
     if extra is not None:
@@ -879,15 +985,23 @@ def main(argv=None):
             # already ran below the boost clock (the limiter acts within a timed loop), so the
             # clock that SUSTAINED scales from is scanned (leave-one-case-out median error of
             # the sustained windows), from the boost clock down.
-            best = None
-            for fr in [fref - 25 * i for i in range(0, 17)]:
-                out = power_validation(rows, meta, params, extra, fr, a.lib, verbose=False,
-                                       idle=a.idle_w, **power_kw)
-                err = float(np.median([abs(tp - tm) / tm for _, tm, tp, *_ in out]))
-                print(f"  time-model clock {fr:.0f} MHz: sustained LOO median |err| {100 * err:.2f} %")
-                if best is None or err < best[0] - 1e-12:
-                    best = (err, fr)
-            fr = best[1] if a.clock_ref is None else fref
+            scan = fref_scan(rows, meta, params, extra, fref, a.lib, a.idle_w, power_kw)
+            for f_, err in scan:
+                print(f"  time-model clock {f_:.0f} MHz: sustained LOO median |err| {100 * err:.2f} %")
+            fr = fref_select(scan, a.fref_rule) if a.clock_ref is None else fref
+            print(f"time-model clock (f_ref, rule {a.fref_rule if a.clock_ref is None else 'given'}): "
+                  f"{fr:.1f} MHz (scan argmin {min(scan, key=lambda q: q[1])[0]:.0f} MHz)")
+            if a.clock_ref is None:
+                nest = nested_fref_validation(rows, meta, params, extra, fref, a.lib, a.idle_w,
+                                              power_kw, a.fref_rule)
+                if nest:
+                    errs = [abs(tp - tm) / tm for _, tm, tp, *_ in nest]
+                    print(f"nested leave-one-case-out (f_ref chosen inside each fold, rule "
+                          f"{a.fref_rule}): median |t err| {100 * float(np.median(errs)):.2f} %, "
+                          f"folds' f_ref {min(q[-1] for q in nest):.0f}-{max(q[-1] for q in nest):.0f} MHz")
+                    for lab, tm, tp, fm, fp, pm, pp, ff in nest:
+                        print(f"    {lab[:44]:<44} {100 * (tp - tm) / tm:>+6.1f}%  f {fm:.0f} / "
+                              f"{fp:.0f} MHz  P {pm:.0f} / {pp:.0f} W  (fold f_ref {ff:.0f})")
             pw = fit_power(rows, fr, idle=a.idle_w, **power_kw)
             print(f"power model ({a.power_form} form" +
                   (f", power.byte_pj held at {a.byte_pj:g} pJ/B" if a.power_form == "scaled" else "")

@@ -3069,9 +3069,10 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   feature is computed, so fit and prediction see the same hit rule, and prints the PACK error
   over 0.6–1.0 × L2 as a diagnostic (no selection: the calibration set has one case on each
   side of the step). `CLOCK_BOUND`: kf (2, 3, 5), pack (2, 4). `bench/sweep_calib.txt` adds
-  the step's cases (`c_l2s1536` N = 8 / 14 / 20 and `c_l2s1792` N = 14 at g = 4; `c_k3hit` /
-  `c_k3miss`, 1024 / 4096 × 96 × 4096 at g = 2); `bench/sweep_perf_validate.txt` adds
-  N = 18–20 cases (W = 3, §3.4.1).
+  the step's cases (`c_l2s1472` N = 8 / 14 / 20, S = 52 MB, and `c_l2s1792` N = 14, S = 77 MB,
+  at g = 4; `c_k3hit` / `c_k3miss`, 1024 / 4096 × 96 × 4096 at g = 2, S ≈ 46 / 150 MB; 1536³
+  is a hold-out shape); `bench/sweep_perf_validate.txt` adds N = 18–20 cases (W = 3, §3.4.1:
+  `v_n18a` … `v_n18d`).
 - **File format 1** (`*.calib`): UTF-8 text, one `key = value` per line, `#` comments and
   blank lines ignored, keys unique, values to the end of the line (trimmed). Required:
   `format = 1`, `gpu`, `sm_count`, the three peaks, `l2_bytes` and **every** parameter
