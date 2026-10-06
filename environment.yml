@@ -12,7 +12,5 @@ dependencies:
   - cuda-version=13.4
   - cuda-nvcc
   - cuda-cudart-dev
-  - libcublas-dev        # baseline: native DGEMM
-  - cutensor             # baseline: native FP64 contraction
   - openjdk=25           # TLC without depending on the VS Code extension
-  - nsight-compute       # ncu kernel profiling (needs GPU counters: see docs/BENCHMARKS.md)
+  - nsight-compute       # ncu kernel profiling (needs GPU counters: see docs/BENCHMARKING.md)

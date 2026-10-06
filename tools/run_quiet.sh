@@ -22,6 +22,29 @@ if [ "${QUIET_GATE:-0}" = 1 ]; then
     [ "$waited" = 0 ] && echo "waiting for a quiet machine..." >&2
     sleep 15; waited=$((waited + 15))
   done
+  # Desktop renderers (the Claude app, gnome-shell) time-slice the GPU whenever they draw,
+  # even at idle clocks (docs/NOTES-K5-bimodal.md), which the clock-weighted check above
+  # lets through. Prefer a moment when raw utilization is ~0: wait up to QUIET_RAW_WAIT
+  # seconds (default 300) for its mean over 2 s to be <= QUIET_GPU_RAW (default 1 %). If it
+  # never gets there, run anyway; bench/warm_run.sh then flags the records "contaminated".
+  rawt=0
+  while [ "$rawt" -lt "${QUIET_RAW_WAIT:-300}" ]; do
+    raw="$(for _ in $(seq 10); do nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -1; sleep 0.2; done | awk '{s+=$1} END{printf "%.1f", s/NR}')"
+    awk -v a="$raw" -v b="${QUIET_GPU_RAW:-1}" 'BEGIN{exit !(a <= b)}' && break
+    [ "$rawt" = 0 ] && echo "waiting for the desktop to stop drawing on the GPU (raw util ${raw}%)..." >&2
+    sleep 5; rawt=$((rawt + 7))
+  done
   "$here/quiet_check.sh" > "${QUIET_LOG:-/dev/null}" 2>&1 || true   # record conditions
+fi
+# GPU work on this box is shared with other projects (ehrenfest): every gated run also
+# takes the machine-wide advisory GPU lock, IMMERDINK_GPU_LOCK (default: ehrenfest's
+# _wip/gpu.lock if present, else $XDG_RUNTIME_DIR/gpu.lock; "none" disables).
+gpu_lock="${IMMERDINK_GPU_LOCK:-}"
+if [ -z "$gpu_lock" ]; then
+  gpu_lock="/home/ef/repos/ehrenfest-ipdps/_wip/gpu.lock"
+  [ -d "$(dirname "$gpu_lock")" ] || gpu_lock="${XDG_RUNTIME_DIR:-/tmp}/gpu.lock"
+fi
+if [ "$gpu_lock" != none ] && [ "${QUIET_GATE:-0}" = 1 ]; then
+  exec flock "$gpu_lock" "$here/memcap.sh" "$@"
 fi
 "$here/memcap.sh" "$@"

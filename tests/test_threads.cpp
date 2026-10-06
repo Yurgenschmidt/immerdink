@@ -60,7 +60,7 @@ struct Problem {
   imd_tensor_t A() const { return {int32_t(eA.size()), eA.data(), sA.data(), lA.data()}; }
   imd_tensor_t B() const { return {int32_t(eB.size()), eB.data(), sB.data(), lB.data()}; }
   imd_tensor_t C() const { return {int32_t(eC.size()), eC.data(), sC.data(), lC.data()}; }
-  imd_options_t opt(int vec) const { return {N, g, IMD_RN, IMD_EMULATE, vec}; }
+  imd_options_t opt(int vec) const { return {N, g, IMD_RN, IMD_EMULATE, vec, IMD_K4_TUNE_OFF}; }
 };
 
 std::vector<int64_t> dense(const std::vector<int64_t>& e) {
@@ -232,10 +232,98 @@ int main() {
           fail("threaded result differs from the sequential one", t, slot);
         checked += long(r.size());
       }
+  // Phase 3 (DESIGN v1.7 §6b.7): packed operands. The main thread packs P0's A once (the
+  // imd_pack_desc_for descriptor: bit-identical to the plain call, ref[0]) and creates a
+  // shared packed plan; then every thread, on its own stream with its own workspace and C,
+  // concurrently creates its own pack handle (same descriptor) and its own packed plan from
+  // the SHARED handle, and contracts kIters times: the shared plan with the shared handle,
+  // the shared plan with its own handle (any handle with the plan's key), its own plan.
+  // Every call reads the one packed buffer concurrently. A thread destroys its own plan and
+  // handle as soon as its calls have returned (before its stream is synchronized).
+  long checked_packed = 0;
+  {
+    const Problem& p = P[0];
+    const imd_tensor_t A = p.A(), B = p.B(), C = p.C();
+    const imd_options_t o = p.opt(IMD_VEC_GENERATE);
+    imd_pack_desc_t desc;
+    std::memset(&desc, 0, sizeof desc);
+    desc.struct_size = sizeof desc;
+    int32_t labels[8];
+    imd_pack_t hp = nullptr;
+    size_t pb = 0, pw = 0, wsp = 0;
+    void *packed = nullptr, *pws = nullptr;
+    const imd_pack_desc_t* pdesc = &desc;
+    const imd_packing_t packing = {pdesc, nullptr};
+    if (!ok(imd_pack_desc_for(&A, &B, &C, &o, 0, &desc, labels, 8), "imd_pack_desc_for") ||
+        !ok(imd_pack_create(h, &desc, &hp), "imd_pack_create") ||
+        !ok(imd_pack_bytes(hp, &pb, &pw), "imd_pack_bytes") ||
+        !ok(imd_workspace_size_packed(&A, &B, &C, &o, &packing, &wsp), "ws packed") ||
+        !ok(cudaMalloc(&packed, pb), "malloc packed") || !ok(cudaMalloc(&pws, pw), "malloc pws") ||
+        !ok(imd_pack(hp, D[0].A, packed, pb, pws, pw, nullptr), "imd_pack") ||
+        !ok(cudaDeviceSynchronize(), "pack sync"))  // RAW: the threads' streams after the pack
+      return 1;
+    imd_plan_t shared_packed = nullptr;
+    if (!ok(imd_plan_create_packed(h, &A, &B, &C, &o, hp, nullptr, &shared_packed), "plan packed"))
+      return 1;
+    std::vector<std::vector<double>> res(kThreads * kIters * 3);
+    std::barrier go(kThreads);
+    std::vector<std::thread> th;
+    for (int t = 0; t < kThreads; ++t) {
+      th.emplace_back([&, t] {
+        cudaStream_t s = nullptr;
+        void* ws = nullptr;
+        double* dC[3] = {};
+        bool good = ok(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream") &&
+                    ok(cudaMalloc(&ws, wsp), "malloc ws");
+        for (int c = 0; c < 3 && good; ++c) good = ok(cudaMalloc(&dC[c], p.nC * 8), "malloc C");
+        go.arrive_and_wait();
+        for (int it = 0; it < kIters && good; ++it) {
+          imd_pack_t own_h = nullptr;
+          imd_plan_t own_p = nullptr;
+          good = ok(imd_pack_create(h, &desc, &own_h), "own pack handle") &&
+                 ok(imd_plan_create_packed(h, &A, &B, &C, &o, hp, nullptr, &own_p), "own plan");
+          const imd_operand_t ops[3] = {{D[0].A, packed, pb, hp}, {D[0].A, packed, pb, own_h},
+                                        {D[0].A, packed, pb, own_h}};
+          const imd_operand_t opB = {D[0].B, nullptr, 0, nullptr};
+          const imd_plan_t plans[3] = {shared_packed, shared_packed, own_p};
+          for (int c = 0; c < 3 && good; ++c) {
+            const int slot = (c + t + it) % 3;
+            good = ok(cudaMemcpyAsync(dC[slot], D[0].C0.data(), p.nC * 8, cudaMemcpyHostToDevice, s),
+                      "C upload") &&
+                   ok(imd_contract_packed(plans[slot], 1.0, &ops[slot], &opB, 0.5, dC[slot], ws, wsp, s),
+                      "imd_contract_packed");
+          }
+          imd_plan_destroy(own_p);   // every call using them has returned
+          imd_pack_destroy(own_h);
+          good = good && ok(cudaStreamSynchronize(s), "stream sync");
+          for (int c = 0; c < 3 && good; ++c) {
+            auto& r = res[(t * kIters + it) * 3 + c];
+            r.resize(p.nC);
+            good = ok(cudaMemcpy(r.data(), dC[c], p.nC * 8, cudaMemcpyDeviceToHost), "download");
+          }
+        }
+        for (double* c : dC) cudaFree(c);
+        cudaFree(ws);
+        if (s) cudaStreamDestroy(s);
+        if (!good) fail("packed thread", t);
+      });
+    }
+    for (auto& x : th) x.join();
+    imd_plan_destroy(shared_packed);
+    imd_pack_destroy(hp);
+    cudaFree(packed);
+    cudaFree(pws);
+    for (const auto& r : res) {
+      if (r.size() != ref[0].size() || std::memcmp(r.data(), ref[0].data(), r.size() * 8) != 0)
+        fail("packed threaded result differs from the plain sequential one");
+      checked_packed += long(r.size());
+    }
+  }
   for (auto& d : D) cudaFree(d.A), cudaFree(d.B);
   imd_destroy(h);
   std::printf("%d threads x %d iterations x 4 calls (shared and own plans, both vec modes): "
-              "%ld C elements bit-identical to the sequential run: %s\n",
-              kThreads, kIters, checked, g_failures == 0 ? "PASS" : "FAIL");
+              "%ld C elements bit-identical to the sequential run; packed (one buffer, shared "
+              "and own plans and handles): %ld C elements bit-identical: %s\n",
+              kThreads, kIters, checked, checked_packed, g_failures == 0 ? "PASS" : "FAIL");
   return g_failures == 0 ? 0 : 1;
 }

@@ -28,6 +28,20 @@ if(Python3_FOUND)
   add_test(NAME host_python
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_host.py"
                    --host-lib "$<TARGET_FILE:immerdink_host>" --suite host -v)
+  # DESIGN v1.8 §6c: the performance model (calibration, features, rank). CPU only.
+  add_test(NAME host_perf
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_host.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" --suite perf -v)
+  # DESIGN v1.11 §6e: the fast planner queries (python/immerdink/planner.py) == host.py, bit
+  # for bit, on random queries; Planner / Memo bounds and threads. CPU only.
+  add_test(NAME host_planner
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_planner.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" -v)
+  # DESIGN v1.12 §6f: accuracy-aware planning (imd_err_*, predict / rank err fields) vs
+  # spec/params.py error_estimate (exact rational enclosure). CPU only.
+  add_test(NAME host_accuracy
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_accuracy.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" -v)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
@@ -112,7 +126,7 @@ if(Python3_FOUND)
   # contract_highrank (operand ranks 6-12) has hard size guards; run it alone with
   # `tools/test.sh -R contract_highrank`, or skip it with `-E contract_highrank`.
   set(shim "$<TARGET_FILE:imd_alloc_shim>")
-  foreach(suite api stages e2e tensor bigk replay)
+  foreach(suite api stages e2e tensor bigk replay every_n)
     add_test(NAME contract_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                      --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
@@ -127,6 +141,24 @@ if(Python3_FOUND)
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
   set_tests_properties(contract_highrank PROPERTIES TIMEOUT 300)
+  # DESIGN v1.7 §6b packed operands: imd_pack (every byte) and imd_contract_packed vs
+  # spec/oracle.py, bit for bit, with the allocation shim; reuse; statuses.
+  foreach(suite packed reuse api)
+    add_test(NAME packed_${suite}
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_packed.py"
+                     --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+    set_tests_properties(packed_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800
+                         ENVIRONMENT "LD_PRELOAD=${shim}")
+  endforeach()
+
+  # DESIGN v1.9 §6d: the Python device API (python/immerdink: Plan, Pack, contract) on the
+  # GPU, bit for bit vs spec/oracle.py, with the allocation shim (pytest; CAI / DLPack
+  # producers built with ctypes, no CuPy or PyTorch needed).
+  add_test(NAME python_device
+           COMMAND Python3::Interpreter -m pytest -q -p no:cacheprovider
+                   "${CMAKE_CURRENT_SOURCE_DIR}/test_python_device.py")
+  set_tests_properties(python_device PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                       ENVIRONMENT "IMMERDINK_LIB=$<TARGET_FILE:immerdink>;IMMERDINK_SHIM=${shim};LD_PRELOAD=${shim}")
 
   # libimmerdink's real plans vs libimmerdink_host's queries (DESIGN §6a): the plan's GEMM
   # view, workspace layout, device bytes, K4 parameter sets and launches, and host payload
@@ -147,6 +179,13 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/contractions.py"
                    --lib "$<TARGET_FILE:immerdink>" --quick --rows 16)
   set_tests_properties(accuracy_bound_quick PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+  # DESIGN v1.12 §6f: measured errors <= libimmerdink_host's rigorous estimates (every metric)
+  # on random small cases; reports the typical estimate's coverage. Exit 1 on a violation.
+  add_test(NAME accuracy_err_api_quick
+           COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/err_api.py"
+                   --lib "$<TARGET_FILE:immerdink>" --host-lib "$<TARGET_FILE:immerdink_host>"
+                   --quick)
+  set_tests_properties(accuracy_err_api_quick PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
 endif()
 
 # GPU tests share one device; run them one at a time.

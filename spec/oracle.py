@@ -486,7 +486,8 @@ def native_dot(a_row, b_col, init: float = NATIVE_ACC_INIT) -> float:
 
 def contract(A, B, C, alpha: float, beta: float, N: int, rounding: str = "RN",
              g: int | None = None, chunk: int = K_C_ALIGNED, m=None, n=None, k=None,
-             trace: dict | None = None, _rule: str | None = None, _L_w: int | None = None):
+             trace: dict | None = None, _rule: str | None = None, _L_w: int | None = None,
+             ext_a=None, ext_b=None):
     """C_out = alpha A B + beta C per DESIGN §3 (returns a new m x n list of lists).
 
     A: m x k, B: k x n, C: m x n (lists of lists of floats).  A and B are not touched
@@ -494,7 +495,11 @@ def contract(A, B, C, alpha: float, beta: float, N: int, rounding: str = "RN",
     check).  Shapes may be given explicitly (m, n, k) so that unread operands can be None.
     `trace`, if a dict, receives sigma, tau, flags, quantized operands, residue planes
     RA[l][i][h] / RB[l][j][h] (every modulus l), W planes, z and D.
-    `_rule` / `_L_w` override the shift rule / CRT word width: negative tests only."""
+    `_rule` / `_L_w` override the shift rule / CRT word width: negative tests only.
+    `ext_a` / `ext_b` (DESIGN v1.7 §6b, packed operands): (sigma, flags, planes) of A's rows
+    (B's columns) read from a packed buffer instead of being computed here: planes[l][i][h],
+    h < k, the int8 residues of every modulus l. A / B are then read only by the native path
+    of flagged elements."""
     if m is None:
         m = len(A)
     if k is None:
@@ -516,24 +521,26 @@ def contract(A, B, C, alpha: float, beta: float, N: int, rounding: str = "RN",
 
     Bt = [[B[h][j] for h in range(k)] for j in range(n)]   # columns of B
 
-    # K1: §3.1 + §3.2
-    srow = [scale_vector(A[i], plan, _rule) for i in range(m)]
-    scol = [scale_vector(Bt[j], plan, _rule) for j in range(n)]
-    sigma = [s[0] for s in srow]
-    fA = [s[1] for s in srow]
-    tau = [s[0] for s in scol]
-    fB = [s[1] for s in scol]
+    # K1: §3.1 + §3.2 (a packed operand brings its sigma and flags, §6b)
+    srow = [scale_vector(A[i], plan, _rule) for i in range(m)] if ext_a is None else None
+    scol = [scale_vector(Bt[j], plan, _rule) for j in range(n)] if ext_b is None else None
+    sigma = [s[0] for s in srow] if ext_a is None else list(ext_a[0])
+    fA = [s[1] for s in srow] if ext_a is None else list(ext_a[1])
+    tau = [s[0] for s in scol] if ext_b is None else list(ext_b[0])
+    fB = [s[1] for s in scol] if ext_b is None else list(ext_b[1])
 
     # §3.3 quantization, once per element (K2/K3 recompute this per group on device)
-    QA = [[quantize(v, sigma[i], rounding) for v in A[i]] for i in range(m)]
-    QB = [[quantize(v, tau[j], rounding) for v in Bt[j]] for j in range(n)]
+    QA = [[quantize(v, sigma[i], rounding) for v in A[i]] for i in range(m)] if ext_a is None else None
+    QB = [[quantize(v, tau[j], rounding) for v in Bt[j]] for j in range(n)] if ext_b is None else None
 
     # K2-K4 per residue group: residues (§3.4) then per-modulus chunked GEMM (§3.5)
     Wplanes = [None] * N
     RAall, RBall = [None] * N, [None] * N             # trace only: residue planes
     for G in plan.groups():
-        RA = {l: [[residue(mu, ep, plan.p[l]) for mu, ep in QA[i]] for i in range(m)] for l in G}
-        RB = {l: [[residue(mu, ep, plan.p[l]) for mu, ep in QB[j]] for j in range(n)] for l in G}
+        RA = {l: ([[residue(mu, ep, plan.p[l]) for mu, ep in QA[i]] for i in range(m)]
+                  if ext_a is None else ext_a[2][l]) for l in G}
+        RB = {l: ([[residue(mu, ep, plan.p[l]) for mu, ep in QB[j]] for j in range(n)]
+                  if ext_b is None else ext_b[2][l]) for l in G}
         for l in G:
             Wplanes[l] = modular_gemm(RA[l], RB[l], plan.p[l], plan.chunk)
             if trace is not None:
@@ -701,7 +708,7 @@ class GemmView:
         return self.b == 0 or self.m == 0 or self.n == 0
 
 
-def lower(A: Desc, B: Desc, C: Desc, mode=EMULATE, build_vec=True) -> GemmView:
+def lower(A: Desc, B: Desc, C: Desc, mode=EMULATE, build_vec=True, orders=None) -> GemmView:
     """DESIGN §5 lowering with the legality rows 1-5 in precedence order (rows 6-7 are
     execute-time). Raises InvalidValue / NotSupported.
 
@@ -709,7 +716,11 @@ def lower(A: Desc, B: Desc, C: Desc, mode=EMULATE, build_vec=True) -> GemmView:
     2k + 3b entries; tens of GB for a legal 2^31-row descriptor). build_vec=False
     makes v.vec a LazyVecs: every status, dimension, order and fusion result is the same,
     lowering costs O(rank) time and memory, and a vector is built (identically) only when
-    it is read."""
+    it is read.
+
+    orders (DESIGN v1.7 §6b.2, packed operands): {class: [labels]} replaces the canonical
+    order of the given POST-SWAP classes (a permutation of the class's kept labels): the
+    orders a plan adopts from its packs. Fusion (step 9) is then applied in that order."""
     T = {"A": A, "B": B, "C": C}
     for d in T.values():
         if any(e < 0 for e in d.extent):
@@ -777,6 +788,9 @@ def lower(A: Desc, B: Desc, C: Desc, mode=EMULATE, build_vec=True) -> GemmView:
             "K": lambda l: (a(big, l), a(oth, l), first[l])}
     v.order = {g: sorted((l for l in cls if cls[l] == g and ext[l] != 1), key=keys[g])
                for g in "IJKL"}
+    for g, lst in (orders or {}).items():              # §6b.2: adopted orders
+        assert sorted(lst) == sorted(v.order[g]), f"adopted {g} order {lst} vs {v.order[g]}"
+        v.order[g] = list(lst)
     v.ext, v.stride, v.first = ext, stride, first
     # step 9: within each group, in canonical order, merge consecutive modes g, g' iff
     # s_X(g') = s_X(g) e(g) for EVERY tensor X carrying the group (stride-0 carriers too).
@@ -816,24 +830,37 @@ class Tensor:
 
 def contract_tensor(A: Tensor, B: Tensor, C: Tensor, alpha: float, beta: float, N: int,
                     rounding: str = "RN", g: int | None = None, mode=EMULATE,
-                    chunk: int = K_C_ALIGNED, trace: dict | None = None):
+                    chunk: int = K_C_ALIGNED, trace: dict | None = None, orders=None,
+                    packs=None):
     """C[I,J,L] <- alpha sum_K A[I,K,L] B[K,J,L] + beta C[I,J,L] (DESIGN §1) through the
     §5 lowering. Returns a new flat list for C's buffer (elements C does not address are
     copied unchanged). Dispatch (§3.7, §4):
       SCALE  alpha = 0 or k = 0: C <- beta == 0 ? +0 : RN(beta C); A, B not read;
       DIRECT K-empty (k = 1 after lowering) or mode DIRECT: native fma dot, acc = +0;
       GEMM   otherwise: contract() per batch lambda on the gathered canonical matrices.
-    `trace` receives view, kind and, per batch of the GEMM path, contract()'s trace."""
+    `trace` receives view, kind and, per batch of the GEMM path, contract()'s trace.
+    DESIGN v1.7 §6b: `orders` = adopted canonical orders (lower(orders=...)); `packs` =
+    (packed A or None, packed B or None), each a PackedOperand of the CALLER's operand:
+    the plan's lowering adopts the packs' orders (lower_packed: PackMismatch on a key
+    mismatch) and the emulated path reads sigma, the flags and the residues from the packed
+    bytes (A / B themselves only on the native path of flagged elements)."""
     if not (N_MIN <= N <= N_MAX):
         raise InvalidValue(f"N={N}")
     if rounding not in ("RN", "TRUNC") or mode not in (EMULATE, DIRECT):
         raise InvalidValue("option")
     if not (g in (None, 0) or 1 <= g <= N):
         raise InvalidValue(f"g={g}")
-    view = lower(A.desc, B.desc, C.desc, mode)
+    info = None
+    if packs is not None and any(pk is not None for pk in packs):
+        assert orders is None, "a packed plan adopts the packs' orders"
+        view, info = lower_packed(A.desc, B.desc, C.desc, mode,
+                                  tuple(pk.desc if pk is not None else None for pk in packs),
+                                  N, rounding)
+    else:
+        view = lower(A.desc, B.desc, C.desc, mode, orders=orders)
     out = list(C.buf)
     if trace is not None:
-        trace.update(view=view, batches=[], kind="NOOP")
+        trace.update(view=view, batches=[], kind="NOOP", packed=info)
     if view.empty_output():
         return out
     m, n, k, b, vec = view.m, view.n, view.k, view.b, view.vec
@@ -873,14 +900,366 @@ def contract_tensor(A: Tensor, B: Tensor, C: Tensor, alpha: float, beta: float, 
                     res[i][j] = E if beta == 0.0 else fma(beta, Cl[i][j], E)
         else:
             t = {} if trace is not None else None
+            ext = {"A": None, "B": None}
+            if info is not None:      # §6b: the packed post-swap operands' sigma, flags, planes
+                for x, role in enumerate(info["roles"]):
+                    if packs[x] is not None:
+                        ext[role] = pack_rows(info["views"][x], packs[x].data, lam,
+                                              m if role == "A" else n)
             res = contract(gather_a(lam), gather_b(lam), Cl, alpha, beta, N, rounding, g,
-                           chunk, m=m, n=n, k=k, trace=t)
+                           chunk, m=m, n=n, k=k, trace=t, ext_a=ext["A"], ext_b=ext["B"])
             if trace is not None:
                 trace["batches"].append(t)
         for i in range(m):
             for j in range(n):
                 out[c_off(lam, i, j)] = res[i][j]
     return out
+
+
+# ---------------------------------------------------------------------------------------
+# §6b Packed operands (DESIGN v1.7, ROADMAP D1)
+# ---------------------------------------------------------------------------------------
+#
+# A packed operand X: per row (lambda, rho) its sigma (§3.2) and flag (§3.1) and the residues
+# of ALL N moduli over the whole canonical K (§3.3, §3.4), in the §6b.4 byte layout (format
+# 1). pack() produces exactly those bytes; a plan built against a pack adopts the pack's
+# canonical orders of K, L and X's row class (lower_packed); the packed contraction reads
+# the packed sigma, flags and residues (contract_tensor(packs=...)). Literal transcription
+# of DESIGN §6b.1-§6b.5; the choices §6b leaves to the implementation are marked
+# ORACLE-CHOICE and are the library's (src/host/pack.cpp).
+
+PACK_FORMAT = 1
+ORDER_AUTO, ORDER_GIVEN = "AUTO", "GIVEN"
+# PACK_MISMATCH reasons (imd_lowering_t v5 pack_mismatch, immerdink_host.h IMD_PACK_MISMATCH_*)
+(MISMATCH_FORMAT, MISMATCH_MODULI, MISMATCH_ROUNDING, MISMATCH_CLASSES, MISMATCH_EXTENTS,
+ MISMATCH_STRIDES, MISMATCH_ORDER) = range(1, 8)
+UINT64_MAX = 2**64 - 1
+
+
+class PackMismatch(Exception):
+    """Plan-time PACK_MISMATCH (§6b.5) with its reason code (MISMATCH_*)."""
+
+    def __init__(self, reason, msg):
+        super().__init__(msg)
+        self.reason = reason
+
+
+class PackDesc:
+    """imd_pack_desc_t (§6b.5): the operand X (a Desc), N, rounding, the order mode and the
+    label lists K (contracted), L (batch) and, for GIVEN, R (rows; AUTO: None)."""
+
+    def __init__(self, tensor: Desc, N, rounding="RN", order=ORDER_AUTO, contracted=(),
+                 batch=(), rows=None):
+        self.tensor, self.N, self.rounding, self.order = tensor, N, rounding, order
+        self.contracted, self.batch = list(contracted), list(batch)
+        self.rows = None if rows is None else list(rows)
+
+
+class PackedOperand:
+    """A pack (desc + the bytes imd_pack wrote) for contract_tensor(packs=...)."""
+
+    def __init__(self, desc: PackDesc, data):
+        self.desc, self.data = desc, bytes(data)
+
+
+def _fuse_x(modes):
+    """§6b.2 key part 4: fuse consecutive (extent, stride) modes over X's strides alone
+    (merge iff s' = s e)."""
+    out = []
+    for e, st in modes:
+        if out and st == out[-1][1] * out[-1][0]:
+            out[-1] = (out[-1][0] * e, out[-1][1])
+        else:
+            out.append((e, st))
+    return out
+
+
+def pack_key(N, rounding, b, r, k, fused):
+    """§6b.2 compatibility key: FORMAT, N, rounding (RN 0, TRUNC 1), b, r, k, then per class
+    L, R, K the number of fused modes and their (extent, stride in X)."""
+    words = [PACK_FORMAT, N, 0 if rounding == "RN" else 1, b, r, k]
+    for c in ("L", "R", "K"):
+        words.append(len(fused[c]))
+        for e, st in fused[c]:
+            words += [e, st]
+    return tuple(words)
+
+
+def _key_kinds(key):
+    """The reason code of every word of a key (EXTENTS for b, r, k, counts and extents)."""
+    kinds = [MISMATCH_FORMAT, MISMATCH_MODULI, MISMATCH_ROUNDING] + [MISMATCH_EXTENTS] * 3
+    p = 6
+    for _ in range(3):
+        cnt = key[p]
+        kinds.append(MISMATCH_EXTENTS)
+        kinds += [MISMATCH_EXTENTS, MISMATCH_STRIDES] * cnt
+        p += 1 + 2 * cnt
+    return kinds
+
+
+def key_mismatch(slot_key, pack_key_):
+    """0 if equal, else the reason code of the first differing word (by the slot key's
+    structure; if one key is a prefix of the other, a count differed first: EXTENTS)."""
+    if slot_key == pack_key_:
+        return 0
+    kinds = _key_kinds(slot_key)
+    for i, (x, y) in enumerate(zip(slot_key, pack_key_)):
+        if x != y:
+            return kinds[i]
+    return MISMATCH_EXTENTS
+
+
+def fnv1a64(words):
+    """§6b.5 key_digest: FNV-1a (64-bit) over the key words as little-endian int64 bytes."""
+    h = 0xcbf29ce484222325
+    for w in words:
+        for byte in (w & UINT64_MAX).to_bytes(8, "little"):
+            h = ((h ^ byte) * 0x100000001b3) & UINT64_MAX
+    return h
+
+
+def pack_layout(b, r, k, N):
+    """§6b.4 format 1, typed from DESIGN (independently of params.pack_layout, which
+    test_oracle cross-checks): {region: (offset, bytes)} for sig, flag, res and pack_bytes;
+    ({}, 0) for b r k = 0. InvalidValue past uint64."""
+    if b * r * k == 0:
+        return {}, 0
+    kh = -(-k // 16) * 16
+    sizes = (("sig", 2 * b * r), ("flag", b * r),
+             ("res", N * b * r * kh + (-(-r // 16) * 16 - r) * kh))
+    regs, off = {}, 0
+    for name, nbytes in sizes:
+        regs[name] = (off, nbytes)
+        off += -(-nbytes // 256) * 256
+        if nbytes > UINT64_MAX or off > UINT64_MAX:
+            raise InvalidValue("§6b.4: pack size exceeds uint64")
+    return regs, off
+
+
+def pack_ws_bytes(b, r, k):
+    """ORACLE-CHOICE (the library's choice, §6b.5 pack_ws_bytes "may be 0"): imd_pack keeps
+    X's scatter vectors (rows, k-bar, batches; int64) in its workspace: 8 (r + k + b)
+    aligned to 256, 0 for an empty pack."""
+    return 0 if b * r * k == 0 else -(-8 * (r + k + b) // 256) * 256
+
+
+class PackView:
+    """pack_lower(): the pack's classes, sizes, canonical orders, X-only fused modes, key and
+    layout (what imd_pack_layout reports, plus the orders)."""
+
+
+def _T_of(N):
+    P = math.prod(MODULI[:N])
+    return math.isqrt((P - 1) // 2)
+
+
+def pack_lower(pd: PackDesc) -> PackView:
+    """imd_pack_layout / imd_pack_create (§6b.3, §6b.5): validate the pack descriptor and
+    lower X alone. InvalidValue: N, rounding, order out of range; a listed label not in X,
+    listed twice or in two lists; GIVEN with a missing row label; AUTO with rows; §5 rows 1
+    and 5 on X alone (extent mismatch of a repeated label; negative extent; merged stride,
+    span, class extent product or pack size overflow). NotSupported: K empty after lowering
+    (k = 1), or RN with k >= 2 and kappa >= T. AUTO orders each class by (|s_X| after the
+    diagonal merge, first position in X's labels)."""
+    if not (N_MIN <= pd.N <= N_MAX):
+        raise InvalidValue(f"N={pd.N}")
+    if pd.rounding not in ("RN", "TRUNC") or pd.order not in (ORDER_AUTO, ORDER_GIVEN):
+        raise InvalidValue("rounding / order")
+    X = pd.tensor
+    if any(e < 0 for e in X.extent):
+        raise InvalidValue("negative extent")
+    ext, ms, first = {}, {}, {}
+    for p, (e, st, l) in enumerate(zip(X.extent, X.stride, X.label)):
+        if ext.setdefault(l, e) != e:
+            raise InvalidValue(f"row 1: extent mismatch for label {l}")
+        ms[l] = ms.get(l, 0) + st
+        first.setdefault(l, p)
+    K, L = pd.contracted, pd.batch
+    if pd.order == ORDER_AUTO:
+        if pd.rows:
+            raise InvalidValue("AUTO with rows")
+        R = None
+    else:
+        R = list(pd.rows or [])
+    listed = K + L + (R or [])
+    if any(l not in ext for l in listed) or len(set(listed)) != len(listed):
+        raise InvalidValue("a listed label not in X, listed twice or in two lists")
+    if R is None:
+        R = [l for l in ext if l not in K and l not in L]
+    elif set(listed) != set(ext):
+        raise InvalidValue("GIVEN without every row label")
+    if any(abs(v) > INT64_MAX for v in ms.values()):
+        raise InvalidValue("row 5: merged stride")
+    if not X.empty() and sum(abs(st) * (e - 1) for e, st in zip(X.extent, X.stride)) > INT64_MAX:
+        raise InvalidValue("row 5: span")
+    lists = {"K": K, "L": L, "R": R}
+    size = {c: math.prod(ext[l] for l in lists[c] if ext[l] != 1) for c in "KLR"}
+    if any(v > INT64_MAX for v in size.values()):
+        raise InvalidValue("row 5: extent product")
+    v = PackView()
+    v.N, v.rounding = pd.N, pd.rounding
+    v.b, v.r, v.k = size["L"], size["R"], size["K"]
+    v.k_hat = -(-v.k // 16) * 16
+    v.kappa = ceil_sqrt(v.k) if v.k > 0 else 0
+    v.regs, v.pack_bytes = pack_layout(v.b, v.r, v.k, pd.N)   # InvalidValue on overflow
+    v.pack_ws = pack_ws_bytes(v.b, v.r, v.k)
+    if not any(ext[l] != 1 for l in K):
+        raise NotSupported("§6b.3: K empty after lowering (every contraction is DIRECT)")
+    if pd.rounding == "RN" and v.k >= 2 and v.kappa >= _T_of(pd.N):
+        raise NotSupported("§6b.3: kappa >= T (RN)")
+    key = (lambda l: (abs(ms[l]), first[l])) if pd.order == ORDER_AUTO else None
+    v.order = {c: [l for l in (sorted(lists[c], key=key) if key else lists[c]) if ext[l] != 1]
+               for c in "KLR"}
+    v.ext, v.stride = ext, ms
+    v.fused = {c: _fuse_x([(ext[l], ms[l]) for l in v.order[c]]) for c in "LRK"}
+    v.key = pack_key(pd.N, pd.rounding, v.b, v.r, v.k, v.fused)
+    v.digest = fnv1a64(v.key)
+    return v
+
+
+def _x_vec(fused):
+    return _radix_vec([(None, e, {"X": st}) for e, st in fused], "X")
+
+
+def pack(X: Tensor, pd: PackDesc, trace: dict | None = None) -> bytearray:
+    """imd_pack (§6b.1, §6b.4): the packed bytes of X (X.desc is the operand; pd.tensor must
+    describe the same element map). Every byte of [0, pack_bytes) is defined: sigma, flags,
+    residues of plane l at l b r k_hat + (lambda r + rho) k_hat + k-bar, zero K padding
+    k-bar in [k, k_hat), a zero tail and zero alignment gaps."""
+    v = pack_lower(pd)
+    out = bytearray(v.pack_bytes)
+    if v.pack_bytes == 0:
+        return out
+    plan = Plan(pd.N, v.k, pd.rounding)
+    vL, vR, vK = _x_vec(v.fused["L"]), _x_vec(v.fused["R"]), _x_vec(v.fused["K"])
+    so, fo, ro = v.regs["sig"][0], v.regs["flag"][0], v.regs["res"][0]
+    plane = v.b * v.r * v.k_hat
+    sig, flg = [], []
+    for lam in range(v.b):
+        for rho in range(v.r):
+            row = [X.buf[X.base + vL[lam] + vR[rho] + vK[h]] for h in range(v.k)]
+            sigma, flag, *_ = scale_vector(row, plan)
+            idx = lam * v.r + rho
+            out[so + 2 * idx:so + 2 * idx + 2] = (sigma & 0xFFFF).to_bytes(2, "little")
+            out[fo + idx] = 1 if flag else 0
+            sig.append(sigma)
+            flg.append(flag)
+            q = [quantize(x, sigma, pd.rounding) for x in row]
+            for l in range(pd.N):
+                base = ro + l * plane + idx * v.k_hat
+                for h, (mu, ep) in enumerate(q):
+                    out[base + h] = residue(mu, ep, plan.p[l]) & 0xFF
+    if trace is not None:
+        trace.update(view=v, sigma=sig, flags=flg)
+    return out
+
+
+def pack_rows(v: PackView, data, lam, rows):
+    """(sigma, flags, planes[l][rho][h]) of batch lambda's rows rho < rows of a pack, as
+    contract(ext_a / ext_b) takes them (h < k; the K padding is not read)."""
+    so, fo, ro = v.regs["sig"][0], v.regs["flag"][0], v.regs["res"][0]
+    plane = v.b * v.r * v.k_hat
+    sig, flg, planes = [], [], []
+    for rho in range(rows):
+        idx = lam * v.r + rho
+        sig.append(int.from_bytes(data[so + 2 * idx:so + 2 * idx + 2], "little", signed=True))
+        flg.append(data[fo + idx] != 0)
+    for l in range(v.N):
+        pl = []
+        for rho in range(rows):
+            base = ro + l * plane + (lam * v.r + rho) * v.k_hat
+            pl.append([x - 256 if x > 127 else x for x in data[base:base + v.k]])
+        planes.append(pl)
+    return sig, flg, planes
+
+
+def _roles(view, x):
+    """Post-swap role ("A" / "B") of the caller's operand x (0 = A, 1 = B), and its row class."""
+    role = ("A", "B")[x] if not view.swapped else ("B", "A")[x]
+    return role, ("I" if role == "A" else "J")
+
+
+def pack_desc_for(A: Desc, B: Desc, C: Desc, mode, operand, N, rounding="RN") -> PackDesc:
+    """imd_pack_desc_for (§6b.5): GIVEN with the classes and orders v1.5's unpacked plan of
+    (A, B, C) uses for the caller's operand (0 = A, 1 = B). ORACLE-CHOICE (the library's):
+    X's extent-1 labels (absent from the plan's orders) are appended to their class's list by
+    membership (not in C: K; in C and the partner: L; else rows); a partner-only K label of
+    the plan is not in X and is not listed (such a plan never matches: CLASSES)."""
+    v = lower(A, B, C, mode, build_vec=False)
+    X, P = (A, B) if operand == 0 else (B, A)
+    role, rowcls = _roles(v, operand)
+    xl = list(dict.fromkeys(X.label))
+    K = [l for l in v.order["K"] if l in xl]
+    L = [l for l in v.order["L"] if l in xl]
+    R = [l for l in v.order[rowcls] if l in xl]    # (an extent-0 C-only label is in I, §5 7)
+    for l in xl:
+        if l in K or l in L or l in R:
+            continue
+        (K if l not in C.label else L if l in P.label else R).append(l)
+    return PackDesc(X, N, rounding, ORDER_GIVEN, K, L, R)
+
+
+def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN", build_vec=True):
+    """imd_plan_create_packed's plan-time checks after §5 rows 1-5 (lower) and before the
+    §3.2 RN acceptance (§6b.5): per packed caller operand (A, then B) the pack descriptor's
+    own status (pack_lower), then PACK_MISMATCH reasons MODULI, ROUNDING, CLASSES (the
+    pack's labels map onto X's by mode position, a consistent bijection; the plan's K, L and
+    X's row class equal the pack's classes; a partner-only K label is CLASSES); both packed:
+    ORDER if their K or L orders differ; then the plan ADOPTS the packs' orders (K, L, X's
+    row class) and each slot key, computed from the adopted lowering restricted to X, must
+    equal the pack's key (EXTENTS / STRIDES: the first differing word). Returns (view, info)."""
+    v0 = lower(A, B, C, mode, build_vec=False)
+    pvs = [pack_lower(pd) if pd is not None else None for pd in packs]
+    adopted = [None, None]
+    roles = [_roles(v0, x)[0] for x in (0, 1)]
+    for x, (Xd, pd, pv) in enumerate(zip((A, B), packs, pvs)):
+        if pd is None:
+            continue
+        if pv.N != N:
+            raise PackMismatch(MISMATCH_MODULI, f"operand {x}: pack N {pv.N} != {N}")
+        if pv.rounding != rounding:
+            raise PackMismatch(MISMATCH_ROUNDING, f"operand {x}: pack rounding")
+        if len(pd.tensor.label) != len(Xd.label):
+            raise PackMismatch(MISMATCH_CLASSES, f"operand {x}: rank differs")
+        mp = {}
+        for lp, lx in zip(pd.tensor.label, Xd.label):
+            if mp.setdefault(lp, lx) != lx:
+                raise PackMismatch(MISMATCH_CLASSES, f"operand {x}: labels do not map")
+        if len(set(mp.values())) != len(mp):
+            raise PackMismatch(MISMATCH_CLASSES, f"operand {x}: labels do not map")
+        role, rowcls = _roles(v0, x)
+        if any(l not in Xd.label for l in v0.order["K"]):
+            raise PackMismatch(MISMATCH_CLASSES, f"operand {x}: partner-only K label")
+        o = {"K": [mp[l] for l in pv.order["K"]], "L": [mp[l] for l in pv.order["L"]],
+             rowcls: [mp[l] for l in pv.order["R"]]}
+        for c in ("K", "L", rowcls):
+            if set(o[c]) != set(v0.order[c]):
+                raise PackMismatch(MISMATCH_CLASSES, f"operand {x}: class {c} differs")
+        adopted[x] = o
+    if adopted[0] is not None and adopted[1] is not None and \
+            (adopted[0]["K"] != adopted[1]["K"] or adopted[0]["L"] != adopted[1]["L"]):
+        raise PackMismatch(MISMATCH_ORDER, "the two packs' K or L orders differ")
+    orders = {}
+    for o in adopted:
+        if o is not None:
+            for c, lst in o.items():
+                orders.setdefault(c, lst)
+    v = lower(A, B, C, mode, build_vec=build_vec, orders=orders)
+    keys = [None, None]
+    for x in (0, 1):
+        if pvs[x] is None:
+            continue
+        role, rowcls = _roles(v, x)
+        st = v.stride[role]
+        fused = {c: _fuse_x([(v.ext[l], st[l]) for l in v.order[g]])
+                 for c, g in (("L", "L"), ("R", rowcls), ("K", "K"))}
+        keys[x] = pack_key(N, rounding, v.b, v.m if role == "A" else v.n, v.k, fused)
+        reason = key_mismatch(keys[x], pvs[x].key)
+        if reason:
+            raise PackMismatch(reason, f"operand {x}: slot key differs (reason {reason})")
+    packed_roles = {roles[x] for x in (0, 1) if pvs[x] is not None}
+    return v, {"views": pvs, "keys": keys, "roles": roles, "packed_roles": packed_roles,
+               "orders": orders}
 
 
 def einsum_addresses(A: Desc, B: Desc, C: Desc):

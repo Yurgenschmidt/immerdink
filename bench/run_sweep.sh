@@ -2,7 +2,7 @@
 # Run a benchmark sweep: every case is one imd_bench process, run through
 # tools/run_bench.sh (machine-wide lock + wait for a quiet machine + QUIET_LOG).
 #   bench/run_sweep.sh [sweep file] [results.jsonl]
-# Defaults: bench/sweep_m4.txt, bench/results/<date>-<commit>.jsonl. Builds first
+# Defaults: bench/sweep_imd.txt, bench/results/<date>-<commit>.jsonl. Builds first
 # (bench/build.sh). Only cases whose name matches $CASES (a grep -E regex) run, if set.
 # If the machine never gets quiet (run_bench.sh exit 3), the sweep stops there and says so;
 # it never bypasses the gate.
@@ -13,7 +13,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
 env_dir="${IMMERDINK_ENV:-$HOME/miniforge3/envs/immerdink}"
 build="${IMMERDINK_BENCH_BUILD:-$root/build/bench}"
-sweep="${1:-$here/sweep_m4.txt}"
+sweep="${1:-$here/sweep_imd.txt}"
 commit="$(git -C "$root" rev-parse --short HEAD)"
 git -C "$root" diff --quiet HEAD -- src include bench CMakeLists.txt || commit="$commit-dirty"
 out="${2:-$here/results/$(date +%Y%m%d-%H%M)-$commit.jsonl}"
@@ -29,18 +29,17 @@ export LD_LIBRARY_PATH="$env_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 logdir="$(mktemp -d "${TMPDIR:-/tmp}/imd-bench.XXXXXX")"
 echo "sweep $sweep -> $out (commit $commit, env $BENCH_ENV)"
 
-while IFS='|' read -r name spec ext methods Ns emu extra; do
+while IFS='|' read -r name spec ext methods Ns extra; do
   name="$(echo "$name" | xargs)"
   case "$name" in ''|'#'*) continue ;; esac
   if [ -n "${CASES:-}" ] && ! echo "$name" | grep -Eq "$CASES"; then continue; fi
   args=(--name "$name" --spec "$(echo "$spec" | xargs)" --ext "$(echo "$ext" | xargs)"
         --methods "$(echo "$methods" | xargs)" --out "$out")
   [ -n "$(echo "$Ns" | xargs)" ] && args+=(--N "$(echo "$Ns" | xargs)")
-  [ -n "$(echo "$emu" | xargs)" ] && args+=(--emu "$(echo "$emu" | xargs)")
   # shellcheck disable=SC2206
   args+=($extra)
   echo "== $name $(date -Is)"
-  QUIET_LOG="$logdir/$name.quiet" "$root/tools/run_bench.sh" "$build/imd_bench" "${args[@]}" </dev/null
+  QUIET_LOG="$logdir/$name.quiet" "$root/tools/run_bench.sh" "$here/warm_run.sh" "$build/imd_bench" "${args[@]}" </dev/null
   rc=$?
   if [ $rc = 3 ]; then
     echo "machine never got quiet; stopping the sweep before case $name" >&2

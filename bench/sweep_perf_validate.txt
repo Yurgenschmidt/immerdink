@@ -1,0 +1,59 @@
+# B2 performance-model HOLD-OUT sweep (DESIGN §6c "Validation"; tools/calibrate.sh --validate):
+# shapes disjoint from the fit set (bench/sweep_calib.txt): the cases of the regression sweep
+# (bench/sweep_imd.txt), tensor cases and many small shapes, at the rule's K4 configuration.
+# name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
+v_s96     | ik,jk->ij | i=96,j=96,k=96             | imd | 8,14 | --reps 300 --phase-reps 10 --max-seconds 1
+v_s256    | ik,jk->ij | i=256,j=256,k=256          | imd | 8,14 | --reps 300 --phase-reps 10 --max-seconds 1
+v_s320    | ik,jk->ij | i=320,j=320,k=320          | imd | 8,14 | --reps 300 --phase-reps 10 --max-seconds 1
+v_s512    | ik,jk->ij | i=512,j=512,k=512          | imd | 8,14 | --reps 300 --phase-reps 10 --max-seconds 1 --g 0,4
+v_s640    | ik,jk->ij | i=640,j=640,k=640          | imd | 10,16 | --reps 200 --phase-reps 10 --max-seconds 1
+v_s900    | ik,jk->ij | i=900,j=700,k=900          | imd | 8,14 | --reps 200 --phase-reps 10 --max-seconds 1
+v_rsm1    | ik,jk->ij | i=2048,j=128,k=256         | imd | 8,14 | --reps 200 --phase-reps 10 --max-seconds 1
+v_rsm2    | ik,jk->ij | i=128,j=1024,k=900         | imd | 8,14 | --reps 200 --phase-reps 10 --max-seconds 1
+v_bsm     | lik,ljk->lij | l=8,i=384,j=384,k=384   | imd | 8,14 | --reps 200 --phase-reps 10 --max-seconds 1
+v_cc16    | kjbc,kiac->abij | i=16,j=16,k=16,a=96,b=96,c=96 | imd | 8,14 | --reps 100 --phase-reps 10 --max-seconds 1
+v_cc12    | kjbc,kiac->abij | i=12,j=12,k=12,a=48,b=48,c=48 | imd | 8,14 | --reps 300 --phase-reps 10 --max-seconds 1
+v_sq1024  | ik,jk->ij | i=1024,j=1024,k=1024       | imd | 8,14 | --reps 100 --phase-reps 10 --max-seconds 1 --vec generate,resident
+v_sq1536  | ik,jk->ij | i=1536,j=1536,k=1536       | imd | 8,14 | --reps 50 --phase-reps 5 --max-seconds 1
+v_sq4096  | ik,jk->ij | i=4096,j=4096,k=4096       | imd | 8,14 | --reps 10 --phase-reps 5 --max-seconds 1 --g 0,7
+v_sq5000  | ik,jk->ij | i=5000,j=5000,k=5000       | imd | 10,16 | --reps 10 --phase-reps 3 --max-seconds 1
+v_sq8192  | ik,jk->ij | i=8192,j=8192,k=8192       | imd | 8,14 | --reps 5 --phase-reps 3 --max-seconds 2
+v_r_lowk  | ik,jk->ij | i=8192,j=8192,k=1024       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
+v_r_bigk  | ik,jk->ij | i=2048,j=2048,k=32768      | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
+v_r_skinny| ik,jk->ij | i=16384,j=512,k=4096      | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
+v_r_mm    | ik,jk->ij | i=1000,j=64,k=50000        | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
+v_r_mid   | ik,jk->ij | i=3000,j=700,k=5000        | imd | 8,14 | --reps 20 --phase-reps 5 --max-seconds 1
+v_t_ikl   | ikl,kjl->ijl | i=1024,j=1024,k=1024,l=16 | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
+v_t_df    | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
+v_t_cc    | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1 --g 0,7
+v_t_perm  | abk,kcd->cadb | a=64,b=64,c=64,d=64,k=4096 | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
+v_t_4d    | abcd,cdef->abef | a=32,b=32,c=48,d=48,e=32,f=32 | imd | 8,14 | --reps 20 --phase-reps 5 --max-seconds 1
+v_b_kl    | lik,ljk->lij | l=4,i=1024,j=1024,k=3000 | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
+v_pk1024  | ik,jk->ij | i=1024,j=1024,k=2048       | packed | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1 --pack A,B --reuse 1
+v_pks     | ik,jk->ij | i=384,j=384,k=384          | packed | 8 | --reps 100 --phase-reps 5 --max-seconds 1 --pack A --reuse 1
+# --- (review 2026-10-05) N = 15, 16, 17 (the operating range of ehrenfest) and g < N on
+#     memory-bound shapes, disjoint from the fit set
+v_n15a    | ik,jk->ij | i=3000,j=3000,k=3000       | imd | 15,16,17 | --reps 10 --phase-reps 3 --max-seconds 1
+v_n15b    | ik,jk->ij | i=640,j=640,k=640          | imd | 15,16,17 | --reps 200 --phase-reps 10 --max-seconds 1
+v_n15c    | kjbc,kiac->abij | i=24,j=24,k=24,a=112,b=112,c=112 | imd | 15,16,17 | --reps 10 --phase-reps 3 --max-seconds 1 --g 0,6
+v_n15d    | ik,jk->ij | i=768,j=768,k=100000       | imd | 15,16 | --reps 10 --phase-reps 3 --max-seconds 1
+v_n15e    | lik,ljk->lij | l=8,i=512,j=512,k=2048  | imd | 15,16,17 | --reps 20 --phase-reps 5 --max-seconds 1
+v_mmg     | ik,jk->ij | i=1500,j=96,k=40000        | imd | 8,14,16 | --reps 10 --phase-reps 3 --max-seconds 1 --g 0,2,5
+v_skg     | ik,jk->ij | i=24576,j=384,k=3072       | imd | 8,14,16 | --reps 10 --phase-reps 3 --max-seconds 1 --g 0,2,7
+v_dom     | ik,jk->ij | i=1536,j=1536,k=6144       | imd | 15,16 | --reps 10 --phase-reps 3 --max-seconds 1 --data dominant
+# --- (2026-10-05, b2-kf-n15) KF at N = 15..17, mid-size, disjoint from the fit set
+w_s512    | ik,jk->ij | i=512,j=512,k=512          | imd | 15,16,17 | --reps 200 --phase-reps 10 --max-seconds 1
+w_s800    | ik,jk->ij | i=800,j=800,k=800          | imd | 15,16,17 | --reps 200 --phase-reps 10 --max-seconds 1
+w_s960    | ik,jk->ij | i=960,j=960,k=960          | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
+w_r1      | ik,jk->ij | i=1200,j=400,k=700        | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
+w_b       | lik,ljk->lij | l=4,i=640,j=640,k=384   | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
+w_cc      | kjbc,kiac->abij | i=12,j=12,k=12,a=56,b=56,c=56 | imd | 15,16,17 | --reps 100 --phase-reps 10 --max-seconds 1
+w_d800    | ik,jk->ij | i=800,j=800,k=800          | imd | 15,16 | --reps 200 --phase-reps 10 --max-seconds 1 --data dominant
+w_dr1     | ik,jk->ij | i=1200,j=400,k=700        | imd | 15,16 | --reps 100 --phase-reps 10 --max-seconds 1 --data dominant
+# --- (2026-10-05, b2-fidelity, v1.10) small B-pack grids at g < N and the partial K tile,
+#     disjoint from the fit set
+y_k3a     | ik,jk->ij | i=3000,j=128,k=6000        | imd | 8,16 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,3
+y_k3b     | ik,jk->ij | i=6000,j=256,k=2500        | imd | 14 | --reps 20 --phase-reps 5 --max-seconds 1 --g 0,5
+y_kt816   | ik,jk->ij | i=2048,j=1536,k=816        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1
+y_kt880   | ik,jk->ij | i=1600,j=1600,k=880        | imd | 15 | --reps 50 --phase-reps 10 --max-seconds 1
+y_kt4944  | ik,jk->ij | i=2048,j=2048,k=4944       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1

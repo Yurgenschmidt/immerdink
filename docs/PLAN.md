@@ -133,31 +133,22 @@ Work order, by expected payoff:
    descriptor); TLA+ models for the n̂ grid split and the κ ≥ T scope.
 
 **Status (2026-10-03):** exit targets met; see `docs/NOTES-M4.md` (what changed, per-phase
-log, A/B of K4 tiles, design proposals) and `docs/BENCHMARKS.md` ("M4 sweep"): sq8192 N = 14
-at 35.05 TFLOPS-eq (GEMMul8 31.15 in the same run), sq16384 234 ms (GEMMul8 242), permuted
-cases within 0–5 % of the matrix case at equal m, n, k (t_ikl 2.91 vs t_batch 2.77 ms),
+log, A/B of K4 tiles, design proposals) and `docs/BENCHMARKS.md (now in the evaluation workspace, legacy/)` ("M4 sweep"): sq8192 N = 14
+at 35.05 TFLOPS-eq, sq16384 234 ms, permuted cases within 0–5 % of the matrix case at
+equal m, n, k (t_ikl 2.91 vs t_batch 2.77 ms),
 per-phase % of the §4 bound reported by `imd_bench`. Items 1, 4, 5 done; item 3: A/B of
 tiles and stages found no gain on the benchmark shapes (one config kept, swizzle 8 added);
-item 2 not changed (K4 is at the cuBLASLt int8 rate for k ≥ 4096; at k = 1024 the
+item 2 not changed (K4 is at 85–97 % of its bound for k ≥ 4096; at k = 1024 the
 un-overlapped mod-p epilogue is the remaining K4 gap); item 6: test hooks gated, the oracle and
 TLA+ follow-ups still open. Not done: K0 on the device and a two-launch K1 (DESIGN
 changes, proposed in NOTES-M4), CUTLASS operators cached per plan.
 
-**Baselines**, all run under `run_bench.sh`, reporting median and spread plus machine
-conditions:
-- native DGEMM (cuBLAS, `CUBLAS_COMPUTE_64F_PEDANTIC`, so env vars can't turn it into
-  emulation);
-- cuBLAS 13.7 fixed-point emulation (`CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT`);
-- cuBLASLt int8 TN GEMM (the GEMM-phase roofline);
-- GEMMul8 v3.5.2 (MIT; build in scratch);
-- cuTENSOR 2.7 FP64 contraction.
-
-Note that cuTENSOR's `CUTENSOR_COMPUTE_DESC_8XINT8` is Hopper+ only, so it is not
-available on sm_89.
+**Baselines:** M4 also timed other libraries under `run_bench.sh`. Since 2026-10-04 those
+comparisons are kept outside this repository (docs/BENCHMARKING.md). Note that cuTENSOR's
+`CUTENSOR_COMPUTE_DESC_8XINT8` is Hopper+ only, so it is not available on sm_89.
 
 **Exit:**
-- 8192³ matrix at N = 14 at or above GEMMul8's measured 12.85 TFLOPS-equivalent (4090
-  Laptop). The desktop 4090 should exceed it.
+- 8192³ matrix at N = 14 at or above 12.85 TFLOPS-equivalent.
 - Permuted tensor contractions within 15% of the matrix-case throughput at equal m, n, k.
 - Each phase reported as a % of its MEMORY_MODEL §5 lower bound.
 
@@ -211,7 +202,8 @@ available on sm_89.
   sign), whether to skip redundant output blocks in the GEMM tiling or only in the scatter,
   and IndexMap/TLA+ extensions for packed legality and injectivity. Not before M4.
 - Accurate-mode scaling.
-- Python package (nanobind), device arrays only (cupy / DLPack); no host-array transfers.
+- Python package, device arrays only (cupy / DLPack); no host-array transfers. **Done (B1,
+  2026-10-05): ctypes over the C ABI, not nanobind (Eric), DESIGN v1.9 §6d.**
 - **Next after the g sweep (Eric, 2026-10-03):**
   - **g trade-off.** Benchmark g ∈ {1, 2, 4, 7, N} (workspace ≈ (g/8)(|A|+|B|) +
     (N/8)|C|; only g = N has been measured). If the speed cost is modest, add a
@@ -221,7 +213,7 @@ available on sm_89.
     vec_mode), plan device bytes, plan host bytes, and the per-region breakdown. **Single
     source of truth:** a CUDA-free `libimmerdink_host` (lowering, legality, memory model,
     later the performance model) with a plain C ABI, linked by the CUDA library, so callers
-    get exactly the numbers the kernels use. Python (ctypes now, nanobind later) and other
+    get exactly the numbers the kernels use. Python (ctypes; DESIGN §6a, §6d) and other
     languages call that ABI; nothing is reimplemented. `spec/params.py` and the oracle stay
     as independent verification (tests compare them with the C), not as an API.
     **Done (2026-10-03, DESIGN v1.3 §6a):** `libimmerdink_host.so` + `immerdink_host.h`

@@ -172,6 +172,49 @@
 (*  "OrderEmptyLast"   empty output after INSUFFICIENT_WORKSPACE          *)
 (*  "OrderAlignFirst"  MISALIGNED before ALIASING                         *)
 (*  "OrderInsuffFirst" INSUFFICIENT_WORKSPACE before MISALIGNED           *)
+(*                                                                         *)
+(* D1 PACKED OPERANDS (DESIGN §6b.2, §6b.5; constants Packing, PackEnum;  *)
+(* "none" in every model above). A pack of the caller's A or B is built   *)
+(* on that operand's descriptor (same labels, extents, base; its own       *)
+(* strides: X's, or with PackEnum "strides" any of the model's, i.e. a     *)
+(* different tensor), with its own classes K, L, R and any order per      *)
+(* class (PackEnum "plan": the plan's classes, which imd_pack_desc_for     *)
+(* fills; "classes": any partition), which covers GIVEN and AUTO. Packs    *)
+(* that imd_pack_layout rejects (K empty, κ >= T with RN) are not          *)
+(* enumerated. The plan (imd_plan_create_packed) ADOPTS the pack's order  *)
+(* for K, L and X's own row class (I for post-swap A, J for B; K, L from  *)
+(* post-swap A's pack when both are packed), keeps v1.5's for the         *)
+(* partner's rows, fuses in the adopted order (all carriers), computes    *)
+(* X's slot key from that lowering restricted to X (X's strides: a       *)
+(* partner-only K label is a mode (e, 0)) and compares it with the pack's  *)
+(* key word for word: b, r, k, then for L, R, K the modes fused over X's  *)
+(* strides alone. Status: §5 rows 1-5, then PACK_MISMATCH (a key differs, *)
+(* a partner-only K label: _CLASSES, both packed with different K or L    *)
+(* orders: _ORDER), then κ >= T. The GEMM reads X FROM THE PACK (its       *)
+(* §6b.4 image as element addresses: (λ·r + ρ)·k̂ + h, K padding 0, then a  *)
+(* zeroed tail of (⌈r⌉ − r)·k̂): post-swap A at (λ·m + i)·k̂ + h, post-swap *)
+(* B rows j < n̂ at batch stride r·k̂ = n·k̂ (rows j >= n: the next block or *)
+(* the tail, finite, in W columns K5 never reads). §4a's sX, fX, RX of a  *)
+(* packed role are 0. imd_contract_packed's execute-time checks are not    *)
+(* modelled (packed models use XDef-like arguments).                       *)
+(* Claims: every claim above on the packed lowering (EinsumPreserved etc., *)
+(* for every enumerated order), PackKeySound (equal keys => the pack's     *)
+(* image IS the plan's operand buffer), PackComplete (a pack with the      *)
+(* plan's classes in any order is accepted), DescForReproduces,            *)
+(* AdoptedOrderExact, AutoOrderV15, PackNoOOB, PackPaddingInert,           *)
+(* PackPolicy, KeyRejectsPartnerOnly (except k = 0).                       *)
+(* D1 rules a negative model drops:                                        *)
+(*  "PackFuseDefault"  fusion runs of the v1.5 order applied to the       *)
+(*                     adopted order (fusion not recomputed)               *)
+(*  "PackNoAdopt"      the plan keeps v1.5's orders (key and lowering)     *)
+(*  "PackNoAdoptLower" the key uses the adopted order, the lowering not    *)
+(*  "KeyNoStrides"     the key without strides (extents only)              *)
+(*  "KeyFuseCarriers"  the slot key fused over all carriers, not X alone  *)
+(*  "PackAfterKappa"   κ >= T checked before PACK_MISMATCH                 *)
+(*  "PackBStrideNh"    role B read at v1's batch stride n̂·k̂               *)
+(*  "PackNoTail"       packs without the zeroed tail                       *)
+(*  "PackPartnerOnly"  no partner-only policy (POSITIVE: the key suffices) *)
+(*  "PackOrderCheck"   no _ORDER check (POSITIVE: the key suffices)        *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, Bags, TLC
 
@@ -192,7 +235,13 @@ CONSTANTS
                      \*   this model must enumerate AND accept (ASSUME in MC)
     Execs,           \* set of execute-time argument records (see XDef)
     GemmMax,         \* CUTLASS GemmCoord limit on m and nh (real 2^31 - 1)
-    AlignWS          \* workspace region alignment (real 256 bytes)
+    AlignWS,         \* workspace region alignment (real 256 bytes)
+    Packing,         \* D1: the caller's operands packed: "none" | "A" | "B" | "AB"
+    PackEnum         \* D1: the packs enumerated: "plan" (the plan's classes,
+                     \*   every order per class), "classes" (every partition of
+                     \*   X's labels into K, L, R, every order), "strides" ("plan"
+                     \*   plus every stride vector of the model for the packed
+                     \*   tensor: a different tensor's pack), "all"
 
 VARIABLES
     desc,   \* the descriptor triple (chosen in Init, then constant)
@@ -200,9 +249,10 @@ VARIABLES
     low,    \* the lowering (a record), or "none" if rejected
     ein,    \* the einsum reference (a record), or "none" if rejected
     el,     \* el[X] = Elems(desc, X), cached
-    xa      \* the plan option and imd_contract arguments (an Execs record)
+    xa,     \* the plan option and imd_contract arguments (an Execs record)
+    pk      \* D1: the packs the plan is created with (NoPk: imd_plan_create)
 
-vars == <<desc, st, low, ein, el, xa>>
+vars == <<desc, st, low, ein, el, xa, pk>>
 
 -----------------------------------------------------------------------------
 (* Helpers *)
@@ -352,13 +402,88 @@ Decode(o, ext, size) ==
            [l \in {o[j] : j \in 1..n} |->
               LET j == CHOOSE j \in 1..n : o[j] = l IN (q \div pre[j]) % ext[l]]]
 
+\* D1 packed operands (DESIGN §6b). A pack is built on the CALLER's operand
+\* op (same labels, extents and base; its own strides s, which are op's own
+\* strides unless the model enumerates "a different tensor's pack"), with
+\* its own classes and canonical orders (label sequences): K (contracted),
+\* L (batch), R (rows). pk = [A |-> pack or NoPack, B |-> pack or NoPack],
+\* indexed by the caller's operand.
+NoPack == [none |-> TRUE]   \* "no pack" (a record: TLC compares records with records)
+IsPk(p) == "op" \in DOMAIN p
+NoPk == [A |-> NoPack, B |-> NoPack]
+SeqSet(sq) == {sq[i] : i \in DOMAIN sq}
+
+\* Fusion over ONE tensor's strides (the key's "fused over X's strides
+\* alone"): consecutive modes <<e, s>>, <<e', s'>> merge iff s' = s*e.
+FuseModes(ms) ==
+    LET n   == Len(ms)
+        S   == {t \in 1..n : t = 1 \/ ms[t][2] # ms[t - 1][2] * ms[t - 1][1]}
+        st0 == SortBy(S, [t \in S |-> <<t>>])
+        ns  == Len(st0)
+        last(j) == IF j < ns THEN st0[j + 1] - 1 ELSE n
+    IN  [j \in 1..ns |-> <<ProdOver(st0[j]..last(j), [t \in 1..n |-> ms[t][1]]), ms[st0[j]][2]>>]
+
+\* Mixed-radix vector over modes <<e, s>> (first fastest).
+RadixS(modes, size) ==
+    LET n   == Len(modes)
+        pre == [j \in 1..n |-> ProdOver(1..(j - 1), [u \in 1..n |-> modes[u][1]])]
+    IN  [q \in 0..(size - 1) |->
+           SumOver(1..n, [j \in 1..n |-> modes[j][2] * ((q \div pre[j]) % modes[j][1])])]
+
+\* DESIGN §6b.2 compatibility key (FORMAT, N and rounding are equal by
+\* construction here: PackedOperand checks those parts): b, r, k, then for
+\* the classes L, R, K the fused modes (extent, stride in X) in canonical
+\* order, fused over X's strides alone, extent-1 modes already dropped.
+\* Drop "KeyNoStrides": the element map without the strides (extents only).
+KMap(ms) == IF Drop = "KeyNoStrides" THEN [t \in DOMAIN ms |-> ms[t][1]] ELSE FuseModes(ms)
+KeyOf(b, r, k, mL, mR, mK) == <<b, r, k, KMap(mL), KMap(mR), KMap(mK)>>
+
+\* The pack of caller operand pck.op of descriptor d (imd_pack_layout + the
+\* bytes imd_pack writes, as element addresses): σ-free view of the §6b.4
+\* residue region of one plane: cell (λ·r + ρ)·k̂ + h holds X at (λ, ρ, h)
+\* in the pack's enumeration (h < k), 0 for h >= k, then the zeroed tail of
+\* (⌈r⌉ − r)·k̂ cells (Drop "PackNoTail": none). k̂ = ⌈k⌉_PadQ, ⌈r⌉ =
+\* ⌈r⌉_PadQ (the GEMM's n̂ rounding).
+PkMS(d, pck, l) == SumOver({p \in Pos(d, pck.op) : d[pck.op].l[p] = l}, pck.s)
+PkInfo(d, pck) ==
+    LET op  == pck.op
+        ext == [l \in Lab(d, op) |-> Ext(d, l)]
+        md(sq) == [t \in 1..Len(sq) |-> <<ext[sq[t]], PkMS(d, pck, sq[t])>>]
+        sz(sq) == ProdOver(SeqSet(sq), ext)
+        b == sz(pck.L)  r == sz(pck.R)  k == sz(pck.K)  kh == CeilQ(k)
+        size == b * r * kh + (IF Drop = "PackNoTail" THEN 0 ELSE (CeilQ(r) - r) * kh)
+        vL == RadixS(md(pck.L), b)  vR == RadixS(md(pck.R), r)  vK == RadixS(md(pck.K), k)
+        buf == [q \in 0..(size - 1) |->
+                  IF q < b * r * kh
+                  THEN LET lam == q \div (r * kh)  rho == (q \div kh) % r  h == q % kh
+                       IN  IF h < k THEN Cell(d[op].base + vL[lam] + vR[rho] + vK[h]) ELSE Pad
+                  ELSE Pad]
+    IN  [b |-> b, r |-> r, k |-> k, kh |-> kh, size |-> size, buf |-> buf,
+         key |-> KeyOf(b, r, k, md(pck.L), md(pck.R), md(pck.K))]
+\* A read of the pack at cell q; past its end: a junk non-pad cell (never an
+\* address of anything, so EinsumPreserved fails as well as PackNoOOB).
+OOBCell == <<FALSE, -2000000>>
+PRead(buf, q) == IF q \in DOMAIN buf THEN buf[q] ELSE OOBCell
+
+\* The canonical orders and fusion of the lowering (DESIGN §5 steps 2-9),
+\* with D1's adopted orders, and the plan-time PACK_MISMATCH check. Cheap
+\* (no buffers): the status chain uses it.
 \* d is the descriptor the lowering works on (already swapped if sw); od is
 \* the CALLER's descriptor. DESIGN §5 step 8 (as implemented in M1): the
 \* swap comes first, the canonical orders are computed on the post-swap
 \* roles (so K's "big" operand compares the post-swap m, n), and the
 \* final tie-break "position" is taken from the caller's original label
 \* order od.A.l \o od.B.l \o od.C.l.
-Lower(d, mode, sw, od) ==
+\* D1 (§6b.2): a plan built against a pack of operand X ADOPTS the pack's
+\* canonical order for the classes the pack carries: K, L and X's own row
+\* class (I if X is post-swap A, J if post-swap B; the swap is still C's);
+\* the partner's row class keeps the v1.5 order; with both operands packed
+\* K and L come from the post-swap A's pack (the two must agree: _ORDER).
+\* Step 9 fusion is then applied in the adopted order (all carriers). The
+\* slot key of X is computed from this lowering restricted to X (X's
+\* strides, so a partner-only K label is a mode (e, 0)), in the adopted
+\* orders, and compared with the pack's key word for word.
+OrdInfo(d, sw, od, pks) ==
     LET labs == AllLab(d)
         ext  == [l \in labs |-> Ext(d, l)]
         ms   == [X \in Tens, l \in labs |-> MS(d, X, l)]
@@ -384,7 +509,27 @@ Lower(d, mode, sw, od) ==
                         [] g = "J" -> <<c, bb, 0, f>>
                         [] g = "L" -> <<c, a, bb, f>>
                         [] g = "K" -> <<Abs(ms[big, l]), Abs(ms[oth, l]), 0, f>>]]
-        ord  == [g \in Grps |-> SortBy(grp[g], key[g])]
+        ord15 == [g \in Grps |-> SortBy(grp[g], key[g])]          \* v1.5 orders
+        \* D1 adoption: the pack of post-swap role R is the caller's cop(R)'s.
+        cop(R) == IF sw THEN (IF R = "A" THEN "B" ELSE "A") ELSE R
+        pR == [R \in {"A", "B"} |-> pks[cop(R)]]
+        proles == {R \in {"A", "B"} : IsPk(pR[R])}
+        kl == IF IsPk(pR["A"]) THEN pR["A"] ELSE pR["B"]
+        adopt == [g \in Grps |-> CASE g \in {"K", "L"} -> kl
+                                   [] g = "I"          -> pR["A"]
+                                   [] g = "J"          -> pR["B"]]
+        adopted == {g \in Grps : IsPk(adopt[g])}
+        pseq(g) == IF g \in {"I", "J"} THEN adopt[g].R ELSE adopt[g][g]
+        \* the pack's order of the class, then (only when the classes differ,
+        \* i.e. the plan will be rejected) the rest in v1.5 order
+        ordA == [g \in Grps |->
+                   IF g \notin adopted THEN ord15[g]
+                   ELSE SelectSeq(pseq(g), LAMBDA l : l \in grp[g])
+                        \o SelectSeq(ord15[g], LAMBDA l : l \notin SeqSet(pseq(g)))]
+        \* Drop "PackNoAdopt": the plan keeps v1.5's orders (key and lowering);
+        \* "PackNoAdoptLower": the key uses the adopted orders, the lowering not.
+        ordKey == IF Drop = "PackNoAdopt" THEN ord15 ELSE ordA
+        ord    == IF Drop \in {"PackNoAdopt", "PackNoAdoptLower"} THEN ord15 ELSE ordA
         \* step 9: g_t fuses into g_(t-1) iff s_X(g_t) = s_X(g_(t-1))*e(g_(t-1))
         \* for every X in Chk.
         fuseOK(g, a, c) ==
@@ -392,17 +537,56 @@ Lower(d, mode, sw, od) ==
                        THEN {X \in Car[g] : a \in Lab(d, X) /\ c \in Lab(d, X)}
                        ELSE Car[g]
             IN  \A X \in chk : ms[X, c] = ms[X, a] * ext[a]
+        starts(g, o) == {t \in 1..Len(o) : t = 1 \/ ~fuseOK(g, o[t - 1], o[t])}
         unf  == [g \in Grps |-> [t \in 1..Len(ord[g]) |->
                    [e |-> ext[ord[g][t]], s |-> [X \in Tens |-> ms[X, ord[g][t]]]]]]
+        \* Drop "PackFuseDefault": the fusion runs are decided on the v1.5
+        \* order and applied to the adopted one (fusion not recomputed).
         fused == [g \in Grps |->
                    LET o == ord[g]
-                       S == {t \in 1..Len(o) : t = 1 \/ ~fuseOK(g, o[t - 1], o[t])}
+                       S == IF Drop = "PackFuseDefault" THEN starts(g, ord15[g]) ELSE starts(g, o)
                        st0 == SortBy(S, [t \in S |-> <<t>>])
                        ns == Len(st0)
                        last(j) == IF j < ns THEN st0[j + 1] - 1 ELSE Len(o)
                    IN  [j \in 1..ns |->
                          [e |-> ProdOver(st0[j]..last(j), [t \in 1..Len(o) |-> ext[o[t]]]),
                           s |-> [X \in Tens |-> ms[X, o[st0[j]]]]]]]
+        \* D1 slot key of post-swap role R (the plan's view of X = d[R]).
+        rowG(R) == IF R = "A" THEN "I" ELSE "J"
+        xm(R, g) == [t \in 1..Len(ordKey[g]) |-> <<ext[ordKey[g][t]], ms[R, ordKey[g][t]]>>]
+        \* Drop "KeyFuseCarriers": the slot key takes the lowering's fusion over
+        \* all carriers instead of fusing over X's strides alone.
+        smap(R, g) == IF Drop = "KeyFuseCarriers"
+                      THEN [j \in 1..Len(fused[g]) |-> <<fused[g][j].e, fused[g][j].s[R]>>]
+                      ELSE KMap(xm(R, g))
+        slotKey == [R \in proles |->
+                      <<b, IF R = "A" THEN m ELSE n, k,
+                        smap(R, "L"), smap(R, rowG(R)), smap(R, "K")>>]
+        packKey == [R \in proles |-> PkInfo(od, pR[R]).key]
+        keyEq   == [R \in proles |-> packKey[R] = slotKey[R]]
+        \* partner-only K label: in the plan's K, not carried by X (§6b.10 #10)
+        partnerOnly == [R \in proles |-> \E l \in grp["K"] : l \notin Lab(d, R)]
+        orderAgree == proles = {"A", "B"} =>
+                        pR["A"].K = pR["B"].K /\ pR["A"].L = pR["B"].L
+        \* PACK_MISMATCH (§6b.5 imd_plan_create_packed): a slot key differs; a
+        \* partner-only K label (_CLASSES, by policy; Drop "PackPartnerOnly"
+        \* leaves it to the key); both packed with different K or L orders
+        \* (_ORDER; Drop "PackOrderCheck" leaves it to the key).
+        mis == \/ \E R \in proles : ~keyEq[R]
+               \/ Drop # "PackPartnerOnly" /\ \E R \in proles : partnerOnly[R]
+               \/ Drop # "PackOrderCheck" /\ ~orderAgree
+    IN  [labs |-> labs, ext |-> ext, ms |-> ms, kept |-> kept, cls |-> cls, grp |-> grp,
+         sz |-> sz, m |-> m, n |-> n, k |-> k, b |-> b, kh |-> kh, nh |-> nh,
+         ord15 |-> ord15, ord |-> ord, unf |-> unf, fused |-> fused,
+         pR |-> pR, proles |-> proles, adopted |-> adopted, slotKey |-> slotKey,
+         packKey |-> packKey, keyEq |-> keyEq, partnerOnly |-> partnerOnly,
+         orderAgree |-> orderAgree, mis |-> mis]
+
+LowerP(d, mode, sw, od, pks) ==
+    LET oi   == OrdInfo(d, sw, od, pks)
+        labs == oi.labs  ext == oi.ext  grp == oi.grp  sz == oi.sz
+        m == oi.m  n == oi.n  k == oi.k  b == oi.b  kh == oi.kh  nh == oi.nh
+        ord == oi.ord  unf == oi.unf  fused == oi.fused
         vec  == [X \in Tens, g \in Grps |-> RadixVec(fused[g], X, sz[g])]
         vecU == [X \in Tens, g \in Grps |-> RadixVec(unf[g], X, sz[g])]
         dec  == [g \in Grps |-> Decode(ord[g], ext, sz[g])]
@@ -416,14 +600,29 @@ Lower(d, mode, sw, od) ==
         bufB == [q \in 0..(b * nh * kh - 1) |->
                    LET lam == q \div (nh * kh)  j == (q \div kh) % nh  h == q % kh
                    IN  IF h < k /\ j < n THEN Cell(offB(lam, h, j)) ELSE Pad]
+        \* D1: a packed post-swap role reads the caller's pack instead (§6b.4):
+        \* role A at (λ·m + i)·k̂ + h; role B rows j < n̂ at batch stride
+        \* r·k̂ = n·k̂ (Drop "PackBStrideNh": v1's n̂·k̂), rows j >= n being
+        \* the next block's or the tail.
+        pkA == "A" \in oi.proles
+        pkB == "B" \in oi.proles
+        pg  == [R \in oi.proles |-> PkInfo(od, oi.pR[R]).buf]
+        bstr == IF Drop = "PackBStrideNh" THEN nh ELSE n
+        qa(t) == (t[1] * m + t[2]) * kh + t[4]
+        qb(t) == (t[1] * bstr + t[3]) * kh + t[4]
+        ca(t) == IF pkA THEN PRead(pg["A"], qa(t)) ELSE bufA[(t[1] * m + t[2]) * kh + t[4]]
+        cb(t) == IF pkB THEN PRead(pg["B"], qb(t)) ELSE bufB[(t[1] * nh + t[3]) * kh + t[4]]
         kind == IF b * m * n = 0 THEN "NOOP" ELSE IF k = 0 THEN "SCALE"
                 ELSE IF mode = "DIRECT" \/ grp["K"] = {} THEN "DIRECT" ELSE "GEMM"
         \* K4 over the padded box; K5 scatters columns j < n only.
         gdom == {<<lam, i, j, h>> : lam \in 0..(b - 1), i \in 0..(m - 1),
                                      j \in 0..(nh - 1), h \in 0..(kh - 1)}
-        ca(t) == bufA[(t[1] * m + t[2]) * kh + t[4]]
-        cb(t) == bufB[(t[1] * nh + t[3]) * kh + t[4]]
-        nz   == {t \in gdom : ~ca(t)[1] /\ ~cb(t)[1]}
+        \* D1: with a packed B, the products in columns j >= n read real
+        \* elements of other rows (finite int8, §6b.4) and land in W columns
+        \* K5 never reads: they are not contributions. (Unpacked: the pad rows
+        \* are zero, and a nonzero product there is caught as Unscattered.)
+        gdomC == IF pkB THEN {t \in gdom : t[3] < n} ELSE gdom
+        nz   == {t \in gdomC : ~ca(t)[1] /\ ~cb(t)[1]}
         cadr(t) == IF t[3] < n THEN offC(t[1], t[2], t[3]) ELSE Unscattered
         \* DIRECT: native sum over the canonical k-bar order, no padding.
         ddom == {<<lam, i, j, h>> : lam \in 0..(b - 1), i \in 0..(m - 1),
@@ -438,17 +637,33 @@ Lower(d, mode, sw, od) ==
         wdom == {<<lam, i, j>> : lam \in 0..(b - 1), i \in 0..(m - 1), j \in 0..(n - 1)}
         writes == IF kind = "NOOP" THEN EmptyBag
                   ELSE MkBag(wdom, [w \in wdom |-> offC(w[1], w[2], w[3])])
-        readsA == CASE kind = "GEMM"   -> {bufA[q][2] : q \in {q \in DOMAIN bufA : ~bufA[q][1]}}
+        \* the elements a GEMM reads: a packed operand's are those imd_pack read
+        cells(bf) == {bf[q][2] : q \in {q \in DOMAIN bf : ~bf[q][1]}}
+        readsA == CASE kind = "GEMM"   -> IF pkA THEN cells(pg["A"]) ELSE cells(bufA)
                     [] kind = "DIRECT" -> {offA(t[1], t[2], t[4]) : t \in ddom}
                     [] OTHER           -> {}
-        readsB == CASE kind = "GEMM"   -> {bufB[q][2] : q \in {q \in DOMAIN bufB : ~bufB[q][1]}}
+        readsB == CASE kind = "GEMM"   -> IF pkB THEN cells(pg["B"]) ELSE cells(bufB)
                     [] kind = "DIRECT" -> {offB(t[1], t[4], t[3]) : t \in ddom}
                     [] OTHER           -> {}
-    IN  [d |-> d, swap |-> sw, labs |-> labs, ext |-> ext, kept |-> kept, cls |-> cls, grp |-> grp,
+        \* D1 pack cells K4 reads (every row j < n̂ in role B)
+        pread == [R \in oi.proles |-> IF R = "A" THEN {qa(t) : t \in gdom} ELSE {qb(t) : t \in gdom}]
+        \* D1 KEY SOUNDNESS's right-hand side: the pack's image equals the
+        \* plan's own operand buffer for X (design strides: role B rows j < n
+        \* at batch stride r·k̂ = n·k̂).
+        gatherEq == [R \in oi.proles |->
+                       IF R = "A"
+                       THEN \A q \in DOMAIN bufA : PRead(pg["A"], q) = bufA[q]
+                       ELSE \A lam \in 0..(b - 1), j \in 0..(n - 1), h \in 0..(kh - 1) :
+                              PRead(pg["B"], (lam * n + j) * kh + h) = bufB[(lam * nh + j) * kh + h]]
+    IN  [d |-> d, swap |-> sw, labs |-> labs, ext |-> ext, kept |-> oi.kept, cls |-> oi.cls, grp |-> grp,
          sz |-> sz, m |-> m, n |-> n, k |-> k, b |-> b, kh |-> kh, nh |-> nh,
          ord |-> ord, unf |-> unf, fused |-> fused, vec |-> vec, vecU |-> vecU,
          dec |-> dec, bufA |-> bufA, bufB |-> bufB, kind |-> kind,
-         contrib |-> contrib, writes |-> writes, readsA |-> readsA, readsB |-> readsB]
+         contrib |-> contrib, writes |-> writes, readsA |-> readsA, readsB |-> readsB,
+         ord15 |-> oi.ord15, proles |-> oi.proles, adopted |-> oi.adopted, pR |-> oi.pR,
+         pg |-> pg, pread |-> pread, gatherEq |-> gatherEq, keyEq |-> oi.keyEq,
+         slotKey |-> oi.slotKey, packKey |-> oi.packKey, partnerOnly |-> oi.partnerOnly,
+         orderAgree |-> oi.orderAgree, mis |-> oi.mis]
 
 -----------------------------------------------------------------------------
 (* Einsum reference (DESIGN §1).                                          *)
@@ -505,7 +720,14 @@ LD(d)        == IF DoSwap(d) THEN Sw(d) ELSE d
 PDims(d)     == UDims(LD(d))                         \* post-swap (DESIGN)
 SDims(d)     == IF Drop = "SwapLate" THEN UDims(d) ELSE PDims(d)  \* what sizing uses
 
-LowerTop(d, mode) == Lower(LD(d), mode, DoSwap(d), d)
+LowerTopP(d, mode, p) == LowerP(LD(d), mode, DoSwap(d), d, p)
+LowerTop(d, mode)     == LowerTopP(d, mode, NoPk)
+OrdInfoTop(d, p)      == OrdInfo(LD(d), DoSwap(d), d, p)
+\* D1: PACK_MISMATCH of a plan of d created with packs p.
+PackMis(d, p) == p # NoPk /\ OrdInfoTop(d, p).mis
+\* The post-swap roles that are packed.
+PRolesOf(d, p) == {IF DoSwap(d) THEN (IF op = "A" THEN "B" ELSE "A") ELSE op :
+                     op \in {o \in {"A", "B"} : IsPk(p[o])}}
 
 \* Dispatch by descriptor (§4 DIRECT path, §4a): a pure function of the
 \* GEMM dimensions and the mode.
@@ -527,11 +749,14 @@ RegCells(u, r) ==
       [] r = "W"            -> u.b * u.m * CeilQ(u.n)
 RegWidth(r) == CASE r \in {"sA", "sB"} -> 2 [] r = "vec" -> 8 [] OTHER -> 1
 \* §4a: 0 for an empty output; only vec for DIRECT, K-empty and k = 0.
-SizedCells(u, mode) ==
+\* D1 (§6b.6): sX, fX, RX of a packed post-swap role X ∈ pr have 0 bytes.
+PackedRegs(pr) == UNION {IF X = "A" THEN {"sA", "fA", "RA"} ELSE {"sB", "fB", "RB"} : X \in pr}
+SizedCellsP(u, mode, pr) ==
     LET kd == DispKind(u, mode) IN
     [r \in RegNames |-> CASE kd = "NOOP" -> 0
-                          [] kd = "GEMM" -> RegCells(u, r)
+                          [] kd = "GEMM" -> IF r \in PackedRegs(pr) THEN 0 ELSE RegCells(u, r)
                           [] OTHER       -> IF r = "vec" THEN RegCells(u, r) ELSE 0]
+SizedCells(u, mode) == SizedCellsP(u, mode, {})
 AlignUp(x) == ((x + AlignWS - 1) \div AlignWS) * AlignWS
 WsSizeU(u, mode) ==
     LET c == SizedCells(u, mode) IN
@@ -563,6 +788,48 @@ KappaApplies(d, x) == /\ x.mode = "EMULATE" \/ Drop = "KappaDirect"
                       /\ PDims(d).k >= 2 \/ Drop = "KappaK"
                       /\ x.rn \/ Drop = "KappaTrunc"
 KappaTooBig(d, x)  == CeilSqrt(PDims(d).k) >= x.tn
+
+-----------------------------------------------------------------------------
+(* D1: the packs a model enumerates (imd_pack_create's valid outputs).    *)
+
+\* X's labels after §5 steps 2 and 4 (diagonals merged, extent 1 dropped).
+PkLab(d, op) == {l \in Lab(d, op) : Ext(d, l) # 1}
+\* The classes of X as the plan sees them (what imd_pack_desc_for fills):
+\* K = X's labels not in C, L = in C and in the partner, R = the rest.
+PlanCls(d, op) ==
+    LET pt == IF op = "A" THEN "B" ELSE "A" IN
+    [K |-> {l \in PkLab(d, op) : l \notin Lab(d, "C")},
+     L |-> {l \in PkLab(d, op) : l \in Lab(d, "C") /\ l \in Lab(d, pt)},
+     R |-> {l \in PkLab(d, op) : l \in Lab(d, "C") /\ l \notin Lab(d, pt)}]
+PermSeqs(S) == {f \in [1..Cardinality(S) -> S] : \A i, j \in DOMAIN f : i # j => f[i] # f[j]}
+ClassChoices(d, op) ==
+    IF PackEnum \in {"classes", "all"}
+    THEN LET S == PkLab(d, op) IN
+         UNION {UNION {{[K |-> pK, L |-> pL, R |-> pR] :
+                           pK \in PermSeqs(SK), pL \in PermSeqs(SL),
+                           pR \in PermSeqs(S \ (SK \cup SL))} : SL \in SUBSET (S \ SK)}
+                : SK \in SUBSET S}
+    ELSE LET c == PlanCls(d, op) IN
+         {[K |-> pK, L |-> pL, R |-> pR] :
+             pK \in PermSeqs(c.K), pL \in PermSeqs(c.L), pR \in PermSeqs(c.R)}
+PackStrides(d, op) ==
+    IF PackEnum \in {"strides", "all"}
+    THEN (IF op = "A" THEN StridesA(Rk(d, "A")) ELSE StridesB(Rk(d, "B")))
+    ELSE {d[op].s}
+\* imd_pack_layout's NOT_SUPPORTED (§6b.3): K empty after lowering (k = 1),
+\* and κ >= T with RN (the pack's N and rounding are the call's: x.tn, x.rn).
+PackValid(d, x, pck) ==
+    LET k == ProdOver(SeqSet(pck.K), [l \in Lab(d, pck.op) |-> Ext(d, l)]) IN
+    /\ pck.K # <<>>
+    /\ ~(x.rn /\ k >= 2 /\ CeilSqrt(k) >= x.tn)
+PacksFor(d, x, op) ==
+    {pck \in {[op |-> op, s |-> s, K |-> c.K, L |-> c.L, R |-> c.R] :
+                 s \in PackStrides(d, op), c \in ClassChoices(d, op)} : PackValid(d, x, pck)}
+Packings(d, x) ==
+    CASE Packing = "none" -> {NoPk}
+      [] Packing = "A"    -> {[A |-> p, B |-> NoPack] : p \in PacksFor(d, x, "A")}
+      [] Packing = "B"    -> {[A |-> NoPack, B |-> p] : p \in PacksFor(d, x, "B")}
+      [] Packing = "AB"   -> {[A |-> p, B |-> q] : p \in PacksFor(d, x, "A"), q \in PacksFor(d, x, "B")}
 
 -----------------------------------------------------------------------------
 (* Execute-time arguments (imd_contract) and checks (DESIGN §5 rows 6-7,  *)
@@ -618,9 +885,9 @@ MisAl(d, x)   == (\E X \in Tens : x.mis[X] # 0) \/ WsAddr(d, x) % AlignWS # 0
 (* 1-5) and then execute time (imd_contract, §6 order). `off` = rules      *)
 (* switched off (normally {Drop}).                                         *)
 
-StatusX(d, x, off) ==
-    LET on(r) == r \notin off
-        plan ==
+\* §5 rows 1-5 (plan time, before any D1 or §3.2 check).
+BaseStatus(d, x, off) ==
+    LET on(r) == r \notin off IN
           IF on("Extents") /\ ~ExtentsConsistent(d)                THEN "INVALID_VALUE"
           ELSE IF on("RepeatC") /\ RepeatedC(d)                     THEN "NOT_SUPPORTED"
           ELSE IF on("COnly") /\ COnlyBig(d)                        THEN "NOT_SUPPORTED"
@@ -628,8 +895,22 @@ StatusX(d, x, off) ==
                                                                     THEN "INVALID_VALUE"
           ELSE IF on("GemmLimit") /\ LimitApplies(d, x) /\ LimitExceeded(d)
                                                                     THEN "INVALID_VALUE"
-          ELSE IF on("Kappa") /\ KappaApplies(d, x) /\ KappaTooBig(d, x)
-                                                                    THEN "NOT_SUPPORTED"
+          ELSE "SUCCESS"
+
+\* p: the packs (D1 imd_plan_create_packed; NoPk = imd_plan_create). After
+\* §5 rows 1-5: PACK_MISMATCH (the key of each packed slot, §6b.5), then
+\* the §3.2 RN acceptance LAST (Drop "PackAfterKappa": κ before the key).
+StatusXP(d, x, p, off) ==
+    LET on(r) == r \notin off
+        base == BaseStatus(d, x, off)
+        pm   == on("PackCheck") /\ PackMis(d, p)
+        kap  == on("Kappa") /\ KappaApplies(d, x) /\ KappaTooBig(d, x)
+        plan ==
+          IF base # "SUCCESS" THEN base
+          ELSE IF Drop = "PackAfterKappa"
+               THEN (IF kap THEN "NOT_SUPPORTED" ELSE IF pm THEN "PACK_MISMATCH" ELSE "SUCCESS")
+          ELSE IF pm  THEN "PACK_MISMATCH"
+          ELSE IF kap THEN "NOT_SUPPORTED"
           ELSE "SUCCESS"
         wsr == IF Drop = "WsRangeBytes" THEN <<WsAddr(d, x), WsAddr(d, x) + WsBytesArg(d, x)>>
                ELSE WsRange(d, x)
@@ -654,7 +935,9 @@ StatusX(d, x, off) ==
         ELSE IF fire = {} THEN "SUCCESS"
         ELSE chk[CHOOSE t \in fire : \A u \in fire : t <= u][2]
 
-FullStatus(d, x) == StatusX(d, x, {Drop})
+StatusX(d, x, off)   == StatusXP(d, x, NoPk, off)
+FullStatusP(d, x, p) == StatusXP(d, x, p, {Drop})
+FullStatus(d, x)     == StatusX(d, x, {Drop})
 \* The status of a descriptor under the default execute arguments XDef
 \* (EMULATE, no null, aligned, workspace far away and large enough).
 Status(d) == FullStatus(d, XDef)
@@ -688,8 +971,16 @@ Init ==
                       B |-> Tensor(bB, lB, ee[2], sB),
                       C |-> Tensor(bC, lC, ee[3], sC)]
     /\ xa \in Execs
-    /\ st  = FullStatus(desc, xa)
-    /\ low = IF st = "SUCCESS" THEN LowerTop(desc, xa.mode) ELSE "none"
+    \* D1: every valid pack of the model's space (one, arbitrary, when the
+    \* descriptor already fails §5 rows 1-5: the packs cannot matter there).
+    /\ pk \in LET P == Packings(desc, xa) IN
+              IF Packing = "none" \/ BaseStatus(desc, xa, {Drop}) = "SUCCESS" \/ P = {} THEN P
+              ELSE {CHOOSE p \in P : TRUE}
+    /\ st  = FullStatusP(desc, xa, pk)
+    \* (D1: the lowering is also built for a plan that passes rows 1-5 but is
+    \* rejected by the key or κ, so KEY SOUNDNESS is checked on every pack.)
+    /\ low = IF st = "SUCCESS" \/ (pk # NoPk /\ BaseStatus(desc, xa, {Drop}) = "SUCCESS")
+             THEN LowerTopP(desc, xa.mode, pk) ELSE "none"
     /\ ein = IF st = "SUCCESS" /\ ExtentsConsistent(desc) THEN Einsum(desc) ELSE "none"
     /\ el  = [X \in Tens |-> Elems(desc, X)]
 
@@ -849,7 +1140,10 @@ KappaReject(d, x) ==
     LET k == PDims(d).k IN
     /\ x.mode = "EMULATE" /\ ~EmptyOut(d) /\ k >= 2 /\ x.rn
     /\ (x.tn - 1) * (x.tn - 1) < k
-Reasons(d, x) ==
+\* D1 (§6b.5): PACK_MISMATCH comes after §5 rows 1-5 and before the §3.2
+\* RN acceptance. (Its condition is the key check of each packed slot; the
+\* table checks its PLACE in the precedence.)
+ReasonsP(d, x, p) ==
     LET u == PDims(d) IN
     << <<"Extents",   ~ExtentsConsistent(d),                     "INVALID_VALUE">>,
        <<"RepeatC",   RepeatedC(d),                              "NOT_SUPPORTED">>,
@@ -857,6 +1151,7 @@ Reasons(d, x) ==
        <<"CStride",   ~Empty(d, "C") /\ ~StrideRule(d, "C"),     "INVALID_VALUE">>,
        <<"GemmLimit", x.mode = "EMULATE" /\ ~EmptyOut(d) /\ u.k >= 2
                       /\ (u.m > GemmMax \/ CeilQ(u.n) > GemmMax), "INVALID_VALUE">>,
+       <<"PackCheck", PackMis(d, p),                             "PACK_MISMATCH">>,
        <<"Kappa",     KappaReject(d, x),                         "NOT_SUPPORTED">>,
        <<"Null",      NullBad(d, x, WsSizeDesign(d, x.mode)),    "INVALID_VALUE">>,
        <<"-",         EmptyOut(d),                               "SUCCESS">>,
@@ -866,10 +1161,11 @@ Reasons(d, x) ==
        <<"Insufficient", WsBytesArg(d, x) < WsSizeDesign(d, x.mode),
                                                        "INSUFFICIENT_WORKSPACE">> >>
 \* The status of the FIRST enabled reason that fires; SUCCESS if none.
-ExpectedStatus(d, x) ==
-    LET R == Reasons(d, x)
+ExpectedStatusP(d, x, p) ==
+    LET R == ReasonsP(d, x, p)
         F == {t \in 1..Len(R) : R[t][1] # Drop /\ R[t][2]}
     IN  IF F = {} THEN "SUCCESS" ELSE R[CHOOSE t \in F : \A u \in F : t <= u][3]
+ExpectedStatus(d, x) == ExpectedStatusP(d, x, NoPk)
 
 \* DESIGN §5 / §6 statuses: each rejection has the right status and reason
 \* and comes in DESIGN's precedence order (first firing reason wins, e.g.
@@ -880,8 +1176,9 @@ ExpectedStatus(d, x) ==
 \* aliasing B is never a reason to reject (no row of the table).
 StatusCorrect ==
     /\ st \in {"SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING",
-               "MISALIGNED", "INSUFFICIENT_WORKSPACE"}
-    /\ st = ExpectedStatus(desc, xa)
+               "MISALIGNED", "INSUFFICIENT_WORKSPACE", "PACK_MISMATCH"}
+    /\ st = ExpectedStatusP(desc, xa, pk)
+    /\ st = "PACK_MISMATCH" => pk # NoPk
     /\ ~ExtentsConsistent(desc) => st = "INVALID_VALUE"
     /\ st = "NOT_SUPPORTED" => ExtentsConsistent(desc)
                                /\ (Unsupported(desc) \/ KappaReject(desc, xa))
@@ -896,11 +1193,12 @@ StatusCorrect ==
 \* non-decreasing in the LARGER operand's |stride| (A if m >= n, else B, in
 \* GEMM roles; stride 0 for a label the operand lacks). Ties are broken by a
 \* fixed key (see CanonicalOrderExact). The "larger operand" is recomputed
-\* here from the post-swap m, n.
+\* here from the post-swap m, n. (D1: not for the classes whose order a
+\* pack fixes, low.adopted; see AdoptedOrderExact.)
 CanonicalOrderSorted ==
     ok => LET bigX == IF low.m >= low.n THEN "A" ELSE "B"
               keyT(g) == IF g = "K" THEN bigX ELSE "C"
-          IN  \A g \in Grps : \A t \in 1..(Len(low.ord[g]) - 1) :
+          IN  \A g \in Grps \ low.adopted : \A t \in 1..(Len(low.ord[g]) - 1) :
                 Abs(MS(low.d, keyT(g), low.ord[g][t]))
                   <= Abs(MS(low.d, keyT(g), low.ord[g][t + 1]))
 
@@ -926,8 +1224,9 @@ CanonicalOrderExact ==
               lt(u, v) == \E t \in DOMAIN u : u[t] < v[t] /\ \A r \in 1..(t - 1) : u[r] = v[r]
           IN  \A g \in Grps :
                 /\ {low.ord[g][t] : t \in DOMAIN low.ord[g]} = low.grp[g]
-                /\ \A t \in 1..(Len(low.ord[g]) - 1) :
-                      lt(kk(g, low.ord[g][t]), kk(g, low.ord[g][t + 1]))
+                /\ g \notin low.adopted =>
+                     \A t \in 1..(Len(low.ord[g]) - 1) :
+                        lt(kk(g, low.ord[g][t]), kk(g, low.ord[g][t + 1]))
 
 \* DESIGN §1.1 / r_layout §4.1: the result does not depend on the group
 \* orders (canonical orders are a performance choice only). Every
@@ -970,14 +1269,18 @@ SwapWellDefined ==
 \* label, it is the FIRST label of the canonical J order, and consecutive
 \* j-bar indices are exactly that smallest |stride| apart in C's scatter
 \* vector (fusion included). (If it carries an L label, nothing is claimed.)
+\* D1: with a packed post-swap B the J order is the pack's (§6b.2
+\* "Performance consequence": the coalescing goal is lost); the swap
+\* itself is unchanged.
 SwapMakesJFastest ==
     (ok /\ ~EmptyOut(desc) /\ BigC(desc) # {}) =>
         LET S  == {p \in BigC(desc) : Abs(desc.C.s[p]) = MinS(desc)}
             fl == desc.C.l[CHOOSE p \in S : TRUE]
         IN  Member(desc, fl) \in {{"A", "C"}, {"B", "C"}} =>
               /\ fl \in low.grp["J"]
-              /\ low.ord["J"][1] = fl
-              /\ Abs(low.vec["C", "J"][1] - low.vec["C", "J"][0]) = MinS(desc)
+              /\ "J" \notin low.adopted =>
+                   /\ low.ord["J"][1] = fl
+                   /\ Abs(low.vec["C", "J"][1] - low.vec["C", "J"][0]) = MinS(desc)
 
 -----------------------------------------------------------------------------
 (* Dispatch and §4a sizing.                                               *)
@@ -985,11 +1288,12 @@ SwapMakesJFastest ==
 \* Elements of each §4a region the call actually uses: K1 writes one
 \* sigma / flag per GEMM row of A' and column of B'; K0 copies the nine
 \* scatter vectors the lowering built; K2/K3 fill the canonical buffers; K4
-\* writes the b*m*nh plane. DIRECT and SCALE use only vec.
+\* writes the b*m*nh plane. DIRECT and SCALE use only vec. D1: no K1, K2
+\* or K3 runs for a packed post-swap role (it reads the caller's pack).
 UsedCells ==
     LET kd == low.kind
         pairs == {p \in Tens \X Grps : p[1] \in Car[p[2]]}
-        gemm(r, v) == IF kd = "GEMM" THEN v ELSE 0
+        gemm(r, v) == IF kd = "GEMM" /\ r \notin PackedRegs(low.proles) THEN v ELSE 0
     IN  [r \in RegNames |->
            CASE kd = "NOOP"   -> 0
              [] r \in {"sA", "fA"} -> gemm(r, low.b * low.m)
@@ -1010,12 +1314,13 @@ DispatchByDescriptor ==
 \* §4a "workspace_size" covers every element the call uses, region by
 \* region (a region overrun corrupts the next region or runs past the end).
 WorkspaceFits ==
-    ok => \A r \in RegNames : UsedCells[r] <= SizedCells(SDims(desc), xa.mode)[r]
+    ok => \A r \in RegNames : UsedCells[r] <= SizedCellsP(SDims(desc), xa.mode, PRolesOf(desc, pk))[r]
 
 \* §4a is EXACT: each region is exactly what is used (and so, with the
-\* swap, §4a's m and n are the post-swap ones).
+\* swap, §4a's m and n are the post-swap ones; D1 §6b.6: a packed role's
+\* sX, fX, RX are 0, on the post-swap role).
 WorkspaceExact ==
-    ok => UsedCells = SizedCells(SDims(desc), xa.mode)
+    ok => UsedCells = SizedCellsP(SDims(desc), xa.mode, PRolesOf(desc, pk))
 
 \* §4 launch limits / §5 row 5: every CUTLASS GEMM that is launched has
 \* m <= GemmMax and nh <= GemmMax (GemmCoord is int).
@@ -1027,7 +1332,7 @@ GemmDimsFit ==
 \* GEMM limits.
 LimitScope ==
     (xa.mode = "DIRECT" \/ EmptyOut(desc) \/ PDims(desc).k < 2) =>
-        st = StatusX(desc, xa, {Drop, "GemmLimit"})
+        st = StatusXP(desc, xa, pk, {Drop, "GemmLimit"})
 
 \* §3.2 accuracy policy: every accepted call that runs the emulated GEMM
 \* with RN has kappa = ceil(sqrt(k)) < T (so 2T - kappa > T and the RN
@@ -1044,7 +1349,7 @@ KappaAccepted ==
 \* to show the clause is still the right one (no GEMM runs at k = 1).
 KappaScope ==
     (xa.mode = "DIRECT" \/ EmptyOut(desc) \/ PDims(desc).k < 2 \/ ~xa.rn) =>
-        st = StatusX(desc, xa, {Drop, "Kappa"})
+        st = StatusXP(desc, xa, pk, {Drop, "Kappa"})
 
 -----------------------------------------------------------------------------
 (* imd_contract execute-time checks (DESIGN §5 rows 6-7, §6).             *)
@@ -1086,6 +1391,114 @@ WsSufficient ==
     ok => WsBytesArg(desc, xa) >= WsSizeDesign(desc, xa.mode)
 
 -----------------------------------------------------------------------------
+(* D1 packed operands (DESIGN §6b.2, §6b.5): the adopted lowering and the  *)
+(* compatibility key. Every claim above also runs on the packed lowering   *)
+(* (EinsumPreserved with the packed operand read FROM THE PACK, for every  *)
+(* order within a class the model enumerates).                            *)
+
+\* A packed plan that passed §5 rows 1-5 (its lowering was built).
+LowP == pk # NoPk /\ BaseStatus(desc, xa, {Drop}) = "SUCCESS"
+
+\* KEY SOUNDNESS: equal keys => the pack's image (X's addresses at (λ, ρ,
+\* k̄) in the pack's enumeration, §6b.4 layout, K padding zero) equals the
+\* plan's own operand buffer for X: RA's rows for post-swap A; for post-swap
+\* B the rows j < n, the pack read at batch stride r·k̂.
+PackKeySound == LowP => \A R \in low.proles : low.keyEq[R] => low.gatherEq[R]
+
+\* COMPLETENESS for the packs built to the plan: classes = the plan's
+\* (imd_pack_desc_for's: K = X's labels not in C, L = in C and the
+\* partner, R = the rest), any order within each class, X's own strides,
+\* no partner-only K label, and (both packed) equal K and L orders: never
+\* PACK_MISMATCH.
+BuiltFor(d, p) ==
+    /\ \A op \in {"A", "B"} : IsPk(p[op]) =>
+          LET c == PlanCls(d, op) IN
+          /\ p[op].s = d[op].s
+          /\ SeqSet(p[op].K) = c.K /\ SeqSet(p[op].L) = c.L /\ SeqSet(p[op].R) = c.R
+          /\ \A l \in AllLab(d) : (Ext(d, l) # 1 /\ l \notin Lab(d, "C")) => l \in Lab(d, op)
+    /\ (IsPk(p.A) /\ IsPk(p.B)) => p.A.K = p.B.K /\ p.A.L = p.B.L
+    \* no C-only label of extent 0 (C empty: a no-op). This lowering puts it
+    \* in I with stride 0 in A (ClassOf), so post-swap A's slot key has an
+    \* extra row mode (0, 0) and r = 0: a pack built by imd_pack_desc_for
+    \* (X's labels only) is PACK_MISMATCH for that empty contraction.
+    /\ \A l \in COnly(d) : Ext(d, l) = 1
+PackComplete ==
+    (pk # NoPk /\ BaseStatus(desc, xa, {Drop}) = "SUCCESS" /\ BuiltFor(desc, pk))
+        => st # "PACK_MISMATCH"
+
+\* imd_pack_desc_for (GIVEN, v1.5's orders of the unpacked plan) is
+\* accepted and reproduces the v1.5 lowering exactly (orders and fusion).
+PostRole(d, op) == IF DoSwap(d) THEN (IF op = "A" THEN "B" ELSE "A") ELSE op
+DescFor(d, op) ==
+    LET o == OrdInfoTop(d, NoPk).ord IN
+    [op |-> op, s |-> d[op].s, K |-> o["K"], L |-> o["L"],
+     R |-> o[IF PostRole(d, op) = "A" THEN "I" ELSE "J"]]
+IsDescFor(d, p) == \A op \in {"A", "B"} : IsPk(p[op]) => p[op] = DescFor(d, op)
+DescForReproduces ==
+    (LowP /\ IsDescFor(desc, pk)) =>
+        /\ st # "PACK_MISMATCH"
+        /\ low.ord = OrdInfoTop(desc, NoPk).ord
+        /\ low.fused = OrdInfoTop(desc, NoPk).fused
+
+\* The adopted classes and orders (§6b.2): K, L and X's row class follow the
+\* pack (K, L from post-swap A's when both are packed); the partner's row
+\* class keeps v1.5's (CanonicalOrderExact). The pack's labels of the class
+\* come in the pack's order; when the class is exactly the pack's (always,
+\* unless an accepted plan never reads the pack: b·m·n·k = 0, a partner-
+\* only label with k = 0 when the policy is dropped), the order IS the pack's.
+AdoptedOrderExact ==
+    (ok /\ pk # NoPk) =>
+        LET kl == IF IsPk(low.pR["A"]) THEN low.pR["A"] ELSE low.pR["B"]
+            want(g) == CASE g = "K" -> kl.K [] g = "L" -> kl.L
+                         [] g = "I" -> low.pR["A"].R [] g = "J" -> low.pR["B"].R
+        IN  /\ low.adopted = {"K", "L"} \cup {IF R = "A" THEN "I" ELSE "J" : R \in low.proles}
+            /\ \A g \in low.adopted :
+                  /\ SelectSeq(low.ord[g], LAMBDA l : l \in SeqSet(want(g)))
+                       = SelectSeq(want(g), LAMBDA l : l \in low.grp[g])
+                  /\ SeqSet(want(g)) = low.grp[g] => low.ord[g] = want(g)
+
+\* AUTO (§6b.5: each class by (|s_X| after the diagonal merge, first
+\* position in X's labels)) gives v1.5's K order whenever X is the post-swap
+\* "big" operand with distinct K strides (§6b.2) and carries every K label.
+FirstIn(sq, l) == CHOOSE p \in 1..Len(sq) : sq[p] = l /\ \A q \in 1..(p - 1) : sq[q] # l
+AutoOrderV15 ==
+    LowP =>
+      \A op \in {o \in {"A", "B"} : IsPk(pk[o])} :
+        LET Kp   == low.grp["K"]
+            big  == IF low.m >= low.n THEN "A" ELSE "B"
+            sx(l) == Abs(MS(desc, op, l))
+            auto == SortBy(Kp, [l \in Kp |-> <<sx(l), FirstIn(desc[op].l, l)>>])
+        IN  (PostRole(desc, op) = big /\ Kp \subseteq Lab(desc, op)
+             /\ \A l1, l2 \in Kp : l1 # l2 => sx(l1) # sx(l2))
+              => auto = OrdInfoTop(desc, NoPk).ord["K"]
+
+\* Every pack byte K4 reads lies in the packed buffer (role B: rows r..n̂−1
+\* of the last block are the tail).
+PackNoOOB ==
+    (ok /\ pk # NoPk /\ low.kind = "GEMM") =>
+        \A R \in low.proles : low.pread[R] \subseteq DOMAIN low.pg[R]
+
+\* §6b.4: the K padding and the tail of every pack are zero, its size is
+\* b·r·k̂ + (⌈r⌉ − r)·k̂.
+PackPaddingInert ==
+    LowP =>
+      \A R \in low.proles :
+        LET pi == PkInfo(desc, low.pR[R]) IN
+        /\ pi.size = pi.b * pi.r * pi.kh + (CeilQ(pi.r) - pi.r) * pi.kh
+        /\ \A q \in DOMAIN pi.buf :
+              pi.buf[q][1] <=> (q >= pi.b * pi.r * pi.kh \/ q % pi.kh >= pi.k)
+
+\* The two policies of §6b.5: a partner-only K label (_CLASSES, §6b.10 #10)
+\* and two packs with different K or L orders (_ORDER) are rejected ...
+PackPolicy ==
+    (LowP /\ ((\E R \in low.proles : low.partnerOnly[R]) \/ ~low.orderAgree)) => ~ok
+\* ... and the key would reject a partner-only label too (it is a mode
+\* (e, 0) of X in the slot key and k grows by e), except when k = 0 (an
+\* extent-0 K label: the plan only scales C and never reads the pack).
+KeyRejectsPartnerOnly ==
+    LowP => \A R \in low.proles : (low.partnerOnly[R] /\ low.k # 0) => ~low.keyEq[R]
+
+-----------------------------------------------------------------------------
 (* Model well-formedness and coverage (checked by TLC as ASSUMEs).        *)
 
 ASSUME Drop \in {"none", "Extents", "RepeatC", "COnly", "CStride", "Aliasing",
@@ -1095,7 +1508,17 @@ ASSUME Drop \in {"none", "Extents", "RepeatC", "COnly", "CStride", "Aliasing",
                  "OrderNullEmpty", "OrderEmptyLast", "OrderAlignFirst",
                  "OrderInsuffFirst", "OrderPreSwap", "PosSwapped", "GemmLimitK",
                  "NullStrict", "NullWsLax", "Kappa", "KappaDirect", "KappaEmpty",
-                 "KappaK", "KappaTrunc"}
+                 "KappaK", "KappaTrunc",
+                 \* D1
+                 "PackFuseDefault", "KeyNoStrides", "KeyFuseCarriers", "PackNoAdopt",
+                 "PackNoAdoptLower", "PackAfterKappa", "PackBStrideNh", "PackNoTail",
+                 "PackPartnerOnly", "PackOrderCheck"}
+ASSUME Packing \in {"none", "A", "B", "AB"} /\ PackEnum \in {"plan", "classes", "strides", "all"}
+\* imd_contract_packed's execute-time checks are not modelled here: a packed
+\* model uses default execute arguments (workspace far away and large enough).
+ASSUME Packing # "none" =>
+          \A x \in Execs : x.nul = {} /\ x.wsp[1] = "far" /\ x.dws >= 0
+                           /\ x.mis = [X \in Tens |-> 0]
 ASSUME GemmMax >= 1 /\ AlignWS >= 8 /\ AlignWS % 8 = 0
 ASSUME \A x \in Execs :
           /\ x.mode \in {"EMULATE", "DIRECT"}

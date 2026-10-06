@@ -55,6 +55,12 @@ std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s) {
   // v1.2 IMD_VEC_RESIDENT: the vectors are plan memory; still sized above, so an
   // overflowing vec is INVALID_VALUE in both modes (the plan would need those bytes).
   if (s.vec_resident) bytes[static_cast<int>(Region::vec)] = std::nullopt;
+  // v1.7 (§6b.6): a packed operand's shifts, flags and residues are in the caller's packed
+  // buffer (sized above all the same: an overflow is INVALID_VALUE as for the in-line plan).
+  if (s.packed & 1)
+    for (const Region r : {Region::sA, Region::fA, Region::RA}) bytes[static_cast<int>(r)] = std::nullopt;
+  if (s.packed & 2)
+    for (const Region r : {Region::sB, Region::fB, Region::RB}) bytes[static_cast<int>(r)] = std::nullopt;
 
   uint64_t off = 0;
   for (int r = 0; r < static_cast<int>(Region::count); ++r) {

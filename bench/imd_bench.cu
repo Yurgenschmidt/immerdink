@@ -1,45 +1,48 @@
-// imd_bench: time one FP64 contraction case with immerdink and the M4 baselines.
+// imd_bench: time one FP64 contraction case with immerdink.
 //
 //   imd_bench --name sq4096 --spec ik,jk->ij --ext i=4096,j=4096,k=4096 \
-//             --methods dgemm,emu,int8,gemmul8,cutensor,imd --N 8,14,20 [options]
+//             --methods imd,bw --N 8,14,20 [options]
 //
 // Run it through bench/run_sweep.sh (which goes through tools/run_bench.sh); see
-// docs/BENCHMARKS.md. Every operand is dense row-major in its label order (last label
+// docs/BENCHMARKING.md. Every operand is dense row-major in its label order (last label
 // fastest). One JSON object per (method, variant) is appended to --out (default stdout).
+// immerdink only: comparisons with other libraries live in a separate evaluation workspace.
 //
 // Methods
-//   dgemm     cuBLAS FP64 GEMM, CUBLAS_COMPUTE_64F_PEDANTIC (never emulated)
-//   emu       cuBLAS FP64 fixed-point emulation, CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT,
-//             strategy EAGER; variants from --emu (dyn | fix<bits>)
-//   int8      cuBLASLt int8 TN GEMM with int32 output on the GEMM view (m, n, k^, b):
-//             the time of ONE modulus' GEMM (the GEMM-phase roofline is N times it)
-//   gemmul8   GEMMul8 INT8 fast mode, one call per batch, N from --N
-//   cutensor  cuTENSOR FP64 contraction on the original layouts
 //   imd       immerdink imd_plan_create + imd_contract, N from --N. With a library built
 //             by this project (IMMERDINK_PROFILE=ON), --phase-reps more calls are made with
 //             per-phase event marks and the record gets "phases": per phase the median
-//             time, its MEMORY_MODEL §4 lower bound and the time as % of that bound
-//             (the timed whole-call loop runs with the marks switched off)
-//   bw        device-to-device copy of A (achievable DRAM bandwidth)
-// Matrix-only methods (dgemm, emu, gemmul8) need the GEMM view: A = [L][I|K], B = [L][J|K],
-// C = [L][I][J] (either I/K or J/K order). If a case is not in that layout the method is
-// timed twice: on pre-permuted operands ("gemm-view") and as "perm+<method>", which
-// permutes A and B in, runs the GEMM and permutes C out (cuTENSOR permutations).
+//             time, its MEMORY_MODEL §4 lower bound, the time as % of that bound and the
+//             performance model's predicted time (pred_ms; bounds and predictions from
+//             libimmerdink_host imd_perf_predict, DESIGN §6c, shipped calibration); every
+//             record has pred_ms / pred_err_pct of the whole call (the timed whole-call loop
+//             runs with the marks switched off)
+//   packed    v1.7 (DESIGN §6b, D1): the caller's A or B (--pack A,B) packed once with
+//             imd_pack (imd_pack_desc_for: bit-identical C) and reused by R contractions
+//             (--reuse 1,4,16): R x imd_contract vs imd_pack + R x imd_contract_packed,
+//             interleaved per repetition, plus imd_pack / imd_contract / imd_contract_packed
+//             alone; workspaces and pack bytes
+//   duel      two immerdink configurations (--duel-a, --duel-b) timed INTERLEAVED, call by
+//             call, in one process (docs/BENCHMARKING.md "Tiny shapes", NOTES-A5 §1.2): both
+//             sides see the same GPU clock / DVFS / host-core state. A side is "default" or
+//             a comma list of N=<n>, vec=generate|resident, g=<g> (0 = N),
+//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule); unset keys keep the plan
+//             defaults, N defaults to the --N value. Defaults: A = default (the K4 rule),
+//             B = k4=tune (the plan-time K4 autotune); when both pick the same K4
+//             configuration (k4_config in both records) the run is an A/A resolution check.
+//             Records duel-a and duel-b; duel-b carries ratio_median = median over pairs of
+//             t_a / t_b (> 1: B faster), its p10 / p90, and whether the two C are bit-identical
+//   bw        device-to-device copy of A (achievable DRAM bandwidth; a hardware reference)
 //
 // Accuracy: for --samples output elements (all of them if C is smaller), the reference
 // is a double-double (Dot2) dot product computed on the device; the host holds only the
 // samples (no operand copies), so host RSS is small for every shape. Reported: max |c - r| / |r| and the
 // normwise max |c - r| / (||a_i||_2 ||b_j||_2) of DESIGN §3.8.
-#include <cublasLt.h>
-#include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include <cutensor.h>
+#include <dlfcn.h>
 #include <sys/resource.h>
 #include <immerdink/immerdink.h>
 
-#ifdef IMD_BENCH_GEMMUL8
-#include <gemmul8.hpp>
-#endif
 #ifdef IMD_BENCH_PROFILE
 #include "profile_hooks.h"  // src/: per-phase event marks (libimmerdink built with IMMERDINK_PROFILE)
 #endif
@@ -57,8 +60,10 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <atomic>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -71,18 +76,6 @@ struct Failure : std::runtime_error {
   do {                                                                                       \
     cudaError_t e_ = (x);                                                                    \
     if (e_ != cudaSuccess) throw Failure(std::string(#x) + ": " + cudaGetErrorString(e_));   \
-  } while (0)
-#define CB(x)                                                                                \
-  do {                                                                                       \
-    cublasStatus_t s_ = (x);                                                                 \
-    if (s_ != CUBLAS_STATUS_SUCCESS)                                                         \
-      throw Failure(std::string(#x) + ": " + cublasGetStatusName(s_));                       \
-  } while (0)
-#define CT(x)                                                                                \
-  do {                                                                                       \
-    cutensorStatus_t s_ = (x);                                                               \
-    if (s_ != CUTENSOR_STATUS_SUCCESS)                                                       \
-      throw Failure(std::string(#x) + ": " + cutensorGetErrorString(s_));                    \
   } while (0)
 #define CI(x)                                                                                \
   do {                                                                                       \
@@ -184,20 +177,17 @@ __device__ __host__ inline uint64_t splitmix64(uint64_t x) {
   return x ^ (x >> 31);
 }
 // (u - 1/2) * exp(phi * g), u uniform in [0,1), g standard normal: GEMMul8's test data.
-__global__ void k_fill(double* p, size_t n, uint64_t seed, double phi) {
+// dom > 0 (--data dominant): every dom-th element (one per row of k contiguous contracted
+// elements, e.g. ik / jk operands) is multiplied by 2^20, so each row has one dominant entry.
+__global__ void k_fill(double* p, size_t n, uint64_t seed, double phi, size_t dom) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
        i += size_t(gridDim.x) * blockDim.x) {
     uint64_t h1 = splitmix64(seed ^ (2 * i)), h2 = splitmix64(seed ^ (2 * i + 1));
     double u = double(h1 >> 11) * 0x1.0p-53, u1 = (double(h2 >> 11) + 1.0) * 0x1.0p-53;
     double u2 = double(splitmix64(h2) >> 11) * 0x1.0p-53;
     double g = sqrt(-2.0 * log(u1)) * cospi(2.0 * u2);
-    p[i] = (u - 0.5) * exp(phi * g);
+    p[i] = (u - 0.5) * exp(phi * g) * ((dom != 0 && i % dom == 0) ? 1048576.0 : 1.0);
   }
-}
-__global__ void k_fill_i8(int8_t* p, size_t n, uint64_t seed) {
-  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
-       i += size_t(gridDim.x) * blockDim.x)
-    p[i] = int8_t(splitmix64(seed ^ i) & 0xff);
 }
 
 // ----------------------------------------------------------------------- the contraction ---
@@ -422,6 +412,7 @@ Accuracy check(Reference& R, const double* dC, cudaStream_t st) {
 // -------------------------------------------------------------------------------- timing ---
 struct Timing {
   std::vector<double> t;  // seconds per repetition
+  std::vector<double> mhz;  // v1.10: SM clock right after each timed call (clock probe), MHz
   double median() const {
     auto v = t;
     std::sort(v.begin(), v.end());
@@ -438,14 +429,42 @@ struct Options {
   long long samples = 256;
   int phase_reps = 5;  // profiled imd calls (per-phase marks), after the timed loop
   std::vector<int> vec_modes = {IMD_VEC_GENERATE};  // imd: --vec generate,resident (v1.2)
+  int mode = IMD_EMULATE;  // imd: --mode emulate|direct (B2 calibration of the DIRECT kernel)
   std::vector<int> groups = {0};  // imd: --g 1,2,4,0 (residue group size g; 0 = N)
+  // imd: --k4 rule,tune,0,1,2,3 (A3: the K4 configuration; -1 = the plan-time rule, -2 =
+  // the k4_tune plan option, 0.. = forced through the benchmark hook)
+  std::vector<int> k4 = {-1};
   double phi = 0.5;
+  bool dominant = false;  // --data dominant (B2 eps-path calibration: one dominant entry per row)
+  // v1.10 (DESIGN §6c): --clock-probe 1 records the SM clock after every timed call (also
+  // IMD_BENCH_CLOCK=1); --l2 flush writes a 2 x L2 buffer before every timed imd call (outside
+  // the timed window: the COLD state; default repeat); --sustain-s / --sustain-warm-s: method
+  // sustained's measured window and warm-up.
+  bool clock_probe = false;
+  bool l2_flush = false;
+  double sustain_s = 8, sustain_warm_s = 3;
   uint64_t seed = 1;
   std::string out;
 };
 
-Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& o) {
-  for (int w = 0; w < o.warmup; ++w) run();
+// A5 diagnostic (IMD_BENCH_CLOCK=1): the SM clock right after each timed call, measured by
+// one warp spinning ~4 µs of %globaltimer and counting clock64 cycles (outside the timed
+// window; it adds ~5 µs of GPU work between calls).
+__global__ void k_clock_probe(unsigned long long* out) {
+  unsigned long long t0, t1, c0, c1;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  c0 = clock64();
+  do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1)); } while (t1 - t0 < 4000);
+  c1 = clock64();
+  if (threadIdx.x == 0) { out[0] = c1 - c0; out[1] = t1 - t0; }
+}
+
+Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& o,
+               const std::function<void()>& pre = nullptr) {
+  for (int w = 0; w < o.warmup; ++w) {
+    if (pre) pre();
+    run();
+  }
   CU(cudaStreamSynchronize(s));
   CU(cudaGetLastError());
   cudaEvent_t e0, e1;
@@ -453,7 +472,13 @@ Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& 
   CU(cudaEventCreate(&e1));
   Timing T;
   double total = 0;
+  const char* clk_env = getenv("IMD_BENCH_CLOCK");
+  const bool clk = (clk_env && *clk_env == '1') || o.clock_probe;
+  unsigned long long* clk_buf = nullptr;
+  std::vector<double> mhz;
+  if (clk) CU(cudaHostAlloc(&clk_buf, 2 * sizeof(unsigned long long), cudaHostAllocMapped));
   for (int r = 0; r < o.reps; ++r) {
+    if (pre) pre();  // outside the timed window (v1.10: the L2 flush of --l2 flush)
     CU(cudaEventRecord(e0, s));
     run();
     CU(cudaEventRecord(e1, s));
@@ -461,13 +486,109 @@ Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& 
     float ms = 0;
     CU(cudaEventElapsedTime(&ms, e0, e1));
     T.t.push_back(ms * 1e-3);
+    if (clk) {
+      k_clock_probe<<<1, 32, 0, s>>>(clk_buf);
+      CU(cudaStreamSynchronize(s));
+      mhz.push_back(1e3 * double(clk_buf[0]) / double(clk_buf[1]));
+    }
     total += ms * 1e-3;
     if (r + 1 >= o.min_reps && total > o.max_seconds) break;
   }
   CU(cudaGetLastError());
   cudaEventDestroy(e0);
   cudaEventDestroy(e1);
+  if (const char* v = getenv("IMD_BENCH_TIMES"); v && *v == '1') {  // A5: every timed call, µs
+    fprintf(stderr, "  times_us:");
+    for (double t : T.t) fprintf(stderr, " %.1f", t * 1e6);
+    fprintf(stderr, "\n");
+  }
+  T.mhz = mhz;
+  if (clk && getenv("IMD_BENCH_CLOCK")) {
+    fprintf(stderr, "  sm_mhz:");
+    for (double m : mhz) fprintf(stderr, " %.0f", m);
+    fprintf(stderr, "\n");
+    cudaFreeHost(clk_buf);
+  }
   return T;
+}
+
+// A side of method duel: one immerdink configuration. k4: -1 the plan-time rule, -2 the
+// k4_tune plan option, >= 0 a forced configuration; k5: 0 the launch rule, 1 / 2 / 4
+// elements per thread. Forced k4 / k5 go through the benchmark hooks (profiling build).
+struct DuelSide {
+  int N = 14, vec = IMD_VEC_GENERATE, g = 0, k4 = -1, k5 = 0;
+  std::string describe() const {
+    std::string d = "N=" + std::to_string(N) + " g=" + ((g == 0 || g >= N) ? "N" : std::to_string(g));
+    d += vec == IMD_VEC_RESIDENT ? " vec=resident" : " vec=generate";
+    d += k4 == -1 ? " k4=rule" : k4 == -2 ? " k4=tune" : " k4=" + std::to_string(k4);
+    d += k5 == 0 ? " k5=rule" : " k5=" + std::to_string(k5);
+    return d;
+  }
+};
+
+// "default" (the plan defaults at --N) or a comma list of key=value overrides.
+DuelSide parse_duel_side(const std::string& spec, int N) {
+  DuelSide d;
+  d.N = N;
+  if (spec.empty() || spec == "default") return d;
+  for (auto& kv : split(spec, ',')) {
+    const auto eq = kv.find('=');
+    if (eq == std::string::npos) throw Failure("bad duel side entry '" + kv + "' (key=value)");
+    const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+    if (k == "N") d.N = std::stoi(v);
+    else if (k == "vec" && (v == "generate" || v == "resident"))
+      d.vec = v == "resident" ? IMD_VEC_RESIDENT : IMD_VEC_GENERATE;
+    else if (k == "g") d.g = std::stoi(v);
+    else if (k == "k4") d.k4 = v == "rule" ? -1 : v == "tune" ? -2 : std::stoi(v);
+    else if (k == "k5" && (v == "0" || v == "1" || v == "2" || v == "4")) d.k5 = std::stoi(v);
+    else throw Failure("bad duel side entry '" + kv + "' (N=, vec=generate|resident, g=, "
+                       "k4=rule|tune|0..3, k5=0|1|2|4)");
+  }
+  return d;
+}
+
+// v1.10: read n words (L2 eviction by clean lines); the store never happens for the zeroed
+// buffer, but the compiler cannot drop the reads.
+__global__ void k_touch(const unsigned long long* p, size_t n, unsigned long long* sink) {
+  unsigned long long acc = 0;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    acc += p[i];
+  if (acc == 1) sink[0] = acc;
+}
+
+// v1.10 (method sustained): NVML through dlopen (no build dependency): board power and SM
+// clock. Neither read disturbs the energy counter (evaluation workspace findings/energy).
+struct Nvml {
+  void* lib = nullptr;
+  void* dev = nullptr;
+  int (*power)(void*, unsigned*) = nullptr;
+  int (*clock)(void*, int, unsigned*) = nullptr;
+  int (*limit)(void*, unsigned*) = nullptr;
+  bool ok() const { return dev != nullptr; }
+  Nvml() {
+    lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+    if (!lib) return;
+    auto init = reinterpret_cast<int (*)()>(dlsym(lib, "nvmlInit_v2"));
+    auto handle = reinterpret_cast<int (*)(unsigned, void**)>(dlsym(lib, "nvmlDeviceGetHandleByIndex_v2"));
+    power = reinterpret_cast<int (*)(void*, unsigned*)>(dlsym(lib, "nvmlDeviceGetPowerUsage"));
+    clock = reinterpret_cast<int (*)(void*, int, unsigned*)>(dlsym(lib, "nvmlDeviceGetClockInfo"));
+    limit = reinterpret_cast<int (*)(void*, unsigned*)>(dlsym(lib, "nvmlDeviceGetEnforcedPowerLimit"));
+    if (!init || !handle || !power || !clock || init() != 0 || handle(0, &dev) != 0) dev = nullptr;
+  }
+  double power_w() const { unsigned mw = 0; return ok() && power(dev, &mw) == 0 ? mw * 1e-3 : NAN; }
+  double sm_mhz() const { unsigned m = 0; return ok() && clock(dev, 1, &m) == 0 ? double(m) : NAN; }
+  double limit_w() const { unsigned mw = 0; return ok() && limit && limit(dev, &mw) == 0 ? mw * 1e-3 : NAN; }
+};
+
+// Number of elements whose bit patterns differ (method duel: are the two sides' C identical).
+__global__ void k_count_diff(const unsigned long long* x, const unsigned long long* y, size_t n,
+                             unsigned long long* count) {
+  unsigned long long local = 0;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    local += x[i] != y[i];
+  if (local) atomicAdd(count, local);
 }
 
 // --------------------------------------------------------------------- the bench context ---
@@ -475,21 +596,16 @@ struct Bench {
   Case c;
   Options o;
   cudaStream_t s = nullptr;
-  cublasHandle_t blas = nullptr;
-  cublasLtHandle_t lt = nullptr;
-  cutensorHandle_t tens = nullptr;
   imd_handle_t imd = nullptr;
   DevBuf dA, dB, dC;
   Reference R;  // sampled reference (host memory O(samples); operands stay on the device)
   Json meta;     // fields common to every record
   FILE* out = stdout;
 
-  // GEMM view: canonical labels and whether each operand needs a permutation.
+  // GEMM view (a case descriptor in every record): canonical labels, and which operands a
+  // matrix-only library would have to permute to reach it.
   std::string cA, cB, cC;  // labels of the GEMM-view operands
   bool needA = false, needB = false, needC = false;
-  bool opA_kfast = true, opB_kfast = true;  // A = [L][I][K] (k fastest) or [L][K][I]
-  DevBuf pA, pB, pC;                        // permuted operands (only when needed)
-  cutensorPlan_t permA = nullptr, permB = nullptr, permC = nullptr;
 
   void emit(Json j) {
     Json rec = meta;
@@ -528,6 +644,11 @@ struct Bench {
     j.integer("reps", (long long)T.t.size());
     j.num("median_s", T.median()).num("min_s", T.min()).num("max_s", T.max());
     j.num("spread_pct", 100.0 * (T.max() - T.min()) / T.median());
+    if (!T.mhz.empty()) {  // v1.10: the SM clock of the timed calls (median of the probes)
+      auto v = T.mhz;
+      std::sort(v.begin(), v.end());
+      j.num("sm_mhz_median", v[v.size() / 2]).num("sm_mhz_min", v.front()).num("sm_mhz_max", v.back());
+    }
     j.num("tflops_eq", flops / T.median() / 1e12);
     j.integer("ws_bytes", (long long)ws_bytes);
     if (acc) {
@@ -553,48 +674,54 @@ struct Bench {
   }
   void poison_C() { CU(cudaMemset(dC.p, 0xff, dC.bytes)); }  // NaN everywhere
 
+  // v1.10 (DESIGN §6c.1 "Cache state"): evict the L2 by writing a buffer of twice its size
+  // (on the stream, before the timed window).
+  DevBuf l2buf;
+  int flush_n = 0;
+  void flush_l2() {
+    if (l2buf.bytes == 0) {
+      cudaDeviceProp p{};
+      CU(cudaGetDeviceProperties(&p, 0));
+      l2buf = DevBuf(2 * size_t(p.l2CacheSize));
+    }
+    // Read (not written: dirty lines would be written back during the timed call); the
+    // first use initializes the buffer.
+    if (flush_n++ == 0) CU(cudaMemsetAsync(l2buf.p, 0, l2buf.bytes, s));
+    k_touch<<<1024, 256, 0, s>>>(l2buf.as<const unsigned long long>(), l2buf.bytes / 8,
+                                 l2buf.as<unsigned long long>());
+  }
+
   // ------------------------------------------------------------------------ setup ---
   void setup() {
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-    CB(cublasCreate(&blas));
-    CB(cublasSetStream(blas, s));
-    CB(cublasLtCreate(&lt));
-    CT(cutensorCreate(&tens));
     CI(imd_create(&imd));
 
     dA = DevBuf(c.A.size * 8);
     dB = DevBuf(c.B.size * 8);
     dC = DevBuf(c.C.size * 8);
-    k_fill<<<1024, 256, 0, s>>>(dA.as<double>(), c.A.size, splitmix64(o.seed * 3 + 0), o.phi);
-    k_fill<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1), o.phi);
+    const size_t dom = o.dominant ? size_t(c.k) : 0;
+    k_fill<<<1024, 256, 0, s>>>(dA.as<double>(), c.A.size, splitmix64(o.seed * 3 + 0), o.phi, dom);
+    k_fill<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1), o.phi, dom);
     CU(cudaStreamSynchronize(s));
     CU(cudaGetLastError());
     R = make_reference(c, dA.as<double>(), dB.as<double>(), o.samples, o.seed, s);
 
     // GEMM view. A: L ++ (I ++ K | K ++ I); B: L ++ (J ++ K | K ++ J); C: L ++ I ++ J.
-    auto pick = [&](const std::string& have, const std::string& X, bool& kfast) {
-      if (have == c.L + X + c.K) { kfast = true; return have; }
-      if (have == c.L + c.K + X) { kfast = false; return have; }
-      kfast = true;
-      return c.L + X + c.K;
+    auto pick = [&](const std::string& have, const std::string& X) {
+      return (have == c.L + X + c.K || have == c.L + c.K + X) ? have : c.L + X + c.K;
     };
-    cA = pick(c.A.labels, c.I, opA_kfast);
-    cB = pick(c.B.labels, c.J, opB_kfast);
+    cA = pick(c.A.labels, c.I);
+    cB = pick(c.B.labels, c.J);
     cC = c.L + c.I + c.J;
     needA = cA != c.A.labels;
     needB = cB != c.B.labels;
     needC = cC != c.C.labels;
-    if (needA) { pA = DevBuf(dA.bytes); permA = make_perm(c.A, cA); }
-    if (needB) { pB = DevBuf(dB.bytes); permB = make_perm(c.B, cB); }
-    if (needC) { pC = DevBuf(dC.bytes); permC = make_perm(make_operand(cC, c.ext), c.C.labels); }
 
     cudaDeviceProp p{};
     CU(cudaGetDeviceProperties(&p, 0));
     int drv = 0, rt = 0;
     cudaDriverGetVersion(&drv);
     cudaRuntimeGetVersion(&rt);
-    int cbv = 0;
-    cublasGetVersion(blas, &cbv);
     std::string extstr;
     for (auto& [k, v] : c.ext) extstr += (extstr.empty() ? "" : ",") + std::string(1, k) + "=" + std::to_string(v);
     meta.str("case", c.name).str("spec", c.spec).str("ext", extstr);
@@ -602,10 +729,11 @@ struct Bench {
     meta.str("gemm_view", cA + "," + cB + "->" + cC);
     meta.raw("perm_needed", std::string("\"") + (needA ? "A" : "") + (needB ? "B" : "") + (needC ? "C" : "") + "\"");
     meta.num("phi", o.phi).integer("seed", (long long)o.seed);
+    meta.str("data", o.dominant ? "dominant" : "normal");
     meta.str("gpu", p.name).integer("sm_count", p.multiProcessorCount);
+    meta.integer("l2_bytes", (long long)p.l2CacheSize);
     meta.str("driver", sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null"));
-    meta.integer("cuda_driver_api", drv).integer("cuda_runtime", rt).integer("cublas", cbv);
-    meta.integer("cutensor", (long long)cutensorGetVersion());
+    meta.integer("cuda_driver_api", drv).integer("cuda_runtime", rt);
     meta.str("gpu_max_clocks", sh("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem "
                                   "--format=csv,noheader 2>/dev/null"));
     meta.str("commit", getenv_or("BENCH_COMMIT", "unknown"));
@@ -614,252 +742,34 @@ struct Bench {
     meta.str("conditions", ql ? read_file(ql) : "not recorded (not run via tools/run_bench.sh)");
   }
 
-  cutensorPlan_t make_perm(const Operand& src, const std::string& dst_labels) {
-    Operand dst = make_operand(dst_labels, c.ext);
-    cutensorTensorDescriptor_t ds, dd;
-    CT(cutensorCreateTensorDescriptor(tens, &ds, uint32_t(src.labels.size()), src.extent.data(),
-                                      src.stride.data(), CUTENSOR_R_64F, 256));
-    CT(cutensorCreateTensorDescriptor(tens, &dd, uint32_t(dst.labels.size()), dst.extent.data(),
-                                      dst.stride.data(), CUTENSOR_R_64F, 256));
-    std::vector<int32_t> ms(src.labels.begin(), src.labels.end()), md(dst.labels.begin(), dst.labels.end());
-    cutensorOperationDescriptor_t op;
-    CT(cutensorCreatePermutation(tens, &op, ds, ms.data(), CUTENSOR_OP_IDENTITY, dd, md.data(),
-                                 CUTENSOR_COMPUTE_DESC_64F));
-    cutensorPlanPreference_t pref;
-    CT(cutensorCreatePlanPreference(tens, &pref, CUTENSOR_ALGO_DEFAULT, CUTENSOR_JIT_MODE_NONE));
-    cutensorPlan_t plan;
-    CT(cutensorCreatePlan(tens, &plan, op, pref, 0));
-    cutensorDestroyPlanPreference(pref);
-    cutensorDestroyOperationDescriptor(op);
-    cutensorDestroyTensorDescriptor(ds);
-    cutensorDestroyTensorDescriptor(dd);
-    return plan;
-  }
-  void permute(cutensorPlan_t plan, const void* src, void* dst) {
-    const double one = 1.0;
-    CT(cutensorPermute(tens, plan, &one, src, dst, s));
-  }
-
-  // The matrix-only methods: `gemm(A, B, C)` on the GEMM view (row-major, see header).
-  void run_gemm_family(const std::string& method, const std::string& variant, int N,
-                       const std::function<void(const double*, const double*, double*)>& gemm,
-                       size_t ws_bytes, Json extra = {}) {
-    const double* a = needA ? pA.as<double>() : dA.as<double>();
-    const double* bb = needB ? pB.as<double>() : dB.as<double>();
-    double* cc = needC ? pC.as<double>() : dC.as<double>();
-    if (needA) permute(permA, dA.p, pA.p);
-    if (needB) permute(permB, dB.p, pB.p);
-    poison_C();
-    Timing T = time_it([&] { gemm(a, bb, cc); }, s, o);
-    if (needC) permute(permC, cc, dC.p);
-    Accuracy acc = result_accuracy();
-    if (!(needA || needB || needC)) {
-      record(method, variant, N, T, &acc, flops(), ws_bytes, extra);
-      return;
-    }
-    Json e1 = extra;
-    e1.str("layout", "gemm-view (operands pre-permuted, permutations not timed)");
-    record(method, variant, N, T, &acc, flops(), ws_bytes, e1);
-    poison_C();
-    Timing P = time_it([&] {
-      if (needA) permute(permA, dA.p, pA.p);
-      if (needB) permute(permB, dB.p, pB.p);
-      gemm(a, bb, cc);
-      if (needC) permute(permC, cc, dC.p);
-    }, s, o);
-    acc = result_accuracy();
-    Json e2 = extra;
-    e2.str("layout", "original (explicit cuTENSOR permutations + GEMM, timed together)");
-    record("perm+" + method, variant, N, P, &acc, flops(), ws_bytes, e2);
-  }
-
-  // Column-major call computing C^T (n x m) = op(B) * op(A), see the header comment.
-  struct BlasArgs {
-    cublasOperation_t ta, tb;  // for the cuBLAS "A" (= our B) and "B" (= our A)
-    int64_t lda, ldb, ldc, sa, sb, sc;
-  };
-  BlasArgs blas_args() const {
-    BlasArgs g;
-    g.ta = opB_kfast ? CUBLAS_OP_T : CUBLAS_OP_N;
-    g.lda = opB_kfast ? c.k : c.n;
-    g.tb = opA_kfast ? CUBLAS_OP_N : CUBLAS_OP_T;
-    g.ldb = opA_kfast ? c.k : c.m;
-    g.ldc = c.n;
-    g.sa = c.n * c.k;
-    g.sb = c.m * c.k;
-    g.sc = c.m * c.n;
-    return g;
-  }
-
-  void run_cublas(cublasHandle_t h, const std::string& method, cublasComputeType_t ct,
-                  const std::string& variant) {
-    BlasArgs g = blas_args();
-    const double one = 1.0, zero = 0.0;
-    auto gemm = [&, g](const double* a, const double* bb, double* cc) {
-      if (c.b == 1)
-        CB(cublasGemmEx(h, g.ta, g.tb, int(c.n), int(c.m), int(c.k), &one, bb, CUDA_R_64F,
-                        int(g.lda), a, CUDA_R_64F, int(g.ldb), &zero, cc, CUDA_R_64F, int(g.ldc),
-                        ct, CUBLAS_GEMM_DEFAULT));
-      else
-        CB(cublasGemmStridedBatchedEx(h, g.ta, g.tb, int(c.n), int(c.m), int(c.k), &one, bb,
-                                      CUDA_R_64F, int(g.lda), g.sa, a, CUDA_R_64F, int(g.ldb),
-                                      g.sb, &zero, cc, CUDA_R_64F, int(g.ldc), g.sc, int(c.b), ct,
-                                      CUBLAS_GEMM_DEFAULT));
-    };
-    run_gemm_family(method, variant, 0, gemm, 0);
-  }
-
-  void method_dgemm() {
-    CB(cublasSetMathMode(blas, CUBLAS_PEDANTIC_MATH));
-    run_cublas(blas, "dgemm", CUBLAS_COMPUTE_64F_PEDANTIC, "CUBLAS_COMPUTE_64F_PEDANTIC");
-    CB(cublasSetMathMode(blas, CUBLAS_DEFAULT_MATH));
-  }
-
-  void method_emu(const std::string& variant, size_t ws_limit) {
-    // A handle of its own, so the emulation settings and workspace never leak into dgemm.
-    cublasHandle_t eh;
-    CB(cublasCreate(&eh));
-    std::unique_ptr<cublasContext, cublasStatus_t (*)(cublasHandle_t)> guard(eh, cublasDestroy);
-    CB(cublasSetStream(eh, s));
-    DevBuf ws(ws_limit);  // the emulated path takes its scratch from the handle workspace
-    CB(cublasSetWorkspace(eh, ws.p, ws.bytes));
-    CB(cublasSetEmulationStrategy(eh, CUBLAS_EMULATION_STRATEGY_EAGER));
-    if (variant == "dyn") {
-      CB(cublasSetFixedPointEmulationMantissaControl(eh, CUDA_EMULATION_MANTISSA_CONTROL_DYNAMIC));
-    } else if (variant.rfind("fix", 0) == 0) {
-      CB(cublasSetFixedPointEmulationMantissaControl(eh, CUDA_EMULATION_MANTISSA_CONTROL_FIXED));
-      CB(cublasSetFixedPointEmulationMaxMantissaBitCount(eh, std::stoi(variant.substr(3))));
-    } else {
-      throw Failure("unknown --emu variant " + variant);
-    }
-    int maxbits = -1, offset = 0;
-    cudaEmulationMantissaControl mc{};
-    cublasGetFixedPointEmulationMaxMantissaBitCount(eh, &maxbits);
-    cublasGetFixedPointEmulationMantissaBitOffset(eh, &offset);
-    cublasGetFixedPointEmulationMantissaControl(eh, &mc);
-    std::string v = variant + " (control=" + (mc == CUDA_EMULATION_MANTISSA_CONTROL_FIXED ? "FIXED" : "DYNAMIC") +
-                    ", max_bits=" + std::to_string(maxbits) + ", offset=" + std::to_string(offset) +
-                    ", strategy=EAGER, ws=" + std::to_string(ws.bytes >> 20) + "MiB)";
-    run_cublas(eh, "emu", CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT, v);
-    CU(cudaStreamSynchronize(s));
-  }
-
-  void method_int8() {
-    const int64_t kh = (c.k + 15) / 16 * 16;
-    DevBuf a8(size_t(c.b * c.m * kh)), b8(size_t(c.b * c.n * kh)), c32(size_t(c.b * c.m * c.n) * 4);
-    k_fill_i8<<<1024, 256, 0, s>>>(a8.as<int8_t>(), a8.bytes, 11);
-    k_fill_i8<<<1024, 256, 0, s>>>(b8.as<int8_t>(), b8.bytes, 12);
-    cublasLtMatmulDesc_t op;
-    CB(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32I, CUDA_R_32I));
-    cublasOperation_t T = CUBLAS_OP_T, Nn = CUBLAS_OP_N;
-    CB(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &T, sizeof T));
-    CB(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &Nn, sizeof Nn));
-    cublasLtMatrixLayout_t la, lb, lc;  // la = our B (k^ x n), lb = our A (k^ x m), lc = C^T
-    CB(cublasLtMatrixLayoutCreate(&la, CUDA_R_8I, uint64_t(kh), uint64_t(c.n), kh));
-    CB(cublasLtMatrixLayoutCreate(&lb, CUDA_R_8I, uint64_t(kh), uint64_t(c.m), kh));
-    CB(cublasLtMatrixLayoutCreate(&lc, CUDA_R_32I, uint64_t(c.n), uint64_t(c.m), c.n));
-    int32_t bc = int32_t(c.b);
-    int64_t sa = c.n * kh, sb = c.m * kh, sc = c.m * c.n;
-    for (auto [l, st] : {std::pair{la, sa}, std::pair{lb, sb}, std::pair{lc, sc}}) {
-      CB(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &bc, sizeof bc));
-      CB(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &st, sizeof st));
-    }
-    size_t wsb = size_t(64) << 20;
-    DevBuf ws(wsb);
-    cublasLtMatmulPreference_t pref;
-    CB(cublasLtMatmulPreferenceCreate(&pref));
-    CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsb, sizeof wsb));
-    cublasLtMatmulHeuristicResult_t h{};
-    int found = 0;
-    CB(cublasLtMatmulAlgoGetHeuristic(lt, op, la, lb, lc, lc, pref, 1, &h, &found));
-    if (!found) throw Failure("cuBLASLt: no int8 algorithm");
-    const int32_t one = 1, zero = 0;
-    Timing Tm = time_it([&] {
-      CB(cublasLtMatmul(lt, op, &one, b8.p, la, a8.p, lb, &zero, c32.p, lc, c32.p, lc, &h.algo,
-                        ws.p, wsb, s));
-    }, s, o);
-    double ops = 2.0 * double(c.m) * double(c.n) * double(kh) * double(c.b);
-    Json e;
-    e.num("int8_tops", ops / Tm.median() / 1e12).integer("k_hat", kh);
-    e.str("layout", "GEMM view, int8 TN, int32 out; time of ONE modulus' GEMM");
-    record("int8", "cublasLt int8 TN int32-out", 1, Tm, nullptr, NAN, wsb, e);
-    cublasLtMatmulPreferenceDestroy(pref);
-    cublasLtMatrixLayoutDestroy(la);
-    cublasLtMatrixLayoutDestroy(lb);
-    cublasLtMatrixLayoutDestroy(lc);
-    cublasLtMatmulDescDestroy(op);
-  }
-
-  void method_gemmul8(int N) {
-#ifdef IMD_BENCH_GEMMUL8
-    BlasArgs g = blas_args();
-    size_t wsb = gemmul8::workSize<false, gemmul8::Backend::INT8, gemmul8::Func::gemm>(
-        size_t(c.n), size_t(c.m), size_t(c.k), N);
-    DevBuf ws(wsb);
-    const double one = 1.0, zero = 0.0;
-    auto gemm = [&, g](const double* a, const double* bb, double* cc) {
-      for (int64_t l = 0; l < c.b; ++l)
-        gemmul8::gemm<double, gemmul8::Backend::INT8, double, double>(
-            blas, g.ta, g.tb, size_t(c.n), size_t(c.m), size_t(c.k), &one, bb + l * g.sa,
-            size_t(g.lda), a + l * g.sb, size_t(g.ldb), &zero, cc + l * g.sc, size_t(g.ldc), N,
-            true, ws.p);
-    };
-    Json e;
-    if (c.b > 1) e.str("note", "one GEMMul8 call per batch (no batched API)");
-    run_gemm_family("gemmul8", "INT8 fastmode", N, gemm, wsb, e);
-#else
-    record_error("gemmul8", "INT8 fastmode", N, "built without GEMMul8 (tools/get_gemmul8.sh)");
-#endif
-  }
-
-  void method_cutensor() {
-    auto desc = [&](const Operand& x) {
-      cutensorTensorDescriptor_t d;
-      CT(cutensorCreateTensorDescriptor(tens, &d, uint32_t(x.labels.size()), x.extent.data(),
-                                        x.stride.data(), CUTENSOR_R_64F, 256));
-      return d;
-    };
-    auto da = desc(c.A), db = desc(c.B), dc = desc(c.C);
-    std::vector<int32_t> ma(c.A.labels.begin(), c.A.labels.end()), mb(c.B.labels.begin(), c.B.labels.end()),
-        mc(c.C.labels.begin(), c.C.labels.end());
-    cutensorOperationDescriptor_t op;
-    CT(cutensorCreateContraction(tens, &op, da, ma.data(), CUTENSOR_OP_IDENTITY, db, mb.data(),
-                                 CUTENSOR_OP_IDENTITY, dc, mc.data(), CUTENSOR_OP_IDENTITY, dc,
-                                 mc.data(), CUTENSOR_COMPUTE_DESC_64F));
-    cutensorPlanPreference_t pref;
-    CT(cutensorCreatePlanPreference(tens, &pref, CUTENSOR_ALGO_DEFAULT, CUTENSOR_JIT_MODE_NONE));
-    uint64_t wsb = 0;
-    CT(cutensorEstimateWorkspaceSize(tens, op, pref, CUTENSOR_WORKSPACE_DEFAULT, &wsb));
-    cutensorPlan_t plan;
-    CT(cutensorCreatePlan(tens, &plan, op, pref, wsb));
-    DevBuf ws(wsb);
-    const double one = 1.0, zero = 0.0;
-    poison_C();
-    Timing T = time_it([&] {
-      CT(cutensorContract(tens, plan, &one, dA.p, dB.p, &zero, dC.p, dC.p, ws.p, wsb, s));
-    }, s, o);
-    Accuracy acc = result_accuracy();
-    record("cutensor", "CUTENSOR_COMPUTE_DESC_64F", 0, T, &acc, flops(), wsb);
-    cutensorDestroyPlan(plan);
-    cutensorDestroyPlanPreference(pref);
-    cutensorDestroyOperationDescriptor(op);
-    for (auto d : {da, db, dc}) cutensorDestroyTensorDescriptor(d);
-  }
-
-  void method_imd(int N, int vec_mode, int g) {
+  // k4: -1 the plan-time rule, -2 the k4_tune plan option, >= 0 a forced configuration
+  // (benchmark hook; needs the profiling build).
+  void method_imd(int N, int vec_mode, int g, int k4 = -1) {
     auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
       lab.assign(x.labels.begin(), x.labels.end());
       return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
     };
     std::vector<int32_t> la, lb, lc;
     imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
-    imd_options_t opt{N, g, IMD_RN, IMD_EMULATE, vec_mode};
+    imd_options_t opt{N, g, IMD_RN, o.mode, vec_mode, k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF};
     size_t wsb = 0;
     CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
+    imd_lowering_t low{};
+    low.struct_size = sizeof low;
+    imd_lowering(&A, &B, &C, &opt, &low);
     imd_plan_t plan = nullptr;
+#ifdef IMD_BENCH_PROFILE
+    if (imd_prof_set_k4_config(k4 >= 0 ? k4 : -1) != 0) throw Failure("imd_prof_set_k4_config");
+#else
+    if (k4 >= 0) throw Failure("--k4 <config> needs the profiling build");
+#endif
     const auto c0 = std::chrono::steady_clock::now();
-    CI(imd_plan_create(imd, &A, &B, &C, &opt, &plan));
+    const imd_status_t pst = imd_plan_create(imd, &A, &B, &C, &opt, &plan);
     const double create_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+#ifdef IMD_BENCH_PROFILE
+    imd_prof_set_k4_config(-1);
+#endif
+    CI(pst);
     size_t plan_dev = 0;
     CI(imd_plan_device_bytes(plan, &plan_dev));
     // A resident plan must outlive in-flight work (its kernels read the plan's vectors).
@@ -869,43 +779,354 @@ struct Bench {
     poison_C();
     Timing T = time_it([&] {
       CI(imd_contract(plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
-    }, s, o);
+    }, s, o, o.l2_flush ? std::function<void()>([&] { flush_l2(); }) : nullptr);
     Accuracy acc = result_accuracy();
     CU(cudaStreamSynchronize(s));
     Json extra;
+    // DESIGN §6c: the predicted call (shipped calibration) for the K4 configuration the plan runs.
+    int32_t k4_plan = -1;
 #ifdef IMD_BENCH_PROFILE
-    extra = profile_imd(plan, N, [&] {
+    imd_prof_plan_k4(plan, &k4_plan);
+#endif
+    // v1.10: the bench's state (the same call repeated) at the reference clock; the default
+    // eps fraction (the v6 bench passed 0 here by value-initialization).
+    imd_perf_request_t preq{sizeof(imd_perf_request_t), 0, k4_plan, 0, -1.0,
+                            IMD_PERF_REGIME_BURST, o.l2_flush ? IMD_PERF_CACHE_COLD : IMD_PERF_CACHE_REPEAT, 0.0};
+    imd_perf_t pred{};
+    pred.struct_size = sizeof pred;
+    imd_perf_predict(&A, &B, &C, &opt, nullptr, &preq, nullptr, &pred);
+#ifdef IMD_BENCH_PROFILE
+    extra = profile_imd(plan, N, pred, [&] {
       CI(imd_contract(plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
     });
 #endif
     extra.integer("plan_device_bytes", (long long)plan_dev).num("plan_create_ms", 1e3 * create_s);
+    extra.num("pred_ms", 1e3 * pred.time_s).num("pred_err_pct", 100.0 * (pred.time_s / T.median() - 1));
     const std::string gs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
     extra.integer("g", (long long)((g == 0 || g >= N) ? N : g));
-    record("imd", vec_mode == IMD_VEC_RESIDENT ? gs + " vec=resident" : gs, N, T, &acc, flops(),
-           wsb, extra);
+    // A3: the K4 configuration of the rule (host query) and the one the plan runs.
+    int32_t k4_run = -1;
+#ifdef IMD_BENCH_PROFILE
+    imd_prof_plan_k4(plan, &k4_run);
+#endif
+    extra.integer("k4_rule", low.k4_config).integer("k4_config", k4_run)
+        .integer("k4_tune_bytes", (long long)low.k4_tune_bytes)
+        .integer("fused", low.fused).integer("fused_large", low.fused_large);
+    std::string vs = vec_mode == IMD_VEC_RESIDENT ? gs + " vec=resident" : gs;
+    if (o.mode == IMD_DIRECT) vs += " mode=direct";
+    if (k4 == -2) vs += " k4=tune";
+    else if (k4 >= 0) vs += " k4=" + std::to_string(k4);
+    if (o.l2_flush) vs += " l2=flush";
+    record("imd", vs, N, T, &acc, flops(), wsb, extra);
+  }
+
+  // Method duel: two immerdink configurations timed INTERLEAVED in one process, call by
+  // call, so both see the same GPU clock / DVFS / host-core state (tiny calls drift between
+  // performance states that last ms to s, docs/NOTES-A5.md §1.2; a sequential comparison of
+  // two processes or two blocks of calls samples different states). Each rep times one call
+  // of each side, each its own event pair after an idle GPU, alternating which goes first.
+  // Side A writes C, side B a second C buffer of the same size; afterwards both are checked
+  // against the reference and compared bit for bit. Records "duel-a" and "duel-b" (medians
+  // as usual); duel-b also carries ratio_median = median over reps of t_a / t_b (> 1: B
+  // faster) with p10 / p90. A = B measures the case's own resolution (ratio ~1 and its spread).
+  struct DuelPlan {
+    DuelSide cfg;
+    std::vector<int32_t> la, lb, lc;
+    imd_plan_t plan = nullptr;
+    size_t wsb = 0, plan_dev = 0;
+    DevBuf ws;
+    imd_lowering_t low{};
+    int32_t k4_run = -1;
+    double create_ms = 0;
+    ~DuelPlan() {
+      if (plan) { cudaDeviceSynchronize(); imd_plan_destroy(plan); }  // a resident plan outlives its work
+    }
+  };
+
+  std::unique_ptr<DuelPlan> make_duel_plan(const DuelSide& d) {
+    auto P = std::make_unique<DuelPlan>();
+    P->cfg = d;
+#ifndef IMD_BENCH_PROFILE
+    if (d.k4 >= 0 || d.k5 != 0) throw Failure("duel k4=<config> / k5=<elems> need the profiling build");
+#endif
+    auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
+      lab.assign(x.labels.begin(), x.labels.end());
+      return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
+    };
+    imd_tensor_t A = t(c.A, P->la), B = t(c.B, P->lb), C = t(c.C, P->lc);
+    imd_options_t opt{d.N, d.g, IMD_RN, IMD_EMULATE, d.vec, d.k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF};
+    CI(imd_workspace_size(&A, &B, &C, &opt, &P->wsb));
+    P->low.struct_size = sizeof P->low;
+    imd_lowering(&A, &B, &C, &opt, &P->low);
+#ifdef IMD_BENCH_PROFILE
+    if (imd_prof_set_k4_config(d.k4 >= 0 ? d.k4 : -1) != 0) throw Failure("imd_prof_set_k4_config");
+#endif
+    const auto c0 = std::chrono::steady_clock::now();
+    const imd_status_t pst = imd_plan_create(imd, &A, &B, &C, &opt, &P->plan);
+    P->create_ms = 1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+#ifdef IMD_BENCH_PROFILE
+    imd_prof_set_k4_config(-1);
+#endif
+    CI(pst);
+    CI(imd_plan_device_bytes(P->plan, &P->plan_dev));
+#ifdef IMD_BENCH_PROFILE
+    imd_prof_plan_k4(P->plan, &P->k4_run);
+#endif
+    P->ws = DevBuf(P->wsb);
+    return P;
+  }
+
+  void method_duel(int N, const std::string& spec_a, const std::string& spec_b) {
+    auto pa = make_duel_plan(parse_duel_side(spec_a, N));
+    auto pb = make_duel_plan(parse_duel_side(spec_b, N));
+    DevBuf dC2(dC.bytes);
+    const bool k5_hook = pa->cfg.k5 != 0 || pb->cfg.k5 != 0;
+    auto set_k5 = [&](const DuelPlan& p) {
+#ifdef IMD_BENCH_PROFILE
+      if (k5_hook && imd_prof_set_k5_elems(p.cfg.k5) != 0) throw Failure("imd_prof_set_k5_elems");
+#else
+      (void)p;
+#endif
+    };
+    auto call = [&](const DuelPlan& p, double* C) {
+      CI(imd_contract(p.plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, C, p.ws.p, p.wsb, s));
+    };
+    double* Ca = dC.as<double>();
+    double* Cb = dC2.as<double>();
+    for (int w = 0; w < std::max(o.warmup, 20); ++w) {
+      set_k5(*pa); call(*pa, Ca);
+      set_k5(*pb); call(*pb, Cb);
+    }
+    CU(cudaStreamSynchronize(s));
+    CU(cudaGetLastError());
+    cudaEvent_t e0, e1;
+    CU(cudaEventCreate(&e0));
+    CU(cudaEventCreate(&e1));
+    auto once = [&](const DuelPlan& p, double* C) {
+      set_k5(p);  // host-side switch, outside the timed window
+      CU(cudaEventRecord(e0, s));
+      call(p, C);
+      CU(cudaEventRecord(e1, s));
+      CU(cudaEventSynchronize(e1));
+      float ms = 0;
+      CU(cudaEventElapsedTime(&ms, e0, e1));
+      return double(ms) * 1e-3;
+    };
+    Timing TA, TB;
+    std::vector<double> ratio;
+    double total = 0;
+    for (int r = 0; r < o.reps; ++r) {
+      double ta, tb;
+      if (r % 2 == 0) { ta = once(*pa, Ca); tb = once(*pb, Cb); }
+      else { tb = once(*pb, Cb); ta = once(*pa, Ca); }
+      TA.t.push_back(ta);
+      TB.t.push_back(tb);
+      ratio.push_back(ta / tb);
+      total += ta + tb;
+      if (r + 1 >= o.min_reps && total > o.max_seconds) break;
+    }
+    CU(cudaGetLastError());
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    std::sort(ratio.begin(), ratio.end());
+    const size_t n = ratio.size();
+    const double rmed = n % 2 ? ratio[n / 2] : 0.5 * (ratio[n / 2 - 1] + ratio[n / 2]);
+    // Accuracy of each side from one fresh call into a poisoned C, then bit identity.
+    CU(cudaMemset(Ca, 0xff, dC.bytes));
+    CU(cudaMemset(Cb, 0xff, dC2.bytes));
+    set_k5(*pa); call(*pa, Ca);
+    set_k5(*pb); call(*pb, Cb);
+#ifdef IMD_BENCH_PROFILE
+    if (k5_hook) imd_prof_set_k5_elems(0);
+#endif
+    CU(cudaStreamSynchronize(s));
+    const Accuracy acc_a = check(R, Ca, s), acc_b = check(R, Cb, s);
+    DevBuf cnt(sizeof(unsigned long long));
+    CU(cudaMemsetAsync(cnt.p, 0, cnt.bytes, s));
+    k_count_diff<<<1024, 256, 0, s>>>(reinterpret_cast<const unsigned long long*>(Ca),
+                                      reinterpret_cast<const unsigned long long*>(Cb), c.C.size,
+                                      cnt.as<unsigned long long>());
+    unsigned long long differ = 0;
+    CU(cudaMemcpyAsync(&differ, cnt.p, sizeof differ, cudaMemcpyDeviceToHost, s));
+    CU(cudaStreamSynchronize(s));
+    CU(cudaGetLastError());
+    auto side_extra = [&](const DuelPlan& p, const char* which) {
+      Json e;
+      e.str("duel_side", which).str("duel_config", p.cfg.describe());
+      e.integer("plan_device_bytes", (long long)p.plan_dev).num("plan_create_ms", p.create_ms);
+      e.integer("g", (long long)((p.cfg.g == 0 || p.cfg.g >= p.cfg.N) ? p.cfg.N : p.cfg.g));
+      e.integer("k4_rule", p.low.k4_config).integer("k4_config", p.k4_run);
+      e.integer("kernel_launches", p.low.kernel_launches);
+      e.integer("fused", p.low.fused).integer("fused_large", p.low.fused_large);
+      return e;
+    };
+    Json ea = side_extra(*pa, "a"), eb = side_extra(*pb, "b");
+    eb.str("duel_vs", pa->cfg.describe());
+    eb.num("ratio_median", rmed).num("ratio_p10", ratio[n / 10]).num("ratio_p90", ratio[(9 * n) / 10]);
+    eb.raw("bit_identical", differ == 0 ? "true" : "false").integer("elements_differing", (long long)differ);
+    record("duel-a", pa->cfg.describe() + ", interleaved", pa->cfg.N, TA, &acc_a, flops(), pa->wsb, ea);
+    record("duel-b", pb->cfg.describe() + ", interleaved", pb->cfg.N, TB, &acc_b, flops(), pb->wsb, eb);
+  }
+
+  // v1.7 (DESIGN §6b, ROADMAP D1): one operand packed once (imd_pack_desc_for: the plain
+  // call's orders, so C is bit-identical) and reused by R contractions. `which`: 0 = the
+  // caller's A, 1 = B. Per R in --reuse, interleaved in each repetition (same clock state):
+  //   plain   R x imd_contract
+  //   packed  imd_pack + R x imd_contract_packed (same partner, same C)
+  // and, timed the same way, imd_pack alone, one imd_contract and one imd_contract_packed.
+  // One record per R: medians, the ratio plain / packed, the workspaces and the pack bytes;
+  // the packed C is checked bit for bit against the plain one.
+  void method_packed(int N, int which, const std::vector<int>& reuse) {
+    auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
+      lab.assign(x.labels.begin(), x.labels.end());
+      return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
+    };
+    std::vector<int32_t> la, lb, lc;
+    imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
+    const imd_options_t opt{N, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    imd_pack_desc_t desc{};
+    desc.struct_size = sizeof desc;
+    int32_t labels[64];
+    CI(imd_pack_desc_for(&A, &B, &C, &opt, which, &desc, labels, 64));
+    imd_pack_t pack = nullptr;
+    CI(imd_pack_create(imd, &desc, &pack));
+    std::unique_ptr<imd_pack_s, imd_status_t (*)(imd_pack_t)> pguard(pack, imd_pack_destroy);
+    size_t pb = 0, pw = 0, wsb = 0, wsp = 0;
+    CI(imd_pack_bytes(pack, &pb, &pw));
+    const imd_packing_t packing = {which == 0 ? &desc : nullptr, which == 1 ? &desc : nullptr};
+    CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
+    CI(imd_workspace_size_packed(&A, &B, &C, &opt, &packing, &wsp));
+    imd_lowering_t lu{}, lp{};
+    lu.struct_size = lp.struct_size = sizeof lu;
+    imd_lowering(&A, &B, &C, &opt, &lu);
+    imd_lowering_packed(&A, &B, &C, &opt, &packing, &lp);
+    imd_plan_t plain = nullptr, packed = nullptr;
+    CI(imd_plan_create(imd, &A, &B, &C, &opt, &plain));
+    std::unique_ptr<imd_plan_st, imd_status_t (*)(imd_plan_t)> g1(plain, imd_plan_destroy);
+    CI(imd_plan_create_packed(imd, &A, &B, &C, &opt, which == 0 ? pack : nullptr,
+                              which == 1 ? pack : nullptr, &packed));
+    std::unique_ptr<imd_plan_st, imd_status_t (*)(imd_plan_t)> g2(packed, imd_plan_destroy);
+    DevBuf ws(wsb), wsP(wsp), P(pb), PW(pw);
+    const double* X = which == 0 ? dA.as<double>() : dB.as<double>();
+    const imd_operand_t opX{X, P.p, pb, pack};
+    const imd_operand_t opO{which == 0 ? dB.as<double>() : dA.as<double>(), nullptr, 0, nullptr};
+    const imd_operand_t& oA = which == 0 ? opX : opO;
+    const imd_operand_t& oB = which == 0 ? opO : opX;
+    auto do_pack = [&] { CI(imd_pack(pack, X, P.p, pb, PW.p, pw, s)); };
+    auto do_plain = [&] {
+      CI(imd_contract(plain, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
+    };
+    auto do_packed = [&] {
+      CI(imd_contract_packed(packed, 1.0, &oA, &oB, 0.0, dC.as<double>(), wsP.p, wsp, s));
+    };
+    // bit-identity of the two paths (imd_pack_desc_for orders)
+    poison_C();
+    do_plain();
+    CU(cudaStreamSynchronize(s));
+    std::vector<double> ref(c.C.size), got(c.C.size);
+    CU(cudaMemcpy(ref.data(), dC.p, c.C.size * 8, cudaMemcpyDeviceToHost));
+    poison_C();
+    do_pack();
+    do_packed();
+    CU(cudaStreamSynchronize(s));
+    CU(cudaMemcpy(got.data(), dC.p, c.C.size * 8, cudaMemcpyDeviceToHost));
+    const bool identical = std::memcmp(ref.data(), got.data(), c.C.size * 8) == 0;
+    Accuracy acc = result_accuracy();
+    // Timed units, interleaved per repetition.
+    cudaEvent_t e0, e1;
+    CU(cudaEventCreate(&e0));
+    CU(cudaEventCreate(&e1));
+    auto timed = [&](const std::function<void()>& f) {
+      CU(cudaEventRecord(e0, s));
+      f();
+      CU(cudaEventRecord(e1, s));
+      CU(cudaEventSynchronize(e1));
+      float ms = 0;
+      CU(cudaEventElapsedTime(&ms, e0, e1));
+      return double(ms) * 1e-3;
+    };
+    const int Rmax = *std::max_element(reuse.begin(), reuse.end());
+    for (int w = 0; w < o.warmup; ++w) { do_pack(); do_plain(); do_packed(); }
+    CU(cudaStreamSynchronize(s));
+    Timing tp, tc, tcp;
+    std::map<int, Timing> tplain, tpacked;
+    double total = 0;
+    for (int r = 0; r < o.reps; ++r) {
+      tp.t.push_back(timed(do_pack));
+      tc.t.push_back(timed(do_plain));
+      tcp.t.push_back(timed(do_packed));
+      for (int R : reuse) {
+        const double a = timed([&] { for (int i = 0; i < R; ++i) do_plain(); });
+        const double b = timed([&] { do_pack(); for (int i = 0; i < R; ++i) do_packed(); });
+        tplain[R].t.push_back(a);
+        tpacked[R].t.push_back(b);
+        total += a + b;
+      }
+      if (r + 1 >= o.min_reps && total > o.max_seconds) break;
+    }
+    CU(cudaGetLastError());
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    (void)Rmax;
+    // Per-phase event marks (profiling build): one plain call, one packed call, imd_pack.
+    Json phases;
+#ifdef IMD_BENCH_PROFILE
+    if (o.phase_reps > 0) {
+      const std::pair<const char*, std::function<void()>> runs[3] = {
+          {"plain_", do_plain}, {"packed_", do_packed}, {"pack_", do_pack}};
+      imd_perf_t preds[3] = {};
+      for (auto& pr : preds) pr.struct_size = sizeof pr;
+      const imd_perf_request_t rq{sizeof(imd_perf_request_t), 0, -1, 0, -1.0,
+                                  IMD_PERF_REGIME_BURST, IMD_PERF_CACHE_REPEAT, 0.0};
+      imd_perf_predict(&A, &B, &C, &opt, nullptr, &rq, nullptr, &preds[0]);
+      imd_perf_predict(&A, &B, &C, &opt, &packing, &rq, nullptr, &preds[1]);
+      imd_perf_predict_pack(&desc, &rq, nullptr, &preds[2]);
+      int ri = 0;
+      for (auto& [pre, fn] : runs) {
+        fprintf(stderr, "  %sphases:\n", pre);
+        Json pj = profile_imd(std::string(pre) == "plain_" ? plain : packed, N, preds[ri++], fn);
+        for (auto& kv : pj.kv) phases.raw(pre + kv.first, kv.second);
+      }
+    }
+#endif
+    for (int R : reuse) {
+      Json e;
+      if (R == reuse.front())
+        for (auto& kv : phases.kv) e.kv.push_back(kv);
+      e.str("pack", which == 0 ? "A" : "B").integer("R", R);
+      e.num("plain_R_ms", 1e3 * tplain[R].median()).num("packed_R_ms", 1e3 * tpacked[R].median());
+      e.num("speedup_R", tplain[R].median() / tpacked[R].median());
+      e.num("pack_ms", 1e3 * tp.median()).num("contract_ms", 1e3 * tc.median());
+      e.num("contract_packed_ms", 1e3 * tcp.median());
+      e.num("pack_vs_contract", tp.median() / tc.median());
+      e.num("contract_packed_vs_contract", tcp.median() / tc.median());
+      e.integer("ws_bytes_plain", (long long)wsb).integer("ws_bytes_packed", (long long)wsp);
+      e.integer("pack_bytes", (long long)pb).integer("pack_ws_bytes", (long long)pw);
+      e.integer("kernel_launches_plain", lu.kernel_launches).integer("kernel_launches_packed", lp.kernel_launches);
+      e.integer("fused", lp.fused).integer("fused_large", lp.fused_large).integer("swapped", lp.swapped);
+      e.raw("bit_identical", identical ? "true" : "false");
+      record("packed", std::string("pack ") + (which == 0 ? "A" : "B") + " R=" + std::to_string(R), N,
+             tpacked[R], &acc, R * flops(), wsp, e);
+    }
+    CU(cudaStreamSynchronize(s));
   }
 
 #ifdef IMD_BENCH_PROFILE
-  // Per-phase times from the library's event marks, against MEMORY_MODEL §4 lower bounds
-  // (g = N, beta = 0, rho = 1, datasheet peaks as in bench/summarize.py).
-  Json profile_imd(imd_plan_t plan, int N, const std::function<void()>& call) {
-    constexpr double kBW = 1008e9, kOps = 660.6e12, kKc = 131056;
+  // Per-phase times from the library's event marks, against the MEMORY_MODEL §4 lower bounds
+  // and the performance model's predicted phase times (DESIGN §6c: `pred` is imd_perf_predict /
+  // imd_perf_predict_pack with the shipped calibration, the one implementation of the bound
+  // formulas: the actual g, beta = 0, rho = 1, datasheet peaks).
+  Json profile_imd(imd_plan_t plan, int N, const imd_perf_t& pred,
+                   const std::function<void()>& call) {
     int64_t d[7];
     CI(imd_prof_plan_dims(plan, d) == 0 ? IMD_STATUS_SUCCESS : IMD_STATUS_INVALID_VALUE);
-    const double m = double(d[0]), n = double(d[1]), k = double(d[2]), b = double(d[3]),
-                 nh = double(d[4]), kh = double(d[5]);
-    const double nc = std::ceil(kh / kKc);
-    std::map<std::string, double> lb;
-    lb["K0 vec"] = 8 * (2 * m + 2 * n + 2 * k + 3 * b) / kBW;  // v1.2: generated (written once)
-    lb["K1 scale A"] = 8 * b * m * k / kBW;
-    lb["K1 scale B"] = 8 * b * n * k / kBW;
-    lb["K2 pack A"] = (8 * b * m * k + N * b * m * kh) / kBW;
-    lb["K3 pack B"] = (8 * b * n * k + N * b * nh * kh) / kBW;
-    lb["K4 gemm"] = std::max(2.0 * N * b * m * nh * kh / kOps,
-                             (N * b * (m * kh + nh * kh) + N * b * m * nh * (2 * nc - 1)) / kBW);
-    lb["K5 crt"] = (N * b * m * nh + 8 * b * m * n) / kBW;
-    lb["DIRECT"] = 8 * b * (m * k + k * n + m * n) / kBW;
-    lb["K5 beta-only"] = 8 * b * m * n / kBW;
+    std::map<std::string, double> lb, pm;  // phase -> bound, predicted time (s)
+    for (int i = 0; i < pred.num_phases; ++i) {
+      const char* nm = imd_perf_phase_name(pred.phase[i].phase);
+      if (nm == nullptr) continue;
+      lb[nm] = pred.phase[i].bound_s;
+      pm[nm] = pred.phase[i].time_s;
+    }
 
     if (imd_prof_enable(1) != 0) throw Failure("imd_prof_enable failed");
     std::map<std::string, std::vector<double>> per;  // phase -> per-call total ms
@@ -947,11 +1168,13 @@ struct Bench {
       const double t_ms = median(per[t]);
       const double l_ms = lb.count(t) ? lb[t] * 1e3 : NAN;
       if (lb.count(t) && t != "K0 vec") lb_sum += l_ms;
+      const double p_ms = pm.count(t) ? pm[t] * 1e3 : NAN;
       Json p;
       p.num("ms", t_ms).num("lb_ms", l_ms).num("pct_of_lb", 100.0 * l_ms / t_ms).integer("marks", launches[t]);
+      p.num("pred_ms", p_ms);
       js += (js.size() > 1 ? ", " : "") + jstr(t) + ": " + p.dump();
-      fprintf(stderr, "    %-14s %9.3f ms  LB %9.3f ms  %5.1f %% of LB  (%d marks)\n", t.c_str(),
-              t_ms, l_ms, 100.0 * l_ms / t_ms, launches[t]);
+      fprintf(stderr, "    %-14s %9.3f ms  LB %9.3f ms  %5.1f %% of LB  pred %9.3f ms  (%d marks)\n",
+              t.c_str(), t_ms, l_ms, 100.0 * l_ms / t_ms, p_ms, launches[t]);
     }
     js += "}";
     const double tot = median(totals);
@@ -966,6 +1189,186 @@ struct Bench {
   }
 #endif
 
+  // ---- v1.10 (DESIGN §6c.1, §6c.2): calibration of occupancy, sustained clock / power, cache
+
+  // An immerdink plan of this case (the rule's K4 configuration), with its workspace.
+  struct SimplePlan {
+    std::vector<int32_t> la, lb, lc;
+    imd_tensor_t A{}, B{}, C{};
+    imd_options_t opt{};
+    imd_plan_t plan = nullptr;
+    size_t wsb = 0;
+    DevBuf ws;
+    ~SimplePlan() {
+      if (plan) { cudaDeviceSynchronize(); imd_plan_destroy(plan); }
+    }
+  };
+  std::unique_ptr<SimplePlan> make_plan(int N, int vec_mode, int g) {
+    auto P = std::make_unique<SimplePlan>();
+    auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
+      lab.assign(x.labels.begin(), x.labels.end());
+      return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
+    };
+    P->A = t(c.A, P->la), P->B = t(c.B, P->lb), P->C = t(c.C, P->lc);
+    P->opt = imd_options_t{N, g, IMD_RN, o.mode, vec_mode, IMD_K4_TUNE_OFF};
+    CI(imd_workspace_size(&P->A, &P->B, &P->C, &P->opt, &P->wsb));
+    CI(imd_plan_create(imd, &P->A, &P->B, &P->C, &P->opt, &P->plan));
+    P->ws = DevBuf(P->wsb);
+    return P;
+  }
+
+  // Method occupancy: the measured CTAs per SM, registers, shared memory and threads of every
+  // kernel (IMD_PERF_KERNEL_*), for the calibration file's kernel.<name> lines. No timing.
+  void method_occupancy() {
+#ifdef IMD_BENCH_PROFILE
+    std::string js = "{";
+    for (int k = 0; k < IMD_PERF_KERNEL_COUNT; ++k) {
+      int32_t v[4] = {0, 0, 0, 0};
+      if (imd_prof_kernel_occupancy(k, v) != 0) throw Failure("imd_prof_kernel_occupancy");
+      js += (k ? ", " : "") + jstr(imd_perf_kernel_name(k)) + ": [" + std::to_string(v[0]) + ", " +
+            std::to_string(v[1]) + ", " + std::to_string(v[2]) + ", " + std::to_string(v[3]) + "]";
+    }
+    Json j;
+    j.str("method", "occupancy").str("variant", "").integer("N", 0).raw("kernels", js + "}");
+    j.str("status", "ok");
+    emit(j);
+#else
+    throw Failure("--methods occupancy needs the profiling build");
+#endif
+  }
+
+  // Method sustained: one plan back to back for --sustain-s seconds after --sustain-warm-s of
+  // the same calls, queued ahead (two chunks of >= 20 ms in flight: the GPU never waits for
+  // the host). Records the mean time per call and the mean board power and SM clock over the
+  // window (NVML, sampled every 20 ms in a host thread; the energy counter is not read).
+  void method_sustained(int N, int vec_mode, int g) {
+    auto P = make_plan(N, vec_mode, g);
+    Nvml nv;
+    if (!nv.ok()) throw Failure("NVML not available (libnvidia-ml.so.1)");
+    auto call = [&] {
+      CI(imd_contract(P->plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), P->ws.p,
+                      P->wsb, s));
+    };
+    for (int w = 0; w < 3; ++w) call();
+    CU(cudaStreamSynchronize(s));
+    cudaEvent_t e0, e1, chunk_ev[2];
+    CU(cudaEventCreate(&e0));
+    CU(cudaEventCreate(&e1));
+    for (auto& e : chunk_ev) CU(cudaEventCreate(&e));
+    CU(cudaEventRecord(e0, s));
+    for (int w = 0; w < 5; ++w) call();
+    CU(cudaEventRecord(e1, s));
+    CU(cudaEventSynchronize(e1));
+    float ms = 0;
+    CU(cudaEventElapsedTime(&ms, e0, e1));
+    const double t_est = std::max(1e-6, ms * 1e-3 / 5);
+    const long chunk = std::max(1L, long(std::ceil(0.02 / t_est)));
+    int cur = 0;
+    // Chunks until `seconds` of host time have passed; returns the calls issued.
+    auto run_for = [&](double seconds) {
+      long calls = 0;
+      const auto t0 = std::chrono::steady_clock::now();
+      bool first = true;
+      while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < seconds) {
+        for (long i = 0; i < chunk; ++i) call();
+        calls += chunk;
+        CU(cudaEventRecord(chunk_ev[cur], s));
+        if (!first) CU(cudaEventSynchronize(chunk_ev[cur ^ 1]));  // two chunks in flight
+        first = false;
+        cur ^= 1;
+      }
+      return calls;
+    };
+    run_for(o.sustain_warm_s);
+    std::atomic<bool> stop{false};
+    std::vector<double> pw, mhz;
+    std::thread sampler([&] {
+      while (!stop.load()) {
+        pw.push_back(nv.power_w());
+        mhz.push_back(nv.sm_mhz());
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+    });
+    CU(cudaEventRecord(e0, s));
+    const long calls = run_for(o.sustain_s);
+    CU(cudaEventRecord(e1, s));
+    CU(cudaEventSynchronize(e1));
+    stop = true;
+    sampler.join();
+    CU(cudaEventElapsedTime(&ms, e0, e1));
+    CU(cudaGetLastError());
+    for (auto e : {e0, e1, chunk_ev[0], chunk_ev[1]}) cudaEventDestroy(e);
+    auto mean = [](const std::vector<double>& v) {
+      double a = 0;
+      int n = 0;
+      for (double x : v)
+        if (std::isfinite(x)) a += x, ++n;
+      return n ? a / n : NAN;
+    };
+    Timing T;
+    T.t.push_back(ms * 1e-3 / double(calls));  // the back-to-back mean time per call
+    Json e;
+    e.num("window_s", ms * 1e-3).integer("calls", calls).integer("chunk", chunk);
+    e.num("power_w_mean", mean(pw)).num("sm_mhz_mean", mean(mhz));
+    e.integer("nvml_samples", (long long)pw.size());
+    e.num("power_limit_w", nv.limit_w()).num("sustain_warm_s", o.sustain_warm_s);
+    e.integer("g", (long long)((g == 0 || g >= N) ? N : g));
+    std::string vs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
+    if (vec_mode == IMD_VEC_RESIDENT) vs += " vec=resident";
+    record("sustained", vs + " sustained", N, T, nullptr, flops(), P->wsb, e);
+  }
+
+  // Method pair (cache state): C = A B^T with n = k, so C of one call is a valid A of the next
+  // (the same plan). Per repetition, interleaved: COLD (L2 evicted, then the call reading C1
+  // as its A), WARM (L2 evicted, call 1 writes C1, then the call reading C1) and REPEAT (the
+  // same call again right after). Three records: cache = cold / warm / repeat.
+  void method_pair(int N) {
+    if (c.A.size != c.C.size || c.A.labels.size() != 2 || c.C.labels.size() != 2 || c.n != c.k)
+      throw Failure("method pair needs ik,jk->ij with j = k (C of one call is A of the next)");
+    auto P = make_plan(N, IMD_VEC_GENERATE, 0);
+    DevBuf C1(dC.bytes);
+    auto call = [&](const double* A, double* C) {
+      CI(imd_contract(P->plan, 1.0, A, dB.as<double>(), 0.0, C, P->ws.p, P->wsb, s));
+    };
+    call(dA.as<double>(), C1.as<double>());  // C1: a valid A
+    for (int w = 0; w < std::max(o.warmup, 3); ++w) call(C1.as<double>(), dC.as<double>());
+    CU(cudaStreamSynchronize(s));
+    cudaEvent_t e0, e1;
+    CU(cudaEventCreate(&e0));
+    CU(cudaEventCreate(&e1));
+    auto timed = [&](const std::function<void()>& f) {
+      CU(cudaEventRecord(e0, s));
+      f();
+      CU(cudaEventRecord(e1, s));
+      CU(cudaEventSynchronize(e1));
+      float ms = 0;
+      CU(cudaEventElapsedTime(&ms, e0, e1));
+      return double(ms) * 1e-3;
+    };
+    Timing tc, tw, tr;
+    double total = 0;
+    auto second = [&] { call(C1.as<double>(), dC.as<double>()); };
+    for (int r = 0; r < o.reps; ++r) {
+      flush_l2();
+      tc.t.push_back(timed(second));
+      flush_l2();
+      call(dA.as<double>(), C1.as<double>());
+      tw.t.push_back(timed(second));
+      tr.t.push_back(timed(second));
+      total += tc.t.back() + tw.t.back() + tr.t.back();
+      if (r + 1 >= o.min_reps && total > o.max_seconds) break;
+    }
+    CU(cudaGetLastError());
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    const std::pair<const char*, Timing*> states[3] = {{"cold", &tc}, {"warm", &tw}, {"repeat", &tr}};
+    for (const auto& [nm, T] : states) {
+      Json e;
+      e.str("cache", nm).integer("g", N);
+      record("pair", std::string("RN g=N cache=") + nm, N, *T, nullptr, flops(), P->wsb, e);
+    }
+  }
+
   void method_bw() {
     DevBuf dst(dA.bytes);
     Timing T = time_it([&] { CU(cudaMemcpyAsync(dst.p, dA.p, dA.bytes, cudaMemcpyDeviceToDevice, s)); }, s, o);
@@ -978,24 +1381,49 @@ struct Bench {
 void usage() {
   fprintf(stderr,
           "usage: imd_bench --name NAME --spec 'ab,bc->ac' --ext a=..,b=..,c=.. [--methods LIST]\n"
-          "  [--N 8,14,20] [--emu dyn,fix55] [--emu-ws-mib 2048] [--reps 10] [--warmup 2]\n"
+          "  [--N 8,14,20] [--reps 10] [--warmup 2]\n"
           "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--phase-reps 5]\n"
-          "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)]\n"
+          "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)] [--k4 rule,tune,0,1,2,3]\n"
+          "  [--mode emulate|direct] (method imd) [--data normal|dominant]\n"
+          "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
+          "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
+          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4)\n"
+          "  [--clock-probe 0|1] [--l2 repeat|flush] (v1.10: per-call SM clock; L2 evicted\n"
+          "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
+          "  methods: imd,packed,duel,bw,occupancy,sustained,pair (default imd)\n"
           "  [--out file.jsonl]\n");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::map<std::string, std::string> a{{"methods", "dgemm,emu,int8,gemmul8,cutensor,imd"},
+  std::map<std::string, std::string> a{{"methods", "imd"},
                                        {"N", "14"},
-                                       {"emu", "dyn"},
-                                       {"emu-ws-mib", "2048"}};
+                                       {"duel-a", "default"},
+                                       {"duel-b", "k4=tune"}};
+  static const char* const kKeys[] = {"name", "spec", "ext", "methods", "N", "reps", "warmup",
+                                      "max-seconds", "samples", "phi", "seed", "phase-reps",
+                                      "vec", "g", "k4", "pack", "reuse", "duel-a", "duel-b", "out",
+                                      "mode", "data", "clock-probe", "l2", "sustain-s",
+                                      "sustain-warm-s"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
-    a[k.substr(2)] = argv[++i];
+    k = k.substr(2);
+    if (std::find(std::begin(kKeys), std::end(kKeys), k) == std::end(kKeys)) {
+      fprintf(stderr, "unknown option --%s\n", k.c_str());
+      usage();
+      return 2;
+    }
+    a[k] = argv[++i];
   }
+  for (auto& m : split(a["methods"], ','))
+    if (m != "imd" && m != "packed" && m != "duel" && m != "bw" && m != "occupancy" &&
+        m != "sustained" && m != "pair") {
+      fprintf(stderr, "unknown method %s (immerdink only: imd, packed, duel, bw, occupancy, "
+                      "sustained, pair)\n", m.c_str());
+      return 2;
+    }
   if (!a.count("name") || !a.count("spec") || !a.count("ext")) { usage(); return 2; }
   Bench B;
   try {
@@ -1014,7 +1442,27 @@ int main(int argc, char** argv) {
       B.o.groups.clear();
       for (auto& v : split(a["g"], ',')) B.o.groups.push_back(std::stoi(v));
     }
+    if (a.count("k4")) {
+      B.o.k4.clear();
+      for (auto& v : split(a["k4"], ','))
+        B.o.k4.push_back(v == "rule" ? -1 : v == "tune" ? -2 : std::stoi(v));
+    }
+    if (a.count("mode")) {
+      if (a["mode"] != "emulate" && a["mode"] != "direct") throw Failure("--mode emulate|direct");
+      B.o.mode = a["mode"] == "direct" ? IMD_DIRECT : IMD_EMULATE;
+    }
+    if (a.count("data")) {
+      if (a["data"] != "normal" && a["data"] != "dominant") throw Failure("--data normal|dominant");
+      B.o.dominant = a["data"] == "dominant";
+    }
     if (a.count("phi")) B.o.phi = std::stod(a["phi"]);
+    if (a.count("clock-probe")) B.o.clock_probe = a["clock-probe"] == "1";
+    if (a.count("l2")) {
+      if (a["l2"] != "flush" && a["l2"] != "repeat") throw Failure("--l2 flush|repeat");
+      B.o.l2_flush = a["l2"] == "flush";
+    }
+    if (a.count("sustain-s")) B.o.sustain_s = std::stod(a["sustain-s"]);
+    if (a.count("sustain-warm-s")) B.o.sustain_warm_s = std::stod(a["sustain-warm-s"]);
     if (a.count("seed")) B.o.seed = std::stoull(a["seed"]);
     B.o.min_reps = std::min(B.o.min_reps, B.o.reps);
     if (a.count("out")) {
@@ -1040,20 +1488,30 @@ int main(int argc, char** argv) {
       }
       cudaDeviceSynchronize();
     };
-    if (m == "dgemm") guarded(m, "", 0, [&] { B.method_dgemm(); });
-    else if (m == "emu")
-      for (auto& v : split(a["emu"], ','))
-        guarded(m, v, 0, [&] { B.method_emu(v, size_t(std::stoll(a["emu-ws-mib"])) << 20); });
-    else if (m == "int8") guarded(m, "", 1, [&] { B.method_int8(); });
-    else if (m == "gemmul8") for (int N : Ns) guarded(m, "", N, [&] { B.method_gemmul8(N); });
-    else if (m == "cutensor") guarded(m, "", 0, [&] { B.method_cutensor(); });
-    else if (m == "imd")
+    if (m == "imd") {  // braces: the else-if chain below must not bind to the inner if
       for (int N : Ns)
         for (int v : B.o.vec_modes)
           for (int g : B.o.groups)
-            if (g <= N) guarded(m, "", N, [&] { B.method_imd(N, v, g); });
-    else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
-    else { fprintf(stderr, "unknown method %s\n", m.c_str()); return 2; }
+            for (int k4 : B.o.k4)
+              if (g <= N) guarded(m, "", N, [&] { B.method_imd(N, v, g, k4); });
+    } else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
+    else if (m == "occupancy") guarded(m, "", 0, [&] { B.method_occupancy(); });
+    else if (m == "sustained") {
+      for (int N : Ns)
+        for (int v : B.o.vec_modes)
+          for (int g : B.o.groups)
+            if (g <= N) guarded(m, "", N, [&] { B.method_sustained(N, v, g); });
+    } else if (m == "pair")
+      for (int N : Ns) guarded(m, "", N, [&] { B.method_pair(N); });
+    else if (m == "duel")
+      for (int N : Ns) guarded(m, "", N, [&] { B.method_duel(N, a["duel-a"], a["duel-b"]); });
+    else if (m == "packed") {  // v1.7 (D1): --pack A,B --reuse 1,4,16
+      std::vector<int> reuse;
+      for (auto& v : split(a.count("reuse") ? a["reuse"] : "1,4,16", ',')) reuse.push_back(std::stoi(v));
+      for (int N : Ns)
+        for (auto& w : split(a.count("pack") ? a["pack"] : "A", ','))
+          guarded(m, "pack " + w, N, [&] { B.method_packed(N, w == "B" ? 1 : 0, reuse); });
+    }
   }
   if (B.out != stdout) fclose(B.out);
   return 0;

@@ -25,7 +25,7 @@ static imd_status_t plan_n2(imd_handle_t h, int64_t k, int32_t rounding) {
   const int64_t ec[2] = {4, 16}, sc[2] = {16, 1};
   const int32_t la[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
   const imd_tensor_t A = {2, ea, sa, la}, B = {2, eb, sb, lb}, C = {2, ec, sc, lc};
-  const imd_options_t o = {2, 0, rounding, IMD_EMULATE, IMD_VEC_GENERATE};
+  const imd_options_t o = {2, 0, rounding, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
   imd_plan_t plan = NULL;
   const imd_status_t st = imd_plan_create(h, &A, &B, &C, &o, &plan);
   imd_plan_destroy(plan);
@@ -39,7 +39,7 @@ int main(void) {
   const int64_t eC[3] = {17, 33, 3}, sC[3] = {99, 3, 1};
   const int32_t lA[3] = {1, 3, 4}, lB[3] = {3, 2, 4}, lC[3] = {1, 2, 4};
   const imd_tensor_t A = {3, eA, sA, lA}, B = {3, eB, sB, lB}, C = {3, eC, sC, lC};
-  const imd_options_t opt = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE};
+  const imd_options_t opt = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
   size_t bytes = 0;
 
   expect("workspace_size", imd_workspace_size(&A, &B, &C, &opt, &bytes), IMD_STATUS_SUCCESS);
@@ -54,8 +54,8 @@ int main(void) {
   {
     /* DESIGN v1.2 vec_mode: RESIDENT drops the vec region (30720 - 1024 = 29696, params.py
      * cert_workspace) and the plan owns exactly 8 (34 + 66 + 10 + 9) = 952 device bytes. */
-    const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT};
-    const imd_options_t bad = {9, 2, IMD_RN, IMD_EMULATE, 2};
+    const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT, IMD_K4_TUNE_OFF};
+    const imd_options_t bad = {9, 2, IMD_RN, IMD_EMULATE, 2, IMD_K4_TUNE_OFF};
     size_t dev = 1;
     imd_plan_t pr = NULL;
     expect("workspace_size resident", imd_workspace_size(&A, &B, &C, &res, &bytes),
@@ -158,6 +158,55 @@ int main(void) {
   if (strcmp(imd_status_string(IMD_STATUS_ALLOC_FAILED), "IMD_STATUS_ALLOC_FAILED") != 0) {
     fprintf(stderr, "FAIL status string\n");
     ++failures;
+  }
+
+  {
+    /* v1.7 (DESIGN §6b) from C: pack the 17 x 5 operand A[i,k] of ik,kj->ij and contract. */
+    const int64_t ea[2] = {17, 5}, sa[2] = {5, 1}, eb[2] = {5, 33}, sb[2] = {33, 1};
+    const int64_t ec[2] = {17, 33}, sc[2] = {33, 1};
+    const int32_t la[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
+    const imd_tensor_t A2 = {2, ea, sa, la}, B2 = {2, eb, sb, lb}, C2 = {2, ec, sc, lc};
+    const int32_t kk[1] = {3};
+    imd_pack_desc_t pd;
+    memset(&pd, 0, sizeof pd);
+    pd.struct_size = sizeof pd;
+    pd.num_moduli = 9, pd.rounding = IMD_RN, pd.order = IMD_PACK_ORDER_AUTO, pd.tensor = &A2;
+    pd.num_contracted = 1, pd.contracted = kk;
+    imd_pack_t pk = NULL;
+    imd_plan_t pp = NULL;
+    size_t pb = 0, pw = 0, wsb = 0;
+    const imd_packing_t packing = {&pd, NULL};
+    expect("pack create", imd_pack_create(h, &pd, &pk), IMD_STATUS_SUCCESS);
+    expect("pack bytes", imd_pack_bytes(pk, &pb, &pw), IMD_STATUS_SUCCESS);
+    expect("packed ws", imd_workspace_size_packed(&A2, &B2, &C2, &opt, &packing, &wsb),
+           IMD_STATUS_SUCCESS);
+    expect("plan packed", imd_plan_create_packed(h, &A2, &B2, &C2, &opt, pk, NULL, &pp),
+           IMD_STATUS_SUCCESS);
+    double *a = NULL, *b = NULL, *c = NULL;
+    void *packed = NULL, *pws = NULL, *ws = NULL;
+    if (cudaMalloc((void**)&a, 17 * 5 * 8) == cudaSuccess &&
+        cudaMalloc((void**)&b, 5 * 33 * 8) == cudaSuccess &&
+        cudaMalloc((void**)&c, 17 * 33 * 8) == cudaSuccess && cudaMalloc(&packed, pb) == cudaSuccess &&
+        cudaMalloc(&pws, pw) == cudaSuccess && cudaMalloc(&ws, wsb) == cudaSuccess) {
+      cudaMemset(a, 0, 17 * 5 * 8);
+      cudaMemset(b, 0, 5 * 33 * 8);
+      const imd_operand_t oa = {a, packed, pb, pk}, ob = {b, NULL, 0, NULL};
+      expect("imd_pack", imd_pack(pk, a, packed, pb, pws, pw, 0), IMD_STATUS_SUCCESS);
+      expect("imd_contract on a packed plan", imd_contract(pp, 1.0, a, b, 0.0, c, ws, wsb, 0),
+             IMD_STATUS_PACK_MISMATCH);
+      expect("imd_contract_packed", imd_contract_packed(pp, 1.0, &oa, &ob, 0.0, c, ws, wsb, 0),
+             IMD_STATUS_SUCCESS);
+      if (cudaDeviceSynchronize() != cudaSuccess) {
+        fprintf(stderr, "FAIL packed kernels\n");
+        ++failures;
+      }
+    } else {
+      fprintf(stderr, "FAIL packed allocations\n");
+      ++failures;
+    }
+    cudaFree(a), cudaFree(b), cudaFree(c), cudaFree(packed), cudaFree(pws), cudaFree(ws);
+    expect("plan destroy", imd_plan_destroy(pp), IMD_STATUS_SUCCESS);
+    expect("pack destroy", imd_pack_destroy(pk), IMD_STATUS_SUCCESS);
   }
 
   expect("destroy", imd_destroy(h), IMD_STATUS_SUCCESS);

@@ -152,6 +152,34 @@
 (*               MISALIGNED): StatusCorrect. These orders are POLICY (no  *)
 (*               semantic invariant depends on them); the models show the  *)
 (*               enumerated space distinguishes every adjacent pair.       *)
+(*                                                                         *)
+(* D1 packed operands (DESIGN §6b; every model above has Packing = "none", *)
+(* PackEnum = "plan"). Witnesses "pk_*" at the end of this module.         *)
+(*  pos_pack_a      A packed, ranks <= 2, ColRow, every order of the plan's *)
+(*                  classes (pk_dot: a reversed K order adopted, fusion    *)
+(*                  recomputed; the desc_for pack fuses over A alone).     *)
+(*  pos_pack_b      B packed, PadQ = 4: n = 2, n̂ = 4, b = 2 (pk_rb: rows   *)
+(*                  into the next block and the tail are read).            *)
+(*  pos_pack_ab     both packed (pk_order: different K orders _ORDER,      *)
+(*                  equal ones accepted in either order).                  *)
+(*  pos_pack_classes any classes for A's pack (pk_cls: exchanged classes   *)
+(*                  rejected, swapped plan).                               *)
+(*  pos_pack_strides another tensor's strides (pk_tr: rejected).           *)
+(*  pos_pack_ext3   B packed at extents 2, 3: padding, a tail, fusion 6.   *)
+(*  pos_pack_kappa  T in 1..3, DIRECT, TRUNC, any classes (pk_kappa: a     *)
+(*                  plan with κ >= T and a mismatching valid pack:         *)
+(*                  PACK_MISMATCH).                                        *)
+(*  pos_pack_zero   extents {0, 2}, any classes (pk_po0, pk_conly0).       *)
+(*  pos_pack_order_policy / pos_pack_partner_policy  Drop "PackOrderCheck" *)
+(*                  / "PackPartnerOnly" are POSITIVE: the key already      *)
+(*                  rejects every unsound pack (pk_po0: k = 0 accepted,    *)
+(*                  never read).                                           *)
+(*  neg_pack_fuse_default / neg_pack_no_adopt_lower  EinsumPreserved       *)
+(*  neg_pack_no_adopt / neg_pack_key_carriers        PackComplete          *)
+(*  neg_pack_key_nostrides                           PackKeySound          *)
+(*  neg_pack_after_kappa                             StatusCorrect         *)
+(*  neg_pack_b_stride                                EinsumPreserved       *)
+(*  neg_pack_no_tail                                 PackNoOOB             *)
 (***************************************************************************)
 EXTENDS IndexMap
 
@@ -526,7 +554,10 @@ CovX == [
   nullalias |-> <<DDot(1), XE({"C"}, Mis0, <<"far", "after", 0>>, 0), "INVALID_VALUE">>,
   ordok    |-> <<DDot(5), XE({}, Mis0, <<"far", "after", 0>>, 0), "SUCCESS">>
 ]
-ASSUME MustCover \subseteq DOMAIN Cov \cup DOMAIN CovX
+\* D1 witnesses (see the end of this module).
+PkCovNames == {"pk_dot", "pk_tr", "pk_kappa", "pk_rb", "pk_order", "pk_cls", "pk_po0",
+               "pk_conly0"}
+ASSUME MustCover \subseteq DOMAIN Cov \cup DOMAIN CovX \cup PkCovNames
 \* The null-ws boundary: an empty output needs no workspace, a dot does.
 ASSUME WsSizeDesign(DEmpty, "EMULATE") = 0 /\ WsSizeDesign(DDot(5), "EMULATE") > 0
 ASSUME \A c \in MustCover \cap DOMAIN Cov : InSpace(Cov[c]) /\ Status(Cov[c]) = "SUCCESS"
@@ -570,4 +601,161 @@ ASSUME Drop = "none" =>
 ASSUME Drop = "none" =>
          /\ LowerTop(Cov.abase, "EMULATE").readsA = {2, 3} /\ LowerTop(Cov.abase, "EMULATE").readsB = {3, 4}
          /\ LowerTop(Cov.abase, "EMULATE").contrib = Einsum(Cov.abase).bag
+
+-----------------------------------------------------------------------------
+(* D1 packed operands (DESIGN §6b): witnesses. A pack is                  *)
+(* Pk(op, strides, K, L, R) on the caller's operand op; PkA / PkB / PkAB    *)
+(* put it in the plan's packing. "pk_*" in MustCover: the positive model   *)
+(* must enumerate the witness (descriptor, execute arguments, packs) and   *)
+(* give the stated result; a negative model's Drop pins its failure to the *)
+(* witness, which the design handles correctly.                            *)
+
+Pk(op, s, K, L, R) == [op |-> op, s |-> s, K |-> K, L |-> L, R |-> R]
+PkA(p)     == [A |-> p, B |-> NoPack]
+PkB(p)     == [A |-> NoPack, B |-> p]
+PkAB(p, q) == [A |-> p, B |-> q]
+\* Status and lowering of a packed plan under the default execute arguments.
+StP(d, p)  == FullStatusP(d, XDef, p)
+LoP(d, p)  == LowerTopP(d, "EMULATE", p)
+\* (EinsumPreserved's comparison: the einsum's triples in GEMM roles.)
+OkP(d, p)  == /\ StP(d, p) = "SUCCESS"
+              /\ LoP(d, p).contrib = (IF LoP(d, p).swap THEN SwapTriples(Einsum(d).bag)
+                                      ELSE Einsum(d).bag)
+\* The witness is in the model's space (descriptor, execute arguments, packs).
+InP(d, x, p) == InSpace(d) /\ x \in Execs /\ p \in Packings(d, x)
+
+\* A dot product C = sum_{1,2} A[1,2] B[1,2], A dense (1,2) (fusable), B
+\* dense (1,2) or (2,1) (not fusable). v1.5's K order is <<1, 2>> (A is
+\* "big", m = n), fused in A and B when both are dense: one mode (4, 1).
+WDot(sB) == D(T(0, <<1, 2>>, <<2, 2>>, <<1, 2>>), T(0, <<1, 2>>, <<2, 2>>, sB), Scalar(100))
+\* A's pack in the reversed order <<2, 1>>: the plan adopts it; then 2, 1 do
+\* not fuse (1 # 2*2): the key is <<(2, 2), (2, 1)>> on both sides.
+PRev  == Pk("A", <<1, 2>>, <<2, 1>>, <<>>, <<>>)
+\* A's pack in v1.5's order (imd_pack_desc_for); its key fuses over A alone
+\* to (4, 1) whatever B's strides are.
+PFwd  == Pk("A", <<1, 2>>, <<1, 2>>, <<>>, <<>>)
+\* A pack of the transposed tensor (strides (2, 1)) in order <<1, 2>>: the
+\* same extents, other strides: its key differs (unless strides are dropped).
+PTr   == Pk("A", <<2, 1>>, <<1, 2>>, <<>>, <<>>)
+WD12 == WDot(<<1, 2>>)
+WD21 == WDot(<<2, 1>>)
+ASSUME "pk_dot" \in MustCover =>
+         /\ InP(WD12, XDef, PkA(PRev)) /\ InP(WD12, XDef, PkA(PFwd)) /\ InP(WD21, XDef, PkA(PFwd))
+         /\ OkP(WD12, PkA(PRev)) /\ LoP(WD12, PkA(PRev)).ord["K"] = <<2, 1>>
+         /\ Len(LoP(WD12, PkA(PRev)).fused["K"]) = 2
+         /\ OkP(WD12, PkA(PFwd)) /\ Len(LoP(WD12, PkA(PFwd)).fused["K"]) = 1
+         /\ OkP(WD21, PkA(PFwd))
+\* A different tensor's pack is rejected (pos_pack_strides).
+ASSUME "pk_tr" \in MustCover =>
+         InP(WD12, XDef, PkA(PTr)) /\ StP(WD12, PkA(PTr)) = "PACK_MISMATCH"
+\* "PackFuseDefault": the fusion runs of v1.5's order (one run) applied to
+\* the adopted <<2, 1>> give one mode (4, s_2): wrong addresses.
+ASSUME Drop = "PackFuseDefault" =>
+         /\ InP(WD12, XDef, PkA(PRev)) /\ StP(WD12, PkA(PRev)) = "SUCCESS"
+         /\ LoP(WD12, PkA(PRev)).contrib # Einsum(WD12).bag
+\* "PackNoAdoptLower": the key (adopted order) matches, the lowering keeps
+\* <<1, 2>>: the pack's k-bar order differs from the partner's.
+ASSUME Drop = "PackNoAdoptLower" =>
+         /\ InP(WD12, XDef, PkA(PRev)) /\ StP(WD12, PkA(PRev)) = "SUCCESS"
+         /\ LoP(WD12, PkA(PRev)).contrib # Einsum(WD12).bag
+\* "PackNoAdopt": the key in v1.5's order rejects a valid built pack.
+ASSUME Drop = "PackNoAdopt" =>
+         InP(WD12, XDef, PkA(PRev)) /\ StP(WD12, PkA(PRev)) = "PACK_MISMATCH"
+\* "KeyFuseCarriers": B (2, 1) is not fusable, so the carrier fusion keeps
+\* two modes; the pack (A alone) fused (4, 1): a valid pack rejected.
+ASSUME Drop = "KeyFuseCarriers" =>
+         InP(WD21, XDef, PkA(PFwd)) /\ StP(WD21, PkA(PFwd)) = "PACK_MISMATCH"
+\* "KeyNoStrides": the transposed tensor's pack is accepted: wrong gather.
+ASSUME Drop = "KeyNoStrides" =>
+         /\ InP(WD12, XDef, PkA(PTr)) /\ StP(WD12, PkA(PTr)) = "SUCCESS"
+         /\ ~LoP(WD12, PkA(PTr)).gatherEq["A"]
+
+\* κ precedence: C = sum A[1] B[1,2] (label 2 is B-only: partner-only for
+\* A's pack), extents 2 and 3: the plan's k = 6 (κ = 3 >= T = 3, RN), A's
+\* pack has k = 2 (κ = 2: a valid pack). Design: PACK_MISMATCH (the key, and
+\* the partner-only policy); "PackAfterKappa": NOT_SUPPORTED.
+WKap == D(T(0, <<1>>, <<2>>, <<1>>), T(0, <<1, 2>>, <<2, 3>>, <<1, 2>>), Scalar(100))
+XK3  == [XDef EXCEPT !.tn = 3]
+XK3Set == {XK3}
+PK1  == Pk("A", <<1>>, <<1>>, <<>>, <<>>)
+ASSUME "pk_kappa" \in MustCover \/ Drop = "PackAfterKappa" =>
+         /\ InP(WKap, XK3, PkA(PK1))
+         /\ KappaReject(WKap, XK3)
+         /\ FullStatusP(WKap, XK3, PkA(PK1)) =
+              (IF Drop = "PackAfterKappa" THEN "NOT_SUPPORTED" ELSE "PACK_MISMATCH")
+
+\* Role B at PadQ = 4: C[1,3] = sum_2 A[1,2] B[1,2,3], extents 2: b = 2
+\* (label 1), k = 2, n = 2 (label 3, J), n̂ = 4. B's pack (the plan's
+\* classes): r = 2 rows per block and a tail of (4 - 2)·k̂ = 8 cells. K4
+\* reads rows j < 4 at batch stride r·k̂ = 8: rows 2, 3 of block 0 are
+\* block 1's rows 0, 1, those of block 1 the tail.
+WRB  == D(T(0, <<1, 2>>, <<2, 2>>, <<1, 2>>), T(0, <<1, 2, 3>>, <<2, 2, 2>>, <<1, 2, 4>>),
+          T(100, <<1, 3>>, <<2, 2>>, <<2, 1>>))
+PRB  == Pk("B", <<1, 2, 4>>, <<2>>, <<1>>, <<3>>)
+ASSUME "pk_rb" \in MustCover =>
+         /\ InP(WRB, XDef, PkB(PRB)) /\ OkP(WRB, PkB(PRB))
+         /\ LET L == LoP(WRB, PkB(PRB)) IN
+            /\ ~L.swap /\ L.b = 2 /\ L.n = 2 /\ L.nh = 4 /\ L.kh = 4
+            /\ DOMAIN L.pg["B"] = 0..23              \* 2·2·4 cells + the tail of 8
+            /\ L.pread["B"] = 0..23                  \* every cell is read, the tail too
+\* "PackBStrideNh": block 1 read at n̂·k̂ = 16: the tail, not its rows.
+ASSUME Drop = "PackBStrideNh" =>
+         /\ InP(WRB, XDef, PkB(PRB)) /\ StP(WRB, PkB(PRB)) = "SUCCESS"
+         /\ LoP(WRB, PkB(PRB)).contrib # Einsum(WRB).bag
+\* "PackNoTail": block 1's rows 2, 3 are read past the end (cells 16..23).
+ASSUME Drop = "PackNoTail" =>
+         /\ InP(WRB, XDef, PkB(PRB)) /\ StP(WRB, PkB(PRB)) = "SUCCESS"
+         /\ ~(LoP(WRB, PkB(PRB)).pread["B"] \subseteq DOMAIN LoP(WRB, PkB(PRB)).pg["B"])
+
+\* Classes: C[1,3] = sum_2 A[1,2] B[2,3], dense (swapped: C's fastest mode
+\* is in I); A's pack with the classes of its labels exchanged (K = <<1>>,
+\* R = <<2>>): the same b, r, k, other strides per class: PACK_MISMATCH
+\* (pos_pack_classes); with the plan's classes: accepted.
+WCls == D(T(0, <<1, 2>>, <<2, 2>>, <<1, 2>>), T(0, <<2, 3>>, <<2, 2>>, <<1, 2>>),
+          T(100, <<1, 3>>, <<2, 2>>, <<1, 2>>))
+PCls == Pk("A", <<1, 2>>, <<1>>, <<>>, <<2>>)
+PClsOk == Pk("A", <<1, 2>>, <<2>>, <<>>, <<1>>)
+ASSUME "pk_cls" \in MustCover =>
+         /\ InP(WCls, XDef, PkA(PCls)) /\ StP(WCls, PkA(PCls)) = "PACK_MISMATCH"
+         /\ InP(WCls, XDef, PkA(PClsOk)) /\ OkP(WCls, PkA(PClsOk))
+
+\* Partner-only K label with k = 0: C = sum A[1] B[1,2], label 1 of extent 0
+\* (stride 1 in A), label 2 B-only (extent 2, a mode (2, 0) of A in the slot
+\* key). A's pack K = <<1>>: the slot key's K modes (0, 1), (2, 0) fuse
+\* (0 = 1·0) into the pack's (0, 1), and k = 0 on both sides: the key
+\* ACCEPTS it, harmlessly (k = 0: the plan only scales C, never reads the
+\* pack); the _CLASSES policy rejects it (pos_pack_partner_policy drops it).
+WPo0 == D(T(0, <<1>>, <<0>>, <<1>>), T(0, <<1, 2>>, <<0, 2>>, <<1, 2>>), Scalar(100))
+PPo0 == Pk("A", <<1>>, <<1>>, <<>>, <<>>)
+ASSUME "pk_po0" \in MustCover =>
+         /\ InP(WPo0, XDef, PkA(PPo0))
+         /\ LoP(WPo0, PkA(PPo0)).keyEq["A"] /\ LoP(WPo0, PkA(PPo0)).partnerOnly["A"]
+         /\ StP(WPo0, PkA(PPo0)) = (IF Drop = "PackPartnerOnly" THEN "SUCCESS" ELSE "PACK_MISMATCH")
+         /\ Drop = "PackPartnerOnly" => LoP(WPo0, PkA(PPo0)).kind = "SCALE"
+
+\* An EMPTY output through a C-only label of extent 0 (label 3; lowered to
+\* I with stride 0 in A): C[2,3] = sum_1 A[1] B[1,2], no swap. A's pack with
+\* the classes imd_pack_desc_for gives from A's labels (K = <<1>>, no rows)
+\* is PACK_MISMATCH: post-swap A's slot key has the row mode (0, 0) and
+\* r = 0. Harmless (the call is a no-op) but a DESIGN gap: §6b does not say
+\* whether such a label belongs to X's row class (PackComplete excludes it).
+WCo0 == D(T(0, <<1>>, <<2>>, <<1>>), T(0, <<1, 2>>, <<2, 2>>, <<1, 2>>),
+          T(100, <<2, 3>>, <<2, 0>>, <<1, 2>>))
+PCo0 == Pk("A", <<1>>, <<1>>, <<>>, <<>>)
+ASSUME "pk_conly0" \in MustCover =>
+         /\ InP(WCo0, XDef, PkA(PCo0)) /\ EmptyOut(WCo0) /\ ~DoSwap(WCo0)
+         /\ BaseStatus(WCo0, XDef, {Drop}) = "SUCCESS"
+         /\ StP(WCo0, PkA(PCo0)) = "PACK_MISMATCH"
+         /\ LoP(WCo0, PkA(PCo0)).grp["I"] = {3}
+
+\* Both packed, K orders differ (<<1, 2>> vs <<2, 1>>): _ORDER; with the
+\* order check dropped the key rejects it too (B's slot key is computed in
+\* the order adopted from A's pack). Equal orders: accepted, either order.
+PBRev == Pk("B", <<1, 2>>, <<2, 1>>, <<>>, <<>>)
+PBFwd == Pk("B", <<1, 2>>, <<1, 2>>, <<>>, <<>>)
+ASSUME "pk_order" \in MustCover =>
+         /\ InP(WD12, XDef, PkAB(PFwd, PBRev))
+         /\ StP(WD12, PkAB(PFwd, PBRev)) = "PACK_MISMATCH"
+         /\ OkP(WD12, PkAB(PFwd, PBFwd))
+         /\ OkP(WD12, PkAB(PRev, PBRev))
 =============================================================================

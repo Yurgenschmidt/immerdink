@@ -65,7 +65,7 @@ Neither GEMMul8 (matrices only) nor TBLIS (native float only) does this.
 
 | Device                          | Native FP64        | INT8 path                         | Ozaki-II FP64 outlook                         |
 |---------------------------------|--------------------|-----------------------------------|-----------------------------------------------|
-| RTX 4090 (sm_89)                | ~1.3 TF peak, 1/64 rate | ~660 TOPS dense tensor core (`mma.sync …s8.s8`) | **Big win.** Paper reports ~9.8 TF vs 0.62 TF native DGEMM at n=8192 (~16×) |
+| RTX 4090 (sm_89)                | ~1.3 TF peak, 1/64 rate | ~660 TOPS dense tensor core (`mma.sync …s8.s8`) | **Big win.** The int8 rate is ~500× the FP64 rate, so N ≈ 14 int8 GEMMs leave a wide margin over native DGEMM |
 | i9-13900K (Raptor Lake, P+E)    | AVX2 FMA, 16 flop/cyc/P-core | AVX-VNNI `vpdpbusd` (u8×s8, 256-bit), roughly 8× the FP64 MAC rate | **Slower than native DGEMM.** N≈14 GEMMs at ~8× rate → ≤0.6× before overhead |
 
 On this CPU, Ozaki-II is a **correctness and reference** target, not a speed target. It
@@ -87,7 +87,7 @@ needed. There is no s8×s8 VNNI (AVX-VNNI-INT8) on this part.
 | D2 | **TBLIS-style, not GETT.** | Ozaki-II must rewrite A and B into N int8 residue copies anyway. Writing them in GEMM-canonical layout makes the tensor→matrix permutation free (TBLIS's insight, by force). GETT's per-contraction code generation buys nothing once operands are rewritten, and it adds an autotuner. The only tensor-aware kernels left are the gather (pack) and the scatter (CRT epilogue). |
 | D3 | **GPU (RTX 4090, sm_89) is the implementation target. No optimized CPU kernels.** | GPU-first is actually *simpler*: CUTLASS supplies the int8 GEMM, while a CPU path means hand-writing a BLIS nest that won't beat DGEMM on this CPU anyway. The CPU's role is the **exact reference oracle** (Python big-int/`Fraction`, no FP), which also matches the TLA+ semantics. |
 | D4 | **CUTLASS 2.x** (`GemmUniversal` kBatched, SM80 int8 on sm_89) with an `Sm80EVT` mod-p → u8 epilogue from the start; v4.8.0 pinned. | 3.x has no sm80/sm89 builders; the epilogue was compile-verified; stock int32 output (V0) only as a baseline. |
-| D5 | **From scratch.** C++20 + CUDA (13.4), CMake. C ABI, then Python bindings (nanobind) later. | Everything is local. cuBLAS and cuTENSOR 2.7 are already in the `main` conda env for baselines. |
+| D5 | **From scratch.** C++20 + CUDA (13.4), CMake. C ABI, then Python bindings (nanobind) later. *(Superseded: ctypes, DESIGN v1.9 §6d.)* | Everything is local. cuBLAS and cuTENSOR 2.7 are already in the `main` conda env for baselines. |
 | D6 | **Dedicated conda env** (`environment.yml`) instead of `main`. | `main` is used by another project's GPU test suite; isolating the env keeps versions and benchmarks clean. |
 | D7 | **General-purpose kernel.** CC was the motivation but drives no design choice; batch indices (L) are in v1; complex is reserved (2M method), not precluded. | User guidance: build a good Ozaki TBLIS-style kernel, don't overengineer toward a downstream user. |
 | D8 | **Accuracy contract:** the caller picks N. *Auto* and *bounded auto* (data-chosen N ≤ N_max) come later. A DGEMM-equivalent guarantee is low priority. | N is explicit, so memory and time are exact functions of it. Bounded auto keeps memory plannable: `workspace_size(problem, N_max)`. |

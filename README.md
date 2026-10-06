@@ -43,6 +43,75 @@ for the g table ([docs/MEMORY_MODEL.md](docs/MEMORY_MODEL.md) §3a has its outpu
 version). Strides default to dense (last mode fastest); pass `strides=(sA, sB, sC)` or raw
 `(extent, stride, label)` descriptors otherwise.
 
+### Contractions from Python
+
+`immerdink.Plan` / `immerdink.contract` (DESIGN §6d) run contractions on caller-owned float64
+CUDA arrays: anything with `__cuda_array_interface__` or DLPack (CuPy, PyTorch, Numba, JAX),
+or raw pointers (`immerdink.DeviceArray(ptr, shape, strides)`). No array library is
+required, nothing is copied between host and device, and immerdink allocates nothing: the
+output and the workspace are yours.
+
+```python
+import immerdink as imd                     # finds build/libimmerdink.so, or set IMMERDINK_LIB
+import cupy as cp                           # any CUDA array library works the same way
+A, B = cp.random.rand(64, 32, 48), cp.random.rand(48, 40)
+C = cp.empty((40, 64, 32))
+plan = imd.Plan("ijk,kl->lij", A, B, C, N=14)                # imd_plan_create
+ws = cp.empty(plan.workspace_bytes, cp.uint8)                # exact bytes (also: imd.workspace_size)
+plan.contract(A, B, C, alpha=1.0, beta=0.0, workspace=ws,
+              stream=cp.cuda.get_current_stream())           # enqueue only: capture-safe
+imd.contract("ijk,kl->lij", A, B, C, N=14, workspace=ws)     # einsum front end, cached plans
+pa = imd.Pack(plan.pack_spec(0))                             # packed operands (DESIGN §6b)
+```
+
+### Predicted time and configuration ranking (no GPU)
+
+The same library predicts what a call costs on a calibrated GPU (the RTX 4090 calibration
+ships with it; `tools/calibrate.sh` makes one for another GPU) and ranks the configurations a
+caller may choose inside a memory budget, each with its exact footprint (DESIGN §6c):
+
+```python
+p = host.predict(spec, ext, N=14, g=7)            # per-phase and total time, TFLOPS-eq
+(p.tflops_eq, p.time_s, [(q.name, q.time_s) for q in p.phases])
+for c in host.rank(spec, ext, N=[12, 14], vec_modes=("GENERATE", "RESIDENT"),
+                   packs=("NONE", "A", "B"), reuse=4, budget=2 * 2**30)[:5]:
+    print(c.num_moduli, c.residue_group, c.vec_mode, c.packed, c.time_s, c.total_bytes)
+```
+
+or `python3 -m immerdink.host <spec> <extents> -N 14 --rank 12,14 --budget 2147483648`. From C:
+`imd_perf_predict`, `imd_perf_rank`, `imd_perf_calib_load` (`immerdink_host.h`).
+
+On a hot path (many single queries), use `immerdink.planner` (DESIGN §6e): the same numbers bit
+for bit, at about 1-2 µs per query instead of 8-20 µs, because the C structs are built once
+per contraction and results are read lazily:
+
+```python
+from immerdink import planner
+q = planner.Query(spec, ext)                      # once per contraction
+q.predict(14, g=7).time_s                         # ~1.7 µs (host.predict: ~17 µs)
+q.workspace_size(14, g=7)                         # ~0.9 µs
+q.rank([12, 14], vec_modes=("GENERATE", "RESIDENT"), budget=2 * 2**30)[0]   # one C call
+pl = planner.Planner(memo=planner.Memo(4096))     # Query cache + opt-in memo of identical queries
+pl.predict(spec, ext, N=14)                       # host.predict's signature; a repeat: ~0.8 µs
+```
+
+### Cheapest N for a target error (no GPU)
+
+The host library also turns the §3.8 error bound into a planning input (DESIGN §6f). You give
+a metric, a target, and whatever operand statistics you have; immerdink never reads the data.
+It returns the rigorous bound of every configuration and a typical (probabilistic)
+estimate. `rank` marks configurations that miss the target as infeasible, so the first
+feasible candidate is the cheapest one that meets it:
+
+```python
+acc = planner.Accuracy(target=1e-12)              # normwise |D - x| / (|a_i| |b_j|): needs no stats
+n = q.min_moduli(acc).num_moduli                  # smallest N whose rigorous bound meets it (~1.5 µs)
+best = q.rank([n, n + 1], accuracy=acc)[0]        # the cheapest one meeting it if best.feasible
+acc_el = planner.Accuracy(metric="ELEMENTWISE", target=1e-10, cond=1e4)   # cond >= |a||b| / |x|
+q.min_moduli(planner.Accuracy(target=1e-12, basis="TYPICAL"))  # typical estimate, not a guarantee
+host.err_estimate(14, k=4096, outputs=2**20)      # the bounds from scalars (imd_err_estimate)
+```
+
 Day-to-day work lands on `dev`; `main` only changes via pull request.
 
 ## License and credits

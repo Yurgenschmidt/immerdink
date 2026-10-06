@@ -23,14 +23,46 @@ IMD_HD uint64_t umulhi64(uint64_t a, uint64_t b) {
 #endif
 }
 
+// umulhi64(a, n) for a 32-bit n, from 32-bit words (A2): with a = ah 2^32 + al,
+// floor(a n / 2^64) = floor((ah n + floor(al n / 2^32)) / 2^32), because dropping the
+// fraction al n / 2^32 - floor(..) < 1 from the integer ah n 2^32 + al n cannot cross a
+// multiple of 2^64; ah n + floor(al n / 2^32) < 2^64. Same value as umulhi64(a, n) (so
+// cert_barrett's proof applies unchanged). On the device: t = umulhi(al, n), then the low
+// and high halves of ah n + t as one carry chain (mad.lo.cc, madc.hi), 3 multiplies instead
+// of the generic 64 x 64 high product (5 instructions + carries).
+IMD_HD uint32_t umulhi64_u32(uint64_t a, uint32_t n) {
+  const auto al = static_cast<uint32_t>(a), ah = static_cast<uint32_t>(a >> 32);
+#if defined(__CUDA_ARCH__)
+  const uint32_t t = __umulhi(al, n);
+  uint32_t q;
+  asm("{\n\t.reg .u32 lo;\n\t"
+      "mad.lo.cc.u32 lo, %1, %2, %3;\n\t"
+      "madc.hi.u32 %0, %1, %2, 0;\n\t}"
+      : "=r"(q)
+      : "r"(ah), "r"(n), "r"(t));
+  return q;
+#else
+  const auto t = static_cast<uint32_t>((uint64_t{al} * n) >> 32);
+  return static_cast<uint32_t>((uint64_t{ah} * n + t) >> 32);
+#endif
+}
+
+// §3.5 epilogue for p != 256: n = v + bias in [0, 2^32), q = umulhi64(magic, n) = n div p,
+// v mod p = n - p q (all u32 words), exact for v in [epi_vmin, epi_vmax] (cert_barrett).
+// neg_p = 2^32 - p, so n - p q = n + neg_p q mod 2^32 (one IMAD; callers hoist neg_p).
+IMD_HD uint32_t mod_p_barrett_neg(int32_t v, uint32_t neg_p, uint32_t bias, uint64_t magic) {
+  const uint32_t n = static_cast<uint32_t>(v) + bias;
+  return n + neg_p * umulhi64_u32(magic, n);
+}
+IMD_HD uint32_t mod_p_barrett(int32_t v, uint32_t p, uint32_t bias, uint64_t magic) {
+  return mod_p_barrett_neg(v, 0u - p, bias, magic);
+}
+
 // §3.5 epilogue: the non-negative residue v mod p for v in the certified reachable range
-// [epi_vmin, epi_vmax]. p = 256: two's-complement mask; otherwise n = v + bias in [0, 2^32),
-// q = umulhi64(magic, n) = n div p, v mod p = n - p q (all u32 / u64 words).
+// [epi_vmin, epi_vmax]. p = 256: two's-complement mask; otherwise mod_p_barrett.
 IMD_HD uint32_t mod_p_epilogue(int32_t v, uint32_t p, uint32_t bias, uint64_t magic) {
   if (p == 256u) return static_cast<uint32_t>(v) & 255u;
-  const uint32_t n = static_cast<uint32_t>(v) + bias;
-  const auto q = static_cast<uint32_t>(umulhi64(magic, n));
-  return n - p * q;
+  return mod_p_barrett(v, p, bias, magic);
 }
 
 // §3.6: n mod p for n in [0, 2^16) (n = q_l W_l), same magic, bias 0.
@@ -74,6 +106,23 @@ IMD_HD uint32_t mod_p_bytes(uint32_t lo, uint32_t hi, uint32_t wlo, uint32_t whi
   if (p == 256u) return lo & 255u;
   const uint32_t s = dot_bytes(lo, wlo) + dot_bytes(hi, whi);
   return s - p * static_cast<uint32_t>(umulhi64(magic, s));
+}
+
+// A5: the same residue with the 32-bit magic m32 = ceil(2^32/p) (Magic32: 2^24 for p = 256),
+// one multiply-high instead of the 64-bit one, branch-free for every p. Exact for s < 2^24:
+// s m32 = (s 2^32 + s e) / p with 0 <= e < p <= 256 (e = 0 for p = 256), and s e < 2^24 2^8
+// = 2^32, so floor(s m32 / 2^32) = floor(s / p) (as for mod_p_small32); here s < 7 * 255^2
+// < 2^19. For p = 256 the weights are 1, 0, ... so s = lo & 255 and the quotient is 0.
+// (Exhaustive over [0, 7 * 255^2] and end to end: tests/test_mod_exhaustive.cpp.)
+IMD_HD uint32_t mod_p_bytes32(uint32_t lo, uint32_t hi, uint32_t wlo, uint32_t whi, uint32_t p,
+                              uint32_t m32) {
+  const uint32_t s = dot_bytes(lo, wlo) + dot_bytes(hi, whi);
+#if defined(__CUDA_ARCH__)
+  const uint32_t q = __umulhi(s, m32);
+#else
+  const auto q = static_cast<uint32_t>((uint64_t{s} * m32) >> 32);
+#endif
+  return s - p * q;
 }
 
 }  // namespace imd::device

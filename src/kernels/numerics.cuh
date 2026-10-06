@@ -62,6 +62,41 @@ __device__ __forceinline__ u128 square_term(uint64_t b, int gamma) {
   return (sq & ((static_cast<u128>(1) << s) - 1)) != 0 ? q + 1 : q;
 }
 
+// A5: the same term with the significand normalized to 53 bits, in two 64-bit words (the
+// generic 128-bit shifts above are ~70 instructions per value; KF, KL and K1 run this once
+// per operand element). m' = m 2^z in [2^52, 2^53) (z > 0 only for subnormals) has
+// ilogb(x) = e' + 52 for e' = e - z, so the same real number m^2 2^t = m'^2 / 2^s with
+// s = 2(gamma - ilogb(x)) + 104 - F >= 104 - F = 44. m'^2 < 2^106: s >= 106 gives 1 (0 <
+// value < 1); otherwise the value is < 2^(106 - 44) = 2^62 and the result is
+// floor(m'^2 / 2^s) + (remainder != 0) from hi:lo = m'^2. Equal to square_term for every
+// finite nonzero x with ilogb(x) <= gamma (GPU test: tests/test_device_constants.cu).
+static_assert(imd::constants::kF >= 0 && imd::constants::kF <= 61,
+              "square_term_n: s >= 104 - F >= 43 and results below 2^(F + 2) <= 2^63");
+__device__ __forceinline__ uint64_t square_term_n(uint64_t b, int gamma) {
+  const int E = static_cast<int>((b >> 52) & 0x7FF);
+  const uint64_t f = b & kFracMask;
+  uint64_t m;
+  int il;  // ilogb(x)
+  if (E != 0) {
+    m = f | (uint64_t{1} << 52);
+    il = E - 1023;
+  } else {  // subnormal, f != 0: bitlen(f) = 64 - lz
+    const int lz = __clzll(static_cast<long long>(f));
+    m = f << (lz - 11);
+    il = -1075 + (64 - lz);
+  }
+  const int s = 2 * (gamma - il) + 104 - imd::constants::kF;
+  if (s >= 106) return 1;
+  const uint64_t lo = m * m, hi = __umul64hi(m, m);
+  if (s < 64) {
+    const uint64_t q = (hi << (64 - s)) | (lo >> s);
+    return q + ((lo << (64 - s)) != 0 ? 1 : 0);
+  }
+  const int r = s - 64;
+  const uint64_t q = hi >> r;
+  return q + ((lo != 0 || (r != 0 && (hi << (64 - r)) != 0)) ? 1 : 0);
+}
+
 __device__ __forceinline__ int bitlen128(u128 x) {
   const auto hi = static_cast<uint64_t>(x >> 64), lo = static_cast<uint64_t>(x);
   if (hi != 0) return 128 - __clzll(static_cast<long long>(hi));
@@ -87,12 +122,17 @@ __device__ __forceinline__ bool shl256(const U256& x, int s, U256* out) {
   }
   if (s < 0 || bl + s > 256) return false;
   const int ws = s / 64, bs = s % 64;
+  // Word shift by selection over the 4 possible ws (static indices only: a dynamic x.w[i - ws]
+  // would put the words in local memory, which is costly when every thread of a warp runs it).
+#pragma unroll
   for (int i = 3; i >= 0; --i) {
-    const int src = i - ws;
     uint64_t v = 0;
-    if (src >= 0) {
-      v = x.w[src] << bs;
-      if (bs != 0 && src >= 1) v |= x.w[src - 1] >> (64 - bs);
+#pragma unroll
+    for (int j = 0; j <= 3; ++j) {
+      if (j == ws && i - j >= 0) {
+        v = x.w[i - j] << bs;
+        if (bs != 0 && i - j >= 1) v |= x.w[i - j - 1] >> (64 - bs);
+      }
     }
     out->w[i] = v;
   }
@@ -167,10 +207,15 @@ __device__ __forceinline__ int8_t residue(uint64_t mu, bool neg, int eps, int l)
 // mag: L little-endian u32 limbs.
 template <int L>
 __device__ __forceinline__ double round_scaled(const uint32_t (&x)[L], bool neg, int e) {
-  int top = L - 1;
-  while (top >= 0 && x[top] == 0) --top;
+  // The top nonzero limb, by a fully unrolled scan (static indices only: a dynamic x[top]
+  // would put the limbs in local memory).
+  int top = -1;
+  uint32_t xt = 0;
+#pragma unroll
+  for (int w = 0; w < L; ++w)
+    if (x[w] != 0) top = w, xt = x[w];
   if (top < 0) return 0.0;
-  const int bl = top * 32 + (32 - __clz(static_cast<int>(x[top])));
+  const int bl = top * 32 + (32 - __clz(static_cast<int>(xt)));
   uint64_t t;  // the top 64 bits of mag (exact when bl <= 64), lsb weight 2^(bl - 64 + e)
   bool sticky = false;
   if (bl <= 64) {
@@ -178,18 +223,24 @@ __device__ __forceinline__ double round_scaled(const uint32_t (&x)[L], bool neg,
     if (L > 1) lo |= static_cast<uint64_t>(x[L > 1 ? 1 : 0]) << 32;
     t = lo << (64 - bl);
   } else {
-    const int s = bl - 64, ws = s / 32, bs = s % 32;
-    uint32_t w0 = 0, w1 = 0, w2 = 0;
+    // t = floor(mag / 2^s) (< 2^64 since mag < 2^bl), sticky = (mag mod 2^s != 0), limb by
+    // limb with runtime shift amounts only: selecting x[s / 32 + j] was compiled into a
+    // dynamically indexed copy of x in local memory (K5's hottest loads).
+    const int s = bl - 64;
+    t = 0;
 #pragma unroll
     for (int i = 0; i < L; ++i) {
-      if (i == ws) w0 = x[i];
-      if (i == ws + 1) w1 = x[i];
-      if (i == ws + 2) w2 = x[i];
-      if (i < ws && x[i] != 0) sticky = true;
+      const int r = 32 * i - s;  // bit position of limb i relative to bit s
+      const uint64_t v = x[i];
+      if (r >= 0) {
+        if (r < 64) t |= v << r;
+      } else if (r > -32) {
+        t |= v >> -r;
+        if ((v & ((uint64_t{1} << -r) - 1)) != 0) sticky = true;
+      } else if (v != 0) {
+        sticky = true;
+      }
     }
-    if (bs != 0 && (w0 & ((1u << bs) - 1)) != 0) sticky = true;
-    const uint64_t lo = static_cast<uint64_t>(w0) | (static_cast<uint64_t>(w1) << 32);
-    t = (lo >> bs) | (bs != 0 ? static_cast<uint64_t>(w2) << (64 - bs) : 0);
   }
   const int lsb = bl - 64 + e;                  // exponent of t's lsb
   const int q = max(bl - 1 + e - 52, -1074);    // exponent of the result's lsb

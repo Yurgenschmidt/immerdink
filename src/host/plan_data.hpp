@@ -51,6 +51,27 @@ struct ExecPlan {
   int64_t pack_radix[2] = {1, 1};
   // K5 thread mapping: lambda fastest (C's fastest label is a batch label) or j-bar fastest.
   bool k5_batch_fast = false;
+  // v1.4 (DESIGN §4 "KF"): K0 (generate mode), K1 and group 1's K2/K3 run as one fused
+  // launch. Chosen at plan time from the lowering (analysis.hpp fused_path).
+  bool fused = false;
+  // v1.6 (DESIGN §4 "KL"): bit x (0 = the GEMM's A, 1 = B) set iff operand x is scaled and
+  // packed for group 1 by one KL launch instead of K1 + its group-1 pack. Chosen at plan time
+  // from the lowering (analysis.hpp fused_large).
+  int32_t fused_large = 0;
+  // Test hook only (imd_test_set_fused 3): log2 of KL's tile height (rows per tile), -1 = the
+  // launch rule. Forcing 64-row tiles makes short rows span several chunks.
+  int32_t kl_lg_rows = -1;
+  // v1.5 (DESIGN §4 "K4 configurations"): the K4 configuration (IMD_K4_*) the plan runs:
+  // k4_select for the device's SM count, or the fastest one timed with k4_tune. Set by
+  // libimmerdink at plan creation (plan_data leaves IMD_K4_128x256).
+  int32_t k4_config = IMD_K4_128x256;
+  // v1.7 (DESIGN §6b): bit x (0 = the GEMM's A, 1 = B, post-swap) set iff operand x is read
+  // from a packed operand: no K1 / KL / KF share / pack launch for it, no sX / fX / RX
+  // region; its sigma, flags and residues are at pack_off (sig, flag, res) in the caller's
+  // packed buffer of pack_bytes bytes (§6b.4; B role read at batch stride n k_hat).
+  int32_t packed = 0;
+  uint64_t pack_off[2][3] = {{0, 0, 0}, {0, 0, 0}};
+  uint64_t pack_bytes[2] = {0, 0};
 
   // §5 step 10 scatter vectors (§4a vec order, vec_count entries), from vec_desc: generated
   // by K0 into ws.vec per call (IMD_VEC_GENERATE), or built once at plan creation into
@@ -112,6 +133,9 @@ struct imd_plan_st {
   imd::detail::Lowered lowered;
   imd::detail::ExecPlan exec;  // exec.vec_dev: IMD_VEC_RESIDENT device vectors, owned
   imd::detail::TensorCopy A, B, C;  // for M3's aliasing check (§5 row 6)
+  // v1.7 (§6b): the compatibility key of the caller's A / B slot (empty: packed in-line),
+  // copied at creation; imd_contract_packed compares the handle it is given with it.
+  std::vector<int64_t> slot_key[2];
 
   imd_plan_st(const imd_options_t& o, const imd::detail::Lowered& lw, const imd_tensor_t& a,
               const imd_tensor_t& b, const imd_tensor_t& c)

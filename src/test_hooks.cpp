@@ -8,6 +8,27 @@
 //       keeps every accumulator within the §3.5 bound); the others in [1, 65535].
 //       Returns 0, or 1 (nothing changed) for an invalid argument.
 //
+//   imd_test_set_fused(mode)
+//       mode -1: plans created afterwards take the v1.4 fused path KF and the v1.6 fused
+//       large path KL when the plan-time rules (analysis.hpp fused_path, fused_large) say so
+//       (production); 0: never (K0, K1 and the packs of group 1 run as separate launches);
+//       2: every plan with the emulated GEMM takes KL for both operands (never KF); 3: as 2,
+//       with KL tiles of 64 rows (so rows of k_hat > 64 span several chunks: the register,
+//       shared-memory and re-read chunks of KL all run on small shapes). Results must not
+//       change. Returns 0, or 1 for another mode.
+//
+//   imd_test_set_k4_config(config)
+//       config -1: plans created afterwards run the K4 configuration of the plan-time rule
+//       (or k4_tune's; production); 0 .. IMD_K4_CONFIG_COUNT - 1: that configuration
+//       (DESIGN v1.5 §4). Results must not change. Returns 0, or 1 for another value.
+//
+//   imd_test_set_k5_one_elem(per_sm)
+//       K5 (j-bar fastest) takes one element per thread while b m n <= per_sm x SMs, else
+//       4 per thread with warp-transposed stores. per_sm -1 restores the production value;
+//       0 always uses 4 per thread and also disables KF's 4-values-per-thread variant (no
+//       small-problem launch variant anywhere). Applies to later imd_contract calls; results
+//       must not change. Returns 0, or 1 for a negative value other than -1.
+//
 //   imd_test_plan_vec(plan, dev, count)
 //       The plan's resident scatter vectors (IMD_VEC_RESIDENT, DESIGN v1.2): *dev = their
 //       device address (NULL for a generate plan), *count = their int64 entries (the vec
@@ -27,12 +48,19 @@
 //       it allocated (0 for a generate plan); the K4 parameter sets (store, add) and the
 //       K4 launches of one call; and its host payload, counted from the live containers:
 //       sizeof(imd_plan_st) + descriptor copies + lowering tables + K0 descriptor + K4Plan
-//       with its map entries. Returns 0, or 1 for a null argument; *count as above.
+//       with its map entries; then (v1.4) whether it takes the fused path and its kernel
+//       launches per imd_contract with alpha != 0; then (v1.5) its K4 configuration, the
+//       configuration of its K4 parameters (both -1 without K4) and its SM count; then (v1.6)
+//       its fused_large bit mask (the operands KL scales and packs); then (v1.7) its packed
+//       slots (bit 0 / 1: the caller's A / B) and the pack bytes of the post-swap A and B
+//       (0 for an in-line operand). The host payload includes the copied slot keys. Returns 0,
+//       or 1 for a null argument; *count as above.
 #include <cstdint>
 #include <vector>
 
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink.h"
+#include "host/analysis.hpp"
 #include "host/index_map.hpp"
 #include "plan.hpp"
 
@@ -47,6 +75,32 @@ IMD_API int imd_test_set_limits(int64_t k_chunk, int64_t max_batch, int64_t max_
   if (max_batch < 1 || max_batch > def.max_batch) return 1;
   if (max_n_tiles < 1 || max_n_tiles > def.max_n_tiles) return 1;
   imd::detail::launch_limits() = {k_chunk, max_batch, max_n_tiles};
+  return 0;
+}
+
+IMD_API int imd_test_set_fused(int mode) {
+  if (mode < -1 || mode == 1 || mode > 3) return 1;
+  imd::detail::fused_override() = mode;
+  return 0;
+}
+
+IMD_API int imd_test_set_k4_config(int config) {
+  if (config < -1 || config >= IMD_K4_CONFIG_COUNT) return 1;
+  imd::detail::k4_config_override() = config;
+  return 0;
+}
+
+IMD_API int imd_test_set_k5_one_elem(int64_t per_sm) {
+  if (per_sm < -1) return 1;
+  static const int64_t production = imd::detail::k5_one_elem_per_sm();
+  imd::detail::k5_one_elem_per_sm() = per_sm == -1 ? production : per_sm;
+  return 0;
+}
+
+// A5: K5 (j-bar fastest) with 1, 2 or 4 elements per thread; 0 restores the launch rule.
+IMD_API int imd_test_set_k5_elems(int elems) {
+  if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
+  imd::detail::k5_elems_override() = elems;
   return 0;
 }
 
@@ -117,7 +171,21 @@ IMD_API int imd_test_plan_sizes(imd_plan_t plan, int64_t* out, int64_t cap, int6
     host += lw.order[g].size() * sizeof(int32_t) + lw.fused[g].size() * sizeof(imd::detail::FusedMode);
   host += e.vec_desc.modes.size() * sizeof(imd::detail::VecMode);
   host += k4.bytes;
+  host += (plan->slot_key[0].size() + plan->slot_key[1].size()) * sizeof(int64_t);  // v1.7
   v.push_back(static_cast<int64_t>(host));
+  v.push_back(e.fused ? 1 : 0);
+  v.push_back(imd::detail::plan_launches(e, e.fused, e.fused_large, e.vec_resident, k4.launches));
+  // v1.5: the K4 configuration the plan runs (-1 without K4), its K4Plan's, and the SMs the
+  // rule was evaluated for.
+  v.push_back(e.k4 ? e.k4_config : -1);
+  v.push_back(e.k4 ? k4.config : -1);
+  v.push_back(e.sms);
+  // v1.6: the operands of the fused large launch KL (bit 0: A, bit 1: B).
+  v.push_back(e.fused_large);
+  // v1.7: the packed operands (bit 0 / 1: the caller's A / B) and their pack bytes.
+  v.push_back((plan->slot_key[0].empty() ? 0 : 1) | (plan->slot_key[1].empty() ? 0 : 2));
+  v.push_back(static_cast<int64_t>(e.pack_bytes[0]));
+  v.push_back(static_cast<int64_t>(e.pack_bytes[1]));
   *count = static_cast<int64_t>(v.size());
   if (out != nullptr && *count <= cap)
     for (size_t i = 0; i < v.size(); ++i) out[i] = v[i];
