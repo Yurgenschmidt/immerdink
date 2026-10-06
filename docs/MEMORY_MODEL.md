@@ -215,7 +215,7 @@ Here:
 - With KL for operand x (DESIGN v1.6 §4), x is read `⌈N/g⌉` times from DRAM in total
   instead of `1 + ⌈N/g⌉` (K1's own second pass hits L2 in both cases).
 - `ρ ≥ 1` is the GEMM tiling's operand re-read factor (1 if L2 captures all reuse).
-- `n_chunks = ⌈k / 131056⌉`.
+- `n_chunks = ⌈k̂ / K_c'⌉` with K_c' = 131008 (DESIGN v1.13; 131056 before).
 - The flagged-element native path adds `s_T·k·(n·#flaggedRows + m·#flaggedCols)` bytes.
 
 **Example: 8192³, N = 14, g = 14, β = 0, ρ = 1.** About 7.75 GiB of traffic (≈ 8 ms at

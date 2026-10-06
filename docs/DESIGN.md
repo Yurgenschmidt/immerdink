@@ -1,4 +1,4 @@
-# immerdink — design (v1.12)
+# immerdink — design (v1.13)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -37,6 +37,10 @@ semantic, layout, C API or spec change; v1.10 is the parallel performance-model 
 v1.12 adds §6f, accuracy-aware planning (host API version 8): rigorous and typical error
 estimates per configuration from caller-supplied operand statistics, `imd_err_min_moduli`, and
 an error target in `imd_perf_rank` (no semantic, layout, launch or spec change).
+v1.13 starts §4b, K4 load alignment. Its stage 1 sets the K-chunk length to `K_c' = 131008 =
+⌊K_c/64⌋·64` (it was 131056), so every full chunk is a whole number of K4's 64-wide K tiles.
+Results stay bit-identical; there is no layout, pack format or API change. Only the chunk
+count of k̂ ∈ (j·131008, j·131056] changes (+1); changed text is marked **[v1.13]**.
 The change lists are at the end.
 
 Sources:
@@ -97,7 +101,7 @@ are NaN, but their payload and sign are unspecified.
 | `M_l, q_l` | `M_l = P/p_l` and `q_l = M_l⁻¹ mod p_l ∈ [1,p_l)`. Then `M_l q_l ≡ δ_lj (mod p_j)`. |
 | `T` | `⌊√H⌋`, the per-side norm budget. `T² ≤ H < (T+1)²`. |
 | `K_c` | `131071 = ⌊(2³¹−1)/128²⌋`. It is tight: `128²·(K_c+1) > 2³¹−1`. CUTLASS 2.x int8 MMA is `.satfinite` ([CUT] `mma_sm80.h`), so overflow **saturates silently**. **Every modulus, including p = 256, must be K-chunked.** The wraparound exemption [G8] relies on with cuBLAS does not apply here. **[spec: OzakiCRT ChunkFits, neg_chunk, neg_order]** |
-| `K_c'` | `131056 = ⌊K_c/16⌋·16`, the chunk length used. Numerically any chunk length ≤ K_c is exact. The multiple of 16 is only there to keep CUTLASS pointers 16-byte aligned. |
+| `K_c'` | **[v1.13]** `131008 = ⌊K_c/64⌋·64 = 2047·64` is the chunk length used (it was `131056 = ⌊K_c/16⌋·16`). Numerically any chunk length ≤ K_c is exact. A multiple of 16 keeps CUTLASS pointers 16-byte aligned (correctness). A multiple of 64, K4's threadblock K tile, keeps every full chunk free of a residue tile, so a row's K4 load phase depends on k̂ alone (§4b, performance). 131008 is the largest such multiple ≤ K_c **[cert: cert_kc, cert_row_phase]**. |
 | `L_w` | Width of the **unsigned** CRT word, `32·L32` with `L32` minimal such that `2P ≤ 2^{L_w}`. `L32` = 1 for N ≤ 3, 2 for N ≤ 7, 3 for N ≤ 12, 4 for N ≤ 16, 5 for N ≤ 20. The bound is exact: the reachable peak needs every bit. |
 
 All constants are generated and checked by `spec/params.py` in exact integer arithmetic.
@@ -214,7 +218,9 @@ Why we deviate:
 - Here `mod` is the **non-negative residue in [0, p_l)**. It must be exact over the
   reachable input `v ∈ [−K_c'·128², (p_l−1) + K_c'·128²]`.
   - Per-modulus exact ranges are in `params_out.json`.
-  - The max of `W + acc` is 2147221759, which fits int32 **[cert: cert_kc]**.
+  - **[v1.13]** For p = 256 the range is `[−2129666048, 2146435327]` (−128·127·K_c' and
+    128²·K_c' + 255); it fits int32 **[cert: cert_kc]** **[spec: apalache Epilogue]**. With
+    the old 131056 the maximum was 2147221759.
 - **Realization [cert: cert_barrett]:**
   - p = 256: `v & 255`;
   - otherwise: `n = v + bias` (u32, `bias = p·⌈2³¹/p⌉`), `q = umulhi64(⌈2⁶⁴/p⌉, n)`,
@@ -642,6 +648,79 @@ neg_resident_ws_vec, neg_resident_reads_ws]**
 - The result includes the tail padding after W, up to 255 bytes.
 - If any product or the total overflows uint64, the call returns INVALID_VALUE.
 - Worked example: 8192³, N = 14, g = 14 needs 2,819,014,912 B (2.625 GiB).
+
+---
+
+## 4b. K4 load alignment [v1.13] (stage 1 of a staged plan; NOTES-K4ALIGN)
+
+**Mechanism (measured; CUTLASS `predicated_tile_access_iterator.h:204-213, 514-523`).**
+- K4 (CUTLASS 2.x, int8 A row-major and B column-major, alignment 16, threadblock K tile 64)
+  reads RA/RB rows with row stride `lda = ldb = k̂` (the region and pack bases are
+  256-aligned).
+- A launch covers the K-chunk `[k0, k0 + kc)`. It loads the chunk's residue tile
+  (`kc mod 64` elements) **first**. Every later main-loop load of row r therefore starts at
+  phase
+
+  `φ(r, c) = (r·k̂ + e_c) mod 64`, where `e_c = k0 + kc` is the chunk end.
+
+  So the phase depends on the stride and the chunk end together, not on the stride alone,
+  and not on the chunk start.
+- Measured K4 time per MAC, relative to class 0, for `k̂ mod 64` classes 32 / 16 / 48:
+
+  | config | class 32 | class 16 | class 48 |
+  |---|---|---|---|
+  | 128×256 | 1.03 | 1.32–1.34 | 1.37–1.44 |
+  | 128×128 | 1.10–1.11 | 1.55–1.58 | 1.61–1.73 |
+  | 64×128 | 1.16–1.17 | 1.69–1.73 | 1.81–1.92 |
+  | 64×64 | 1.15–1.19 | 1.69–1.76 | 1.83–1.94 |
+
+  These cover 2048² and 16384×512, N = 8 and 14. ncu shows more L2 requests and sectors and
+  more shared-memory store wavefronts; DRAM reads are flat.
+- Two facts are measured but **not** explained by the phase rule:
+  - class 48 is 5–15 % slower than class 16, although both have the same set of phases;
+  - the sector multipliers are 1.5× with half of the rows misaligned and 2.0× with all of
+    them (a 64-byte segment touching 3 sectors instead of 2 predicts at most 1.5×).
+
+**Stage 1 (this version): `K_c' = ⌊K_c/64⌋·64 = 131008`** **[cert: cert_kc, cert_row_phase]**.
+- Every full chunk has `k0 ≡ kc ≡ 0 (mod 64)`, so its phase is `r·k̂ mod 64`. With 131056
+  it was `r·k̂ + 48·(c+1)`. The last chunk ends at k̂ and does not depend on K_c'.
+- The phase class therefore depends on k̂ alone, and no chunk gets worse:
+  - k̂ ≡ 0 (mod 64) is fully aligned in every chunk (before: full chunk c sat at phase
+    48·(c+1) mod 64, so chunk 0 was fully misaligned);
+  - k̂ ≡ 32: the even chunks move from phases {16, 48} to {0, 32} (the odd ones were
+    already there);
+  - odd multiples of 16 are unchanged (their phases are uniform either way).
+- 131008 is the largest multiple of 64 that is ≤ K_c. 131040 (≡ 32 mod 64) would leave
+  full chunks in class 32.
+- Exactness is unchanged. CRT and add-mod do not depend on the chunking (any chunk length
+  ≤ K_c is exact, §2/§3.5), so W and C are bit-identical to v1.12. The epilogue range
+  shrinks to `[−2129666048, 2146435327]` for p = 256.
+- What changes:
+  - `k_chunks = ⌈k̂/131008⌉` gains one for `k̂ ∈ (j·131008, j·131056]`;
+  - in those windows a call has one more add-mod launch per group and part (§4 launch
+    counts), one more W read-modify-write (`N·b·m·n̂` bytes), and possibly one more add-mod
+    shape key (plan host bytes);
+  - workspace and pack layout, the pack format, the host API version and the calibration
+    format do not change.
+- Expected gain, from the measured class rates, not measured after the change: k̂ ≡ 0 or 32
+  (mod 64) with k̂ > 131008 runs its full chunks at the aligned rate. For example,
+  2048² × 196608, N = 8 is projected to drop from 45.7 ms to about 23–25 ms in K4, so the
+  call goes from 23.4 to about 33 TFLOPS-eq.
+  - Cost in the windows: the extra launch and W pass, about 30–40 µs at 2048², N = 8.
+
+**Later stages (not in v1.13 stage 1; DESIGN text before code, review 2026-10-05):**
+- Stage 0, done with stage 1, is a refactor with no behaviour change. `k̂ = ⌈k⌉_A` has one
+  definition, `k_hat_of(k, A)`, in libimmerdink_host (`src/host/k_hat.hpp`), mirrored by
+  `spec/params.py k_hat_of`. A = 16 for every plan.
+- Stage 2: `k̂ = ⌈k⌉_A` with A ∈ {16, 64}, a pure function of k
+  (`A = 64 iff k > K_PAD64_MIN`, the threshold frozen from a sweep).
+  - k̂ is both the row stride and the GEMM K extent, with a zero tail.
+  - It adds no `imd_options_t` field. A test hook forces A, and `imd_lowering_t` reports
+    the resolved alignment (additive, host API 9).
+  - The pack format word carries A (1 = A16, 2 = A64).
+  - Padding only the stride while the K extent stays ⌈k⌉₁₆ is **rejected**: with the
+    residue tile loaded first, it misaligns every row of every full chunk.
+- The W/n̂ stride (`ldw = n̂`, ≡ 16 mod 32 possible) is excluded here and unmeasured.
 
 ---
 
@@ -1987,6 +2066,24 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
   untested. The two-chunk check (512² × 262144, chunk 1 misaligned, vs 262160, all misaligned)
   is inconclusive: K4 there is DRAM-bound and 262144 (a power-of-two row stride) is the slower
   one (NOTES-B2 §6).
+  **[v1.13] Correction (measured, NOTES-K4ALIGN; §4b).** The per-chunk rule above uses the
+  chunk *start*. The measured mechanism depends on the chunk *end*. CUTLASS 2.x loads a
+  chunk's residue tile (`kc mod 64` elements) first, so row r's main-loop loads sit at phase
+  `(r·k̂ + e_c) mod 64`, where `e_c = k0 + kc` is the chunk end.
+  - With K_c' = 131056 (≡ 48 mod 64), an aligned k̂ had its chunk 0 misaligned, not the odd
+    chunks. The 262144 call was slower because of that, not because of a DRAM-channel
+    effect of its power-of-two stride: 196608, also aligned, measured worst
+    (2048² × 196608, N = 8: 23.4 TFLOPS-eq, 70.5 ms per call).
+  - k̂ ≡ 16 mod 32 misaligns half of the rows (the phases cycle through all four 16-byte
+    classes), not every row.
+  - The slow-chunk count of format 2 happened to agree for every calibrated shape.
+  - Since v1.13, K_c' = 131008 ≡ 0 mod 64. Every full chunk ends on a multiple of 64 and
+    the last chunk ends at k̂, so the c·K_c' term is always 0 mod 32. The format-2 criterion
+    becomes exactly "slow iff k̂ mod 32 ≠ 0" for the 16/48 phase classes. The class-32 cost
+    (+3 % for 128×256 and +10 to +19 % for the smaller tiles, measured) has no term of its
+    own.
+  - The calibration format is unchanged (review 2026-10-05). The shipped θ was fitted with
+    the old chunk length, and a later step refits it.
 
 - **The eps path** (the `op_eps` features, reviewed 2026-10-05). The packs quantize an
   element to `μ·2^ε`; a residue costs one more modular multiply when ε > 0, i.e. |a'| ≥ 2⁵³
@@ -3311,3 +3408,35 @@ and host API; every value the same integer (bit-identical, tested on every contr
   `Query.min_moduli`. Reference and certificate: `params.error_estimate`,
   `cert_error_estimate`. No TLA+ change (§6f.5).
 - **§3.8.** A pointer to §6f.
+
+## v1.13 stage 1 (K4 load alignment: K_c' = 131008; no semantic, layout, pack format, API or calibration-format change)
+
+- **§2, §3.5.** `K_c' = ⌊K_c/64⌋·64 = 131008` replaces 131056 (`⌊K_c/16⌋·16`). It is
+  derived in `spec/params.py` (`K_CHUNK_ALIGN = 64`), not written as a literal. cert_kc
+  checks `K_c' % 64 = 0` and `K_c − K_c' < 64`. The epilogue range for p = 256 is
+  `[−2129666048, 2146435327]`; the regenerated `epi_vmin` / `epi_vmax` are in
+  `constants.hpp`, which also gains `kKChunkAlign`.
+- **§4b (new).** Why: the measured K4 load-phase rule `φ = (r·k̂ + chunk end) mod 64`, with
+  CUTLASS loading the residue tile first. With 131056 (≡ 48 mod 64), an aligned k̂ had a
+  fully misaligned chunk 0 (2048² × 196608, N = 8, 128×256: 23.4 TFLOPS-eq, 70.5 ms per
+  call, K4 45.7 ms; measured before the change, NOTES-K4ALIGN). With 131008 the phase class
+  depends on k̂ alone, and no chunk gets worse.
+- **Results are bit-identical**, since the chunking does not change W or C.
+  - The calls with `k̂ ∈ (j·131008, j·131056]` gain one K-chunk: one more add-mod launch per
+    group and part, one more W pass, and possibly one more add-mod shape key.
+  - Every other host query value is unchanged.
+  - A pre-check before the change ran 11 long-k cases with `imd_test_set_limits(k_chunk =
+    131008)` on the old code. All were bit-exact against the oracle at chunk 131008 and
+    identical to the 131056 run.
+- **Stage 0 (refactor, no behaviour change).** `k_hat_of(k, A)` (`src/host/k_hat.hpp`) is the
+  one rounding of k to k̂ in libimmerdink_host, with A = 16 for every plan. It is mirrored
+  by `params.k_hat_of`.
+- **§6c.** A correction to the v1.10 per-chunk text: the criterion is the chunk end, not
+  the start, and the 262144 effect was the residue-first phase, not a DRAM-channel effect.
+  The format-2 criterion is now exactly "k̂ mod 32 ≠ 0". There is no format change, and θ is
+  to be refit.
+- **Spec.** `spec/apalache/Epilogue.tla`: `Kp = 131008`, with the tight max 2146435327
+  (new counterexample value). The comments in Pipeline, MC_Pipeline, OzakiCRT and
+  Int32Chunk change; no TLC model changes. `params.cert_row_phase` (new) covers the boundary
+  k list and the 131008 / 131056 windows. Lean `Chunk.lean` (≤ 131056) covers 131008
+  a fortiori and was not re-instantiated.

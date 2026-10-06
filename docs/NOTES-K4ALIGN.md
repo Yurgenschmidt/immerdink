@@ -1,0 +1,166 @@
+# NOTES-K4ALIGN — K4 load alignment (DESIGN v1.13 §4b, ROADMAP A6)
+
+## Status
+
+Stage 0 and stage 1 are done (2026-10-05):
+- **Stage 0:** one `k_hat_of(k, A)` in libimmerdink_host, with A = 16.
+- **Stage 1:** K_c' = 131008.
+
+Stage 2 is designed in DESIGN §4b: k̂ = ⌈k⌉₆₄ above a threshold, pack format 2, host API 9.
+Its threshold `K_PAD64_MIN` is frozen from a sweep before any code. The rulings of the
+independent review (2026-10-05) are binding and listed below.
+
+The measurements were taken before any change (origin/dev ca7141c), with the profiling build
+of `imd_bench` and the repo's gated runner (quiet gate, shared GPU lock, warm-up), only while
+the machine was otherwise idle. The raw records and scripts are outside the product repo
+(immerdink-eval `results/k4align`).
+
+## 1. Mechanism
+
+K4 is CUTLASS 2.x `DefaultMma`: int8 A row-major and B column-major, alignment 16, threadblock
+K tile 64.
+- RA/RB rows have stride `lda = ldb = k̂`, and the region and pack bases are 256-aligned.
+- A launch covers the K-chunk `[k0, k0 + kc)`.
+- CUTLASS's predicated tile iterator loads the chunk's **residue tile** (`kc mod 64`
+  elements) **first** (`predicated_tile_access_iterator.h:204-213, 514-523`).
+- Every later 64-element main-loop load of row r therefore starts at phase
+
+  `φ(r, c) = (r·k̂ + e_c) mod 64`, where `e_c = k0 + kc` is the chunk end.
+
+The phase depends on the stride and the chunk end together, not on the stride alone and not
+on the chunk start. This one rule fits every case measured, including the two-chunk test
+that NOTES-B2 §6 called inconclusive.
+
+## 2. K4 time per MAC by `k̂ mod 64` class (measured)
+
+- Shapes: 2048² and 16384×512.
+- N = 8 and 14.
+- k̂ = 992–1072 and 4064–4128.
+- Values are relative to class 0, averaged over both k̂ bands. The best K4 rate in class 0 is
+  about 620 TOPS-eq at k̂ = 4096.
+
+| config | class 32 | class 16 | class 48 |
+|---|---|---|---|
+| 128×256 (the rule's usual choice) | 1.03 | 1.32–1.34 | 1.37–1.44 |
+| 128×128 | 1.10–1.11 | 1.55–1.58 | 1.61–1.73 |
+| 64×128 | 1.16–1.17 | 1.69–1.73 | 1.81–1.92 |
+| 64×64 | 1.15–1.19 | 1.69–1.76 | 1.83–1.94 |
+
+- N and the shape barely change the ratios.
+- A zero tail costs nothing: k = 1016 (k̂ = 1024) runs like k = 1024.
+- Class 32 is also slow on the three smaller configurations (+10 to +19 %), so the target is
+  64, not 32.
+- Example (2048², N = 14, 128×256):
+
+  | k̂ | K4 throughput | K4 time | call throughput |
+  |---|---|---|---|
+  | 4096 | 618 TOPS-eq | 0.778 ms | 26.3 TFLOPS-eq |
+  | 4080 | 435 TOPS-eq | 1.102 ms | 21.0 TFLOPS-eq |
+
+- Measured but **not explained** by the phase rule:
+  - class 48 is 5–15 % slower than class 16, although both have the same set of phases;
+  - the sector multipliers are 1.5× with half of the rows misaligned and 2.0× with all of
+    them (a 64-byte segment touching 3 sectors instead of 2 predicts at most 1.5×).
+
+## 3. Padding emulated by running the padded k (per useful MAC)
+
+| case | K4 throughput, k / padded (TOPS-eq) | K4 gain | call throughput, k / padded (TFLOPS-eq) | call gain |
+|---|---|---|---|---|
+| 2048², N = 14, 128×256, 4080 → 4096 | 435 / 616 | +42 % | 21.0 / 26.2 | +24 % |
+| 2048², N = 14, 128×256, 1008 → 1024 | 380 / 548 | +44 % | 15.6 / 19.6 | +25 % |
+| 2048², N = 14, 128×256, 1040 → 1056 (to 32 only) | 430 / 525 | +22 % | 16.3 / 18.0 | +10 % |
+| 2048², N = 14, 128×256, 4064 → 4096 (class 32) | 610 / 613 | +1 % | 26.0 / 26.1 | 0 % |
+| 16384×512, N = 8, 128×256, 4080 → 4096 | 418 / 595 | +42 % | 25.6 / 30.0 | +17 % |
+| 2048², N = 14, 64×64, 4080 → 4096 | 170 / 311 | +83 % | 10.2 / 16.4 | +61 % |
+| 2048², N = 14, 64×64, 4064 → 4096 (class 32) | 270 / 310 | +15 % | 14.9 / 16.3 | +10 % |
+
+## 4. ncu, single K4 launches (2048², N = 8; ncu locks the clock at about 2.45 GHz)
+
+| case | µs | tensor pipe | L2 requests | L2 sectors | smem store wavefronts |
+|---|---|---|---|---|---|
+| 128×256, k̂ 1024 | 134.7 | 80.6 % | 6.29 M | 12.58 M | 4.46 M |
+| 128×256, k̂ 1040 | 180.2 | 62.7 % | 12.19 M (1.91× per k) | 19.27 M (1.48× per k) | 8.70 M |
+| 64×128, k̂ 1024 | 177.4 | 60.1 % | 12.58 M | 25.17 M | 10.88 M |
+| 64×128, k̂ 1056 | 221.9 | 50.6 % | 16.52 M (1.27× per k) | 25.95 M (same per k) | 14.62 M |
+
+- DRAM reads are flat (34 MB) and the L2 hit rate is 96–98 %. The loss is in L1/L2 request
+  and sector counts and in shared-memory store wavefronts, which stall the load pipeline.
+- In class 32 the sector count is unchanged but requests rise by about 27 %. That fits loads
+  crossing a 128-byte line, but it stays a hypothesis until it is profiled directly.
+
+## 5. Long k: the chunk length (before stage 1, K_c' = 131056 ≡ 48 mod 64)
+
+All runs are 2048² × k, N = 8, 128×256.
+
+| k̂ | chunks | chunk-0 rows misaligned | call TFLOPS-eq | call ms | K4 TOPS-eq | K4 ms | chunk-0 L2 sectors |
+|---|---|---|---|---|---|---|---|
+| 131040 | 1 | none | 33.4 | 32.9 | 529 | 16.6 | 1.00× |
+| 131056 | 1 | half | 29.4 | 37.4 | 427 | 20.6 | 1.50× |
+| 196608 | 2 | all | 23.4 | 70.5 | 289 | 45.7 | 2.00× |
+| 196624 | 2 | half | 27.5 | 60.0 | 378 | 34.9 | 1.50× |
+| 196640 | 2 | all | 25.9 | 63.7 | 350 | 37.6 | 2.00× |
+
+- **196608, an aligned power-of-two stride, is the worst case.** Its chunk 0 (131056 long) ends
+  at 48 mod 64, so every row is misaligned; chunk 1 ends at k̂ and is aligned.
+- That is the residue-first phase, **not a DRAM-channel effect**. NOTES-B2 §6 is corrected.
+- These launches run at 67–74 % of DRAM peak. Misaligned loads raise their DRAM traffic too
+  (chunk 0: 12.0 GB aligned against 25.5 GB all-misaligned).
+
+## 6. Stage 1: K_c' = 131008
+
+**The rule.** `K_c' = ⌊K_c/64⌋·64 = 131008 = 2047·64` replaces 131056.
+- Every full chunk then has `k0 ≡ kc ≡ 0 (mod 64)`, so its phase is `r·k̂ mod 64`.
+- The last chunk ends at k̂.
+- The phase class therefore depends on k̂ alone, and no chunk gets worse. A k̂ ≡ 0 (mod 64)
+  is aligned in every chunk.
+- 131040 would leave full chunks in class 32.
+
+**Exactness.**
+- `128²·131008 + 255 = 2146435327 ≤ 2³¹ − 1` and `−128·127·131008 = −2129666048`.
+- Chunking does not change W or C, so results are bit-identical.
+
+| check | result |
+|---|---|
+| `spec/params.py --check` | cert_kc and cert_row_phase pass; the boundary k list covers 131007–131073, 196608 / 196624, 262016 / 262017 / 262112 / 262113 / 262144 / 262160, 393024 / 393025 and 524032 / 524033 |
+| Apalache `Epilogue` | `Kp = 131008` |
+| pre-check on the old code with `imd_test_set_limits(k_chunk = 131008)` | 11 long-k cases (k = 131009 … 262212, N = 2–14, RN and TRUNC) bit-exact against the oracle at chunk 131008, and identical to the production-chunk run |
+
+**What changes.** The chunk count of `k̂ ∈ (j·131008, j·131056]` goes up by one. Each such
+call does one more add-mod launch per group and part and one more W read-modify-write
+(`N·b·m·n̂` bytes; about 30–40 µs at 2048², N = 8), and may need one more add-mod shape key.
+Nothing else changes: workspace and pack layout, pack format, host API version and
+calibration format.
+
+**Expected gain (projected from §5, not measured after the change).** For 2048² × 196608
+(N = 8, 128×256), chunk 0 should move from the all-misaligned rate to the aligned one:
+- K4 from 45.7 ms to about 23–25 ms;
+- the call from 23.4 to about 33 TFLOPS-eq.
+
+**Perf model.** `mac_ktail` format 2 ("k̂ mod 32 ≠ 0, or c·K_c' mod 32 ≠ 0") reduces exactly
+to "k̂ mod 32 ≠ 0", because c·K_c' ≡ 0. The rule's chunk counts in the windows change with
+`k_chunks`. The calibration format is unchanged, and θ (fitted with 131056) is refit in a
+later step.
+
+## 7. Review rulings (2026-10-05, binding)
+
+- **Stage 2 (AUTO).** A ∈ {16, 64} is a pure function of k, defined in `spec/params.py`. It
+  is not chosen by the perf model, because sizing stays GPU-free and independent of the
+  calibration.
+  - `K_PAD64_MIN` is frozen from a sweep of k̂ = 80…1024 (step 16) on four configurations
+    and two or three shapes, including a DF-CC shape.
+  - There is no `imd_options_t` field: that struct has no `struct_size`, so a new field
+    would break v8 callers.
+  - A test hook forces A, and `imd_lowering_t` reports the resolved `k_align`.
+- **Packs.** No pack override to force A = 16. The pack FORMAT word carries A (1 = A16,
+  2 = A64).
+- **Calibration.** No format bump; refit θ.
+- **W/n̂ stride.** Excluded and unmeasured; a later item.
+- **Stage-2 tests:**
+  - a TLA+ model of CUTLASS's residue-first address sequence (absolute addresses ≡ 0 mod 64;
+    `SectorK` renamed to `TileK`);
+  - a poisoned-workspace test over the AUTO range for every producer path (KF at k ∈ {600,
+    1000}; KL at k ∈ {1040, 4080}; K2/K3; packed A and B with the B-role tail; two-chunk k in
+    131009–131072);
+  - accuracy and κ paths identical across A.
+- **Deferred.** The realign-kernel alternative stays one deferred paragraph. The ncu check of
+  class 32 on 64×64 is wanted, but not as a gate.

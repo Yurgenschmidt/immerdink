@@ -225,6 +225,25 @@ validation logs next to them.
   - Evidence strength: 128×256 has the full sweep. 128×128 is partly counter-evidence (4960 is
     +14 % there). 64×128 and 64×64 are untested.
 
+  **Correction (2026-10-05, DESIGN v1.13 §4b, NOTES-K4ALIGN).** Later measurements found the
+  mechanism, and two statements above are wrong.
+  - **The "DRAM-channel effect" claim is wrong.** CUTLASS 2.x loads a chunk's residue tile
+    (`kc mod 64`) first, so row r's main-loop loads sit at phase `(r·k̂ + chunk end) mod 64`.
+    Under this rule:
+    - in 262144, chunk 0 (131056 long, ending at 48 mod 64) has every row misaligned, and
+      chunk 1 (ending at k̂) is aligned. It is chunk 0, not chunk 1, that is misaligned;
+    - in 262160, both chunks have half of the rows misaligned.
+
+    The two calls had equal misaligned fractions, so this check could not separate the
+    criteria. The aligned power-of-two stride was slower because of the residue-first
+    phase, not because of a DRAM-channel effect. 196608 (aligned, chunk 0 fully misaligned)
+    measured worst of the long-k cases: 2048² × 196608, N = 8, 128×256 ran at 23.4
+    TFLOPS-eq (70.5 ms; K4 45.7 ms), against 27.5 TFLOPS-eq (60.0 ms) at 196624.
+  - **k̂ ≡ 16 (mod 32) misaligns half of the rows, not every row.**
+  - The "per chunk" criterion above (`c·K_c' mod 32`) used the chunk start. It happened to
+    give the same slow-chunk count. Since v1.13, K_c' = 131008 ≡ 0 (mod 64), so the
+    criterion is exactly "k̂ mod 32 ≠ 0".
+
 ### 6.2 Hold-out, before and after (post-BIOS data, 136 calls, BURST, REPEAT state)
 
 "Before" is the v1.8 model form refitted on the same post-BIOS calibration data (`perf_fit
@@ -402,7 +421,9 @@ change per-query costs: in `planner_overhead`, predict takes 1.6–1.8 µs and r
 
 - **K4 alignment fix in the kernel.** Set K_c' = 131040 (≡ 0 mod 32) and pad k̂ to a multiple
   of 32. Half of all k̂ values pay 28–38 % in K4. This is a layout change, so it needs DESIGN
-  and TLA+ work first.
+  and TLA+ work first. **Superseded by DESIGN v1.13 §4b.** Class 32 is also slow on the
+  smaller tiles, so the target is K_c' = 131008 (done in v1.13 stage 1) and k̂ padded to 64 as
+  both the stride and the K extent (stage 2).
 - A **settled-clock / hot calibration point** for long thermal runs (16384³ at ~1950 MHz).
 - A **clock-scaled e_byte** in the power model.
 
