@@ -702,11 +702,14 @@ neg_resident_ws_vec, neg_resident_reads_ws]**
     shape key (plan host bytes);
   - workspace and pack layout, the pack format, the host API version and the calibration
     format do not change.
-- Expected gain, from the measured class rates, not measured after the change: k̂ ≡ 0 or 32
-  (mod 64) with k̂ > 131008 runs its full chunks at the aligned rate. For example,
-  2048² × 196608, N = 8 is projected to drop from 45.7 ms to about 23–25 ms in K4, so the
-  call goes from 23.4 to about 33 TFLOPS-eq.
-  - Cost in the windows: the extra launch and W pass, about 30–40 µs at 2048², N = 8.
+- **Measured** (same-session interleaved A/B of v1.12 and v1.13; NOTES-K4ALIGN §6):
+  - 2048² × 196608, N = 8, 128×256: 23.5 → 32.0 TFLOPS-eq per call (70.1 → 51.5 ms); K4
+    45.1 → 25.9 ms.
+  - 2048² × 196640 (k̂ ≡ 32 mod 64): 25.8 → 31.8 TFLOPS-eq.
+  - 512² × 262144: 11.1 → 11.8 TFLOPS-eq; K4 −18 %.
+  - Odd multiples of 16 (196624, 262160): unchanged within 2 %.
+  - Window cases (k̂ = 131040 and 131056, now two chunks): the call is unchanged within
+    1 %; K4 changes by −2 to +3 %.
 
 **Later stages (not in v1.13 stage 1; DESIGN text before code, review 2026-10-05):**
 - Stage 0, done with stage 1, is a refactor with no behaviour change. `k̂ = ⌈k⌉_A` has one
@@ -3420,7 +3423,9 @@ and host API; every value the same integer (bit-identical, tested on every contr
   CUTLASS loading the residue tile first. With 131056 (≡ 48 mod 64), an aligned k̂ had a
   fully misaligned chunk 0 (2048² × 196608, N = 8, 128×256: 23.4 TFLOPS-eq, 70.5 ms per
   call, K4 45.7 ms; measured before the change, NOTES-K4ALIGN). With 131008 the phase class
-  depends on k̂ alone, and no chunk gets worse.
+  depends on k̂ alone, and no chunk gets worse. Measured after the change (interleaved A/B):
+  that call runs at 32.0 TFLOPS-eq (51.5 ms, K4 25.9 ms), and 196640 goes from 25.8 to
+  31.8 TFLOPS-eq. Odd multiples of 16 and the window cases are unchanged within 2 %.
 - **Results are bit-identical**, since the chunking does not change W or C.
   - The calls with `k̂ ∈ (j·131008, j·131056]` gain one K-chunk: one more add-mod launch per
     group and part, one more W pass, and possibly one more add-mod shape key.

@@ -10,9 +10,9 @@ Stage 2 is designed in DESIGN §4b: k̂ = ⌈k⌉₆₄ above a threshold, pack 
 Its threshold `K_PAD64_MIN` is frozen from a sweep before any code. The rulings of the
 independent review (2026-10-05) are binding and listed below.
 
-The measurements were taken before any change (origin/dev ca7141c), with the profiling build
-of `imd_bench` and the repo's gated runner (quiet gate, shared GPU lock, warm-up), only while
-the machine was otherwise idle. The raw records and scripts are outside the product repo
+The measurements in §2–§5 were taken before any change (origin/dev ca7141c), and the A/B in
+§6 after it. All used the profiling build of `imd_bench` and the repo's gated runner (quiet
+gate, shared GPU lock, warm-up), only while the machine was otherwise idle. The raw records and scripts are outside the product repo
 (immerdink-eval `results/k4align`).
 
 ## 1. Mechanism
@@ -131,10 +131,29 @@ call does one more add-mod launch per group and part and one more W read-modify-
 Nothing else changes: workspace and pack layout, pack format, host API version and
 calibration format.
 
-**Expected gain (projected from §5, not measured after the change).** For 2048² × 196608
-(N = 8, 128×256), chunk 0 should move from the all-misaligned rate to the aligned one:
-- K4 from 45.7 ms to about 23–25 ms;
-- the call from 23.4 to about 33 TFLOPS-eq.
+**Measured after the change.** `bench/run_ab.sh` ran the stage 0 build (K_c' = 131056) and the
+stage 1 build (131008) interleaved per case, gated and warmed as above. The 2048² rows use
+`--k4 0` (128×256); the 512² rows use the rule's 128×128. N = 8.
+
+| case | k̂ mod 64 | chunks before → after | call TFLOPS-eq, before → after | call ms | K4 ms |
+|---|---|---|---|---|---|
+| 2048² × 131040 | 32 | 1 → 2 (window) | 33.3 → 33.6 | 33.0 → 32.7 | 16.61 → 16.35 |
+| 2048² × 131050 (k̂ 131056) | 48 | 1 → 2 (window) | 29.3 → 29.6 | 37.5 → 37.2 | 20.60 → 20.78 |
+| 2048² × 131056 | 48 | 1 → 2 (window) | 29.3 → 29.6 | 37.5 → 37.2 | 20.77 → 21.34 |
+| 2048² × 196608 | 0 | 2 → 2 | **23.5 → 32.0** | 70.1 → 51.5 | 45.08 → 25.92 |
+| 2048² × 196624 | 16 | 2 → 2 | 27.5 → 28.0 | 59.9 → 59.0 | 34.41 → 33.43 |
+| 2048² × 196640 | 32 | 2 → 2 | **25.8 → 31.8** | 63.9 → 51.9 | 37.98 → 25.98 |
+| 512² × 262144 | 0 | 3 → 3 | 11.1 → 11.8 | 12.3 → 11.7 | 3.64 → 2.97 |
+| 512² × 262160 | 16 | 3 → 3 | 11.4 → 11.5 | 12.1 → 11.9 | 3.37 → 3.24 |
+
+- The 196608 call is 36 % faster in TFLOPS-eq, and K4 drops by 43 %, close to the projected
+  23–25 ms.
+- Class 32 (196640) gains 23 %. Odd multiples of 16 are unchanged, as the rule predicts.
+- In the windows the extra chunk costs nothing measurable at 2048²: the call is within
+  1 %, and K4 moves by −2 to +3 %.
+- Timed-loop spread was ≤ 3.4 % for every record.
+- The perf model's error on these calls (still θ fitted with 131056) changes from −38 / −32 %
+  to −20 % on 196608 / 196640. A refit is still a later step.
 
 **Perf model.** `mac_ktail` format 2 ("k̂ mod 32 ≠ 0, or c·K_c' mod 32 ≠ 0") reduces exactly
 to "k̂ mod 32 ≠ 0", because c·K_c' ≡ 0. The rule's chunk counts in the windows change with
