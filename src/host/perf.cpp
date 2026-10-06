@@ -456,9 +456,9 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     // reduces to "slow iff k_hat mod 32 != 0", which is exact for the phase classes 16 / 48
     // (class 32, +3 % to +19 % measured, is not a separate term). v1.13 stage 2 (§4b.6): an
     // A = 64 plan (AUTO: k > 96) has k_hat = 0 mod 64 and is never slow; only A = 16 plans
-    // (k <= 96, or forced by the test hook) can be. Calibration format 2 is unchanged; its
-    // theta was fitted on misaligned data with K_c' = 131056 and is to be refit (A = 16-forced
-    // cases at k > 96 through --k-align keep the slow term determined).
+    // (k <= 96, or forced by the test hook) can be. Calibration format 2 is unchanged; theta was
+    // refit after stage 2 (2026-10-06, NOTES-B2 §8): the A = 16-forced calibration cases at
+    // k > 96 (--k-align 16) keep the slow term determined.
     const int64_t nfull = kc.k_chunks - 1;
     bool last_slow;
     int64_t full_slow;

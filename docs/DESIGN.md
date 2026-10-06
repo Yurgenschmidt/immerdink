@@ -668,9 +668,9 @@ binding; the threshold is frozen from the 2026-10-05 sweep). `spec/params.py` an
 `spec/oracle.py` run with `K_ALIGN_POLICY = "AUTO"`; their A16 paths stay exercised by the
 certificates and the oracle suite. Text marked **[stage 2]** elsewhere in this document is
 the implemented behaviour; the implementation notes (the one rule fixed for two packs, the
-places where the code had a choice) are in the v1.13 stage 2 change list. Still open: the
-θ refit and the `k4_select` re-check (§4b.6), and the real-implementation A/B sweep (§4b.8
-"Bench").
+places where the code had a choice) are in the v1.13 stage 2 change list. The θ refit and
+the `k4_select` re-check (§4b.6) were done on 2026-10-06: θ refit, rule unchanged (NOTES-B2
+§8, NOTES-K4ALIGN §10).
 
 ### 4b.1 Mechanism (measured; CUTLASS `predicated_tile_access_iterator.h:204-213, 514-523`)
 
@@ -964,7 +964,9 @@ Against A = 16, with `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆`:
     A = 16 plan (k ≤ 96) is unchanged. The `perf.cpp:449-456` comments are corrected. θ was
     fitted on misaligned data; it is **refit** (`tools/calibrate.sh`) after stage 2, and
     `k4_select`'s preference for 128×256 is re-checked then (the smaller configurations
-    gain the most from A = 64).
+    gain the most from A = 64). **Done 2026-10-06** (NOTES-B2 §8): θ refit with the A = 16
+    cases below; the rule is +0.65 % over the per-view fastest on a padded-k̂ grid, so it is
+    unchanged.
   - **MMA work before the refit.** `tile_macs ∝ k̂` (`k4_config.cpp`) undercounts A = 16
     plans: CUTLASS runs ⌈kc/64⌉ full 64-wide tiles per chunk either way. The model's MMA
     term uses **Σ_c ⌈kc⌉₆₄** over the plan's chunks (A-independent MMA work); only the
@@ -2562,11 +2564,11 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
     (+3 % for 128×256 and +10 to +19 % for the smaller tiles, measured) has no term of its
     own.
   - The calibration format is unchanged (review ruling 2026-10-05: no format bump, refit θ).
-    The shipped θ was fitted with the old chunk length; the refit is an open item, to be done
-    with stage 2.
+    The shipped θ was fitted with the old chunk length; it was refit after stage 2
+    (2026-10-06, NOTES-B2 §8).
   - **[stage 2]** (§4b.6) The rule stays exact with per-plan alignment: an A = 64 plan has
     k̂ ≡ 0 mod 64 and is never "slow"; A = 16 plans (k ≤ 96) are unchanged. No format bump;
-    θ is refit after stage 2 and `k4_select` re-checked. The model's K4 and byte terms use
+    θ was refit after stage 2 and `k4_select` re-checked (unchanged; NOTES-B2 §8). The model's K4 and byte terms use
     the plan's (padded) k̂; useful flops stay the logical 2mnk.
 
 - **The eps path** (the `op_eps` features, reviewed 2026-10-05). The packs quantize an
@@ -4023,7 +4025,8 @@ and host API; every value the same integer (bit-identical, tested on every contr
   - *`k4_select`* keeps its estimate over the plan's k̂ (unchanged for every A = 16 plan);
     only the performance model's K4 MMA term and its ops count use Σ⌈kc⌉₆₄ (§4b.6). An
     A = 16-forced plan of k > 96 may therefore pick another K4 configuration than the
-    A = 64 plan of the same k (results are identical). To be re-checked with the refit.
+    A = 64 plan of the same k (results are identical). Re-checked with the refit: the rule
+    stays (NOTES-B2 §8).
   - *Tests (§4b.8):* `host_k_align` (new, CPU); `host_c_api` (the hand-computed A = 64
     cases, the 180² case recomputed, a v5-size caller); `host_python` (`suite_k_align`: the
     boundary k list, every query at the hook's 16 and 64 against params / oracle at the
@@ -4039,4 +4042,13 @@ and host API; every value the same integer (bit-identical, tested on every contr
   - *Bench and calibration:* `imd_bench --k-align auto|16|64` (or `IMD_BENCH_K_ALIGN`);
     every record carries `k_align_hook`, imd / duel records also `k_align` and `k_hat`;
     `tools/calibrate.sh --k-align`; `bench/perf_fit.py` models each record at its
-    alignment (records without the field ran at A = 16: they predate stage 2). No refit yet.
+    alignment (records without the field ran at A = 16: they predate stage 2).
+  - *Refit (2026-10-06, branch `k4-align-s2-refit`; NOTES-B2 §8).* The shipped calibration
+    was refit with no format change: 14 new calibration cases (A = 16 forced at k > 96 on
+    every configuration, AUTO k ≤ 96) and 16 new hold-out cases across the AUTO range. The
+    hold-out meets every §6c.5 target. `tools/calibrate.sh --sustained / --cache` reuse
+    earlier sustained / cache records when those sweeps' plans are unchanged.
+    `bench/perf_fit.py` now fits the K4 MAC costs per round, c_q = q·mac_q, as cumulative
+    non-negative increments (c_1 ≤ c_2 ≤ c_3), so a round of q concurrent CTAs never costs
+    less than a round of q − 1. This keeps the predictions monotone in the shape (host_perf).
+    The `k4_select` re-check keeps the rule and its constants.

@@ -634,3 +634,151 @@ the ε path, g, the vec mode, packing and K4 were confirmed exact. Changes:
 12. **The ε path and the K4 configuration do not enter the error.** They are exact, so
     accuracy depends only on (N, rounding, dispatch, k, M) and the statistics. g, the vec mode
     and packing have no effect.
+
+## 8. Refit after K4 alignment stage 2 (2026-10-06, branch `k4-align-s2-refit`)
+
+DESIGN v1.13 §4b.6, review ruling "no calibration format bump; refit θ". Stage 2 pads k̂ to
+64 for k > 96, so the format-2 slow-chunk term (`mac_ktail`, "k̂ mod 32 ≠ 0") is reached
+only by k ≤ 96 plans under AUTO. The shipped θ (2026-10-05) had been fitted on A = 16 data
+with K_c' = 131056.
+
+**Data** (RTX 4090, stock clocks, quiet gate and shared GPU lock, `ehrenfest_busy.sh` FREE
+before every run; profiling `imd_bench` at f9c4950):
+- calibration: `tools/calibrate.sh` over bench/sweep_calib.txt, 01:07–01:29 (22 min), 447
+  timed calls. The sweep keeps every earlier case, which now runs at AUTO (the `t_k*` fine-k̂
+  cases measure the aligned rate at the padded k̂). It adds 14 cases (`a_*`):
+  - A = 16 forced through `--k-align 16` at k > 96 (k̂ mod 32 = 16) on all four K4
+    configurations: 2048² × {784, 1008, 1040, 4880, 5008}, 256 × 3000 × 1000,
+    512² × 1000, 2000 × 128 × 30000 and 768² × 65552;
+  - AUTO k ≤ 96 (k̂ = 48 and 80 are slow, 64 and 96 are not) at 2048² and 512².
+- sustained and cache records: reused from 2026-10-05 13:20 through the new
+  `tools/calibrate.sh --sustained FILE --cache FILE`. This saves about 13 GPU minutes, and
+  is exact because every case of those two sweeps has k ≡ 0 (mod 64), so its plans are
+  unchanged by stage 2.
+- hold-out: bench/sweep_perf_validate.txt, 01:29–01:44 (15 min), 178 calls. It adds 16 cases
+  (`z_*`) with k across the AUTO range: 1536² × {80, 112, 144, 208, 528, 1000, 2032, 4080},
+  12288 × 384 × {144, 1040}, 400² × 200, 600³, a DF `acQ,bdQ->acbd` 56⁴ with Q = 2000, a
+  CC `kjbc,kiac->abij` with o = 19, v = 112, and two A = 16-forced cases (1536² × 1008 and
+  3000 × 700 × 5000).
+- Raw records, fits and logs are in immerdink-eval `results/k4align/refit/`.
+
+**Fitted K4 terms** (ps per MAC at full occupancy; slow chunk = `mac_ktail` / that rate):
+
+| configuration | round µs, before → after | MAC rate, before → after | slow-chunk extra, before → after |
+|---|---|---|---|
+| 128×256 | 3.56 → 2.91 | 0.389 → 0.404 | +36 % → +26 % |
+| 128×128 | 3.69 → 3.64 | 0.394 → 0.390 | +71 % → +80 % |
+| 64×128 | 3.09 → 3.00 | 0.562 → 0.557 | +54 % → +86 % |
+| 64×64 | 4.23 → 3.57 | 0.373 → 0.472 | +263 % → +166 % |
+
+**Fitter change: monotone K4 rounds.** The first refit gave 64×64 mac1 = 0.86 ps and
+mac2 = 0, so a round of two concurrent CTAs cost less than a round of one. host_perf then
+failed its monotonicity check: 3142 × 128 × 4434 predicted faster than 3142 × 64 × 4434 under
+64×64 at N = 6, g = 2. The calibration's 64×64 cases have no two-CTA rounds, so mac2 was
+unidentified. `bench/perf_fit.py` (`k4_round_monotone`) now fits the per-round MAC costs
+c_q = q·mac_q as cumulative sums of non-negative increments, so c_1 ≤ c_2 ≤ c_3 with NNLS
+unchanged. Fit quality is the same or better: 64×128 phases 9.0 / 21.2 → 7.7 / 20.5 %, and
+hold-out K4 p90 on ≥ 1 ms 14.3 → 13.0 %. The constraint is active for 64×128 (c_1 = c_2) and
+64×64 (c_2 = c_3).
+
+Every `mac_ktail` stays determined (non-zero) with the forced cases. The size ordering of the
+slow-chunk penalty (128×256 smallest) matches NOTES-K4ALIGN §2. The other changes:
+- K4 effective L2: still 0.40 × 72 MiB.
+- K4 DRAM rates: 775 / 775 / 737 / 667 GB/s.
+- `power.clock_eff_mhz`: 2530 → 2455 MHz (sustained leave-one-out median 1.6 %).
+- `rank.tie_ratio`: 1.075 → 1.078.
+- Bands: the 5 / 95 hold-out quantiles, cross-validated coverage 82 %. Call bands are
+  < 100 µs 0.906–1.251, 100 µs – 1 ms 0.890–1.108 and ≥ 1 ms 0.926–1.028.
+
+In sample, on the new calibration records, the ≥ 1 ms max error falls from 29.5 % (old θ) to
+16.1 %. The old θ predicted 256² × 150000 at g < N (`c_rkl2g`, K4 memory-bound, k̂ now
+150016 instead of the slow 150000) up to 21–30 % too fast; the refit has it within −11 … +4 %.
+
+**Hold-out, before (shipped θ of 2026-10-05) and after (the shipped refit), same 178 calls,
+BURST, REPEAT** (median / p90 / max |error| of the predicted call time):
+
+| subset | measured call | calls | before | after | target |
+|---|---|---|---|---|---|
+| all | < 100 µs | 44 | 8.9 / 16.0 / 23.1 % | 7.2 / 17.3 / 24.6 % | 15 / 30 % |
+| all | 100 µs – 1 ms | 68 | 4.1 / 14.6 / 19.6 % | 4.5 / 14.8 / 19.7 % | 10 / 20 % |
+| all | ≥ 1 ms | 66 | 1.9 / 6.5 / 15.8 % | 1.9 / 7.3 / 15.3 % | 5 / 15 % |
+| N = 15–17 | < 100 µs | 6 | 8.9 / 9.9 / 9.9 % | 8.9 / 10.5 / 10.5 % | |
+| N = 15–17 | 100 µs – 1 ms | 26 | 8.3 / 15.7 / 19.6 % | 8.0 / 15.8 / 19.7 % | |
+| N = 15–17 | ≥ 1 ms | 24 | 2.8 / 7.0 / 15.8 % | 2.7 / 7.4 / 15.3 % | |
+| new AUTO-range cases (`z_*`) | < 100 µs | 9 | 12.0 / 16.8 / 19.0 % | 6.0 / 19.3 / 20.3 % | |
+| new AUTO-range cases | 100 µs – 1 ms | 20 | 2.8 / 8.3 / 16.2 % | 2.5 / 7.4 / 16.4 % | |
+| new AUTO-range cases | ≥ 1 ms | 3 | 3.8 / 5.7 / 6.2 % | 2.9 / 6.4 / 7.3 % | |
+| k mod 64 ≠ 0 (A matters) | < 100 µs | 17 | 10.4 / 16.8 / 19.0 % | 7.4 / 19.6 / 20.3 % | |
+| k mod 64 ≠ 0 | 100 µs – 1 ms | 39 | 3.5 / 11.6 / 19.6 % | 3.2 / 11.3 / 19.7 % | |
+| k mod 64 ≠ 0 | ≥ 1 ms | 18 | 2.9 / 9.4 / 15.8 % | 3.9 / 7.8 / 15.3 % | |
+| k mod 64 = 0 | < 100 µs | 27 | 6.9 / 15.2 / 23.1 % | 6.9 / 14.7 / 24.6 % | |
+| k mod 64 = 0 | 100 µs – 1 ms | 29 | 6.2 / 15.0 / 16.2 % | 6.8 / 15.1 / 16.1 % | |
+| k mod 64 = 0 | ≥ 1 ms | 48 | 1.4 / 5.9 / 10.3 % | 1.8 / 6.7 / 11.4 % | |
+| k ≤ 96 or A = 16 forced | all | 8 | 0.3–17.7 %, median 3.6 % | 0.5–20.3 %, median 4.0 % (the max is 96³ at N = 14, KF; 1536² × 80 +13 / +14 → +6 / +8 %) | |
+
+Per phase on calls ≥ 1 ms (median / p90, before → after):
+- K4: 3.3 / 14.5 → 4.7 / 13.0 %
+- K0: 7.8 / 14.6 → 5.3 / 17.4 %
+- KL A: 4.1 / 13.5 → 4.1 / 14.1 %
+- K3: 11.7 / 22.0 → 11.9 / 22.2 %
+- K5: 4.3 / 17.0 → 4.4 / 17.5 %
+
+All targets are met before and after.
+
+What the refit buys is on the shapes stage 2 changed:
+- The small-k AUTO calls lose the over-prediction: the old θ priced A = 64 as if it were
+  still partly slow. Before → after (call time measured / predicted with the refit):
+  - 1536² × 80: +13 / +14 % → +6 / +8 % (63.2 / 66.8 µs at N = 8; 5.98 / 5.65 TFLOPS-eq);
+  - × 112: +12 / +11 % → +6 / +6 %;
+  - × 144: +6 / +3 % → +1 / −1 %;
+  - × 208: +7 / +7 % → +2 / +3 %.
+- The two A = 16-forced hold-out cases: 1536² × 1008 −1.8 / +3.5 % → −4.8 / +0.5 %, and
+  3000 × 700 × 5000 +3.8 / +1.6 % → +1.5 / −0.8 %.
+
+On aligned shapes the refit is neutral to slightly worse (≥ 1 ms p90 5.9 → 6.7 %, within the
+spread of two calibration days). The largest remaining errors are unchanged by the refit:
+- KF on 600³ / 400² × 200 / 96³: −13 … −20 %;
+- 12288 × 384 × 1040: −7 … −10 %;
+- DF 56⁴ at N = 16: +7 %.
+
+Examples, refit (TFLOPS-eq measured / predicted; time measured / predicted):
+
+| call | TFLOPS-eq | time |
+|---|---|---|
+| sq8192, N = 14 | 36.25 / 36.88 | 30.34 / 29.82 ms |
+| t_cc (32 / 128), N = 14 | 31.85 / 31.05 | 4.32 / 4.43 ms |
+| DF 56⁴, Q = 2000, N = 8 | 39.45 / 38.67 | 0.997 / 1.017 ms |
+| CC o = 19, v = 112, N = 16 | 16.94 / 17.44 | 1.138 / 1.105 ms |
+| 1536² × 4080, N = 8 | 34.72 / 34.21 | 0.555 / 0.563 ms |
+| 1536² × 80, N = 8 | 5.98 / 5.65 | 63.2 / 66.8 µs |
+
+**`k4_select` re-check (no change).** The K4 rule constants (DESIGN §4, NOTES-A3 §3) come from
+84 A3 cases with mostly power-of-two k. Under stage 2, A = 64 gives every k > 96 the aligned
+rate, so the question was whether the smaller tiles now win where the rule keeps 128×256.
+- Grid: 15 views × N = 8 / 14, each with every configuration forced plus the rule, call
+  medians of 20–300 reps, all with k ≢ 0 (mod 64) so that k̂ is padded. The views were 384²,
+  512² and 1024² × 1000, 512² × 4080, 768² × 760, 1024² × 250, 1536² × 500, 2048² × 1000,
+  256² × 8100, 128² × 16300, 1000 × 64 × 50000, 4096 × 128 × 4000, 4 × 256² × 500,
+  256 × 64² × 100 and 512² × 32700.
+- Ran at 01:44–01:48 (3.5 min). Raw data and scripts: `results/k4align/refit/k4grid*`.
+- **Result:** the rule's calls sum to 11.42 ms, against 11.35 ms for the per-view fastest
+  configuration (+0.65 %) and 12.12 ms for always 128×256 (−5.8 %).
+- The rule is the fastest configuration or within 1.5 % in 27 of 30 groups.
+  - The three exceptions are 4 × 256² × 500 at N = 14 (128×256 instead of 128×128,
+    1.048×), 768² × 760 at N = 8 (128×128 instead of 64×128, 1.034×) and 256² × 8100 at
+    N = 8 (64×64 instead of 64×128, 1.066×).
+  - These are 45–100 µs calls. Measured with the rule's own record instead of the forced
+    run of the same configuration, the worst pick is 1.014×, so the gap is within
+    cross-process noise.
+- Offline (`k4margin.py`, the rule transcribed; it agrees with `k4_rule` in 30 / 30), the
+  margin changes almost nothing:
+  - margin 0 or 25 ‰: +0.52 %;
+  - 50 ‰ (shipped): +0.53 %;
+  - 75–150 ‰: +0.58 %, worst pick 1.09×.
+- The calibration's own forced-configuration cases agree: 32 groups, the rule +0.04 % over
+  the per-group fastest. Its worst picks are on calls of 15–25 µs (128³, 384³), where the
+  noise is larger.
+- So the rule is unchanged: no alternative is clearly better.
+- Caveat: an A = 16-forced plan (test hook only) is estimated over its unpadded k̂ and may
+  pick another configuration than the AUTO plan of the same k. This affects calibration
+  and tests, not production.

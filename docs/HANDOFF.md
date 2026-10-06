@@ -59,7 +59,8 @@ first.
   / `_A64`; a pack's format is that of its k); `imd_lowering_t` v6 `k_align` (192 bytes);
   test hook `imd_test_set_k_align` (libimmerdink_host; Python `host.test_set_k_align`);
   `imd_bench --k-align`. `spec/params.py` / `spec/oracle.py` run `K_ALIGN_POLICY = "AUTO"`.
-  Open: the real-implementation A/B sweep, the θ refit, the `k4_select` re-check. A caller
+  Done 2026-10-06: the A/B sweep (eval findings), the θ refit and the `k4_select` re-check
+  (rule unchanged; branch `k4-align-s2-refit`, NOTES-B2 §8). A caller
   that persists pack bytes must persist `format` and `pack_bytes` and re-pack on a change.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,

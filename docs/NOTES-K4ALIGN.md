@@ -12,8 +12,9 @@ API 9 (`imd_lowering_t.k_align`); the test hook `imd_test_set_k_align`. The thre
 frozen from the sweep in §8. The rulings of the independent review (2026-10-05) are binding
 and listed below. The TLA+ models (K4Align, Pipeline and PackedOperand additions) and the
 certificates are in DESIGN §4b.7; the test plan in §4b.8; the implementation notes in §9
-and in DESIGN's v1.13 stage 2 change list. Open: the real-implementation A/B sweep, the θ
-refit (with A = 16-forced cases at k > 96) and the `k4_select` re-check.
+and in DESIGN's v1.13 stage 2 change list. The real-implementation A/B sweep is in
+immerdink-eval `findings/k4align-s2-perf.md`. The θ refit (with A = 16-forced cases at k > 96)
+and the `k4_select` re-check (no change) were done on 2026-10-06: §10 and NOTES-B2 §8.
 
 The measurements in §2–§5 were taken before any change (origin/dev ca7141c), and the A/B in
 §6 after it. All used the profiling build of `imd_bench` and the repo's gated runner (quiet
@@ -161,13 +162,13 @@ stage 1 build (131008) interleaved per case, gated and warmed as above. The 2048
   1 %, and K4 moves by −2 to +3 %.
 - Timed-loop spread was ≤ 3.4 % for every record.
 - The perf model's error on these calls (still θ fitted with 131056) changes from −38 / −32 %
-  to −20 % on 196608 / 196640. The θ refit is an open item (review ruling: no format bump,
-  refit θ), to be done with stage 2.
+  to −20 % on 196608 / 196640. The θ refit (review ruling: no format bump,
+  refit θ) was done after stage 2 (§10).
 
 **Perf model.** `mac_ktail` format 2 ("k̂ mod 32 ≠ 0, or c·K_c' mod 32 ≠ 0") reduces exactly
 to "k̂ mod 32 ≠ 0", because c·K_c' ≡ 0. The rule's chunk counts in the windows change with
 `k_chunks`. Review ruling: no calibration format bump; refit θ (fitted with 131056). The
-refit is an open item, to be done with stage 2.
+refit was done after stage 2 (§10).
 
 ## 7. Review rulings (2026-10-05, binding)
 
@@ -295,7 +296,7 @@ v1.13 stage 2 change list, "Implementation"):
   ran and fires.
 - **Performance model:** the K4 MMA term (`tile_macs`) and the K4 ops count use Σ⌈kc⌉₆₄ over
   the plan's chunks (A-independent); bytes use the padded k̂. `k4_select` is unchanged (its
-  estimate uses the plan's k̂). No calibration change; θ is to be refit.
+  estimate uses the plan's k̂). No calibration-format change; θ was refit afterwards (§10).
 - **Kernels:** no change; KF's launch asserts `2^lg_tk ≥ k̂`.
 
 Tests (all passing, see the commit message for counts): `host_k_align` (new),
@@ -305,3 +306,27 @@ identical C across A, PACK_MISMATCH through the hook), the stage-1 window tests 
 A = 16, `spec/params.py --check`, `spec/test_oracle.py`. compute-sanitizer initcheck (fresh,
 never-written allocations: `IMD_TEST_POISON=0`) and memcheck over the two `k_align` suites
 (`IMD_TEST_QUICK=1`): clean.
+
+## 10. θ refit and `k4_select` re-check (2026-10-06, branch `k4-align-s2-refit`)
+
+The full write-up, with the hold-out tables, is in NOTES-B2 §8. In brief:
+- **Calibration.** No format change. `tools/calibrate.sh` ran bench/sweep_calib.txt with 14
+  new cases: A = 16 forced through `--k-align 16` at k > 96 on all four configurations, plus
+  AUTO k ∈ {48, 64, 80, 96}. The sustained and cache records of 2026-10-05 were reused
+  (`--sustained` / `--cache`), since every case there has k ≡ 0 (mod 64). This took 22 GPU
+  minutes. Every `mac_ktail` stays determined. The fitted slow-chunk extra per MAC is +26 %
+  (128×256), +80 % (128×128), +86 % (64×128) and +166 % (64×64).
+- **Hold-out** (178 calls, 16 new cases across the AUTO range). All targets are met before
+  and after. Median / p90 |error|, before → after:
+  - ≥ 1 ms: 1.9 / 6.5 → 1.9 / 7.3 %;
+  - 100 µs – 1 ms: 4.1 / 14.6 → 4.5 / 14.8 %;
+  - < 100 µs: 8.9 / 16.0 → 7.2 / 17.3 %.
+- **Where the refit helps.** The over-prediction of small-k AUTO calls halves (1536² × 80 /
+  112: +12 … +14 % → +6 … +8 %), as does the error on calls of k mod 64 ≠ 0 below 100 µs
+  (median 10.4 → 7.4 %).
+- **Fitter.** `perf_fit` now keeps the K4 round cost monotone in the number of concurrent CTAs
+  (`k4_round_monotone`, NOTES-B2 §8). Without it, the unidentified 64×64 mac2 fitted to 0 and
+  host_perf's monotonicity check failed.
+- **`k4_select`.** The constants are unchanged. On a 15-view grid with every configuration
+  forced and k̂ padded, the rule is +0.65 % over the per-view fastest (always 128×256:
+  +6.8 %). Margin variants move this by at most 0.06 pp. No alternative is clearly better.

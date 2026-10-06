@@ -41,6 +41,7 @@ import itertools
 import json
 import math
 import os
+import re
 import statistics
 import sys
 
@@ -284,11 +285,34 @@ def predicted_ns(params, names, cls, x):
     return sum(terms)
 
 
-def fit_k4(X, t, byte_col, rates=None):
+def k4_round_monotone(cls_names, used):
+    """The K4 MAC parameters reparametrized so that a round of q concurrent CTAs never costs
+    less than a round of q - 1 (2026-10-06, NOTES-B2 §8): with c_q = q mac_q (the cost per
+    tile-MAC of a q-CTA round), fit d_p >= 0 with c_q = d_1 + ... + d_q. Returns T with
+    theta = T d over the class's used columns (identity outside the mac columns): fitting X T
+    keeps NNLS and gives c_1 <= c_2 <= c_3. Without it NNLS may set mac2 = 0 next to mac1 > 0
+    (64x64, stage-2 refit), and the predicted time then drops when a shape grows from one to
+    two CTAs per SM (host_perf monotonicity)."""
+    T = np.eye(len(used))
+    macs = [(int(cls_names[j][3:]), i) for i, j in enumerate(used)
+            if cls_names[j] and re.fullmatch(r"mac\d", cls_names[j])]
+    for q, i in macs:
+        T[i, :] = 0.0
+        for p, ip in macs:
+            if p <= q:
+                T[i, ip] = 1.0 / q
+    return T
+
+
+def fit_k4(X, t, byte_col, rates=None, T=None):
     """max(round model, DRAM term) (a roofline): for each candidate DRAM rate (bandwidths from
     100 GB/s to 2 TB/s, or none) the round model is fitted (NNLS, relative) on the phases the
     DRAM term does not explain (its time below 90 % of the measured), and the rate with the
-    smallest total relative error of the max is kept."""
+    smallest total relative error of the max is kept. T (k4_round_monotone): fit in d with
+    theta = T d."""
+    if T is not None:
+        th, err = fit_k4(X @ T, t, byte_col, rates)
+        return (None if th is None else T @ th), err
     comp = [j for j in range(X.shape[1]) if j != byte_col]
     xb = X[:, byte_col]
     best, best_err = None, float("inf")
@@ -326,11 +350,12 @@ def fit(samples, seed, lib=None, verbose=True, worst=0, k4_shared_dram=False, fr
                 used = [j for j, n in enumerate(names[cls]) if n]
                 X = np.array([d[0][used] for d in data])
                 t = np.array([d[1] for d in data])
-                th = fit_k4(X, t, used.index(K4_BYTE), [rate])[0]
+                T = k4_round_monotone(names[cls], used)
+                th, e = fit_k4(X, t, used.index(K4_BYTE), [rate], T)
                 if th is None:
                     tot = float("inf")
                     break
-                tot += fit_k4(X, t, used.index(K4_BYTE), [rate])[1]
+                tot += e
             if best is None or tot < best[1]:
                 best = (rate, tot)
         shared = best[0]
@@ -347,7 +372,8 @@ def fit(samples, seed, lib=None, verbose=True, worst=0, k4_shared_dram=False, fr
         for j in [used.index(j) for j in used if f"{cls}.{names[cls][j]}" in drop]:
             X[:, j] = 0.0  # a dropped feature: its parameter fits to 0
         if is_k4(cls):
-            theta = fit_k4(X, t, used.index(K4_BYTE), None if shared is None else [shared])[0]
+            theta = fit_k4(X, t, used.index(K4_BYTE), None if shared is None else [shared],
+                           k4_round_monotone(names[cls], used))[0]
         else:
             theta = nnls_relative(X, t)
         for j, v in zip(used, theta):
@@ -408,7 +434,7 @@ def k4_error(samples, lib, shared, fref=0.0):
         used = [j for j, n in enumerate(names[cls]) if n]
         X = np.array([d[0][used] for d in data])
         t = np.array([d[1] for d in data])
-        tot += fit_k4(X, t, used.index(K4_BYTE))[1]
+        tot += fit_k4(X, t, used.index(K4_BYTE), None, k4_round_monotone(names[cls], used))[1]
     return tot
 
 
