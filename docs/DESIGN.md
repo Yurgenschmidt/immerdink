@@ -1,4 +1,4 @@
-# immerdink — design (v1.16)
+# immerdink — design (v1.17)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -63,6 +63,12 @@ contract), the exact maxima of the reduction sum, a W-aware occupancy query for 
 performance model, and W = 1 for N ≤ 8 evaluated and not adopted (pack phases −2.7 %, below
 the 3 % bar, for +11 % library size). Same int8 bytes: no semantic, layout, launch-shape,
 pack-format, API, calibration-format or TLA+ change; changed text is marked **[v1.16]**.
+v1.17 (§6c) adds two features to the performance model in the slots the eps path freed: KF's
+per-element chain (`kf.elem`) and the PACK bytes that are not L2 hits (`pack.dram`, with the
+residency size `warm.pack_l2_bytes`), all optional keys (absent = 0 predicts exactly as
+before; calibration format 2 kept), host API 12 (one appended calibration field), a less
+overfit choice of the effective clock f_ref, and a full recalibration (NOTES-B2 §11). No
+semantic, layout, launch, pack-format or TLA+ change; changed text is marked **[v1.17]**.
 The change lists are at the end.
 
 Sources:
@@ -2628,9 +2634,9 @@ fraction (below), `L2` = the calibration's `l2_bytes`. Only **in-line** operands
 | phase (bench tag) | when | class | x₀ | x₁ | x₂ | x₃ | x₄ |
 |---|---|---|---|---|---|---|---|
 | `K0 vec` | `IMD_VEC_GENERATE`, no KF (any dispatch but NOOP) | K0 | 1 | `8V` written | | | |
-| `KF fused` | `fused` (§4) | KF | 1 | `Σ_x (8E_x + g·pad_x·k̂ + 3rows_x) + 8V·[GENERATE]` | `g·Σ_x E_x` residues | `Σ_x rows_x` | `f·x₂`; x₅ = the busiest SM's chain (below) |
+| `KF fused` | `fused` (§4) | KF | 1 | `Σ_x (8E_x + g·pad_x·k̂ + 3rows_x) + 8V·[GENERATE]` | `g·Σ_x E_x` residues | `Σ_x rows_x` | `f·x₂` ([v1.17] `elem`, below); x₅ = the busiest SM's chain (below) |
 | `KL A`, `KL B` | `fused_large` bit of x | KL | 1 | `8E_x + g·pad_x·k̂ + 3rows_x` | `g·E_x` | `16·rows_x·max(0, k̂ − 2·tk_x)` L2 re-read | `f·x₂` |
-| `K2 pack A`, `K3 pack B` | groups of x not packed by KF / KL | PACK | launches (B: + the zero-rows launch per group if n̂ > n) | `Σ_groups (8E_x + g_i·pad_x·k̂)` | `Σ_groups g_i·E_x` | `f·x₂` | |
+| `K2 pack A`, `K3 pack B` | groups of x not packed by KF / KL | PACK | launches (B: + the zero-rows launch per group if n̂ > n) | `Σ_groups (8E_x + g_i·pad_x·k̂)` | `Σ_groups g_i·E_x` | `f·x₂` ([v1.17] `dram`: x₁ − the L2-hit re-reads, below) | |
 | `K4 gemm` | EMULATE | K4[config] | rounds | MACs run at q = 1 | q = 2 | q = 3 | DRAM bytes beyond L2: `Σ_groups max(0, g_i·b·(m + n̂)·k̂ + g_i·b·m·n̂·(2·k_chunks − 1) − L2)`; x₅ = the busiest SM's MACs of K-chunks whose length is not a multiple of 64 (`mac_ktail`; [v1.10] format 2: of 32, below) |
 | `K5 crt` | EMULATE | K5 | 1 | `N·b·m·n̂ + 3b(m+n) + 8bmn(1+β')` | `N·L32·b·m·n` limb operations | | |
 | `DIRECT` | DIRECT dispatch | DIRECT | 1 | `8b(mk + nk) + 8bmn(1+β')` | `2bmnk` FP64 flops | | |
@@ -2789,6 +2795,39 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
   A pre-v1.15 calibration (the shipped one before the combined refit, NOTES-B2 §10) loaded by
   this library predicts without its eps terms; at N ≥ 15 on typical data that is up to the
   eps terms faster than it predicted before, which is what the v1.14 kernels measure.
+- **[v1.17] KF's element chain and the PACK L2-hit re-reads** (NOTES-B2 §11; the analysis:
+  evaluation workspace `findings/openitems-model-analysis.md`). Two **additive** features in
+  the slots the eps path freed (KF x₄, PACK x₃). Every existing feature keeps its meaning and
+  the new keys are optional (absent = 0), so a calibration without them predicts
+  bit-identically (format 2 kept; §6c.2, §6c.5).
+  - **KF x₄ = `elem`**, the busiest SM's per-element chain: KF's launch exactly as for
+    `kf.chain` (one helper, `kf_launch_shape`: tiles, parts, E = 16 or 4, r = kernel.kf16 /
+    kf4), `x₄ = ⌈B/(S·r)⌉ · ⌈tiles/grid_x⌉ · E`, i.e. `kf.chain` with u = E instead of
+    E·⌈g/parts⌉. Each moduli part loads its tile, quantizes it and reduces |a'| to W words
+    (§3.4.1) once per element before it emits that element's residues; this cost does not
+    grow with the residue count, and the per-residue features (bytes, op, chain) priced it as
+    if it did. Measured (REPEAT, 1024³, g = N): KF 30.5 µs at N = 8 and 35.8 µs at N = 14
+    (+17 %), where the v1.15 refit predicted 23.5 → 51.8 µs (+120 %); the tiny CC call
+    `v_cc12` N = 8 was −29 %. Not clock-bound (mostly the tile load's latency, like
+    `pack.wave`). W is not in the term: scaling it by W/2 fitted worse (N ≥ 17 over-predicted),
+    and kernel.kf16 / kf4 have the same CTAs per SM for W = 2 and 3 ([v1.16] W-aware
+    occupancy, asserted by `contract_api`), so no per-W occupancy is needed.
+  - **PACK x₃ = `dram`**, the phase bytes that are not L2 hits: `x₃ = x₁ − hit`, where `hit` =
+    the operand re-reads of the phase's launches, `(groups − [x's first group is in this
+    phase]) · 8·rows_x·k`, when the call's group working set `S = Σ_{in-line y} (8·rows_y·k +
+    g·pad_y·k̂)` (both operands plus one group's residues: what passes through L2 between two
+    re-reads of x) is at most `L_hit` = `warm.pack_l2_bytes`, and 0 otherwise (always 0 when
+    L_hit = 0). A hit byte costs `pack.byte`, every other byte `pack.byte + pack.dram`.
+    Measured (g = 4, KL path, squares): K3 predicted 1.5–1.7× slow for S ≤ 57 MB (1280³,
+    1536³) and 1.15–1.4× fast for S ≥ 77 MB (1792³ … 2560³), at every N; one byte rate
+    averaged the two. The 4090 data bound L_hit to [57, 77) MB; `perf_fit.py` sets it to
+    0.8 × the nominal L2 (60.4 MB, the cache term's residency fraction, §6c.2). Not clock-bound.
+    Terms in W, the grid shape or the occupancy fitted to 0 in the analysis.
+  - Not adopted: the analysis's KF read / write byte split (residue writes cost ~1/3 of an
+    input read per byte: they stay in L2 until K4). It needs a seventh KF slot, or a
+    retirement of `kf.op` / `kf.row` (both fit 0 on the 4090, but retiring them changes the
+    meaning of existing keys, which needs a format bump); offline it moved the hold-out by
+    ≤ 0.9 points per statistic over `elem` + `dram` (NOTES-B2 §11).
 - **K4's DRAM term.** The operands of a group were just written by the packs and stay in L2
   while the group's operands and W planes fit; beyond that K4 streams them from DRAM
   (measured memory-bound: r_mm-like n̂ = 64–128 with long k, skinny m ≫ n). The calibration
@@ -2846,7 +2885,8 @@ split into a time model at a given clock and a clock model per regime.
 
 - **Time at clock f.** Each feature is either clock-bound (scales with the SM clock) or not:
   DRAM bytes (every `byte` feature, K4's DRAM term), `launch` and the call term are not; every
-  other feature (op, op_eps, row, chain, l2byte, K4's round model) is. With the calibration's
+  other feature (op, op_eps, row, chain, l2byte, K4's round model) is; [v1.17] `kf.elem` and
+  `pack.dram` are not (a tile-load latency and DRAM bytes). With the calibration's
   reference clock `f_ref`: `t_p(f) = Σ_{clock-bound j} θ_j x_j · f_ref / f + Σ_{others} θ_j x_j`
   (K4: `max(rounds · f_ref / f, DRAM term)`). **As calibrated (NOTES-B2 §6):** θ are the costs
   of the burst calibration state as measured, **not** normalized per record (normalizing by
@@ -2857,7 +2897,15 @@ split into a time model at a given clock and a clock model per regime.
   relative indicator. `f_ref` (`power.clock_eff_mhz`) is then the **effective** clock of those
   θ: scanned from the boost clock down by the leave-one-case-out error of the sustained
   windows (the burst calibration's large calls already ran below boost: the limiter acts
-  within a timed loop). On the 4090: 2530 MHz (boost 2805). `clock_mhz` in requests and
+  within a timed loop). On the 4090: 2530 MHz (boost 2805). **[v1.17] Selection rule:** the
+  scan (17 candidates, 25 MHz apart, from the boost clock down) is flat near its minimum and
+  its argmin is noise (2026-10-06: 2455 / 2480 / 2505 / 2530 MHz gave 1.07 / 0.78 / 0.97 /
+  0.88 %, and the folds of a nested leave-one-out chose 2405–2530 MHz). `perf_fit.py` takes
+  the vertex of the least-squares parabola through the scan points within ±100 MHz of the
+  argmin (clamped to that window; the argmin itself if the parabola is not convex or has
+  fewer than 5 points) and prints the **nested** leave-one-case-out error (f_ref selected
+  inside each fold by the same rule, the left-out case predicted at that fold's f_ref and
+  power fit), which the notes report instead of the scan's minimum. `clock_mhz` in requests and
   results is on this scale.
 - **Power at clock f** (an energy roofline): `P(f) = P_idle + [ (e_tc·O_tc + e_alu·O_alu) ·
   (f/f_ref)^γ + e_byte·D ] / t(f)`, with O_tc = K4's int8 ops (its phase `ops`), O_alu = the
@@ -2950,7 +2998,10 @@ phase layout is frozen); the prediction reports `warm_bytes` = res. Calibration:
 the repeat calls (`--l2 repeat`, the default) and `--methods pair` (a square GEMM whose second
 call reads the first call's C as its A: WARM); Δ and L_w are fitted on the differences
 (a scan over L_w, least squares for Δ on COLD − REPEAT; 4090: L_w = 0.8 × 72 MiB, Δ = 1.46 ps
-per byte). **If the measured COLD / WARM difference is below a few
+per byte). **[v1.17]** `--l2 flush` evicts the L2 before each *timed* call only: a flushed
+record's per-phase times (the profiled phase reps) are REPEAT state, and `perf_fit.py` now
+raises them to COLD like every repeat record's phases (it treated them as COLD; no
+calibration or hold-out record used `--l2 flush`, so no shipped fit was affected). **If the measured COLD / WARM difference is below a few
 % of the call on every measured shape, the calibration keeps Δ = 0 (COLD = WARM, the option
 stays as a reported no-op) and NOTES-B2 says so.** A format-1 calibration has Δ = 0.
 
@@ -3013,12 +3064,23 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   ordinary least squares of `(t_timed − Σ_p t̂_p) / t_timed` on (1, kernel_launches). Classes
   the sweep cannot exercise get documented stand-ins: BETA takes K5's launch and byte
   parameters. The fitter prints per-class residuals and writes the file.
+- **[v1.17] Fit and data.** `perf_fit.py` writes `warm.pack_l2_bytes` = 0.8 × the records'
+  nominal L2 (`--pack-l2-frac`; the 4090: 60.4 MB) into the seed calibration before any
+  feature is computed, so fit and prediction see the same hit rule, and prints the PACK error
+  over 0.6–1.0 × L2 as a diagnostic (no selection: the calibration set has one case on each
+  side of the step). `CLOCK_BOUND`: kf (2, 3, 5), pack (2, 4). `bench/sweep_calib.txt` adds
+  the step's cases (`c_l2s1536` N = 8 / 14 / 20 and `c_l2s1792` N = 14 at g = 4; `c_k3hit` /
+  `c_k3miss`, 1024 / 4096 × 96 × 4096 at g = 2); `bench/sweep_perf_validate.txt` adds
+  N = 18–20 cases (W = 3, §3.4.1).
 - **File format 1** (`*.calib`): UTF-8 text, one `key = value` per line, `#` comments and
   blank lines ignored, keys unique, values to the end of the line (trimmed). Required:
   `format = 1`, `gpu`, `sm_count`, the three peaks, `l2_bytes` and **every** parameter
   (`<class>.<feature>`, ns per feature unit, e.g. `kl.byte`, `kl.op_eps`, `k4_64x64.mac2`,
   `k4_64x64.byte`; [v1.15] except `kf.op_eps`, `kl.op_eps`, `pack.op_eps`: optional, absent =
-  0, no effect, written only when non-zero, §6c.1 "The eps path — retired"); optional
+  0, no effect, written only when non-zero, §6c.1 "The eps path — retired"; [v1.17] they are
+  **retired keys**: accepted in formats 1 and 2 (a number ≥ 0, at most once) and discarded,
+  never written: their slots now hold `kf.elem` and `pack.dram`, and `kl.op_eps` has no slot);
+  optional
   metadata `date`, `version` (immerdink commit / host API), `clocks` (clock and power state
   of the calibration run), `notes`. Unknown keys, duplicates, a missing key, a malformed or
   negative-where-forbidden number, or another `format` → INVALID_VALUE with the line number.
@@ -3059,6 +3121,17 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
     (unknown key). Only a file that still carries all three `op_eps` keys and no `byte_f`
     loads in both. "Format 2" names the key grammar this library reads, not a promise that
     older libraries read every file it writes.
+  - **[v1.17, host API 12] optional:** `kf.elem`, `pack.dram` (parameters, ≥ 0) and
+    `warm.pack_l2_bytes` (L_hit of §6c.1, ≥ 0; the field `pack_l2_hit_bytes`), each absent
+    = 0 and written only when non-zero; format-2 keys (rejected in a format-1 file). With
+    all three absent a calibration predicts bit-identically to API 11 (tested): the features
+    are additive, no existing key changes meaning. **Why format 2 is kept** (§6c.5 says a
+    feature change is a new format): that rule exists so that a file is never read with
+    features it was not fitted with; here an older file sees exactly its own features (the
+    new parameters are 0) and a newer file is rejected by API ≤ 11 (unknown key), so no file
+    is misread. A bump would be needed if an existing key's meaning changed (e.g. the KF
+    read / write split of §6c.1, not adopted). A library older than API 12 rejects a file
+    containing any of the three keys.
   A value of several numbers is separated by blanks. **Reading format 1** migrates: the new
   parameters 0, the built-in occupancy table, no power model, Δ = 0, bands `1 1`; such a
   calibration predicts exactly as host API 6 did (tested). `imd_perf_calib_format` writes the
@@ -3085,6 +3158,10 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   `imd_perf_calib_format` do not fold: they read such a struct with byte_f = 0 (its bytes end
   before the field), which is the folded struct those functions returned. With byte_f = 0
   (every file before v1.15) the view is the full calibration.
+  **[v1.17] A version-7…11-sized struct** has no `pack_l2_hit_bytes`: every function reads
+  it as 0 (no fold), so the hit rule is off and every PACK byte costs `pack.byte +
+  pack.dram`, the DRAM rate. Another degraded, unvalidated view (pass NULL); with
+  `pack.dram` = 0 (every file before v1.17) it is the full calibration.
 - **Shipped table.** `src/host/calib/rtx4090_sm89.calib` (the 4090 at stock clocks, as
   shipped: no clock lock; its `clocks` line records the state) is embedded at configure time
   (CMake reads the file into a raw string literal: the file is the one source; editing it
@@ -3337,6 +3414,7 @@ enum { IMD_PERF_ORDER_TIME = 0, IMD_PERF_ORDER_TIES_BY_FOOTPRINT = 1 };
   double band_class[16][2];                                  /* per IMD_PERF_CLASS_*         */
   double tie_ratio;                                          /* rank tie window, 1 ... 1.25  */
   double energy_byte_f_pj;  /* [v1.15, API 11] clock-scaled byte energy (power.byte_f_pj)   */
+  double pack_l2_hit_bytes; /* [v1.17, API 12] L_hit of the PACK hit rule (warm.pack_l2_bytes) */
 /* imd_perf_request_t, appended (v6: 24 bytes, v7: 40):                                      */
   int32_t regime, cache;          /* IMD_PERF_REGIME_*, IMD_PERF_CACHE_*                    */
   double  clock_mhz;              /* > 0: NVML-scale clock, clamped to clock_eff (overrides
@@ -3367,6 +3445,11 @@ enum { IMD_PERF_ORDER_TIME = 0, IMD_PERF_ORDER_TIES_BY_FOOTPRINT = 1 };
   3680). A struct of the v7–v10 size (3672) is read with byte_f = 0 and receives the folded
   view from the calibration functions (§6c.2). Python: `Calibration.power` has
   `"power.byte_f_pj"`; `host.API_VERSION` 11.
+- **[v1.17] host API 12:** `imd_perf_calib_t` grows by `pack_l2_hit_bytes` (8 bytes, 3680 →
+  3688); a struct of the v7–v11 size is read with it 0 (§6c.2). `imd_perf_param_name`
+  returns `"elem"` for KF slot 4 and `"dram"` for PACK slot 3 (were `"op_eps"`) and NULL for
+  KL slot 4 (retired). Python: `Calibration.warm` has `"warm.pack_l2_bytes"`,
+  `host.FORMAT2_PARAMS` has `kf.elem` and `pack.dram`; `host.API_VERSION` 12.
 - `imd_perf_predict_pack` uses the request's regime, cache (its input is X: WARM serves X from
   L2 up to L_w) and clock as `imd_perf_predict`.
 - Python (`host.py`): `predict(..., regime=, cache=, clock_mhz=)`, `Prediction.regime`,
@@ -3424,6 +3507,17 @@ in formats 1 and 2, written only when non-zero (the old shipped text round-trips
 fraction > 1 or NaN still INVALID_VALUE (`host_c_api`). Monotonicity (doubling m, n or k never
 lowers the predicted time) is checked against the shipped and a synthetic calibration.
 
+[v1.17] `host_perf` (Python) adds: the Python transcription of `kf.elem` (the KF launch rules
+re-implemented) and of the PACK hit rule (S against L_hit on both sides of the threshold,
+hit = re-reads only) against the C features on the random descriptors; with `kf.elem`,
+`pack.dram` and `warm.pack_l2_bytes` absent, or explicitly 0, predictions are bit-identical
+to the file without them (the shipped API-11 calibration as a test vector, every regime and
+cache state); `pack.dram` > 0 with L_hit 0 charges every byte; the three keys optional,
+rejected in format 1, negative rejected, written only when non-zero and round-tripping
+bit-exactly; the retired `op_eps` keys accepted and discarded in both formats (not written);
+the v11-sized struct reads L_hit as 0. `host_c_api`: the v12 size and offset. Monotonicity
+(doubling m, n or k never lowers the predicted time) is re-checked with the new terms.
+
 ### 6c.5 Validation (hold-out)
 
 `bench/sweep_perf_validate.txt` (shapes disjoint from the fit set: the regression sweep's
@@ -3455,7 +3549,9 @@ size; Δ = 0 if it is small).
 Tiny calls drift by 10–20 % between performance states (BENCHMARKING "Tiny shapes"), so
 their target is loose. If a target is missed: per-class residuals first; then the smallest
 physically motivated feature (e.g. tile-quantized bytes for grids below one wave, the K5
-λ-fastest kernel), never per-shape factors; a feature change is a new file format.
+λ-fastest kernel), never per-shape factors; a feature change is a new file format ([v1.17]
+unless it is purely additive with optional keys, absent = 0, so no file is read with features
+it was not fitted with; §6c.2).
 
 ### 6c.6 Spec
 
@@ -3643,7 +3739,11 @@ fit). So the hold-out is a check of the long-run state, and of shape only at 163
   on the 9 windows of this run with N ≤ 14 (the 5 N = 16 windows ran the pre-v1.14 pack
   emitter with its eps path and were left out): e_tc 0.708 pJ/op, e_byte 0, e_byte^f 301
   pJ/B, γ = 1, f_ref 2480 MHz; sustained leave-one-case-out median 0.8 % (capped windows
-  −0.6 … +0.8 %).
+  −1.4 … +0.8 %, u_sq2048 −1.4 %). [review 2026-10-06] **Not an independent figure:** f_ref
+  was chosen by minimising this same leave-one-out median over 17 candidates, and the capped
+  clock is predicted 2–4 % high, the time error being small because the time model's bias
+  cancels it (NOTES-B2 §10). [v1.17] Superseded by the v1.17 refit (all 14 windows
+  recollected, f_ref by the parabola rule, nested figure reported; NOTES-B2 §11).
 
 ---
 
@@ -4697,7 +4797,10 @@ and host API; every value the same integer (bit-identical, tested on every contr
   refit on the v1.14 kernels with the eps path retired (no `op_eps` keys) and the clock-scaled
   byte energy (`power.byte_f_pj` 301 pJ/B, e_tc 0.708 pJ/op, γ = 1, f_ref 2480 MHz); hold-out
   targets met in every size class (as shipped before: < 1 ms classes missed on the v1.14
-  kernels, N = 15–17 medians 25–29 %).
+  kernels, N = 15–17 medians 25–29 %). [review 2026-10-06] That gain is the eps retirement,
+  not the refit: the old θ with eps ignored already met every target, and against it the
+  refit was worse on < 100 µs calls (p90 12.5 → 14.5 %, max 22.9 → 28.8 %), neutral on ≥ 1 ms
+  and better at 100 µs – 1 ms (NOTES-B2 §10).
 - **§6c.1 / §6c.2 / §6c.3 / §6c.4: the eps path retired** (combined branch
   `followups-combined`, part of host API 11's change set; no struct layout change). The
   v1.14 pack emitter has no eps path, so: `op_eps` features 0 and the chains without the
@@ -4744,3 +4847,30 @@ and host API; every value the same integer (bit-identical, tested on every contr
   certificate keeps the fact that N = 8 is the largest N with T < 2³².
 - **Tests.** contract suite `eps` adds N = 2, 5, 6, 7; `packed_packed` adds two ε-heavy
   `imd_pack` cases at N = 6, 8.
+
+## v1.17 (§6c performance model: KF element chain, PACK L2-hit re-reads, f_ref rule; host API 12, calibration format 2 with optional keys; no semantic, layout, launch, pack-format or TLA+ change)
+
+- **§6c.1 two additive features** (from the open-items model analysis, evaluation workspace
+  `findings/openitems-model-analysis.md`): KF x₄ = `elem`, the busiest SM's per-element chain
+  (`kf.chain` with u = E; one launch-shape helper for both), not clock-bound; PACK x₃ =
+  `dram` = x₁ − the operand re-reads that hit L2 (call working set S ≤ L_hit =
+  `warm.pack_l2_bytes`), not clock-bound. Both in the slots the eps path freed; every
+  existing feature keeps its meaning. The analysis's KF read / write split is not adopted
+  (needs a seventh slot or a format bump).
+- **§6c.1 f_ref rule:** the vertex of a parabola through the LOO scan within ±100 MHz of its
+  argmin (was: the argmin); the nested leave-one-out figure is printed and reported.
+- **§6c.1 cache:** the per-phase times of `--l2 flush` records are REPEAT state; `perf_fit.py`
+  raises them to COLD (latent: no record used it).
+- **§6c.2 keys:** `kf.elem`, `pack.dram`, `warm.pack_l2_bytes` optional (absent = 0, written
+  only when non-zero, format-2 keys); the `op_eps` keys retired (accepted, discarded, never
+  written); format 2 kept, with the reason (no file is read with features it was not fitted
+  with; §6c.5 amended). `perf_fit.py`: L_hit = 0.8 × the nominal L2 in the seed, CLOCK_BOUND
+  kf (2, 3, 5) / pack (2, 4). Sweeps: the L2-step cases in the calibration sweep, N = 18–20
+  in the hold-out.
+- **§6c.3 host API 12:** `imd_perf_calib_t.pack_l2_hit_bytes` appended (3688 bytes);
+  `imd_perf_param_name` KF 4 `"elem"`, PACK 3 `"dram"`, KL 4 NULL; a v7–v11-sized struct
+  reads L_hit 0. Python `host.API_VERSION` 12.
+- **§6c.4 tests:** see §6c.4 [v1.17].
+- **Docs caveats of the 2026-10-06 review** carried into DESIGN: §6c.7's shipped sustained
+  figure (u_sq2048 −1.4 %, f_ref chosen on the same metric, capped clock 2–4 % high) and the
+  v1.15 changelog's hold-out claim (the gain is the eps retirement, not the refit).
