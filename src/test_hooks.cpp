@@ -32,9 +32,12 @@
 //   imd_test_k4_align_check(mode)
 //       v1.13 §4b.5: mode 1 enables the check that every K4 operand pointer (call_of in
 //       gemm_k4.cu) is = 0 mod the plan's K alignment A, for plans whose K-chunk is a multiple
-//       of A, and resets its violation count; 0 disables it; -1 only queries. Returns the
-//       violations counted since the last reset (debug builds: on by default, and a violation
-//       also fails the call). The K alignment itself is forced by libimmerdink_host's
+//       of A, and resets its counts; 0 disables it; -1 only queries; 2 returns the launches
+//       checked since the last reset (so a suite can show the check ran); 3 is mode 1 with a
+//       mutation: the check sees the A operand pointer + 8 bytes (the launch is unchanged), so
+//       every checked launch must count as a violation. Returns the violations counted since
+//       the last reset, mode 2 the checked launches, -1 for an unknown mode (debug builds: on
+//       by default, and a violation also fails the call). The K alignment itself is forced by libimmerdink_host's
 //       imd_test_set_k_align (src/host/k_hat.cpp).
 //
 //   imd_test_plan_vec(plan, dev, count)
@@ -113,7 +116,7 @@ IMD_API int imd_test_set_k5_elems(int elems) {
 }
 
 IMD_API int64_t imd_test_k4_align_check(int mode) {
-  if (mode < -1 || mode > 1) return -1;
+  if (mode < -1 || mode > 3) return -1;
   return imd::detail::k4_align_check(mode);
 }
 

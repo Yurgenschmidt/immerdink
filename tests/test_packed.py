@@ -425,7 +425,7 @@ def suite_k_align(lib, cuda, verbose):
     j0 > 0) and both packed, bit-exact vs the oracle on every producer path and identical
     across A; PACK_MISMATCH when the hook changes between imd_pack_create and plan creation
     (both directions), and in imd_contract_packed for a handle of the other alignment; the K4
-    operand-pointer check (= 0 mod A) with no violation."""
+    operand-pointer check (= 0 mod A) with no violation, shown to run and to fire (a mutation)."""
     if not lib.has_test_hooks:
         raise Fail("suite k_align needs the test hooks")
     rng = random.Random(1713)
@@ -477,9 +477,17 @@ def suite_k_align(lib, cuda, verbose):
                     n_runs += 1
                 if not np.array_equal(out[16].view(np.uint64), out[64].view(np.uint64)):
                     raise Fail(f"{label} [{which}]: C differs between A = 16 and A = 64")
-        bad = lib.k4_align_check(-1)
-        if bad:
-            raise Fail(f"K4 operand pointers not = 0 mod A: {bad} launches")
+        tc.k4_align_check_verdict(lib, "packed")
+        # the check fires on packed operand pointers too (mode 3 mutation, both packed)
+        A, B, Cd = T([4, 1000], [I, K]), T([1000, 6], [K, J]), T([4, 6], [I, J])
+        TA, TB = tc.gen(rng, A.extent, "phi"), tc.gen(rng, B.extent, "wide")
+        TC = tc.gen(rng, Cd.extent, "uniform")
+        for a in (16, 64):
+            with tc.k_align(lib, a):
+                tc.k4_align_check_mutated(lib, lambda: run_packed_case(
+                    lib, cuda, f"k_align mutation [AB, A={a}]", A, B, Cd, TA, TB, TC, 1.0, 0.5,
+                    8, 0, "RN", o.EMULATE, "AB", "auto", random.Random(7), verbose),
+                    f"packed A={a}")
     finally:
         lib.k4_align_check(0)
     # FORMAT: a pack and a plan of different A (only through the hook)

@@ -4016,7 +4016,10 @@ and host API; every value the same integer (bit-identical, tested on every contr
     K-chunk is a multiple of A (the production K_c'; `imd_test_set_limits` may choose
     another). On by default in debug builds (a violation fails the call), and through the
     test hook `imd_test_k4_align_check` (libimmerdink) in any build (a violation is
-    counted). 0 violations in `contract_k_align` and `packed_k_align`.
+    counted). 0 violations in `contract_k_align` and `packed_k_align`, each also asserting
+    that the check ran (the hook's checked-launch count, mode 2, > 0) and that it fires: a
+    test mutation (mode 3: the check sees the A pointer + 8 bytes, the launch unchanged)
+    counts every checked launch as a violation (fix review 2026-10-06 must-fix 3).
   - *`k4_select`* keeps its estimate over the plan's k̂ (unchanged for every A = 16 plan);
     only the performance model's K4 MMA term and its ops count use Σ⌈kc⌉₆₄ (§4b.6). An
     A = 16-forced plan of k > 96 may therefore pick another K4 configuration than the

@@ -90,9 +90,11 @@ imd_status_t k4_group(const K4Plan& k4, const int8_t* RA, const int8_t* RB, uint
                       int32_t k_align);
 
 // v1.13 §4b.5 (gemm_k4.cu; test hook imd_test_k4_align_check): mode 1 = enable the check that
-// every K4 operand pointer is = 0 mod the plan's A and reset its violation count, 0 = disable,
-// -1 = query only (default: on in debug builds). Returns the violations counted since the
-// last reset.
+// every K4 operand pointer is = 0 mod the plan's A and reset its counts, 0 = disable, -1 =
+// query only (default: on in debug builds), 2 = return the launches checked since the last
+// reset, 3 = as 1 with a test mutation (the check sees the A pointer + 8 bytes; the launch is
+// unchanged: every checked launch is a violation). Returns the violations counted since the
+// last reset (mode 2: the checked launches).
 int64_t k4_align_check(int mode);
 
 // Test hook state (api.cpp; test_hooks.cpp imd_test_set_fused): -1 = the plan-time rule

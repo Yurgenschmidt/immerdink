@@ -65,6 +65,11 @@ constexpr bool kAlignCheckDefault = true;
 #endif
 std::atomic<bool> g_align_check{kAlignCheckDefault};
 std::atomic<int64_t> g_align_violations{0};
+std::atomic<int64_t> g_align_checked{0};  // launches checked: proves the check ran (tests)
+// Test-only mutation (imd_test_k4_align_check mode 3): this many bytes are added to the A
+// operand pointer the check sees (never to the pointer launched), so the suites can show the
+// check fires. 0 outside that mode.
+std::atomic<int64_t> g_align_mutation{0};
 
 // One K4 launch of a call (host/k4_launches.hpp K4Launch). Its kernel parameters depend
 // only on the shape key (kc, zc, nc; store-mod for chunk 0, add-mod after); the pointers and
@@ -140,8 +145,13 @@ bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, 
     const auto& map = L.k0 == 0 ? k.store : k.add;
     const auto it = map.find(key);
     const K4Call call = call_of(k, L, RA, RB, W, g0, batch_a, batch_b);
-    if (check && (reinterpret_cast<uintptr_t>(call.A) % static_cast<uintptr_t>(k_align) != 0 ||
-                  reinterpret_cast<uintptr_t>(call.B) % static_cast<uintptr_t>(k_align) != 0)) {
+    if (check) g_align_checked.fetch_add(1, std::memory_order_relaxed);
+    if (check &&
+        ((reinterpret_cast<uintptr_t>(call.A) +
+          static_cast<uintptr_t>(g_align_mutation.load(std::memory_order_relaxed))) %
+                 static_cast<uintptr_t>(k_align) !=
+             0 ||
+         reinterpret_cast<uintptr_t>(call.B) % static_cast<uintptr_t>(k_align) != 0)) {
       g_align_violations.fetch_add(1, std::memory_order_relaxed);
 #ifndef NDEBUG
       ok = false;  // debug builds: a broken plan contract fails the call
@@ -160,8 +170,15 @@ LaunchLimits& launch_limits() { return g_limits; }
 LaunchLimits default_launch_limits() { return production_launch_limits(); }
 
 int64_t k4_align_check(int mode) {
-  if (mode == 1) g_align_violations.store(0, std::memory_order_relaxed);
-  if (mode == 0 || mode == 1) g_align_check.store(mode == 1, std::memory_order_relaxed);
+  if (mode == 2) return g_align_checked.load(std::memory_order_relaxed);
+  if (mode == 1 || mode == 3) {
+    g_align_violations.store(0, std::memory_order_relaxed);
+    g_align_checked.store(0, std::memory_order_relaxed);
+  }
+  if (mode == 0 || mode == 1 || mode == 3) {
+    g_align_mutation.store(mode == 3 ? 8 : 0, std::memory_order_relaxed);
+    g_align_check.store(mode != 0, std::memory_order_relaxed);
+  }
   return g_align_violations.load(std::memory_order_relaxed);
 }
 

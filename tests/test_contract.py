@@ -293,9 +293,10 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
                 lib.plan_destroy(plan)
                 raise Fail(f"{vname}: plan K4 configuration {cfg} / {k4p_cfg}, wanted {k4}")
             STATS["k4"][cfg] = STATS["k4"].get(cfg, 0) + 1
-            if lib.plan_sizes(plan)[7] != kh_plan:   # v1.13 §4b: the real plan's k_hat
+            got_kh = lib.plan_sizes(plan)[7]   # v1.13 §4b: the real plan's k_hat
+            if got_kh != kh_plan:   # read before plan_destroy (review 2026-10-06 must-fix 1)
                 lib.plan_destroy(plan)
-                raise Fail(f"{vname}: plan k_hat {lib.plan_sizes(plan)[7]}, want {kh_plan}")
+                raise Fail(f"{vname}: plan k_hat {got_kh}, want {kh_plan}")
             if k4_expect is not None:
                 v = lib.plan_sizes(plan)
                 got_k4 = {"k_hat": v[7], "store": v[28], "add": v[29], "launches": v[30]}
@@ -759,7 +760,7 @@ def suite_k_align(lib, cuda, verbose):
     forced and KL with 64-row tiles; every K4 configuration and k4_tune), and the results of
     A = 16 and A = 64 identical bit for bit. Also: the K-chunk limit at multiples of 64 and at
     an odd multiple of 16 (correctness only), and the K4 operand-pointer check (= 0 mod A)
-    with no violation."""
+    with no violation, shown to run (checked launches > 0) and to fire (a mutation)."""
     if not lib.has_test_hooks:
         raise Fail("suite k_align needs the test hooks")
     KP = o.K_C_ALIGNED
@@ -824,12 +825,49 @@ def suite_k_align(lib, cuda, verbose):
                 n += 1
             if not np.array_equal(out[16].view(np.uint64), out[64].view(np.uint64)):
                 raise Fail(f"k_align {label} k={k}: C differs between A = 16 and A = 64")
-        bad = lib.k4_align_check(-1)
-        if bad:
-            raise Fail(f"K4 operand pointers not = 0 mod A: {bad} launches")
+        k4_align_check_verdict(lib, "contract")
+        # the check fires: one case per A under the mutation (mode 3)
+        rng = random.Random(4999)
+        A, B, Cd = matrix(rng, 7, 9, 200, a_kfast=True, b_kfast=False)
+        TA, TB = gen(rng, (7, 200), "phi"), gen(rng, (200, 9), "wide")
+        TC = gen(rng, (7, 9), "uniform")
+        for a in (16, 64):
+            with k_align(lib, a):
+                k4_align_check_mutated(lib, lambda: run_case(
+                    lib, cuda, f"k_align mutation [A={a}]", A, B, Cd, TA, TB, TC, 1.0, 0.5, 8, 0,
+                    "RN", rng=random.Random(4999), verbose=verbose, expect_kind="GEMM"),
+                    f"contract A={a}")
     finally:
         lib.k4_align_check(0)
     STATS["k_align_runs"] = n
+
+
+def k4_align_check_verdict(lib, what):
+    """After a suite under k4_align_check(1): no violation, and the check really ran (review
+    2026-10-06 must-fix 3: a call site passing k_align = 0 would disable it silently)."""
+    bad, checked = lib.k4_align_check(-1), lib.k4_align_check(2)
+    if bad:
+        raise Fail(f"{what}: K4 operand pointers not = 0 mod A: {bad} of {checked} launches")
+    if checked <= 0:
+        raise Fail(f"{what}: the K4 operand-pointer check ran on no launch")
+
+
+def k4_align_check_mutated(lib, run, what):
+    """The check fires: under mode 3 (the check sees the A pointer + 8 bytes, the launch is
+    unchanged) every checked launch is a violation. run() is one contraction; release builds
+    complete it (and it stays bit-exact), debug builds fail the call at the first violation.
+    Leaves the check on (mode 1, counts reset)."""
+    lib.k4_align_check(3)
+    try:
+        run()
+        failed = None
+    except Fail as e:
+        failed = e
+    bad, checked = lib.k4_align_check(-1), lib.k4_align_check(2)
+    lib.k4_align_check(1)
+    if checked <= 0 or bad != checked:
+        raise Fail(f"{what}: mutated K4 pointer check: {bad} violations of {checked} launches "
+                   f"(want all, > 0); {failed or 'call completed'}")
 
 
 def suite_api(lib, cuda, verbose):

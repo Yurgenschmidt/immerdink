@@ -1559,6 +1559,29 @@ def test_k_align():
             finally:
                 o.pack_lower = real
             n_order += 1
+            # ... per pack, not before every pack's MODULI (immerdink_host.h, review
+            # 2026-10-06 must-fix 2): A's wrong N with B's unknown format is MODULI, A's
+            # unknown format with B's wrong N is FORMAT (the same in analysis.cpp)
+            pdy = o.PackDesc(Yq, N, rnd, o.ORDER_AUTO, [kk], [l])
+            for foreign_of, want in ((pdy, o.MISMATCH_MODULI), (pd, o.MISMATCH_FORMAT)):
+                pd.N, pdy.N = (N + 1, N) if foreign_of is pdy else (N, N + 1)
+
+                def foreign_one(pd_, f=None, _x=foreign_of):
+                    v = real(pd_, f)
+                    if pd_ is _x:
+                        v.key = (3,) + tuple(v.key[1:])
+                    return v
+                o.pack_lower = foreign_one
+                try:
+                    o.lower_packed(Xq, Yq, Cd, o.EMULATE, (pd, pdy), N, rnd, k_align="AUTO")
+                    got = 0
+                except o.PackMismatch as e:
+                    got = e.reason
+                finally:
+                    o.pack_lower = real
+                assert got == want, (kq, got, want)
+                n_order += 1
+            pd.N = N
     # every default follows the policy (must-fix 5): no silent A = 16
     for k in (1, 96, 97, 200, 4080):
         assert o.k_hat_of(k) == o.k_hat_of(k, o.k_align_of(k)) == pp.k_hat_of(k)

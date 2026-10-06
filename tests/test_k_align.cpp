@@ -3,7 +3,7 @@
 // call and passed explicitly (analyze -> ExecPlan::k_align, pack_lower -> PackLowered), the
 // pack format word, and the plan-time PACK_MISMATCH reason order of analyze_packed (§4b.5,
 // §6b.5; the same order as spec/oracle.py lower_packed and PackedOperand Reason):
-//   an unknown format word first (before MODULI), then per pack MODULI, ROUNDING, CLASSES,
+//   per pack (the caller's A, then B) an unknown format word, MODULI, ROUNDING, CLASSES,
 //   then ORDER, then the other key words of BOTH packs (EXTENTS, STRIDES), then a format 1 vs
 //   2 difference of either (FORMAT), then the k_hat drift check (FORMAT).
 // A pack and a plan of different A are made by changing the hook between pack_lower and
@@ -236,6 +236,17 @@ void test_reason_order() {
     pl.key[0] = 0;
     CHECK(plan_with(g, &pl, nullptr).reason == IMD_PACK_MISMATCH_FORMAT);
     CHECK(plan_with(g, &p.pl, nullptr).reason == IMD_PACK_MISMATCH_MODULI);
+    // The unknown-format check is per pack, not before every pack's MODULI (immerdink_host.h,
+    // review 2026-10-06 must-fix 2): A's wrong N with B's unknown format is MODULI; A's
+    // unknown format with B's wrong N is FORMAT.
+    Pack bn(g.b, 8), b9(g.b);
+    PackLowered bu = b9.pl;
+    bu.key[0] = 3;
+    CHECK(plan_with(g, &p.pl, &bu).reason == IMD_PACK_MISMATCH_MODULI);
+    Pack a9(g.a);
+    PackLowered au = a9.pl;
+    au.key[0] = 3;
+    CHECK(plan_with(g, &au, &bn.pl).reason == IMD_PACK_MISMATCH_FORMAT);
   }
   // Drift check: an equal key with another k_hat is FORMAT (unreachable by construction).
   {

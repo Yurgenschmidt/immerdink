@@ -204,8 +204,8 @@ folded into DESIGN §4b.3–§4b.11, §6a and §6b.5 (changelog "Adversarial rev
   (`WorkspaceShape`, `pack_layout`, `ExecPlan.k_align`); libimmerdink never resolves;
 - the hook is one out-of-line atomic in libimmerdink_host (hidden visibility would
   duplicate a header static per `.so`);
-- PACK_MISMATCH: an unknown format word first, the 1-vs-2 difference **last** (k = 96 pack,
-  k = 97 plan: EXTENTS), against the plan's own format; the oracle does this now, and
+- PACK_MISMATCH: per pack an unknown format word before its MODULI, the 1-vs-2 difference
+  **last** (k = 96 pack, k = 97 plan: EXTENTS), against the plan's own format; the oracle does this now, and
   PackedOperand models the order (`neg_reason_fmt_first` fails);
 - `k_hat_of` defaults to the policy and `PACK_FORMAT` is derived, so the policy flip is one
   switch; the test call sites that rely on a default are listed in DESIGN §4b.8;
@@ -290,7 +290,9 @@ v1.13 stage 2 change list, "Implementation"):
   is the rule PackedOperand `Reason` models.
 - **The `call_of` check** in `gemm_k4.cu` (debug builds by default; `imd_test_k4_align_check`
   in any build) counts K4 launches whose A or B operand pointer is not ≡ 0 mod A, for plans
-  whose K-chunk is a multiple of A.
+  whose K-chunk is a multiple of A. It also counts the launches it checked (mode 2) and has a
+  test mutation (mode 3: A pointer + 8 bytes in the check only), so both suites show the check
+  ran and fires.
 - **Performance model:** the K4 MMA term (`tile_macs`) and the K4 ops count use Σ⌈kc⌉₆₄ over
   the plan's chunks (A-independent); bytes use the padded k̂. `k4_select` is unchanged (its
   estimate uses the plan's k̂). No calibration change; θ is to be refit.

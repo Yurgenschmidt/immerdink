@@ -227,7 +227,9 @@ class Library:
 
     def k4_align_check(self, mode=-1):
         """imd_test_k4_align_check: 1 = enable the K4 operand-pointer = 0 mod A check and reset
-        its count, 0 = disable, -1 = query. Returns the violations since the last reset."""
+        its counts, 0 = disable, -1 = query, 2 = the launches checked since the reset, 3 = as 1
+        with a mutation (the check sees the A pointer + 8 bytes; the launch is unchanged).
+        Returns the violations since the last reset (mode 2: the checked launches)."""
         return self.lib.imd_test_k4_align_check(mode)
 
     def set_limits(self, k_chunk=0, max_batch=0, max_n_tiles=0):

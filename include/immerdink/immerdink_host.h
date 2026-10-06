@@ -245,15 +245,18 @@ IMD_API imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
  * The pack bytes carry no header: a caller that persists them must persist the layout's
  * format and pack_bytes with them and re-pack when a fresh imd_pack_layout of the same
  * descriptor reports another format or size (bytes saved under host API <= 8 for k > 96 are
- * format 1 and NOT valid for a version-9 handle, which is format 2; nothing detects it). */
+ * format 1 and NOT valid for a version-9 handle, which is format 2; nothing detects it).
+ * Compare a saved format with a fresh layout's, never with IMD_PACK_FORMAT: packs of k <= 96
+ * are format 1 in every version. */
 #define IMD_PACK_FORMAT_A16 1  /* k_hat = ceil(k)_16 (k <= 96; every pack before host API 9) */
 #define IMD_PACK_FORMAT_A64 2  /* k_hat = ceil(k)_64 (k > 96; host API 9)                     */
 #define IMD_PACK_FORMAT 2      /* the newest format this library writes (1 before API 9)    */
 enum { IMD_PACK_ORDER_AUTO = 0, IMD_PACK_ORDER_GIVEN = 1 };
-/* imd_lowering_t.pack_mismatch: the first differing part. An unknown format word first; then
- * per packed operand (the caller's A, then B) MODULI, ROUNDING, CLASSES; then ORDER; then the
- * keys' extents and strides of both packs; then (host API 9) a format 1 vs 2 difference: the
- * same tensor in the other K alignment (in-process only through a test hook). */
+/* imd_lowering_t.pack_mismatch: the first differing part. Per packed operand (the caller's A,
+ * then B): an unknown format word (FORMAT), MODULI, ROUNDING, CLASSES (so A's wrong N is
+ * MODULI even when B's format is unknown); then ORDER; then the keys' extents and strides of
+ * both packs; then (host API 9) a format 1 vs 2 difference of either pack: the same tensor in
+ * the other K alignment (in-process only through a test hook). */
 enum {
   IMD_PACK_MISMATCH_NONE = 0,
   IMD_PACK_MISMATCH_FORMAT = 1,   /* an unknown format, or the pack's format (1 / 2) is not the
