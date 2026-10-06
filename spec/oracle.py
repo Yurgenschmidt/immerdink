@@ -68,6 +68,14 @@ K_C = INT32_MAX // RESIDUE_ABS_MAX**2    # §2: 131071, max K-chunk with no satu
 K_C_ALIGNED = (K_C // 16) * 16           # §3.5: 131056, default chunk length
 INT16_MIN, INT16_MAX = -2**15, 2**15 - 1
 N_MIN, N_MAX = 2, 20
+K_ALIGN = 16                             # §4: the plan's K alignment A (every plan today)
+
+
+def k_hat_of(k, A=K_ALIGN):
+    """§4: k_hat = ceil(k)_A, the residue row stride and K extent (typed from DESIGN;
+    test_oracle cross-checks it with params.k_hat_of)."""
+    return -(-k // A) * A
+
 
 DESIGN_MODULI = (256, 255, 253, 251, 247, 241, 239, 233, 229, 227,
                  223, 217, 211, 199, 197, 193, 191, 181, 179, 173)
@@ -1024,7 +1032,7 @@ def pack_layout(b, r, k, N):
     ({}, 0) for b r k = 0. InvalidValue past uint64."""
     if b * r * k == 0:
         return {}, 0
-    kh = -(-k // 16) * 16
+    kh = k_hat_of(k)
     sizes = (("sig", 2 * b * r), ("flag", b * r),
              ("res", N * b * r * kh + (-(-r // 16) * 16 - r) * kh))
     regs, off = {}, 0
@@ -1099,7 +1107,7 @@ def pack_lower(pd: PackDesc) -> PackView:
     v = PackView()
     v.N, v.rounding = pd.N, pd.rounding
     v.b, v.r, v.k = size["L"], size["R"], size["K"]
-    v.k_hat = -(-v.k // 16) * 16
+    v.k_hat = k_hat_of(v.k)
     v.kappa = ceil_sqrt(v.k) if v.k > 0 else 0
     v.regs, v.pack_bytes = pack_layout(v.b, v.r, v.k, pd.N)   # InvalidValue on overflow
     v.pack_ws = pack_ws_bytes(v.b, v.r, v.k)

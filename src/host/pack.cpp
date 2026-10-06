@@ -7,6 +7,7 @@
 #include "checked.hpp"
 #include "immerdink/detail/constants.hpp"
 #include "index_map.hpp"
+#include "k_hat.hpp"
 
 namespace imd::detail {
 namespace {
@@ -37,7 +38,7 @@ std::optional<PackLayout> pack_layout(int64_t b, int64_t r, int64_t k, int N) {
   const auto ub = static_cast<uint64_t>(b), ur = static_cast<uint64_t>(r),
              uk = static_cast<uint64_t>(k);
   uint64_t kh = 0, rh = 0, br = 0, sig = 0, res = 0, tail = 0;
-  if (!align_u64(uk, c::kKAlign, &kh) || !align_u64(ur, c::kNAlign, &rh) ||
+  if (!k_hat_of(uk, uint64_t{kKHatAlign}, &kh) || !align_u64(ur, c::kNAlign, &rh) ||
       !mul_u64(ub, ur, &br) || !mul_u64(br, 2, &sig) ||
       !mul_u64(br, kh, &res) || !mul_u64(res, static_cast<uint64_t>(N), &res) ||
       !mul_u64(rh - ur, kh, &tail) || !add_u64(res, tail, &res))
@@ -184,8 +185,7 @@ imd_status_t pack_lower(const imd_pack_desc_t& d, PackLowered* out) {
   o.N = d.num_moduli;
   o.rounding = d.rounding;
   o.b = size[kPackL], o.r = size[kPackR], o.k = size[kPackK];
-  if (o.k > INT64_MAX - (c::kKAlign - 1)) return IMD_STATUS_INVALID_VALUE;
-  o.k_hat = (o.k + c::kKAlign - 1) / c::kKAlign * c::kKAlign;
+  if (!k_hat_of(o.k, kKHatAlign, &o.k_hat)) return IMD_STATUS_INVALID_VALUE;
   const auto layout = pack_layout(o.b, o.r, o.k, o.N);
   const auto ws = pack_ws_bytes(o.b, o.r, o.k);
   if (!layout || !ws) return IMD_STATUS_INVALID_VALUE;  // §6b.4 sizes exceed uint64

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "checked.hpp"
+#include "k_hat.hpp"
 #include "immerdink/detail/constants.hpp"
 
 namespace imd::detail {
@@ -249,7 +250,7 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
   e = ExecPlan{};
   e.swapped = lw.swapped;
   e.m = lw.m, e.n = lw.n, e.k = lw.k, e.b = lw.b;
-  e.k_hat = (lw.k + c::kKAlign - 1) / c::kKAlign * c::kKAlign;
+  if (!k_hat_of(lw.k, kKHatAlign, &e.k_hat)) return IMD_STATUS_INVALID_VALUE;
   e.n_hat = (lw.n + c::kNAlign - 1) / c::kNAlign * c::kNAlign;
   e.N = N;
   e.g = an.options.residue_group;

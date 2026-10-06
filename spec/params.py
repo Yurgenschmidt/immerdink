@@ -87,6 +87,15 @@ def align_up(x, a):
     return ceil_div(x, a) * a
 
 
+def k_hat_of(k, A=K_ALIGN):
+    """DESIGN §4: k_hat = ceil(k)_A, the residue row stride and K4's GEMM K extent; A a power
+    of two >= 16 (today every plan uses A = K_ALIGN = 16). Mirrors libimmerdink_host's
+    k_hat_of (src/host/k_hat.hpp), the one rounding site there."""
+    if A < 16 or A & (A - 1):
+        raise ValueError(f"A={A}: a power of two >= 16")
+    return align_up(k, A)
+
+
 def smod(x, p):
     """Symmetric residue in [-floor(p/2), ceil(p/2)-1] (DESIGN §3.4; OzakiCRT SMod)."""
     r = x % p
@@ -560,7 +569,7 @@ def workspace_size(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE, packed=()):
     if mode == DIRECT or k <= 1:
         total = vec
     else:
-        kh, nh = align_up(k, K_ALIGN), align_up(n, N_ALIGN)
+        kh, nh = k_hat_of(k), align_up(n, N_ALIGN)
         pa, pb = "A" not in packed, "B" not in packed      # 1: packed in-line (in the workspace)
         total = (pa * A(2 * b * m) + pb * A(2 * b * n) + pa * A(b * m) + pb * A(b * n) + vec
                  + pa * A(g * b * m * kh) + pb * A(g * b * nh * kh) + A(N * b * m * nh))
@@ -589,7 +598,7 @@ def region_offsets(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE, packed=()):
     packed = _check_packed(packed)
     if b * m * n == 0:
         return []
-    kh, nh = align_up(k, K_ALIGN), align_up(n, N_ALIGN)
+    kh, nh = k_hat_of(k), align_up(n, N_ALIGN)
     names = ["vec"] if (mode == DIRECT or k <= 1) else [r[0] for r in _REGIONS]
     if vec == VEC_RESIDENT:
         names = [x for x in names if x != "vec"]
@@ -626,7 +635,7 @@ def pack_layout(b, r, k, N):
         raise ValueError(f"N={N}")
     if b * r * k == 0:
         return [], 0
-    kh = align_up(k, K_ALIGN)
+    kh = k_hat_of(k)
     sizes = {"sig": 2 * b * r, "flag": b * r,
              "res": N * b * r * kh + (align_up(r, N_ALIGN) - r) * kh}
     out, off = [], 0

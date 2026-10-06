@@ -205,7 +205,7 @@ def spec_expect(descs, N, g, rnd, mode, vec):
         return "INVALID_VALUE", None
     m, n, k, b = v.m, v.n, v.k, v.b
     gg = N if g == 0 else g
-    k_hat, n_hat = params.align_up(k, 16), params.align_up(n, 16)
+    k_hat, n_hat = params.k_hat_of(k), params.align_up(n, 16)
     noop = b * m * n == 0
     dispatch = ("NOOP" if noop else "SCALE" if k == 0 else
                 "DIRECT" if (mode == "DIRECT" or k == 1) else "EMULATE")
@@ -477,7 +477,7 @@ def check_pack_layout(p, what):
     want_regs = {n: (o, nb) for n, o, nb in regs} or {n: (0, 0) for n in ("sig", "flag", "res")}
     if lay.regions != want_regs or lay.pack_bytes != total or \
             lay.pack_ws_bytes != params.pack_ws_bytes(lay.b, lay.r, lay.k) or \
-            lay.k_hat != params.align_up(lay.k, 16) or lay.format != 1:
+            lay.k_hat != params.k_hat_of(lay.k) or lay.format != 1:
         raise Fail(f"{what}: pack layout {lay} vs params {regs} {total}")
     if want_st == "SUCCESS":
         if (lay.b, lay.r, lay.k, lay.kappa) != (pv.b, pv.r, pv.k, pv.kappa) or \
@@ -594,7 +594,7 @@ def check_packed(direct, descs, opts, rng, what):
                 [tuple(x) for x in want_regs]:
             raise Fail(f"{what}: packed regions {lay}, params {want_regs}")
         # launches and fused paths of the packed plan (DESIGN §6b.5)
-        n_hat, k_hat = params.align_up(v.n, 16), params.align_up(v.k, 16)
+        n_hat, k_hat = params.align_up(v.n, 16), params.k_hat_of(v.k)
         emu = mode == "EMULATE" and not v.empty_output() and v.k > 1
         pbits = (1 if "A" in roles else 0) | (2 if "B" in roles else 0)
         fused = emu and k_hat <= 1024 and pbits != 3

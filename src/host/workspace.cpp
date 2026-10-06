@@ -1,6 +1,7 @@
 #include "workspace.hpp"
 
 #include "checked.hpp"
+#include "k_hat.hpp"
 #include "immerdink/detail/constants.hpp"
 
 namespace imd::detail {
@@ -23,8 +24,10 @@ std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s) {
   if (s.b == 0 || s.m == 0 || s.n == 0) return L;  // empty output: no-op
 
   const uint64_t kAlign = c::kRegionAlign;
-  // k_hat = ceil(k)_16, n_hat = ceil(n)_16; k, n < 2^63 so these cannot overflow uint64.
-  const uint64_t k_hat = (static_cast<uint64_t>(s.k) + (c::kKAlign - 1)) & ~uint64_t{c::kKAlign - 1};
+  // k_hat = ceil(k)_A (k_hat.hpp), n_hat = ceil(n)_16; k, n < 2^63 so these cannot overflow
+  // uint64.
+  uint64_t k_hat = 0;
+  if (!k_hat_of(static_cast<uint64_t>(s.k), uint64_t{kKHatAlign}, &k_hat)) return std::nullopt;
   const uint64_t n_hat = (static_cast<uint64_t>(s.n) + (c::kNAlign - 1)) & ~uint64_t{c::kNAlign - 1};
 
   // vec = 8 (2m + 2n + 2k + 3b)

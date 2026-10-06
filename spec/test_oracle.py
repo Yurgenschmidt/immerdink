@@ -308,6 +308,12 @@ def test_params_crosscheck():
         pl = o.Plan(N, 1)
         assert (c["P"], c["H"], c["T"], list(c["M"]), list(c["q"])) == (pl.P, pl.H, pl.T, pl.M, pl.q), N
         assert c["Lw"] <= pl.L_w
+    # §4 k_hat = ceil(k)_A: the oracle's rounding and params.k_hat_of (libimmerdink_host's
+    # mirror) agree, and so do the chunk lengths (§3.5 K_c')
+    for A in (16, 32, 64):
+        for k in list(range(0, 300)) + [131007, 131008, 131009, 131056, 131057, 131072, 2**40 + 3]:
+            assert o.k_hat_of(k, A) == pm.k_hat_of(k, A), (k, A)
+    assert o.k_hat_of(5) == pm.k_hat_of(5) == 16 and pm.K_C_PRIME == o.K_C_ALIGNED
     rng = random.Random(11)
     n = 0
     for _ in range(400):

@@ -132,7 +132,7 @@ def scatter(T, desc, fill):
 def k4_tune_bytes(view, N, g):
     """DESIGN v1.5 §6 k4_tune: group 1's RA, RB and W planes, each 256-aligned, in one
     temporary allocation; 0 (no tuning) above 256 MiB."""
-    kh, nh, gb = -(-view.k // 16) * 16, -(-view.n // 16) * 16, min(g, N) * view.b
+    kh, nh, gb = params.k_hat_of(view.k), -(-view.n // 16) * 16, min(g, N) * view.b
     regs = [gb * view.m * kh, gb * nh * kh, gb * view.m * nh]
     total = sum(-(-r // 256) * 256 for r in regs)
     return 0 if max(regs) > 256 << 20 or total > 256 << 20 else total
@@ -354,7 +354,7 @@ def check_stages(name, view, trace, ws, N, g, vec=params.VEC_GENERATE):
     """Compare every workspace region with the oracle's intermediates (see module doc). With
     vec = RESIDENT there is no vec region (run_case checks the plan's copy instead)."""
     m, n, k, b = view.m, view.n, view.k, view.b
-    kh, nh = -(-k // 16) * 16, -(-n // 16) * 16
+    kh, nh = params.k_hat_of(k), -(-n // 16) * 16
     regs = {r: (s, e) for r, s, e in params.region_offsets(m, n, k, b, N, g, params.EMULATE, vec)}
 
     def reg(r, dtype, shape):
