@@ -47,8 +47,8 @@ k > 96 and 16 otherwise (a pure function of k), pack format 2 for A = 64, the re
 alignment in `imd_lowering_t` (host API 9) and a test hook to force A. Results stay
 bit-identical.
 §6c.7 is a **[v1.14 draft]**: measurements of long hot runs and a proposed clock-scaled
-DRAM-byte energy in the power model. It is not implemented, and its design questions are
-open.
+byte energy in the power model (host API 11). It is not implemented; its design questions
+are decided (independent reviewer, 2026-10-06) and the refit needs new GPU windows.
 The change lists are at the end.
 
 Sources:
@@ -2700,8 +2700,10 @@ split into a time model at a given clock and a clock model per regime.
   model the call's own), and **optimistic** for long hot runs. [v1.14 draft, §6c.7: measured, not
   the ~20 % first stated: the settled time after 2–4 min at the cap is 0.6–3.9 % above the
   SUSTAINED prediction (16384³ −3.7 %, 8192³ −1.4 … −1.8 %, a DF 9216² × 3000 −0.6 … −0.9 %);
-  of that, ≤ ~1 % is thermal (the die settles at 74–75 °C, the calibration windows ran at
-  67–74 °C) and the rest is the power model's unscaled e_byte.] A caller that has measured
+  of that, ≈ 1–1.8 % is thermal (the die settles at 74–75 °C; the calibration windows' 67–74 °C
+  are end-of-window readings). 8192³ and DF are therefore mostly thermal; 16384³ is roughly
+  half thermal and half a fit bias of the unscaled power model, which solves too high a
+  clock for tensor-core-heavy calls.] A caller that has measured
   its settled clock passes it as `clock_mhz` (NVML scale).
 - **`clock_mhz`** (request) is an NVML-scale SM clock for capped / sustained operation; it is
   clamped to the effective clock (`min(clock_mhz, clock_eff)`, the value reported): values at or
@@ -3150,7 +3152,8 @@ changes.
 ### 6c.7 Long hot runs and clock-scaled DRAM energy **[v1.14 draft: proposal, not implemented]**
 
 Status: measured and proposed (NOTES-B2 §9, branch `followup-hotclock`); nothing below is in
-the library yet. It needs the reviewer's answers to the questions at the end before code.
+the library yet. The design questions at the end are decided (independent reviewer,
+2026-10-06); code follows the combined refit's new sustained windows.
 
 **Measured (2026-10-06, stock clocks, 450 W cap; `imd_bench --methods sustained
 --sustain-trace-s 2`).** Six windows of 2–4 min, N = 14, from a cold card (≈ 45 °C idle; the
@@ -3183,14 +3186,24 @@ and are excluded.
   16384³ at 36.7 TFLOPS-eq and 452 W, which does not fit a 1950 MHz clock (that would give
   about 33).
 
-**What the residual is.** The calibration's sustained windows (15 s pre-heat) already ran
-at 67–74 °C, so the thermal part of the gap to the settled state is ≤ ~1 %. The rest is the
-power model's form: e_byte (335 pJ/B) is not clock-scaled. When the clock drops, the model
-keeps the DRAM-byte energy rate and has to cut the clock further to meet the cap. For a call
-dominated by tensor-core energy, that underestimates the clock change needed for the
-remaining power, and the fit compensates with a too-high e_byte. Refits of the same 14
-calibration windows (NNLS, idle 60 W, as `bench/perf_fit.py`), predicting the six settled
-windows as a hold-out (none of them in the fit):
+**What the residual is.** Two parts.
+- *Thermal, ≈ 1–1.8 %.* The calibration's sustained windows (15 s pre-heat) ended at
+  67–74 °C (end-of-window readings; the windows start cooler), the settled state is 74–75 °C,
+  at 0.15–0.22 % per °C. For 8192³ (−1.4 … −1.8 %) and DF (−0.6 … −0.9 %) this is most or all
+  of the gap; for 16384³ (−3.7 … −3.9 %) it is roughly half.
+- *Fit bias of the unscaled form (the other half at 16384³).* e_byte is not clock-scaled, so
+  the fit of the shipped form puts more of the windows' power into e_byte (335 vs 296 pJ/B)
+  and less into e_tc: **0.650 pJ/op shipped vs 0.691 in the clock-scaled form**. A
+  tensor-core-heavy call then gets too little power at a given clock, the bisection's solved
+  clock is too high and the predicted time is **optimistic**. (The scaled part is named below
+  as SM/L2-side energy per modelled DRAM byte: the memory clock is fixed at 10251 MHz, so the
+  part that follows the SM clock is the on-chip side of the traffic, not DRAM itself.)
+
+Refits of the same 14 calibration windows (NNLS, idle 60 W, as `bench/perf_fit.py`),
+predicting the six settled windows as a hold-out. None of the six 2–4 min windows is in the
+fit, but only 16384³ is a new shape: 8192³ at N = 14 is a calibration shape (its 15 s window
+is in the fit), and the DF call is in the `u_tdf` family (`acQ,bdQ->acbd`, 64⁴ × 2048 in the
+fit). So the hold-out is a check of the long-run state, and of shape only at 16384³:
 
 | power-model form (fit on the calibration windows only) | γ | 16384³ | 8192³ | DF | median |err| |
 |---|---|---|---|---|---|
@@ -3212,46 +3225,59 @@ windows as a hold-out (none of them in the fit):
   (bench/perf_validate.py, BURST) is unaffected.
 
 **Proposal (smallest extension).**
-1. **Clock-scaled DRAM energy.** Add one calibration key, `power.byte_f_pj`: the part of the
-   DRAM-byte energy that scales with the SM clock. Then
+1. **Clock-scaled byte energy.** Add one calibration key, `power.byte_f_pj`: the SM/L2-side
+   energy per modelled DRAM byte, which scales with the SM clock (the memory clock is fixed at
+   10251 MHz, so DRAM's own energy per byte does not). Then
    `P(f) = P_idle + [ (e_tc·O_tc + e_alu·O_alu + e_byte^f·D)·(f/f_ref)^γ + e_byte·D ] / t(f)`.
-   - This needs one appended `imd_perf_calib_t` field, `energy_byte_f_pj` (host API 10;
-     calibration format 2 keeps its other keys).
-   - A missing key, a format-1 file or a version-9 struct_size means 0, so existing files
-     predict exactly what they do today.
-   - `bench/perf_fit.py` fits four NNLS columns (tc, alu, byte, byte_f; `nnls_relative`
-     already handles ≤ 4). On the shipped data at γ = 1 it gives e_byte = 0 and
-     e_byte^f = 296 pJ/B.
+   - **Host API 11** (followup-hygiene takes 10): one appended `imd_perf_calib_t` field,
+     `energy_byte_f_pj`.
+   - **Parser:** in format 2, `power.byte_f_pj` is optional (absent = 0, ≥ 0 when present);
+     the other format-2 keys stay required. A format-1 file means 0. Existing files predict
+     exactly what they do today. A library older than API 11 does not know the key and rejects
+     a file that contains it (unknown key: a loud parse error, acceptable).
+   - **Older callers (v9/v10 view).** A caller whose `struct_size` is below the API-11 size
+     has no room for `energy_byte_f_pj`. `imd_perf_calib_default`, `imd_perf_calib_parse` and
+     the predictors give it a folded view, `energy_byte_pj := byte_pj + byte_f_pj` (the
+     shipped, unscaled form with the total byte energy), in the same way as the v6 view
+     (`to_format1_params`, perf.cpp:830). It predicts as an API-10 library would with such a
+     calibration, not as API 11.
+   - **Fit:** `power.byte_pj` and `power.byte_f_pj` are collinear on the windows (D·(f/f_ref)^γ
+     and D differ only through the 2300–2800 MHz clock spread), so `bench/perf_fit.py` holds
+     `byte_pj` fixed (0, or a stated prior written into the fit record) and fits three NNLS
+     columns: tc, alu, byte_f. On the 2026-10-05 windows at γ = 1 and byte_pj = 0 it gives
+     e_tc 0.691 pJ/op and e_byte^f 296 pJ/B.
    - `perf.cpp call_power` changes by one term. The bisection is unchanged: P(f) is still
      monotone in f.
-   - Refit: no GPU. `tools/calibrate.sh --sustained` reuses the 2026-10-05 windows; only the
-     power.* keys change.
-   - Tests: `host_perf` gets a v9-size caller (byte_f ignored) and the identity at
-     byte_f = 0. A SUSTAINED case whose solved clock moves the expected way when e_byte is
-     moved into e_byte^f.
+   - **Refit: needs GPU.** The sustained sweep is re-run with the longer pre-heat (item 2),
+     and the form comparison and the γ selection of the table above are redone on those
+     windows during the combined refit; only then are the power.* keys written.
+   - Tests: `host_perf` gets a v9-size and a v10-size caller (folded view: equal to the
+     shipped-form prediction with e_byte = byte + byte_f), the identity at byte_f = 0, a
+     format-2 file without the key, and a SUSTAINED case whose solved clock moves the expected
+     way (down for a tensor-core-heavy call) when e_byte is moved into e_byte^f.
 2. **No THERMAL regime.** A hot run settles at the same die temperature for every capped
-   call, and its whole effect is ≤ ~1 % beyond the calibration state. A third regime with a
+   call; beyond the calibration state the thermal effect is ≈ 1–1.8 %. A third regime with a
    temperature input would add an API field and a calibration of the fan curve (ambient
-   dependent) for a ≤ 1 % term. Instead, the recipe in §6c.1 stays: a caller that has
-   measured its settled clock passes `clock_mhz`. NOTES-B2 §9 gives the settled clocks above.
-   Optional: the calibration's sustained sweep moves to `--sustain-warm-s 60`, so the windows
-   run at the settled 74–75 °C (+~45 s × 14 windows ≈ 10 GPU minutes per calibration).
+   dependent) for that term. Instead, the recipe in §6c.1 stays: a caller that has measured
+   its settled clock passes `clock_mhz`, and **SUSTAINED is documented as +1–2 % optimistic
+   for minute-scale runs** (NOTES-B2 §9 gives the settled clocks above). The calibration's
+   sustained sweep moves to **`--sustain-warm-s 60`**, so the windows start nearer the
+   settled 74–75 °C (+~45 s × 14 windows ≈ 10 GPU minutes per calibration).
 3. **Bench (done, not a library change):** `imd_bench --methods sustained --sustain-trace-s
    T` adds a time series to the record: per T seconds the mean s per call, power, clock,
    temperature, OR of the clock-event reasons, and fan. It also adds the die temperature at
    the start and end of every sustained window.
 
-**Design questions (for the reviewer).**
-- Q1. Use the split key `power.byte_f_pj` (backward compatible, four columns), or a single
-  exponent key `power.byte_gamma` that applies γ to the existing e_byte? The second has one
-  field fewer but changes what an old file's e_byte means unless it defaults to 0.
-  Recommendation: the split key.
-- Q2. γ selection: the fitter picks γ by the power residual (γ = 1 here). The settled-window
-  hold-out prefers γ = 2 (0.30 % vs 0.72 %), the calibration-window LOO prefers γ = 1 (0.50 %
-  vs 1.60 %). Keep the power-residual rule, or select by the sustained-time LOO?
-  Recommendation: keep the rule. The two criteria disagree, and the settled set is only
-  three shapes.
-- Q3. Accept "no THERMAL regime, recipe plus an optional longer pre-heat"?
+**Design decisions (independent reviewer, 2026-10-06; binding).**
+- Q1. **Split key** `power.byte_f_pj` (backward compatible, optional), with `power.byte_pj`
+  held fixed in the fit (the two are collinear), not a `power.byte_gamma` exponent key (which
+  would change what an old file's e_byte means).
+- Q2. **Keep γ = 1** and the power-residual rule. The settled-window hold-out prefers γ = 2
+  (0.30 % vs 0.72 %), the calibration-window LOO prefers γ = 1 (0.50 % vs 1.60 %); the
+  settled set is only three shapes. Re-checked on the 60 s pre-heat windows at the refit.
+- Q3. **No THERMAL regime.** Document the +1–2 % drift of minute-scale runs, keep the
+  `clock_mhz` recipe, and use `--sustain-warm-s 60` for the calibration windows; the form
+  comparison and γ are redone on those windows in the combined refit (GPU).
 
 ---
 
@@ -4170,10 +4196,13 @@ and host API; every value the same integer (bit-identical, tested on every contr
 - **§6c.7 (new, draft).** Long sustained windows (2–4 min, NVML traces, energy counter never
   read) on 16384³, 8192³ and a DF 96⁴ × 3000 at N = 14 settle at 74–75 °C and 2240–2310
   MHz. The settled time is 0.6–3.9 % above the shipped SUSTAINED prediction, not ~20 %; the
-  thermal part is ≤ ~1 %. Proposed: a clock-scaled DRAM-byte energy (`power.byte_f_pj`,
-  host API 10, backward compatible; settled hold-out median 1.58 → 0.72 %), no THERMAL
-  regime (recipe: `clock_mhz`; optional longer calibration pre-heat). Design questions Q1–Q3
-  are open for the reviewer.
+  thermal part is ≈ 1–1.8 % (half of the gap at 16384³, most of it at 8192³ and DF); the
+  rest is a fit bias of the unscaled form (e_tc 0.650 vs 0.691 pJ/op: solved clock too high,
+  optimistic). Proposed: a clock-scaled byte energy (`power.byte_f_pj`, SM/L2-side energy per
+  modelled DRAM byte; host API 11, optional key, folded v9/v10 view, fit with byte_pj fixed;
+  settled hold-out median 1.58 → 0.72 %), no THERMAL regime (recipe: `clock_mhz`, +1–2 %
+  documented drift; calibration pre-heat 60 s). Q1–Q3 decided by the independent reviewer;
+  the refit needs new sustained windows (GPU).
 - **§6c.1** The "~1950 MHz at 16384³" statement and the "~20 % optimistic for long hot runs"
   bias are corrected to the measured values (most likely a single post-loop NVML sample).
 - Bench only: `imd_bench --sustain-trace-s T` (time series in method sustained's record)
