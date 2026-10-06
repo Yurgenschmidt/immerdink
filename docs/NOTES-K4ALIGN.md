@@ -131,8 +131,11 @@ All runs are 2048² × k, N = 8, 128×256.
 **What changes.** The chunk count of `k̂ ∈ (j·131008, j·131056]` goes up by one. Each such
 call does one more add-mod launch per group and part and one more W read-modify-write
 (`N·b·m·n̂` bytes; about 30–40 µs at 2048², N = 8), and may need one more add-mod shape key.
-Nothing else changes: workspace and pack layout, pack format, host API version and
-calibration format.
+Workspace and pack layout, pack format, host API version and calibration format do not
+change. The perf-model values (`imd_perf_predict` / `imd_perf_rank`) do change for every
+multi-chunk call (k̂ > 131008): chunk sizes and round counts, the format-2 slow-chunk set, and
+the format-1 rule (full chunks are no longer slow); see the error figures below. The
+"+1 chunk" holds while the windows are disjoint (j ≤ 2729, k̂ ≲ 3.58·10⁸).
 
 **Measured after the change.** `bench/run_ab.sh` ran the stage 0 build (K_c' = 131056) and the
 stage 1 build (131008) interleaved per case, gated and warmed as above. The 2048² rows use
@@ -156,12 +159,13 @@ stage 1 build (131008) interleaved per case, gated and warmed as above. The 2048
   1 %, and K4 moves by −2 to +3 %.
 - Timed-loop spread was ≤ 3.4 % for every record.
 - The perf model's error on these calls (still θ fitted with 131056) changes from −38 / −32 %
-  to −20 % on 196608 / 196640. A refit is still a later step.
+  to −20 % on 196608 / 196640. The θ refit is an open item (review ruling: no format bump,
+  refit θ), to be done with stage 2.
 
 **Perf model.** `mac_ktail` format 2 ("k̂ mod 32 ≠ 0, or c·K_c' mod 32 ≠ 0") reduces exactly
 to "k̂ mod 32 ≠ 0", because c·K_c' ≡ 0. The rule's chunk counts in the windows change with
-`k_chunks`. The calibration format is unchanged, and θ (fitted with 131056) is refit in a
-later step.
+`k_chunks`. Review ruling: no calibration format bump; refit θ (fitted with 131056). The
+refit is an open item, to be done with stage 2.
 
 ## 7. Review rulings (2026-10-05, binding)
 

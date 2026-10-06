@@ -719,7 +719,8 @@ describes the designed behaviour.
   ≤ K_c is exact, §2/§3.5), so W and C are bit-identical to v1.12. The epilogue range
   shrinks to `[−2129666048, 2146435327]` for p = 256.
 - What changes:
-  - `k_chunks = ⌈k̂/131008⌉` gains one for `k̂ ∈ (j·131008, j·131056]`;
+  - `k_chunks = ⌈k̂/131008⌉` gains one for `k̂ ∈ (j·131008, j·131056]` (exactly one while
+    these windows are disjoint, j ≤ 2729, k̂ ≲ 3.58·10⁸; above, the difference can exceed one);
   - in those windows a call has one more add-mod launch per group and part (§4 launch
     counts), one more W read-modify-write (`N·b·m·n̂` bytes), and possibly one more add-mod
     shape key (plan host bytes);
@@ -2392,7 +2393,11 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
   = 32, which the v1.8 term over-predicted by 26–35 %). Refit on the v1.8 data, hold-out:
   100 µs – 1 ms max error 29.1 → 14.8 %, N = 15–17 100 µs – 1 ms median / p90 8.0 / 15.1 →
   5.3 / 11.7 %; mod 128 was worse (≥ 1 ms median 3.9 %). The fine-k̂ sweep (NOTES-B2 §6)
-  separates the criteria. A format-1 calibration keeps mod 64 (v6-identical predictions).
+  separates the criteria. A format-1 calibration keeps mod 64 (v6-identical predictions up to
+  v1.12). **[v1.13]** The format-1 rule tests each chunk length against 64 and follows
+  K_c': every full chunk (131008) is now a multiple of 64 where 131056 was not, and the chunk
+  sizes and counts change, so format-1 predictions for k̂ > 131008 are no longer
+  v6-identical (single-chunk calls, k̂ ≤ 131008, are unchanged).
   **Per chunk (review 2026-10-05):** K4 reads chunk c of a row at `row·k̂ + c·K_c'` (lda = k̂,
   gemm_k4.cu), so the criterion is the row start of each chunk: slow iff `k̂ mod 32 ≠ 0` or
   `c·K_c' mod 32 ≠ 0`; K_c' = 131056 ≡ 16 (mod 32), so for an aligned k̂ the odd chunks are
@@ -2400,16 +2405,19 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
   strength:** 128×256 (the rule's usual choice) has the full fine-k̂ sweep; 128×128 has the
   4864–5120 points, where k̂ = 4960 (mod 32 = 0, mod 64 = 32) is still +14 % (partly counter-
   evidence: that tile may also pay for the 64-wide residue tile); 64×128 and 64×64 are
-  untested. The two-chunk check (512² × 262144, chunk 1 misaligned, vs 262160, all misaligned)
+  untested. The long-k check (512² × 262144 vs 262160; three chunks each, since 2·131056 =
+  262112 < k̂, not two as first written; v1.10 read it as chunk 1 misaligned vs all misaligned)
   is inconclusive: K4 there is DRAM-bound and 262144 (a power-of-two row stride) is the slower
   one (NOTES-B2 §6).
   **[v1.13] Correction (measured, NOTES-K4ALIGN; §4b).** The per-chunk rule above uses the
   chunk *start*. The measured mechanism depends on the chunk *end*. CUTLASS 2.x loads a
   chunk's residue tile (`kc mod 64` elements) first, so row r's main-loop loads sit at phase
   `(r·k̂ + e_c) mod 64`, where `e_c = k0 + kc` is the chunk end.
-  - With K_c' = 131056 (≡ 48 mod 64), an aligned k̂ had its chunk 0 misaligned, not the odd
-    chunks. The 262144 call was slower because of that, not because of a DRAM-channel
-    effect of its power-of-two stride: 196608, also aligned, measured worst
+  - With K_c' = 131056 (≡ 48 mod 64), an aligned k̂ had its chunk 0 misaligned (class 48),
+    not the odd chunks. Later full chunks were not aligned either: chunk c ends at
+    (c + 1)·131056 ≡ 48·(c + 1) mod 64, so 262144's chunk 1 (ending at 262112) was class 32,
+    and only the last chunk (ending at k̂) was aligned. The 262144 call was slower because
+    of its class-48 chunk 0, not because of a DRAM-channel effect of its power-of-two stride: 196608, also aligned, measured worst
     (2048² × 196608, N = 8: 23.4 TFLOPS-eq, 70.5 ms per call).
   - k̂ ≡ 16 mod 32 misaligns half of the rows (the phases cycle through all four 16-byte
     classes), not every row.
@@ -2419,8 +2427,9 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
     becomes exactly "slow iff k̂ mod 32 ≠ 0" for the 16/48 phase classes. The class-32 cost
     (+3 % for 128×256 and +10 to +19 % for the smaller tiles, measured) has no term of its
     own.
-  - The calibration format is unchanged (review 2026-10-05). The shipped θ was fitted with
-    the old chunk length, and a later step refits it.
+  - The calibration format is unchanged (review ruling 2026-10-05: no format bump, refit θ).
+    The shipped θ was fitted with the old chunk length; the refit is an open item, to be done
+    with stage 2.
   - **[stage 2]** (§4b.6) The rule stays exact with per-plan alignment: an A = 64 plan has
     k̂ ≡ 0 mod 64 and is never "slow"; A = 16 plans (k ≤ 96) are unchanged. No format bump;
     θ is refit after stage 2 and `k4_select` re-checked. The model's K4 and byte terms use
@@ -3767,7 +3776,17 @@ and host API; every value the same integer (bit-identical, tested on every contr
 - **Results are bit-identical**, since the chunking does not change W or C.
   - The calls with `k̂ ∈ (j·131008, j·131056]` gain one K-chunk: one more add-mod launch per
     group and part, one more W pass, and possibly one more add-mod shape key.
-  - Every other host query value is unchanged.
+  - Every other sizing value (workspace, pack and plan layout, plan bytes apart from the
+    add-mod shape keys) is unchanged.
+  - `imd_perf_predict` / `imd_perf_rank` values change for every multi-chunk call
+    (k̂ > 131008), not only in the windows: the chunk sizes and per-chunk round counts
+    change; the format-2 slow-chunk set changes (the `c·K_c' mod 32` term is now always 0);
+    and under format 1 the full chunks (131008 ≡ 0 mod 64) are no longer slow. Measured on
+    θ fitted with 131056, the model error on 2048² × 196608 / 196640 goes from −38 / −32 %
+    to −20 % (NOTES-K4ALIGN §6). θ is to be refit (with stage 2).
+  - The "+1 chunk in the windows" statement holds while the windows `(j·131008, j·131056]`
+    are disjoint, i.e. j·48 < 131008, j ≤ 2729 (k̂ ≲ 3.58·10⁸); beyond that the chunk counts
+    can differ by more than one.
   - A pre-check before the change ran 11 long-k cases with `imd_test_set_limits(k_chunk =
     131008)` on the old code. All were bit-exact against the oracle at chunk 131008 and
     identical to the 131056 run.
@@ -3776,8 +3795,8 @@ and host API; every value the same integer (bit-identical, tested on every contr
   by `params.k_hat_of`.
 - **§6c.** A correction to the v1.10 per-chunk text: the criterion is the chunk end, not
   the start, and the 262144 effect was the residue-first phase, not a DRAM-channel effect.
-  The format-2 criterion is now exactly "k̂ mod 32 ≠ 0". There is no format change, and θ is
-  to be refit.
+  The format-2 criterion is now exactly "k̂ mod 32 ≠ 0". Review ruling: no calibration format
+  bump; θ is to be refit (open item, done with stage 2).
 - **Spec.** `spec/apalache/Epilogue.tla`: `Kp = 131008`, with the tight max 2146435327
   (new counterexample value). The comments in Pipeline, MC_Pipeline, OzakiCRT and
   Int32Chunk change; no TLC model changes. `params.cert_row_phase` (new) covers the boundary

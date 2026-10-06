@@ -229,10 +229,13 @@ validation logs next to them.
   mechanism, and two statements above are wrong.
   - **The "DRAM-channel effect" claim is wrong.** CUTLASS 2.x loads a chunk's residue tile
     (`kc mod 64`) first, so row r's main-loop loads sit at phase `(r·k̂ + chunk end) mod 64`.
-    Under this rule:
-    - in 262144, chunk 0 (131056 long, ending at 48 mod 64) has every row misaligned, and
-      chunk 1 (ending at k̂) is aligned. It is chunk 0, not chunk 1, that is misaligned;
-    - in 262160, both chunks have half of the rows misaligned.
+    Under this rule (both calls had three chunks under 131056, since 2·131056 = 262112 < k̂,
+    so the "two-chunk check" above was really a three-chunk check):
+    - in 262144, chunk 0 (131056 long, ending at 131056 ≡ 48 mod 64) is in class 48, every
+      row misaligned; chunk 1 (ending at 262112 ≡ 32 mod 64) is in class 32, every row
+      off the 64-byte phase but not misaligned in the format-2 sense; chunk 2 (32 long, ending
+      at k̂) is aligned. It is chunk 0, not chunk 1, that is misaligned;
+    - in 262160, every chunk (131056, 131056, 48 long) has half of the rows misaligned.
 
     The two calls had equal misaligned fractions, so this check could not separate the
     criteria. The aligned power-of-two stride was slower because of the residue-first
