@@ -1,5 +1,6 @@
 // GPU unit test of the pack emitter (DESIGN v1.14 §3.4.1, src/kernels/pack_emitter.cuh):
-// PackEmitterT<E, W> for E = 16, 8, 4 and W = 2 (N <= 16) / W = 3 (every N), RN and TRUNC,
+// PackEmitterT<E, W> for E = 16, 8, 4 and every W >= W(N): W = 1 (v1.16, N <= 8), W = 2
+// (N <= 16), W = 3 (every N), RN and TRUNC,
 // against an exact host reference: |a'| from the double's significand and exponent in
 // u128 (§3.3: RN ties-to-even or truncation toward zero), r = |a'| mod p, SMod, the sign.
 // Device asserts are ON (NDEBUG undefined below): X's bits past kPackXBits[W] must be zero.
@@ -263,24 +264,28 @@ long run(int N, bool trunc, int threads, uint64_t seed, Coverage& cov, long* che
 
 template <int E>
 long run_n(int N, bool trunc, int threads, uint64_t seed, Coverage* cov, long* checked) {
-  // cov[0]: the W = 3 run, cov[1]: the W = 2 run (N <= 16); coverage is checked per W.
-  long bad = run<E, 3>(N, trunc, threads, seed, cov[0], checked);  // W = 3 is valid for every N
-  if (imd::kernels::pack_words(N) == 2)
+  // cov[W - 1]: the run with W words, for every W >= W(N) (a larger W is valid too: W = 3 at
+  // every N, W = 2 at N <= 16, W = 1 at N <= 8); coverage is checked per W.
+  long bad = run<E, 3>(N, trunc, threads, seed, cov[2], checked);
+  if (imd::kernels::pack_words(N) <= 2)
     bad += run<E, 2>(N, trunc, threads, seed + 1, cov[1], checked);
+  if (imd::kernels::pack_words(N) == 1)
+    bad += run<E, 1>(N, trunc, threads, seed + 2, cov[0], checked);
   return bad;
 }
 
 }  // namespace
 
 int main() {
-  static_assert(imd::kernels::pack_words(16) == 2 && imd::kernels::pack_words(17) == 3,
+  static_assert(imd::kernels::pack_words(8) == 1 && imd::kernels::pack_words(9) == 2 &&
+                    imd::kernels::pack_words(16) == 2 && imd::kernels::pack_words(17) == 3,
                 "W rule (cert_pack_words)");
   long bad = 0, checked = 0;
   int fails = 0;
   for (int N = c::kNMin; N <= c::kNMax; ++N) {
-    Coverage covw[2];  // [0]: W = 3, [1]: W = 2 (review L1: "all eps hit" per W)
+    Coverage covw[3];  // [W - 1] (review L1: "all eps hit" per W)
     for (Coverage& cv : covw) cv.eps.assign(c::kEpsMax + 1, 0);
-    const int n_w = imd::kernels::pack_words(N) == 2 ? 2 : 1;
+    const int w_min = imd::kernels::pack_words(N);
     long bn = 0;
     for (int tr = 0; tr < 2; ++tr) {
       const bool trunc = tr == 1;
@@ -291,7 +296,7 @@ int main() {
     }
     int missing = 0;
     bool cov_ok = true;
-    for (int w = 0; w < n_w; ++w) {
+    for (int w = w_min - 1; w < 3; ++w) {
       const Coverage& cv = covw[w];
       int miss_w = 0;
       for (int e = 0; e <= c::kTables.eps_max[N]; ++e) miss_w += cv.eps[e] == 0;
@@ -299,12 +304,12 @@ int main() {
       cov_ok = cov_ok && miss_w == 0 && cv.top > 0 && cv.rounding > 0 && cv.ties > 0 &&
                (N < 9 || cv.q1 > 0) && (N < 17 || cv.q2 > 0);
     }
-    Coverage cov = covw[0];  // the report: both W summed
-    if (n_w == 2) {
-      cov.q1 += covw[1].q1, cov.q2 += covw[1].q2, cov.top += covw[1].top;
-      cov.rounding += covw[1].rounding, cov.ties += covw[1].ties;
+    Coverage cov = covw[2];  // the report: every W summed
+    for (int w = w_min - 1; w < 2; ++w) {
+      cov.q1 += covw[w].q1, cov.q2 += covw[w].q2, cov.top += covw[w].top;
+      cov.rounding += covw[w].rounding, cov.ties += covw[w].ties;
     }
-    std::printf("N=%2d W=%d: %ld mismatches; eps 0..%d all hit: %s (q=1: %ld, q=2: %ld, |a'| at "
+    std::printf("N=%2d W=%d..3: %ld mismatches; eps 0..%d all hit: %s (q=1: %ld, q=2: %ld, |a'| at "
                 "bitlen T: %ld, rounding path: %ld, ties: %ld)\n",
                 N, imd::kernels::pack_words(N), bn, c::kTables.eps_max[N], missing ? "NO" : "yes",
                 cov.q1, cov.q2, cov.top, cov.rounding, cov.ties);

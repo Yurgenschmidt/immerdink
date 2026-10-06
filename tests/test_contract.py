@@ -939,6 +939,26 @@ def suite_api(lib, cuda, verbose):
             raise Fail(f"plan status {st}, expected {want}")
     if verbose:
         print(f"  ok  plan-time statuses ({len(checks)} cases)")
+    # v1.16 §3.4.1: the pack kernels' occupancy per emitter word count W. The performance model
+    # keeps one row per kernel (the most constrained W); its features use the CTAs per SM, so
+    # they must be equal for every W, and the reported row must be the most constrained one.
+    names = {1: "kf16", 2: "kf4", 3: "kl8", 4: "kl4", 5: "pack"}   # IMD_PERF_KERNEL_*
+    for kern, name in names.items():
+        rows = {w: lib.kernel_occupancy_w(kern, w) for w in (0, 1, 2, 3)}
+        if any(r is None or r[0] < 1 for r in rows.values()):
+            raise Fail(f"occupancy {name}: {rows}")
+        if len({rows[w][0] for w in (1, 2, 3)}) != 1:
+            raise Fail(f"occupancy {name}: CTAs per SM differ by W {rows} (the model needs "
+                       "per-W occupancy rows: DESIGN §3.4.1 v1.16)")
+        worst = min((rows[w] for w in (3, 2, 1)), key=lambda r: (r[0], -r[1]))
+        if rows[0] != worst or any(rows[w][2:] != rows[0][2:] for w in (1, 2, 3)):
+            raise Fail(f"occupancy {name}: reported row {rows[0]} is not the most constrained {rows}")
+        if verbose:
+            print(f"  ok  occupancy {name}: {rows[0][0]} CTAs/SM at W = 1, 2, 3; registers "
+                  f"{rows[1][1]} / {rows[2][1]} / {rows[3][1]}")
+    for kern, w in ((0, 1), (5, 4), (5, -1), (14, 2)):    # K0 has no W; W 4 / -1; a K5 kernel
+        if lib.kernel_occupancy_w(kern, w) is not None:
+            raise Fail(f"occupancy hook accepted kernel {kern} W {w}")
 
 
 def suite_replay(lib, cuda, verbose):
@@ -1103,7 +1123,8 @@ def suite_pad_mutation(lib, cuda, verbose):
 def suite_eps(lib, cuda, verbose):
     """DESIGN v1.14 §3.4.1, the branch-free pack emitter on eps-heavy data (gen_eps): rows
     of subnormals scaled to eps in [32, 77] at N = 17-20 (both word selects of W = 3) and up
-    to 62 at N = 16 (W = 2), eps > 0 at N <= 13 (subnormals), dominant entries, RN and TRUNC,
+    to 62 at N = 16 (W = 2), eps > 0 at N <= 13 (subnormals; v1.16: W = 1 at N <= 8, eps up to
+    eps_max - 3 at N = 5..8), dominant entries, RN and TRUNC,
     g < N; small operands (KF E = 4, moduli parts, gridDim.y > 1), K2/K3, KL (forced, and by
     the rule for k_hat > 1024, E = 8 and, with 64-row tiles, E = 4): every run_case variant
     bit-exact vs the oracle. Fails if the data of the emulated cases (k >= 2; k = 1 is DIRECT)
@@ -1112,13 +1133,13 @@ def suite_eps(lib, cuda, verbose):
     reach = {}
     shapes = ((9, 13, 1, "sub1", "sub1"), (17, 12, 5, "sub", "mix"), (24, 20, 33, "mix", "sub1"),
               (12, 30, 129, "dominant", "mix"), (20, 16, 300, "mix", "dominant"))
-    cases = [(N, t, sh) for N in (8, 13, 14, 15, 16, 17, 18, 19, 20) for t, sh in enumerate(shapes)
-             if not (t == 4 and N in (14, 15, 18, 19))]
+    cases = [(N, t, sh) for N in (2, 5, 6, 7, 8, 13, 14, 15, 16, 17, 18, 19, 20)
+             for t, sh in enumerate(shapes) if not (t == 4 and N in (2, 5, 7, 14, 15, 18, 19))]
     cases += [(16, 5, (6, 5, 1100, "mix", "sub1")), (20, 6, (5, 7, 1100, "sub1", "mix")),
               (17, 7, (4, 4, 2100, "mix", "sub"))]
     for N, t, (m, n, k, ka, kb) in cases:
         rounding = ("RN", "TRUNC")[(N + t) % 2]
-        g = (0, 1, 3, 0, 5, 0, 4, 0)[t]
+        g = min((0, 1, 3, 0, 5, 0, 4, 0)[t], N)
         A, B, C = matrix(rng, m, n, k)
         TA, TB = gen_eps(rng, (m, k), ka, 1), gen_eps(rng, (k, n), kb, 0)
         if t == 3:
@@ -1140,7 +1161,8 @@ def suite_eps(lib, cuda, verbose):
             print(f"  eps reached N={N}: max {r['max']} (eps_max {params.constants(N)['eps_max']}), "
                   f"{r['pos']} entries eps > 0, {r['ge32']} >= 32, {r['ge64']} >= 64")
         if r["pos"] == 0 or (N >= 13 and r["ge32"] == 0) or (N >= 17 and r["ge64"] == 0) or \
-                (N == 16 and r["max"] < 60) or (N >= 17 and r["max"] < params.constants(N)["eps_max"] - 3):
+                (N == 16 and r["max"] < 60) or (N >= 17 and r["max"] < params.constants(N)["eps_max"] - 3) or \
+                (5 <= N <= 8 and r["max"] < params.constants(N)["eps_max"] - 3):
             raise Fail(f"suite eps: N={N} did not reach the intended eps ({r})")
 
 

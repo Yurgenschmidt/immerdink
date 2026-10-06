@@ -1282,8 +1282,24 @@ struct Bench {
       js += (k ? ", " : "") + jstr(imd_perf_kernel_name(k)) + ": [" + std::to_string(v[0]) + ", " +
             std::to_string(v[1]) + ", " + std::to_string(v[2]) + ", " + std::to_string(v[3]) + "]";
     }
+    // v1.16 §3.4.1: the pack kernels per emitter word count W (1, 2, 3); "kernels" holds the
+    // most constrained W's row (the performance model's).
+    std::string jw = "{";
+    const int pack_kernels[] = {IMD_PERF_KERNEL_KF16, IMD_PERF_KERNEL_KF4, IMD_PERF_KERNEL_KL8,
+                                IMD_PERF_KERNEL_KL4, IMD_PERF_KERNEL_PACK};
+    for (int k : pack_kernels) {
+      jw += (jw.size() > 1 ? ", " : "") + jstr(imd_perf_kernel_name(k)) + ": {";
+      for (int w = 1; w <= 3; ++w) {
+        int32_t v[4] = {0, 0, 0, 0};
+        if (imd_prof_kernel_occupancy_w(k, w, v) != 0) throw Failure("imd_prof_kernel_occupancy_w");
+        jw += (w > 1 ? ", " : "") + jstr(std::to_string(w)) + ": [" + std::to_string(v[0]) + ", " +
+              std::to_string(v[1]) + ", " + std::to_string(v[2]) + ", " + std::to_string(v[3]) + "]";
+      }
+      jw += "}";
+    }
     Json j;
     j.str("method", "occupancy").str("variant", "").integer("N", 0).raw("kernels", js + "}");
+    j.raw("kernels_w", jw + "}");
     j.str("status", "ok");
     emit(j);
 #else

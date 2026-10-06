@@ -125,8 +125,8 @@ IMD_HD uint32_t mod_p_bytes32(uint32_t lo, uint32_t hi, uint32_t wlo, uint32_t w
   return s - p * q;
 }
 
-// v1.14 §3.4.1: X mod p for X = sum_j x[j] 2^(32 j) < 2^(32 W) whose bytes 10, 11 are zero
-// when W = 3 (X < 2^78: cert_pack_words), with the pack weights wt[j] (u8 lanes 2^(8(4j+i))
+// v1.14 §3.4.1: X mod p for X = sum_j x[j] 2^(32 j) < 2^(32 W) (v1.16: W = 1, 2 or 3) whose
+// bytes 10, 11 are zero when W = 3 (X < 2^78: cert_pack_words), with the pack weights wt[j] (u8 lanes 2^(8(4j+i))
 // mod p, device/residue.hpp PackWeights). s = sum_j dp4a(x[j], wt[j]) = X (mod p) and
 // s <= 12 * 255^2 < 2^20, inside mod_p_bytes32's exact range s < 2^24 (same quotient by
 // the 32-bit magic m32 = ceil(2^32/p), 2^24 for p = 256). Returns the non-negative X mod p.
@@ -134,7 +134,7 @@ IMD_HD uint32_t mod_p_bytes32(uint32_t lo, uint32_t hi, uint32_t wlo, uint32_t w
 template <int W>
 IMD_HD uint32_t mod_p_words32(const uint32_t (&x)[W], const uint32_t (&wt)[W], uint32_t p,
                               uint32_t m32) {
-  static_assert(W == 2 || W == 3, "2 or 3 words");
+  static_assert(W == 1 || W == 2 || W == 3, "1, 2 or 3 words");
   uint32_t s = 0;
 #if defined(__CUDA_ARCH__)
 #pragma unroll

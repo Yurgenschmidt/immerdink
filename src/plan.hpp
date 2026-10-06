@@ -40,6 +40,10 @@ int32_t pack_kl_lg_rows(const ExecPlan& p);
 // registers per thread, static shared memory bytes and threads of the launch, of kernel
 // IMD_PERF_KERNEL_* (the K4 ones excepted: cudaErrorInvalidValue).
 cudaError_t kernel_occupancy(int32_t kernel, int32_t* out);
+// v1.16 §3.4.1: the same row for one pack-emitter word count W in {1, 2, 3} of a pack kernel
+// (KF16, KF4, KL8, KL4, PACK); W = 0 is kernel_occupancy's row (a pack kernel's most
+// constrained W: fewest CTAs per SM, then most registers). cudaErrorInvalidValue otherwise.
+cudaError_t kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out);
 
 // K0 (contract.cu): write the p.vec_count scatter vectors to `vec` from p.vec_desc, on
 // `stream`. Also builds the resident copy at plan creation. SUCCESS or CUDA_ERROR.
