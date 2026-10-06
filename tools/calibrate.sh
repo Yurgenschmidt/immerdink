@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Calibrate the performance model (DESIGN v1.8 §6c.2) on this machine's GPU.
 #   tools/calibrate.sh [-o out.calib] [--validate] [--results DIR] [--k-align auto|16|64]
+#                      [--sustained FILE] [--cache FILE]
 # 1. builds the profiling imd_bench (bench/build.sh, via bench/run_sweep.sh);
 # 2. runs the calibration sweep bench/sweep_calib.txt through bench/run_sweep.sh (quiet gate,
 #    shared GPU lock, warm-up; ~12 min of GPU time on an RTX 4090) into DIR/calib-<stamp>.jsonl;
@@ -19,22 +20,31 @@
 # IMD_BENCH_K_ALIGN; default auto). A single sweep line can force it with "--k-align 16" too
 # (the A = 16-forced cases at k > 96 the refit needs); every record carries k_align_hook and
 # bench/perf_fit.py models each record at its alignment.
+# --sustained / --cache: reuse the records of an earlier bench/sweep_sustained.txt /
+# bench/sweep_cache.txt run instead of measuring them again (~13 min of GPU). Only valid when
+# those sweeps' plans are unchanged since (v1.13 stage 2: every case there has k = 0 mod 64,
+# so A = 16 and A = 64 give the same k_hat).
 # Results default to bench/results/ (git-ignored). Never changes GPU clocks.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
 env_dir="${IMMERDINK_ENV:-$HOME/miniforge3/envs/immerdink}"
 build="${IMMERDINK_BENCH_BUILD:-$root/build/bench}"
-out="" validate=0 results="$root/bench/results"
+out="" validate=0 results="$root/bench/results" sdata="" cdata=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     --validate) validate=1; shift ;;
     --results) results="$2"; shift 2 ;;
+    --sustained) sdata="$2"; shift 2 ;;
+    --cache) cdata="$2"; shift 2 ;;
     --k-align) case "$2" in auto|0|16|64) export IMD_BENCH_K_ALIGN="$2" ;;
                *) echo "--k-align auto|16|64" >&2; exit 2 ;; esac; shift 2 ;;
-    *) echo "usage: tools/calibrate.sh [-o out.calib] [--validate] [--results DIR] [--k-align auto|16|64]" >&2; exit 2 ;;
+    *) echo "usage: tools/calibrate.sh [-o out.calib] [--validate] [--results DIR] [--k-align auto|16|64] [--sustained FILE] [--cache FILE]" >&2; exit 2 ;;
   esac
+done
+for f in "$sdata" "$cdata"; do
+  [ -z "$f" ] || [ -s "$f" ] || { echo "calibrate: no records in $f" >&2; exit 2; }
 done
 mkdir -p "$results"
 stamp="$(date +%Y%m%d-%H%M)"
@@ -47,9 +57,14 @@ export IMD_BENCH_CLOCK=1
 data="$results/calib-$stamp.jsonl"
 "$root/bench/run_sweep.sh" "$root/bench/sweep_calib.txt" "$data" || exit $?
 # v1.10 (DESIGN §6c.1): sustained windows (power model) and the cache-state pairs.
-sdata="$results/sustained-$stamp.jsonl" cdata="$results/cache-$stamp.jsonl"
-"$root/bench/run_sweep.sh" "$root/bench/sweep_sustained.txt" "$sdata" || exit $?
-"$root/bench/run_sweep.sh" "$root/bench/sweep_cache.txt" "$cdata" || exit $?
+if [ -z "$sdata" ]; then
+  sdata="$results/sustained-$stamp.jsonl"
+  "$root/bench/run_sweep.sh" "$root/bench/sweep_sustained.txt" "$sdata" || exit $?
+fi
+if [ -z "$cdata" ]; then
+  cdata="$results/cache-$stamp.jsonl"
+  "$root/bench/run_sweep.sh" "$root/bench/sweep_cache.txt" "$cdata" || exit $?
+fi
 [ -n "$out" ] || out="$results/$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 |
                                  tr ' ' '_' | tr -cd 'A-Za-z0-9_-')-$stamp.calib"
 # shellcheck disable=SC2086

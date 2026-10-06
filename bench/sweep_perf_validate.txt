@@ -57,3 +57,22 @@ y_k3b     | ik,jk->ij | i=6000,j=256,k=2500        | imd | 14 | --reps 20 --phas
 y_kt816   | ik,jk->ij | i=2048,j=1536,k=816        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1
 y_kt880   | ik,jk->ij | i=1600,j=1600,k=880        | imd | 15 | --reps 50 --phase-reps 10 --max-seconds 1
 y_kt4944  | ik,jk->ij | i=2048,j=2048,k=4944       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1
+# --- (v1.13 stage 2, 2026-10-06) k across the AUTO range (A = 16 for k <= 96, else 64; every
+#     k_hat mod 64 class of the logical k), skinny and tensor shapes, and two A = 16-forced
+#     cases (--k-align 16) for the slow K-chunk term
+z_k80     | ik,jk->ij | i=1536,j=1536,k=80         | imd | 8,14 | --reps 200 --phase-reps 10 --max-seconds 1
+z_k112    | ik,jk->ij | i=1536,j=1536,k=112        | imd | 8,14 | --reps 200 --phase-reps 10 --max-seconds 1
+z_k144    | ik,jk->ij | i=1536,j=1536,k=144        | imd | 8,14 | --reps 200 --phase-reps 10 --max-seconds 1
+z_k208    | ik,jk->ij | i=1536,j=1536,k=208        | imd | 8,14 | --reps 200 --phase-reps 10 --max-seconds 1
+z_k528    | ik,jk->ij | i=1536,j=1536,k=528        | imd | 8,14 | --reps 100 --phase-reps 10 --max-seconds 1
+z_k1000   | ik,jk->ij | i=1536,j=1536,k=1000       | imd | 8,14 | --reps 100 --phase-reps 10 --max-seconds 1
+z_k2032   | ik,jk->ij | i=1536,j=1536,k=2032       | imd | 8,14 | --reps 50 --phase-reps 5 --max-seconds 1
+z_k4080   | ik,jk->ij | i=1536,j=1536,k=4080       | imd | 8,14 | --reps 20 --phase-reps 5 --max-seconds 1
+z_sk144   | ik,jk->ij | i=12288,j=384,k=144        | imd | 8,14 | --reps 50 --phase-reps 10 --max-seconds 1
+z_sk1040  | ik,jk->ij | i=12288,j=384,k=1040       | imd | 8,14 | --reps 20 --phase-reps 5 --max-seconds 1
+z_s200    | ik,jk->ij | i=400,j=400,k=200          | imd | 8,14 | --reps 300 --phase-reps 10 --max-seconds 1
+z_s600    | ik,jk->ij | i=600,j=600,k=600          | imd | 8,16 | --reps 200 --phase-reps 10 --max-seconds 1
+z_df      | acQ,bdQ->acbd | a=56,b=56,c=56,d=56,Q=2000 | imd | 8,16 | --reps 10 --phase-reps 3 --max-seconds 1
+z_cc19    | kjbc,kiac->abij | i=19,j=19,k=19,a=112,b=112,c=112 | imd | 8,16 | --reps 20 --phase-reps 5 --max-seconds 1
+z_a16a    | ik,jk->ij | i=1536,j=1536,k=1008       | imd | 8,14 | --reps 100 --phase-reps 10 --max-seconds 1 --k-align 16
+z_a16b    | ik,jk->ij | i=3000,j=700,k=5000        | imd | 8,14 | --reps 20 --phase-reps 5 --max-seconds 1 --k-align 16
