@@ -26,7 +26,8 @@
 //             call, in one process (docs/BENCHMARKING.md "Tiny shapes", NOTES-A5 §1.2): both
 //             sides see the same GPU clock / DVFS / host-core state. A side is "default" or
 //             a comma list of N=<n>, vec=generate|resident, g=<g> (0 = N),
-//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule); unset keys keep the plan
+//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule), ka=auto|16|64 (v1.13 §4b:
+//             the side's K alignment, via the test hook at plan creation); unset keys keep the plan
 //             defaults, N defaults to the --N value. Defaults: A = default (the K4 rule),
 //             B = k4=tune (the plan-time K4 autotune); when both pick the same K4
 //             configuration (k4_config in both records) the run is an A/A resolution check.
@@ -526,11 +527,13 @@ Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& 
 // elements per thread. Forced k4 / k5 go through the benchmark hooks (profiling build).
 struct DuelSide {
   int N = 14, vec = IMD_VEC_GENERATE, g = 0, k4 = -1, k5 = 0;
+  int ka = -1;  // v1.13 §4b: -1 = the run's --k-align, 0 = AUTO, 16 / 64 = forced (plan-time hook)
   std::string describe() const {
     std::string d = "N=" + std::to_string(N) + " g=" + ((g == 0 || g >= N) ? "N" : std::to_string(g));
     d += vec == IMD_VEC_RESIDENT ? " vec=resident" : " vec=generate";
     d += k4 == -1 ? " k4=rule" : k4 == -2 ? " k4=tune" : " k4=" + std::to_string(k4);
     d += k5 == 0 ? " k5=rule" : " k5=" + std::to_string(k5);
+    if (ka >= 0) d += ka == 0 ? " ka=auto" : " ka=" + std::to_string(ka);
     return d;
   }
 };
@@ -550,8 +553,9 @@ DuelSide parse_duel_side(const std::string& spec, int N) {
     else if (k == "g") d.g = std::stoi(v);
     else if (k == "k4") d.k4 = v == "rule" ? -1 : v == "tune" ? -2 : std::stoi(v);
     else if (k == "k5" && (v == "0" || v == "1" || v == "2" || v == "4")) d.k5 = std::stoi(v);
+    else if (k == "ka" && (v == "auto" || v == "16" || v == "64")) d.ka = v == "auto" ? 0 : std::stoi(v);
     else throw Failure("bad duel side entry '" + kv + "' (N=, vec=generate|resident, g=, "
-                       "k4=rule|tune|0..3, k5=0|1|2|4)");
+                       "k4=rule|tune|0..3, k5=0|1|2|4, ka=auto|16|64)");
   }
   return d;
 }
@@ -866,6 +870,14 @@ struct Bench {
     };
     imd_tensor_t A = t(c.A, P->la), B = t(c.B, P->lb), C = t(c.C, P->lc);
     imd_options_t opt{d.N, d.g, IMD_RN, IMD_EMULATE, d.vec, d.k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF};
+    // ka=: the K alignment of this side's sizing, lowering and plan (the host library's test
+    // hook, resolved once at plan creation; the plan keeps its A), restored to the run's
+    // --k-align afterwards. Times A = 16 against A = 64 interleaved in one process.
+    if (d.ka >= 0 && imd_test_set_k_align(d.ka) != 0) throw Failure("imd_test_set_k_align");
+    struct KaRestore {
+      int run; bool on;
+      ~KaRestore() { if (on) imd_test_set_k_align(run); }
+    } ka_restore{o.k_align_hook, d.ka >= 0};
     CI(imd_workspace_size(&A, &B, &C, &opt, &P->wsb));
     P->low.struct_size = sizeof P->low;
     imd_lowering(&A, &B, &C, &opt, &P->low);
@@ -1399,7 +1411,7 @@ void usage() {
           "  [--mode emulate|direct] (method imd) [--data normal|dominant]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
-          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4)\n"
+          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, ka=auto|16|64)\n"
           "  [--clock-probe 0|1] [--l2 repeat|flush] (v1.10: per-call SM clock; L2 evicted\n"
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
           "  [--k-align auto|16|64] (v1.13 §4b: force the K alignment of every plan / pack)\n"

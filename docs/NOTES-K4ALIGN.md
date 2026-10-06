@@ -330,3 +330,33 @@ The full write-up, with the hold-out tables, is in NOTES-B2 §8. In brief:
 - **`k4_select`.** The constants are unchanged. On a 15-view grid with every configuration
   forced and k̂ padded, the rule is +0.65 % over the per-view fastest (always 128×256:
   +6.8 %). Margin variants move this by at most 0.06 pp. No alternative is clearly better.
+
+## 11. Threshold follow-up with the real A = 64 (2026-10-06, branch `followup-threshold`)
+
+Full write-up: immerdink-eval `findings/followup-threshold.md`; raw data and `analyze.py`:
+`results/followups/threshold/`. **Result: keep `K_PAD64_MIN = 96`; no rule change.**
+
+- **Method.** `imd_bench` duel sides take `ka=auto|16|64` (the host library's
+  `imd_test_set_k_align` hook around that side's sizing, lowering and plan creation; the plan
+  keeps its A), so A = 16 and A = 64 are timed interleaved call by call in one process
+  (no cross-process noise). 7 shapes (2048², 16384×512, 512×16384, 4096×1024, 1024², 512²,
+  DF `Qia,Qjb->iajb` 2304² × Q; K4 configurations 0, 1, 2 as the rule picks), N ∈ {8, 14},
+  k = 65…385 (every ⌈k⌉₁₆ class 80…400 that a fraction rule could treat differently),
+  up to 1000 pairs per duel; the class-32 k repeated with sides swapped. Noise: A/A
+  controls (⌈k⌉₁₆ ≡ 0) −0.6 … +1.2 %, pass-to-pass median 0.25 %. All C bit-identical.
+  About 20 GPU minutes.
+- **Per class** (mean over shapes × N): ≡ 48 +4 to +7 % (up to +17 %); ≡ 16 +0.7 % at
+  k̂ = 144, +1.8 % at 208, +2.8 % at 272, +3.8 % at 336; ≡ 32 −0.5 … +0.0 %. Losses come only
+  from the skinny shapes (−1 to −4 % at ≡ 16 / 32, k̂ ≤ 352; the s2-perf 16384×512×144
+  regression reproduces at −1.3 / −3.5 %), where K4 is about a third of the call and the
+  tall operand's extra producer bytes dominate.
+- **Rules** (mean gain vs 96 / mean loss vs the per-case best, 238 duels): 96 0 / 0.29 %;
+  64 −0.02 %; 80 −0.03 %; 112…160 about −0.24 %; 256 −0.93 %; padding-fraction bounds
+  0.07…0.25 −1.2 … −0.04 % (they un-pad class 16, which nets a gain); "never pad class 32"
+  +0.03 … +0.05 % (within noise, and class 32 gains a little at large k); per-k oracle
+  +0.08 %; per-case oracle knowing (m, n, N) +0.29 %.
+- **Agreement.** A pack resolves A from (N, b, r, k) with r its own free extent; K4 reads
+  RA and RB with one k̂. A rule in m or n can make the A and B packs (or a pack and the
+  native partner) of one contraction disagree, and a pack reused against partners of
+  different n has no single right A. Only (k, N, b) are known to both; no N dependence
+  worth a parameter was seen. So A stays a function of k alone (§4b.3).
