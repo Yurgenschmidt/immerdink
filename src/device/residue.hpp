@@ -1,5 +1,6 @@
-// Byte weights for mod_p_bytes (device/modp.hpp), derived at compile time from the
-// generated table pow2_mod (2^e mod p_l, e = 0..kEpsMax >= 48): no new constants.
+// Byte weights for mod_p_bytes (device/modp.hpp) and (v1.14) the pack emitter's
+// mod_p_words32, derived at compile time from the generated table pow2_mod (2^e mod p_l,
+// e = 0..kEpsMax): no new constants.
 #pragma once
 
 #include <cstdint>
@@ -42,5 +43,27 @@ constexpr Magic32 make_magic32(const imd::constants::Tables& t) {
 inline constexpr Magic32 kMagic32 = make_magic32(imd::constants::kTables);
 
 inline constexpr ByteWeights kByteWeights = make_byte_weights(imd::constants::kTables);
+
+// v1.14 §3.4.1: the pack emitter's weights. Word j of modulus l packs the u8 lanes
+// 2^(8(4j + i)) mod p_l, i = 0..3, for the bytes 0..kPackWeightBytes-1 = 0..9 of X = |a'|
+// (X < 2^78, cert_pack_words); the lanes of bytes 10 and 11 are 0. Derived from pow2_mod.
+struct PackWeights {
+  uint32_t w[3][imd::constants::kNMax];
+};
+constexpr PackWeights make_pack_weights(const imd::constants::Tables& t) {
+  static_assert(imd::constants::kEpsMax >= 72, "pow2_mod must reach 2^72 (byte 9 of X)");
+  static_assert(imd::constants::kPackWeightBytes == 10 &&
+                    8 * (imd::constants::kPackWeightBytes - 1) <= imd::constants::kEpsMax,
+                "weights 2^0 .. 2^72 from pow2_mod");
+  static_assert(imd::constants::kPackXBits3 <= 8 * imd::constants::kPackWeightBytes &&
+                    imd::constants::kPackXBits2 < 64,
+                "X < 2^(8 kPackWeightBytes); W = 2 keeps X below 2^63");
+  PackWeights w{};
+  for (int l = 0; l < imd::constants::kNMax; ++l)
+    for (int i = 0; i < imd::constants::kPackWeightBytes; ++i)
+      w.w[i / 4][l] |= static_cast<uint32_t>(t.pow2_mod[l][8 * i]) << (8 * (i % 4));
+  return w;
+}
+inline constexpr PackWeights kPackWeights = make_pack_weights(imd::constants::kTables);
 
 }  // namespace imd::device

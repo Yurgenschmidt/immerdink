@@ -797,6 +797,18 @@ struct Bench {
     Accuracy acc = result_accuracy();
     CU(cudaStreamSynchronize(s));
     Json extra;
+    // C's bits after the timed calls (FNV-1a 64 over the whole C buffer): equal hashes across
+    // builds = bit-identical results (v1.14 A/B).
+    std::string c_hash;
+    {
+      std::vector<unsigned char> hc(dC.bytes);
+      CU(cudaMemcpy(hc.data(), dC.p, dC.bytes, cudaMemcpyDeviceToHost));
+      uint64_t h = 0xcbf29ce484222325ull;
+      for (unsigned char b : hc) h = (h ^ b) * 0x100000001b3ull;
+      char hs[17];
+      snprintf(hs, sizeof hs, "%016llx", static_cast<unsigned long long>(h));
+      c_hash = hs;
+    }
     // DESIGN §6c: the predicted call (shipped calibration) for the K4 configuration the plan runs.
     int32_t k4_plan = -1;
 #ifdef IMD_BENCH_PROFILE
@@ -815,6 +827,7 @@ struct Bench {
     });
 #endif
     extra.integer("plan_device_bytes", (long long)plan_dev).num("plan_create_ms", 1e3 * create_s);
+    extra.str("c_hash", c_hash);
     extra.num("pred_ms", 1e3 * pred.time_s).num("pred_err_pct", 100.0 * (pred.time_s / T.median() - 1));
     const std::string gs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
     extra.integer("g", (long long)((g == 0 || g >= N) ? N : g));
