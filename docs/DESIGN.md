@@ -1,4 +1,4 @@
-# immerdink — design (v1.15)
+# immerdink — design (v1.16)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -58,6 +58,11 @@ reviewer. v1.15 also retires the model's eps data dependence (§6c.1 "The eps pa
 retired"; the v1.14 kernels have none): `eps_fraction` is validated and ignored, `eps_s` /
 `eps_fraction` out are 0, the `op_eps` features are 0 and their keys optional (format 2
 kept). The shipped calibration is the combined refit of both (NOTES-B2 §10).
+v1.16 (§3.4.1) finishes the pack emitter: W = 1 (one `dp4a` per residue) for N ≤ 8, masked
+shifts (no undefined shift outside the contract), the exact maxima of the reduction sum,
+and a W-aware occupancy query for the performance model. Same int8 bytes: no semantic,
+layout, launch-shape, pack-format, API, calibration-format or TLA+ change; changed text is
+marked **[v1.16]**.
 The change lists are at the end.
 
 Sources:
@@ -238,8 +243,10 @@ the lanes' distinct ε. The cost depended on the data (§6c "The eps path").
 - `W(N) = 2` for N ≤ 16 and `W(N) = 3` for N = 17–20. **[cert: cert_pack_words]**
   `T(N) < 2^(32·W(N))` for every N: `⌊log₂T⌋ + 1` = 63 bits at N = 16 and 78 at N = 20
   (`kPackXBits2 = 63`, `kPackXBits3 = 78`, `kPackW2MaxN = 16`, generated into constants.hpp).
-  W = 1 would do for N ≤ 8 (T < 2³²); it is not used (one more instantiation for one
-  `dp4a` per residue).
+- **[v1.16]** `W(N) = 1` for N ≤ 8 (`kPackW1MaxN = 8`, `kPackXBits1 = 32`): N = 8 is the
+  largest N with `T(N) < 2³²` (T(8) has 32 bits, T(9) 36), so X is one u32 word and the
+  residue is one `dp4a`. **[cert: cert_pack_words]** (The W rule is then 1 / 2 / 3 for
+  N ≤ 8 / 9–16 / 17–20.)
 - **Precondition `|a'| ≤ T(N)`**, for RN and TRUNC: each entry is bounded by the row's
   norm, `|a'_h| ≤ ‖a'‖₂ ≤ T` (§3.2 guarantee, **[cert: cert_shift_rule_guarantee; spec:
   OzakiScaling]**). cert_pack_words also checks it directly with the §3.2 rule (`shift_u`,
@@ -249,15 +256,29 @@ the lanes' distinct ε. The cost depended on the data (§6c "The eps path").
   lost. A debug build asserts this on the device (no NDEBUG; the unit test
   `pack_emitter` always runs with it).
 - **Construction** (once per element, in `load`, after the unchanged §3.3 `quantize`):
-  W = 2: `X = μ << ε` as one u64. W = 3: the two words of μ shifted by `b = ε mod 32` with
+  **[v1.16]** W = 1: `X = u32(μ) << (ε & 31)` (μ ≤ T < 2³² when μ ≠ 0, and then
+  ε ≤ 31: the cast and the mask are the identity). W = 2: `X = μ << (ε & 63)` as one u64.
+  **[v1.16] The masks** make the shift defined for every ε the u32 / u64 shift could be
+  handed: in the contract (|a'| ≤ T, the precondition above) they change nothing, and a
+  release build of a hypothetical σ bug that produced |a'| ≥ 2^(32W) would store wrong
+  bytes instead of executing undefined behaviour (`mu << eps` with eps ≥ 64). The debug
+  assert stays. Measured cost: none (identical SASS for every pack kernel; the v1.16
+  changelog). W = 3: the two words of μ shifted by `b = ε mod 32` with
   `__funnelshift_l`, then placed by `q = ⌊ε/32⌋ ∈ {0, 1, 2}` with selects (static indices
-  only, no local memory). Zero, ±0 and non-finite elements give X = 0 (as μ = 0 before).
+  only, no local memory; b ≤ 31 by construction and q ≥ 3 selects as q = 2, so W = 3 has
+  no undefined shift). Zero, ±0 and non-finite elements give X = 0 (as μ = 0 before).
   For N ≤ 13 normal inputs always have ε = 0 (T < 2⁵¹ < 2⁵³ ≤ the smallest μ·2^ε with
   ε > 0 and a 53-bit μ), so X = μ; there is one emitter for every N, no N ≤ 13 special case.
 - **Residue** of modulus l: `s = Σ_{j<W} dp4a(X_j, w_j(l))`, where the u8 lanes of the
   weight word `w_j(l)` are `2^(8(4j+i)) mod p_l`, i = 0..3, for the bytes 0..9 of X
   (bytes 10 and 11, the top lanes of `w_2`, have weight 0; X < 2⁷⁸ keeps them zero anyway).
   Then `s ≡ X (mod p_l)` and `s ≤ 10·255·255 < 12·255² < 2²⁰`.
+  **[v1.16] Note:** 10·255·255 = 650,250 is a loose bound (it takes every weight as 255).
+  The exact maxima, certified by cert_pack_words over the moduli each W serves, are:
+  83,130 (W = 1, X < 2³²), 210,472 (W = 2, X < 2⁶³) and 264,156 (W = 3, X < 2⁷⁸, p = 253).
+  With every one of the ten bytes at 255 the maximum would be 302,940 (p = 253); over
+  X ≤ T(N) it is 258,500 (N = 20, p = 253). All of them are below 2¹⁹; only s < 2²⁴ is
+  needed.
   `r = s − p_l·umulhi(s, ⌈2³²/p_l⌉)` is the non-negative `s mod p_l` for every s < 2²⁴
   (the A5 `mod_p_bytes32` lemma: s·e < 2³² for e = ⌈2³²/p⌉·p − 2³² < p ≤ 256;
   `mod_p_words32<W>`, device/modp.hpp). For p = 256 the weights are 1, 0, 0, …, so s is
@@ -272,13 +293,27 @@ the lanes' distinct ε. The cost depended on the data (§6c "The eps path").
   layout, launch-shape or API change.
 
 **W per plan: a template parameter.** Every pack kernel is instantiated for W = 2 and
-W = 3, and the launch picks the instantiation from the plan's N (`pack_words(N)`). A
+W = 3 (**[v1.16]** and W = 1), and the launch picks the instantiation from the plan's N (`pack_words(N)`). A
 warp-uniform runtime branch on W was the alternative: the kernel's register allocation would
 then be W = 3's at every N (the exploration measured W = 3 everywhere 5–8 % slower at
 N ≤ 16). Cost of the templates, measured (Release, sm_89, one compile job): contract.cu
 16.8 → 18.5 s (+10 %), `libimmerdink.so` 5.83 → 6.60 MB (+13 %). Accepted.
 The occupancy query for the performance model (`kernel_occupancy`, §6c) reports the
 W = 3 instantiation of each pack kernel (the model is unchanged in v1.14; §6c).
+**[v1.16] W-aware occupancy.** `kernel_occupancy_w(kernel, W, out)` (src/plan.hpp) returns
+one pack kernel's (KF16, KF4, KL8, KL4, pack) occupancy row for one W ∈ {1, 2, 3} (W = 0:
+the row `kernel_occupancy` reports; the other kernels have no W and take only W = 0).
+`kernel_occupancy` keeps one row per kernel and reports the **most constrained**
+instantiation: fewest CTAs per SM, then the most registers (on sm_89 that is W = 3: same
+CTAs per SM at every W, most registers). The model keeps one occupancy row per kernel
+(calibration format unchanged): its features use the CTAs per SM, which are equal for
+every W (K2/K3: 40,768 B static shared memory, 2 CTAs; KF and KL at their launch-bound
+register caps), so the one row is exact at every N. The GPU test (`contract_api`, through
+the test hook `imd_test_kernel_occupancy_w`) asserts that equality for every pack kernel
+and that the reported row is the most constrained one; if a later kernel change makes the
+CTAs per SM differ by W, it fails, and the model then needs per-W rows. Those are already
+measured: `imd_bench --methods occupancy` writes `kernels_w` (per pack kernel, the rows of
+W = 1, 2, 3; benchmark hook `imd_prof_kernel_occupancy_w`) next to `kernels`.
 
 **Per-residue cost.** W `dp4a`, one `umulhi`, one multiply-subtract, SMod and the sign: the
 same instruction stream for every element and every data. No ε registers (16 fewer live
@@ -296,8 +331,9 @@ N = 13; the product A/B is in the v1.14 changelog entry.
 - `tests/test_mod_exhaustive.cpp` (CPU, the kernels' own `modp.hpp` code): the reduction
   over the whole range [0, 12·255²] for every modulus; `mod_p_words32<2>` / `<3>` against
   `X mod p` on edge values and 2²⁰ random X < 2⁶³ / 2⁷⁸ per modulus; the weight table.
+  **[v1.16]** `mod_p_words32<1>` on X < 2³² the same way.
 - `tests/test_pack_emitter.cu` (GPU, `pack_emitter`): the emitter itself for E = 16, 8, 4
-  and W = W(N), every N, every ε in 0..eps_max(N) with μ of every bit length allowed by
+  and W = W(N) (**[v1.16]** and every larger W: W = 1, 2, 3 at N ≤ 8), every N, every ε in 0..eps_max(N) with μ of every bit length allowed by
   X ≤ T(N) (both word selects q = 1, 2 at N = 17–20; every shift up to 62 at N = 16),
   ±T, T − 1, 2⁵³ ± 1, 2⁶³ − 1 (N = 16), 2⁶⁴ (N = 17), mixed ε in one warp, RN and TRUNC
   rounding paths, negative values, zeros and non-finite entries, against an exact host
@@ -305,7 +341,7 @@ N = 13; the product A/B is in the v1.14 changelog entry.
 - `tests/test_contract.py` suite `eps` (GPU, bit-exact vs spec/oracle.py on every launch
   path of `run_case`: KF E = 16 / E = 4, K2/K3 with moduli parts, KL E = 8 / E = 4): rows of
   subnormals scaled to ε ∈ [32, 77] at N = 17–20 and up to 62 at N = 16, ε > 0 at N ≤ 13
-  (subnormals), dominant entries, TRUNC; and `test_packed.py` cases of the same data
+  (subnormals), **[v1.16]** ε up to eps_max(N) − 3 at N = 2, 5, 6, 7, 8 (W = 1), dominant entries, TRUNC; and `test_packed.py` cases of the same data
   (`imd_pack`, every byte). compute-sanitizer memcheck on a few of them.
 - No TLA+ change: single-thread arithmetic on one element; no protocol, layout, lowering
   or pack-format change.
@@ -4676,3 +4712,22 @@ and host API; every value the same integer (bit-identical, tested on every contr
   the same leave-one-out metric and the 2–4 % high capped clock, and all 14 hotclock windows
   are to be recollected. `test_contract` suite eps: the eps-reach check counts only
   emulated (k ≥ 2) cases.
+
+## v1.16 (pack emitter: W = 1, masked shifts, exact s maxima, W-aware occupancy; no semantic, layout, launch-shape, pack-format, API, calibration-format or TLA+ change)
+
+- **§3.4.1 W = 1 for N ≤ 8** (T(8) < 2³² ≤ T(9)): `PackEmitterT<E, 1>` holds X in one u32
+  and reduces it with one `dp4a`; `pack_words(N)` = 1 / 2 / 3 for N ≤ 8 / 9–16 / 17–20; every
+  pack kernel (`k23_pack`, `kf_scale_pack`, `kl_scale_pack`) gains a W = 1 instantiation.
+  Generated constants `kPackW1MaxN = 8`, `kPackXBits1 = 32`; `cert_pack_words` extended
+  (the W rule, T < 2³², bit lengths ≤ 32 on the ε-maximizing rows, the reduction).
+- **§3.4.1 masked shifts.** W = 1 shifts by `ε & 31`, W = 2 by `ε & 63` (identity in the
+  contract; defined behaviour for any ε); the debug assert stays.
+- **§3.4.1 the s bound.** 10·255·255 noted as loose; exact maxima certified per W.
+- **§3.4.1 / §6c W-aware occupancy.** `kernel_occupancy` reports the most constrained W
+  instantiation of each pack kernel (fewest CTAs per SM, then most registers; the W = 3 row,
+  as before: shipped calibration unchanged); `kernel_occupancy_w` per W; test hook
+  `imd_test_kernel_occupancy_w`, benchmark hook `imd_prof_kernel_occupancy_w`, imd_bench
+  `--methods occupancy` record field `kernels_w`. Test: `contract_api` asserts equal CTAs
+  per SM over W for every pack kernel.
+- **Tests.** `pack_emitter` covers every W ≥ W(N) at every N (W = 1 at N ≤ 8);
+  `mod_exhaustive_cpu` covers `mod_p_words32<1>`; contract suite `eps` adds N = 2, 5, 6, 7.

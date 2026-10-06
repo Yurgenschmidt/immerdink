@@ -93,6 +93,7 @@ EMULATE, DIRECT = "EMULATE", "DIRECT"
 VEC_GENERATE, VEC_RESIDENT = "GENERATE", "RESIDENT"   # DESIGN v1.2 vec_mode
 PACK_W2_MAX_N = 16                   # v1.14 §3.4.1: the pack emitter holds |a'| in W = 2 u32
 #                                      words for N <= 16 (T < 2^63), else W = 3 (T < 2^78)
+PACK_W1_MAX_N = 8                    # v1.16 §3.4.1: W = 1 for N <= 8 (T < 2^32)
 
 # ---------------------------------------------------------------------------
 # Integer helpers
@@ -241,13 +242,14 @@ def pow2_table(p, emax):
 
 
 def pack_words(N):
-    """v1.14 §3.4.1: u32 words W(N) of the pack emitter's X = |a'| (2 for N <= 16, else 3)."""
-    return 2 if N <= PACK_W2_MAX_N else 3
+    """v1.14 §3.4.1: u32 words W(N) of the pack emitter's X = |a'| (v1.16: 1 for N <= 8, 2 for
+    N <= 16, else 3)."""
+    return 1 if N <= PACK_W1_MAX_N else 2 if N <= PACK_W2_MAX_N else 3
 
 
 @functools.lru_cache(maxsize=None)
 def pack_x_bits(W):
-    """The largest bit length of T(N) over the N with pack_words(N) = W (63 / 78)."""
+    """The largest bit length of T(N) over the N with pack_words(N) = W (32 / 63 / 78)."""
     return max(constants(N)["T"].bit_length() for N in range(N_MIN, N_MAX + 1)
                if pack_words(N) == W)
 
@@ -1323,26 +1325,57 @@ def _dev_eps(v, sigma):
     return max(0, e + sigma)
 
 
+def _s_max_below(w, xb):
+    """max over X < 2^xb of sum_i byte_i(X) w_i (the weights are >= 0: every byte at its top)."""
+    return sum(min(255, 2**max(0, xb - 8 * i) - 1) * w[i] for i in range(len(w)))
+
+
+def _s_max_le(T, w):
+    """max over 0 <= X <= T of sum_i byte_i(X) w_i: X = T, or T's bytes above i, byte i one
+    less, every byte below at 255 (digit bound; the weights are >= 0)."""
+    b = [(T >> (8 * i)) & 255 for i in range(len(w))]
+    best = sum(x * y for x, y in zip(b, w))
+    for i in range(len(w)):
+        if b[i]:
+            best = max(best, sum(b[j] * w[j] for j in range(i + 1, len(w))) + (b[i] - 1) * w[i]
+                       + 255 * sum(w[:i]))
+    return best
+
+
 @check("§3.4.1 pack emitter words (v1.14)")
 def cert_pack_words():
-    """v1.14 §3.4.1: W(N) = 2 for N <= 16, else 3, and T(N) < 2^(32 W); on the rows that
+    """v1.14 §3.4.1: W(N) = 2 for N <= 16, else 3 (v1.16: 1 for N <= 8, the largest N with
+    T < 2^32), and T(N) < 2^(32 W); on the rows that
     maximize eps (one nonzero entry, subnormals down to 2^-1074, dominant entries, random
     rows), RN and TRUNC with the §3.2 rule: |a'| <= T and bitlen|a'| <= kPackXBits[W];
     weight bytes 2^(8i) mod p (i <= 9) within pow2_mod; s <= 12*255^2 < 2^20; the umulhi
     quotient exact for every s < 2^24; sum b_i w_i = X (mod p) on random X and on every
-    quantized entry of the rows."""
+    quantized entry of the rows. v1.16: the exact maxima of s per W (over X < 2^kPackXBits[W]
+    and the moduli of the N with that W), and over X <= T(N)."""
     for N in range(N_MIN, N_MAX + 1):
         W, T = pack_words(N), constants(N)["T"]
-        need((W == 2) == (N <= 16), f"W rule at N={N}")
+        need(W == (1 if N <= 8 else 2 if N <= 16 else 3), f"W rule at N={N}")
         need(T < 2**(32 * W), f"T(N={N}) >= 2^(32 W)")
+        need(W == 1 or T >= 2**(32 * (W - 1)), f"W(N={N}) not the smallest")
         need(T.bit_length() <= pack_x_bits(W), f"bitlen T(N={N})")
-    need(pack_x_bits(2) == 63 and pack_x_bits(3) == 78, "kPackXBits = 63 / 78")
+    need(pack_x_bits(1) == 32 and pack_x_bits(2) == 63 and pack_x_bits(3) == 78,
+         "kPackXBits = 32 / 63 / 78")
     need(pack_x_bits(2) < 64, "W = 2: X = mu << eps fits a u64 without bit 63")
     nb = pack_weight_bytes()
     need(nb == 10 and 8 * (nb - 1) <= constants(N_MAX)["eps_max"], "weights within pow2_mod (kEpsMax >= 72)")
     need(8 * nb <= 32 * 3, "W = 3 holds the weighted bytes")
     s_cap = 12 * 255 * 255
     need(s_cap < 2**20 <= 2**24, "s < 12 255^2 < 2^20")
+    # v1.16: the exact maxima of s (DESIGN §3.4.1 note; 10 255^2 is loose)
+    s_w = {W: max(_s_max_below(pack_weights(p), pack_x_bits(W))
+                  for N in range(N_MIN, N_MAX + 1) if pack_words(N) == W
+                  for p in constants(N)["moduli"]) for W in (1, 2, 3)}
+    need(s_w == {1: 83130, 2: 210472, 3: 264156}, f"s maxima per W {s_w}")
+    s_all = max(sum(255 * x for x in pack_weights(p)) for p in REAL_MODULI)
+    s_t = max(_s_max_le(constants(N)["T"], pack_weights(p))
+              for N in range(N_MIN, N_MAX + 1) for p in constants(N)["moduli"])
+    need(s_all == 302940 and s_t == 258500 and max(s_w.values()) < 2**19 <= 10 * 255 * 255,
+         f"s maxima {s_all} / {s_t}")
     rng = random.Random(1414)
     for p in REAL_MODULI:
         w = pack_weights(p)
@@ -1358,9 +1391,10 @@ def cert_pack_words():
             for s in (j * p - 1, j * p):
                 if 0 <= s < 2**24:
                     need((s * m) >> 32 == s // p, f"quotient p={p} s={s}")
-        for W in (2, 3):
+        for W in (1, 2, 3):
             xb = pack_x_bits(W)
-            for X in [0, 1, 2**xb - 1, 2**53 - 1, 2**53, 2**53 + 1, 2**32 - 1, 2**32] + \
+            for X in [x for x in (0, 1, 2**xb - 1, 2**53 - 1, 2**53, 2**53 + 1, 2**32 - 1, 2**32,
+                                  2**31, 2**31 - 1) if x < 2**xb] + \
                      [rng.getrandbits(rng.randint(1, xb)) for _ in range(300)]:
                 r, s = pack_residue_words(X, W, p)
                 need(s < 2**20 and r == X % p, f"residue p={p} W={W} X={X}")
@@ -1394,8 +1428,9 @@ def cert_pack_words():
                         need(pack_residue_words(a, W, p)[0] == a % p, f"N={N} p={p} row residue")
     for N in range(N_MIN, N_MAX + 1):
         need(eps_hi[N] == constants(N)["eps_max"], f"N={N}: eps {eps_hi[N]} != eps_max reached")
-    return (f"W = 2 for N <= 16 (T < 2^63), 3 above (T < 2^78); {rows_n} rows, eps up to "
-            f"eps_max at every N ({eps_hi[16]} at N=16, {eps_hi[20]} at N=20); s < 12*255^2")
+    return (f"W = 1 for N <= 8 (T < 2^32), 2 for N <= 16 (T < 2^63), 3 above (T < 2^78); "
+            f"{rows_n} rows, eps up to eps_max at every N ({eps_hi[8]} at N=8, {eps_hi[16]} at "
+            f"N=16, {eps_hi[20]} at N=20); s max {s_w[1]} / {s_w[2]} / {s_w[3]} per W")
 
 
 @check("§3.2 S width")
@@ -2379,7 +2414,9 @@ def build_header():
     w(f"inline constexpr int kSigmaMax = {sig_hi};")
     w(f"inline constexpr int kEpsMax = {emax};             // §3.3 eps_max at N = kNMax (pow2_mod width - 1)")
     w(f"inline constexpr int32_t kModMaskModulus = 256;  // §3.5 p = 256 reduces by v & 255")
+    w(f"inline constexpr int kPackW1MaxN = {PACK_W1_MAX_N};          // v1.16 §3.4.1 W(N) = 1 for N <= this")
     w(f"inline constexpr int kPackW2MaxN = {PACK_W2_MAX_N};         // v1.14 §3.4.1 W(N) = 2 for N <= this, else 3")
+    w(f"inline constexpr int kPackXBits1 = {pack_x_bits(1)};         // v1.16 §3.4.1 bitlen |a'| <= this at W = 1")
     w(f"inline constexpr int kPackXBits2 = {pack_x_bits(2)};         // v1.14 §3.4.1 bitlen |a'| <= this at W = 2")
     w(f"inline constexpr int kPackXBits3 = {pack_x_bits(3)};         // ... and at W = 3")
     w(f"inline constexpr int kPackWeightBytes = {pack_weight_bytes()};    // v1.14 §3.4.1 bytes 0..9 of |a'| (2^0 .. 2^72)")
