@@ -107,6 +107,13 @@ target_include_directories(test_device_constants PRIVATE "${PROJECT_SOURCE_DIR}/
 target_link_libraries(test_device_constants PRIVATE imd_constants imd_warnings)
 add_test(NAME device_constants COMMAND test_device_constants)
 
+# DESIGN v1.14 §3.4.1: the pack emitter (|a'| as W words) vs an exact host reference, every
+# N, every eps, E = 16 / 8 / 4, W = 2 / 3, RN and TRUNC, device asserts on.
+add_executable(test_pack_emitter test_pack_emitter.cu)
+target_include_directories(test_pack_emitter PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(test_pack_emitter PRIVATE imd_constants imd_warnings)
+add_test(NAME pack_emitter COMMAND test_pack_emitter)
+
 # CUTLASS de-risking for M1: int8 batched TN GEMM, and the mod-p -> u8 EVT epilogue.
 add_executable(test_cutlass_int8_gemm test_cutlass_int8_gemm.cu)
 target_link_libraries(test_cutlass_int8_gemm PRIVATE imd_constants imd_cutlass)
@@ -151,7 +158,7 @@ if(Python3_FOUND)
   # contract_highrank (operand ranks 6-12) has hard size guards; run it alone with
   # `tools/test.sh -R contract_highrank`, or skip it with `-E contract_highrank`.
   set(shim "$<TARGET_FILE:imd_alloc_shim>")
-  foreach(suite api stages e2e tensor bigk replay every_n k_align pad_mutation)
+  foreach(suite api stages e2e tensor bigk replay every_n k_align pad_mutation eps)
     add_test(NAME contract_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                      --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
@@ -236,5 +243,5 @@ if(Python3_FOUND)
 endif()
 
 # GPU tests share one device; run them one at a time.
-set_tests_properties(device_constants cutlass_int8_gemm cutlass_mod_epilogue
+set_tests_properties(device_constants pack_emitter cutlass_int8_gemm cutlass_mod_epilogue
                      PROPERTIES RESOURCE_LOCK gpu)

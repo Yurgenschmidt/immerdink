@@ -125,6 +125,10 @@ and 3000 × 700 × 5000 were −21 / −22 %; now +5 % / −6 %.
   (apply the 2^ε factor unconditionally, with ε = 0 giving 1) would remove the data dependence
   from the packs. Then `eps_fraction` would no longer matter and `eps_s` would become a constant
   cost, at the price of the multiply on every element at N ≤ 14.
+  **Done differently in DESIGN v1.14 §3.4.1** (2026-10-06): no multiply at all — |a'| is held
+  as 2 or 3 u32 words and reduced by byte weights, so the pack cost is data-independent and
+  N ≤ 13 is unchanged. The model's eps terms are still in place until a recalibration retires
+  them.
 - Recalibrate after any kernel change that moves per-phase times (`tools/calibrate.sh`).
 
 Raw records: the local evaluation workspace, `results/b2/` (calib-1/2/3, validate-1/2/3,

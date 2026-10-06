@@ -90,6 +90,53 @@ def gen(rng, shape, kind):
     return np.array(v, dtype=np.float64).reshape(shape)
 
 
+def gen_eps(rng, shape, kind, kaxis):
+    """DESIGN v1.14 §3.4.1: eps-heavy operands. Every vector along the contracted axis `kaxis`
+    (a row of the GEMM view, scaled by its own sigma) is one of
+      sub1      one nonzero subnormal m 2^-1074 (m of 1..52 bits) at a random position: the
+                row's sigma puts it near T, so the device's eps reaches eps_max(N) - bits + 1
+      sub       subnormals of up to 1..20 bits in every entry (about 20 % zero)
+      dominant  (u - 1/2) exp(g / 2) 2^s (s per row in [-20, 20)) with one entry x 2^20
+                (imd_bench --data dominant; eps up to bitlen(T) - 53 on the dominant entry)
+      phi       gen()'s phi = 4 data
+    and `mix` picks one of them per vector."""
+    k = shape[kaxis]
+    rest = [d for i, d in enumerate(shape) if i != kaxis]
+    flat = np.zeros((int(np.prod(rest)) if rest else 1, k))
+    for r in range(flat.shape[0]):
+        kd = rng.choice(("sub1", "sub", "dominant", "phi")) if kind == "mix" else kind
+        if kd == "sub1":
+            L = rng.randint(1, 52)
+            m = rng.getrandbits(L) | (1 << (L - 1))
+            flat[r, rng.randrange(k)] = math.ldexp(m, -1074) * rng.choice((1, -1))
+        elif kd == "sub":
+            L = rng.randint(1, 20)
+            for h in range(k):
+                if rng.random() >= 0.2:
+                    flat[r, h] = math.ldexp(rng.getrandbits(L) | 1, -1074) * rng.choice((1, -1))
+        elif kd == "dominant":
+            sc = math.ldexp(1.0, rng.randint(-20, 19))
+            for h in range(k):
+                flat[r, h] = (rng.random() - 0.5) * math.exp(0.5 * rng.gauss(0, 1)) * sc
+            flat[r, rng.randrange(k)] *= 2.0**20
+        else:
+            flat[r] = gen(rng, (k,), "phi")
+    X = flat.reshape(rest + [k])
+    return np.moveaxis(X, -1, kaxis).copy()
+
+
+def eps_reached(T, kaxis, N, rounding):
+    """The device's eps (src/kernels/numerics.cuh quantize) of every nonzero quantized entry
+    of T's vectors along kaxis, with the §3.2 rule's sigma (spec/params.py scale_row)."""
+    out = []
+    X = np.moveaxis(T, kaxis, -1).reshape(-1, T.shape[kaxis])
+    for row in X:
+        vals = [float(v) if math.isfinite(v) else 0.0 for v in row]
+        sig, _, _ = params.scale_row(vals, N, rounding)
+        out += [params._dev_eps(v, sig) for v in vals if params.quantize(v, sig, rounding)[0] != 0]
+    return out
+
+
 def inject(rng, T, rate):
     """Sprinkle Inf / -Inf / NaN / -0 / zeros into T (in place)."""
     flat = T.reshape(-1)
@@ -1053,9 +1100,50 @@ def suite_pad_mutation(lib, cuda, verbose):
             lib.plan_destroy(plan)
 
 
+def suite_eps(lib, cuda, verbose):
+    """DESIGN v1.14 §3.4.1, the branch-free pack emitter on eps-heavy data (gen_eps): rows
+    of subnormals scaled to eps in [32, 77] at N = 17-20 (both word selects of W = 3) and up
+    to 62 at N = 16 (W = 2), eps > 0 at N <= 13 (subnormals), dominant entries, RN and TRUNC,
+    g < N; small operands (KF E = 4, moduli parts, gridDim.y > 1), K2/K3, KL (forced, and by
+    the rule for k_hat > 1024, E = 8 and, with 64-row tiles, E = 4): every run_case variant
+    bit-exact vs the oracle. Fails if the data did not reach the intended eps."""
+    rng = random.Random(1414)
+    reach = {}
+    shapes = ((9, 13, 1, "sub1", "sub1"), (17, 12, 5, "sub", "mix"), (24, 20, 33, "mix", "sub1"),
+              (12, 30, 129, "dominant", "mix"), (20, 16, 300, "mix", "dominant"))
+    cases = [(N, t, sh) for N in (8, 13, 14, 15, 16, 17, 18, 19, 20) for t, sh in enumerate(shapes)
+             if not (t == 4 and N in (14, 15, 18, 19))]
+    cases += [(16, 5, (6, 5, 1100, "mix", "sub1")), (20, 6, (5, 7, 1100, "sub1", "mix")),
+              (17, 7, (4, 4, 2100, "mix", "sub"))]
+    for N, t, (m, n, k, ka, kb) in cases:
+        rounding = ("RN", "TRUNC")[(N + t) % 2]
+        g = (0, 1, 3, 0, 5, 0, 4, 0)[t]
+        A, B, C = matrix(rng, m, n, k)
+        TA, TB = gen_eps(rng, (m, k), ka, 1), gen_eps(rng, (k, n), kb, 0)
+        if t == 3:
+            inject(rng, TB, 0.02)
+        e = eps_reached(TA, 1, N, rounding) + eps_reached(TB, 0, N, rounding)
+        r = reach.setdefault(N, {"max": 0, "ge32": 0, "ge64": 0, "pos": 0})
+        r["max"] = max([r["max"]] + e)
+        r["ge32"] += sum(x >= 32 for x in e)
+        r["ge64"] += sum(x >= 64 for x in e)
+        r["pos"] += sum(x > 0 for x in e)
+        run_case(lib, cuda, f"eps[N={N} {m}x{n}x{k} {ka}/{kb} g={g} {rounding}]", A, B, C, TA, TB,
+                 gen(rng, (m, n), "uniform"), rng.choice((1.0, -0.75)), 0.0, N, g, rounding,
+                 rng=rng, verbose=verbose)
+    for N in sorted(reach):
+        r = reach[N]
+        if verbose:
+            print(f"  eps reached N={N}: max {r['max']} (eps_max {params.constants(N)['eps_max']}), "
+                  f"{r['pos']} entries eps > 0, {r['ge32']} >= 32, {r['ge64']} >= 64")
+        if r["pos"] == 0 or (N >= 13 and r["ge32"] == 0) or (N >= 17 and r["ge64"] == 0) or \
+                (N == 16 and r["max"] < 60) or (N >= 17 and r["max"] < params.constants(N)["eps_max"] - 3):
+            raise Fail(f"suite eps: N={N} did not reach the intended eps ({r})")
+
+
 SUITES = {"api": suite_api, "replay": suite_replay, "stages": suite_stages, "e2e": suite_e2e, "tensor": suite_tensor,
           "bigk": suite_bigk, "every_n": suite_every_n, "k_align": suite_k_align,
-          "pad_mutation": suite_pad_mutation}
+          "pad_mutation": suite_pad_mutation, "eps": suite_eps}
 
 
 def main():

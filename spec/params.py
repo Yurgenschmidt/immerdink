@@ -40,6 +40,7 @@ scaled_constants() produce their parameters with the same greedy rule.
 """
 
 import argparse
+import functools
 import json
 import math
 import os
@@ -90,6 +91,8 @@ SIZE_T_MAX = 2**64 - 1
 RN, TRUNC = "RN", "TRUNC"
 EMULATE, DIRECT = "EMULATE", "DIRECT"
 VEC_GENERATE, VEC_RESIDENT = "GENERATE", "RESIDENT"   # DESIGN v1.2 vec_mode
+PACK_W2_MAX_N = 16                   # v1.14 §3.4.1: the pack emitter holds |a'| in W = 2 u32
+#                                      words for N <= 16 (T < 2^63), else W = 3 (T < 2^78)
 
 # ---------------------------------------------------------------------------
 # Integer helpers
@@ -235,6 +238,44 @@ def crt_peak_exact(ps):
 def pow2_table(p, emax):
     """2^e mod p for e in 0..emax (DESIGN §3.4)."""
     return [pow(2, e, p) for e in range(emax + 1)]
+
+
+def pack_words(N):
+    """v1.14 §3.4.1: u32 words W(N) of the pack emitter's X = |a'| (2 for N <= 16, else 3)."""
+    return 2 if N <= PACK_W2_MAX_N else 3
+
+
+@functools.lru_cache(maxsize=None)
+def pack_x_bits(W):
+    """The largest bit length of T(N) over the N with pack_words(N) = W (63 / 78)."""
+    return max(constants(N)["T"].bit_length() for N in range(N_MIN, N_MAX + 1)
+               if pack_words(N) == W)
+
+
+@functools.lru_cache(maxsize=None)
+def pack_weight_bytes():
+    """Bytes of X that can be nonzero: ceil(pack_x_bits(3) / 8) = 10 (weights 2^0 .. 2^72)."""
+    return ceil_div(pack_x_bits(3), 8)
+
+
+def magic32(p):
+    """ceil(2^32 / p) (2^24 for p = 256): the 32-bit magic of mod_p_bytes32 / mod_p_words32."""
+    return ceil_div(2**32, p)
+
+
+@functools.lru_cache(maxsize=None)
+def pack_weights(p):
+    """The 12 u8 weight lanes (3 words) of modulus p: 2^(8i) mod p for i < 10, then 0."""
+    return tuple(pow(2, 8 * i, p) if i < pack_weight_bytes() else 0 for i in range(12))
+
+
+def pack_residue_words(X, W, p):
+    """v1.14 §3.4.1 as the device computes it: s = sum_j dp4a(X_j, w_j), r = s - p umulhi(s,
+    m32). X < 2^(32 W) is |a'|; returns the non-negative r (which must equal X mod p)."""
+    w = pack_weights(p)
+    s = sum(((X >> (8 * i)) & 255) * w[i] for i in range(4 * W))
+    q = (s * magic32(p)) >> 32
+    return s - p * q, s
 
 
 def scaled_moduli(res_bits, N):
@@ -1272,6 +1313,91 @@ def cert_pow2():
     return f"eps_max from {constants(2)['eps_max']} (N=2) to {constants(20)['eps_max']} (N=20)"
 
 
+def _dev_eps(v, sigma):
+    """The device quantize's eps (src/kernels/numerics.cuh): the significand as decoded
+    (53 bits for normals, the raw fraction for subnormals), eps = max(0, e + sigma)."""
+    if v == 0.0:
+        return 0
+    f, ex = math.frexp(abs(v))
+    e = max(ex - MANT, GAMMA_MIN)                  # m 2^e: e = -1074 for subnormals
+    return max(0, e + sigma)
+
+
+@check("§3.4.1 pack emitter words (v1.14)")
+def cert_pack_words():
+    """v1.14 §3.4.1: W(N) = 2 for N <= 16, else 3, and T(N) < 2^(32 W); on the rows that
+    maximize eps (one nonzero entry, subnormals down to 2^-1074, dominant entries, random
+    rows), RN and TRUNC with the §3.2 rule: |a'| <= T and bitlen|a'| <= kPackXBits[W];
+    weight bytes 2^(8i) mod p (i <= 9) within pow2_mod; s <= 12*255^2 < 2^20; the umulhi
+    quotient exact for every s < 2^24; sum b_i w_i = X (mod p) on random X and on every
+    quantized entry of the rows."""
+    for N in range(N_MIN, N_MAX + 1):
+        W, T = pack_words(N), constants(N)["T"]
+        need((W == 2) == (N <= 16), f"W rule at N={N}")
+        need(T < 2**(32 * W), f"T(N={N}) >= 2^(32 W)")
+        need(T.bit_length() <= pack_x_bits(W), f"bitlen T(N={N})")
+    need(pack_x_bits(2) == 63 and pack_x_bits(3) == 78, "kPackXBits = 63 / 78")
+    need(pack_x_bits(2) < 64, "W = 2: X = mu << eps fits a u64 without bit 63")
+    nb = pack_weight_bytes()
+    need(nb == 10 and 8 * (nb - 1) <= constants(N_MAX)["eps_max"], "weights within pow2_mod (kEpsMax >= 72)")
+    need(8 * nb <= 32 * 3, "W = 3 holds the weighted bytes")
+    s_cap = 12 * 255 * 255
+    need(s_cap < 2**20 <= 2**24, "s < 12 255^2 < 2^20")
+    rng = random.Random(1414)
+    for p in REAL_MODULI:
+        w = pack_weights(p)
+        tab = pow2_table(p, constants(N_MAX)["eps_max"])
+        need(all(w[i] == tab[8 * i] for i in range(nb)) and w[10] == w[11] == 0, f"weights p={p}")
+        need(all(0 <= x <= 255 for x in w), f"u8 lanes p={p}")
+        m = magic32(p)
+        e = m * p - 2**32
+        need(0 <= e < p and 2**24 * e < 2**32, f"umulhi exact for s < 2^24, p={p}")
+        smax = sum(255 * x for x in w)
+        need(smax <= s_cap, f"s_max p={p}")
+        for j in range(smax // p + 2):                 # every quotient boundary up to s_max
+            for s in (j * p - 1, j * p):
+                if 0 <= s < 2**24:
+                    need((s * m) >> 32 == s // p, f"quotient p={p} s={s}")
+        for W in (2, 3):
+            xb = pack_x_bits(W)
+            for X in [0, 1, 2**xb - 1, 2**53 - 1, 2**53, 2**53 + 1, 2**32 - 1, 2**32] + \
+                     [rng.getrandbits(rng.randint(1, xb)) for _ in range(300)]:
+                r, s = pack_residue_words(X, W, p)
+                need(s < 2**20 and r == X % p, f"residue p={p} W={W} X={X}")
+    # |a'| <= T and the bit length on eps-maximizing rows, product sigma rule
+    tiny = 5e-324
+    eps_hi = {}
+    rows_n = 0
+    for N in range(N_MIN, N_MAX + 1):
+        T, W = constants(N)["T"], pack_words(N)
+        ps = constants(N)["moduli"]
+        xb = pack_x_bits(W)
+        rows = [[tiny], [-tiny], [3 * tiny], [tiny, 0.0], [tiny] * 3, [tiny * 2**20, tiny, -tiny],
+                [tiny * (2**52 - 1)], [tiny * 2**51, -tiny], [1.0], [-(2 - 2**-52)],
+                [1.0, 2**-60, -2**-80], [tiny * 5, tiny * 7, tiny * 2**30, 0.0]]
+        for _ in range(12):
+            rows.append(_rand_row(rng, rng.choice((1, 2, 3, 5, 16)), emin=-1074, emax=-1000))
+            rows.append(_rand_row(rng, rng.choice((1, 2, 3, 16)), emin=-60, emax=60))
+        for rnd in (RN, TRUNC):
+            for row in rows:
+                if rnd == RN and kappa(len(row)) >= T:
+                    continue
+                sig, _, _ = scale_row(row, N, rnd)
+                rows_n += 1
+                for v in row:
+                    a = abs(quantize(v, sig, rnd)[0])
+                    need(a <= T, f"N={N} {rnd} |a'| > T")
+                    need(a.bit_length() <= xb, f"N={N} {rnd} bitlen |a'| > {xb}")
+                    if a:
+                        eps_hi[N] = max(eps_hi.get(N, 0), _dev_eps(v, sig))
+                    for p in ps:
+                        need(pack_residue_words(a, W, p)[0] == a % p, f"N={N} p={p} row residue")
+    for N in range(N_MIN, N_MAX + 1):
+        need(eps_hi[N] == constants(N)["eps_max"], f"N={N}: eps {eps_hi[N]} != eps_max reached")
+    return (f"W = 2 for N <= 16 (T < 2^63), 3 above (T < 2^78); {rows_n} rows, eps up to "
+            f"eps_max at every N ({eps_hi[16]} at N=16, {eps_hi[20]} at N=20); s < 12*255^2")
+
+
 @check("§3.2 S width")
 def cert_s_width():
     """Each term ceil(x^2 2^60) <= 2^62-1023 < 2^63; S fits uint128 for every k < 2^66."""
@@ -2253,6 +2379,10 @@ def build_header():
     w(f"inline constexpr int kSigmaMax = {sig_hi};")
     w(f"inline constexpr int kEpsMax = {emax};             // §3.3 eps_max at N = kNMax (pow2_mod width - 1)")
     w(f"inline constexpr int32_t kModMaskModulus = 256;  // §3.5 p = 256 reduces by v & 255")
+    w(f"inline constexpr int kPackW2MaxN = {PACK_W2_MAX_N};         // v1.14 §3.4.1 W(N) = 2 for N <= this, else 3")
+    w(f"inline constexpr int kPackXBits2 = {pack_x_bits(2)};         // v1.14 §3.4.1 bitlen |a'| <= this at W = 2")
+    w(f"inline constexpr int kPackXBits3 = {pack_x_bits(3)};         // ... and at W = 3")
+    w(f"inline constexpr int kPackWeightBytes = {pack_weight_bytes()};    // v1.14 §3.4.1 bytes 0..9 of |a'| (2^0 .. 2^72)")
     w("")
     w("struct Tables {")
     w("  // §2 moduli p_l, l = 0..kNMax-1 (a prefix of length N is used).")

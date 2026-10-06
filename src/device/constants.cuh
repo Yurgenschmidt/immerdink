@@ -14,6 +14,7 @@ namespace imd::device {
 static __constant__ imd::constants::Tables c_tables = imd::constants::kTables;
 static __constant__ ByteWeights c_byte_weights = kByteWeights;  // derived from pow2_mod
 static __constant__ Magic32 c_magic32 = kMagic32;                // derived from epi_magic
+static __constant__ PackWeights c_pack_weights = kPackWeights;    // v1.14, from pow2_mod
 
 // §3.5 exact non-negative v mod p_l for v in [epi_vmin[l], epi_vmax[l]] (cert_barrett):
 // p = 256 by mask, otherwise bias + umulhi64.
