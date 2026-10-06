@@ -114,16 +114,20 @@ int main() {
     for (auto& x : B) x = int8_t(any_int8(rng));
     expect_equal("random batched TN", gpu_gemm(m, n, k, batch, A, B), cpu_gemm(m, n, k, batch, A, B));
   }
-  {  // Extremes at K = K_c': the largest exact sums, +128^2 K_c' and -128*127 K_c'.
-    const int m = 16, n = 16, k = int(c::kKcPrime), batch = 1;
+  // Extremes at K = K_c' (v1.13: 131008 = 2047 * 64, whole 64-wide K tiles), +128^2 K_c' and
+  // -128*127 K_c'; and at the pre-v1.13 chunk 131056 (a 48-wide residue tile, still <= K_c).
+  static_assert(c::kKcPrime == 131008 && c::kKcPrime % 64 == 0, "K_c'");
+  for (const int k : {int(c::kKcPrime), 131056}) {
+    const int m = 16, n = 16, batch = 1;
     std::vector<int8_t> A(size_t(m) * k), B(size_t(n) * k);
     for (int i = 0; i < m; ++i)
       for (int h = 0; h < k; ++h) A[size_t(i) * k + h] = int8_t(i % 2 ? 127 : -128);
     for (int j = 0; j < n; ++j)
       for (int h = 0; h < k; ++h) B[size_t(j) * k + h] = int8_t(j % 2 ? 127 : -128);
     const auto got = gpu_gemm(m, n, k, batch, A, B);
-    expect_equal("K = K_c' extremes", got, cpu_gemm(m, n, k, batch, A, B));
-    if (got[0] != 128 * 128 * c::kKcPrime || got[1] != -128 * 127 * c::kKcPrime) ++failures;
+    expect_equal(k == c::kKcPrime ? "K = K_c' extremes" : "K = 131056 extremes", got,
+                 cpu_gemm(m, n, k, batch, A, B));
+    if (got[0] != int64_t{128 * 128} * k || got[1] != int64_t{-128 * 127} * k) ++failures;
   }
   {  // Past K_c the true sum 128^2 * 131072 = 2^31 does not fit: .satfinite clamps it.
     const int m = 16, n = 16, k = 131072, batch = 1;

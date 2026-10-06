@@ -100,7 +100,32 @@ t_k5120   | ik,jk->ij | i=2048,j=2048,k=5120       | imd | 8 | --reps 20 --phase
 t_lk0     | ik,jk->ij | i=768,j=768,k=65536        | imd | 8,15 | --reps 10 --phase-reps 3 --max-seconds 1
 t_lk1     | ik,jk->ij | i=768,j=768,k=65552        | imd | 8,15 | --reps 10 --phase-reps 3 --max-seconds 1
 t_lk2     | ik,jk->ij | i=768,j=768,k=65568        | imd | 8,15 | --reps 10 --phase-reps 3 --max-seconds 1
-#     two K-chunks (review 2026-10-05): K4 reads chunk c at row * k_hat + c * K_c' and K_c' =
-#     131056 = 16 mod 32, so with k_hat = 262144 only chunk 1 is misaligned, with 262160 all
+#     three K-chunks (2 K_c' < k_hat, before and after v1.13): CUTLASS loads a chunk's residue
+#     tile (kc mod 64) first, so row r's main-loop loads sit at phase (r k_hat + chunk end) mod 64
+#     (DESIGN v1.13 §4b; NOTES-K4ALIGN). Since v1.13, K_c' = 131008 = 0 mod 64: both cases are
+#     3 chunks (131008, 131008, then 128 / 144) whose phases depend on k_hat alone (262144: every
+#     row aligned in every chunk; 262160: half of the rows misaligned in every chunk). Measured
+#     with the old 131056 (= 48 mod 64; chunks 131056, 131056, then 32 / 48), 262144 had chunk 0
+#     in class 48 (every row misaligned), chunk 1 in class 32 (ending at 262112) and the short
+#     chunk 2 aligned; 262160 had half of the rows misaligned in every chunk.
 t_2c0     | ik,jk->ij | i=512,j=512,k=262144       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
 t_2c1     | ik,jk->ij | i=512,j=512,k=262160       | imd | 8,14 | --reps 10 --phase-reps 3 --max-seconds 1
+# --- (v1.13 stage 2, 2026-10-06) the slow K-chunk term (mac_ktail). Under AUTO (A = 64 iff
+#     k > 96) only plans with k <= 96 can be slow, so the misaligned rows of k > 96 are produced
+#     with the test hook (--k-align 16: k_hat = ceil(k)_16, k_hat mod 32 = 16) on every K4
+#     configuration; the t_k* cases above now run at A = 64 (the aligned rate at the padded k_hat).
+#     Plus AUTO plans at k <= 96 whose k_hat mod 32 = 16 (48, 80) next to aligned 64 / 96.
+a_k784    | ik,jk->ij | i=2048,j=2048,k=784        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule --k-align 16
+a_k1008   | ik,jk->ij | i=2048,j=2048,k=1008       | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,1 --k-align 16
+a_k1040   | ik,jk->ij | i=2048,j=2048,k=1040       | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule --k-align 16
+a_k4880   | ik,jk->ij | i=2048,j=2048,k=4880       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1 --k-align 16
+a_k5008   | ik,jk->ij | i=2048,j=2048,k=5008       | imd | 8 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,1 --k-align 16
+a_rkf2    | ik,jk->ij | i=256,j=3000,k=1000        | imd | 8,14 | --reps 100 --phase-reps 10 --max-seconds 1 --k4 rule,1,2 --k-align 16
+a_s1000   | ik,jk->ij | i=512,j=512,k=1000         | imd | 8,14 | --reps 200 --phase-reps 10 --max-seconds 1 --k4 rule,1,2,3 --k-align 16
+a_rmm2    | ik,jk->ij | i=2000,j=128,k=30000       | imd | 8,14 | --reps 20 --phase-reps 5 --max-seconds 1 --k4 rule,2,3 --k-align 16
+a_lk1     | ik,jk->ij | i=768,j=768,k=65552        | imd | 8 | --reps 10 --phase-reps 3 --max-seconds 1 --k-align 16
+a_k48     | ik,jk->ij | i=2048,j=2048,k=48         | imd | 8,16 | --reps 100 --phase-reps 10 --max-seconds 1 --k4 rule,0
+a_k64     | ik,jk->ij | i=2048,j=2048,k=64         | imd | 8,16 | --reps 100 --phase-reps 10 --max-seconds 1 --k4 rule,0
+a_k80     | ik,jk->ij | i=2048,j=2048,k=80         | imd | 8,16 | --reps 100 --phase-reps 10 --max-seconds 1 --k4 rule,0
+a_k96     | ik,jk->ij | i=2048,j=2048,k=96         | imd | 8,16 | --reps 100 --phase-reps 10 --max-seconds 1 --k4 rule,0
+a_s80     | ik,jk->ij | i=512,j=512,k=80           | imd | 8,14 | --reps 300 --phase-reps 10 --max-seconds 1 --k4 rule,1,2,3

@@ -31,7 +31,9 @@ Map to docs/DESIGN.md (v1). Each certificate in CHECKS names its section.
   §3.8  error contract and worst-case guidance ..................... error_guidance()
   §4a   workspace layout ........................................... workspace_size(),
                                                                      region_offsets()
-  §6b.4 packed-operand byte layout (format 1, D1) .................. pack_layout(),
+  §4b   K alignment A (v1.13; stage 2 AUTO designed) .............. k_align_of(), k_hat_of(),
+                                                                     k4_load_addresses()
+  §6b.4 packed-operand byte layout (formats 1, 2) .................. pack_layout(),
                                                                      pack_ws_bytes()
 TLA+ models are scaled-down copies of the same rules; scaled_moduli() and
 scaled_constants() produce their parameters with the same greedy rule.
@@ -58,7 +60,8 @@ ACC_BITS = 32                        # int32 MMA accumulator (.satfinite: no wra
 INT32_MAX = 2**31 - 1
 INT32_MIN = -2**31
 K_C = 131071                         # §2  floor((2^31-1)/128^2)
-K_C_PRIME = 131056                   # §3.5 floor(K_c/16)*16
+K_CHUNK_ALIGN = 64                   # v1.13 §4b: K4's threadblock K tile (64 int8 = 64 B)
+K_C_PRIME = (K_C // K_CHUNK_ALIGN) * K_CHUNK_ALIGN   # §3.5 131008 = 2047*64 (v1.13; was 131056)
 F_BITS = 60                          # §3.2 fixed-point fraction bits of S
 MANT = 53                            # FP64 significand bits
 GAMMA_MIN, GAMMA_MAX = -1074, 1023   # ilogb range of nonzero finite FP64
@@ -66,7 +69,20 @@ TERM_MAX = 2**62 - 1023              # max ceil(x^2 * 2^F) for |x| <= 2 - 2^-52
 INT16_MIN, INT16_MAX = -2**15, 2**15 - 1
 LIMB = 32                            # CRT word = L32 limbs of 32 bits
 REGION_ALIGN = 256                   # §4a align(x) = ceil(x)_256
-K_ALIGN = 16                         # §4  k_hat = ceil(k)_16
+K_ALIGN = 16                         # §4  k_hat = ceil(k)_A: A = 16 (CUTLASS 16-B rule) ...
+K_ALIGN_PAD = 64                     # v1.13 §4b stage 2: ... or 64 (= K_CHUNK_ALIGN, K4's K tile)
+K_PAD64_MIN = 96                     # v1.13 §4b stage 2: AUTO(k) = 64 iff k > 96 (threshold sweep
+                                     # 2026-10-05, immerdink-eval findings/k4align-threshold.md)
+PACK_FORMAT_A16 = 1                  # §6b.4 format 1: k_hat = ceil(k)_16 (v1.7 .. v1.13 stage 1)
+PACK_FORMAT_A64 = 2                  # v1.13 §4b stage 2, format 2: k_hat = ceil(k)_64
+PACK_FORMATS = {PACK_FORMAT_A16: K_ALIGN, PACK_FORMAT_A64: K_ALIGN_PAD}   # format -> A
+# The K-alignment policy of the library this file describes. "A16": every plan and pack uses
+# A = 16 (v1.7 .. v1.13 stage 1); "AUTO": A = k_align_auto(k) (v1.13 §4b stage 2, implemented).
+# This one switch (with oracle.K_ALIGN_POLICY) moves every default (k_hat_of, workspace_size,
+# region_offsets, pack_layout and PACK_FORMAT, the newest format written); every sizing
+# function also takes an explicit A (the library's test hook imd_test_set_k_align). Callers
+# that model a plan whose A was forced must pass it.
+K_ALIGN_POLICY = "AUTO"
 N_ALIGN = 16                         # §4  n_hat = ceil(n)_16
 UNIT_ROUNDOFF = Fraction(1, 2**53)   # u in §3.8
 KMAX_CERT = 2**40                    # k range for the int16 shift certificate
@@ -85,6 +101,50 @@ def ceil_div(a, b):
 
 def align_up(x, a):
     return ceil_div(x, a) * a
+
+
+def k_hat_of(k, A=None):
+    """DESIGN §4: k_hat = ceil(k)_A, the residue row stride and K4's GEMM K extent; A a power
+    of two >= 16 (16 or 64 in a plan, §4b). A = None: k_align_of(k), the policy's A (never a
+    silent 16: review 2026-10-05, must-fix 5). Mirrors libimmerdink_host's k_hat_of
+    (src/host/k_hat.hpp), the one rounding site there."""
+    if A is None:
+        A = k_align_of(k)
+    if A < 16 or A & (A - 1):
+        raise ValueError(f"A={A}: a power of two >= 16")
+    return align_up(k, A)
+
+
+def k_align_auto(k):
+    """DESIGN v1.13 §4b stage 2, AUTO: the plan's (and the pack's) K alignment is a pure
+    function of the logical contraction length k (after lowering): 64 iff k > K_PAD64_MIN,
+    else 16. No data, no device, no calibration, no option."""
+    return K_ALIGN_PAD if k > K_PAD64_MIN else K_ALIGN
+
+
+def k_align_of(k, policy=None):
+    """The resolved K alignment A of a plan or pack of contraction length k under `policy`:
+    "A16" (16 for every k), "AUTO" (k_align_auto), or 16 / 64 (the library's test hook,
+    imd_test_set_k_align, forcing A). None = K_ALIGN_POLICY. libimmerdink_host's k_align_of
+    (stage 2) is the one resolver there; it is called once per API call (analyze for a plan
+    or a sizing query, pack_lower for a pack) and its A is passed explicitly from then on
+    (WorkspaceShape, pack_layout, ExecPlan.k_align), as this file's functions take it."""
+    policy = K_ALIGN_POLICY if policy is None else policy
+    if policy == "A16":
+        return K_ALIGN
+    if policy == "AUTO":
+        return k_align_auto(k)
+    if policy in (K_ALIGN, K_ALIGN_PAD):
+        return policy
+    raise ValueError(f"k-alignment policy {policy!r}")
+
+
+def pack_format_of(A):
+    """§6b.4: the pack FORMAT word of a pack laid out with K alignment A (1 = A16, 2 = A64)."""
+    for fmt, a in PACK_FORMATS.items():
+        if a == A:
+            return fmt
+    raise ValueError(f"A={A}: no pack format")
 
 
 def smod(x, p):
@@ -541,14 +601,15 @@ def _check_packed(packed):
     return packed
 
 
-def workspace_size(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE, packed=()):
+def workspace_size(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE, packed=(), k_align=None):
     """DESIGN §4a, transcribed literally as a closed form:
     sum of align(bytes) over sA sB fA fB vec RA RB W; 0 if b*m*n = 0;
     only align(vec) in DIRECT mode, when k = 0, or when K is empty (k = 1 after lowering:
     extent-1 labels are dropped, so k = 1 <=> K-empty, dispatched to DIRECT; DESIGN v1.1 §4/§4a).
     v1.2: with vec = RESIDENT the vec term is 0 everywhere (the vectors are plan memory).
     v1.7 (§6b.6): `packed` = the POST-SWAP roles ("A", "B") read from packed operands; their
-    sX, fX and RX terms are 0 (the caller's packed buffer holds them)."""
+    sX, fX and RX terms are 0 (the caller's packed buffer holds them).
+    v1.13 §4b: k_hat = ceil(k)_A with A = k_align (16 or 64; None: k_align_of(k), the policy)."""
     g = _check_shape(m, n, k, b, N, g, mode, vec)
     packed = _check_packed(packed)
     if b * m * n == 0:
@@ -560,7 +621,7 @@ def workspace_size(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE, packed=()):
     if mode == DIRECT or k <= 1:
         total = vec
     else:
-        kh, nh = align_up(k, K_ALIGN), align_up(n, N_ALIGN)
+        kh, nh = k_hat_of(k, k_align_of(k) if k_align is None else k_align), align_up(n, N_ALIGN)
         pa, pb = "A" not in packed, "B" not in packed      # 1: packed in-line (in the workspace)
         total = (pa * A(2 * b * m) + pb * A(2 * b * n) + pa * A(b * m) + pb * A(b * n) + vec
                  + pa * A(g * b * m * kh) + pb * A(g * b * nh * kh) + A(N * b * m * nh))
@@ -582,14 +643,15 @@ _REGIONS = [
 ]
 
 
-def region_offsets(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE, packed=()):
+def region_offsets(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE, packed=(), k_align=None):
     """[(name, start, end)] laid out in §4a order at 256-B-aligned offsets (no vec region
-    with vec = RESIDENT; v1.7: no sX, fX, RX for a packed post-swap role X in `packed`)."""
+    with vec = RESIDENT; v1.7: no sX, fX, RX for a packed post-swap role X in `packed`;
+    v1.13 §4b: k_hat = ceil(k)_A, A = k_align or k_align_of(k))."""
     g = _check_shape(m, n, k, b, N, g, mode, vec)
     packed = _check_packed(packed)
     if b * m * n == 0:
         return []
-    kh, nh = align_up(k, K_ALIGN), align_up(n, N_ALIGN)
+    kh, nh = k_hat_of(k, k_align_of(k) if k_align is None else k_align), align_up(n, N_ALIGN)
     names = ["vec"] if (mode == DIRECT or k <= 1) else [r[0] for r in _REGIONS]
     if vec == VEC_RESIDENT:
         names = [x for x in names if x != "vec"]
@@ -608,17 +670,20 @@ def region_offsets(m, n, k, b, N, g, mode=EMULATE, vec=VEC_GENERATE, packed=()):
 # ---------------------------------------------------------------------------
 # §6b.4 packed operand, byte layout format 1 (DESIGN v1.7, D1)
 
-PACK_FORMAT = 1
+# The newest format the library writes: the format of a large k under the policy ("A16": 1,
+# "AUTO": 2). Derived, so the policy switch moves it (review 2026-10-05, must-fix 5).
+PACK_FORMAT = pack_format_of(k_align_of(K_PAD64_MIN + 1))
 _PACK_REGIONS = ("sig", "flag", "res")
 
 
-def pack_layout(b, r, k, N):
-    """DESIGN §6b.4, format 1: [(name, offset, bytes)] of the regions sig (int16 sigma of row
-    (lambda, rho) at lambda r + rho), flag (u8, same index) and res (int8 residues of plane l,
-    row (lambda, rho), k-bar at l b r k_hat + (lambda r + rho) k_hat + k-bar, then a zeroed tail
-    of (ceil(r)_16 - r) k_hat bytes), in that order at 256-aligned offsets, and pack_bytes =
-    the sum of the aligned region sizes. ([], 0) if b r k = 0. OverflowError when a size or
-    the total exceeds uint64 (the library: INVALID_VALUE)."""
+def pack_layout(b, r, k, N, fmt=None):
+    """DESIGN §6b.4, format fmt (1: k_hat = ceil(k)_16; 2, v1.13 §4b: ceil(k)_64; None: the
+    format of k_align_of(k), the policy): [(name, offset, bytes)] of the regions sig (int16
+    sigma of row (lambda, rho) at lambda r + rho), flag (u8, same index) and res (int8 residues
+    of plane l, row (lambda, rho), k-bar at l b r k_hat + (lambda r + rho) k_hat + k-bar, then a
+    zeroed tail of (ceil(r)_16 - r) k_hat bytes), in that order at 256-aligned offsets, and
+    pack_bytes = the sum of the aligned region sizes. ([], 0) if b r k = 0. OverflowError when
+    a size or the total exceeds uint64 (the library: INVALID_VALUE)."""
     for name, v in (("b", b), ("r", r), ("k", k)):
         if not isinstance(v, int) or v < 0:
             raise ValueError(f"{name}={v} must be a nonnegative int")
@@ -626,7 +691,10 @@ def pack_layout(b, r, k, N):
         raise ValueError(f"N={N}")
     if b * r * k == 0:
         return [], 0
-    kh = align_up(k, K_ALIGN)
+    fmt = pack_format_of(k_align_of(k)) if fmt is None else fmt
+    if fmt not in PACK_FORMATS:
+        raise ValueError(f"pack format {fmt}")
+    kh = k_hat_of(k, PACK_FORMATS[fmt])
     sizes = {"sig": 2 * b * r, "flag": b * r,
              "res": N * b * r * kh + (align_up(r, N_ALIGN) - r) * kh}
     out, off = [], 0
@@ -852,11 +920,17 @@ def cert_crt_roundtrip():
 
 @check("§2/§3.5 K_c, K_c'")
 def cert_kc():
-    """128^2 K_c <= 2^31-1 < 128^2 (K_c+1); K_c' = floor(K_c/16)*16; epilogue W+acc fits int32."""
+    """128^2 K_c <= 2^31-1 < 128^2 (K_c+1); K_c' = floor(K_c/64)*64 (v1.13 §4b: a multiple of
+    K4's 64-wide K tile, so every full chunk starts and ends on a 64-byte phase; a multiple of
+    16 too, the CUTLASS pointer rule) and maximal under that rule; epilogue W+acc fits int32."""
     need(128 * 128 * K_C <= INT32_MAX < 128 * 128 * (K_C + 1), "K_c")
     need(K_C == INT32_MAX // (128 * 128), "K_c formula")
-    need(K_C_PRIME % 16 == 0 and K_C_PRIME <= K_C and K_C_PRIME == (K_C // 16) * 16, "K_c'")
-    need(K_C - K_C_PRIME < 16, "K_c' maximal")
+    need(K_C_PRIME % 16 == 0 and K_C_PRIME % K_CHUNK_ALIGN == 0 and K_C_PRIME <= K_C and
+         K_C_PRIME == (K_C // K_CHUNK_ALIGN) * K_CHUNK_ALIGN, "K_c'")
+    need(K_C - K_C_PRIME < K_CHUNK_ALIGN, "K_c' maximal")
+    need(K_C_PRIME == 131008 == 2047 * 64, "K_c' value (DESIGN §2 table)")
+    # the pinned extremes of the 256 GEMM's epilogue input (DESIGN §3.5, PROOFS L-epilogue)
+    need(epilogue_range(256) == (-2129666048, 2146435327), "v range p=256 literal")
     for p in REAL_MODULI:
         lo, hi = epilogue_range(p)
         need(INT32_MIN <= lo and hi <= INT32_MAX, f"p={p} epilogue range [{lo},{hi}] not int32")
@@ -876,6 +950,223 @@ def cert_kc():
             h = (p - 1) // 2
             need(epilogue_range(p) == (-h * h * K_C_PRIME, h * h * K_C_PRIME + p - 1), f"closed form p={p}")
     return f"K_c={K_C}, K_c'={K_C_PRIME}, max W+acc = {epilogue_range(256)[1]}"
+
+
+# v1.13 §4b boundary k list: around one, two and four K_c' (old and new), the measured long-k
+# shapes (196608, 196624) and the one-chunk windows k_hat in (j K_c', j 131056].
+K_BOUNDARY = [1, 16, 17, 64, 65, 131007, 131008, 131009, 131040, 131041, 131056, 131057,
+              131071, 131072, 131073, 196608, 196624, 262016, 262017, 262112, 262113, 262144,
+              262160, 262200, 392961, 393008, 393009, 393024, 393025, 393168, 524032, 524033]
+
+
+def k_chunk_list(k_hat, chunk=K_C_PRIME):
+    """§3.5 the K-chunks of a row: [(k0, kc)], k0 = c chunk, the last one ending at k_hat."""
+    return [(k0, min(chunk, k_hat - k0)) for k0 in range(0, k_hat, chunk)]
+
+
+def k4_row_phase(row_base, k_hat, k0, kc, tile=K_CHUNK_ALIGN):
+    """v1.13 §4b: the byte phase (mod 64) of row r's main-loop K4 loads in the chunk
+    [k0, k0 + kc). CUTLASS 2.x loads the chunk's residue tile (kc mod 64 elements) first, so
+    every later 64-element load starts at row_base + k0 + (kc mod 64) + 64 t, i.e. at phase
+    (row_base + chunk end) mod 64 with row_base = r k_hat (mod 64) for 256-aligned regions."""
+    return (row_base + k0 + kc % tile) % tile
+
+
+@check("v1.13 §4b K4 row phase")
+def cert_row_phase():
+    """With K_c' = 131008 every full K-chunk starts and ends on a multiple of 64, so the
+    main-loop load phase of row r in chunk c, (r k_hat + e_c) mod 64 with e_c the chunk end,
+    is r k_hat mod 64 in a full chunk and (r + 1) k_hat mod 64 in the last one (e_c = k_hat):
+    the set of phases over the rows, hence the phase class, depends on k_hat alone. The old
+    K_c' = 131056 shifted chunk c by 48 (c + 1) (the measured slow chunk 0 of k_hat = 196608).
+    k_chunks gains one exactly in the windows k_hat in (j K_c', j 131056]; this holds while
+    the windows are disjoint, j 48 < K_c' (j <= 2729, k_hat < ~3.58e8), which covers the
+    checked list (j < 5); beyond that the counts can differ by more than one."""
+    n = 0
+    for k in K_BOUNDARY + list(range(1, 2000, 7)):
+        kh = k_hat_of(k, K_ALIGN)                    # stage 1: the A = 16 rows (the windows)
+        chunks = k_chunk_list(kh)
+        need(len(chunks) == ceil_div(kh, K_C_PRIME) and sum(c[1] for c in chunks) == kh, f"k={k}")
+        for ci, (k0, kc) in enumerate(chunks):
+            need(k0 % 16 == 0 and kc % 16 == 0, f"k={k} chunk {ci}: CUTLASS 16-B rule")
+            if ci < len(chunks) - 1:
+                need(kc == K_C_PRIME and k0 % 64 == 0 and (k0 + kc) % 64 == 0, f"k={k} full chunk {ci}")
+            end = kh if ci == len(chunks) - 1 else 0     # e_c mod 64: 0 for a full chunk
+            for r in range(8):
+                need(k4_row_phase(r * kh, kh, k0, kc) == (r * kh + end) % 64, f"k={k} chunk {ci} row {r}")
+                n += 1
+        old = k_chunk_list(kh, 131056)
+        if len(old) > 1:   # the old chunk length shifts chunk 0's phase by 48 (not by k_hat)
+            need(k4_row_phase(0, kh, *old[0]) == 48, f"k={k}: old chunk 0 phase")
+        win = any(j * K_C_PRIME < kh <= j * 131056 for j in range(1, 5))
+        need((len(chunks) == len(old) + 1) == win and len(chunks) - len(old) in (0, 1), f"k={k} window")
+    # the measured long-k case (k4align measurements): 196608 = 3 * 2^16, two chunks
+    need(k4_row_phase(0, 196608, *k_chunk_list(196608, 131056)[0]) == 48 and
+         k4_row_phase(0, 196608, *k_chunk_list(196608, 131056)[1]) == 0, "196608 old phases")
+    need([k4_row_phase(0, 196608, *c) for c in k_chunk_list(196608)] == [0, 0], "196608 new phases")
+    return f"{len(K_BOUNDARY)} boundary k + 286 small k, {n} (row, chunk) phases = (r k_hat + e_c) mod 64, e_c = 0 or k_hat"
+
+
+def k4_load_addresses(row_start, k0, kc, tile=K_CHUNK_ALIGN):
+    """v1.13 §4b: the absolute start addresses of K4's K-tile loads of one row (row_start = its
+    absolute address: a 256-aligned region / pack base plus the row index times the row
+    stride) in the K-chunk [k0, k0 + kc), in CUTLASS 2.x's order
+    (predicated_tile_access_iterator.h:204-213, 514-523): the residue tile of
+    R = ((kc - 1) mod T) + 1 elements first, at row_start + k0, then the full tiles at
+    row_start + k0 + R + T i, i = 0 .. (kc - R)/T - 1. ceil(kc / T) loads in all."""
+    R = (kc - 1) % tile + 1
+    return [row_start + k0] + [row_start + k0 + R + tile * i for i in range((kc - R) // tile)]
+
+
+def _k4_row_starts(base, kh, rows):
+    """Absolute row starts of a K4 operand: base (256-aligned) + R k_hat for the row indices R
+    the launches form (z0 plane offsets, j0 y-part offsets, rows in a block: all R k_hat)."""
+    return [base + R * kh for R in rows]
+
+
+def _k4_all_aligned(kh, extent, chunk, bases, rows, T):
+    """Every K4 load address of every row and chunk (CUTLASS order) is a multiple of T; the
+    K extent `extent` is chunked by `chunk` (§3.5), the rows are kh apart."""
+    for k0, kc in k_chunk_list(extent, chunk):
+        for s in _k4_row_starts(0, kh, rows):
+            for base in bases:
+                if any(a % T for a in k4_load_addresses(base + s, k0, kc, T)):
+                    return False
+    return True
+
+
+def k4_add_chunk_keys(k_hat, chunk=K_C_PRIME):
+    """The number of distinct add-mod chunk lengths of a K4 plan (src/host/k4_launches.hpp
+    k4_counts): chunks 1.. are add-mod launches; the full length counts if there are >= 3
+    chunks, the last one if there are >= 2 chunks and it is not itself a full chunk of a
+    >= 3-chunk plan (then the two keys merge). add_shapes = this times the z and n-part
+    size counts (independent of A)."""
+    nch = ceil_div(k_hat, chunk)
+    last = k_hat - (nch - 1) * chunk
+    return (nch >= 3) + (nch >= 2 and not (nch >= 3 and last == chunk))
+
+
+K4_TUNE_MAX_BYTES = 256 << 20        # src/host/k4_config.hpp kK4TuneMaxBytes
+
+
+def k4_tune_bytes(m, n, k_hat, b, g):
+    """src/host/k4_config.cpp k4_tune_bytes for an emulating plan: align(g b m k_hat) +
+    align(g b n_hat k_hat) + align(g b m n_hat), 0 (tuning off) when a region or the sum
+    exceeds K4_TUNE_MAX_BYTES."""
+    nh, total = align_up(n, N_ALIGN), 0
+    for x in (m * k_hat, nh * k_hat, m * nh):
+        r = g * b * x
+        if r > K4_TUNE_MAX_BYTES:
+            return 0
+        total += align_up(r, REGION_ALIGN)
+    return total if total <= K4_TUNE_MAX_BYTES else 0
+
+
+@check("v1.13 §4b stage 2 K alignment")
+def cert_k_align():
+    """Stage 2 (designed): k_hat = ceil(k)_A, A = AUTO(k) = 64 iff k > K_PAD64_MIN = 96, is the
+    row stride and the GEMM K extent of every residue row (RA, RB, packs). With K_c' = 131008
+    and 256-aligned region / pack bases, EVERY K4 load address in CUTLASS's residue-first
+    order is 64-aligned for A = 64 (and 16-aligned for A = 16: the correctness rule). Each
+    alternative fails: the stride padded but the extent not (stride-only), K_c' = 131040,
+    A = 32, a 16-aligned base. A changes no launch count: k_chunks, the K4 main-loop
+    iterations per chunk, the KF / KL decisions and KL's tile and chunk count are the same for
+    A = 16 and 64. Footprint deltas are exact (delta = ceil(k)_64 - ceil(k)_16 per row).
+    Two plan-level differences are NOT launch counts (review 2026-10-05, must-fix 8): the
+    add-mod shape keys merge for A = 64 exactly when ceil(k)_64 = n K_c' (n >= 3) and
+    ceil(k)_16 < ceil(k)_64 (one fewer add key: plan host bytes and add_shapes differ;
+    e.g. k = 393008), and k4_tune_bytes can cross its 256 MiB cap (tuning off for A = 64)."""
+    need(K_ALIGN_PAD == K_CHUNK_ALIGN == 64 and K_PAD64_MIN == 96, "stage-2 constants")
+    need(PACK_FORMATS == {1: 16, 2: 64}, "pack formats")
+    need(all(k_align_auto(k) == 16 for k in range(0, 97)) and
+         all(k_align_auto(k) == 64 for k in range(97, 5000)), "AUTO threshold")
+    need(k_align_of(10**6, "A16") == 16 and k_align_of(5, 64) == 64 and k_align_of(5, "AUTO") == 16,
+         "policies")
+    bases = [0, 256, 768, 4096 + 256]                   # 256-aligned region / pack bases
+    rows = list(range(9)) + [17, 33, 65535 * 256, 65535 * 256 + 3]   # incl. z0 m, j0 = q YLen
+    ks = sorted(set(K_BOUNDARY + list(range(1, 1100, 3)) +
+                    [96, 97, 112, 113, 128, 129, 144, 145, 4080, 4096, 4097]))
+    n = 0
+    for k in ks:
+        for A in (16, 64):
+            kh = k_hat_of(k, A)
+            need(_k4_all_aligned(kh, kh, K_C_PRIME, bases, rows, 16), f"k={k} A={A}: 16-B rule")
+            if A == 64:
+                need(_k4_all_aligned(kh, kh, K_C_PRIME, bases, rows, 64), f"k={k}: 64-B rule")
+            n += 1
+        k16, k64 = k_hat_of(k, 16), k_hat_of(k, 64)
+        # launch structure independent of A (K_c' and every KL tile tk >= 64 are multiples of 64)
+        c16, c64 = k_chunk_list(k16), k_chunk_list(k64)
+        need(len(c16) == len(c64) == ceil_div(k, K_C_PRIME), f"k={k}: k_chunks")
+        need([ceil_div(kc, 64) for _, kc in c16] == [ceil_div(kc, 64) for _, kc in c64],
+             f"k={k}: K4 main-loop iterations per chunk")
+        need((k16 <= 1024) == (k64 <= 1024) == (k <= 1024), f"k={k}: KF / KL choice")
+        for kh in (k16, k64):
+            tk = 64
+            while tk < 4096 and tk < kh:
+                tk *= 2
+            if kh == k16:
+                tk16, nc16 = tk, ceil_div(kh, tk)
+            else:
+                need(tk == tk16 and ceil_div(kh, tk) == nc16, f"k={k}: KL tile")
+        if k > 64:                                       # KF tile tk = pow2 >= k_hat (>= 16)
+            need(1 << (k16 - 1).bit_length() == 1 << (k64 - 1).bit_length(), f"k={k}: KF tile")
+    # each alternative misaligns some main-loop load (k > 96, so these are AUTO = 64 plans)
+    def any_bad(f):
+        return any(not f(k) for k in range(97, 1200))
+    need(any_bad(lambda k: _k4_all_aligned(k_hat_of(k, 64), k_hat_of(k, 16), K_C_PRIME, bases,
+                                           rows, 64)), "stride-only must fail")
+    need(not _k4_all_aligned(k_hat_of(196608, 64), k_hat_of(196608, 64), 131040, bases, rows, 64),
+         "K_c' = 131040 must fail")
+    need(not _k4_all_aligned(k_hat_of(196608, 64), k_hat_of(196608, 64), 131056, bases, rows, 64),
+         "K_c' = 131056 must fail")
+    need(any_bad(lambda k: _k4_all_aligned(k_hat_of(k, 32), k_hat_of(k, 32), K_C_PRIME, bases,
+                                           rows, 64)), "A = 32 must fail")
+    need(not _k4_all_aligned(k_hat_of(1000, 64), k_hat_of(1000, 64), K_C_PRIME, [16], rows, 64),
+         "16-aligned base must fail")
+    need(any_bad(lambda k: _k4_all_aligned(k_hat_of(k, 16), k_hat_of(k, 16), K_C_PRIME, bases,
+                                           rows, 64)), "A = 16 is misaligned (witness)")
+    # footprints: per residue row the bytes grow by delta = ceil(k)_64 - ceil(k)_16 in {0..48}
+    worst = (Fraction(0), None)
+    for k in range(97, 20000):
+        d = k_hat_of(k, 64) - k_hat_of(k, 16)
+        need(d in (0, 16, 32, 48) and d == (-k_hat_of(k, 16)) % 64, f"k={k}: delta")
+        worst = max(worst, (Fraction(d, k_hat_of(k, 16)), k))
+    need(worst[0] == Fraction(1, 3) and k_hat_of(worst[1], 16) == 144, "max relative overhead")
+    need(max(Fraction(k_hat_of(k, 64) - k_hat_of(k, 16), k_hat_of(k, 16))
+             for k in range(1025, 20000)) == Fraction(48, 1040), "overhead k > 1024")
+    for (m, nn, k, b, N, g) in ((17, 33, 200, 3, 9, 2), (1000, 3, 1000, 2, 20, 7), (5, 1, 97, 1, 2, 1)):
+        d, nh = k_hat_of(k, 64) - k_hat_of(k, 16), align_up(nn, 16)
+        r16 = {x[0]: x[2] - x[1] for x in region_offsets(m, nn, k, b, N, g, k_align=16)}
+        r64 = {x[0]: x[2] - x[1] for x in region_offsets(m, nn, k, b, N, g, k_align=64)}
+        need(r64["RA"] - r16["RA"] == g * b * m * d and r64["RB"] - r16["RB"] == g * b * nh * d and
+             all(r64[x] == r16[x] for x in r16 if x not in ("RA", "RB")), f"ws delta {m, nn, k}")
+        for r in (1, 15, 16, 17):
+            p16 = {x[0]: x[2] for x in pack_layout(b, r, k, N, PACK_FORMAT_A16)[0]}
+            p64 = {x[0]: x[2] for x in pack_layout(b, r, k, N, PACK_FORMAT_A64)[0]}
+            need(p64["res"] - p16["res"] == (N * b * r + align_up(r, 16) - r) * d and
+                 p64["sig"] == p16["sig"] and p64["flag"] == p16["flag"], f"pack delta {r, k}")
+    # add-mod shape keys: they differ exactly when ceil(k)_64 is n >= 3 full chunks and
+    # ceil(k)_16 is below it (the last A = 64 chunk is full: its key merges with the full one)
+    n_key = 0
+    kk = sorted(set(ks + [j * K_C_PRIME - d for j in range(1, 6) for d in range(0, 80)]))
+    for k in kk:
+        a16, a64 = k4_add_chunk_keys(k_hat_of(k, 16)), k4_add_chunk_keys(k_hat_of(k, 64))
+        k64 = k_hat_of(k, 64)
+        merge = k64 % K_C_PRIME == 0 and k64 // K_C_PRIME >= 3 and k_hat_of(k, 16) < k64
+        need(a16 - a64 == (1 if merge else 0), f"k={k}: add keys {a16} / {a64}")
+        n_key += merge
+    need(k4_add_chunk_keys(k_hat_of(393008, 16)) == 2 and k4_add_chunk_keys(k_hat_of(393008, 64)) == 1
+         and k4_add_chunk_keys(k_hat_of(393009, 16)) == k4_add_chunk_keys(k_hat_of(393009, 64)) == 1
+         and k4_add_chunk_keys(k_hat_of(262016, 16)) == k4_add_chunk_keys(k_hat_of(262016, 64)) == 1,
+         "add-key examples 393008 (merge), 393009 / 262016 (none)")
+    # k4_tune's 256 MiB cap: (m, n, k, b, g) = (2000000, 1, 97, 1, 1) tunes at A = 16 only
+    t16, t64 = (k4_tune_bytes(2000000, 1, k_hat_of(97, A), 1, 1) for A in (16, 64))
+    need(t16 == 224000000 + 1792 + 32000000 and t64 == 0, f"tune cap {t16} / {t64}")
+    return (f"{len(ks)} k x A in {{16, 64}}: {n} layouts, every CUTLASS load 16-B (A16) / 64-B "
+            f"(A64) aligned; stride-only, K_c' 131040 / 131056, A = 32, base 16 each misaligned; "
+            f"launches independent of A; max overhead 1/3 at k_hat16 = 144; {n_key} k with one "
+            f"fewer add key at A = 64 (e.g. 393008); tune cap crossed at (2e6, 1, 97)")
 
 
 @check("§3.5 mod reduction realization")
@@ -1507,7 +1798,7 @@ def cert_scaled_tla():
     """scaled_constants reproduces the real constants at (8, 32) and the parameters the
     TLA+ model headers state (MC_OzakiCRT, MC_CRTRealization, MC_OzakiScaling);
     it refuses accumulators too narrow for one product (K_c = 0)."""
-    real = scaled_constants(RES_BITS, ACC_BITS, N_MAX, limb_bits=LIMB, k_align=K_ALIGN)
+    real = scaled_constants(RES_BITS, ACC_BITS, N_MAX, limb_bits=LIMB, k_align=K_CHUNK_ALIGN)
     need(real["moduli"] == REAL_MODULI and real["K_c"] == K_C and real["K_c_prime"] == K_C_PRIME,
          "real-width scaled_constants")
     for N in range(N_MIN, N_MAX + 1):
@@ -1560,21 +1851,22 @@ def cert_workspace():
     """Closed form = sum of aligned regions; regions disjoint, 256-aligned, in order;
     sub-buffer strides 16-B aligned; zero/DIRECT/k=0 rules; monotone in every argument."""
     ms = [0, 1, 15, 16, 17, 100, 257]
-    ks = [0, 1, 2, 15, 16, 17, 131056, 131057, 262200]
+    ks = [0, 1, 2, 15, 16, 17, 96, 97, 144, 131008, 131009, 131056, 131057, 196624, 262200]
     bs = [0, 1, 3]
     n_cases = 0
-    for N in (2, 9, 14, 20):
-        for g in sorted({1, 2, N // 2 or 1, N}):
-            for mode in (EMULATE, DIRECT):
-                for vec in (VEC_GENERATE, VEC_RESIDENT):
-                    for m in ms:
-                        for n in ms:
-                            for k in ks:
-                                for b in bs:
-                                    ws = workspace_size(m, n, k, b, N, g, mode, vec)
-                                    regs = region_offsets(m, n, k, b, N, g, mode, vec)
-                                    _check_layout(m, n, k, b, N, g, mode, ws, regs, vec)
-                                    n_cases += 1
+    for A in (16, 64):                                   # v1.13 §4b: both K alignments
+        for N in (2, 9, 14, 20):
+            for g in sorted({1, 2, N // 2 or 1, N}):
+                for mode in (EMULATE, DIRECT):
+                    for vec in (VEC_GENERATE, VEC_RESIDENT):
+                        for m in ms:
+                            for n in ms:
+                                for k in ks:
+                                    for b in bs:
+                                        ws = workspace_size(m, n, k, b, N, g, mode, vec, k_align=A)
+                                        regs = region_offsets(m, n, k, b, N, g, mode, vec, k_align=A)
+                                        _check_layout(m, n, k, b, N, g, mode, ws, regs, vec, A)
+                                        n_cases += 1
     # monotonicity (EMULATE, k >= 1): a planner may price with it
     for N in (2, 14):
         for g in (1, N):
@@ -1619,8 +1911,31 @@ def cert_workspace():
         ((17, 33, 0, 3, 9, 0, EMULATE, VEC_RESIDENT), 0, []),
     ]
     for args, want, regs_want in worked:
-        need(workspace_size(*args) == want, f"worked example {args}: {workspace_size(*args)} != {want}")
-        need(region_offsets(*args) == regs_want, f"worked example {args} offsets")
+        need(workspace_size(*args, k_align=16) == want,
+             f"worked example {args}: {workspace_size(*args, k_align=16)} != {want}")
+        need(region_offsets(*args, k_align=16) == regs_want, f"worked example {args} offsets")
+    # v1.13 §4b stage 2, A = 64 (hand-computed from DESIGN §4a / §4b):
+    #  (17,33,5,3,N=9,g=2) forced A = 64: k^=64 n^=48; sA 0 sB 256 fA 512 fB 768 vec 1024..1976;
+    #   RA 2*3*17*64 = 6528 at 2048 (-> 6656); RB 2*3*48*64 = 18432 at 8704; W 22032 at 27136
+    #   (-> 22272); total 49408
+    #  (1000,3,200,2,N=20,g=7) AUTO (200 > 96): k^=256 n^=16; sA 4000 at 0; sB 12 at 4096;
+    #   fA 2000 at 4352; fB 6 at 6400; vec 8*2412 = 19296 at 6656 (-> 19456); RA 7*2*1000*256 =
+    #   3584000 at 26112; RB 7*2*16*256 = 57344 at 3610112; W 640000 at 3667456; total 4307456
+    worked64 = [
+        ((17, 33, 5, 3, 9, 2, EMULATE), 49408,
+         [("sA", 0, 102), ("sB", 256, 454), ("fA", 512, 563), ("fB", 768, 867),
+          ("vec", 1024, 1976), ("RA", 2048, 8576), ("RB", 8704, 27136), ("W", 27136, 49168)]),
+        ((1000, 3, 200, 2, 20, 7, EMULATE), 4307456,
+         [("sA", 0, 4000), ("sB", 4096, 4108), ("fA", 4352, 6352), ("fB", 6400, 6406),
+          ("vec", 6656, 25952), ("RA", 26112, 3610112), ("RB", 3610112, 3667456),
+          ("W", 3667456, 4307456)]),
+    ]
+    for args, want, regs_want in worked64:
+        need(workspace_size(*args, k_align=64) == want,
+             f"A64 example {args}: {workspace_size(*args, k_align=64)} != {want}")
+        need(region_offsets(*args, k_align=64) == regs_want, f"A64 example {args} offsets")
+    need(workspace_size(1000, 3, 200, 2, 20, 7, k_align=k_align_of(200, "AUTO")) == 4307456 and
+         workspace_size(17, 33, 5, 3, 9, 2, k_align=k_align_of(5, "AUTO")) == 30720, "AUTO examples")
     # plan device bytes: (17,33,5,3) RESIDENT 8*(34+66+10+9) = 952; GENERATE / empty 0
     need(plan_device_bytes(17, 33, 5, 3, VEC_RESIDENT) == 952, "plan device bytes")
     need(plan_device_bytes(17, 33, 5, 3) == 0 and plan_device_bytes(0, 33, 5, 3, VEC_RESIDENT) == 0,
@@ -1639,17 +1954,18 @@ def cert_pack_layout():
     uint64 raises (INVALID_VALUE); the packed workspace (§6b.6) is §4a without sX, fX, RX of
     each packed role. Hand-computed examples."""
     n_cases = 0
-    for N in (2, 9, 14, 20):
+    for fmt, A in sorted(PACK_FORMATS.items()):          # v1.13 §4b: formats 1 (A16), 2 (A64)
+     for N in (2, 9, 14, 20):
         for b in (0, 1, 3, 7):
             for r in (0, 1, 15, 16, 17, 33):
-                for k in (0, 1, 2, 15, 16, 17, 131056, 131057):
-                    regs, total = pack_layout(b, r, k, N)
+                for k in (0, 1, 2, 15, 16, 17, 96, 97, 144, 131008, 131009, 131056, 131057, 131072):
+                    regs, total = pack_layout(b, r, k, N, fmt)
                     n_cases += 1
                     if b * r * k == 0:
                         need(regs == [] and total == 0 and pack_ws_bytes(b, r, k) == 0,
                              "empty pack")
                         continue
-                    kh, nh = ceil_div(k, 16) * 16, ceil_div(r, 16) * 16
+                    kh, nh = ceil_div(k, A) * A, ceil_div(r, 16) * 16
                     lit = {"sig": 2 * b * r, "flag": b * r,
                            "res": N * b * r * kh + (nh - r) * kh}
                     need([x[0] for x in regs] == ["sig", "flag", "res"], "region order")
@@ -1667,7 +1983,9 @@ def cert_pack_layout():
                             for rho in sorted({0, r - 1, nh - 1}):
                                 for c in range(ceil_div(k, K_C_PRIME)):
                                     a = res0 + l * b * r * kh + (lam * r + rho) * kh + c * K_C_PRIME
-                                    need(a % 16 == 0, "K4 pointer alignment")
+                                    need(a % A == 0, "K4 pointer alignment (16, or 64 in format 2)")
+                                    # v1.13 §4b: the chunk offset keeps the row's 64-B phase
+                                    need((a - c * K_C_PRIME) % 64 == a % 64, "chunk phase")
                     # role B: the last byte K4 can read (plane N-1, batch b-1, row n_hat-1,
                     # k_hat-1) is inside res; the bound is tight (the tail is exactly needed)
                     last = res0 + (N - 1) * b * r * kh + ((b - 1) * r + nh - 1) * kh + kh - 1
@@ -1679,16 +1997,23 @@ def cert_pack_layout():
     #  (1, 1, 1000, 14): k^=1008; sig 2 -> 256; flag 1 -> 256; res 14*1008 + 15*1008 = 29232
     #   -> 29440; total 29952
     #  (2, 32, 16, 2): sig 128 -> 256; flag 64 -> 256; res 2*2*32*16 = 2048; total 2560
-    worked = [((3, 17, 5, 9), 8192, [("sig", 0, 102), ("flag", 256, 51), ("res", 512, 7584)]),
-              ((1, 1, 1000, 14), 29952, [("sig", 0, 2), ("flag", 256, 1), ("res", 512, 29232)]),
-              ((2, 32, 16, 2), 2560, [("sig", 0, 128), ("flag", 256, 64), ("res", 512, 2048)]),
-              ((0, 5, 5, 8), 0, []), ((2, 3, 0, 8), 0, [])]
+    #  format 2 (v1.13 §4b): (3, 17, 5, 9) forced: k^=64; res 9*3*17*64 + 15*64 = 29376 + 960 =
+    #   30336 -> 30464; total 30976. (1, 1, 1000, 14) (AUTO: 1000 > 96): k^=1024; res 14*1024 +
+    #   15*1024 = 29696; total 30208
+    worked = [((3, 17, 5, 9, 1), 8192, [("sig", 0, 102), ("flag", 256, 51), ("res", 512, 7584)]),
+              ((1, 1, 1000, 14, 1), 29952, [("sig", 0, 2), ("flag", 256, 1), ("res", 512, 29232)]),
+              ((2, 32, 16, 2, 1), 2560, [("sig", 0, 128), ("flag", 256, 64), ("res", 512, 2048)]),
+              ((3, 17, 5, 9, 2), 30976, [("sig", 0, 102), ("flag", 256, 51), ("res", 512, 30336)]),
+              ((1, 1, 1000, 14, 2), 30208, [("sig", 0, 2), ("flag", 256, 1), ("res", 512, 29696)]),
+              ((0, 5, 5, 8, 1), 0, []), ((2, 3, 0, 8, 2), 0, [])]
     for args, want, regs_want in worked:
         regs, total = pack_layout(*args)
         need(total == want and regs == regs_want, f"pack worked example {args}: {regs} {total}")
+    need(pack_layout(1, 1, 1000, 14, pack_format_of(k_align_of(1000, "AUTO")))[1] == 30208 and
+         pack_layout(3, 17, 5, 9, pack_format_of(k_align_of(5, "AUTO")))[1] == 8192, "AUTO packs")
     need(pack_ws_bytes(3, 17, 5) == 256 and pack_ws_bytes(1, 1, 1000) == 8192, "pack ws examples")
     # overflow: N b r k_hat beyond 2^64
-    for args in ((1, 2**40, 2**30, 20), (2**20, 2**20, 2**30, 2)):
+    for args in ((1, 2**40, 2**30, 20, 1), (2**20, 2**20, 2**30, 2, 1), (1, 2**40, 2**30, 20, 2)):
         try:
             pack_layout(*args)
             need(False, f"no overflow for {args}")
@@ -1716,19 +2041,19 @@ def cert_pack_layout():
 
 
 # DESIGN §4a table typed literally (independent of _REGIONS / workspace_size).
-def _design_region_bytes(m, n, k, b, N, g):
-    kh, nh = ceil_div(k, 16) * 16, ceil_div(n, 16) * 16
+def _design_region_bytes(m, n, k, b, N, g, A=16):
+    kh, nh = ceil_div(k, A) * A, ceil_div(n, 16) * 16
     return {"sA": 2 * b * m, "sB": 2 * b * n, "fA": b * m, "fB": b * n,
             "vec": 8 * (2 * m + 2 * n + 2 * k + 3 * b),
             "RA": g * b * m * kh, "RB": g * b * nh * kh, "W": N * b * m * nh}
 
 
-def _check_layout(m, n, k, b, N, g, mode, ws, regs, vec=VEC_GENERATE):
+def _check_layout(m, n, k, b, N, g, mode, ws, regs, vec=VEC_GENERATE, A=16):
     gg = N if g == 0 else g
     if b * m * n == 0:
         need(ws == 0 and regs == [], "zero-size rule")
         return
-    lit = _design_region_bytes(m, n, k, b, N, gg)
+    lit = _design_region_bytes(m, n, k, b, N, gg, A)
     res = vec == VEC_RESIDENT     # v1.2: no vec region
     if mode == DIRECT or k <= 1:
         need([r[0] for r in regs] == ([] if res else ["vec"]), "DIRECT/k=0/K-empty rule")
@@ -1748,19 +2073,22 @@ def _check_layout(m, n, k, b, N, g, mode, ws, regs, vec=VEC_GENERATE):
     if mode == EMULATE and k > 1:
         # CUTLASS alignment 16: every operand/aux pointer the K4 launches form
         # (workspace base is 256-aligned, §5) is 16-B aligned: plane (l, lambda)
-        # base + row i/j + chunk c*K_c' for A' (RA), B' (RB) and W planes.
+        # base + row i/j + chunk c*K_c' for A' (RA), B' (RB) and W planes; and (v1.13 §4b, a
+        # performance contract) c*K_c' is a multiple of 64.
         off = {r[0]: r[1] for r in regs}
-        kh, nh = ceil_div(k, 16) * 16, ceil_div(n, 16) * 16
+        kh, nh = ceil_div(k, A) * A, ceil_div(n, 16) * 16
         rows_a = sorted({0, 1, m - 1})
         rows_b = sorted({0, 1, nh - 1})
         chunks = range(ceil_div(k, K_C_PRIME))
         for lam in sorted({0, b - 1}):
             for l in sorted({0, gg - 1}):
                 for c in chunks:
+                    # v1.13 §4b: a chunk start leaves the row's 64-B load phase unchanged
+                    need((c * K_C_PRIME) % K_CHUNK_ALIGN == 0, "chunk start 64-B phase")
                     for i in rows_a:
-                        need((off["RA"] + ((l * b + lam) * m + i) * kh + c * K_C_PRIME) % 16 == 0, "A' ptr")
+                        need((off["RA"] + ((l * b + lam) * m + i) * kh + c * K_C_PRIME) % A == 0, "A' ptr")
                     for j in rows_b:
-                        need((off["RB"] + ((l * b + lam) * nh + j) * kh + c * K_C_PRIME) % 16 == 0, "B' ptr")
+                        need((off["RB"] + ((l * b + lam) * nh + j) * kh + c * K_C_PRIME) % A == 0, "B' ptr")
             for l in sorted({0, N - 1}):
                 for i in rows_a:
                     need((off["W"] + ((l * b + lam) * m + i) * nh) % 16 == 0, "W ptr")
@@ -1831,6 +2159,8 @@ def build_json():
         "K_c": S(K_C), "K_c_prime": S(K_C_PRIME), "F": S(F_BITS),
         "term_max": S(TERM_MAX), "gamma_range": [S(GAMMA_MIN), S(GAMMA_MAX)],
         "region_align": S(REGION_ALIGN), "k_align": S(K_ALIGN), "n_align": S(N_ALIGN),
+        "k_chunk_align": S(K_CHUNK_ALIGN),
+        "k_align_pad": S(K_ALIGN_PAD), "k_pad64_min": S(K_PAD64_MIN),
         "workspace_regions": [r[0] for r in _REGIONS],
         "pow2_mod": {S(p): [S(t) for t in pow2_table(p, emax)] for p in REAL_MODULI},
         "epilogue_note": ("v = W + acc in [v_min, v_max]; p = 256: v & 255; else n = v + bias "
@@ -1907,9 +2237,14 @@ def build_header():
     w(f"inline constexpr int kMaxLimbs = {max_limbs};          // L32 at N = kNMax")
     w(f"inline constexpr int kF = {F_BITS};                  // §3.2 fraction bits of S")
     w(f"inline constexpr int64_t kKc = {K_C};          // §2 max exact K-chunk (.satfinite)")
-    w(f"inline constexpr int64_t kKcPrime = {K_C_PRIME};     // §2/§3.5 chunk length used")
+    w(f"inline constexpr int64_t kKcPrime = {K_C_PRIME};     // §3.5 chunk length used, floor(K_c/64)*64")
+    w(f"inline constexpr int kKChunkAlign = {K_CHUNK_ALIGN};       // v1.13 §4b K_c' multiple (K4 K tile)")
     w(f"inline constexpr int kRegionAlign = {REGION_ALIGN};       // §4a align(x) = ceil(x)_256")
-    w(f"inline constexpr int kKAlign = {K_ALIGN};            // §4 k_hat = ceil(k)_16")
+    w(f"inline constexpr int kKAlign = {K_ALIGN};            // §4 k_hat = ceil(k)_A: A = 16 ...")
+    w(f"inline constexpr int kKAlignPad = {K_ALIGN_PAD};         // v1.13 §4b ... or 64 (AUTO: k > kKPad64Min)")
+    w(f"inline constexpr int64_t kKPad64Min = {K_PAD64_MIN};     // v1.13 §4b AUTO(k) = 64 iff k > 96")
+    w(f"inline constexpr int kPackFormatA16 = {PACK_FORMAT_A16};      // §6b.4 format 1: k_hat = ceil(k)_16")
+    w(f"inline constexpr int kPackFormatA64 = {PACK_FORMAT_A64};      // v1.13 §4b format 2: k_hat = ceil(k)_64")
     w(f"inline constexpr int kNAlign = {N_ALIGN};            // §4 n_hat = ceil(n)_16")
     w(f"inline constexpr int kGammaMin = {GAMMA_MIN};       // §3.2 ilogb range, finite nonzero FP64")
     w(f"inline constexpr int kGammaMax = {GAMMA_MAX};")

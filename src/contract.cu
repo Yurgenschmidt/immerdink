@@ -1002,6 +1002,8 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   a.R[0] = region<int8_t>(ws, p, Region::RA), a.R[1] = region<int8_t>(ws, p, Region::RB);
   a.b = p.b, a.k = p.k, a.k_hat = p.k_hat;
   const int lg_tk = kf_lg_tk(p.k_hat);  // k_hat <= kKfKMax: lg_tk <= 10
+  // v1.13 §4b.5: one tile row covers the whole padded row (KF writes the zeros [k, k_hat)).
+  if ((int64_t{1} << lg_tk) < p.k_hat) return IMD_STATUS_INVALID_VALUE;  // unreachable
   a.lg_tk = lg_tk;
   a.gsize = std::min(p.g, p.N);
   a.trunc = p.trunc ? 1 : 0;
@@ -1447,7 +1449,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
     const int gsize = std::min(p.g, p.N - g0);
     if (use_kf && g0 == 0) {  // group 1 was packed by KF
       if (const imd_status_t st = k4_group(*p.k4, operand(0, g0), operand(1, g0), W, g0, gsize,
-                                           stream, batch[0], batch[1]);
+                                           stream, batch[0], batch[1], p.k_align);
           st != IMD_STATUS_SUCCESS)
         return st;
       continue;
@@ -1477,7 +1479,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
     }
     if (cudaPeekAtLastError() != cudaSuccess) return IMD_STATUS_CUDA_ERROR;
     if (const imd_status_t st = k4_group(*p.k4, operand(0, g0), operand(1, g0), W, g0, gsize,
-                                         stream, batch[0], batch[1]);
+                                         stream, batch[0], batch[1], p.k_align);
         st != IMD_STATUS_SUCCESS)
       return st;
   }

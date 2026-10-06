@@ -8,6 +8,9 @@
 
 #include "immerdink/immerdink_host.h"
 
+/* libimmerdink_host's test-only K-alignment hook (DESIGN v1.13 §4b.5; not in a header). */
+int imd_test_set_k_align(int32_t a);
+
 static double dabs(double x) { return x < 0 ? -x : x; }
 
 #ifdef CUDART_VERSION
@@ -35,7 +38,9 @@ int main(void) {
   const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT, IMD_K4_TUNE_OFF};
 
   CHECK(imd_host_api_version() == IMD_HOST_API_VERSION);
-  CHECK(sizeof(imd_lowering_t) == 184 && IMD_HOST_API_VERSION >= 5);
+  CHECK(sizeof(imd_lowering_t) == 192 && IMD_HOST_API_VERSION >= 9);
+  CHECK(offsetof(imd_lowering_t, k_align) == 184 && offsetof(imd_lowering_t, reserved6) == 188);
+  CHECK(IMD_PACK_FORMAT_A16 == 1 && IMD_PACK_FORMAT_A64 == 2 && IMD_PACK_FORMAT == 2);
   CHECK(sizeof(imd_options_t) == 24);
   CHECK(sizeof(imd_pack_desc_t) == 72 && sizeof(imd_pack_layout_t) == 136);
 
@@ -98,6 +103,8 @@ int main(void) {
   CHECK(lw.fused == 1 && lw.reserved == 0 && lw.kernel_launches == 19);
   /* v4: KF, so no KL. */
   CHECK(lw.fused_large == 0 && lw.reserved4 == 0);
+  /* v6 (DESIGN v1.13 §4b): k = 5 <= 96: A = 16 (k_hat 16 above) */
+  CHECK(lw.k_align == 16 && lw.reserved6 == 0);
 
   /* v3: sm_count 0 -> the reference 128 SMs; a configuration of the table; the autotuning
    * scratch of group 1 (g = 2, b = 3): RA 2*3*17*16 = 1632, RB 2*3*48*16 = 4608, W
@@ -130,6 +137,14 @@ int main(void) {
     CHECK(imd_lowering(&A, &B, &C, &tune, &l2) == IMD_STATUS_SUCCESS);
     CHECK(l2.k4_config == lw.k4_config && l2.k4_tune_bytes == 11520 && l2.plan_host_bytes == host);
   }
+
+  /* A version-5 caller (struct_size 184) gets the v5 fields; the v6 tail is untouched. */
+  lw.k_align = -5;
+  lw.reserved6 = -5;
+  lw.struct_size = 184;
+  CHECK(imd_lowering(&A, &B, &C, &opt, &lw) == IMD_STATUS_SUCCESS);
+  CHECK(lw.m == 17 && lw.k_hat == 16 && lw.pack_mismatch == 0 && lw.k_align == -5 &&
+        lw.reserved6 == -5);
 
   /* A version-3 caller (struct_size 168) gets the v3 fields; the v4 tail is untouched. */
   lw.fused_large = -5;
@@ -182,8 +197,10 @@ int main(void) {
      * K5 (group 1's packs are KL's; n_hat = n: no zero rows). */
     CHECK(lw.fused == 0 && lw.fused_large == (IMD_FUSED_LARGE_A | IMD_FUSED_LARGE_B));
     CHECK(lw.kernel_launches == 5);
-    /* v3 fields are valid with lowered = 1, as k_chunks: 259200 + 1036800 + 128, aligned. */
-    CHECK(lw.k4_tune_bytes == 259328 + 1036800 + 256 && lw.sm_count == 128);
+    /* v1.13 §4b: k = 32400 > 96 (= 16 mod 64): A = 64, k_hat 32448. v3 fields are valid with
+     * lowered = 1, as k_chunks: 2*4*32448 + 2*16*32448 + 2*4*16, each 256-aligned. */
+    CHECK(lw.k_align == 64 && lw.k_hat == 32448);
+    CHECK(lw.k4_tune_bytes == 259584 + 1038336 + 256 && lw.sm_count == 128);
   }
 
   /* Illegal descriptors: the §5 status, lowered = 0. */
@@ -198,6 +215,98 @@ int main(void) {
   }
 
   CHECK(strcmp(imd_status_string(IMD_STATUS_NOT_SUPPORTED), "IMD_STATUS_NOT_SUPPORTED") == 0);
+
+  /* v1.13 §4b.4 hand-computed A = 64 examples (spec/params.py cert_workspace /
+   * cert_pack_layout). (m, n, k, b, N, g) = (1000, 3, 200, 2, 20, 7), AUTO: k_hat = 256; RA
+   * 3584000 at 26112, RB 57344 at 3610112, W 640000 at 3667456; total 4307456. */
+  {
+    const int64_t ea[3] = {1000, 200, 2}, sa[3] = {400, 2, 1};
+    const int64_t eb[3] = {200, 3, 2}, sb[3] = {6, 2, 1};
+    const int64_t ec[3] = {1000, 3, 2}, sc[3] = {6, 2, 1};
+    const imd_tensor_t a = {3, ea, sa, lA}, b = {3, eb, sb, lB}, c = {3, ec, sc, lC};
+    const imd_options_t o = {20, 7, IMD_TRUNC, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    imd_region_t r8[IMD_REGION_COUNT];
+    int32_t n8 = 0;
+    size_t t8 = 0;
+    CHECK(imd_workspace_size(&a, &b, &c, &o, &bytes) == IMD_STATUS_SUCCESS && bytes == 4307456);
+    CHECK(imd_workspace_layout(&a, &b, &c, &o, r8, IMD_REGION_COUNT, &n8, &t8) == 0 &&
+          t8 == 4307456);
+    CHECK(r8[IMD_REGION_RA].offset == 26112 && r8[IMD_REGION_RA].bytes == 3584000 &&
+          r8[IMD_REGION_RB].offset == 3610112 && r8[IMD_REGION_RB].bytes == 57344 &&
+          r8[IMD_REGION_W].offset == 3667456 && r8[IMD_REGION_W].bytes == 640000);
+    memset(&lw, 0, sizeof lw);
+    lw.struct_size = sizeof lw;
+    CHECK(imd_lowering(&a, &b, &c, &o, &lw) == IMD_STATUS_SUCCESS);
+    CHECK(lw.k == 200 && lw.k_hat == 256 && lw.k_align == 64 && lw.fused == 1);
+    /* DIRECT: no residue rows, A = 16 whatever k */
+    const imd_options_t d = {20, 7, IMD_TRUNC, IMD_DIRECT, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    memset(&lw, 0, sizeof lw);
+    lw.struct_size = sizeof lw;
+    CHECK(imd_lowering(&a, &b, &c, &d, &lw) == IMD_STATUS_SUCCESS);
+    CHECK(lw.dispatch == IMD_DISPATCH_DIRECT && lw.k_align == 16 && lw.k_hat == 208);
+  }
+  /* pack (b, r, k, N) = (1, 1, 1000, 14), AUTO: format 2, k_hat 1024, res 14*1024 + 15*1024 =
+   * 29696 at 512; total 30208. */
+  {
+    const int64_t ex[1] = {1000}, sx[1] = {1};
+    const int32_t lx[1] = {3}, kx[1] = {3};
+    const imd_tensor_t x = {1, ex, sx, lx};
+    imd_pack_desc_t d;
+    imd_pack_layout_t pl;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d;
+    d.num_moduli = 14, d.rounding = IMD_TRUNC, d.order = IMD_PACK_ORDER_AUTO, d.tensor = &x;
+    d.num_contracted = 1, d.contracted = kx;
+    memset(&pl, 0, sizeof pl);
+    pl.struct_size = sizeof pl;
+    CHECK(imd_pack_layout(&d, &pl) == IMD_STATUS_SUCCESS);
+    CHECK(pl.format == IMD_PACK_FORMAT_A64 && pl.k_hat == 1024 && pl.res.offset == 512 &&
+          pl.res.bytes == 29696 && pl.pack_bytes == 30208);
+  }
+  /* The test hook forces A (16 or 64; 0 = AUTO; anything else: 1, nothing changed). */
+  CHECK(imd_test_set_k_align(32) == 1 && imd_test_set_k_align(64) == 0);
+  {
+    /* (17, 33, 5, 3, 9, 2) at A = 64: k_hat 64; RA 6528 at 2048, RB 18432 at 8704, W 22032 at
+     * 27136; total 49408 (A = 16: 30720). KF's tile becomes tk = 64. */
+    imd_region_t r8[IMD_REGION_COUNT];
+    int32_t n8 = 0;
+    size_t t8 = 0;
+    CHECK(imd_workspace_size(&A, &B, &C, &opt, &bytes) == IMD_STATUS_SUCCESS && bytes == 49408);
+    CHECK(imd_workspace_layout(&A, &B, &C, &opt, r8, IMD_REGION_COUNT, &n8, &t8) == 0 &&
+          r8[IMD_REGION_RA].offset == 2048 && r8[IMD_REGION_RA].bytes == 6528 &&
+          r8[IMD_REGION_RB].offset == 8704 && r8[IMD_REGION_RB].bytes == 18432 &&
+          r8[IMD_REGION_W].offset == 27136 && r8[IMD_REGION_W].bytes == 22032);
+    memset(&lw, 0, sizeof lw);
+    lw.struct_size = sizeof lw;
+    CHECK(imd_lowering(&A, &B, &C, &opt, &lw) == IMD_STATUS_SUCCESS);
+    CHECK(lw.k_align == 64 && lw.k_hat == 64 && lw.fused == 1 && lw.kappa == 3);
+    /* pack (3, 17, 5, 9) forced to format 2: res 29376 + 960 = 30336; total 30976 */
+    imd_pack_desc_t pa;
+    imd_pack_layout_t pl;
+    int32_t la[8];
+    memset(&pa, 0, sizeof pa);
+    pa.struct_size = sizeof pa;
+    CHECK(imd_pack_desc_for(&A, &B, &C, &opt, 0, &pa, la, 8) == IMD_STATUS_SUCCESS);
+    memset(&pl, 0, sizeof pl);
+    pl.struct_size = sizeof pl;
+    CHECK(imd_pack_layout(&pa, &pl) == IMD_STATUS_SUCCESS);
+    CHECK(pl.format == IMD_PACK_FORMAT_A64 && pl.k_hat == 64 && pl.res.bytes == 30336 &&
+          pl.pack_bytes == 30976);
+  }
+  CHECK(imd_test_set_k_align(16) == 0);
+  {
+    /* forced 16 at k = 200: k_hat 208 */
+    const int64_t ea[2] = {4, 200}, sa[2] = {200, 1}, eb[2] = {200, 16}, sb[2] = {1, 200};
+    const int64_t ec[2] = {4, 16}, sc[2] = {16, 1};
+    const int32_t la[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
+    const imd_tensor_t a = {2, ea, sa, la}, b = {2, eb, sb, lb}, c = {2, ec, sc, lc};
+    memset(&lw, 0, sizeof lw);
+    lw.struct_size = sizeof lw;
+    CHECK(imd_lowering(&a, &b, &c, &opt, &lw) == IMD_STATUS_SUCCESS);
+    CHECK(lw.k_align == 16 && lw.k_hat == 208);
+  }
+  CHECK(imd_test_set_k_align(0) == 0);
+  CHECK(imd_workspace_size(&A, &B, &C, &opt, &bytes) == IMD_STATUS_SUCCESS && bytes == 30720);
 
   /* v1.7 (DESIGN §6b): packed operands of the same contraction. No swap (C's fastest label
    * l is a batch label): A is the GEMM's A with K = {k}, L = {l}, R = {i}; B: K, L, R = {j}. */
@@ -222,7 +331,7 @@ int main(void) {
     memset(&pl, 0, sizeof pl);
     pl.struct_size = sizeof pl;
     CHECK(imd_pack_layout(&pa, &pl) == IMD_STATUS_SUCCESS && pl.status == IMD_STATUS_SUCCESS);
-    CHECK(pl.format == IMD_PACK_FORMAT && pl.num_moduli == 9 && pl.rounding == IMD_RN);
+    CHECK(pl.format == IMD_PACK_FORMAT_A16 && pl.num_moduli == 9 && pl.rounding == IMD_RN);
     CHECK(pl.b == 3 && pl.r == 17 && pl.k == 5 && pl.k_hat == 16 && pl.kappa == 3);
     CHECK(pl.sig.offset == 0 && pl.sig.bytes == 102 && pl.flag.offset == 256 &&
           pl.flag.bytes == 51 && pl.res.offset == 512 && pl.res.bytes == 7584);

@@ -196,7 +196,9 @@ So saturation never triggers, and `acc_c = Σ_{h∈C_c} r_h s_h` exactly. ∎
 
 **Claim L4c (int32 epilogue).** This is a separate numeric fact, not a consequence of
 `Q·K ≤ A_max`; it needs `(p − 1) + Q·K ≤ 2³¹ − 1`. `W_{c−1} + acc_c ∈ [−Q·K, (p − 1) + Q·K] ⊆ int32`. For
-`Q = 128²` and `K = 131056` the maximum is 2147221759, which is ≤ 2³¹ − 1. ∎
+`Q = 128²` and the chunk length `K = 131008` used since DESIGN v1.13, the maximum is
+2146435327, which is ≤ 2³¹ − 1. (With the earlier `K = 131056` it was 2147221759. The bound
+is monotone in K, and Lean's `epi_input_int32` is stated for chunks of length ≤ 131056.) ∎
 
 The hypothesis `Q·K ≤ A_max` must hold for **every** order (a bound on `Σ|products|`), not
 just for the final sum. `spec: OzakiCRT neg_order` shows a data-sized chunk failing under

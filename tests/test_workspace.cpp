@@ -13,6 +13,7 @@
 
 #include "immerdink/immerdink_host.h"
 #include "index_map.hpp"
+#include "k_hat.hpp"
 #include "workspace.hpp"
 
 namespace {
@@ -127,7 +128,8 @@ void check(const Case& c) {
   const int g = c.opts.residue_group == 0 ? c.opts.num_moduli : c.opts.residue_group;
   const auto L = imd::detail::workspace_layout(
       {lw.m, lw.n, lw.k, lw.b, c.opts.num_moduli, g, c.opts.mode == IMD_DIRECT,
-       c.opts.vec_mode == IMD_VEC_RESIDENT});
+       c.opts.vec_mode == IMD_VEC_RESIDENT, 0,
+       imd::detail::k_align_auto(lw.k)});  // v1.13 §4b: the vectors are params.py's AUTO
   if (!L) return fail(c, "layout overflow");
   std::vector<Region> got;
   for (int r = 0; r < 8; ++r)

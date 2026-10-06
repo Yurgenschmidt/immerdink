@@ -169,7 +169,7 @@ def matrix(m, n, k, b):
 
 def grid():
     ms = [0, 1, 15, 16, 17, 100, 257]
-    ks = [0, 1, 2, 15, 16, 17, 131056, 131057, 262200]
+    ks = [0, 1, 2, 15, 16, 17, 131008, 131009, 131056, 131057, 262200]
     for N, g in ((2, 1), (2, 2), (9, 2), (14, 0), (14, 7), (20, 20)):
         for mode in (EMULATE, DIRECT):
             for vec in (VEC_GENERATE, VEC_RESIDENT):
@@ -179,6 +179,20 @@ def grid():
                             for b in (0, 1, 3):
                                 add(f"grid_m{m}_n{n}_k{k}_b{b}_N{N}_g{g}_mode{mode}_vec{vec}",
                                     *matrix(m, n, k, b), N=N, g=g, mode=mode, vec=vec)
+
+
+def k_align_boundary():
+    """DESIGN v1.13 §4b stage 2: the boundary k of the AUTO rule (A = 64 iff k > 96) and of
+    the K-chunking, at params.py's policy (K_ALIGN_POLICY = "AUTO", the library's default)."""
+    ks = [1, 16, 17, 64, 65, 95, 96, 97, 112, 113, 128, 129, 144, 145, 1023, 1024, 1025, 1040,
+          4080, 131008, 131009, 131072, 196608, 196624, 262017, 392961, 393008, 393009]
+    for k in ks:
+        for (m, n) in ((17, 33), (100, 1), (1, 257)):
+            for b in (1, 3):
+                for N, g in ((9, 2), (14, 0)):
+                    for mode in (EMULATE, DIRECT):
+                        add(f"kalign_m{m}_n{n}_k{k}_b{b}_N{N}_g{g}_mode{mode}",
+                            *matrix(m, n, k, b), N=N, g=g, mode=mode, vec=VEC_GENERATE)
 
 
 def tensors():
@@ -397,6 +411,7 @@ if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     grid()
+    k_align_boundary()
     tensors()
     random_cases(3000)
     g_sweep(150)

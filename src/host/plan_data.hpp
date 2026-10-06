@@ -44,6 +44,11 @@ struct ExecPlan {
   int64_t m = 0, n = 0, k = 0, b = 0, k_hat = 0, n_hat = 0;  // post-swap GEMM view
   int N = 0, g = 0;      // number of moduli, residue group size in [1, N]
   bool trunc = false;    // rounding = TRUNC
+  // v1.13 §4b: the plan's K alignment A (16 or 64), resolved once by libimmerdink_host
+  // (analysis.hpp Analysis::k_align; plan_data), k_hat = ceil(k)_A. Here, not in K4Plan:
+  // sizeof(K4Plan) is kK4PlanBytes (plan host bytes). libimmerdink never resolves A itself.
+  // (In the padding after trunc: sizeof(ExecPlan) is unchanged.)
+  int32_t k_align = 16;
   WorkspaceLayout layout;
 
   // K2 / K3 gather tiling (index_map.hpp pack_pivot), for the GEMM's A and B operands.

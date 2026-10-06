@@ -448,11 +448,17 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     // The K-chunk kinds: full chunks with aligned / misaligned rows, then the last chunk.
     // The slow K-chunks (mac_ktail): format 1 (v1.8) took a chunk whose length is not a
     // multiple of the 64-wide K tile (CUTLASS's predicated residue tile); format 2 (v1.10,
-    // NOTES-B2 §6) one whose residue rows start mid-sector: K4 reads chunk c of a row at
-    // row * k_hat + c * K_c' (lda = k_hat, gemm_k4.cu), so the rows are 32-byte aligned iff
-    // k_hat and the chunk offset c * K_c' are multiples of 32 (K_c' = 131056 = 16 mod 32: the
-    // odd chunks are misaligned when k_hat is aligned). That explains k_hat = 1008 / 5008
-    // (slow) and 800 (not slow) alike.
+    // NOTES-B2 §6) one whose rows are misaligned, by the rule "k_hat and the chunk offset
+    // c * K_c' are multiples of 32". The measured mechanism (DESIGN v1.13 §4b, NOTES-K4ALIGN):
+    // CUTLASS loads a chunk's residue tile (kc mod 64) first, so row r's main-loop loads sit at
+    // phase (r k_hat + chunk end) mod 64. Since v1.13 K_c' = 131008 = 0 mod 64: every chunk
+    // end is 0 mod 64 or k_hat, the c * K_c' term is always 0 mod 32, and the format-2 rule
+    // reduces to "slow iff k_hat mod 32 != 0", which is exact for the phase classes 16 / 48
+    // (class 32, +3 % to +19 % measured, is not a separate term). v1.13 stage 2 (§4b.6): an
+    // A = 64 plan (AUTO: k > 96) has k_hat = 0 mod 64 and is never slow; only A = 16 plans
+    // (k <= 96, or forced by the test hook) can be. Calibration format 2 is unchanged; theta was
+    // refit after stage 2 (2026-10-06, NOTES-B2 §8): the A = 16-forced calibration cases at
+    // k > 96 (--k-align 16) keep the slow term determined.
     const int64_t nfull = kc.k_chunks - 1;
     bool last_slow;
     int64_t full_slow;
@@ -467,7 +473,12 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
       for (int64_t c = 0; c < nfull; ++c) full_slow += misaligned(c) ? 1 : 0;
       last_slow = misaligned(nfull);
     }
-    const int64_t ksz[3] = {chunk, chunk, last}, kcnt[3] = {nfull - full_slow, full_slow, 1};
+    // v1.13 §4b.6: the MMA work of a chunk is ceil(kc)_64 (CUTLASS runs its residue tile as a
+    // full zero-filled 64-wide tile), whatever A: the same for A = 16 and A = 64 plans. Only the
+    // byte terms use the padded k_hat.
+    const auto mma_k = [](int64_t len) { return (len + kK4TileK - 1) / kK4TileK * kK4TileK; };
+    const int64_t ksz[3] = {mma_k(chunk), mma_k(chunk), mma_k(last)},
+                  kcnt[3] = {nfull - full_slow, full_slow, 1};
     const bool kslow[3] = {false, true, last_slow};
     double x[kP] = {0, 0, 0, 0, 0, 0};
     const int occ = kK4Configs[cfg].ctas_per_sm;
@@ -492,7 +503,7 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
       const double group = gi * b * (m + nh) * kh + gi * b * m * nh * (2.0 * kc.k_chunks - 1);
       dram += static_cast<double>(gcnt[i]) * std::max(0.0, group - l2);
     }
-    const double k4_ops = 2 * N * b * m * nh * kh;
+    const double k4_ops = 2 * N * b * m * nh * static_cast<double>(nfull * ksz[0] + ksz[2]);
     add_phase(&P, IMD_PERF_PHASE_K4, IMD_PERF_CLASS_K4_128x256 + cfg, kc.launches,
               {x[0], x[1], x[2], x[3], dram, x[kK4TailSlot]}, k4_bytes, k4_ops, 1);
     // K5: the N planes, sigma / tau and the flags read, C written (and read if beta != 0);

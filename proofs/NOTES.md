@@ -118,7 +118,11 @@ a statement that the formalization proves in a more general form.
 7. **L4c's int32 inclusion is a separate numeric fact.** It does not follow from
    `Q·K ≤ A_max`: it needs `(p − 1) + Q·K ≤ 2³¹ − 1`.
    - `design_constants` checks this for `Q = 128²` and `p ≤ 256`. The maximum is
-     2147221759 for `K = 131056`.
+     2147221759 for `K = 131056`, the chunk length before DESIGN v1.13.
+   - Since v1.13 the chunk length is `K_c' = 131008`, with maximum 2146435327
+     (`spec/params.py` cert_kc, `spec/apalache/Epilogue.tla`). The bound is monotone in
+     `K`, so `epi_input_int32` (chunks of length `≤ 131056`) covers it unchanged. The
+     theorem was not re-instantiated at 131008.
    - It also holds for `K = K_c = 131071`.
 
    PROOFS states the concrete numbers, so its claim is correct as written.
