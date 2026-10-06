@@ -404,8 +404,10 @@ int main(void) {
   {
     CHECK(IMD_HOST_API_VERSION >= 7);
     /* v8 sizes (v7: 3672, 1952, 168, 88, 40; v6: 1232, 96, 1648, 128, 64, 24; the older
-     * prefixes are unchanged) */
-    CHECK(sizeof(imd_perf_calib_t) == 3672 && sizeof(imd_perf_phase_t) == 96 &&
+     * prefixes are unchanged); v11: imd_perf_calib_t 3680 (energy_byte_f_pj at 3672) */
+    CHECK(sizeof(imd_perf_calib_t) == 3680 && offsetof(imd_perf_calib_t, energy_byte_f_pj) == 3672 &&
+          IMD_HOST_API_VERSION >= 11);
+    CHECK(sizeof(imd_perf_phase_t) == 96 &&
           sizeof(imd_perf_t) == 1976 && sizeof(imd_perf_candidate_t) == 192 &&
           sizeof(imd_perf_rank_request_t) == 96 && sizeof(imd_perf_request_t) == 48);
     CHECK(offsetof(imd_perf_t, err_bound) == 1952 && offsetof(imd_perf_candidate_t, err_bound) == 168 &&
@@ -442,6 +444,33 @@ int main(void) {
     CHECK(strcmp(back.gpu, cal.gpu) == 0 && strcmp(back.clocks, cal.clocks) == 0);
     CHECK(back.sm_count == cal.sm_count &&
           memcmp(&back.peak_dram_bytes_per_s, &cal.peak_dram_bytes_per_s, 4 * sizeof(double)) == 0);
+    /* host API 11 (DESIGN v1.15 §6c.7): the optional power.byte_f_pj, and the folded view
+     * energy_byte_pj = byte + byte_f of a v7..v10-sized struct (nothing written beyond it) */
+    {
+      static char t2[16600];
+      static imd_perf_calib_t full, v10;
+      const uint32_t v10_size = (uint32_t)offsetof(imd_perf_calib_t, energy_byte_f_pj);
+      CHECK(cal.energy_byte_f_pj == 0 && strstr(text, "power.byte_f_pj") == NULL);
+      const int n2 = snprintf(t2, sizeof t2, "%spower.byte_f_pj = 7.5\n", text);
+      full.struct_size = sizeof full;
+      CHECK(imd_perf_calib_parse(t2, (size_t)n2, &full, &line) == IMD_STATUS_SUCCESS &&
+            full.energy_byte_f_pj == 7.5 && full.energy_byte_pj == cal.energy_byte_pj);
+      memset(&v10, 0x5a, sizeof v10);
+      v10.struct_size = v10_size;
+      CHECK(imd_perf_calib_parse(t2, (size_t)n2, &v10, &line) == IMD_STATUS_SUCCESS &&
+            v10.struct_size == v10_size && v10.energy_byte_pj == cal.energy_byte_pj + 7.5);
+      const unsigned char* tail = (const unsigned char*)&v10.energy_byte_f_pj;
+      for (size_t i = 0; i < sizeof v10.energy_byte_f_pj; ++i) CHECK(tail[i] == 0x5a);
+      memset(&v10, 0x5a, sizeof v10);
+      v10.struct_size = v10_size;
+      CHECK(imd_perf_calib_default(&v10) == IMD_STATUS_SUCCESS &&
+            v10.energy_byte_pj == cal.energy_byte_pj && tail[0] == 0x5a);
+      /* format: the key only when non-zero; round trip */
+      static char t3[16600];
+      size_t len3 = 0;
+      CHECK(imd_perf_calib_format(&full, t3, sizeof t3, &len3) == IMD_STATUS_SUCCESS &&
+            strstr(t3, "\npower.byte_f_pj = 7.5\n") != NULL);
+    }
     /* parse errors, with their lines */
     {
       static char bad[16600];

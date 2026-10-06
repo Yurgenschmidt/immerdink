@@ -30,7 +30,9 @@ probe, else gpu_after) in the REPEAT cache state, and the clock-bound features a
 reference clock (the median NVML clock of the calls < 1 ms; with --clock-normalize); the chain features
 are fitted like the others (--no-chain drops them, --kernel kf4=4 overrides an occupancy for an
 A/B). Method-sustained records fit the power model (NNLS on the windows' mean power, a scan of
-gamma; a leave-one-case-out check is printed), method-pair records the cache term (L_w scan,
+gamma; a leave-one-case-out check is printed; v1.15 §6c.7: by default the clock-scaled form,
+power.byte_f_pj fitted with power.byte_pj held at --byte-pj, gamma 1; --power-form unscaled is
+the v1.10 fit), method-pair records the cache term (L_w scan,
 Delta by least squares; Delta = 0 when the measured effect is below 3 %). --format1 writes a v1.8
 file. Bands are added by bench/perf_validate.py --bands from the hold-out set.
 
@@ -594,40 +596,60 @@ def sustained_rows(records, cal, lib=None):
     return out
 
 
-def fit_power(rows, fref, gammas=(1.0, 2.0, 3.0), idle=60.0):
-    """P = idle + ((e_tc tc + e_alu alu) (f / fref)^gamma + e_byte D) 1e-12 / t over the
-    sustained windows at their measured clock f, time t and power P: NNLS of P - idle on the
-    three energies (relative error), the gamma of the smallest error. The awake idle is held
-    fixed (`idle`): with most windows pinned at the cap, a free intercept absorbs the power
-    (it fitted 366 W on the post-BIOS data). Returns the power.* keys (cap = the records'
-    enforced limit, clock_min = 0.8 x the lowest measured)."""
+POWER_FORMS = ("scaled", "unscaled")
+
+
+def fit_power(rows, fref, gammas=None, idle=60.0, form="scaled", byte_pj=0.0):
+    """The power model over the sustained windows at their measured clock f, time t and power
+    P (NNLS of P - idle, relative in the dynamic power; the gamma of the smallest power error).
+    The awake idle is held fixed (`idle`): with most windows pinned at the cap, a free
+    intercept absorbs the power (it fitted 366 W on the post-BIOS data).
+      form "scaled" (v1.15, DESIGN §6c.7, the default): P = idle + ((e_tc tc + e_alu alu +
+        e_byte^f D) (f / fref)^gamma + e_byte D) 1e-12 / t with e_byte held fixed at `byte_pj`
+        (the two byte columns are collinear on the windows: 0, or a stated prior); fitted
+        e_tc, e_alu, e_byte^f; gammas default (1,).
+      form "unscaled" (v1.10): P = idle + ((e_tc tc + e_alu alu) (f / fref)^gamma + e_byte D)
+        1e-12 / t; fitted e_tc, e_alu, e_byte; gammas default (1, 2, 3).
+    Returns the power.* keys (cap = the records' enforced limit, clock_min = 0.8 x the lowest
+    measured; power.byte_f_pj only for the scaled form)."""
+    if form not in POWER_FORMS:
+        raise ValueError(f"power form {form!r}: one of {POWER_FORMS}")
+    scaled = form == "scaled"
+    if gammas is None:
+        gammas = (1.0,) if scaled else (1.0, 2.0, 3.0)
     best = None
     P = np.array([r["P"] for r in rows])
+    fixed = np.array([byte_pj * r["D"] * 1e-12 / r["t"] for r in rows]) if scaled else 0.0
     for gm in gammas:
         X = np.array([[r["tc"] * (r["f"] / fref) ** gm * 1e-12 / r["t"],
-                       r["alu"] * (r["f"] / fref) ** gm * 1e-12 / r["t"], r["D"] * 1e-12 / r["t"]]
+                       r["alu"] * (r["f"] / fref) ** gm * 1e-12 / r["t"],
+                       r["D"] * ((r["f"] / fref) ** gm if scaled else 1.0) * 1e-12 / r["t"]]
                       for r in rows])
-        th = nnls_relative(X, np.maximum(P - idle, 1e-3))  # relative in the dynamic power
-        err = float(np.sum(((idle + X @ th - P) / P) ** 2))
+        th = nnls_relative(X, np.maximum(P - idle - fixed, 1e-3))  # relative in the dynamic power
+        err = float(np.sum(((idle + fixed + X @ th - P) / P) ** 2))
         if best is None or err < best[0]:
             best = (err, gm, th)
     _, gm, th = best
-    return {"power.clock_eff_mhz": fref, "power.clock_min_mhz": 0.8 * min(r["f"] for r in rows),
-            "power.cap_w": float(np.median([r["cap"] for r in rows])), "power.idle_w": float(idle),
-            "power.tc_pj": float(th[0]), "power.alu_pj": float(th[1]), "power.byte_pj": float(th[2]),
-            "power.gamma": gm}
+    out = {"power.clock_eff_mhz": fref, "power.clock_min_mhz": 0.8 * min(r["f"] for r in rows),
+           "power.cap_w": float(np.median([r["cap"] for r in rows])), "power.idle_w": float(idle),
+           "power.tc_pj": float(th[0]), "power.alu_pj": float(th[1]),
+           "power.byte_pj": float(byte_pj) if scaled else float(th[2]), "power.gamma": gm}
+    if scaled:
+        out["power.byte_f_pj"] = float(th[2])
+    return out
 
 
-def power_validation(rows, meta, params, extra, fref, lib=None, verbose=True, idle=60.0):
-    """Leave-one-case-out: the power model fitted without the window's case, then the window's
-    SUSTAINED prediction (time, clock) against the measured. Returns [(label, t meas, t pred,
-    f meas, f pred, P meas, P pred)]."""
+def power_validation(rows, meta, params, extra, fref, lib=None, verbose=True, idle=60.0,
+                     **power_kw):
+    """Leave-one-case-out: the power model fitted without the window's case (fit_power with
+    power_kw: form, byte_pj, gammas), then the window's SUSTAINED prediction (time, clock)
+    against the measured. Returns [(label, t meas, t pred, f meas, f pred, P meas, P pred)]."""
     out = []
     for case in sorted({r["case"] for r in rows}):
         train = [r for r in rows if r["case"] != case]
         if len(train) < 4:
             continue
-        pw = fit_power(train, fref, idle=idle)
+        pw = fit_power(train, fref, idle=idle, **power_kw)
         cal = host.Calibration.from_values(meta, params, lib, dict(extra, **pw))
         for r in rows:
             if r["case"] != case:
@@ -739,6 +761,17 @@ def main(argv=None):
                     help="awake-idle board power held fixed in the power fit (W; the 4090: about "
                          "60 W, evaluation workspace findings/energy-20261004.md)")
     ap.add_argument("--clock-ref", type=float, default=None, help="reference SM clock (MHz)")
+    # v1.15 (DESIGN §6c.7)
+    ap.add_argument("--power-form", choices=POWER_FORMS, default="scaled",
+                    help="power model: 'scaled' (v1.15 default: clock-scaled byte energy "
+                         "power.byte_f_pj fitted, power.byte_pj held at --byte-pj) or "
+                         "'unscaled' (the v1.10 fit of power.byte_pj, no byte_f key)")
+    ap.add_argument("--byte-pj", type=float, default=0.0,
+                    help="scaled form: the fixed unscaled byte energy (pJ per DRAM byte; 0, or "
+                         "a stated prior), written as power.byte_pj")
+    ap.add_argument("--power-gammas", default=None,
+                    help="comma-separated gammas scanned by the power residual (default: 1 for "
+                         "the scaled form, 1,2,3 for the unscaled form)")
     ap.add_argument("--no-chain", action="store_true",
                     help="drop the v1.10 chain features of K0, KL, PACK, K5, DIRECT, BETA")
     ap.add_argument("--kernel", action="append", default=[], metavar="NAME=R",
@@ -760,6 +793,13 @@ def main(argv=None):
         ap.error("records and -o/--out are required (or --check FILE...)")
     if a.format1:
         a.no_clock = a.no_chain = True
+    if a.byte_pj < 0 or not math.isfinite(a.byte_pj):
+        ap.error("--byte-pj must be a finite number >= 0")
+    if a.byte_pj != 0 and a.power_form != "scaled":
+        ap.error("--byte-pj is the scaled form's fixed term")
+    power_kw = dict(form=a.power_form, byte_pj=a.byte_pj,
+                    gammas=tuple(float(x) for x in a.power_gammas.split(","))
+                    if a.power_gammas else None)
     USE_RECORD_CLOCK = a.clock_normalize and not a.no_clock
     records = []
     for f in a.records:
@@ -863,15 +903,17 @@ def main(argv=None):
             best = None
             for fr in [fref - 25 * i for i in range(0, 17)]:
                 out = power_validation(rows, meta, params, extra, fr, a.lib, verbose=False,
-                                       idle=a.idle_w)
+                                       idle=a.idle_w, **power_kw)
                 err = float(np.median([abs(tp - tm) / tm for _, tm, tp, *_ in out]))
                 print(f"  time-model clock {fr:.0f} MHz: sustained LOO median |err| {100 * err:.2f} %")
                 if best is None or err < best[0] - 1e-12:
                     best = (err, fr)
             fr = best[1] if a.clock_ref is None else fref
-            pw = fit_power(rows, fr, idle=a.idle_w)
-            print("power model: " + ", ".join(f"{k} {v:.4g}" for k, v in pw.items()))
-            power_validation(rows, meta, params, extra, fr, a.lib, idle=a.idle_w)
+            pw = fit_power(rows, fr, idle=a.idle_w, **power_kw)
+            print(f"power model ({a.power_form} form" +
+                  (f", power.byte_pj held at {a.byte_pj:g} pJ/B" if a.power_form == "scaled" else "")
+                  + "): " + ", ".join(f"{k} {v:.4g}" for k, v in pw.items()))
+            power_validation(rows, meta, params, extra, fr, a.lib, idle=a.idle_w, **power_kw)
             extra.update(pw)
     meta["notes"] = a.notes or fit_text(  # --notes "" (like no --notes): the generated notes
         f"fit on {len(samples)} calls ({len(ok)} records) by bench/perf_fit.py", "notes")
