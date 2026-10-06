@@ -300,6 +300,7 @@ unsigned k1_blocks(int64_t work_items, double bytes_per_block, int sms) {
 struct PackArgs {
   Operand op;
   int64_t rows_pad, b, k, k_hat;  // rows_pad = m (A) or n_hat (B)
+  int64_t k_store;                // k-bar < k_store are stored: k_hat (pad_mutation: test only)
   const int16_t* sigma;           // [lambda][rows] = [rho]
   int g0, gsize;
   bool trunc;
@@ -424,7 +425,7 @@ __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
     __syncthreads();
     // 3. convert and store 16 K-contiguous int8 per modulus
     const int dl = tid >> (lg_tk - 4), hl = (tid & ((tk >> 4) - 1)) * kVec;
-    if (s_valid[dl] && h0 + hl < a.k_hat) {  // k_hat is a multiple of 16
+    if (s_valid[dl] && h0 + hl < a.k_store) {  // k_store = k_hat, a multiple of 16
       uint64_t bits[kVec];
       const uint64_t* src = tile + dl * pitch + hl + hl / kVec;
 #pragma unroll
@@ -1001,9 +1002,9 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   a.flag[0] = region<uint8_t>(ws, p, Region::fA), a.flag[1] = region<uint8_t>(ws, p, Region::fB);
   a.R[0] = region<int8_t>(ws, p, Region::RA), a.R[1] = region<int8_t>(ws, p, Region::RB);
   a.b = p.b, a.k = p.k, a.k_hat = p.k_hat;
-  const int lg_tk = kf_lg_tk(p.k_hat);  // k_hat <= kKfKMax: lg_tk <= 10
-  // v1.13 §4b.5: one tile row covers the whole padded row (KF writes the zeros [k, k_hat)).
-  if ((int64_t{1} << lg_tk) < p.k_hat) return IMD_STATUS_INVALID_VALUE;  // unreachable
+  // k_hat <= kKfKMax: lg_tk <= 10. v1.13 §4b.5: one tile row covers the whole padded row (KF
+  // writes the zeros [k, k_hat)); plan_data checks this at plan time.
+  const int lg_tk = kf_lg_tk(p.k_hat);
   a.lg_tk = lg_tk;
   a.gsize = std::min(p.g, p.N);
   a.trunc = p.trunc ? 1 : 0;
@@ -1339,6 +1340,11 @@ int& k5_elems_override() {
   return v;
 }
 
+int& pad_mutation() {
+  static int v = -1;  // only the test hook imd_test_set_pad_mutation changes it
+  return v;
+}
+
 imd_status_t k0_generate(const ExecPlan& p, int64_t* vec, cudaStream_t stream) {
   if (p.vec_count == 0) return IMD_STATUS_SUCCESS;
   if (p.vec_desc.modes.size() <= static_cast<size_t>(kK0SmallModes))
@@ -1348,10 +1354,53 @@ imd_status_t k0_generate(const ExecPlan& p, int64_t* vec, cudaStream_t stream) {
   return IMD_STATUS_CUDA_ERROR;  // unreachable: at most 4 * 62 fused modes
 }
 
+namespace {
+
+// The K4 operands of an emulated call: RA / RB (the workspace's slots, or v1.7 a packed
+// operand's residue planes), the W planes, the K4 batch strides (0: the workspace's; a
+// packed operand's r k_hat, §6b.4: the B role reads blocks at the pack's stride) and the
+// offset per modulus of a residue group's first plane (a packed operand: b batch; the
+// workspace's slots: 0, every group reuses them). enqueue_contract's launches and its
+// pointer-check pre-pass (k4_check_call) both use this one computation.
+struct K4Operands {
+  int8_t* R[2] = {nullptr, nullptr};
+  uint8_t* W = nullptr;
+  int64_t batch[2] = {0, 0};
+  int64_t group[2] = {0, 0};
+};
+K4Operands k4_operands(const ExecPlan& p, void* ws, const void* const* packed) {
+  K4Operands o;
+  o.R[0] = region<int8_t>(ws, p, Region::RA);
+  o.R[1] = region<int8_t>(ws, p, Region::RB);
+  o.W = region<uint8_t>(ws, p, Region::W);
+  for (int x = 0; x < 2; ++x) {
+    if (!(p.packed & (1 << x))) continue;
+    auto* base = static_cast<unsigned char*>(const_cast<void*>(packed[x]));
+    o.R[x] = reinterpret_cast<int8_t*>(base + p.pack_off[x][kPackRes]);
+    o.batch[x] = (x == 0 ? p.m : p.n) * p.k_hat;
+    o.group[x] = p.b * o.batch[x];
+  }
+  return o;
+}
+
+}  // namespace
+
 imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, const double* B,
                               double beta, double* C, void* ws, cudaStream_t stream,
                               const void* const* packed) {
   if (p.path == Path::kNoop) return IMD_STATUS_SUCCESS;
+  // v1.13 §4b.5 (hygiene): the K4 operand-pointer check (debug builds, test hook) of the whole
+  // call, before anything is queued: a violation fails the call with nothing launched.
+  K4Operands k4o{};
+  const bool emulated = p.path == Path::kGemm && alpha != 0.0 && p.k >= 2 && p.k4 != nullptr;
+  if (emulated) {
+    k4o = k4_operands(p, ws, packed);
+    if (const imd_status_t st = k4_check_call(*p.k4, p.N, p.g, k4o.R[0], k4o.R[1], k4o.W,
+                                              k4o.group[0], k4o.group[1], k4o.batch[0],
+                                              k4o.batch[1], p.k_align);
+        st != IMD_STATUS_SUCCESS)
+      return st;
+  }
   // K0: generate the scatter vectors into ws.vec (IMD_VEC_GENERATE), or use the plan's
   // resident copy (IMD_VEC_RESIDENT: no K0, no vec region).
   IMD_PROF(stream, "begin");
@@ -1393,28 +1442,22 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
   auto* sB = region<int16_t>(ws, p, Region::sB);
   auto* fA = region<uint8_t>(ws, p, Region::fA);
   auto* fB = region<uint8_t>(ws, p, Region::fB);
-  auto* RA = region<int8_t>(ws, p, Region::RA);
-  auto* RB = region<int8_t>(ws, p, Region::RB);
-  auto* W = region<uint8_t>(ws, p, Region::W);
   // v1.7 (DESIGN §6b): a packed operand's sigma, flags and residues come from its packed
-  // buffer (only read; the workspace has no sX, fX, RX). The B role reads blocks at the
-  // pack's batch stride r k_hat (§6b.4), and a residue group is the slice of planes g0...
-  int64_t batch[2] = {0, 0};  // K4 operand batch strides (0: the workspace's)
+  // buffer (only read; the workspace has no sX, fX, RX); k4_operands (also the pre-pass's).
   for (int x = 0; x < 2; ++x) {
     if (!(p.packed & (1 << x))) continue;
     auto* base = static_cast<unsigned char*>(const_cast<void*>(packed[x]));
-    auto* s = reinterpret_cast<int16_t*>(base + p.pack_off[x][kPackSig]);
-    auto* f = reinterpret_cast<uint8_t*>(base + p.pack_off[x][kPackFlag]);
-    auto* r = reinterpret_cast<int8_t*>(base + p.pack_off[x][kPackRes]);
-    (x == 0 ? sA : sB) = s;
-    (x == 0 ? fA : fB) = f;
-    (x == 0 ? RA : RB) = r;
-    batch[x] = (x == 0 ? p.m : p.n) * p.k_hat;
+    (x == 0 ? sA : sB) = reinterpret_cast<int16_t*>(base + p.pack_off[x][kPackSig]);
+    (x == 0 ? fA : fB) = reinterpret_cast<uint8_t*>(base + p.pack_off[x][kPackFlag]);
   }
+  if (!emulated) k4o = k4_operands(p, ws, packed);  // defensive: here k >= 2 and K4 exists
+  int8_t* const RA = k4o.R[0];
+  int8_t* const RB = k4o.R[1];
+  uint8_t* const W = k4o.W;
+  const int64_t* const batch = k4o.batch;
   // The GEMM operand of group g0: the workspace's slots, or the pack's planes g0...
   const auto operand = [&](int x, int g0) -> const int8_t* {
-    const int8_t* R = x == 0 ? RA : RB;
-    return (p.packed & (1 << x)) ? R + int64_t{g0} * p.b * batch[x] : R;
+    return k4o.R[x] + int64_t{g0} * k4o.group[x];
   };
   const Operand opA{A, out.a_bat, out.a_row, out.a_k, p.m};
   const Operand opB{B, out.b_bat, out.b_col, out.b_k, p.n};
@@ -1449,7 +1492,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
     const int gsize = std::min(p.g, p.N - g0);
     if (use_kf && g0 == 0) {  // group 1 was packed by KF
       if (const imd_status_t st = k4_group(*p.k4, operand(0, g0), operand(1, g0), W, g0, gsize,
-                                           stream, batch[0], batch[1], p.k_align);
+                                           stream, batch[0], batch[1]);
           st != IMD_STATUS_SUCCESS)
         return st;
       continue;
@@ -1463,6 +1506,8 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
       pa.rows_pad = x == 0 ? p.m : p.n_hat;
       pa.sigma = x == 0 ? sA : sB;
       pa.R = x == 0 ? RA : RB;
+      // production: every k-bar < k_hat (zeros past k); the test mutation stops at ceil(k)_16
+      pa.k_store = pad_mutation() == x ? (p.k + 15) / 16 * 16 : p.k_hat;
       pa.radix = p.pack_radix[x];
       pa.along_rows = p.pack_along_rows[x];
       // v1.10: host/analysis.hpp pack_launch (shared with the performance model).
@@ -1479,7 +1524,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
     }
     if (cudaPeekAtLastError() != cudaSuccess) return IMD_STATUS_CUDA_ERROR;
     if (const imd_status_t st = k4_group(*p.k4, operand(0, g0), operand(1, g0), W, g0, gsize,
-                                         stream, batch[0], batch[1], p.k_align);
+                                         stream, batch[0], batch[1]);
         st != IMD_STATUS_SUCCESS)
       return st;
   }

@@ -14,27 +14,31 @@
 namespace imd::detail {
 
 // The packs of a host query (imd_packing_t: descriptors), lowered: each descriptor's own
-// status first (imd_pack_layout's), then the plan's analyze_packed.
+// status first (imd_pack_layout's), then the plan's pack checks (match_packs). One analyze,
+// and one hook snapshot `sel` for the plan and every descriptor (DESIGN §4b.5).
 imd_status_t analyze_with(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
-                          const imd_options_t* options, const imd_packing_t* packing,
-                          Analysis* an) {
-  if (packing == nullptr || (packing->A == nullptr && packing->B == nullptr))
-    return imd::detail::analyze(A, B, C, options, an);
+                          const imd_options_t* options, const KAlignSel& sel,
+                          const imd_packing_t* packing, Analysis* an) {
   // §5 rows 1-5 of the plan first (as imd_workspace_size), then the pack descriptors.
-  if (const imd_status_t st = imd::detail::analyze(A, B, C, options, an); st != IMD_STATUS_SUCCESS)
+  if (const imd_status_t st = imd::detail::analyze(A, B, C, options, sel, an);
+      st != IMD_STATUS_SUCCESS)
     return st;
+  an->packed = PackedSlots{};
+  if (packing == nullptr || (packing->A == nullptr && packing->B == nullptr))
+    return IMD_STATUS_SUCCESS;
   const imd_pack_desc_t* d[2] = {packing->A, packing->B};
   PackLowered pl[2];
   PackSource ps[2];
   const PackSource* src[2] = {nullptr, nullptr};
   for (int x = 0; x < 2; ++x) {
     if (d[x] == nullptr) continue;
-    if (const imd_status_t st = imd::detail::pack_lower(*d[x], &pl[x]); st != IMD_STATUS_SUCCESS)
+    if (const imd_status_t st = imd::detail::pack_lower(*d[x], sel, &pl[x]);
+        st != IMD_STATUS_SUCCESS)
       return st;
     ps[x] = PackSource{d[x]->tensor->rank, d[x]->tensor->label, &pl[x]};
     src[x] = &ps[x];
   }
-  return imd::detail::analyze_packed(A, B, C, options, src, an);
+  return imd::detail::match_packs(A, B, src, an);
 }
 
 }  // namespace imd::detail
@@ -142,7 +146,8 @@ imd_status_t lowering_impl(const imd_tensor_t* A, const imd_tensor_t* B, const i
   const int32_t sms = sms_in > 0 ? sms_in : imd::detail::kK4ReferenceSms;
   r.status = guarded([&] {
     Analysis an;
-    const imd_status_t ast = analyze_with(A, B, C, options, packing, &an);
+    const imd_status_t ast =
+        analyze_with(A, B, C, options, imd::detail::k_align_sel(), packing, &an);
     // v1.7: a PACK_MISMATCH still has the plan's view (rows 1-5 passed) and its packed
     // layout; the summary is filled as for NOT_SUPPORTED (no plan bytes).
     if (ast != IMD_STATUS_SUCCESS && ast != IMD_STATUS_PACK_MISMATCH) return ast;
@@ -205,7 +210,8 @@ imd_status_t layout_impl(const imd_tensor_t* A, const imd_tensor_t* B, const imd
   if (capacity < 0 || (capacity > 0 && regions == nullptr)) return IMD_STATUS_INVALID_VALUE;
   return guarded([&] {
     Analysis an;
-    if (const imd_status_t st = analyze_with(A, B, C, options, packing, &an);
+    if (const imd_status_t st =
+            analyze_with(A, B, C, options, imd::detail::k_align_sel(), packing, &an);
         st != IMD_STATUS_SUCCESS)
       return st;
     const int32_t n = std::min<int32_t>(capacity, IMD_REGION_COUNT);
@@ -237,7 +243,8 @@ imd_status_t imd_workspace_size_packed(const imd_tensor_t* A, const imd_tensor_t
   if (bytes == nullptr) return IMD_STATUS_INVALID_VALUE;
   return guarded([&] {
     Analysis an;
-    if (const imd_status_t st = analyze_with(A, B, C, options, packing, &an);
+    if (const imd_status_t st =
+            analyze_with(A, B, C, options, imd::detail::k_align_sel(), packing, &an);
         st != IMD_STATUS_SUCCESS)
       return st;
     *bytes = static_cast<size_t>(an.layout.total);
@@ -291,13 +298,24 @@ imd_status_t imd_pack_desc_for(const imd_tensor_t* A, const imd_tensor_t* B,
                                const imd_tensor_t* C, const imd_options_t* options,
                                int32_t operand, imd_pack_desc_t* out, int32_t* labels,
                                int32_t capacity) {
+  return imd::detail::pack_desc_for(A, B, C, options, imd::detail::k_align_sel(), operand, out,
+                                    labels, capacity);
+}
+
+}  // extern "C"
+
+imd_status_t imd::detail::pack_desc_for(const imd_tensor_t* A, const imd_tensor_t* B,
+                                        const imd_tensor_t* C, const imd_options_t* options,
+                                        const KAlignSel& sel, int32_t operand,
+                                        imd_pack_desc_t* out, int32_t* labels,
+                                        int32_t capacity) {
   if ((operand != 0 && operand != 1) || out == nullptr ||
       out->struct_size < sizeof(imd_pack_desc_t) || capacity < 0 ||
       (capacity > 0 && labels == nullptr))
     return IMD_STATUS_INVALID_VALUE;
   return guarded([&] {
     Analysis an;
-    if (const imd_status_t st = imd::detail::analyze(A, B, C, options, &an);
+    if (const imd_status_t st = imd::detail::analyze(A, B, C, options, sel, &an);
         st != IMD_STATUS_SUCCESS)
       return st;
     const imd::detail::Lowered& lw = an.lowered;
@@ -348,6 +366,8 @@ imd_status_t imd_pack_desc_for(const imd_tensor_t* A, const imd_tensor_t* B,
     return IMD_STATUS_SUCCESS;
   });
 }
+
+extern "C" {
 
 const char* imd_status_string(imd_status_t status) {
   switch (status) {

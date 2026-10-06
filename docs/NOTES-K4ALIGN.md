@@ -330,3 +330,17 @@ The full write-up, with the hold-out tables, is in NOTES-B2 §8. In brief:
 - **`k4_select`.** The constants are unchanged. On a 15-view grid with every configuration
   forced and k̂ padded, the rule is +0.65 % over the per-view fastest (always 128×256:
   +6.8 %). Margin variants move this by at most 0.06 pp. No alternative is clearly better.
+
+## 11. Release note and code-review leftovers (2026-10-06, branch `followup-hygiene`)
+
+- **Release note: `IMD_PACK_FORMAT` changed meaning in host API 9, 1 → 2.** It used to be
+  the only pack format; it is now the newest format the library writes. A pack's format
+  follows its k (1 for k ≤ 96, 2 for k > 96; `imd_pack_layout_t.format`). Callers that
+  persist pack bytes compare the saved `format` and `pack_bytes` with a fresh
+  `imd_pack_layout`, never with `IMD_PACK_FORMAT` (DESIGN changelog "v1.13 follow-up").
+- The hook is read once per API call (`KAlignSel`), packed host queries analyse once, the
+  DIRECT slot-key choice is stated in DESIGN §6b.4, KF's tile check is at plan time, the
+  K4 pointer check runs before anything is queued, `summarize.py` honours a record's forced
+  alignment, and the test gaps of the stage-2 code review are closed (FORMAT reason of a
+  handle mismatch, the plan-cache clear, `planner.Memo` under the hook, the initcheck
+  mutation test for one-sided padding). Details: DESIGN changelog "v1.13 follow-up".

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "export.hpp"
+#include "k_hat.hpp"
 #include "immerdink/immerdink_host.h"
 
 namespace imd::detail {
@@ -66,6 +67,10 @@ struct PackLowered {
 // after lowering; RN, k >= 2 and kappa >= T), else SUCCESS. AUTO orders each class by
 // (|merged stride|, first position in X's labels); GIVEN takes the lists' order. Extent-1
 // labels are dropped (§5 step 4); a repeated label of X is a diagonal (strides summed).
+// The pack's A is sel.of(k) (DESIGN §4b.5: sel is the API call's one hook snapshot); the
+// overload without sel takes the snapshot itself (an entry point packing one descriptor).
+IMD_HOST_INTERNAL imd_status_t pack_lower(const imd_pack_desc_t& d, const KAlignSel& sel,
+                                          PackLowered* out);
 IMD_HOST_INTERNAL imd_status_t pack_lower(const imd_pack_desc_t& d, PackLowered* out);
 
 // The §6b.2 key: FORMAT (the pack's own, or for a plan's slot key the plan's), N, rounding

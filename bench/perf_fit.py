@@ -33,6 +33,17 @@ A/B). Method-sustained records fit the power model (NNLS on the windows' mean po
 gamma; a leave-one-case-out check is printed), method-pair records the cache term (L_w scan,
 Delta by least squares; Delta = 0 when the measured effect is below 3 %). --format1 writes a v1.8
 file. Bands are added by bench/perf_validate.py --bands from the hold-out set.
+
+Host API 10 (DESIGN §6c.3): the metadata strings are checked against the calibration's field
+sizes before anything is written (check_meta: UTF-8 bytes, NUL included, no line break, no
+leading or trailing blank); a --version or --notes that does not fit is an error, the generated
+clocks and notes are cut to fit at a UTF-8 boundary. The written file is re-loaded and must
+format back to the same text.
+
+    python3 bench/perf_fit.py --check FILE [FILE ...]
+
+checks existing calibration files (every string line, then the C parser with its reason) and
+exits 1 listing every problem.
 """
 
 import argparse
@@ -52,6 +63,63 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "python"))
 from immerdink import host  # noqa: E402
 
 CALL = "call"
+
+
+# ------------------------------------------------------------------------------------------
+# Generation-time checks (host API 10, DESIGN §6c.3)
+
+def fit_text(text, field):
+    """`text` cut to the calibration string field's capacity (UTF-8 bytes, NUL excluded) at a
+    character boundary: for generated metadata only (a caller's value is checked instead)."""
+    cap = host.CALIB_STRING_FIELDS[field] - 1
+    b = text.encode()
+    if len(b) <= cap:
+        return text
+    return b[:cap].decode(errors="ignore").rstrip(" \t")
+
+
+def check_meta(meta):
+    """The problems of a calibration's metadata strings: [] if every value can be written and
+    parsed back unchanged (fits its field, no line break, no leading / trailing blank)."""
+    probs = []
+    for k, cap in host.CALIB_STRING_FIELDS.items():
+        if k not in meta:
+            continue
+        v = str(meta[k])
+        n = len(v.encode())
+        if n > cap - 1:
+            probs.append(f"{k}: {n} bytes, the calibration field holds {cap - 1}")
+        if "\n" in v or "\r" in v:
+            probs.append(f"{k}: contains a line break")
+        if v != v.strip(" \t"):
+            probs.append(f"{k}: leading or trailing blank (the parser would trim it)")
+    return probs
+
+
+def check_calibration_file(path, lib=None):
+    """The problems of an existing calibration file: every string line against its field
+    (all of them, by line), then the C parser's first error with its reason."""
+    probs = []
+    try:
+        text = open(path, "rb").read()
+    except OSError as e:
+        return [f"{path}: {e}"]
+    for i, raw in enumerate(text.split(b"\n"), 1):
+        line = raw.strip(b" \t\r")
+        if not line or line.startswith(b"#") or b"=" not in line:
+            continue
+        key, val = line.split(b"=", 1)
+        key = key.strip(b" \t").decode(errors="replace")
+        cap = host.CALIB_STRING_FIELDS.get(key)
+        val = val.strip(b" \t\r")
+        if cap is not None and len(val) > cap - 1:
+            probs.append(f"{path}:{i}: {key}: {len(val)} bytes, the calibration field holds "
+                         f"{cap - 1}")
+    try:
+        host.Calibration.load(path, lib)
+    except host.CalibrationError as e:
+        probs.append(str(e))
+    return probs
 
 
 # ------------------------------------------------------------------------------------------
@@ -636,8 +704,12 @@ def fit_warm(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=
 def main(argv=None):
     global USE_RECORD_CLOCK
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("records", nargs="+", help="JSON lines of a calibration sweep")
-    ap.add_argument("-o", "--out", required=True, help="calibration file to write")
+    ap.add_argument("records", nargs="*", help="JSON lines of a calibration sweep (with --check: "
+                    "calibration files to check)")
+    ap.add_argument("-o", "--out", help="calibration file to write")
+    ap.add_argument("--check", action="store_true",
+                    help="check the given calibration files (string fields, the C parser) and "
+                         "exit: 1 if any has a problem")
     ap.add_argument("--lib", default=None, help="libimmerdink_host.so")
     ap.add_argument("--version", default=None, help="version string (default: the commit)")
     ap.add_argument("--notes", default=None)
@@ -672,6 +744,17 @@ def main(argv=None):
                     help="write a format-1 file (v1.8 features only; implies --no-clock, "
                          "--no-chain)")
     a = ap.parse_args(argv)
+    if a.check:
+        probs = [p for f in a.records for p in check_calibration_file(f, a.lib)]
+        for p in probs:
+            print(p, file=sys.stderr)
+        if not a.records:
+            ap.error("--check needs calibration files")
+        print(f"{len(a.records)} calibration file(s): "
+              f"{'ok' if not probs else str(len(probs)) + ' problem(s)'}")
+        sys.exit(1 if probs else 0)
+    if not a.records or not a.out:
+        ap.error("records and -o/--out are required (or --check FILE...)")
     if a.format1:
         a.no_clock = a.no_chain = True
     USE_RECORD_CLOCK = a.clock_normalize and not a.no_clock
@@ -702,7 +785,9 @@ def main(argv=None):
     commit = next((r.get("commit") for r in ok if r.get("commit")), "unknown")
     meta = {"gpu": gpu, "sm_count": sms, "date": datetime.date.today().isoformat(),
             "version": a.version or f"immerdink {commit}, host API {host.API_VERSION}",
-            "clocks": clock_summary(records)[:127], **peaks, "l2_bytes": l2}
+            "clocks": fit_text(clock_summary(records), "clocks"), **peaks, "l2_bytes": l2}
+    if probs := check_meta(meta):  # before the fit: a caller's --version or the records' gpu
+        sys.exit("calibration metadata cannot be written (DESIGN §6c.3):\n  " + "\n  ".join(probs))
     fref = 0.0 if a.no_clock else (a.clock_ref or reference_clock(records))
     fnorm = fref if USE_RECORD_CLOCK else 0.0  # the clock normalization of the fit
     kernels = occupancy_from_records(records, a.lib) or {}
@@ -784,11 +869,21 @@ def main(argv=None):
             print("power model: " + ", ".join(f"{k} {v:.4g}" for k, v in pw.items()))
             power_validation(rows, meta, params, extra, fr, a.lib, idle=a.idle_w)
             extra.update(pw)
-    meta["notes"] = (a.notes or f"fit on {len(samples)} calls ({len(ok)} records) by "
-                     f"bench/perf_fit.py")[:127]
+    meta["notes"] = a.notes if a.notes is not None else fit_text(
+        f"fit on {len(samples)} calls ({len(ok)} records) by bench/perf_fit.py", "notes")
+    if probs := check_meta(meta):  # a caller's --notes is never cut silently
+        sys.exit("calibration metadata cannot be written (DESIGN §6c.3):\n  " + "\n  ".join(probs))
     cal = host.Calibration.from_values(meta, params, a.lib, extra)
+    text = cal.format()
     with open(a.out, "w") as f:
-        f.write(cal.format())
+        f.write(text)
+    # What was written must load and format back to the same text (DESIGN §6c.3).
+    try:
+        back = host.Calibration.load(a.out, a.lib).format()
+    except host.CalibrationError as e:
+        sys.exit(f"the written calibration does not load: {e}")
+    if back != text:
+        sys.exit(f"{a.out}: the written calibration does not re-load to the same text")
     # The fit's own error on the timed totals (in-sample, the C model).
     errs = [abs(s.again(cal).time_s - s.timed_s) / s.timed_s for s in samples]
     print(f"in-sample total: median |err| {100 * statistics.median(errs):.1f}%, "

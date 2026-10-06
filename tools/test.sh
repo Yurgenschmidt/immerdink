@@ -6,6 +6,7 @@
 #   IMMERDINK_ENV         conda env with the toolchain (default ~/miniforge3/envs/immerdink)
 #   IMMERDINK_BUILD_DIR   build directory (default <repo>/build)
 #   IMMERDINK_CUTLASS_DIR CUTLASS checkout (default: the third_party/cutlass submodule)
+#   IMMERDINK_COMPUTE_SANITIZER  compute-sanitizer for contract_initcheck_pad (default: next to nvcc)
 #   IMMERDINK_WERROR      ON (default) / OFF: warnings in immerdink's own code are errors
 #   IMMERDINK_BUILD_JOBS  parallel compile jobs (default: min(nproc, MemAvailable / 3 GiB);
 #                         one CUTLASS nvcc/cicc job can take ~2-3 GiB)
@@ -28,6 +29,7 @@ cfg=(-S "$root" -B "$build" -G Ninja
      -DPython3_EXECUTABLE="$env_dir/bin/python3"
      -DIMMERDINK_WERROR="${IMMERDINK_WERROR:-ON}")
 [ -n "${IMMERDINK_CUTLASS_DIR:-}" ] && cfg+=(-DIMMERDINK_CUTLASS_DIR="$IMMERDINK_CUTLASS_DIR")
+[ -n "${IMMERDINK_COMPUTE_SANITIZER:-}" ] && cfg+=(-DIMMERDINK_COMPUTE_SANITIZER="$IMMERDINK_COMPUTE_SANITIZER")
 
 cmake "${cfg[@]}"
 avail_gb=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1048576 ))
@@ -40,7 +42,7 @@ gpu_lock="${IMMERDINK_GPU_LOCK:-/home/ef/repos/ehrenfest-ipdps/_wip/gpu.lock}"
 [ "$gpu_lock" = none ] || [ -d "$(dirname "$gpu_lock")" ] || gpu_lock="${XDG_RUNTIME_DIR:-/tmp}/gpu.lock"
 # CPU-only tests never touch the GPU, so they run first without the lock; only the GPU
 # tests wait for it. A caller's own -R/-E filters apply to both passes.
-cpu_only='^(host_c_api|host_k_align|host_python|host_perf|host_planner|host_accuracy|host_cuda_free|workspace_vs_params|params_check|constants_header_current)$'
+cpu_only='^(calib_strings_shipped|calib_strings_too_long|host_c_api|host_k_align|host_python|host_perf|host_planner|host_accuracy|host_cuda_free|workspace_vs_params|params_check|constants_header_current)$'
 if [ "$gpu_lock" = none ]; then ctest --test-dir "$build" --output-on-failure "$@"
 else
   rc=0

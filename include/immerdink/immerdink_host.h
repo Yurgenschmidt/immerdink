@@ -27,7 +27,7 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 9  /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 10 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
@@ -42,7 +42,11 @@ extern "C" {
                                       the requests' accuracy, err_* / infeasible fields;
                                    9: per-plan K alignment (§4b v1.13 stage 2):
                                       imd_lowering_t k_align (k_hat = ceil(k)_k_align),
-                                      IMD_PACK_FORMAT_A16 / _A64, pack format 2 */
+                                      IMD_PACK_FORMAT_A16 / _A64, pack format 2;
+                                  10: explicit calibration parse errors (§6c.3):
+                                      imd_perf_calib_error_t, IMD_PERF_CALIB_ERR_*,
+                                      imd_perf_calib_parse_ex / _load_ex / _default_ex,
+                                      imd_perf_calib_error_name */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -517,6 +521,45 @@ IMD_API imd_status_t imd_perf_calib_parse(const char* text, size_t length, imd_p
 /* imd_perf_calib_parse of a file's contents; an unreadable file is INVALID_VALUE, line 0. */
 IMD_API imd_status_t imd_perf_calib_load(const char* path, imd_perf_calib_t* out,
                                          int32_t* error_line);
+/* Host API 10 (DESIGN §6c.3): why a calibration was rejected. The _ex functions return the
+ * status of the function without _ex and fill the caller's struct_size bytes of *err: on
+ * SUCCESS line 0, reason IMD_PERF_CALIB_OK, key and message ""; else the first error in file
+ * order (a missing key: line 0, the first missing key in canonical order). The format of the
+ * calibration text is unchanged; the functions without _ex are wrappers. */
+enum { IMD_PERF_CALIB_OK = 0,
+       IMD_PERF_CALIB_ERR_ARGUMENT = 1,     /* NULL / undersized out or err, NULL text        */
+       IMD_PERF_CALIB_ERR_FILE = 2,         /* load: cannot open or read, or >= 1 MiB         */
+       IMD_PERF_CALIB_ERR_SYNTAX = 3,       /* a line not blank, '#' comment or key = value   */
+       IMD_PERF_CALIB_ERR_UNKNOWN_KEY = 4,
+       IMD_PERF_CALIB_ERR_REPEATED_KEY = 5,
+       IMD_PERF_CALIB_ERR_VALUE = 6,        /* not a number, wrong count, out of range        */
+       IMD_PERF_CALIB_ERR_TOO_LONG = 7,     /* a string value does not fit its field (+ NUL)  */
+       IMD_PERF_CALIB_ERR_MISSING_KEY = 8,  /* a key the format requires                      */
+       IMD_PERF_CALIB_ERR_FORMAT2_KEY = 9,  /* a format-2 key in a format-1 calibration       */
+       IMD_PERF_CALIB_ERR_INCONSISTENT = 10 /* a cross-key rule: power clocks, tie_ratio      */ };
+#define IMD_PERF_CALIB_ERR_COUNT 11
+typedef struct {
+  uint32_t struct_size;  /* sizeof(imd_perf_calib_error_t) as the caller compiled it (>= 16) */
+  int32_t line;          /* 1-based line of the error; 0: not tied to a line                */
+  int32_t reason;        /* IMD_PERF_CALIB_OK or IMD_PERF_CALIB_ERR_*                       */
+  int32_t reserved;      /* 0                                                               */
+  char key[64];          /* the offending or missing key (truncated), or ""; NUL-terminated */
+  char message[192];     /* e.g. "line 9: notes: value is 133 bytes, the field holds 127"   */
+} imd_perf_calib_error_t;
+/* imd_perf_calib_parse with the reason; err may be NULL. */
+IMD_API imd_status_t imd_perf_calib_parse_ex(const char* text, size_t length,
+                                             imd_perf_calib_t* out, imd_perf_calib_error_t* err);
+/* imd_perf_calib_load with the reason; err may be NULL. */
+IMD_API imd_status_t imd_perf_calib_load_ex(const char* path, imd_perf_calib_t* out,
+                                            imd_perf_calib_error_t* err);
+/* imd_perf_calib_default with the reason: INVALID_VALUE with the shipped file's own parse
+ * error (message prefixed "shipped calibration: ") if the embedded text did not parse, which
+ * is also why every function given a NULL calibration then returns INVALID_VALUE. */
+IMD_API imd_status_t imd_perf_calib_default_ex(imd_perf_calib_t* out,
+                                               imd_perf_calib_error_t* err);
+/* Static name of a reason ("IMD_PERF_CALIB_OK", "IMD_PERF_CALIB_ERR_TOO_LONG", ...); NULL out
+ * of range. */
+IMD_API const char* imd_perf_calib_error_name(int32_t reason);
 /* The canonical text of a calibration (every key; numbers in the shortest round-trip form,
  * so parse(format(c)) == c bit for bit). *length = its length without the NUL, always;
  * INSUFFICIENT_WORKSPACE if capacity <= *length (nothing useful written). */

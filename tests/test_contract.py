@@ -25,6 +25,8 @@ Environment (DESIGN v1.13 §4b.8): IMD_TEST_POISON=0 leaves every workspace a fr
 unwritten cudaMalloc (for compute-sanitizer --tool initcheck: a 0xA5 memset counts as
 initialised; the guard-zone check is skipped); IMD_TEST_QUICK=1 runs each case in the
 production rule, unfused (K2/K3) and KL with 64-row tiles only (sanitizer runs).
+IMD_TEST_PAD_MUTATION = none / A / B: the mutation of suite pad_mutation under
+IMD_TEST_POISON=0 (tests/initcheck_pad_mutation.sh: the initcheck mutation test).
 """
 
 import argparse
@@ -953,8 +955,107 @@ def suite_replay(lib, cuda, verbose):
         print(f"  ok  {done} of {len(calls)} recorded oracle-test contractions replayed bit-exact")
 
 
+def suite_pad_mutation(lib, cuda, verbose):
+    """DESIGN v1.13 §4b.8 / hygiene: the initcheck mutation test for ONE-SIDED padding. The
+    test hook imd_test_set_pad_mutation(x) makes the K2 / K3 pack of the post-swap GEMM operand
+    x store k-bar only below ceil(k)_16 (Pipeline neg_a64_pad_old_k3), so with A = 64 the bytes
+    [ceil(k)_16, k_hat) of x's residue rows are never written while the other operand's are
+    zeros. The call stays BIT-EXACT (the zeros cancel the garbage): only initcheck on an
+    unpoisoned workspace can see it (tests/initcheck_pad_mutation.sh, ctest
+    contract_initcheck_pad). This suite runs the case: with the poisoned workspace (default) for
+    no mutation, A and B, each bit-exact vs the oracle, and the workspace shows the mutation
+    took effect (x's padding still 0xA5, the other operand's 0); with IMD_TEST_POISON=0 (the
+    initcheck driver) only the mutation IMD_TEST_PAD_MUTATION = A / B / none, bit-exact."""
+    if not lib.has_test_hooks:
+        raise Fail("suite pad_mutation needs the test hooks")
+    env = os.environ.get("IMD_TEST_PAD_MUTATION", "none")
+    if env not in ("none", "A", "B"):
+        raise Fail(f"IMD_TEST_PAD_MUTATION={env!r}: none, A or B")
+    rng = random.Random(4242)
+    m, n, k, N = 7, 9, 97, 8
+    A, B, Cd = matrix(rng, m, n, k, a_kfast=True, b_kfast=True)
+    TA, TB, TC = gen(rng, (m, k), "phi"), gen(rng, (k, n), "wide"), gen(rng, (m, n), "uniform")
+    lenA, _ = buffer_for(A)
+    lenB, _ = buffer_for(B)
+    lenC, _ = buffer_for(Cd)
+    bufA, baseA = scatter(TA, A, gen(rng, (lenA,), "uniform"))
+    bufB, baseB = scatter(TB, B, gen(rng, (lenB,), "uniform"))
+    bufC, baseC = scatter(TC, Cd, gen(rng, (lenC,), "uniform"))
+    k16, k_hat = -(-k // 16) * 16, -(-k // 64) * 64    # 112, 128
+    with k_align(lib, 64):
+        want = np.array(o.contract_tensor(o.Tensor(bufA.tolist(), baseA, A),
+                                          o.Tensor(bufB.tolist(), baseB, B),
+                                          o.Tensor(bufC.tolist(), baseC, Cd), 1.0, 0.5, N, "RN",
+                                          N, o.EMULATE), dtype=np.float64)
+        tA, tB, tC = (hz.make_tensor(d.extent, d.stride, d.label) for d in (A, B, Cd))
+        runs = ("none", "A", "B") if POISON else (env,)
+        lib.set_fused(0)                   # K1 + K2 / K3 for every group (no KF, no KL)
+        try:
+            st, plan = lib.plan_create(tA, tB, tC, N, N)
+        finally:
+            lib.set_fused()
+        if st != "SUCCESS":
+            raise Fail(f"pad mutation: imd_plan_create {st}")
+        try:
+            v = lib.plan_sizes(plan)
+            if v[1] != 0 or v[7] != k_hat or v[9] != N:
+                raise Fail(f"pad mutation: plan swapped {v[1]}, k_hat {v[7]}, g {v[9]}")
+            ws_bytes = v[10]
+            off = {x: (v[11 + 2 * r], v[12 + 2 * r]) for x, r in ((0, 5), (1, 6))}  # RA, RB
+            rows = {0: m, 1: -(-n // 16) * 16}     # rows held: m, n_hat (B's n.. are zero rows)
+            real = {0: m, 1: n}
+            for which in runs:
+                x = {"none": -1, "A": 0, "B": 1}[which]
+                dA, dB, dC = (cuda.malloc(b.nbytes) for b in (bufA, bufB, bufC))
+                dW = cuda.malloc(ws_bytes)        # fresh; with POISON filled with 0xA5
+                try:
+                    cuda.upload(dA, bufA)
+                    cuda.upload(dB, bufB)
+                    cuda.upload(dC, bufC)
+                    if POISON:
+                        cuda.memset(dW, 0xA5, ws_bytes)
+                    lib.set_pad_mutation(x)
+                    try:
+                        st = lib.contract(plan, 1.0, dA.value + 8 * baseA, dB.value + 8 * baseB,
+                                          0.5, dC.value + 8 * baseC, dW.value, ws_bytes)
+                    finally:
+                        lib.set_pad_mutation(-1)
+                    if st != "SUCCESS":
+                        raise Fail(f"pad mutation {which}: imd_contract {st}")
+                    cuda.sync()
+                    got = np.empty_like(bufC)
+                    cuda.download(got, dC)
+                    if POISON:
+                        ws = np.empty(ws_bytes, dtype=np.uint8)
+                        cuda.download(ws, dW)
+                finally:
+                    for p in (dA, dB, dC, dW):
+                        cuda.free(p)
+                bad = bit_mismatches(got, want)
+                if len(bad):
+                    raise Fail(f"pad mutation {which}: {len(bad)} C elements differ from the "
+                               "oracle (the other operand's zero padding should cancel it)")
+                if POISON:
+                    for y in (0, 1):
+                        o_, nb = off[y]
+                        R = ws[o_:o_ + nb].reshape(N, rows[y], k_hat)   # [s][row][k_hat], b = 1
+                        pad = R[:, :real[y], k16:k_hat]
+                        if (R[:, real[y]:, :] != 0).any():
+                            raise Fail(f"pad mutation {which}: operand {y}'s zero rows")
+                        if y == x and not (pad == 0xA5).all():
+                            raise Fail(f"pad mutation {which}: operand {y}'s padding was written")
+                        if y != x and (pad != 0).any():
+                            raise Fail(f"pad mutation {which}: operand {y}'s padding not zero")
+                if verbose:
+                    print(f"  ok  pad mutation {which}: bit-exact"
+                          f"{', padding [112, 128) unwritten on that side only' if POISON and x >= 0 else ''}")
+        finally:
+            lib.plan_destroy(plan)
+
+
 SUITES = {"api": suite_api, "replay": suite_replay, "stages": suite_stages, "e2e": suite_e2e, "tensor": suite_tensor,
-          "bigk": suite_bigk, "every_n": suite_every_n, "k_align": suite_k_align}
+          "bigk": suite_bigk, "every_n": suite_every_n, "k_align": suite_k_align,
+          "pad_mutation": suite_pad_mutation}
 
 
 def main():

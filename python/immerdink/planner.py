@@ -397,7 +397,10 @@ class Memo:
     """An explicit, bounded memo of planner results keyed by the full query (the Query object,
     the method and every argument). Only an identical query hits: the results are pure
     functions of the key (DESIGN §6e), and immutable views, so a hit returns the same object
-    a miss stored. Two bounds, both always on: at most `maxsize` entries and at most
+    a miss stored. The test-only K-alignment hook (host.test_set_k_align, DESIGN §4b.5) is
+    not part of the key and does not clear a Memo (it is caller-owned): a hit after a hook
+    change returns the result computed under the old A, so code that sets the hook uses a
+    fresh Memo or calls clear(). Two bounds, both always on: at most `maxsize` entries and at most
     `max_bytes` (default 64 MiB) of stored C result structs (nbytes: the exact sum of
     ctypes.sizeof of the structs held, counted at insert; a Prediction 1648 B, a Ranking 128 B
     per candidate). Oldest entries are evicted until both hold; a single result larger than
@@ -507,6 +510,8 @@ class Query:
         self._f = _state(h)[0]
         self._calib = calib
         self._cal = None if calib is None else _calib_ref(calib)  # None: NULL, the shipped one
+        if calib is None:
+            h.check_shipped_calib()  # DESIGN §6c.3: say why, not INVALID_VALUE per query
         self.memo = memo
         if memo is not None and not isinstance(memo, Memo):
             raise TypeError("memo must be a Memo or None")

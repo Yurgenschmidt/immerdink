@@ -86,6 +86,9 @@ ByteInterval bytes_at(const void* p, uint64_t n) {
 // For src/test_hooks.cpp (same library, not exported): the plan's execution data.
 namespace imd::detail {
 const ExecPlan* exec_of(imd_plan_t plan) { return plan == nullptr ? nullptr : &plan->exec; }
+PackSource pack_source_of(imd_pack_t pack) {
+  return {static_cast<int32_t>(pack->tensor.label.size()), pack->tensor.label.data(), &pack->pl};
+}
 int& fused_override() {
   static int v = -1;  // only the test hook changes it (-1, 0, 2, 3: test_hooks.cpp)
   return v;
@@ -215,8 +218,7 @@ imd_status_t imd_plan_create_packed(imd_handle_t handle, const imd_tensor_t* A,
   const imd_pack_t pk[2] = {packA, packB};
   for (int x = 0; x < 2; ++x) {
     if (pk[x] == nullptr) continue;
-    ps[x] = {static_cast<int32_t>(pk[x]->tensor.label.size()), pk[x]->tensor.label.data(),
-             &pk[x]->pl};
+    ps[x] = imd::detail::pack_source_of(pk[x]);
     src[x] = &ps[x];
   }
   return plan_create(handle, A, B, C, options, src, plan);

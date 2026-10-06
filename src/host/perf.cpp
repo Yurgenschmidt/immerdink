@@ -1,7 +1,10 @@
 // The performance model (DESIGN v1.8 / v1.10 §6c): features of every phase from the plan's
 // lowering and the shared launch rules, the calibration file (formats 1 and 2),
-// imd_perf_predict, imd_perf_predict_pack, imd_perf_rank. Pure: no global or static mutable
-// state, no allocation visible to the caller, thread-safe.
+// imd_perf_predict, imd_perf_predict_pack, imd_perf_rank. Pure: no allocation visible to the
+// caller, thread-safe, and no global or static mutable state but one, test-only: the
+// K-alignment hook (k_hat.cpp imd_test_set_k_align, DESIGN v1.13 §4b.5), read once per API
+// call (one KAlignSel snapshot, passed to every analysis of the call). The shipped
+// calibration is parsed once into an immutable function-local static.
 #include "perf.hpp"
 
 #include <algorithm>
@@ -682,14 +685,41 @@ constexpr ScalarKey kScalarKeys[] = {
 constexpr int kScalarKeyCount = sizeof kScalarKeys / sizeof kScalarKeys[0];
 const char* const kBandCallKeys[3] = {"band.call_small", "band.call_mid", "band.call_large"};
 
-imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* error_line) {
+// A rejected calibration (host API 10, DESIGN §6c.3): the line (0: none), the reason
+// (IMD_PERF_CALIB_ERR_*), the key and a message. reason 0 = no error.
+struct CalibErr {
+  int32_t line = 0;
+  int32_t reason = IMD_PERF_CALIB_OK;
+  std::string key;
+  std::string message;
+};
+
+// Text as it may be shown in a message: at most `cap` bytes, non-printable bytes as '?'.
+std::string printable(std::string_view k, size_t cap = 63) {
+  std::string s(k.substr(0, cap));
+  for (char& ch : s)
+    if (static_cast<unsigned char>(ch) < 0x20 || static_cast<unsigned char>(ch) > 0x7e) ch = '?';
+  return s;
+}
+
+imd_status_t calib_fail(CalibErr* e, int32_t line, int32_t reason, std::string_view key,
+                        const std::string& detail) {
+  if (e != nullptr) {
+    e->line = line;
+    e->reason = reason;
+    e->key = printable(key);
+    std::string m;
+    if (line > 0) m = "line " + std::to_string(line) + ": ";
+    if (!e->key.empty()) m += e->key + ": ";
+    e->message = m + detail;
+  }
+  return IMD_STATUS_INVALID_VALUE;
+}
+
+imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr* err) {
   imd_perf_calib_t r;
   std::memset(&r, 0, sizeof r);
   r.struct_size = sizeof r;
-  const auto fail = [&](int32_t line) {
-    if (error_line != nullptr) *error_line = line;
-    return IMD_STATUS_INVALID_VALUE;
-  };
   // Seen keys: 0 format, 1 gpu, 2 sm_count, 3..5 peaks, 6..9 strings, 10 l2_bytes, then the
   // params, then (format 2) the kernels, the scalar keys and the bands.
   constexpr int kFixed = 11;
@@ -697,14 +727,30 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
   constexpr int kScalarSlot = kKernelSlot + IMD_PERF_KERNEL_COUNT;
   constexpr int kBandSlot = kScalarSlot + kScalarKeyCount;  // 3 call bands, then the classes
   constexpr int kSeen = kBandSlot + 3 + IMD_PERF_CLASS_COUNT;
-  bool seen[kSeen] = {};
+  int32_t seen[kSeen] = {};   // the line of each key seen (0: not seen)
   int32_t first_v2_line = 0;  // the first line of a format-2-only key
+  std::string first_v2_key;
   StrField strs[5] = {{"gpu", r.gpu, sizeof r.gpu},
                       {"date", r.date, sizeof r.date},
                       {"version", r.version, sizeof r.version},
                       {"clocks", r.clocks, sizeof r.clocks},
                       {"notes", r.notes, sizeof r.notes}};
   const int str_seen[5] = {1, 6, 7, 8, 9};
+  // The canonical key of a slot (MISSING_KEY names it).
+  const auto slot_key = [&](int slot) -> std::string {
+    static const char* const kFixedKeys[kFixed] = {
+        "format", "gpu", "sm_count", "peak_dram_bytes_per_s", "peak_int8_ops_per_s",
+        "peak_fp64_flops_per_s", "date", "version", "clocks", "notes", "l2_bytes"};
+    if (slot < kFixed) return kFixedKeys[slot];
+    if (slot < kKernelSlot) {
+      const int cl = (slot - kFixed) / kP, j = (slot - kFixed) % kP;
+      return std::string(kClassNames[cl]) + "." + kParamNames[cl][j];
+    }
+    if (slot < kScalarSlot) return std::string("kernel.") + kernel_name(slot - kKernelSlot);
+    if (slot < kBandSlot) return kScalarKeys[slot - kScalarSlot].key;
+    const int b = slot - kBandSlot;
+    return b < 3 ? std::string(kBandCallKeys[b]) : std::string("band.") + kClassNames[b - 3];
+  };
   int32_t line = 0;
   size_t pos = 0;
   while (pos <= text.size()) {
@@ -719,22 +765,28 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
       continue;
     }
     const size_t eq = s.find('=');
-    if (eq == std::string_view::npos) return fail(line);
+    if (eq == std::string_view::npos)
+      return calib_fail(err, line, IMD_PERF_CALIB_ERR_SYNTAX, "",
+                        "'" + printable(s, 40) + "' is not 'key = value', a '#' comment or blank");
     const std::string_view key = trim(s.substr(0, eq)), val = trim(s.substr(eq + 1));
+    const auto bad = [&](const char* want) {
+      return calib_fail(err, line, IMD_PERF_CALIB_ERR_VALUE, key,
+                        "invalid value '" + printable(val, 40) + "' (want " + want + ")");
+    };
     int slot = -1;
     bool v2 = false;
     if (key == "format") {
       int64_t f = 0;
-      if (!parse_int(val, &f) || (f != 1 && f != 2)) return fail(line);
+      if (!parse_int(val, &f) || (f != 1 && f != 2)) return bad("1 or 2");
       r.format = static_cast<int32_t>(f), slot = 0;
     } else if (key == "sm_count") {
       int64_t s2 = 0;
-      if (!parse_int(val, &s2) || s2 < 1 || s2 > 1000000) return fail(line);
+      if (!parse_int(val, &s2) || s2 < 1 || s2 > 1000000) return bad("an integer in [1, 1000000]");
       r.sm_count = static_cast<int32_t>(s2), slot = 2;
     } else if (key == "peak_dram_bytes_per_s" || key == "peak_int8_ops_per_s" ||
                key == "peak_fp64_flops_per_s" || key == "l2_bytes") {
       double d = 0;
-      if (!parse_number(val, &d) || !(d > 0)) return fail(line);
+      if (!parse_number(val, &d) || !(d > 0)) return bad("a finite number > 0");
       if (key == "peak_dram_bytes_per_s") r.peak_dram_bytes_per_s = d, slot = 3;
       else if (key == "peak_int8_ops_per_s") r.peak_int8_ops_per_s = d, slot = 4;
       else if (key == "peak_fp64_flops_per_s") r.peak_fp64_flops_per_s = d, slot = 5;
@@ -744,10 +796,10 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
       for (int k = 0; k < IMD_PERF_KERNEL_COUNT && slot < 0; ++k) {
         if (nm != kernel_name(k)) continue;
         double d[4];
-        if (!parse_numbers(val, d, 4)) return fail(line);
-        for (const double q : d)
-          if (q != std::floor(q) || q < 0 || q > 1e9) return fail(line);
-        if (d[0] < 1) return fail(line);
+        bool ok = parse_numbers(val, d, 4) && d[0] >= 1;
+        for (int i = 0; ok && i < 4; ++i)
+          ok = d[i] == std::floor(d[i]) && d[i] >= 0 && d[i] <= 1e9;
+        if (!ok) return bad("4 integers 'resident regs smem threads' <= 1e9, resident >= 1");
         r.kernel[k] = {static_cast<int32_t>(d[0]), static_cast<int32_t>(d[1]),
                        static_cast<int32_t>(d[2]), static_cast<int32_t>(d[3])};
         slot = kKernelSlot + k, v2 = true;
@@ -760,7 +812,8 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
       for (int cl = 0; cl < IMD_PERF_CLASS_COUNT && idx < 0; ++cl)
         if (key.substr(5) == kClassNames[cl]) idx = 3 + cl;
       if (idx >= 0) {
-        if (!parse_numbers(val, d, 2) || !(d[0] > 0) || !(d[0] <= d[1])) return fail(line);
+        if (!parse_numbers(val, d, 2) || !(d[0] > 0) || !(d[0] <= d[1]))
+          return bad("two numbers 'lo hi', 0 < lo <= hi");
         double* dst = idx < 3 ? r.band_call[idx] : r.band_class[idx - 3];
         dst[0] = d[0], dst[1] = d[1];
         slot = kBandSlot + idx, v2 = true;
@@ -769,13 +822,16 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
       for (int i = 0; i < kScalarKeyCount && slot < 0; ++i)
         if (key == kScalarKeys[i].key) {
           double d = 0;
-          if (!parse_number(val, &d) || d < 0) return fail(line);
+          if (!parse_number(val, &d) || d < 0) return bad("a finite number >= 0");
           r.*(kScalarKeys[i].field) = d;
           slot = kScalarSlot + i, v2 = true;
         }
       for (int i = 0; i < 5 && slot < 0; ++i)
         if (key == strs[i].key) {
-          if (val.size() >= strs[i].cap) return fail(line);
+          if (val.size() >= strs[i].cap)
+            return calib_fail(err, line, IMD_PERF_CALIB_ERR_TOO_LONG, key,
+                              "value is " + std::to_string(val.size()) +
+                                  " bytes, the field holds " + std::to_string(strs[i].cap - 1));
           std::memcpy(strs[i].dst, val.data(), val.size());
           strs[i].dst[val.size()] = '\0';
           slot = str_seen[i];
@@ -788,7 +844,8 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
           for (int j = 0; j < kP; ++j)
             if (kParamNames[cl][j] != nullptr && feat == kParamNames[cl][j]) {
               double d = 0;
-              if (!parse_number(val, &d) || (cl != IMD_PERF_CLASS_CALL && d < 0)) return fail(line);
+              if (!parse_number(val, &d) || (cl != IMD_PERF_CLASS_CALL && d < 0))
+                return bad(cl == IMD_PERF_CLASS_CALL ? "a finite number" : "a finite number >= 0");
               r.param[cl * kP + j] = d;
               slot = kFixed + cl * kP + j;
               v2 = kFormat2Param[cl][j];
@@ -796,29 +853,40 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
         }
       }
     }
-    if (slot < 0 || seen[slot]) return fail(line);  // unknown or repeated key
-    seen[slot] = true;
-    if (v2 && first_v2_line == 0) first_v2_line = line;
+    if (slot < 0) return calib_fail(err, line, IMD_PERF_CALIB_ERR_UNKNOWN_KEY, key, "unknown key");
+    if (seen[slot] != 0)
+      return calib_fail(err, line, IMD_PERF_CALIB_ERR_REPEATED_KEY, key,
+                        "repeated key (first on line " + std::to_string(seen[slot]) + ")");
+    seen[slot] = line;
+    if (v2 && first_v2_line == 0) first_v2_line = line, first_v2_key = std::string(key);
     if (eol == text.size()) break;
   }
   // Required: format, gpu, sm_count, the peaks and every parameter of the format; format 2
-  // also every kernel, scalar and band key. A format-2 key in a format-1 file is unknown.
+  // also every kernel, scalar and band key. A format-2 key in a format-1 file is rejected.
+  const auto missing = [&](int slot) {
+    return calib_fail(err, 0, IMD_PERF_CALIB_ERR_MISSING_KEY, slot_key(slot), "missing key");
+  };
   for (const int i : {0, 1, 2, 3, 4, 5, 10})
-    if (!seen[i]) return fail(0);
+    if (seen[i] == 0) return missing(i);
   const bool f2 = r.format == 2;
-  if (!f2 && first_v2_line != 0) return fail(first_v2_line);
+  if (!f2 && first_v2_line != 0)
+    return calib_fail(err, first_v2_line, IMD_PERF_CALIB_ERR_FORMAT2_KEY, first_v2_key,
+                      "a format-2 key in a format-1 calibration");
   for (int cl = 0; cl < IMD_PERF_CLASS_COUNT; ++cl)
     for (int j = 0; j < kP; ++j)
       if (kParamNames[cl][j] != nullptr && (f2 || !kFormat2Param[cl][j]) &&
-          !seen[kFixed + cl * kP + j])
-        return fail(0);
+          seen[kFixed + cl * kP + j] == 0)
+        return missing(kFixed + cl * kP + j);
   if (f2) {
     for (int i = kKernelSlot; i < kSeen; ++i)
-      if (!seen[i]) return fail(0);
+      if (seen[i] == 0) return missing(i);
     if (r.power_cap_w > 0 && !(r.clock_eff_mhz > 0 && r.clock_min_mhz > 0 &&
                                r.clock_min_mhz <= r.clock_eff_mhz))
-      return fail(0);
-    if (!(r.tie_ratio >= 1 && r.tie_ratio <= 1.25)) return fail(0);
+      return calib_fail(err, 0, IMD_PERF_CALIB_ERR_INCONSISTENT, "power.clock_min_mhz",
+                        "power.cap_w > 0 needs 0 < power.clock_min_mhz <= power.clock_eff_mhz");
+    if (!(r.tie_ratio >= 1 && r.tie_ratio <= 1.25))
+      return calib_fail(err, 0, IMD_PERF_CALIB_ERR_INCONSISTENT, "rank.tie_ratio",
+                        "must be in [1, 1.25]");
     for (int k = IMD_PERF_KERNEL_COUNT; k < IMD_PERF_KERNEL_CAPACITY; ++k) r.kernel[k] = {};
     for (int cl = IMD_PERF_CLASS_COUNT; cl < IMD_PERF_CLASS_CAPACITY; ++cl)
       r.band_class[cl][0] = r.band_class[cl][1] = 1;
@@ -830,7 +898,7 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, int32_t* 
   if (out->struct_size < kCalibV7Size) to_format1_params(&r);
   r.struct_size = out->struct_size;
   std::memcpy(out, &r, std::min<size_t>(out->struct_size, sizeof r));
-  if (error_line != nullptr) *error_line = 0;
+  if (err != nullptr) *err = CalibErr{};
   return IMD_STATUS_SUCCESS;
 }
 
@@ -912,20 +980,29 @@ std::string format_calib(const imd_perf_calib_t& c) {
 }
 
 // The shipped calibration, parsed once (C++11 thread-safe initialization of a function-local
-// static; immutable afterwards, so the model keeps no mutable state). A NULL calibration
-// pointer anywhere means this one, at its full (v7) size: the recommended way to use it.
-const imd_perf_calib_t* shipped_calib() {
-  static const imd_perf_calib_t kShipped = [] {
-    imd_perf_calib_t c;
-    std::memset(&c, 0, sizeof c);
-    c.struct_size = sizeof c;
-    if (parse_calib(std::string_view(kPerfCalibDefault, sizeof kPerfCalibDefault - 1), &c,
-                    nullptr) != IMD_STATUS_SUCCESS)
-      c.format = 0;  // unreachable: the shipped file is tested (perf_calib_shipped)
-    return c;
+// static; immutable afterwards, so the model keeps no mutable state), with its parse error
+// (host API 10: kept, so imd_perf_calib_default_ex can say why; CMake and host_c_api / host_perf
+// make a failure unreachable in a correct build). A NULL calibration pointer anywhere means
+// this one, at its full (v7) size: the recommended way to use it.
+struct Shipped {
+  imd_perf_calib_t cal;
+  CalibErr err;  // reason OK, or why the embedded text did not parse (cal.format = 0)
+};
+const Shipped& shipped() {
+  static const Shipped kShipped = [] {
+    Shipped s;
+    std::memset(&s.cal, 0, sizeof s.cal);
+    s.cal.struct_size = sizeof s.cal;
+    if (parse_calib(std::string_view(kPerfCalibDefault, sizeof kPerfCalibDefault - 1), &s.cal,
+                    &s.err) != IMD_STATUS_SUCCESS) {
+      s.cal.format = 0;
+      s.err.message = "shipped calibration: " + s.err.message;
+    }
+    return s;
   }();
-  return &kShipped;
+  return kShipped;
 }
+const imd_perf_calib_t* shipped_calib() { return &shipped().cal; }
 
 // The calibration a function uses: the shipped one (NULL; no copy), or the caller's,
 // validated and copied into *scratch with the v7 fields of a format-1 or version-6-sized
@@ -952,6 +1029,93 @@ imd_status_t resolve_calib(const imd_perf_calib_t* in, imd_perf_calib_t* scratch
   }
   cal->struct_size = sizeof *cal;
   return IMD_STATUS_SUCCESS;
+}
+
+// ---- the calibration functions (host API 10: with the reason) -----------------------------
+
+static_assert(sizeof(imd_perf_calib_error_t) == 272, "imd_perf_calib_error_t v1 layout");
+constexpr uint32_t kCalibErrMinSize = 16;  // struct_size, line, reason, reserved
+
+imd_status_t calib_default(imd_perf_calib_t* out, CalibErr* e) {
+  if (out == nullptr || out->struct_size < kCalibV1Size)
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_ARGUMENT, "", "out is NULL or undersized");
+  // The parsed-once shipped calibration, the caller's struct_size bytes of it (a version-6
+  // caller gets its format-1 view: the v7 fields do not fit; NULL is the full one).
+  const Shipped& sh = shipped();
+  if (sh.cal.format == 0) {
+    if (e != nullptr) *e = sh.err;
+    return IMD_STATUS_INVALID_VALUE;
+  }
+  imd_perf_calib_t c = sh.cal;
+  if (out->struct_size < kCalibV7Size) to_format1_params(&c);
+  c.struct_size = out->struct_size;
+  std::memcpy(out, &c, std::min<size_t>(out->struct_size, sizeof c));
+  return IMD_STATUS_SUCCESS;
+}
+
+imd_status_t calib_parse(const char* text, size_t length, imd_perf_calib_t* out, CalibErr* e) {
+  if ((text == nullptr && length > 0) || out == nullptr || out->struct_size < kCalibV1Size)
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_ARGUMENT, "",
+                      "text is NULL with length > 0, or out is NULL or undersized");
+  return parse_calib(std::string_view(text == nullptr ? "" : text, length), out, e);
+}
+
+imd_status_t calib_load(const char* path, imd_perf_calib_t* out, CalibErr* e) {
+  if (path == nullptr || out == nullptr || out->struct_size < kCalibV1Size)
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_ARGUMENT, "",
+                      "path or out is NULL, or out is undersized");
+  std::FILE* f = std::fopen(path, "rb");
+  if (f == nullptr)
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_FILE, "",
+                      "cannot open '" + printable(path, 120) + "'");
+  std::string text;
+  char buf[4096];
+  size_t got = 0;
+  while ((got = std::fread(buf, 1, sizeof buf, f)) > 0 && text.size() < (size_t{1} << 20))
+    text.append(buf, got);
+  const bool rd_err = std::ferror(f) != 0;
+  std::fclose(f);
+  if (rd_err)
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_FILE, "",
+                      "read error on '" + printable(path, 120) + "'");
+  if (text.size() >= (size_t{1} << 20))
+    return calib_fail(e, 0, IMD_PERF_CALIB_ERR_FILE, "",
+                      "'" + printable(path, 120) + "' is 1 MiB or larger");
+  return parse_calib(text, out, e);
+}
+
+// The functions without _ex: the status and error line of f's CalibErr (unchanged results).
+template <class F>
+imd_status_t with_line(int32_t* error_line, F&& f) {
+  if (error_line != nullptr) *error_line = 0;
+  return guarded([&] {
+    CalibErr e;
+    const imd_status_t st = f(&e);
+    if (error_line != nullptr) *error_line = st == IMD_STATUS_SUCCESS ? 0 : e.line;
+    return st;
+  });
+}
+
+// The _ex functions: the same status and *err filled (its struct_size bytes; < 16:
+// INVALID_VALUE, nothing written). An exception (allocation) leaves reason OK.
+template <class F>
+imd_status_t with_error(imd_perf_calib_error_t* err, F&& f) {
+  if (err != nullptr && err->struct_size < kCalibErrMinSize) return IMD_STATUS_INVALID_VALUE;
+  CalibErr e;
+  const imd_status_t st = guarded([&] { return f(&e); });
+  if (err != nullptr) {
+    imd_perf_calib_error_t r;
+    std::memset(&r, 0, sizeof r);
+    r.struct_size = err->struct_size;
+    if (st != IMD_STATUS_SUCCESS) {
+      r.line = e.line;
+      r.reason = e.reason;
+      std::snprintf(r.key, sizeof r.key, "%s", e.key.c_str());
+      std::snprintf(r.message, sizeof r.message, "%s", e.message.c_str());
+    }
+    std::memcpy(err, &r, std::min<size_t>(err->struct_size, sizeof r));
+  }
+  return st;
 }
 
 // ---- prediction ---------------------------------------------------------------------------
@@ -1085,9 +1249,11 @@ int32_t dispatch_of(const ExecPlan& e) {
 // The contract prediction of a lowered packing: status, and on SUCCESS *r filled.
 imd_status_t predict_contract(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
                               const imd_options_t* options, const imd_packing_t* packing,
-                              const Req& q, const imd_perf_calib_t& cal, imd_perf_t* r) {
+                              const KAlignSel& sel, const Req& q, const imd_perf_calib_t& cal,
+                              imd_perf_t* r) {
   Analysis an;
-  if (const imd_status_t st = analyze_with(A, B, C, options, packing, &an); st != IMD_STATUS_SUCCESS)
+  if (const imd_status_t st = analyze_with(A, B, C, options, sel, packing, &an);
+      st != IMD_STATUS_SUCCESS)
     return st;
   ExecPlan e;
   if (const imd_status_t st = plan_data(an, &e); st != IMD_STATUS_SUCCESS) return st;
@@ -1107,10 +1273,10 @@ imd_status_t predict_contract(const imd_tensor_t* A, const imd_tensor_t* B, cons
   return IMD_STATUS_SUCCESS;
 }
 
-imd_status_t predict_pack(const imd_pack_desc_t& d, const Req& q, const imd_perf_calib_t& cal,
-                          imd_perf_t* r) {
+imd_status_t predict_pack(const imd_pack_desc_t& d, const KAlignSel& sel, const Req& q,
+                          const imd_perf_calib_t& cal, imd_perf_t* r) {
   PackLowered pl;
-  if (const imd_status_t st = pack_lower(d, &pl); st != IMD_STATUS_SUCCESS) return st;
+  if (const imd_status_t st = pack_lower(d, sel, &pl); st != IMD_STATUS_SUCCESS) return st;
   PerfPhases P;
   perf_pack_phases(pl, cal, q.eps, &P);
   r->dispatch = IMD_DISPATCH_EMULATE;
@@ -1181,48 +1347,58 @@ const char* imd_perf_phase_name(int32_t phase) {
 const char* imd_perf_kernel_name(int32_t kernel) { return imd::detail::kernel_name(kernel); }
 
 imd_status_t imd_perf_calib_default(imd_perf_calib_t* out) {
-  if (out == nullptr || out->struct_size < imd::detail::kCalibV1Size) return IMD_STATUS_INVALID_VALUE;
-  return imd::detail::guarded([&] {
-    // The parsed-once shipped calibration, the caller's struct_size bytes of it (a version-6
-    // caller gets its format-1 view: the v7 fields do not fit; NULL is the full one).
-    imd_perf_calib_t c = *imd::detail::shipped_calib();
-    if (c.format == 0) return IMD_STATUS_INVALID_VALUE;
-    if (out->struct_size < imd::detail::kCalibV7Size) imd::detail::to_format1_params(&c);
-    c.struct_size = out->struct_size;
-    std::memcpy(out, &c, std::min<size_t>(out->struct_size, sizeof c));
-    return IMD_STATUS_SUCCESS;
+  return imd::detail::with_line(nullptr, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_default(out, e);
+  });
+}
+
+imd_status_t imd_perf_calib_default_ex(imd_perf_calib_t* out, imd_perf_calib_error_t* err) {
+  return imd::detail::with_error(err, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_default(out, e);
   });
 }
 
 imd_status_t imd_perf_calib_parse(const char* text, size_t length, imd_perf_calib_t* out,
                                   int32_t* error_line) {
-  if (error_line != nullptr) *error_line = 0;
-  if ((text == nullptr && length > 0) || out == nullptr ||
-      out->struct_size < imd::detail::kCalibV1Size)
-    return IMD_STATUS_INVALID_VALUE;
-  return imd::detail::guarded([&] {
-    return imd::detail::parse_calib(std::string_view(text == nullptr ? "" : text, length), out,
-                                    error_line);
+  return imd::detail::with_line(error_line, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_parse(text, length, out, e);
+  });
+}
+
+imd_status_t imd_perf_calib_parse_ex(const char* text, size_t length, imd_perf_calib_t* out,
+                                     imd_perf_calib_error_t* err) {
+  return imd::detail::with_error(err, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_parse(text, length, out, e);
   });
 }
 
 imd_status_t imd_perf_calib_load(const char* path, imd_perf_calib_t* out, int32_t* error_line) {
-  if (error_line != nullptr) *error_line = 0;
-  if (path == nullptr || out == nullptr || out->struct_size < imd::detail::kCalibV1Size)
-    return IMD_STATUS_INVALID_VALUE;
-  return imd::detail::guarded([&] {
-    std::FILE* f = std::fopen(path, "rb");
-    if (f == nullptr) return IMD_STATUS_INVALID_VALUE;
-    std::string text;
-    char buf[4096];
-    size_t got = 0;
-    while ((got = std::fread(buf, 1, sizeof buf, f)) > 0 && text.size() < (size_t{1} << 20))
-      text.append(buf, got);
-    const bool err = std::ferror(f) != 0;
-    std::fclose(f);
-    if (err || text.size() >= (size_t{1} << 20)) return IMD_STATUS_INVALID_VALUE;
-    return imd::detail::parse_calib(text, out, error_line);
+  return imd::detail::with_line(error_line, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_load(path, out, e);
   });
+}
+
+imd_status_t imd_perf_calib_load_ex(const char* path, imd_perf_calib_t* out,
+                                    imd_perf_calib_error_t* err) {
+  return imd::detail::with_error(err, [&](imd::detail::CalibErr* e) {
+    return imd::detail::calib_load(path, out, e);
+  });
+}
+
+const char* imd_perf_calib_error_name(int32_t reason) {
+  static const char* const kNames[IMD_PERF_CALIB_ERR_COUNT] = {
+      "IMD_PERF_CALIB_OK",
+      "IMD_PERF_CALIB_ERR_ARGUMENT",
+      "IMD_PERF_CALIB_ERR_FILE",
+      "IMD_PERF_CALIB_ERR_SYNTAX",
+      "IMD_PERF_CALIB_ERR_UNKNOWN_KEY",
+      "IMD_PERF_CALIB_ERR_REPEATED_KEY",
+      "IMD_PERF_CALIB_ERR_VALUE",
+      "IMD_PERF_CALIB_ERR_TOO_LONG",
+      "IMD_PERF_CALIB_ERR_MISSING_KEY",
+      "IMD_PERF_CALIB_ERR_FORMAT2_KEY",
+      "IMD_PERF_CALIB_ERR_INCONSISTENT"};
+  return reason >= 0 && reason < IMD_PERF_CALIB_ERR_COUNT ? kNames[reason] : nullptr;
 }
 
 imd_status_t imd_perf_calib_format(const imd_perf_calib_t* calib, char* buf, size_t capacity,
@@ -1270,7 +1446,8 @@ imd_status_t imd_perf_predict(const imd_tensor_t* A, const imd_tensor_t* B, cons
     if (const imd_status_t st = imd::detail::resolve_calib(calib, &scratch, &cal);
         st != IMD_STATUS_SUCCESS)
       return st;
-    return imd::detail::predict_contract(A, B, C, options, packing, q, *cal, &r);
+    return imd::detail::predict_contract(A, B, C, options, packing,
+                                         imd::detail::k_align_sel(), q, *cal, &r);
   });
   return imd::detail::finish(r, out);
 }
@@ -1292,7 +1469,7 @@ imd_status_t imd_perf_predict_pack(const imd_pack_desc_t* desc,
     if (const imd_status_t st = imd::detail::resolve_calib(calib, &scratch, &cal);
         st != IMD_STATUS_SUCCESS)
       return st;
-    return imd::detail::predict_pack(*desc, q, *cal, &r);
+    return imd::detail::predict_pack(*desc, imd::detail::k_align_sel(), q, *cal, &r);
   });
   return imd::detail::finish(r, out);
 }
@@ -1336,6 +1513,8 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
     if (const imd_status_t st = resolve_calib(calib, &scratch, &calp); st != IMD_STATUS_SUCCESS)
       return st;
     const imd_perf_calib_t& cal = *calp;
+    // DESIGN §4b.5: one hook snapshot for every candidate's plan and packs.
+    const KAlignSel sel = k_align_sel();
     const int32_t vec_mask = req->vec_modes != 0 ? req->vec_modes : IMD_PERF_VEC_GENERATE;
     const int32_t pack_mask = req->pack_modes != 0 ? req->pack_modes : IMD_PERF_PACK_NONE;
     struct Cand {
@@ -1378,22 +1557,23 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
               labels[x].assign(static_cast<size_t>(std::max(X->rank, 1)), 0);
               std::memset(&desc[x], 0, sizeof desc[x]);
               desc[x].struct_size = sizeof desc[x];
-              st = imd_pack_desc_for(A, B, C, &o, x, &desc[x], labels[x].data(),
-                                     static_cast<int32_t>(labels[x].size()));
+              st = pack_desc_for(A, B, C, &o, sel, x, &desc[x], labels[x].data(),
+                                 static_cast<int32_t>(labels[x].size()));
             }
             const imd_packing_t packing = {(packed & 1) ? &desc[0] : nullptr,
                                            (packed & 2) ? &desc[1] : nullptr};
             imd_perf_t pr;
             std::memset(&pr, 0, sizeof pr);
             if (st == IMD_STATUS_SUCCESS)
-              st = predict_contract(A, B, C, &o, packed ? &packing : nullptr, q, cal, &pr);
+              st = predict_contract(A, B, C, &o, packed ? &packing : nullptr, sel, q, cal,
+                                    &pr);
             double pack_s = 0, pack_eps = 0, pack_lo = 0, pack_hi = 0;
             uint64_t pack_bytes = 0, pack_ws = 0;
             for (int x = 0; x < 2 && st == IMD_STATUS_SUCCESS; ++x) {
               if (!(packed & (1 << x))) continue;
               imd_perf_t pp;
               std::memset(&pp, 0, sizeof pp);
-              st = predict_pack(desc[x], q, cal, &pp);
+              st = predict_pack(desc[x], sel, q, cal, &pp);
               pack_s += pp.time_s;
               pack_eps += pp.eps_s;
               pack_lo += pp.time_lo_s;

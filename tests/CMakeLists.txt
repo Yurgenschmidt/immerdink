@@ -6,6 +6,20 @@
 add_executable(test_host_c test_host_c.c)
 target_link_libraries(test_host_c PRIVATE immerdink_host imd_warnings)
 add_test(NAME host_c_api COMMAND test_host_c)
+# Host API 10 (DESIGN §6c.3): the configure-time string check of a calibration file passes on
+# the shipped file and fails on a notes value one byte over its field.
+add_test(NAME calib_strings_shipped
+         COMMAND "${CMAKE_COMMAND}"
+                 "-DIMD_CALIB_FILE=${PROJECT_SOURCE_DIR}/src/host/calib/rtx4090_sm89.calib"
+                 -P "${PROJECT_SOURCE_DIR}/src/host/calib/check_strings.cmake")
+add_test(NAME calib_strings_too_long
+         COMMAND "${CMAKE_COMMAND}"
+                 "-DIMD_CALIB_FILE=${CMAKE_CURRENT_SOURCE_DIR}/data/perf_calib_notes_too_long.calib"
+                 -P "${PROJECT_SOURCE_DIR}/src/host/calib/check_strings.cmake")
+# (CMake wraps the message: blanks or line breaks between the words; no ';' in a regex here,
+# a property value is a list.)
+set_tests_properties(calib_strings_too_long PROPERTIES PASS_REGULAR_EXPRESSION
+  "too_long[.]calib:9:[ \n]+'notes'[ \n]+is[ \n]+128[ \n]+bytes.[ \n]+the[ \n]+calibration[ \n]+field[ \n]+holds[ \n]+127")
 
 if(Python3_FOUND)
   # The host library and its C++ lowering vs spec/params.py on generated descriptors: the
@@ -133,7 +147,7 @@ if(Python3_FOUND)
   # contract_highrank (operand ranks 6-12) has hard size guards; run it alone with
   # `tools/test.sh -R contract_highrank`, or skip it with `-E contract_highrank`.
   set(shim "$<TARGET_FILE:imd_alloc_shim>")
-  foreach(suite api stages e2e tensor bigk replay every_n k_align)
+  foreach(suite api stages e2e tensor bigk replay every_n k_align pad_mutation)
     add_test(NAME contract_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                      --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
@@ -148,6 +162,28 @@ if(Python3_FOUND)
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
   set_tests_properties(contract_highrank PROPERTIES TIMEOUT 300)
+  # DESIGN v1.13 §4b.8 (hygiene): the initcheck mutation test for one-sided padding. Needs
+  # compute-sanitizer: IMMERDINK_COMPUTE_SANITIZER (a path; tools/test.sh passes the variable
+  # of the same name), else found next to nvcc; without it the test is not registered.
+  set(IMMERDINK_COMPUTE_SANITIZER "" CACHE FILEPATH "compute-sanitizer (contract_initcheck_pad)")
+  set(_imd_san "${IMMERDINK_COMPUTE_SANITIZER}")
+  if(NOT _imd_san)
+    find_program(IMD_COMPUTE_SANITIZER_FOUND compute-sanitizer
+                 HINTS "${CUDAToolkit_BIN_DIR}" "${CUDAToolkit_BIN_DIR}/../compute-sanitizer")
+    if(IMD_COMPUTE_SANITIZER_FOUND)
+      set(_imd_san "${IMD_COMPUTE_SANITIZER_FOUND}")
+    endif()
+  endif()
+  if(_imd_san)
+    add_test(NAME contract_initcheck_pad
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/initcheck_pad_mutation.sh" "${_imd_san}"
+                     "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                     "$<TARGET_FILE:immerdink>")
+    set_tests_properties(contract_initcheck_pad PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+  else()
+    message(STATUS "compute-sanitizer not found: contract_initcheck_pad not registered "
+                   "(set IMMERDINK_COMPUTE_SANITIZER)")
+  endif()
   # DESIGN v1.7 §6b packed operands: imd_pack (every byte) and imd_contract_packed vs
   # spec/oracle.py, bit for bit, with the allocation shim; reuse; statuses.
   foreach(suite packed reuse api k_align)
