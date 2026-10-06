@@ -149,8 +149,11 @@ MAX_WORKSPACE = 512 << 20     # device workspace bytes per case
 
 
 def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, rounding="RN",
-             mode=o.EMULATE, rng=None, expect_kind=None, verbose=False, chunk=o.K_C_ALIGNED):
+             mode=o.EMULATE, rng=None, expect_kind=None, verbose=False, chunk=o.K_C_ALIGNED,
+             k4_expect=None):
     """Run one contraction on the GPU and in the oracle; raise Fail on any difference.
+    `k4_expect` (test hooks, GEMM): {"k_hat", "store", "add", "launches"} that every plan's K4
+    footprint (imd_test_plan_sizes: k_hat, store-/add-mod shape keys, launches) must equal.
     The workspace sits between two GUARD-byte poisoned zones that must stay untouched (the
     library touches only [ws, ws + workspace_size)); with the allocation shim loaded,
     imd_contract must not allocate. `chunk` is the oracle's K-chunk length (the library's
@@ -256,6 +259,12 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
                 lib.plan_destroy(plan)
                 raise Fail(f"{vname}: plan K4 configuration {cfg} / {k4p_cfg}, wanted {k4}")
             STATS["k4"][cfg] = STATS["k4"].get(cfg, 0) + 1
+            if k4_expect is not None:
+                v = lib.plan_sizes(plan)
+                got_k4 = {"k_hat": v[7], "store": v[28], "add": v[29], "launches": v[30]}
+                if got_k4 != k4_expect:
+                    lib.plan_destroy(plan)
+                    raise Fail(f"{vname}: plan K4 footprint {got_k4}, expected {k4_expect}")
         dA, dB, dC = cuda.malloc(bufA.nbytes), cuda.malloc(bufB.nbytes), cuda.malloc(bufC.nbytes)
         dW = cuda.malloc(ws_bytes + 2 * GUARD)
         try:
@@ -624,6 +633,28 @@ def suite_bigk(lib, cuda, verbose):
         run_case(lib, cuda, f"bigk window k={k} ({chunks} chunks, {m}x{n}, N={N} g={g} {rnd})", A, B,
                  C, TA, TB, gen(rng, (m, n), "uniform"), 1.0, 0.25, N, g, rnd, rng=rng,
                  expect_kind="GEMM", verbose=verbose)
+    # Review 2026-10-05: whole-chunk multiples of K_c'. k_hat = 2 K_c' is two full chunks, so
+    # the add-mod launch has the store-mod kc (131008); k_hat = 3 K_c' is three full chunks,
+    # and the add-mod shape of the last chunk dedupes with the full one (one add-mod shape
+    # key). The chunk counts are asserted here (params.k_chunk_list) and on the plan
+    # (launches = chunks x groups; m, n tiny so one batch part and one n part per chunk).
+    for (m, n, nch, N, g, rnd, a_kf, b_kf) in (
+            (2, 1, 2, 3, 0, "RN", True, False),             # k_hat = 262016
+            (1, 2, 3, 4, 3, "TRUNC", False, True)):         # k_hat = 393024, groups 3 + 1
+        k = nch * KP
+        chunks = params.k_chunk_list(params.k_hat_of(k))
+        if params.k_hat_of(k) != k or chunks != [(c * KP, KP) for c in range(nch)]:
+            raise Fail(f"bigk k={k}: chunks {chunks}, expected {nch} full chunks of {KP}")
+        gg = N if g == 0 else g
+        groups = [gg] * (N // gg) + ([N % gg] if N % gg else [])
+        expect = {"k_hat": k, "store": len(set(groups)), "add": len(set(groups)),
+                  "launches": nch * len(groups)}
+        A, B, C = matrix(rng, m, n, k, a_kfast=a_kf, b_kfast=b_kf)
+        TA, TB = gen(rng, (m, k), "phi"), gen(rng, (k, n), "wide")
+        TA[0, k - 3] = math.inf                # in the last full chunk
+        run_case(lib, cuda, f"bigk k={k} ({nch} full chunks, {m}x{n}, N={N} g={g} {rnd})", A, B,
+                 C, TA, TB, gen(rng, (m, n), "uniform"), 1.0, -0.5, N, g, rnd, rng=rng,
+                 expect_kind="GEMM", verbose=verbose, k4_expect=expect)
     # A4: long rows with more rows than K1's L2-capped grid (k = 32768: 160 rows in flight),
     # so K1 takes two 512-thread blocks per SM (contract.cu launch_k1).
     k = 32768

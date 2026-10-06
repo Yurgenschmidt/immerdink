@@ -921,7 +921,9 @@ def cert_row_phase():
     is r k_hat mod 64 in a full chunk and (r + 1) k_hat mod 64 in the last one (e_c = k_hat):
     the set of phases over the rows, hence the phase class, depends on k_hat alone. The old
     K_c' = 131056 shifted chunk c by 48 (c + 1) (the measured slow chunk 0 of k_hat = 196608).
-    k_chunks gains one exactly in the windows k_hat in (j K_c', j 131056]."""
+    k_chunks gains one exactly in the windows k_hat in (j K_c', j 131056]; this holds while
+    the windows are disjoint, j 48 < K_c' (j <= 2729, k_hat < ~3.58e8), which covers the
+    checked list (j < 5); beyond that the counts can differ by more than one."""
     n = 0
     for k in K_BOUNDARY + list(range(1, 2000, 7)):
         kh = k_hat_of(k)
