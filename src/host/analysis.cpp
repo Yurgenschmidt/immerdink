@@ -86,6 +86,11 @@ int big_bitlen(const Big& x) {
 
 imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
                      const imd_options_t* options, Analysis* out) {
+  return analyze(A, B, C, options, k_align_sel(), out);
+}
+
+imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
+                     const imd_options_t* options, const KAlignSel& sel, Analysis* out) {
   if (A == nullptr || B == nullptr || C == nullptr || options == nullptr)
     return IMD_STATUS_INVALID_VALUE;
   if (!options_ok(*options)) return IMD_STATUS_INVALID_VALUE;
@@ -100,8 +105,9 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
   // k >= 2); not for DIRECT, K-empty or k = 0.
   if (out->options.mode == IMD_EMULATE && !lw.empty_output() && lw.k >= 2 && !gemm_dims_ok(lw))
     return IMD_STATUS_INVALID_VALUE;
-  // v1.13 §4b.5: the one resolution of A for this API call; passed explicitly from here on.
-  out->k_align = k_align_of(lw.k);
+  // v1.13 §4b.5: the one resolution of A for this analysis, from the API call's one hook
+  // snapshot `sel`; passed explicitly from here on.
+  out->k_align = sel.of(lw.k);
   const auto layout = workspace_layout({lw.m, lw.n, lw.k, lw.b, out->options.num_moduli,
                                         out->options.residue_group,
                                         out->options.mode == IMD_DIRECT,
@@ -116,7 +122,19 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
 imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
                             const imd_options_t* options, const PackSource* const src[2],
                             Analysis* out) {
-  if (const imd_status_t st = analyze(A, B, C, options, out); st != IMD_STATUS_SUCCESS) return st;
+  return analyze_packed(A, B, C, options, k_align_sel(), src, out);
+}
+
+imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
+                            const imd_options_t* options, const KAlignSel& sel,
+                            const PackSource* const src[2], Analysis* out) {
+  if (const imd_status_t st = analyze(A, B, C, options, sel, out); st != IMD_STATUS_SUCCESS)
+    return st;
+  return match_packs(A, B, src, out);
+}
+
+imd_status_t match_packs(const imd_tensor_t* A, const imd_tensor_t* B,
+                         const PackSource* const src[2], Analysis* out) {
   out->packed = PackedSlots{};
   if (src[0] == nullptr && src[1] == nullptr) return IMD_STATUS_SUCCESS;
   Lowered& lw = out->lowered;
@@ -197,7 +215,12 @@ imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B, const 
     adopt_order(&lw, role[x] == 0 ? kI : kJ, adopted[x][kPackR]);
   }
   // The slot keys, from the adopted lowering restricted to X (X's merged strides alone), with
-  // the PLAN's own format word (v1.13 §4b.5: of its resolved A, never IMD_PACK_FORMAT).
+  // the PLAN's own format word (v1.13 §4b.5: of its resolved A, never IMD_PACK_FORMAT). That
+  // is Analysis::k_align = sel.of(k), also for a plan without residue rows (DIRECT, K-empty)
+  // whose ExecPlan::k_align / imd_lowering_t.k_align is 16: such a plan reads no residues,
+  // and a pack must match it exactly when it matches the EMULATE plan of the same tensors
+  // (the mode is not in the key, §6b.2). Keying with 16 would reject every AUTO pack of
+  // k > 96 (format 2) from a DIRECT plan. DESIGN §6b.4 word 1.
   int32_t reason[2] = {0, 0};
   for (int x = 0; x < 2; ++x) {
     if (src[x] == nullptr) continue;
@@ -309,6 +332,9 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
     e.k5_batch_fast = k5_batch_fastest(lw);
     e.fused = fused_path(e);
     e.fused_large = fused_large(e);
+    // v1.13 §4b.5 (hygiene: at plan time, not per call): KF's tile row covers the whole
+    // padded row, so KF writes the zeros [k, k_hat). Unreachable (kf_lg_tk rounds up).
+    if (e.fused && (int64_t{1} << kf_lg_tk(e.k_hat)) < e.k_hat) return IMD_STATUS_INVALID_VALUE;
   }
   if (e.path != Path::kNoop) {
     // §5 step 10 (v1.2): the fused-mode descriptor K0 generates the vectors from.

@@ -510,6 +510,25 @@ def suite_k_align(lib, cuda, verbose):
                     if st != want:
                         raise Fail(f"pack A={pack_a}, plan A={plan_a}: {st}, want {want}")
                     n_mis += st == "PACK_MISMATCH"
+                    # hygiene (stage-2 code review): the reason is FORMAT (= 1; plan creation's
+                    # own analysis of the handles, imd_test_pack_mismatch), 0 on SUCCESS
+                    st2, why = lib.pack_mismatch(tA, tB, tC, 9, pa, pb)
+                    if st2 != st or why != (1 if st != "SUCCESS" else 0):
+                        raise Fail(f"pack A={pack_a}, plan A={plan_a}: reason {st2} {why}, "
+                                   f"want {st} FORMAT")
+                # imd_lowering_packed with the descriptors resolves the plan and the packs from
+                # ONE hook snapshot (DESIGN §4b.5): never FORMAT, whatever the handles had
+                raw = (C.c_uint8 * 192)()
+                C.c_uint32.from_buffer(raw, 0).value = 192
+                pk_arg, keep = packing_arg(tuple(ods))
+                lst = lib.lib.imd_lowering_packed(C.byref(tA), C.byref(tB), C.byref(tC),
+                                                  C.byref(hz.Options(9, 0, hz.RN)), pk_arg, raw)
+                if (hz.STATUS[lst] != "SUCCESS" or C.c_int32.from_buffer(raw, 180).value != 0 or
+                        C.c_int32.from_buffer(raw, 184).value != (plan_a or 64)):
+                    raise Fail(f"imd_lowering_packed under hook {plan_a}: {hz.STATUS[lst]}, "
+                               f"reason {C.c_int32.from_buffer(raw, 180).value}, k_align "
+                               f"{C.c_int32.from_buffer(raw, 184).value}")
+                del keep
             # a plan made against handles of one alignment, called with a handle of the other
             if want == "PACK_MISMATCH":
                 with tc.k_align(lib, plan_a):

@@ -923,6 +923,17 @@ Against A = 16, with `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆`:
   - in `analyze` (every sizing query, lowering and plan: `workspace_layout`, `plan_data`)
     and in `pack_lower` (`imd_pack_layout`, `imd_pack_create`, and per packed operand of a
     packed plan);
+  - **[hygiene, host API 10] the hook itself is read once per API call.** An API call that
+    analyses several things (a host query with pack descriptors: the plan and each
+    descriptor; `imd_perf_predict(_pack)`; `imd_perf_rank`: every candidate's plan and
+    packs) takes one snapshot of the hook at its entry (`KAlignSel sel = k_align_sel()`)
+    and passes it down: `analyze(…, sel)`, `pack_lower(…, sel)`, `analyze_with(…, sel)`
+    resolve `A = sel.of(k)` from it. So every A of one call comes from the same hook
+    value (a concurrent `imd_test_set_k_align` cannot split a call), and the analysis of a
+    host query with packs runs `analyze` once (it ran twice: `analyze_with`, then again in
+    `analyze_packed`; now `analyze` then `match_packs`). `k_align_of(k)` remains as
+    `k_align_sel().of(k)` for the single-analysis entry points (`imd_plan_create(_packed)`,
+    `imd_pack_create`);
   - from then on A is an explicit argument: `WorkspaceShape` and `pack_layout` take A (as
     `params.workspace_size(k_align=)` / `pack_layout(fmt=)` do), `ExecPlan` gains an
     `int32_t k_align` field (in `ExecPlan`, **not** `K4Plan`: `static_assert(sizeof(K4Plan)
@@ -939,10 +950,19 @@ Against A = 16, with `δ = ⌈k⌉₆₄ − ⌈k⌉₁₆`:
   - after a packed slot's key matches, `pl.k_hat == e.k_hat` (the handle's k̂ equals the
     plan's; `analysis.cpp` after the key comparison) or PACK_MISMATCH FORMAT;
   - a debug check (debug builds and a test) that every operand pointer `call_of` forms in
-    `gemm_k4.cu` is ≡ 0 mod A.
+    `gemm_k4.cu` is ≡ 0 mod A. **[hygiene]** It runs as a host-only pre-pass over every
+    K4 launch of the call (`k4_check_call`, before K0, so a debug-build violation fails the
+    call with nothing queued; the counts of the test hook are unchanged: one per launch).
+  **[hygiene]** KF's tile check `2^lg_tk ≥ k̂` is a plan-time check (`plan_data`, for a
+  plan that takes KF: INVALID_VALUE, unreachable), no longer evaluated per call.
 - **Python**: `python/immerdink/host.py` mirrors gain the lowering's `k_align` (struct
   v6) and the format constants; the `planner` fast path (§6e) calls C and follows. A
-  `host.test_set_k_align(a)` helper binds the hook for tests.
+  `host.test_set_k_align(a)` helper binds the hook for tests. **[hygiene]** It clears
+  `device.default_plan_cache` (a library-owned cache whose key has no A; tested). A
+  `planner.Memo` is caller-owned and keyed by the query only, so it is **not** cleared: a
+  hit after a hook change returns the result computed under the old A (tested); code that
+  sets the hook uses a fresh Memo or calls `clear()`. `planner`'s own per-Query caches hold
+  only the operand descriptors, never an A.
 
 ### 4b.6 Numerics, accuracy and the performance model **[stage 2]**
 
@@ -1694,7 +1714,16 @@ packed slot from its own lowering, and compared **word for word**:
    K alignment: 1 = A16 (k̂ = ⌈k⌉₁₆), 2 = A64 (k̂ = ⌈k⌉₆₄); a pack's format is AUTO(k) of its
    k, a slot key's that of the plan's resolved A (§4b.5). It is word 0, but a known format
    (1 or 2) is **compared last** (§6b.5 plan-time order); only an unknown word is
-   rejected first.
+   rejected first. **[hygiene] The slot key uses the resolved A of the plan's k
+   (`Analysis::k_align`), not the plan's `ExecPlan::k_align` / `imd_lowering_t.k_align`.**
+   They differ only for a plan without residue rows (DIRECT, K-empty; SCALE and NOOP have
+   no slot to fill), where the lowering reports 16 because no row is ever laid out. Such a
+   plan never reads the packed residues (DIRECT reads `data`), and §6b.2 keeps the mode out
+   of the key, so a pack must match a DIRECT plan exactly when it matches the EMULATE plan
+   of the same tensors: the pack's format is AUTO(k) of the same k (or the same hook), i.e.
+   `sel.of(k)` = `Analysis::k_align`. Keying with 16 instead would reject every AUTO pack of
+   k > 96 (format 2) from a DIRECT plan as FORMAT. The `pl.k_hat` drift check compares with
+   ⌈k⌉ of that same A.
 2. N and rounding.
 3. b, r, k.
 4. The **FP64 element map**: for each class in the order L, R, K, the fused modes
@@ -2939,6 +2968,72 @@ imd_status_t imd_perf_predict_pack(const imd_pack_desc_t*, const imd_perf_reques
   length (without the NUL), INSUFFICIENT_WORKSPACE if `capacity` ≤ length (the length is
   still reported, as `snprintf`). A calibration whose `format` is not 1 or whose `sm_count`
   < 1 is INVALID_VALUE in every function that takes one.
+- **[hygiene, host API 10] Explicit parse errors.** Before, a rejected calibration said only
+  INVALID_VALUE and a line number, and a broken *shipped* calibration (an over-long `notes`
+  line in the embedded file: every string value must fit its field, NUL included) made
+  every query with a NULL calibration return INVALID_VALUE with no hint why. The calibration
+  **format does not change**; what is added:
+  ```c
+  enum { IMD_PERF_CALIB_OK = 0,
+         IMD_PERF_CALIB_ERR_ARGUMENT = 1,     /* NULL / undersized out or err, NULL text  */
+         IMD_PERF_CALIB_ERR_FILE = 2,         /* load: cannot open / read, or >= 1 MiB     */
+         IMD_PERF_CALIB_ERR_SYNTAX = 3,       /* a line that is not blank, '#', key = value */
+         IMD_PERF_CALIB_ERR_UNKNOWN_KEY = 4,  /* also a known key of no slot (bad class)  */
+         IMD_PERF_CALIB_ERR_REPEATED_KEY = 5,
+         IMD_PERF_CALIB_ERR_VALUE = 6,        /* not a number, wrong count, out of range   */
+         IMD_PERF_CALIB_ERR_TOO_LONG = 7,     /* a string value >= its field's bytes       */
+         IMD_PERF_CALIB_ERR_MISSING_KEY = 8,  /* a key the format requires (line 0)        */
+         IMD_PERF_CALIB_ERR_FORMAT2_KEY = 9,  /* a format-2 key in a format-1 file          */
+         IMD_PERF_CALIB_ERR_INCONSISTENT = 10 /* cross-key rule: power clocks, tie_ratio  */ };
+  typedef struct {
+    uint32_t struct_size;  /* sizeof(imd_perf_calib_error_t) as the caller compiled it   */
+    int32_t  line;         /* 1-based line of the error; 0: not tied to a line           */
+    int32_t  reason;       /* IMD_PERF_CALIB_ERR_* (IMD_PERF_CALIB_OK on SUCCESS)        */
+    int32_t  reserved;     /* 0                                                          */
+    char     key[64];      /* the offending or missing key, NUL-terminated, truncated; "" */
+    char     message[192]; /* "line 9: notes: value is 133 bytes, the field holds 127"    */
+  } imd_perf_calib_error_t;                                   /* 272 bytes, version 1     */
+  imd_status_t imd_perf_calib_parse_ex(const char* text, size_t length, imd_perf_calib_t* out,
+                                       imd_perf_calib_error_t* err);  /* err may be NULL */
+  imd_status_t imd_perf_calib_load_ex(const char* path, imd_perf_calib_t* out,
+                                      imd_perf_calib_error_t* err);
+  imd_status_t imd_perf_calib_default_ex(imd_perf_calib_t* out, imd_perf_calib_error_t* err);
+  const char*  imd_perf_calib_error_name(int32_t reason);  /* "IMD_PERF_CALIB_ERR_..."; NULL */
+  ```
+  The `_ex` functions return exactly the status of the function without `_ex` and fill
+  `*err` (its first `struct_size` bytes; `struct_size` < 16 is INVALID_VALUE with nothing
+  written): on SUCCESS line 0, reason OK, key and message empty; otherwise the **first**
+  error in file order (the same line the old `error_line` reports; the old functions are
+  now wrappers and keep their results bit for bit). The required-key check after the last
+  line names the first missing key in canonical order (`imd_perf_calib_format`'s order).
+  The message is ASCII-safe (a non-printable byte of the key is written as `?`). Pure and
+  thread-safe like every other host function.
+  - **The shipped calibration** is still parsed once; its parse error (if any) is kept with
+    it (immutable). `imd_perf_calib_default(_ex)` return INVALID_VALUE with that error
+    (message prefixed `shipped calibration: `), and the functions taking a NULL
+    calibration still return INVALID_VALUE: the diagnosis is one `imd_perf_calib_default_ex`
+    away, and the Python layer (`host.Calibration`, `planner`) raises with it. A broken
+    shipped file is meant to be impossible to build: **CMake checks the embedded file at
+    configure time** (every `gpu`, `date`, `version`, `clocks`, `notes` value must fit its
+    field; a `FATAL_ERROR` names the line), `host_c_api` and `host_perf` parse it, and
+    `bench/perf_fit.py` checks what it writes (below).
+    **[hygiene-b] Consequence: in a CMake build the broken-shipped-calibration path is
+    unreachable** (a too-long string fails configure; every other parse error of the shipped
+    file fails `host_c_api` / `host_perf`), so it has **no test-only override and no direct
+    test**: what it would return is the `_ex` result of the same text, which the tests cover
+    reason by reason on non-shipped files (`calib_strings_too_long`'s vector among them), and
+    the NULL-calibration functions only forward that kept error.
+  - **Generation-time check** (`bench/perf_fit.py`): the metadata strings are checked
+    against the field sizes of the ctypes mirror (UTF-8 bytes, NUL included; no line break;
+    no leading or trailing blank, which the parser would trim), a caller's `--notes` or
+    `--version` that does not fit is an error (the generated defaults, like `clocks`, are
+    cut to fit at a UTF-8 boundary; an empty `--notes ""` / `--version ""` means the
+    generated default, as before host API 10), and
+    the written file is re-loaded (`Calibration.load`) and must format back to the same
+    text. `perf_fit.py --check FILE...` runs the same checks and the C parser on existing
+    files (exit 1 with every problem, one per line).
+  - Python: `host.CalibrationError(ValueError)` with `.line`, `.reason` (the enum name),
+    `.key`, and the message; `Calibration.parse / load / default` raise it.
 
 **Rank:**
 ```c
@@ -4052,3 +4147,78 @@ and host API; every value the same integer (bit-identical, tested on every contr
     non-negative increments (c_1 ≤ c_2 ≤ c_3), so a round of q concurrent CTAs never costs
     less than a round of q − 1. This keeps the predictions monotone in the shape (host_perf).
     The `k4_select` re-check keeps the rule and its constants.
+
+## v1.13 follow-up: hygiene (host API 10; no semantic, layout, launch, pack-format, calibration-format or spec change)
+
+- **Release note (host API 9, restated): `IMD_PACK_FORMAT` changed meaning, 1 → 2.** Up to
+  host API 8 it was *the* pack format (1). From host API 9 it is **the newest format the
+  library writes** (2 = A64); a pack's actual format is a function of its k (1 for k ≤ 96,
+  2 for k > 96) and is reported by `imd_pack_layout_t.format`. Code comparing
+  `imd_pack_layout_t.format == IMD_PACK_FORMAT` to decide whether saved bytes are reusable
+  is wrong for k ≤ 96 packs (format 1, still valid); compare with the `format` saved next
+  to the bytes instead (§4b.5 contract, §6a integration contract, §6b.5). Also in
+  NOTES-K4ALIGN §11.
+- **§6c.3: explicit calibration parse errors (host API 10, additive).**
+  `imd_perf_calib_error_t` (version 1, 272 bytes), `IMD_PERF_CALIB_ERR_*`,
+  `imd_perf_calib_parse_ex`, `_load_ex`, `_default_ex`, `imd_perf_calib_error_name`. The
+  existing functions are wrappers with unchanged results. The shipped calibration keeps its
+  parse error; CMake rejects an embedded file whose string values do not fit at configure
+  time; `bench/perf_fit.py` checks the metadata it writes and re-loads the file
+  (`--check FILE...` for existing files); Python raises `host.CalibrationError` with the
+  line, reason, key and message. **Python behaviour change:** with a broken shipped
+  file (unreachable in a CMake build, §6c.3), the `calib=None` paths (`host.predict`,
+  `host.predict_pack`, `host.rank`, `planner.Query` construction) raise `host.CalibrationError`
+  (a `ValueError`) instead of `host.ImmerdinkError` (`INVALID_VALUE`, a `RuntimeError`);
+  a caller catching `ImmerdinkError` there must also catch `CalibrationError`.
+  `bench/perf_fit.py`: `--notes ""` / `--version ""` mean the generated value (as before
+  host API 10); the generated version is cut to fit like `clocks` and `notes`. Cause: a
+  calibration whose `notes` line exceeded the
+  127-byte field failed to load, and as the shipped file it silently turned every NULL-
+  calibration perf query into INVALID_VALUE.
+- **§4b.5: the hook is read once per API call** (stage-2 code review): one `KAlignSel`
+  snapshot at the entry of each API call, passed to `analyze`, `pack_lower`,
+  `analyze_with`, the perf model's `predict_contract` / `predict_pack` and every
+  candidate of `imd_perf_rank`; a host query with pack descriptors runs `analyze` once
+  (`analyze` + `match_packs`, was `analyze` + `analyze_packed`).
+- **§6b.4 / §6b.5: the slot key of a DIRECT plan** keeps the resolved A of the plan's k
+  (not `imd_lowering_t.k_align` = 16); the reason is now stated in §6b.4 word 1.
+- **§4b.5 device checks.** KF's `2^lg_tk ≥ k̂` moved to plan time (`plan_data`). The
+  `call_of` ≡ 0 mod A check is a host pre-pass over every K4 launch before K0, so a
+  debug-build violation fails the call with nothing queued (was: mid-call, after K0–K3
+  and earlier groups' K4 launches had been queued).
+- **Tests.** C and Python tests of every calibration error reason (an over-long `notes`
+  line among them) and of the `perf_fit.py` generation check; the hook read once per call
+  (`host_k_align`: `analyze`, `pack_lower`, `analyze_packed` and `analyze_with` follow the
+  snapshot they are given, not the current hook, and `analyze_with` keeps analyze's,
+  the descriptor's and `match_packs`' status order); the FORMAT reason of a handle-based
+  mismatch asserted (`imd_test_pack_mismatch`, libimmerdink test export: plan creation's
+  analysis of handles, returning the reason); `imd_lowering_packed` with descriptors under
+  one hook value never reports FORMAT (one snapshot); `host.test_set_k_align` clears
+  `device.default_plan_cache`; `planner.Memo` is caller-owned and **not** cleared by the
+  hook (a hit after a hook change returns the result computed under the old A; tests use
+  a fresh Memo or `clear()`), documented in `planner.py` and §4b.5's Python bullet; the
+  **initcheck mutation test** for one-sided padding: the test export
+  `imd_test_set_pad_mutation(x)` makes the K2/K3 pack of post-swap operand x store only
+  up to ⌈k⌉₁₆ (Pipeline `neg_a64_pad_old_k3`'s bug), the call stays bit-exact (the other
+  operand's zeros cancel it), and `compute-sanitizer --tool initcheck` on unpoisoned
+  allocations must report it (`contract_initcheck_pad`, registered when
+  `IMMERDINK_COMPUTE_SANITIZER` names the tool or it is found next to nvcc), while
+  `contract_pad_mutation` (poisoned workspace) shows the mutation takes effect (the
+  padding stays 0xA5 on that side only) and the call stays bit-exact. CMake's string check
+  itself: `calib_strings_shipped` passes, `calib_strings_too_long` (the committed vector
+  `tests/data/perf_calib_notes_too_long.calib`, notes 128 bytes) fails with the line.
+- **Code hygiene.** `perf.cpp`'s header comment names the test-hook exception to "pure";
+  `bench/summarize.py` sizes the phase bounds with a record's own `k_align` / `k_hat`
+  (forced alignment) when present.
+- **[hygiene-b] Review of the hygiene follow-up.** `tools/test.sh`: a caller's ctest
+  selection option (`-R`, `-E`, `-L`, `-LE`, `-I`, `-U`, `--tests-from-file`,
+  `--rerun-failed`, …, attached or `=` spellings too) replaced or widened the CPU-only
+  pass's own `-R`, so GPU tests ran **without the GPU lock**; with any such option the
+  whole selection now runs in one pass under the lock (the two-pass scheme is kept for a
+  plain run). `tools/test.sh --self-test` checks the detection (ctest
+  `tools_test_sh_selftest`, CPU-only). `tools/test.sh` warns at the start and the end of a
+  run when `contract_initcheck_pad` is not registered and prints how to enable it. The
+  pad-mutation hook state is a `std::atomic<int>` (relaxed). `imd_lowering_t.k_align`'s
+  header comment states that it is not a DIRECT plan's pack key. Doc notes: the Python
+  `calib=None` exception change and the broken-shipped-calibration path being unreachable
+  in a CMake build (§6c.3, changelog above); `perf_fit.py` `--notes ""` / `--version ""`.

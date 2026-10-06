@@ -1211,6 +1211,124 @@ def suite_perf_v110(cal, names, rng):
     return count
 
 
+def suite_calib_errors(cal, lib_path):
+    """Host API 10 (DESIGN §6c.3): every calibration rejection as a CalibrationError with its
+    line, reason, key and message; the shipped calibration loads (no error kept); the
+    generation-time checks of bench/perf_fit.py (check_meta, fit_text, --check) on a notes
+    value one byte over its field and on other malformed metadata."""
+    import tempfile
+    sys.path.insert(0, os.path.join(ROOT, "bench"))
+    import perf_fit
+    n = 0
+    text = cal.format()
+    lines = text.split("\n")
+    nl = len(lines)            # the line after the last ("...\n" ends with an empty item)
+    ln = {l.split(" = ")[0]: i + 1 for i, l in enumerate(lines) if " = " in l}
+    notes128 = "n" * 128
+
+    def drop(key):
+        return "\n".join(l for l in lines if not l.startswith(key + " = "))
+
+    def subst(key, value):
+        return "\n".join((f"{key} = {value}" if l.startswith(key + " = ") else l) for l in lines)
+
+    cases = [  # (text, reason, line, key, message part)
+        (subst("notes", notes128), "TOO_LONG", ln["notes"], "notes",
+         "notes: value is 128 bytes, the field holds 127"),
+        (subst("gpu", "g" * 64), "TOO_LONG", ln["gpu"], "gpu", "the field holds 63"),
+        (subst("clocks", "§" * 64), "TOO_LONG", ln["clocks"], "clocks",
+         "value is 128 bytes"),    # UTF-8 bytes, not characters
+        (text + "bogus.key = 1\n", "UNKNOWN_KEY", nl, "bogus.key", "unknown key"),
+        (text + "k5.byte = 1\n", "REPEATED_KEY", nl, "k5.byte",
+         f"repeated key (first on line {ln['k5.byte']})"),
+        (drop("k5.byte"), "MISSING_KEY", 0, "k5.byte", "missing key"),
+        (drop("band.call_mid"), "MISSING_KEY", 0, "band.call_mid", "missing key"),
+        (drop("gpu"), "MISSING_KEY", 0, "gpu", "missing key"),
+        (subst("format", "3"), "VALUE", ln["format"], "format", "(want 1 or 2)"),
+        (subst("kl.byte", "-1"), "VALUE", ln["kl.byte"], "kl.byte", "invalid value '-1'"),
+        (subst("sm_count", "0"), "VALUE", ln["sm_count"], "sm_count", "[1, 1000000]"),
+        (subst("band.call_mid", "1.2 1.1"), "VALUE", ln["band.call_mid"], "band.call_mid",
+         "lo <= hi"),
+        ("kl.byte\n" + text, "SYNTAX", 1, "", "'kl.byte' is not"),
+        (subst("rank.tie_ratio", "2"), "INCONSISTENT", 0, "rank.tie_ratio", "[1, 1.25]"),
+    ]
+    if cal.power["power.cap_w"] > 0:
+        cases.append((subst("power.clock_min_mhz", "1e9"), "INCONSISTENT", 0,
+                      "power.clock_min_mhz", "power.cap_w > 0 needs"))
+    if cal.file_format == 2:
+        cases.append((subst("format", "1"), "FORMAT2_KEY", None, None,
+                      "a format-2 key in a format-1 calibration"))
+    for t, reason, line, key, msg in cases:
+        try:
+            host.Calibration.parse(t)
+            raise Fail(f"accepted a calibration ({reason}, {key})")
+        except host.CalibrationError as e:
+            if (e.reason != reason or (line is not None and e.line != line) or
+                    (key is not None and e.key != key) or msg not in e.message or
+                    not isinstance(e, ValueError) or msg not in str(e)):
+                raise Fail(f"{reason} {key}: got {e.reason} line {e.line} key {e.key!r}: "
+                           f"{e.message!r}")
+        n += 1
+    # 127 bytes fit
+    if host.Calibration.parse(subst("notes", "n" * 127)).meta["notes"] != "n" * 127:
+        raise Fail("a 127-byte notes value")
+    # load: a missing file, the committed over-long test vector (line 9)
+    try:
+        host.Calibration.load("/nonexistent/x.calib")
+        raise Fail("loaded a missing file")
+    except host.CalibrationError as e:
+        if e.reason != "FILE" or e.line != 0 or "cannot open" not in e.message:
+            raise Fail(f"missing file: {e}")
+    vec = os.path.join(ROOT, "tests/data/perf_calib_notes_too_long.calib")
+    try:
+        host.Calibration.load(vec)
+        raise Fail("loaded the over-long notes vector")
+    except host.CalibrationError as e:
+        if (e.reason, e.line, e.key) != ("TOO_LONG", 9, "notes"):
+            raise Fail(f"over-long notes vector: {e}")
+    # the shipped calibration parses: nothing kept, predict with calib=None works
+    h = host.load(lib_path)
+    if h.shipped_calib_error is not None:
+        raise Fail(f"shipped calibration: {h.shipped_calib_error}")
+    h.check_shipped_calib()
+    n += 4
+    # perf_fit: the generation-time checks
+    good = dict(cal.meta)
+    if perf_fit.check_meta(good):
+        raise Fail(f"check_meta on the shipped metadata: {perf_fit.check_meta(good)}")
+    bad_meta = {"notes": notes128, "gpu": "a\nb", "version": " v", "clocks": "§" * 64,
+                "date": "2026-10-06 "}
+    probs = perf_fit.check_meta(bad_meta)
+    for want in ("notes: 128 bytes, the calibration field holds 127", "gpu: contains a line break",
+                 "version: leading or trailing blank", "clocks: 128 bytes",
+                 "date: leading or trailing blank"):
+        if not any(want in p for p in probs):
+            raise Fail(f"check_meta missed {want!r}: {probs}")
+    cut = perf_fit.fit_text("§" * 100, "notes")      # 200 bytes -> 63 characters, 126 bytes
+    if cut != "§" * 63 or perf_fit.fit_text("short", "notes") != "short":
+        raise Fail(f"fit_text: {cut!r}")
+    if perf_fit.check_meta({"notes": perf_fit.fit_text("x" * 500 + " ", "notes")}):
+        raise Fail("fit_text output does not pass check_meta")
+    with tempfile.TemporaryDirectory() as d:
+        ok_path = os.path.join(d, "ok.calib")
+        with open(ok_path, "w") as f:
+            f.write(text)
+        if perf_fit.check_calibration_file(ok_path, lib_path):
+            raise Fail(f"--check on a good file: {perf_fit.check_calibration_file(ok_path)}")
+        probs = perf_fit.check_calibration_file(vec, lib_path)
+        if (len(probs) != 2 or ":9: notes: 128 bytes" not in probs[0] or
+                "[TOO_LONG]" not in probs[1]):
+            raise Fail(f"--check on the over-long vector: {probs}")
+        for argv, code in ((["--check", ok_path], 0), (["--check", ok_path, vec], 1)):
+            try:
+                perf_fit.main(argv + ["--lib", lib_path])
+                raise Fail(f"perf_fit {argv}: no exit")
+            except SystemExit as e:
+                if e.code != code:
+                    raise Fail(f"perf_fit {argv}: exit {e.code}, want {code}")
+    return n + 8
+
+
 def suite_perf(args):
     host.load(args.host_lib)
     os.environ["IMMERDINK_HOST_LIB"] = args.host_lib
@@ -1242,6 +1360,10 @@ def suite_perf(args):
             raise Fail(f"accepted an invalid calibration: {bad[-40:]!r}")
         except ValueError:
             pass
+    n_err = suite_calib_errors(cal, args.host_lib)  # host API 10 (DESIGN §6c.3)
+    if args.verbose:
+        print(f"  ok  calibration errors: {n_err} checks (reasons, lines, keys, messages; "
+              f"perf_fit generation checks and --check)")
     # --- features == the independent transcription; K4 == the A3 estimate ----------------
     cases = [  # spec, extents, along_rows (A, B) of the post-swap operands
         ("ik,jk->ij", dict(i=64, j=64, k=64), (False, False)),
