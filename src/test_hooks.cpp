@@ -134,7 +134,7 @@ IMD_API int imd_test_set_k5_elems(int elems) {
 
 IMD_API int imd_test_set_pad_mutation(int operand) {
   if (operand < -1 || operand > 1) return 1;
-  imd::detail::pad_mutation() = operand;
+  imd::detail::pad_mutation().store(operand, std::memory_order_relaxed);
   return 0;
 }
 

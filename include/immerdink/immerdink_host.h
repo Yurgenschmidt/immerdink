@@ -217,7 +217,12 @@ typedef struct {
   int32_t k_align;         /* the plan's resolved K alignment A (16 or 64): k_hat = ceil(k)_A,
                               the row stride and GEMM K extent of every residue row. AUTO:
                               64 iff k > 96. 16 for a lowering without residue rows (NOOP,
-                              SCALE, DIRECT, K-empty); 0 when lowered = 0                 */
+                              SCALE, DIRECT, K-empty); 0 when lowered = 0.
+                              NOT the pack key: a DIRECT plan with k > 96 reports 16 here
+                              but matches packs of format 2 (A64), the resolved A of its k
+                              (AUTO, or the hook), exactly like the EMULATE plan of the same
+                              tensors (§6b.4 word 1); compare a pack's format with
+                              imd_pack_layout_t.format, never with this field             */
   int32_t reserved6;       /* 0                                                           */
 } imd_lowering_t;
 enum { IMD_FUSED_LARGE_A = 1, IMD_FUSED_LARGE_B = 2 };

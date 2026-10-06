@@ -3017,10 +3017,18 @@ imd_status_t imd_perf_predict_pack(const imd_pack_desc_t*, const imd_perf_reques
     configure time** (every `gpu`, `date`, `version`, `clocks`, `notes` value must fit its
     field; a `FATAL_ERROR` names the line), `host_c_api` and `host_perf` parse it, and
     `bench/perf_fit.py` checks what it writes (below).
+    **[hygiene-b] Consequence: in a CMake build the broken-shipped-calibration path is
+    unreachable** (a too-long string fails configure; every other parse error of the shipped
+    file fails `host_c_api` / `host_perf`), so it has **no test-only override and no direct
+    test**: what it would return is the `_ex` result of the same text, which the tests cover
+    reason by reason on non-shipped files (`calib_strings_too_long`'s vector among them), and
+    the NULL-calibration functions only forward that kept error.
   - **Generation-time check** (`bench/perf_fit.py`): the metadata strings are checked
     against the field sizes of the ctypes mirror (UTF-8 bytes, NUL included; no line break;
-    no leading or trailing blank, which the parser would trim), a caller's `--notes` that
-    does not fit is an error (the generated default is cut to fit at a UTF-8 boundary), and
+    no leading or trailing blank, which the parser would trim), a caller's `--notes` or
+    `--version` that does not fit is an error (the generated defaults, like `clocks`, are
+    cut to fit at a UTF-8 boundary; an empty `--notes ""` / `--version ""` means the
+    generated default, as before host API 10), and
     the written file is re-loaded (`Calibration.load`) and must format back to the same
     text. `perf_fit.py --check FILE...` runs the same checks and the C parser on existing
     files (exit 1 with every problem, one per line).
@@ -4157,7 +4165,14 @@ and host API; every value the same integer (bit-identical, tested on every contr
   parse error; CMake rejects an embedded file whose string values do not fit at configure
   time; `bench/perf_fit.py` checks the metadata it writes and re-loads the file
   (`--check FILE...` for existing files); Python raises `host.CalibrationError` with the
-  line, reason, key and message. Cause: a calibration whose `notes` line exceeded the
+  line, reason, key and message. **Python behaviour change:** with a broken shipped
+  file (unreachable in a CMake build, §6c.3), the `calib=None` paths (`host.predict`,
+  `host.predict_pack`, `host.rank`, `planner.Query` construction) raise `host.CalibrationError`
+  (a `ValueError`) instead of `host.ImmerdinkError` (`INVALID_VALUE`, a `RuntimeError`);
+  a caller catching `ImmerdinkError` there must also catch `CalibrationError`.
+  `bench/perf_fit.py`: `--notes ""` / `--version ""` mean the generated value (as before
+  host API 10); the generated version is cut to fit like `clocks` and `notes`. Cause: a
+  calibration whose `notes` line exceeded the
   127-byte field failed to load, and as the shipped file it silently turned every NULL-
   calibration perf query into INVALID_VALUE.
 - **§4b.5: the hook is read once per API call** (stage-2 code review): one `KAlignSel`
@@ -4195,3 +4210,15 @@ and host API; every value the same integer (bit-identical, tested on every contr
 - **Code hygiene.** `perf.cpp`'s header comment names the test-hook exception to "pure";
   `bench/summarize.py` sizes the phase bounds with a record's own `k_align` / `k_hat`
   (forced alignment) when present.
+- **[hygiene-b] Review of the hygiene follow-up.** `tools/test.sh`: a caller's ctest
+  selection option (`-R`, `-E`, `-L`, `-LE`, `-I`, `-U`, `--tests-from-file`,
+  `--rerun-failed`, …, attached or `=` spellings too) replaced or widened the CPU-only
+  pass's own `-R`, so GPU tests ran **without the GPU lock**; with any such option the
+  whole selection now runs in one pass under the lock (the two-pass scheme is kept for a
+  plain run). `tools/test.sh --self-test` checks the detection (ctest
+  `tools_test_sh_selftest`, CPU-only). `tools/test.sh` warns at the start and the end of a
+  run when `contract_initcheck_pad` is not registered and prints how to enable it. The
+  pad-mutation hook state is a `std::atomic<int>` (relaxed). `imd_lowering_t.k_align`'s
+  header comment states that it is not a DIRECT plan's pack key. Doc notes: the Python
+  `calib=None` exception change and the broken-shipped-calibration path being unreachable
+  in a CMake build (§6c.3, changelog above); `perf_fit.py` `--notes ""` / `--version ""`.

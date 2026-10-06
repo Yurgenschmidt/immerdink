@@ -37,7 +37,8 @@ file. Bands are added by bench/perf_validate.py --bands from the hold-out set.
 Host API 10 (DESIGN §6c.3): the metadata strings are checked against the calibration's field
 sizes before anything is written (check_meta: UTF-8 bytes, NUL included, no line break, no
 leading or trailing blank); a --version or --notes that does not fit is an error, the generated
-clocks and notes are cut to fit at a UTF-8 boundary. The written file is re-loaded and must
+clocks, version and notes are cut to fit at a UTF-8 boundary (an empty --version / --notes
+means the generated value, as before host API 10). The written file is re-loaded and must
 format back to the same text.
 
     python3 bench/perf_fit.py --check FILE [FILE ...]
@@ -711,8 +712,10 @@ def main(argv=None):
                     help="check the given calibration files (string fields, the C parser) and "
                          "exit: 1 if any has a problem")
     ap.add_argument("--lib", default=None, help="libimmerdink_host.so")
-    ap.add_argument("--version", default=None, help="version string (default: the commit)")
-    ap.add_argument("--notes", default=None)
+    ap.add_argument("--version", default=None,
+                    help="version string (default or \"\": the commit, cut to fit)")
+    ap.add_argument("--notes", default=None,
+                    help="notes string (default or \"\": the fit's sample counts, cut to fit)")
     ap.add_argument("--worst", type=int, default=0, help="print the N worst phases per class")
     ap.add_argument("--sm-count", type=int, default=None, help="override the records' sm_count")
     ap.add_argument("--l2-bytes", type=float, default=None,
@@ -784,7 +787,8 @@ def main(argv=None):
             peaks[k] = v
     commit = next((r.get("commit") for r in ok if r.get("commit")), "unknown")
     meta = {"gpu": gpu, "sm_count": sms, "date": datetime.date.today().isoformat(),
-            "version": a.version or f"immerdink {commit}, host API {host.API_VERSION}",
+            "version": a.version or fit_text(f"immerdink {commit}, host API {host.API_VERSION}",
+                                             "version"),
             "clocks": fit_text(clock_summary(records), "clocks"), **peaks, "l2_bytes": l2}
     if probs := check_meta(meta):  # before the fit: a caller's --version or the records' gpu
         sys.exit("calibration metadata cannot be written (DESIGN §6c.3):\n  " + "\n  ".join(probs))
@@ -869,7 +873,7 @@ def main(argv=None):
             print("power model: " + ", ".join(f"{k} {v:.4g}" for k, v in pw.items()))
             power_validation(rows, meta, params, extra, fr, a.lib, idle=a.idle_w)
             extra.update(pw)
-    meta["notes"] = a.notes if a.notes is not None else fit_text(
+    meta["notes"] = a.notes or fit_text(  # --notes "" (like no --notes): the generated notes
         f"fit on {len(samples)} calls ({len(ok)} records) by bench/perf_fit.py", "notes")
     if probs := check_meta(meta):  # a caller's --notes is never cut silently
         sys.exit("calibration metadata cannot be written (DESIGN §6c.3):\n  " + "\n  ".join(probs))

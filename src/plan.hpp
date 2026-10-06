@@ -3,6 +3,7 @@
 // in libimmerdink_host (src/host/plan_data.hpp); C++17 (it is included by nvcc TUs).
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -120,8 +121,9 @@ int& k5_elems_override();
 // v1.13 §4b (hygiene; contract.cu, test hook imd_test_set_pad_mutation): -1 (production) or
 // the post-swap operand x (0 = the GEMM's A, 1 = its B) whose K2 / K3 pack stores only k-bar
 // < ceil(k)_16 (Pipeline neg_a64_pad_old_k3: [ceil(k)_16, k_hat) left unwritten on one side
-// only, which the bit-exact check cannot see; initcheck must). Read by imd_contract.
-int& pad_mutation();
+// only, which the bit-exact check cannot see; initcheck must). Read by imd_contract with a
+// relaxed load (an atomic so a hook call racing a contract on another thread is not a data race).
+std::atomic<int>& pad_mutation();
 
 // The execution data of a plan (api.cpp), for the test hooks; nullptr for a null plan.
 const ExecPlan* exec_of(imd_plan_t plan);

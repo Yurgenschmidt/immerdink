@@ -19,6 +19,7 @@
 // here (tile shapes, grids, thread mappings) leaves the results bitwise unchanged.
 // M4 measurements and the remaining gaps: docs/NOTES-M4.md.
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 
@@ -1340,8 +1341,8 @@ int& k5_elems_override() {
   return v;
 }
 
-int& pad_mutation() {
-  static int v = -1;  // only the test hook imd_test_set_pad_mutation changes it
+std::atomic<int>& pad_mutation() {
+  static std::atomic<int> v{-1};  // only the test hook imd_test_set_pad_mutation changes it
   return v;
 }
 
@@ -1507,7 +1508,8 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
       pa.sigma = x == 0 ? sA : sB;
       pa.R = x == 0 ? RA : RB;
       // production: every k-bar < k_hat (zeros past k); the test mutation stops at ceil(k)_16
-      pa.k_store = pad_mutation() == x ? (p.k + 15) / 16 * 16 : p.k_hat;
+      const int mutated = pad_mutation().load(std::memory_order_relaxed);
+      pa.k_store = mutated == x ? (p.k + 15) / 16 * 16 : p.k_hat;
       pa.radix = p.pack_radix[x];
       pa.along_rows = p.pack_along_rows[x];
       // v1.10: host/analysis.hpp pack_launch (shared with the performance model).

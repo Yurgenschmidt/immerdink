@@ -20,6 +20,10 @@ add_test(NAME calib_strings_too_long
 # a property value is a list.)
 set_tests_properties(calib_strings_too_long PROPERTIES PASS_REGULAR_EXPRESSION
   "too_long[.]calib:9:[ \n]+'notes'[ \n]+is[ \n]+128[ \n]+bytes.[ \n]+the[ \n]+calibration[ \n]+field[ \n]+holds[ \n]+127")
+# tools/test.sh's detection of a caller's ctest selection option (-R/-E/-L/...): any such
+# option must put the whole run under the GPU lock (CPU-only; no build, no GPU).
+add_test(NAME tools_test_sh_selftest
+         COMMAND bash "${PROJECT_SOURCE_DIR}/tools/test.sh" --self-test)
 
 if(Python3_FOUND)
   # The host library and its C++ lowering vs spec/params.py on generated descriptors: the
