@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "checked.hpp"
+#include "k_hat.hpp"
 #include "immerdink/detail/constants.hpp"
 
 namespace imd::detail {
@@ -99,10 +100,13 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
   // k >= 2); not for DIRECT, K-empty or k = 0.
   if (out->options.mode == IMD_EMULATE && !lw.empty_output() && lw.k >= 2 && !gemm_dims_ok(lw))
     return IMD_STATUS_INVALID_VALUE;
+  // v1.13 §4b.5: the one resolution of A for this API call; passed explicitly from here on.
+  out->k_align = k_align_of(lw.k);
   const auto layout = workspace_layout({lw.m, lw.n, lw.k, lw.b, out->options.num_moduli,
                                         out->options.residue_group,
                                         out->options.mode == IMD_DIRECT,
-                                        out->options.vec_mode == IMD_VEC_RESIDENT});
+                                        out->options.vec_mode == IMD_VEC_RESIDENT, 0,
+                                        out->k_align});
   if (!layout) return IMD_STATUS_INVALID_VALUE;
   if (layout->total > SIZE_MAX) return IMD_STATUS_INVALID_VALUE;
   out->layout = *layout;
@@ -131,7 +135,8 @@ imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B, const 
   const auto layout = workspace_layout({lw.m, lw.n, lw.k, lw.b, out->options.num_moduli,
                                         out->options.residue_group,
                                         out->options.mode == IMD_DIRECT,
-                                        out->options.vec_mode == IMD_VEC_RESIDENT, ps.role});
+                                        out->options.vec_mode == IMD_VEC_RESIDENT, ps.role,
+                                        out->k_align});
   if (!layout) return IMD_STATUS_INVALID_VALUE;
   out->layout = *layout;
   const auto mismatch = [&](int32_t reason) {
@@ -140,13 +145,15 @@ imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B, const 
   };
   constexpr int kI = static_cast<int>(LabelClass::I), kJ = static_cast<int>(LabelClass::J),
                 kK = static_cast<int>(LabelClass::K), kL = static_cast<int>(LabelClass::L);
-  // Per packed operand (the caller's A, then B): format, N, rounding, then the classes,
-  // mapped onto the plan's labels by mode position in X.
+  // Per packed operand (the caller's A, then B): an unknown format word (v1.13 §4b.5: a
+  // future or foreign key layout; a known format of the other alignment is compared last), N,
+  // rounding, then the classes, mapped onto the plan's labels by mode position in X.
   std::vector<int32_t> adopted[2][3];  // per caller operand: K, L, rows (plan labels)
   for (int x = 0; x < 2; ++x) {
     if (src[x] == nullptr) continue;
     const PackLowered& pl = *src[x]->pl;
-    if (pl.key.empty() || pl.key[0] != kPackFormat) return mismatch(IMD_PACK_MISMATCH_FORMAT);
+    if (pl.key.empty() || pack_format_align(pl.key[0]) == 0)
+      return mismatch(IMD_PACK_MISMATCH_FORMAT);
     if (pl.N != out->options.num_moduli) return mismatch(IMD_PACK_MISMATCH_MODULI);
     if (pl.rounding != out->options.rounding) return mismatch(IMD_PACK_MISMATCH_ROUNDING);
     const imd_tensor_t& T = *X[x];
@@ -189,7 +196,9 @@ imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B, const 
     adopt_order(&lw, kL, adopted[x][kPackL]);
     adopt_order(&lw, role[x] == 0 ? kI : kJ, adopted[x][kPackR]);
   }
-  // The slot keys, from the adopted lowering restricted to X (X's merged strides alone).
+  // The slot keys, from the adopted lowering restricted to X (X's merged strides alone), with
+  // the PLAN's own format word (v1.13 §4b.5: of its resolved A, never IMD_PACK_FORMAT).
+  int32_t reason[2] = {0, 0};
   for (int x = 0; x < 2; ++x) {
     if (src[x] == nullptr) continue;
     std::vector<PackMode> f[3];
@@ -200,14 +209,30 @@ imd_status_t analyze_packed(const imd_tensor_t* A, const imd_tensor_t* B, const 
         pack_fuse_append(f[cl], li.extent, li.stride[role[x]]);
       }
     const int64_t rows = role[x] == 0 ? lw.m : lw.n;
-    ps.key[x] = pack_key(out->options.num_moduli, out->options.rounding, lw.b, rows, lw.k,
-                         f[kPackL], f[kPackR], f[kPackK]);
-    if (const int32_t r = key_mismatch(ps.key[x], src[x]->pl->key); r != 0) {
-      ps.key[0].clear(), ps.key[1].clear();
-      return mismatch(r);
-    }
-    ps.layout[role[x]] = src[x]->pl->layout;  // equal keys: the plan's (b, r, k, N) layout
+    ps.key[x] = pack_key(pack_format_of(out->k_align), out->options.num_moduli,
+                         out->options.rounding, lw.b, rows, lw.k, f[kPackL], f[kPackR],
+                         f[kPackK]);
+    reason[x] = key_mismatch(ps.key[x], src[x]->pl->key);
   }
+  // The other key words of both packs first, then the format 1 vs 2 of either (§4b.5: FORMAT
+  // means "the same tensor in the other K alignment"; a k = 96 pack against a k = 97 plan is
+  // EXTENTS).
+  for (const bool format_pass : {false, true})
+    for (int x = 0; x < 2; ++x)
+      if (reason[x] != 0 && (reason[x] == IMD_PACK_MISMATCH_FORMAT) == format_pass) {
+        ps.key[0].clear(), ps.key[1].clear();
+        return mismatch(reason[x]);
+      }
+  // Drift check (§4b.5): equal keys (format and k) must mean equal k_hat.
+  int64_t plan_k_hat = 0;
+  if (!k_hat_of(lw.k, int64_t{out->k_align}, &plan_k_hat)) return IMD_STATUS_INVALID_VALUE;
+  for (int x = 0; x < 2; ++x)
+    if (src[x] != nullptr && src[x]->pl->k_hat != plan_k_hat) {
+      ps.key[0].clear(), ps.key[1].clear();
+      return mismatch(IMD_PACK_MISMATCH_FORMAT);
+    }
+  for (int x = 0; x < 2; ++x)
+    if (src[x] != nullptr) ps.layout[role[x]] = src[x]->pl->layout;  // the plan's (b, r, k, N)
   return IMD_STATUS_SUCCESS;
 }
 
@@ -249,7 +274,6 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
   e = ExecPlan{};
   e.swapped = lw.swapped;
   e.m = lw.m, e.n = lw.n, e.k = lw.k, e.b = lw.b;
-  e.k_hat = (lw.k + c::kKAlign - 1) / c::kKAlign * c::kKAlign;
   e.n_hat = (lw.n + c::kNAlign - 1) / c::kNAlign * c::kNAlign;
   e.N = N;
   e.g = an.options.residue_group;
@@ -258,6 +282,11 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
   e.path = lw.empty_output()                                ? Path::kNoop
            : (an.options.mode == IMD_DIRECT || lw.k == 1) ? Path::kDirect
                                                           : Path::kGemm;
+  // v1.13 §4b.5: A from the analysis (resolved once), for a plan with residue rows; 16 for
+  // NOOP, SCALE (k = 0), DIRECT and K-empty, whatever the hook says.
+  e.k_align = emulates(e) ? an.k_align : kKAlign16;
+  if (e.k_align != kKAlign16 && e.k_align != kKAlign64) return IMD_STATUS_INVALID_VALUE;
+  if (!k_hat_of(lw.k, int64_t{e.k_align}, &e.k_hat)) return IMD_STATUS_INVALID_VALUE;
   // v1.7 (§6b): the packed post-swap operands and where their regions are in the packs.
   e.packed = an.packed.role;
   for (int x = 0; x < 2; ++x) {
@@ -357,6 +386,7 @@ void pack_exec(const PackLowered& pl, ExecPlan* out) {
   e.path = Path::kGemm;
   e.m = pl.r, e.n = 0, e.k = pl.k, e.b = pl.b;
   e.k_hat = pl.k_hat;
+  e.k_align = pl.k_align;  // v1.13 §4b: the pack's resolved A
   e.N = pl.N;
   e.g = pl.N;  // all N planes at once: the format is g-free (§6b.4)
   e.trunc = pl.rounding == IMD_TRUNC;

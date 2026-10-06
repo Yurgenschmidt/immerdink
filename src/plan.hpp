@@ -83,9 +83,19 @@ int& k4_config_override();
 // (gridDim.y <= 65535). Copies the prepared parameters, sets this call's pointers and
 // launches; reads `k4` only. Returns SUCCESS or CUDA_ERROR. batch_a / batch_b (v1.7, a packed
 // operand, DESIGN §6b.4): the operand's batch stride z -> z * batch (0: the workspace's
-// m k_hat / n_hat k_hat).
+// m k_hat / n_hat k_hat). k_align (v1.13 §4b): the plan's A, for the operand-pointer check
+// (k4_align_check; 0 = none).
 imd_status_t k4_group(const K4Plan& k4, const int8_t* RA, const int8_t* RB, uint8_t* W, int g0,
-                      int gsize, cudaStream_t stream, int64_t batch_a = 0, int64_t batch_b = 0);
+                      int gsize, cudaStream_t stream, int64_t batch_a, int64_t batch_b,
+                      int32_t k_align);
+
+// v1.13 §4b.5 (gemm_k4.cu; test hook imd_test_k4_align_check): mode 1 = enable the check that
+// every K4 operand pointer is = 0 mod the plan's A and reset its counts, 0 = disable, -1 =
+// query only (default: on in debug builds), 2 = return the launches checked since the last
+// reset, 3 = as 1 with a test mutation (the check sees the A pointer + 8 bytes; the launch is
+// unchanged: every checked launch is a violation). Returns the violations counted since the
+// last reset (mode 2: the checked launches).
+int64_t k4_align_check(int mode);
 
 // Test hook state (api.cpp; test_hooks.cpp imd_test_set_fused): -1 = the plan-time rule
 // (production), 0 = no fused launch (KF, KL), 2 / 3 = KL for both operands of every emulated

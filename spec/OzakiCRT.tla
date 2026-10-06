@@ -74,7 +74,7 @@
 (*               (tight: neg_resbits_p9 has p = 2^ResBits + 1, the analogue *)
 (*               of a table starting at 257, whose residue 128 is no int8) *)
 (*   PreChunk    KC * 2^(2*(ResBits-1)) <= AccMax (DESIGN §2: K_c =        *)
-(*               (2^31-1) \div 128^2 = 131071; §3.5 uses K_c' = 131056)     *)
+(*               (2^31-1) \div 128^2 = 131071; §3.5 uses K_c' = 131008)     *)
 (*   PreCarry    later chunks ADD into W (ChunkCarry = TRUE)               *)
 (*   per input   SumAbs = sum_k |a[k]|*|b[k]| <= H (DESIGN §3.2 guarantee; *)
 (*               a guard of CRTExact, not an assumption, so inputs beyond  *)

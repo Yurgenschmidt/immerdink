@@ -1,6 +1,7 @@
 // libimmerdink_host C ABI (include/immerdink/immerdink_host.h, docs/DESIGN.md §6a): pure,
 // thread-safe host queries over analysis.hpp. No exception crosses this boundary; nothing
-// here touches CUDA, a device or global state.
+// here touches CUDA or a device. The one global state is the test-only K-alignment hook
+// (k_hat.cpp imd_test_set_k_align, DESIGN v1.13 §4b.5), read once per query.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -49,11 +50,13 @@ constexpr uint32_t kLoweringV2Size = 152;  // + fused, reserved, kernel_launches
 constexpr uint32_t kLoweringV3Size = 168;  // + sm_count, k4_config, k4_tune_bytes (v1.5)
 constexpr uint32_t kLoweringV4Size = 176;  // + fused_large, reserved4 (v1.6)
 constexpr uint32_t kLoweringV5Size = 184;  // + packed, pack_mismatch (v1.7)
+constexpr uint32_t kLoweringV6Size = 192;  // + k_align, reserved6 (v1.13 §4b, host API 9)
 static_assert(offsetof(imd_lowering_t, fused) == kLoweringV1Size, "imd_lowering_t v1 layout changed");
 static_assert(offsetof(imd_lowering_t, sm_count) == kLoweringV2Size, "imd_lowering_t v2 layout changed");
 static_assert(offsetof(imd_lowering_t, fused_large) == kLoweringV3Size, "imd_lowering_t v3 layout changed");
 static_assert(offsetof(imd_lowering_t, packed) == kLoweringV4Size, "imd_lowering_t v4 layout changed");
-static_assert(sizeof(imd_lowering_t) == kLoweringV5Size, "imd_lowering_t v5 layout changed");
+static_assert(offsetof(imd_lowering_t, k_align) == kLoweringV5Size, "imd_lowering_t v5 layout changed");
+static_assert(sizeof(imd_lowering_t) == kLoweringV6Size, "imd_lowering_t v6 layout changed");
 static_assert(sizeof(imd_options_t) == 24, "imd_options_t layout changed");
 static_assert(sizeof(imd_region_t) == 16, "imd_region_t layout changed");
 // v1.7 (§6b.5): the version-1 pack structs (64-bit ABI).
@@ -156,6 +159,7 @@ imd_status_t lowering_impl(const imd_tensor_t* A, const imd_tensor_t* B, const i
     r.swapped = e.swapped ? 1 : 0;
     r.m = e.m, r.n = e.n, r.k = e.k, r.b = e.b;
     r.n_hat = e.n_hat, r.k_hat = e.k_hat;
+    r.k_align = e.k_align;  // v6 (v1.13 §4b): the plan's A; 16 without residue rows
     r.kappa = e.k >= 1 ? imd::detail::ceil_sqrt_u64(static_cast<uint64_t>(e.k)) : 0;
     r.workspace_bytes = an.layout.total;
     using imd::detail::Path;
@@ -266,7 +270,7 @@ imd_status_t imd_pack_layout(const imd_pack_desc_t* desc, imd_pack_layout_t* out
     PackLowered pl;
     const imd_status_t st = imd::detail::pack_lower(*desc, &pl);
     if (pl.lowered) {  // SUCCESS or NOT_SUPPORTED: sizes and layout
-      r.format = IMD_PACK_FORMAT;
+      r.format = static_cast<int32_t>(pl.format);  // v1.13 §4b: 1 (k <= 96) or 2
       r.num_moduli = pl.N;
       r.rounding = pl.rounding;
       r.b = pl.b, r.r = pl.r, r.k = pl.k, r.k_hat = pl.k_hat;

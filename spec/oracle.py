@@ -18,7 +18,7 @@ Every step of DESIGN §3 is implemented literally and in exact integer arithmeti
                          plan-time NOT_SUPPORTED when kappa >= T in RN mode
   §3.3  quantization     quantize(): a' = RN_even / trunc (a 2^sigma) held as mu * 2^eps
   §3.4  residues         residue(): SMod((mu mod p) * (2^eps mod p), p)
-  §3.5  INT8 GEMM        modular_gemm(): K-chunks of length `chunk` (default 131056),
+  §3.5  INT8 GEMM        modular_gemm(): K-chunks of length `chunk` (default 131008),
                          int32 accumulation with an asserted no-saturation bound,
                          store-mod (first chunk) / add-mod (later chunks) into u8 planes
   §3.6  CRT              crt(): division-free running reduction, asserted word bound
@@ -35,7 +35,7 @@ math.ldexp from an already-rounded <= 54-bit integer, which is exact.
 Design choices that DESIGN.md leaves open are marked ORACLE-CHOICE below (and reported):
   * native-path accumulator starts at +0.0 (NATIVE_ACC_INIT);
   * the emulated path returns +0.0 for z = 0 (an exact integer zero has no sign);
-  * any K-chunk length 1..K_c is accepted (the 16-alignment of 131056 is a device concern),
+  * any K-chunk length 1..K_c is accepted (the 64-alignment of 131008 is a device concern),
     so determinism across chunkings can be tested with small chunks.
 
 The residue-group size g only changes the ORDER in which planes are produced here (each
@@ -65,9 +65,40 @@ F = 60                                   # §3.2 fixed-point fraction bits of S
 INT32_MAX = 2**31 - 1
 RESIDUE_ABS_MAX = 128                    # |r| <= 128 for every modulus (p = 256: -128)
 K_C = INT32_MAX // RESIDUE_ABS_MAX**2    # §2: 131071, max K-chunk with no saturation
-K_C_ALIGNED = (K_C // 16) * 16           # §3.5: 131056, default chunk length
+K_C_ALIGNED = (K_C // 64) * 64           # §3.5 (v1.13): 131008, default chunk length
 INT16_MIN, INT16_MAX = -2**15, 2**15 - 1
 N_MIN, N_MAX = 2, 20
+K_ALIGN = 16                             # §4: the plan's K alignment A: 16 ...
+K_ALIGN_PAD = 64                         # §4b (v1.13 stage 2): ... or 64 for k > K_PAD64_MIN
+K_PAD64_MIN = 96                         # §4b: AUTO(k) = 64 iff k > 96
+# The library's K-alignment policy (§4b): "A16" = every plan and pack at A = 16 (v1.7 ..
+# v1.13 stage 1); "AUTO" = stage 2 (implemented). One switch (with params.K_ALIGN_POLICY):
+# every default follows it (k_hat_of, pack_layout, pack_key, pack, PACK_FORMAT); every
+# function also takes an explicit A / format.
+K_ALIGN_POLICY = "AUTO"
+
+
+def k_hat_of(k, A=None):
+    """§4: k_hat = ceil(k)_A, the residue row stride and K extent (typed from DESIGN;
+    test_oracle cross-checks it with params.k_hat_of). A = None: k_align_of(k), the policy's
+    A (§4b; never a silent 16)."""
+    if A is None:
+        A = k_align_of(k)
+    return -(-k // A) * A
+
+
+def k_align_of(k, policy=None):
+    """§4b: the resolved K alignment of a plan or pack of (logical, lowered) contraction length
+    k: AUTO = 64 iff k > 96 else 16; "A16" = 16; 16 / 64 = forced (the library's test hook)."""
+    policy = K_ALIGN_POLICY if policy is None else policy
+    if policy == "A16":
+        return K_ALIGN
+    if policy == "AUTO":
+        return K_ALIGN_PAD if k > K_PAD64_MIN else K_ALIGN
+    if policy in (K_ALIGN, K_ALIGN_PAD):
+        return policy
+    raise ValueError(f"k-alignment policy {policy!r}")
+
 
 DESIGN_MODULI = (256, 255, 253, 251, 247, 241, 239, 233, 229, 227,
                  223, 217, 211, 199, 197, 193, 191, 181, 179, 173)
@@ -831,7 +862,7 @@ class Tensor:
 def contract_tensor(A: Tensor, B: Tensor, C: Tensor, alpha: float, beta: float, N: int,
                     rounding: str = "RN", g: int | None = None, mode=EMULATE,
                     chunk: int = K_C_ALIGNED, trace: dict | None = None, orders=None,
-                    packs=None):
+                    packs=None, k_align=None):
     """C[I,J,L] <- alpha sum_K A[I,K,L] B[K,J,L] + beta C[I,J,L] (DESIGN §1) through the
     §5 lowering. Returns a new flat list for C's buffer (elements C does not address are
     copied unchanged). Dispatch (§3.7, §4):
@@ -843,7 +874,9 @@ def contract_tensor(A: Tensor, B: Tensor, C: Tensor, alpha: float, beta: float, 
     (packed A or None, packed B or None), each a PackedOperand of the CALLER's operand:
     the plan's lowering adopts the packs' orders (lower_packed: PackMismatch on a key
     mismatch) and the emulated path reads sigma, the flags and the residues from the packed
-    bytes (A / B themselves only on the native path of flagged elements)."""
+    bytes (A / B themselves only on the native path of flagged elements).
+    §4b: k_align = the plan's K-alignment policy or forced A (None: K_ALIGN_POLICY); it changes
+    no value (the in-line path is values-only), only which packs are compatible."""
     if not (N_MIN <= N <= N_MAX):
         raise InvalidValue(f"N={N}")
     if rounding not in ("RN", "TRUNC") or mode not in (EMULATE, DIRECT):
@@ -855,7 +888,9 @@ def contract_tensor(A: Tensor, B: Tensor, C: Tensor, alpha: float, beta: float, 
         assert orders is None, "a packed plan adopts the packs' orders"
         view, info = lower_packed(A.desc, B.desc, C.desc, mode,
                                   tuple(pk.desc if pk is not None else None for pk in packs),
-                                  N, rounding)
+                                  N, rounding,
+                                  fmts=tuple(pk.fmt if pk is not None else None for pk in packs),
+                                  k_align=k_align)
     else:
         view = lower(A.desc, B.desc, C.desc, mode, orders=orders)
     out = list(C.buf)
@@ -928,8 +963,19 @@ def contract_tensor(A: Tensor, B: Tensor, C: Tensor, alpha: float, beta: float, 
 # of DESIGN §6b.1-§6b.5; the choices §6b leaves to the implementation are marked
 # ORACLE-CHOICE and are the library's (src/host/pack.cpp).
 
-PACK_FORMAT = 1
+PACK_FORMAT_A16, PACK_FORMAT_A64 = 1, 2   # §6b.4 FORMAT word: k_hat = ceil(k)_16 / ceil(k)_64
+PACK_FORMAT_ALIGN = {PACK_FORMAT_A16: 16, PACK_FORMAT_A64: 64}
 ORDER_AUTO, ORDER_GIVEN = "AUTO", "GIVEN"
+
+
+def pack_format_for(k, policy=None):
+    """§4b / §6b.4: the format of a pack (or of a plan's slot key) of contraction length k:
+    1 for A = 16, 2 for A = 64, A = k_align_of(k, policy)."""
+    return PACK_FORMAT_A64 if k_align_of(k, policy) == 64 else PACK_FORMAT_A16
+
+
+# the newest format written: a large k's format under the policy (A16: 1, AUTO: 2)
+PACK_FORMAT = pack_format_for(K_PAD64_MIN + 1)
 # PACK_MISMATCH reasons (imd_lowering_t v5 pack_mismatch, immerdink_host.h IMD_PACK_MISMATCH_*)
 (MISMATCH_FORMAT, MISMATCH_MODULI, MISMATCH_ROUNDING, MISMATCH_CLASSES, MISMATCH_EXTENTS,
  MISMATCH_STRIDES, MISMATCH_ORDER) = range(1, 8)
@@ -956,10 +1002,11 @@ class PackDesc:
 
 
 class PackedOperand:
-    """A pack (desc + the bytes imd_pack wrote) for contract_tensor(packs=...)."""
+    """A pack (desc + the bytes imd_pack wrote + its format, §4b) for contract_tensor(packs=...).
+    fmt None: the format the policy gives the pack's k (what imd_pack_create resolves)."""
 
-    def __init__(self, desc: PackDesc, data):
-        self.desc, self.data = desc, bytes(data)
+    def __init__(self, desc: PackDesc, data, fmt=None):
+        self.desc, self.data, self.fmt = desc, bytes(data), fmt
 
 
 def _fuse_x(modes):
@@ -974,10 +1021,12 @@ def _fuse_x(modes):
     return out
 
 
-def pack_key(N, rounding, b, r, k, fused):
-    """§6b.2 compatibility key: FORMAT, N, rounding (RN 0, TRUNC 1), b, r, k, then per class
-    L, R, K the number of fused modes and their (extent, stride in X)."""
-    words = [PACK_FORMAT, N, 0 if rounding == "RN" else 1, b, r, k]
+def pack_key(N, rounding, b, r, k, fused, fmt=None):
+    """§6b.2 compatibility key: FORMAT (§4b: 1 = A16, 2 = A64; None: the policy's for k), N,
+    rounding (RN 0, TRUNC 1), b, r, k, then per class L, R, K the number of fused modes and
+    their (extent, stride in X)."""
+    fmt = pack_format_for(k) if fmt is None else fmt
+    words = [fmt, N, 0 if rounding == "RN" else 1, b, r, k]
     for c in ("L", "R", "K"):
         words.append(len(fused[c]))
         for e, st in fused[c]:
@@ -999,14 +1048,20 @@ def _key_kinds(key):
 
 def key_mismatch(slot_key, pack_key_):
     """0 if equal, else the reason code of the first differing word (by the slot key's
-    structure; if one key is a prefix of the other, a count differed first: EXTENTS)."""
+    structure; if one key is a prefix of the other, a count differed first: EXTENTS), the
+    FORMAT word 0 compared LAST (§6b.5, v1.13 §4b review 2026-10-05): FORMAT then means "the
+    same tensor in another K alignment" (in-process only through the test hook), and a pack
+    of another k across K_PAD64_MIN (k = 96 against a plan of k = 97) is EXTENTS. An unknown
+    format word is rejected earlier (lower_packed)."""
     if slot_key == pack_key_:
         return 0
     kinds = _key_kinds(slot_key)
-    for i, (x, y) in enumerate(zip(slot_key, pack_key_)):
+    for i, (x, y) in enumerate(zip(slot_key[1:], pack_key_[1:]), 1):
         if x != y:
             return kinds[i]
-    return MISMATCH_EXTENTS
+    if len(slot_key) != len(pack_key_):
+        return MISMATCH_EXTENTS
+    return MISMATCH_FORMAT
 
 
 def fnv1a64(words):
@@ -1018,13 +1073,15 @@ def fnv1a64(words):
     return h
 
 
-def pack_layout(b, r, k, N):
-    """§6b.4 format 1, typed from DESIGN (independently of params.pack_layout, which
-    test_oracle cross-checks): {region: (offset, bytes)} for sig, flag, res and pack_bytes;
-    ({}, 0) for b r k = 0. InvalidValue past uint64."""
+def pack_layout(b, r, k, N, fmt=None):
+    """§6b.4 format fmt (1: k_hat = ceil(k)_16; 2, §4b: ceil(k)_64), typed from DESIGN
+    (independently of params.pack_layout, which test_oracle cross-checks): {region: (offset,
+    bytes)} for sig, flag, res and pack_bytes; ({}, 0) for b r k = 0. InvalidValue past
+    uint64. fmt None: the policy's format for k."""
     if b * r * k == 0:
         return {}, 0
-    kh = -(-k // 16) * 16
+    fmt = pack_format_for(k) if fmt is None else fmt
+    kh = k_hat_of(k, PACK_FORMAT_ALIGN[fmt])
     sizes = (("sig", 2 * b * r), ("flag", b * r),
              ("res", N * b * r * kh + (-(-r // 16) * 16 - r) * kh))
     regs, off = {}, 0
@@ -1053,14 +1110,16 @@ def _T_of(N):
     return math.isqrt((P - 1) // 2)
 
 
-def pack_lower(pd: PackDesc) -> PackView:
+def pack_lower(pd: PackDesc, fmt=None) -> PackView:
     """imd_pack_layout / imd_pack_create (§6b.3, §6b.5): validate the pack descriptor and
     lower X alone. InvalidValue: N, rounding, order out of range; a listed label not in X,
     listed twice or in two lists; GIVEN with a missing row label; AUTO with rows; §5 rows 1
     and 5 on X alone (extent mismatch of a repeated label; negative extent; merged stride,
     span, class extent product or pack size overflow). NotSupported: K empty after lowering
     (k = 1), or RN with k >= 2 and kappa >= T. AUTO orders each class by (|s_X| after the
-    diagonal merge, first position in X's labels)."""
+    diagonal merge, first position in X's labels). §4b: fmt = the pack's format (None: the
+    policy's format for the pack's k, as imd_pack_create resolves it; 1 or 2 forced: the
+    library's test hook)."""
     if not (N_MIN <= pd.N <= N_MAX):
         raise InvalidValue(f"N={pd.N}")
     if pd.rounding not in ("RN", "TRUNC") or pd.order not in (ORDER_AUTO, ORDER_GIVEN):
@@ -1099,9 +1158,10 @@ def pack_lower(pd: PackDesc) -> PackView:
     v = PackView()
     v.N, v.rounding = pd.N, pd.rounding
     v.b, v.r, v.k = size["L"], size["R"], size["K"]
-    v.k_hat = -(-v.k // 16) * 16
+    v.format = pack_format_for(v.k) if fmt is None else fmt
+    v.k_hat = k_hat_of(v.k, PACK_FORMAT_ALIGN[v.format])
     v.kappa = ceil_sqrt(v.k) if v.k > 0 else 0
-    v.regs, v.pack_bytes = pack_layout(v.b, v.r, v.k, pd.N)   # InvalidValue on overflow
+    v.regs, v.pack_bytes = pack_layout(v.b, v.r, v.k, pd.N, v.format)   # InvalidValue on overflow
     v.pack_ws = pack_ws_bytes(v.b, v.r, v.k)
     if not any(ext[l] != 1 for l in K):
         raise NotSupported("§6b.3: K empty after lowering (every contraction is DIRECT)")
@@ -1112,7 +1172,7 @@ def pack_lower(pd: PackDesc) -> PackView:
                for c in "KLR"}
     v.ext, v.stride = ext, ms
     v.fused = {c: _fuse_x([(ext[l], ms[l]) for l in v.order[c]]) for c in "LRK"}
-    v.key = pack_key(pd.N, pd.rounding, v.b, v.r, v.k, v.fused)
+    v.key = pack_key(pd.N, pd.rounding, v.b, v.r, v.k, v.fused, v.format)
     v.digest = fnv1a64(v.key)
     return v
 
@@ -1121,12 +1181,13 @@ def _x_vec(fused):
     return _radix_vec([(None, e, {"X": st}) for e, st in fused], "X")
 
 
-def pack(X: Tensor, pd: PackDesc, trace: dict | None = None) -> bytearray:
+def pack(X: Tensor, pd: PackDesc, trace: dict | None = None, fmt=None) -> bytearray:
     """imd_pack (§6b.1, §6b.4): the packed bytes of X (X.desc is the operand; pd.tensor must
-    describe the same element map). Every byte of [0, pack_bytes) is defined: sigma, flags,
+    describe the same element map) in format fmt (§4b: 1 = A16, 2 = A64; None = the policy's
+    format for the pack's k). Every byte of [0, pack_bytes) is defined: sigma, flags,
     residues of plane l at l b r k_hat + (lambda r + rho) k_hat + k-bar, zero K padding
     k-bar in [k, k_hat), a zero tail and zero alignment gaps."""
-    v = pack_lower(pd)
+    v = pack_lower(pd, fmt)
     out = bytearray(v.pack_bytes)
     if v.pack_bytes == 0:
         return out
@@ -1199,7 +1260,8 @@ def pack_desc_for(A: Desc, B: Desc, C: Desc, mode, operand, N, rounding="RN") ->
     return PackDesc(X, N, rounding, ORDER_GIVEN, K, L, R)
 
 
-def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN", build_vec=True):
+def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN", build_vec=True,
+                 fmts=(None, None), k_align=None):
     """imd_plan_create_packed's plan-time checks after §5 rows 1-5 (lower) and before the
     §3.2 RN acceptance (§6b.5): per packed caller operand (A, then B) the pack descriptor's
     own status (pack_lower), then PACK_MISMATCH reasons MODULI, ROUNDING, CLASSES (the
@@ -1207,14 +1269,24 @@ def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN", build
     X's row class equal the pack's classes; a partner-only K label is CLASSES); both packed:
     ORDER if their K or L orders differ; then the plan ADOPTS the packs' orders (K, L, X's
     row class) and each slot key, computed from the adopted lowering restricted to X, must
-    equal the pack's key (EXTENTS / STRIDES: the first differing word). Returns (view, info)."""
+    equal the pack's key (EXTENTS / STRIDES: the first differing word). Returns (view, info).
+    §4b: fmts = each pack's format (None: the policy's for its k); the slot key's FORMAT word
+    is the PLAN's format, of its own resolved A (k_align: a policy or a forced 16 / 64, None =
+    K_ALIGN_POLICY), never "the newest format". Reason order (DESIGN §6b.5, the same in
+    analysis.cpp, review 2026-10-05 must-fix 4): an UNKNOWN format word (not 1 or 2) is FORMAT
+    first, before MODULI; a known format of the other alignment is compared LAST, after every
+    other key word (key_mismatch), so FORMAT means "the same tensor in the other alignment"
+    (impossible under AUTO: both resolve A from the same k; reachable through the test hook)
+    and a pack of k = 96 offered to a plan of k = 97 is EXTENTS."""
     v0 = lower(A, B, C, mode, build_vec=False)
-    pvs = [pack_lower(pd) if pd is not None else None for pd in packs]
+    pvs = [pack_lower(pd, f) if pd is not None else None for pd, f in zip(packs, fmts)]
     adopted = [None, None]
     roles = [_roles(v0, x)[0] for x in (0, 1)]
     for x, (Xd, pd, pv) in enumerate(zip((A, B), packs, pvs)):
         if pd is None:
             continue
+        if pv.key[0] not in PACK_FORMAT_ALIGN:      # a future / foreign key layout
+            raise PackMismatch(MISMATCH_FORMAT, f"operand {x}: unknown pack format {pv.key[0]}")
         if pv.N != N:
             raise PackMismatch(MISMATCH_MODULI, f"operand {x}: pack N {pv.N} != {N}")
         if pv.rounding != rounding:
@@ -1245,7 +1317,7 @@ def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN", build
             for c, lst in o.items():
                 orders.setdefault(c, lst)
     v = lower(A, B, C, mode, build_vec=build_vec, orders=orders)
-    keys = [None, None]
+    keys, reasons = [None, None], [0, 0]
     for x in (0, 1):
         if pvs[x] is None:
             continue
@@ -1253,10 +1325,18 @@ def lower_packed(A: Desc, B: Desc, C: Desc, mode, packs, N, rounding="RN", build
         st = v.stride[role]
         fused = {c: _fuse_x([(v.ext[l], st[l]) for l in v.order[g]])
                  for c, g in (("L", "L"), ("R", rowcls), ("K", "K"))}
-        keys[x] = pack_key(N, rounding, v.b, v.m if role == "A" else v.n, v.k, fused)
-        reason = key_mismatch(keys[x], pvs[x].key)
-        if reason:
-            raise PackMismatch(reason, f"operand {x}: slot key differs (reason {reason})")
+        keys[x] = pack_key(N, rounding, v.b, v.m if role == "A" else v.n, v.k, fused,
+                           pack_format_for(v.k, k_align))
+        reasons[x] = key_mismatch(keys[x], pvs[x].key)
+    # Both packs' other key words first, then the 1-vs-2 FORMAT of either (v1.13 stage 2: the
+    # one rule of DESIGN §4b.5 / §6b.5, PackedOperand Reason, analysis.cpp analyze_packed).
+    for x in (0, 1):
+        if reasons[x] and reasons[x] != MISMATCH_FORMAT:
+            raise PackMismatch(reasons[x], f"operand {x}: slot key differs (reason {reasons[x]})")
+    for x in (0, 1):
+        if reasons[x]:
+            raise PackMismatch(reasons[x], f"operand {x}: pack format {pvs[x].key[0]} != the "
+                               f"plan's {keys[x][0]}")
     packed_roles = {roles[x] for x in (0, 1) if pvs[x] is not None}
     return v, {"views": pvs, "keys": keys, "roles": roles, "packed_roles": packed_roles,
                "orders": orders}

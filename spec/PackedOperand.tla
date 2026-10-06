@@ -49,7 +49,9 @@
 (*       "rnd"     the pack was made with the other rounding               *)
 (*       "kset"    the pack's K set lacks k2 (k2 is a partner-only label:  *)
 (*                 the plan sums over it with stride 0 in X)               *)
-(*       "kalign"  the pack's k̂ alignment (format) differs: 2·KAlign       *)
+(*       "kalign"  the pack's k̂ alignment (format) differs from the plan's *)
+(*                 (v1.13 §4b: format 1 = A16 = KAlign, 2 = A64 =          *)
+(*                 4·KAlign; only reachable by forcing A, the test hook)   *)
 (*       "partnerOrder"  both operands packed, the partner's pack has the  *)
 (*                 other K order                                           *)
 (*     byte-contract components (not key fields: every pack of a format    *)
@@ -62,6 +64,12 @@
 (*   With Cmp.check = TRUE the plan compares keys and returns              *)
 (*   PACK_MISMATCH instead of contracting (pos_key_check: every key        *)
 (*   mutation is rejected, none gives a wrong result).                     *)
+(*   v1.13 §4b: the plan's and the pack's K alignment are AUTO(k)          *)
+(*   (Cmp.kpmin is K_PAD64_MIN), or forced by Cmp.hookPlan / hookPack;     *)
+(*   format 2 (k̂ = ⌈k⌉_{4·KAlign}) gives the same σ, W and C              *)
+(*   (the pos_fmt2 models); AutoFormatsAgree: without the hook they never  *)
+(*   differ;                                                               *)
+(*   FormatMismatchRejected: if forced apart, the key rejects the pack.    *)
 (*                                                                         *)
 (* StreamSpec (state machine): the caller's ordering of imd_pack, the      *)
 (* contracts that read the packed buffer and the FP64 operand (native      *)
@@ -88,12 +96,21 @@ Mods     == <<8, 7, 5, 3>>       \* pairwise coprime, first one even (as 256)
 E1       == 2
 E2       == 2
 KAlign   == 8                    \* k̂ = ⌈k⌉_KAlign: k = 4 -> k̂ = 8 (4 padding)
+\* v1.13 §4b: the pack FORMAT carries the K alignment A: format 1 = A16
+\* (KAlign here), format 2 = A64 (4·KAlign, the real ratio 64/16). A is
+\* resolved from k alone, AUTO(k) = 2 iff k > Cmp.kpmin (K_PAD64_MIN), by
+\* the plan and by imd_pack_create alike; Cmp.hookPlan / Cmp.hookPack ≠ 0
+\* force a format (the library's test hook, set between the two calls).
+FmtAlign == <<KAlign, 4 * KAlign>>
+AutoFmt(k) == IF k > Cmp.kpmin THEN 2 ELSE 1
+PlanFmt    == IF Cmp.hookPlan # 0 THEN Cmp.hookPlan ELSE AutoFmt(E1 * E2)
+PackFmt(k) == IF Cmp.hookPack # 0 THEN Cmp.hookPack ELSE AutoFmt(k)
 RowAlign == 2                    \* n̂ = ⌈n⌉_RowAlign: r = 1 -> n̂ = 2
 INF      == 99                   \* a non-finite FP64 entry (Inf or NaN)
 JUNK     == 1                    \* an unwritten int8 / an out-of-bounds read
 KP       == E1 * E2              \* the plan's k
 Ceil(x, a) == ((x + a - 1) \div a) * a
-KH       == Ceil(KP, KAlign)     \* the plan's k̂
+KH       == Ceil(KP, FmtAlign[PlanFmt])     \* the plan's k̂ = ⌈k⌉_A
 RowHat   == Ceil(1, RowAlign)    \* n̂ for r = 1
 Idx      == (0..E1-1) \X (0..E2-1)
 
@@ -155,19 +172,24 @@ OtherRnd(r)   == IF r = "RN" THEN "TRUNC" ELSE "RN"
 (* Packs (imd_pack) and their keys                                         *)
 (* ----------------------------------------------------------------------- *)
 PackOrderX == "12"   \* X's AUTO order: by X's own strides (k1 fastest in X)
+\* X's pack format: AUTO of the pack's own k (E1 without k2: "kset"), or
+\* forced; "kalign" = the pack was made in the other format (the test hook
+\* forcing A between imd_pack_create and the plan).
+XFmt(mut) == LET f == PackFmt(IF mut = "kset" THEN E1 ELSE E1 * E2) IN
+             IF mut = "kalign" THEN 3 - f ELSE f
 XPack(mut) ==
     [n |-> IF mut = "N" THEN Cmp.N + 1 ELSE Cmp.N,
      rnd |-> IF mut = "rnd" THEN OtherRnd(Cmp.rnd) ELSE Cmp.rnd,
      order |-> PackOrderX,
      k2 |-> mut # "kset",
-     kalign |-> IF mut = "kalign" THEN 2 * KAlign ELSE KAlign,
+     fmt |-> XFmt(mut), kalign |-> FmtAlign[XFmt(mut)],
      zeroPad |-> mut # "nopad", tail |-> mut # "notail", flags |-> mut # "noflags"]
 \* the plan's K order: adopted from the (caller's A) pack, or v1's default
 PO(mut) == IF mut = "order" THEN Cmp.defOrder ELSE XPack(mut).order
 YPack(mut) ==
     [n |-> Cmp.N, rnd |-> Cmp.rnd,
      order |-> IF mut = "partnerOrder" THEN Other(PO(mut)) ELSE PO(mut),
-     k2 |-> TRUE, kalign |-> KAlign,
+     k2 |-> TRUE, fmt |-> PackFmt(E1 * E2), kalign |-> FmtAlign[PackFmt(E1 * E2)],
      zeroPad |-> mut # "nopad", tail |-> TRUE, flags |-> TRUE]
 
 PackK(pc)     == IF pc.k2 THEN KP ELSE E1
@@ -187,17 +209,44 @@ Pack(pc, D) ==
                        ELSE IF pc.zeroPad THEN 0 ELSE JUNK]]
 
 \* The compatibility key (§6b): N, rounding, the K set (here: k2 or not),
-\* the format (here: the k̂ alignment), the K order. (The FP64 element map,
-\* the row and batch classes, extents and strides are fixed in this toy.)
-Key(pc)      == [n |-> pc.n, rnd |-> pc.rnd, k2 |-> pc.k2, fmt |-> pc.kalign,
+\* the format (v1.13 §4b: it carries the k̂ alignment A), the K order. (The
+\* FP64 element map, the row and batch classes, extents and strides are
+\* fixed in this toy.) The slot key's format is the PLAN's (its own A).
+Key(pc)      == [n |-> pc.n, rnd |-> pc.rnd, k2 |-> pc.k2, fmt |-> pc.fmt,
                  order |-> pc.order]
-SlotKey(mut) == [n |-> Cmp.N, rnd |-> Cmp.rnd, k2 |-> TRUE, fmt |-> KAlign,
+SlotKey(mut) == [n |-> Cmp.N, rnd |-> Cmp.rnd, k2 |-> TRUE, fmt |-> PlanFmt,
                  order |-> PO(mut)]
 Status(mut) ==
     IF ~Cmp.check THEN "SUCCESS"
     ELSE IF Key(XPack(mut)) # SlotKey(mut)
             \/ (Cmp.both /\ Key(YPack(mut)) # SlotKey(mut))
          THEN "PACK_MISMATCH" ELSE "SUCCESS"
+\* v1.13 §4b (review 2026-10-05, must-fix 4): the PACK_MISMATCH REASON, in
+\* the order of DESIGN §6b.5 = oracle.lower_packed = analysis.cpp (stage 2).
+\* (An unknown format word, not 1 or 2, is FORMAT before everything; the toy
+\* has formats 1 and 2 only, so it is not modelled.) Then each pack's early
+\* checks (MODULI, ROUNDING, CLASSES: the toy's K set), then the key words
+\* (the toy's K order: ORDER) of every pack, and the 1-vs-2 FORMAT
+\* difference LAST (after the other words of BOTH keys).
+\* Cmp.fmtFirst = TRUE is the pre-review C++ order (FORMAT word first).
+Early(pc, s) == IF pc.n # s.n THEN "MODULI"
+                ELSE IF pc.rnd # s.rnd THEN "ROUNDING"
+                ELSE IF pc.k2 # s.k2 THEN "CLASSES" ELSE "NONE"
+Late(pc, s)  == IF pc.order # s.order THEN "ORDER" ELSE "NONE"
+FmtOnly(pc, s) == IF pc.fmt # s.fmt THEN "FORMAT" ELSE "NONE"
+Reason(mut) ==
+    LET s  == SlotKey(mut)
+        kx == Key(XPack(mut))
+        ky == Key(YPack(mut))
+        ps == IF Cmp.both THEN <<kx, ky>> ELSE <<kx>>
+        np == Len(ps)
+        early == [i \in 1..np |-> Early(ps[i], s)]
+        late  == [i \in 1..np |-> Late(ps[i], s)]
+        first == [i \in 1..np |-> FmtOnly(ps[i], s)]
+        flat  == IF Cmp.fmtFirst THEN first \o early \o late ELSE early \o late \o first
+        hits  == {j \in DOMAIN flat : flat[j] # "NONE"}
+    IN IF hits = {} THEN "NONE"
+       ELSE flat[CHOOSE j \in hits : \A i \in hits : j <= i]
 
 (* ----------------------------------------------------------------------- *)
 (* Contraction: in-line reference and packed path                          *)
@@ -310,7 +359,30 @@ EmulatedOrderFree ==
     LET a == Inline("12")
         b == Inline("21")
     IN ~a.x.flag /\ ~a.y.flag => Same(a.out, b.out)
-AcceptedWhenKeyMatches == mut = "none" => OK(mut)
+AcceptedWhenKeyMatches == mut = "none" /\ XPack(mut).fmt = PlanFmt => OK(mut)
+\* v1.13 §4b: under AUTO (no hook) a pack and a plan of the same k resolve
+\* the same format, for the caller's operand and the partner's pack alike:
+\* a format mismatch needs the test hook (or a pack of another k: "kset")
+AutoFormatsAgree ==
+    Cmp.hookPlan = 0 /\ Cmp.hookPack = 0 /\ mut \notin {"kalign", "kset"} =>
+        XPack(mut).fmt = PlanFmt /\ YPack(mut).fmt = PlanFmt
+\* ... and a pack of another format than the plan's is rejected (the key's
+\* FORMAT word), never read with the wrong row stride
+FormatMismatchRejected ==
+    Cmp.check /\ (XPack(mut).fmt # PlanFmt \/ (Cmp.both /\ YPack(mut).fmt # PlanFmt))
+        => Status(mut) = "PACK_MISMATCH"
+\* AutoFormatsAgree is a sanity check, not the guarantee: plan and pack apply
+\* the same AutoFmt to the same k here by construction. The real guarantee is
+\* that k is a key word and A is resolved once per API call (DESIGN §4b.5).
+\* Reason order (must-fix 4): a reason is reported iff the key differs, and
+\* FORMAT only for the same tensor in the other alignment (every other key
+\* part equal), so a pack of another k across K_PAD64_MIN ("kset" with
+\* kpmin = 3: pack k = 2, format 1; plan k = 4, format 2) is CLASSES.
+ReasonIffMismatch == Cmp.check => ((Reason(mut) # "NONE") <=> (Status(mut) = "PACK_MISMATCH"))
+FormatMeansSameTensor ==
+    Cmp.check /\ Reason(mut) = "FORMAT" =>
+        /\ [Key(XPack(mut)) EXCEPT !.fmt = PlanFmt] = SlotKey(mut)
+        /\ Cmp.both => [Key(YPack(mut)) EXCEPT !.fmt = PlanFmt] = SlotKey(mut)
 \* witnesses (expected to FAIL on positive configurations)
 NeverMismatch   == OK(mut)
 NativeOrderFree == Same(Inline("12").out, Inline("21").out)
