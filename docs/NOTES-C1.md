@@ -191,7 +191,7 @@ what has been built since is recorded under "Implementation status".
       after an output passed near zero). The report-only cases became caller guidance (§1.3).
   - **Not yet run:** M-b (the [M] re-runs of IR9 and the share-group raise cost of IR15; CPU,
     round 1), and M-c and M-d2 (GPU, round 2). Stage 3 may start: the M-a summary is published
-    (§4.11). (It has since been implemented; below.)
+    (§4.11). (Stage 3 has since been implemented, and M-b has since run; both below.)
   - **Open:** the M-d1 caller guidance (§1.3: the DIIS reset, Davidson's recompute and its +5
     iterations, CG's relaxation scaled by the iteration count) lives only here. It is to be
     carried into DESIGN §6g.12, `bench/accuracy/schedule.py` and the `precision.py`
@@ -249,6 +249,32 @@ what has been built since is recorded under "Implementation status".
   - *Records:* the logs are in immerdink-eval `results/c1/round2_tests_4ba78b1/` (untracked,
     with a manifest of the commands, the conditions and each log's sha256); summary
     `findings/c1-round2-stage0-gpu-tests.md` (b352778).
+- **M-b (§4.3; IR9, IR15 (3), IR23) is done, 2026-10-07**: CPU only, one thread, under memcap,
+  FREE only, on this worktree's `build/libimmerdink_host.so` (sha256 `466acdb4…`, host API 13;
+  `ninja -n` finds nothing to rebuild at 4ba78b1). Summary immerdink-eval
+  `findings/c1-m-b.md`, scripts `scripts/c1/m_b_rerun.py` and `m_b.py` (96f7c4f), records
+  `results/c1/m_b/` (untracked, sha256 in the summary).
+  - *The design-phase [M] records reproduce byte for byte:* the design-phase scripts, run
+    unchanged with only the library path redirected, print `perf.json`, `perf_summary.md`,
+    `c2cost.md`, `nsweep.out`, `phases.out`, `predict_cc.out` and `slice_eval/cost.out`
+    identically. So do stage 2's [M] records: M-a's `perf` blocks (66 Tier L, 9 real),
+    `c2_summary.md` and `b6_split_cost.txt`. No prediction changed.
+  - *The cited figures:* 191 [M] and [E] figures of §2.3–§2.7, §4.2, §4.3 and DESIGN §3.8,
+    recomputed from fresh queries: 169 print as cited; 7 differ in the last digit only
+    (≤ 0.42 %, kept by IR9's 0.5 % rule); 6 differ by more. One is a text error, corrected in
+    §2.3: the 4096² re-pack is 9–11 % of one call, not "about 11 %" (8.8 % at N = 14). Five
+    are [E] estimates, kept and annotated: §2.7's first-round K-segmentation costs at S = 4 are
+    3× the rounded S = 2 figures (reconstructed: +52 / +95 / +31 %, and +32 % for DF at S = 2),
+    and §4.2's "about 9 %" is 9.5 % at 0.9 TB/s. §2.7 now also gives the [M] composition of the
+    S calls, M-a's method: +13 / +24 / +8 % at S = 2, +40 / +72 / +24 % at S = 4.
+  - *PrecisionPlan's own choices* reproduce the §2.4 ratios (g = N at every level), and M-d2's
+    bars are 0.750 (PPL view), 0.664 (DF) and 0.673 (4096³) unrounded (§4.3).
+  - *The share-group raise cost* (IR15 (3); §3.3; [M], outside the hold-out at levels not in
+    {8, 10, 14, 16}): on ehrenfest ccsd.py's pairwise DF contractions at the psi4 sizes, 0 in
+    11 of 12 forcing-rule cases with the real norm products and +16.5 % in the twelfth
+    (benzene/cc-pVDZ at 1e−8, through R5); −32 % to +25 % of the group's time per iteration
+    when one member's floor is a level apart, up to +102 % from N = 6 to 14. The joint ranking
+    chose the group floor in all 292 scenarios.
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -392,7 +418,10 @@ order of work and a definition of done. They override the earlier text wherever 
   `tools/memcap.sh` and took at most a minute. R-num's [M] re-runs were not completed, because
   ehrenfest became BUSY; R-num checked their arithmetic for internal consistency instead. M-b
   re-runs every [M] figure DESIGN will cite on this worktree's rebuilt library. A figure that
-  differs by > 0.5 % is replaced, and the change is noted (IR9).
+  differs by > 0.5 % is replaced, and the change is noted (IR9). **Done (M-b, 2026-10-07;
+  Status):** every stored design-phase [M] record reproduces byte for byte on this worktree's
+  library, so R-num's re-runs are complete; the one cited [M] figure that differed was a text
+  error (§2.3's re-pack share), corrected there.
 - Stage 2 (§4.3) moves the study into `bench/accuracy/` and the raw records into immerdink-eval
   `results/c1/`.
 - [M] numbers come from `.claude/worktrees/agent-ac829dae3600d2888/build/libimmerdink_host.so`
@@ -632,6 +661,12 @@ Max normwise error, worst over the sizes 64²×256 … 256²×4096:
   `ik,jk->ij` form of 4096³ from predict and rank, against 2.86 / 4.70 below; regime and cache
   make no difference there [M, review]. The pack times and the packed-AB ratio reproduce
   exactly. DESIGN figures must name the spec, the strides and the request flags.
+- **Re-run by M-b** (2026-10-07, this worktree's library, sha256 `466acdb4…`, host API 13;
+  immerdink-eval `findings/c1-m-b.md`): the scripts' stored outputs reproduce byte for byte, and
+  every figure of §2.3 and §2.4 recomputed from fresh queries prints as cited except the
+  re-pack share below (a text error, corrected) and five table cells that differ in the last
+  digit only (1024³ N = 6 24.35, 4096³ N = 4 82.85, 8192³ N = 10 47.45, DF N = 12 30.85
+  TFLOPS-eq, QZ N = 16 18.895 ms; ≤ 0.21 %, kept by IR9's 0.5 % rule).
 
 TFLOPS-eq (time):
 
@@ -664,8 +699,9 @@ TFLOPS-eq (time):
 - **K5's share of the call at N = 14** is 8.6 % (4096³), 5.1 % (8192³) and 15.6 % (DF) [M]. It
   was measured at 16.8 % on sq4096 (NOTES-D1:106: 0.887 of 5.276 ms).
 - **Re-pack cost:** `imd_pack` of a 4096² operand is 313 / 414 µs at N = 8 / 14 [M] (measured
-  0.437 ms at N = 14, NOTES-D1:107), against a call of 2.86 / 4.70 ms. That is about 11 % of one
-  call, paid once per switch for each invariant operand.
+  0.437 ms at N = 14, NOTES-D1:107), against a call of 2.86 / 4.70 ms. That is 9–11 % of one
+  call (10.9 % at N = 8, 8.8 % at N = 14; M-b, was "about 11 %", which holds at N = 8 only),
+  paid once per switch for each invariant operand.
 - **No calibration or hold-out case covers N = 5, 6, 7, 9 or 13.** N = 4, 11 and 12 have one or
   two rows each (§1.2 item 8). [KT26] also reports INT8 throughput that depends on the data at
   small N, through the fraction of zeros after scaling. M-c in stage 2 checks these predictions
@@ -689,6 +725,11 @@ final precision is equal:
 
 **Ending at N = 9**, ehrenfest's historical operating point: 6×N6 + 10×N9 against a fixed N = 9
 gives 1.09× (1024³), 1.12× (4096³) and 1.13× (8192³ and DF).
+
+These use g = N predictions. `PrecisionPlan`'s own choices (`configs()` over the levels 6, 8,
+9, 10, 14, in-line, GENERATE) are g = N at every level of every shape here, so they give the
+same ratios to three digits; with both vec modes (RESIDENT everywhere) the ratios move by at
+most 0.003 [M; M-b, immerdink-eval `results/c1/m_b/schedules_pp.jsonl`].
 
 - Re-packing one invariant 4096² operand at each of the three switches costs about 1.1 ms, about
   2 % of the 50.6 ms schedule [M].
@@ -861,6 +902,9 @@ median / worst pair.
   | 1e−10 | 18 → 12 (k = 600) | 4096³ | | 1.47× |
   | 1e−6 | 16 → 9 | 4096³ | 26.0 (5.30 ms) → 43.5 (3.16 ms) | 1.68× |
 
+  Re-run by M-b: unchanged (DF N = 12 is 30.85 TFLOPS-eq, the last digit only). The recurring
+  costs below reproduce at 0.9 TB/s (the design phase's bandwidth assumption); the last one is
+  1.195×.
 - **Recurring costs** for operands rebuilt every iteration (t2, dressed integrals; §1.3) [E]:
   - Pre-scaling costs one FP64 read and write, 16 B per element, per changed operand per call,
     unless it is fused into the operand's producer kernel. That is about 0.3 ms per 4096²
@@ -907,13 +951,30 @@ max normwise error:
 
   Net at decay_opp, 1e−10 elementwise, where fast mode needs N = 20: S = 2 at N = 14 is 1.08×
   (DF) to 1.28× (8192³) faster, and S = 4 is a net loss on DF.
+
+  *M-b* (immerdink-eval `findings/c1-m-b.md`). The review's method is not recorded. Taken as
+  (S − 1) × (K0 + K5 + the W-plane writes N·m·n̂ B + the β = 1 read of C, 8·m·n B) at
+  0.9 TB/s, with the [M] phases at N = 14, it gives the S = 2 row for 4096³ and 8192³ (+17.4,
+  +10.3 %), +31.6 % for DF, and the two net speedups (1.075×, 1.280×); its S = 4 row is
+  +52.2 / +94.8 / +30.8 %, so the table's S = 4 row is 3× the rounded S = 2 one. The [E] stands
+  as an estimate. The model's own composition of the S calls (S calls of k/S, every call after
+  the first with β = 1: the [M] method M-a and DESIGN §3.8 use) is lower:
+
+  | S | 4096³ | DF | 8192³ |
+  |---|---|---|---|
+  | 2 | +13 % | +24 % | +8 % |
+  | 4 | +40 % | +72 % | +24 % |
+
+  [M, composition], N = 14. With it, S = 2 at N = 14 is 1.15× (DF) to 1.31× (8192³) faster
+  than fast mode at N = 20, and S = 4 on DF is still a net loss (0.82×) [M, model-only,
+  outside hold-out: N = 20 is outside {8, 10, 14, 16}].
 - **Numerics.** Segmentation adds S − 1 FP64 roundings, so the result is no longer correctly
   rounded once, and its ELEMENTWISE bound is provably worse at high N (L7).
 - **Against K-equilibration on decay_opp:** K-eq gives about 6 moduli at about 0 per-call cost
   for invariant operands or pre-scaling fused into the producer; about 6–13 % per call per
   changed operand otherwise (§2.6 [E]; corrected by IR12). K-segmentation gives 3–5 at
-  +10–93 %. K-segmentation needs only contiguous magnitude bands, not
-  separable profiles, so it stays as a recipe.
+  +10–93 % [E] (+8–72 % [M, composition], M-b). K-segmentation needs only contiguous
+  magnitude bands, not separable profiles, so it stays as a recipe.
 
 ### 2.8 Why K-weights beat σ/τ shifts per bit (from L3a)
 
@@ -1095,7 +1156,18 @@ If revived, the design is as P1 drafted it, with these corrections:
     N_eq ≈ 2N − N_max. It needs an asymmetric scaling rule in KF/KL, not a new pack format.
     Unlike A6 it re-scales the partner, so the CRT over the prefix stays exact [I].
   - *The share-group raise cost*: a group run at its max N against each member at its own floor
-    with separate packs. M-b measures it on the DF-CCSD contraction set (§4.3).
+    with separate packs. M-b measures it on the DF-CCSD contraction set (§4.3). *Measured
+    (M-b, [M], model-only and outside the hold-out where a level is not in {8, 10, 14, 16};
+    immerdink-eval `findings/c1-m-b.md`):* on ccsd.py's pairwise DF contractions at the psi4
+    sizes, with the forcing rule's equal ABSOLUTE targets and the real norm products, the
+    members of a group share a floor in 11 of 12 (molecule, target) cases, so
+    the raise costs nothing; the twelfth (benzene/cc-pVDZ, 1e−8) costs +16.5 % per iteration
+    (20.45 against 23.83 TFLOPS-eq, 4.020 against 3.450 ms), hh's floor reaching R2 and L2
+    through R5. With one member's floor a level apart (ΔN = 2) the raise is −32 % to +25 % of
+    the group's time per iteration: negative where the separate variant's second pack of a
+    dressed factor (re-packed every iteration) outweighs the raised calls, largest where the
+    raised member dominates the group (R2's v⁴ output); from N = 6 to 14, up to +102 %. A
+    slice revival that avoids the raise would save at most that.
 
 ---
 
@@ -1509,8 +1581,9 @@ rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, beta=
   iteration's.
 - *Cost* [E]. One pass over C, plus the caller's norms: a pass over A and B, about 2× a pass
   over C at square shapes. At 4096³, N = 14, that is about 3 % for C and 6 % for the norms, so
-  about 9 % of a call when every norm is recomputed. Norms of an invariant operand are computed
-  once per phase. The ρ that sets N is needed once per phase decision, so this cost amortizes
+  about 9 % of a call when every norm is recomputed (M-b: 3.2 + 6.3 = 9.5 % at 0.9 TB/s, 8.6 %
+  at the 1.008 TB/s peak, against the [M] call of 4.70 ms). Norms of an invariant operand are
+  computed once per phase. The ρ that sets N is needed once per phase decision, so this cost amortizes
   over the phase.
 - σ-derived norms, ‖a_i‖ ≤ d·2^{−σ_i} (L1b), are valid for nonzero rows only. A zero row has
   σ := 0, so its bound d·2^0 is vacuous and can inflate the maximum by up to about T. So the
@@ -1703,6 +1776,25 @@ CC-shaped cases, schedule totals against fixed N, and the re-pack cost per switc
 - **The share-group raise cost** (IR15) on the DF-CCSD contraction set (ehrenfest ccsd.py,
   read-only): the group at its max N against each member at its own floor with separate packs,
   [M], TFLOPS-eq and time.
+
+*Outcome (2026-10-07; immerdink-eval `findings/c1-m-b.md`, records `results/c1/m_b/`).*
+- *Re-runs:* the design-phase scripts, run unchanged on this worktree's library (sha256
+  `466acdb4…`, host API 13), reproduce every stored [M] record byte for byte, and so do stage
+  2's (M-a's `perf` blocks, `c2_summary.md`, `b6_split_cost.txt`). Of 191 cited figures
+  recomputed from fresh queries, 169 print as cited, 7 differ in the last digit only
+  (≤ 0.42 %, kept), and 6 differ by more: §2.3's re-pack share (a text error, corrected: 9–11 %,
+  not "about 11 %"), four of §2.7's first-round [E] K-segmentation costs and §4.2's "about 9 %"
+  [E] (kept as estimates and annotated, §2.7). §2.7 also gets the [M] composition of the S
+  calls.
+- *M-d2's bars* (below), unrounded: 0.750 (PPL view, best g), 0.664 (DF), 0.673 (4096³);
+  0.786 on the Jacobi view. The best-g and g = N predictions coincide on these shapes
+  (`PrecisionPlan` picks g = N at every level), so the bars hold whichever M-d2 runs.
+- *The share-group raise cost:* §3.3. The contraction set is ccsd.py's pairwise DF
+  contractions (R1, R2 at cc-pVDZ only, hh, R5, both L_aikc and both L_ldkc terms) at the M-a
+  psi4 sizes, with four groups: Bvv {R2, R5, L2}, Boo {hh, R5}, Bvo {R1, L1} (t1-dressed,
+  re-packed every iteration) and Bov {L1, Lld1, Lld2} (bare, re-packed per phase). L2 reads Boo
+  with another pack key than hh and R5 (`imd_pack_layout` digests), so it is not in the Boo
+  group. The joint ranking chose the group floor in all 292 scenarios.
 
 **M-c (GPU, round 2): small-N hold-out** (IR4; decided by the independent reviewer). It runs
 **strictly before M-d2**.

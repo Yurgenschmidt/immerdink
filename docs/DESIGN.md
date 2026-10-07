@@ -586,9 +586,12 @@ do not see. With the per-band norms (one pass over A and B, as §6g.11's norms):
   is still +4 % to +62 % over fast mode's [M] (R2b: 2 % faster, inside the model's error),
   and it loses elementwise accuracy at 1e−10 / 1e−12 on the outputs with ρ ≤ 1e8.
 - Costs per call: S-fold K0, K5 and W-plane writes plus the β = 1 read of C ([E] +10–93 % at
-  S = 2–4 on 4096³, DF and 8192³; NOTES-C1 §2.7).
+  S = 2–4 on 4096³, DF and 8192³; NOTES-C1 §2.7). The model's own composition of the S calls,
+  the method of the [M] figures above, prices them lower: +8–72 % at N = 14 (NOTES-C1 §2.7,
+  M-b).
 - [M] figures at N ∉ {8, 10, 14, 16} are model-only until the small-N hold-out M-c passes
-  (NOTES-C1 IR4).
+  (NOTES-C1 IR4). NOTES-C1's M-b re-ran the [M] figures here on this worktree's library:
+  unchanged (immerdink-eval `findings/c1-m-b.md`).
 
 Use it for banded anti-correlated K profiles at normwise or absolute targets well above S·u,
 not for elementwise targets near u.
@@ -5080,7 +5083,9 @@ it.
   would catch it. C-pack does not depend on I1.
 - The gain depends on the final N the consumer needs and on the shape (NOTES-C1 §2.3–§2.4,
   §4.10). Gains at N ∉ {8, 10, 14, 16} rest on the performance model outside its hold-out
-  until NOTES-C1's M-c passes.
+  until NOTES-C1's M-c passes. NOTES-C1's M-b re-ran these [M] figures on this worktree's
+  library (host API 13): every design-phase record reproduces byte for byte, and `PrecisionPlan`'s
+  own choices give the same schedule ratios (immerdink-eval `findings/c1-m-b.md`).
 
 ### 6g.10 Choosing N per phase: `PrecisionPlan` (stage 1) **[test: host_precision]**
 
@@ -5185,6 +5190,14 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   this normally returns the floor, but not when the packing and reuse terms differ by level.
   Groups that share a contraction are merged for N. Whether the members can really read one
   pack (one key) is checked where it matters, by plan creation (PACK_MISMATCH).
+  *What the raise costs* [M, model-only, outside hold-out at levels ∉ {8, 10, 14, 16}]
+  (NOTES-C1 §3.3, M-b: ehrenfest ccsd.py's pairwise DF contractions at psi4 sizes): nothing
+  in 11 of 12 forcing-rule cases on the real operands, whose group members share a floor, and
+  +16.5 % per iteration in the twelfth, raised through a contraction in two groups. With one
+  member's floor a level (ΔN = 2) from the rest's, from −32 % (the second pack of a factor
+  re-packed every iteration costs more than the raise) to +25 % of the group's time per
+  iteration (the raised member dominates the group); a caller can split such a group. The
+  joint choice was the group floor in every case measured.
   **A member at DIRECT** (its floor, step 1 or 3) reads no pack, so it leaves the group's N
   coupling for that phase (independent review of stage 1, MF1): it is settled alone, as
   outside a group (in-line, g = 1, status `DIRECT`, `BUDGET` or `MISSED`), and the other
@@ -5414,7 +5427,7 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 | N-range plan: one plan serving every N′ ∈ [N_lo, N_hi] (NOTES-C1 §3.2) | Parked. A call at N′ is launch-identical to the single-N′ plan, so it gains nothing per call; precision phases use a plan per N (§6g). It would save only plan count, host bytes and creation time (0.011–0.15 ms per N, once). **Trigger:** a consumer that cannot re-plan per phase, or a measurement showing that plan count, plan creation or RESIDENT memory matters. |
 | Multi-N packs; round-to-odd reference-integer packs; lower-N planes from a higher-N pack (NOTES-C1 §3.1 A3, A4, A6) | A multi-N pack has the same bytes as separate packs and saves one FP64 read per pack creation, for N-set key semantics. A round-to-odd pack takes 5 / 8 / 9 / 11 B per element at N_max = 8 / 14 / 16 / 20 (≥ FP64 from N_max = 14), each call still reads ≥ 8 B per element, and it saves only the S pass that KL already fuses. Lower-N planes cannot come from a higher-N pack: σ depends on N, rounding is not modular, and the CRT over a prefix gives z mod P(N′) (PackedOperand `neg_n`). |
 | Choosing N on the device within a call | N fixes the launch sequence, the K5 instantiation, W, the workspace and σ itself, and kernel scope forbids the sync. N is chosen on the host per phase (§6g.10). |
-| Ozaki-I slice mode: prefix slices, one pack for every precision (C1(c), NOTES-C1 §2.9, §3.3) | Parked. Faster than Ozaki-II only on benign data below about 1e−8, break-even near 1e−10, 1.25–1.75× slower at FP64 level [E], no win beyond S = 2 slices on heavy-tailed rows; and no operand is needed at two N at once. **Triggers:** a consumer needs one operand at two or more precisions at once under memory pressure, or M-d measures phase-switch re-packs at ≥ 5 % of a phase. A revival must beat the prefix-plane option and the share-group raise cost, and builds its TLA+ then. |
+| Ozaki-I slice mode: prefix slices, one pack for every precision (C1(c), NOTES-C1 §2.9, §3.3) | Parked. Faster than Ozaki-II only on benign data below about 1e−8, break-even near 1e−10, 1.25–1.75× slower at FP64 level [E], no win beyond S = 2 slices on heavy-tailed rows; and no operand is needed at two N at once. **Triggers:** a consumer needs one operand at two or more precisions at once under memory pressure, or M-d measures phase-switch re-packs at ≥ 5 % of a phase. A revival must beat the prefix-plane option and the share-group raise cost (NOTES-C1 M-b, [M, model-only, outside hold-out]: 0 in 11 of 12 forcing-rule cases on the DF-CCSD contraction set with real operands, +16.5 % per iteration in the twelfth; −32 % to +25 % with one member's floor a level apart), and builds its TLA+ then. |
 | K5 statistics and a device a-posteriori certificate (lemma L6; NOTES-C1 stage 5) | Deferred: no consumer issues elementwise targets, and the host-side `rho_from_output` (§6g.11) gives a rigorous ρ now. **Triggers** (NOTES-C1 §4.6): T1, a consumer issues ELEMENTWISE requests per phase and the recipe's measured cost is ≥ 3 % of its run; T2, a consumer needs a rigorous per-call elementwise certificate on every call; T3, Eric asks for it. |
 | FP8 / INT4 paths | FP8 can't hold residues exactly at speed on Ada. INT4 forces p ≤ 16. |
 
@@ -6156,7 +6169,11 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
   `libimmerdink_host.so` byte-identical to the library that produced NOTES-C1's [M] figures.
   The design-phase scripts and records are in immerdink-eval (`scripts/c1/design-phase/`,
   `results/c1/design-phase/`), listed with their sha256 in
-  `findings/c1-design-phase-manifest.md`.
+  `findings/c1-design-phase-manifest.md`. **M-b** (NOTES-C1 §4.3, IR9, IR15, IR23; CPU) re-ran
+  them on this worktree's library: every stored [M] record reproduces byte for byte, as do
+  stage 2's, and no cited [M] figure here changed. §3.8 adds the [M] composition of the
+  K-segmentation cost next to the [E]; §6g.10 and §7 add the share-group raise cost
+  (immerdink-eval `findings/c1-m-b.md`).
 - **Stage 1** (NOTES-C1 §4.2 with IR2, IR3, IR7, IR8, IR15, IR24; Python only, host API 13):
   - **§6g.10:** `immerdink.precision.PrecisionPlan` (new module; planner.py unchanged):
     per phase, `min_moduli`, then one rank per contraction over the levels ≥ the floor with
