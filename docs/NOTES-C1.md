@@ -429,34 +429,47 @@ what has been built since is recorded under "Implementation status".
   MD2-0, binding): MC-3a comes first. MC-3 may close without a calibration change only as
   MC-3a's recorded outcome or by Eric's explicit decision. Instead, before any M-d2
   measurement:
-  - *Protocol and driver pre-registered,* first at 3254b15. After the review
-    (approve-with-fixes, §5.10) they were **re-registered at daf3583**, which is normative:
-    `bench/accuracy/md2_time.py`, sha256 `b4cb932621ee…` (in full in §4.3), whose docstring
-    is the protocol (§4.3 "M-d2", "Pre-registered protocol"). It has four modes: `predict`
-    (CPU), `run` (GPU, one fresh process per system and data set), `judge` (CPU) and
-    `selftest` (CPU, the decision and provenance rules, 60 checks).
+  - *Protocol and driver pre-registered,* first at 3254b15, re-registered at daf3583 after
+    the review (approve-with-fixes, §5.10), and **re-registered at 35eeb46** after the
+    re-review (approve-with-fixes, §5.10 "Re-review"), which is normative:
+    `bench/accuracy/md2_time.py`, sha256 `90fa7f92a143…` (in full in §4.3), whose
+    docstring is the protocol (§4.3 "M-d2", "Pre-registered protocol"). It has four modes:
+    `predict` (CPU), `run` (GPU, one fresh process per system and data set), `judge` (CPU)
+    and `selftest` (CPU, the decision and provenance rules, 95 checks; the CPU-only ctest
+    `md2_time_selftest`).
     - `judge` decides per system *and data set* by the pre-registered rules (a)–(d) (§4.3):
-      contaminated or not bit-exact records are inadmissible, a bit-exact failure stops
-      M-d2, one re-run at most, and the first admissible record decides. 3254b15's judge
-      keyed its verdict by system only, so one data set recorded twice passed.
+      records that are contaminated, or whose bit-exact check is not true at every level,
+      are inadmissible; a bit-exact failure on any record in the file stops M-d2; one
+      re-run at most; the first admissible record decides. 3254b15's judge keyed its
+      verdict by system only, so one data set recorded twice passed.
+    - One normative records file (immerdink-eval `results/c1/m_d2/md2.jsonl`); every M-d2
+      record in any file is an attempt and is reported. The driver is frozen from the
+      first M-d2 record on. After rule (d), STOPPED or a refused file, nothing continues
+      without a recorded reviewer verdict or Eric's decision (§4.3 "Records, freeze and
+      continuation").
     - `judge` refuses a records file holding an M-d2 record that fails a provenance check:
       - the registered calibration file;
       - the loaded library's shipped (build-time embedded) calibration equal to that file,
         as canonical text and as bit-identical predictions;
-      - a clean tree and a `--md2-cleared` reason;
+      - the registered bar and p90 class reproduced on the loaded host library
+        (`registered_check`);
+      - a clean tree, and a `--md2-cleared` that cites the commit (an ancestor of the
+        record's) and the NOTES-C1 section recording MC-3's closure;
       - the judging driver's own sha256;
       - the fixed protocol parameters;
-      - the bars' configuration at every level (g = N, GENERATE, in-line, RN).
-    - `run` refuses the four M-d2 systems unless `--md2-cleared` names why the ordering is
-      met. Before any GPU work, it also refuses a record that would fail those checks, or
-      that rules (a)–(c) forbid.
-    - The protocol decisions MD2-0 to MD2-7 and the reviewer's verdicts are in §5.10: all
-      upheld, MD2-3, MD2-6 and MD2-7 with the fixes above. MD2-8 (which driver counts as
-      registered) arose while applying the fixes and is not reviewed.
+      - the bars' configuration at every level (g = N, GENERATE, in-line, RN);
+      - one library per file (`lib_sha256`, `host_lib_sha256`, host API).
+    - `run` refuses the four M-d2 systems unless `--md2-cleared` cites the closure, and
+      with any `--lib` but `build/libimmerdink.so`. Before any GPU work, it also refuses a
+      record that would fail those checks, or that rules (a)–(c) forbid.
+    - The protocol decisions MD2-0 to MD2-8 and the reviewer's verdicts are in §5.10: all
+      upheld, MD2-3, MD2-6 and MD2-7 with the first review's fixes, and MD2-8 amended by
+      the re-review (the driver frozen from the first M-d2 record on).
   - *The bars reproduce* from the shipped calibration (`d31f62ca…`). This is `predict` at
-    daf3583 on `libimmerdink_host.so` `466acdb4…`; CPU, one thread, under memcap, FREE.
-    Its tables are identical to 3254b15's. The library's shipped calibration equals the
-    registered file, as canonical text and as predictions on the six systems.
+    35eeb46 on `libimmerdink_host.so` `466acdb4…`; CPU, one thread, under memcap, FREE.
+    Its tables and systems are identical to daf3583's and 3254b15's. The library's
+    shipped calibration equals the registered file, as canonical text and as predictions
+    on the six systems.
     - S14/F14 = 0.7501 (PPL view), 0.6635 (DF) and 0.6728 (4096³), i.e. the registered
       0.750 / 0.664 / 0.673. Rank's choice and g = N agree, and `PrecisionPlan` picks
       g = N at every level. The Jacobi view gives 0.7865.
@@ -464,24 +477,30 @@ what has been built since is recorded under "Implementation status".
       [0.550, 1.022] is reported only.
   - *Tooling check only, not M-d2 evidence:* the driver ran on two shapes that are not M-d2
     systems: 512³ with A invariant, and a PPL-like 100 × 576 × 576 with B invariant. Both
-    data sets, 5 reps, under the GPU lock. It ran at 3254b15 and again at daf3583
-    (42 s of wall time, each lock hold about 10 s).
-    - At daf3583, packed and in-line agree bit for bit at every level. Every run was
+    data sets, 5 reps, under the GPU lock. It ran at 3254b15, at daf3583 and again at
+    35eeb46 (41 s of wall time, each lock hold about 10 s).
+    - At 35eeb46, packed and in-line agree bit for bit at every level. Every run was
       queued ahead (0 of 10 gated S14/F14 runs not queued ahead, per record). Worst
-      spreads 0.51–2.65 %, and every record is admissible.
-    - Measured S14/F14 against [M]: 0.860 and 0.855 against 0.859 on 512³; 0.723 and
-      0.714 against 0.681 on the PPL-like shape (+6.2 % and +4.8 %). These ratios check
+      spreads 0.39–2.28 %, and every record is admissible.
+    - Measured S14/F14 against [M]: 0.859 and 0.859 against 0.859 on 512³; 0.724 and
+      0.713 against 0.681 on the PPL-like shape (+6.3 % and +4.7 %). These ratios check
       the tooling. They are not model evidence.
     - The rules end to end, on relabelled copies of these records (CPU):
       - one data set recorded twice gives INCOMPLETE (3254b15's judge said PASS);
       - a contaminated record is inadmissible;
-      - two inadmissible attempts give INCOMPLETE, with the cause to be recorded;
-      - a bit-exact failure stops M-d2;
-      - a dirty tree, another driver or other protocol parameters are refused.
+      - two inadmissible attempts give INCOMPLETE, and no further attempt without a
+        recorded verdict;
+      - a bit-exact failure stops M-d2, on a smoke record in the file too;
+      - a null bit-exact value at one level is inadmissible, not a stop;
+      - a dirty tree, another driver, other protocol parameters, two libraries, no
+        `registered_check` or `calib_check`, and an `--md2-cleared` without a citation
+        or with a commit that is no ancestor are refused.
 
-      With no GPU visible, `run` refused each case the rules forbid and wrote nothing.
-    - Records: immerdink-eval `results/c1/m_d2/` (untracked; `reregister/` for daf3583);
-      summary `findings/c1-m-d2.md`.
+      With no GPU visible, `run` refused each case the rules forbid and wrote nothing. A
+      positive control that meets every check got past the gate and stopped at the first
+      CUDA call ("no CUDA-capable device"), writing nothing.
+    - Records: immerdink-eval `results/c1/m_d2/` (untracked; `rereg2/` for 35eeb46,
+      `reregister/` for daf3583); summary `findings/c1-m-d2.md`.
   - *Caller note [M, model-only, outside hold-out]* (§5.10 MD2-4, §2.4). The PPL view's bar
     is an in-line ratio. With the invariant B (680 MB) packed per phase, the schedule gain
     is 1.14× (P14/PF14 = 0.876, above the 0.8 cap), against 1.33× in-line: the four packs
@@ -2153,16 +2172,45 @@ under 100 µs (10–13 %).
     N = 8–9 is reported even if small.
   - **Pre-registered protocol** (2026-10-07, before any M-d2 measurement). Not run: it waits
     for the MC-3 path (Status "M-d2").
-    - *Normative driver:* `bench/accuracy/md2_time.py` at **daf3583**, sha256
-      `b4cb932621eea6fdacc6fb67f13479d65ecb9544517b31e77b90870c68792c18`; its docstring is
-      normative. It replaces 3254b15 (sha256 `95ed2f6c…`), whose judge the review found
-      wrong (§5.10).
-    - *Decisions:* §5.10 MD2-0 to MD2-7, reviewed (approve-with-fixes; the verdicts are
-      binding).
+    - *Normative driver:* `bench/accuracy/md2_time.py` at **35eeb46**, sha256
+      `90fa7f92a1439f4056253aa69d378fadda4cee3751b2ec5ce0b221ca262f5b9a`; its docstring is
+      normative. It replaces daf3583 (sha256 `b4cb9326…`), which the re-review found to
+      leave forking paths open outside one records file, and 3254b15 (sha256
+      `95ed2f6c…`), whose judge the first review found wrong (§5.10).
+    - *Decisions:* §5.10 MD2-0 to MD2-8, reviewed twice (approve-with-fixes both times; the
+      verdicts are binding).
     - *If the calibration changes (MC-3a):* re-run M-b's [M] figures and `predict` (which
       then exits 1). Update the bars, the band classes and `REGISTERED_CALIB` in the
       driver, and commit before any M-d2 run. That re-registers the driver: a new commit
-      and sha256 here.
+      and sha256 here (allowed before the first M-d2 record; below).
+    - *Records, freeze and continuation* (binding; the re-review's must-fix, §5.10 MD2-8 as
+      amended; mirrored in the driver's docstring):
+      - *One normative records file:* immerdink-eval `results/c1/m_d2/md2.jsonl`. Every
+        M-d2 record `run` ever writes, in any file, is an attempt under rules (b) and (c)
+        below and is reported. Starting another file resets nothing.
+      - *The driver is frozen from the first M-d2 record on.* Before it, re-registration
+        is a commit plus this section and the findings naming it, as now. From the first
+        M-d2 record on, the driver is re-registered only with an independent-review
+        verdict recorded in §5.10. Records made under an earlier driver stay reported and
+        binding, judged by the driver that made them (`git show
+        <commit>:bench/accuracy/md2_time.py`, run in a checkout of that commit, e.g. `git
+        worktree add`).
+      - *Nothing continues automatically* after rule (d) (two inadmissible attempts) or
+        M-d2 STOPPED. A further attempt, a new records file, or a restart after a library
+        fix needs a reviewer verdict or Eric's decision, recorded here. That record names
+        the cause or the fix and the new file, and every earlier record stays reported.
+      - *A refused file is a procedural breach, not a reset.* If `judge` refuses a records
+        file holding M-d2 records (a provenance failure, below), the breach is recorded
+        here: which record, and how it got there. Continuing in a new file needs a
+        recorded reviewer verdict or Eric's decision.
+    - *The library:* `build/libimmerdink.so` (and its `libimmerdink_host.so`), built at the
+      registered commit before the first M-d2 run; the findings name its sha256 before
+      that run. `run` refuses the M-d2 systems with any other `--lib`.
+    - *`--md2-cleared`* must cite the commit and the NOTES-C1 section that record MC-3's
+      closure (MC-3a's recorded outcome, or Eric's decision; §5.10 MD2-0), e.g.
+      "MC-3a's outcome recorded at <commit>, NOTES-C1 §5.n". `run` and `judge` check that
+      the reason names a "NOTES-C1 §n.m" section and a commit that is the record's commit
+      or an ancestor of it, so each record points at that evidence.
     - *Configuration:* `PrecisionPlan.configs()` over the levels 6, 8, 9, 10, 14, in-line,
       GENERATE, RN: M-b's view, which gives g = N at every level here. The invariant
       operand is B (the integrals) for the PPL view and DF, and A for 4096³ and for the
@@ -2193,16 +2241,19 @@ under 100 µs (10–13 %).
         systems pass.
     - *Admissibility, re-runs and the decision* (the reviewer's binding rule, §5.10 MD2-6;
       per system and data set; `selftest` checks it):
-      - (a) A record with `contaminated` true, or without a bit-exact match at every
-        level, is inadmissible: neither PASS nor FAIL. A bit-exact failure is a library
-        defect and stops M-d2 (M-d2 STOPPED) until it is fixed and recorded.
+      - (a) A record with `contaminated` not false, or whose bit-exact check is not true at
+        every level (a missing or non-boolean value included), is inadmissible: neither
+        PASS nor FAIL. A bit-exact failure (false at any level) is a library defect and
+        stops M-d2 (M-d2 STOPPED) until it is fixed and recorded. This holds for a
+        bit-exact failure on *any* record made with the M-d2 library, smoke records
+        included, in any file; `judge` and `run` apply it to every record in the file.
       - (b) At most one re-run, in a fresh process after a FREE busy check in its own call,
         appended to the same records file.
       - (c) The first admissible record in file order decides, and every record is
         reported. A later record never replaces it, and a record past the second is
         excess, never considered.
       - (d) If both attempts are inadmissible, the pair is INCOMPLETE, and M-d2 is not
-        decided until the cause is recorded here.
+        decided until the cause is recorded here; nothing continues automatically (above).
 
       A system fails when either data set is outside. M-d2 fails when any system fails,
       and is INCOMPLETE while any pair is undecided.
@@ -2211,15 +2262,23 @@ under 100 µs (10–13 %).
       - the registered calibration file (`d31f62ca…`);
       - the loaded library's shipped calibration (embedded at build time) equal to that
         file, as canonical text and as bit-identical predictions (`calib_check`);
-      - a clean tree and a non-empty `--md2-cleared`;
+      - `registered_check`: the loaded host library reproduces the system's registered bar
+        (rank's choice and g = N, to 3 decimals) and its p90 class, as `predict` checks.
+        `calib_check` compares two calibrations on the same model code, so this catches a
+        model-code change under an unchanged calibration;
+      - a clean tree, and an `--md2-cleared` that cites the closure (above);
       - the judging driver's own sha256;
       - the protocol's fixed parameters (15 reps, 2 attempts, 3 s warm-up, 1 GiB primer,
         seed 1, 5 %);
       - the bars' configuration at every level (N moduli, g = N, GENERATE, in-line, RN,
-        EMULATE).
+        EMULATE);
+      - per file, one library: the M-d2 records share one (`lib_sha256`,
+        `host_lib_sha256`, `host_api`).
 
       `run` also refuses a re-run of a decided pair, a third record, and any M-d2 system
-      after a bit-exact failure.
+      after a bit-exact failure in the file. `md2_time.py selftest` (95 checks, the bars,
+      bands, runs and protocol constants pinned as literals) is the CPU-only ctest
+      `md2_time_selftest`.
     - *Budget:* about 3 min of GPU in all for 8 processes, each well under 1 min per lock
       hold, with a busy check before each chunk (≤ 5 min).
 
@@ -3253,9 +3312,11 @@ dependencies:
   narrow-KL hold-out, and the per-phase conditions); then M-b's [M] figures and M-d2's bars
   re-derived if the calibration changes. Still strictly before M-d2.
 - M-d2 against its pre-registered bands, after the MC-3 path closes (§5.9 "M-d2 ordering").
-  *Its protocol and driver are pre-registered (re-registered after review at daf3583, §4.3,
-  §5.10), and it has not run.*
-  Once the ordering is met, it is eight `md2_time.py run` processes and one `judge`.
+  *Its protocol and driver are pre-registered (re-registered after two reviews, now at
+  35eeb46, §4.3, §5.10), and it has not run.*
+  Once the ordering is met, the library is built at the registered commit and its sha256
+  named in the findings; then it is eight `md2_time.py run` processes into the one
+  normative records file, and one `judge` (§4.3 "Records, freeze and continuation").
 - Then the mechanical gate decisions: stage 4 by its pre-registered rule (§4.5); stage 5
   deferred (a trigger check only, §4.6); stage 6 by its rule (§4.7).
 
@@ -4808,10 +4869,12 @@ of this section; they are binding.
 ### 5.10 M-d2: the protocol's design questions (implementer and independent reviewer, 2026-10-07)
 
 Evidence: Status "M-d2"; §4.3 "Pre-registered protocol"; `bench/accuracy/md2_time.py`
-(3254b15, re-registered at daf3583); immerdink-eval `findings/c1-m-d2.md`. The implementer
-decided each question conservatively, and an independent reviewer then ruled on each; the
-verdicts are binding. The review was **approve-with-fixes**, and every fix is applied at
-daf3583 (the driver) and in the docs. No library, calibration or ABI change.
+(3254b15, re-registered at daf3583 and again at 35eeb46); immerdink-eval
+`findings/c1-m-d2.md`. The implementer decided each question conservatively, and an
+independent reviewer then ruled on each; the verdicts are binding. The review was
+**approve-with-fixes**, and every fix is applied at daf3583 (the driver) and in the docs.
+A re-review of daf3583 was **approve-with-fixes** too; its fixes are applied at 35eeb46
+and in the docs ("Re-review", below). No library, calibration or ABI change.
 
 Must-fix items:
 1. **The judge did not enforce MD2-3.** It keyed its verdict by system only, and `run`
@@ -4834,6 +4897,7 @@ Must-fix items:
 3. **Re-registration before any M-d2 measurement.** The fixed driver is committed (daf3583,
    sha256 `b4cb9326…`). §4.3, Status and the findings name it as normative in place of
    3254b15 / `95ed2f6c…`. The verdicts are recorded here, with a summary in DESIGN §6g.9.
+   (Superseded by 35eeb46 after the re-review, below.)
 
 Should-fix items:
 - *Provenance checks, all applied.* `judge` refuses, and `run` will not make, an M-d2 record
@@ -4957,8 +5021,95 @@ The questions and verdicts:
   driver's own, and the record's tree to be clean (`dirty` false, this driver included).
   The judge is then byte-identical to the committed driver that made the record. §4.3 and
   the findings name the registered commit and sha256, and `judge` prints its own for
-  comparison. Any later change to the driver re-registers it. Not reviewed; conservative:
-  a separate registration file was considered and judged no stronger.
+  comparison. A separate registration file was considered and judged no stronger. The
+  decision's sentence "Any later change to the driver re-registers it" is struck by the
+  verdict.
+  ***Verdict (re-review): UPHELD in mechanism, AMENDED (binding).*** A file cannot carry
+  its own hash, and a separate registration file is no stronger than the docs naming the
+  commit and sha256, which `judge` prints for comparison, so the mechanism is sound.
+  - Before the first M-d2 record, re-registration is a commit plus updated §4.3 and
+    findings, as now.
+  - From the first M-d2 record on, the driver is frozen: a change needs an
+    independent-review verdict recorded here. Earlier records stay binding, judged by the
+    driver that made them.
+
+  *Rationale:* otherwise refusing whole files by driver sha256 becomes a way to discard
+  unwanted records (the re-review's must-fix, below).
+
+**Re-review of daf3583 (approve-with-fixes, 2026-10-07; binding).** No M-d2 record exists;
+every fix is applied at **35eeb46** (the driver, sha256 `90fa7f92…`, re-registered; the
+ctest) and in the docs, before any M-d2 record.
+
+Must-fix: **close the forking paths outside a single records file.** Rules (a)–(d) were
+scoped to whatever `--out` file `run` is given, and `judge` refuses a whole file whose
+records came from another driver. With "any later change to the driver re-registers it",
+"start a new file" and "edit the driver and re-run" stayed open: the "re-run until clean or
+inside" path that the first review's must-fix 2 was meant to close. *Applied* in §4.3
+"Records, freeze and continuation" and in the driver's docstring:
+1. One normative records file, immerdink-eval `results/c1/m_d2/md2.jsonl`. Every M-d2
+   record `run` ever writes, in any file, is an attempt under (b) and (c) and is reported.
+2. The driver is frozen from the first M-d2 record on (MD2-8 as amended).
+3. After rule (d) or STOPPED nothing continues automatically. A further attempt, a new
+   records file, or a restart after a library fix needs a recorded reviewer verdict or
+   Eric's decision that names the cause or the fix and the new file. All earlier records
+   stay reported.
+
+Should-fix items, all applied at 35eeb46:
+- *Library identity.* `--lib` was a free flag, and `lib_sha256`, `host_lib_sha256` and
+  `host_api` were recorded but never compared: two records of one system from different
+  builds were judged as one. Now:
+  - `run` refuses the M-d2 systems unless `--lib` is `build/libimmerdink.so`;
+  - `judge` refuses a file whose M-d2 records do not share one (`lib_sha256`,
+    `host_lib_sha256`, `host_api`), and `run` will not add such a record;
+  - `run` records `predict`'s `registered_check` for the system (the bar to 3 decimals and
+    the p90 class on the loaded host library), and `judge` requires it. `calib_check`
+    compares two calibrations on the same model code, so a model-code change with an
+    unchanged `.calib` used to pass.
+  - §4.3 states that the library is built at the registered commit before the first M-d2
+    run, and that the findings name its sha256.
+- *`inadmissible()` matched neither its docstring nor §4.3.* A level was bit-exact unless
+  its value was literally false, so None, 0 or "yes" decided a pair. Now any value that is
+  not true is inadmissible, and only false stops M-d2. The selftest checks None, 0, 1,
+  "yes" and "true".
+- *`md2_time_selftest` is a CPU-only ctest* (`tests/CMakeLists.txt`, `tools/test.sh`'s
+  CPU-only list), with all three bands, the bars and p90, the runs and the protocol
+  constants pinned as literals. Planting df bar = 0.70 or df p90 = 0.20 used to pass; it now
+  fails 3 checks each. The selftest has 95 checks, against 60 before.
+- *`--md2-cleared` cites the closure:* a commit, the record's commit or an ancestor of it,
+  and a "NOTES-C1 §n.m" section (§4.3). `run` and `judge` check both.
+- *Wording:*
+  - A record with no `calib_check` now says "no calib_check".
+  - Under STOPPED, the failing pair now reads "M-d2 STOPPED by a bit-exact failure: no
+    re-run", not "one re-run allowed".
+  - A bit-exact failure on any record made with the M-d2 library, smoke included, blocks
+    M-d2 until fixed (§4.3 rule (a)). `judge` and `run` apply it to every record in the
+    file; the selftest's smoke case now expects STOPPED.
+- *This record:* MD2-8's verdict, the Status bullet, and DESIGN §6g.9.
+
+The re-review's verdicts on the questions:
+- *First review's must-fix 1 (keyed by system only):* **RESOLVED.** The reviewer re-ran
+  `judge` on `repro_same_data_twice` (INCOMPLETE) and `both_data_inside` (PASS).
+- *First review's must-fix 2 (rules (a)–(d)):* **RESOLVED within a records file.** The
+  cross-file and continuation gap is the must-fix above.
+- *First review's must-fix 3 (re-registration before any M-d2 measurement):*
+  **RESOLVED.** No M-d2 record exists.
+- *Nothing regressed* (predict, the bars, the smoke, the provenance claims):
+  **CONFIRMED.** The reviewer reproduced the functional `calib_check` and the caller-note
+  figures.
+- *MD2-8:* **UPHELD in mechanism, AMENDED** (above).
+- *Provenance failures refuse the whole file rather than marking the record
+  inadmissible:* **UPHELD, with a condition.** The registered `run` cannot write such a
+  record, so it is not an attempt under (b). Counting it as inadmissible would let a
+  non-protocol record use up or occupy a pair's re-run, and letting it decide would be
+  worse. *Condition:* a refused file is a procedural breach, not a reset. It is recorded
+  here (which record, how it got there), and continuing in a new file needs a recorded
+  reviewer verdict or Eric's decision (§4.3).
+- *The fixed protocol parameters in the provenance check:* **UPHELD.** `--lib`, the one
+  free flag left, is now covered by the library-identity item.
+- *`selftest` not a ctest:* **ACCEPTED for that round, should-fix at the next code
+  commit.** Done at 35eeb46.
+- *MD2-0 (M-d2 not run; MC-3a first):* **UPHELD (binding).** The fixes add no
+  measurement and change no library, calibration or ABI.
 
 ---
 

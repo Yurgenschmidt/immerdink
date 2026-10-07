@@ -153,7 +153,8 @@ first.
   hold-out committed before the refit, the v1.18 hold-out judged with and without its 7
   view overlaps, and a fresh 160-call M-c run); then M-d2 (GPU), which waits for it (its
   protocol and driver `bench/accuracy/md2_time.py` are pre-registered, re-registered at
-  daf3583 after review, NOTES-C1 §4.3, §5.10; the review upheld the ordering: MC-3a first;
+  35eeb46 after two reviews, NOTES-C1 §4.3, §5.10; the reviews upheld the ordering: MC-3a
+  first; one normative records file, the driver frozen from the first M-d2 record on;
   not run); and
   the M-d1 caller guidance into DESIGN §6g.12.
   Evaluation records and summaries are in

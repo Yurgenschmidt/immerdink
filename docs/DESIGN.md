@@ -5117,7 +5117,7 @@ it.
     ordering", binding; upheld in review, §5.10 MD2-0: MC-3a first, closed without a
     calibration change only as MC-3a's recorded outcome or by Eric's decision).
     - Its protocol and driver are pre-registered: `bench/accuracy/md2_time.py`,
-      re-registered after review at daf3583 (sha256 `b4cb9326…`; NOTES-C1 §4.3).
+      re-registered after two reviews, now at 35eeb46 (sha256 `90fa7f92…`; NOTES-C1 §4.3).
     - The review (approve-with-fixes; NOTES-C1 §5.10, binding) upheld MD2-0 to MD2-7.
       The fixes:
       - the judge decides per system *and* data set, by rules (a)–(d): contaminated or
@@ -5126,6 +5126,13 @@ it.
       - provenance checks: a clean tree, the driver's sha256, the fixed protocol
         parameters, the bars' configuration per record, and the library's embedded
         calibration equal to the registered file.
+    - The re-review (approve-with-fixes; NOTES-C1 §5.10 "Re-review", binding) closed the
+      paths outside one records file: one normative records file, every M-d2 record in any
+      file reported; the driver frozen from the first M-d2 record on (MD2-8 amended);
+      nothing continues after two inadmissible attempts, STOPPED or a refused file without
+      a recorded reviewer verdict or Eric's decision. Also: one library per records file,
+      the registered bar re-checked on the loaded library, `--md2-cleared` citing the
+      closure's commit and section, and the selftest as ctest `md2_time_selftest`.
     - On the shipped calibration, its `predict` reproduces the bars: 0.750 (the PPL view),
       0.664 (DF) and 0.673 (4096³), with bands of ± 15 % capped at 0.8.
     - [M, model-only, outside hold-out] (NOTES-C1 §5.10 MD2-4): with the PPL view's
@@ -6347,7 +6354,7 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     view matches no fit case.
 - **M-d2, pre-registered and not run** (NOTES-C1 §4.3, §5.10; 2026-10-07; no library,
   calibration or ABI change). `bench/accuracy/md2_time.py` (3254b15; re-registered after
-  review at daf3583) has four modes:
+  review at daf3583 and after the re-review at 35eeb46) has four modes:
   - `predict` (CPU) checks that the shipped calibration reproduces the registered bars, and
     that the library's embedded calibration equals the registered file;
   - `run` (GPU) times the 16-call schedules end to end, in-line (gated) and with the
@@ -6356,10 +6363,14 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     rules would reject;
   - `judge` (CPU) applies the bands per system and data set by the pre-registered rules
     (a)–(d) of NOTES-C1 §4.3, and refuses records outside the protocol;
-  - `selftest` (CPU) checks those rules on synthetic records.
+  - `selftest` (CPU) checks those rules on synthetic records (ctest `md2_time_selftest`).
 
-  A smoke on two non-M-d2 shapes checked the tooling, at 3254b15 and again at daf3583.
+  A smoke on two non-M-d2 shapes checked the tooling, at 3254b15, daf3583 and 35eeb46.
   - Review (approve-with-fixes; NOTES-C1 §5.10, binding): MD2-0 to MD2-7 upheld. M-d2 waits
     for MC-3a. The judge's verdict was keyed by system only, so one data set recorded twice
     passed; it is now keyed per data set, with the admissibility and provenance rules
     above. A caller note on packing the invariant operand is in §6g.12.
+  - Re-review (approve-with-fixes; NOTES-C1 §5.10 "Re-review", binding): one normative
+    records file, the driver frozen from the first M-d2 record on (MD2-8 amended), no
+    automatic continuation after two inadmissible attempts, STOPPED or a refused file;
+    library identity and `--md2-cleared`'s citation checked; re-registered at 35eeb46.
