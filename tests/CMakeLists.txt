@@ -73,6 +73,13 @@ if(Python3_FOUND)
   add_test(NAME host_footprint_monotone
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_footprint.py"
                    --host-lib "$<TARGET_FILE:immerdink_host>" -v)
+  # DESIGN v1.19 §6g.10-§6g.11 (NOTES-C1 §4.2, stage 1): python/immerdink/precision.py, the
+  # PrecisionPlan phase rule == a brute-force composition from host.py's queries (per-role
+  # pack cost, share groups, BUDGET / MISSED / DIRECT, monotone floor), its footprints, and
+  # rho_from_output == spec/params.py rho_recipe bit for bit. CPU only (needs numpy).
+  add_test(NAME host_precision
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_precision.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" -v)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files

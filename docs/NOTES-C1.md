@@ -39,6 +39,13 @@ what has been built since is recorded under "Implementation status".
     review found every earlier case at radix 1), plus `kp_prep`'s two instances and a gathered
     K; sentinels and memcheck are clean, and the 16-byte-short mutation is reported.
   - **IR18:** ROADMAP C1's decision column and C2's title are updated (Q6, Q7).
+- **Stage 1 (§4.2) is implemented, 2026-10-07: DESIGN v1.19 §6g.10–§6g.12**, Python only
+  (host API 13). `python/immerdink/precision.py` (`PrecisionPlan` with the IR2 composition,
+  masks and BUDGET, joint share groups, the DIRECT sentinel; `rho_from_output`),
+  spec/params.py `rho_recipe` and `cert_rho_recipe`, the CPU test `host_precision` (a brute
+  force from host.py's queries), and the example `bench/accuracy/schedule.py`. The
+  implementation's design questions are §5.5, decided conservatively and put to the
+  independent reviewer.
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -3194,6 +3201,45 @@ decided conservatively and then put to an independent reviewer, whose verdicts a
 - **S0-7. `host_footprint_monotone` covers N = 2..20** where §4.1's grid said 2..19. *Verdict:
   accepted.* N_MAX is 20; the superset covers the W = 3 boundary (N ≥ 17) and the whole
   published F1/F2 range.
+
+### 5.5 Stage 1: the implementation's design questions (pending the independent reviewer)
+
+Each was decided conservatively, in the spirit of §4.2, and is implemented and documented as
+stated (DESIGN §6g.10–§6g.11).
+- **S1-1. Parameters beyond §4.2's signature.** `vec_modes` (§4.2 ranks "the given vec modes"
+  but names no parameter); `perf` (regime, cache, clock of rank and the pack predictions: the
+  `Planner` carries only the calibration and the memo, not the regime or cache §4.2's comment
+  attributes to it); a dict form of a contraction with `beta` (rank's β flag; CC residual
+  builders accumulate); `configs(iterations)` (so a `"phase"` reuse prices the same in
+  `configs()` as in the phase, and the phase's choice is a `configs()` plan); `mode=` of
+  `rho_from_output` (a DIRECT call's U is γ_k, which exceeds the EMULATE bound at large N, so
+  using the EMULATE U there would be unsound).
+- **S1-2. Share-group members** are `(name, "A" | "B")`, the role reading the group's pack, or
+  a bare name (equal N only). Groups that share a contraction are merged for N; one role is in
+  at most one group. Whether the members' packs have one key is left to plan creation
+  (PACK_MISMATCH), not checked by `PrecisionPlan`. A shared role's int reuse is the total
+  calls per pack, and the members' kinds must agree.
+- **S1-3. Statuses.** The normal status is `MET`; precedence MISSED > BUDGET > DIRECT.
+  `configs()` reports `OK` or `BUDGET`. In a share group where no level fits every member,
+  the group takes its floor; members that fit there are MET, the others BUDGET. Ties between
+  levels of a group go to the smaller N.
+- **S1-4. MISSED** contractions are ranked with their target, so the reported err fields are in
+  its metric, and chosen by status and budget only (the accuracy bit ignored).
+- **S1-5. DIRECT** choices are in-line (no packs), g = 1, with the plan's num_moduli the top
+  emulated level (a DIRECT plan ignores it); `Phase.N` reports `"DIRECT"`. Under the monotone
+  floor DIRECT stays, and a target DIRECT misses is reported MISSED there.
+- **S1-6. Footprints.** Per level, the maximum over the allowed pack modes × vec modes at the
+  largest g whose query succeeds (F1, ABI); the plan device bytes are included; the totals
+  share no workspace; a shared pack counts once, keyed by its group.
+- **S1-7. `rho_from_output` details.** A C of exactly 2⁻¹⁰²² with e < 0 is uncertified (it
+  may be a subnormal 2^e·D rounded up, so D is not recoverable); a ρ̂ that overflows is
+  uncertified; α must be a positive power of two (−2^e would also be exact, but §4.2 says
+  2^e); norm bounds broadcast against C (1-D vectors for a 2-D C) and are validated (NaN or
+  negative: ValueError); uncertified entries are +∞.
+- **S1-8. `fail_budget`** is per phase (§4.2 step 7: P over the phase's calls). A run budget is
+  the caller's split; the example calls `phase()` every iteration with `iterations=1` and
+  P / T_max.
+- **S1-9. A phase names every contraction** (a subset raises ValueError).
 
 ---
 

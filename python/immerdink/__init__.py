@@ -9,7 +9,9 @@
   `DeviceArray` raw pointers), a ctypes binding of libimmerdink's C ABI. Importing loads no
   library; libimmerdink is loaded on first use.
 - Precision phases (DESIGN v1.19 §6g): a plan and a pack per N; `PackSpec.with_moduli` and
-  `PackedBuffer` (a packed buffer re-packed at several N, guarded on the host).
+  `PackedBuffer` (a packed buffer re-packed at several N, guarded on the host);
+  `immerdink.precision` (not imported here): `PrecisionPlan`, N per phase from targets on the
+  host, and `rho_from_output`, the rigorous rho of a previous output (needs numpy).
 """
 
 from .device import (  # noqa: F401

@@ -35,6 +35,8 @@ Map to docs/DESIGN.md (v1). Each certificate in CHECKS names its section.
                                                                      k4_load_addresses()
   §6b.4 packed-operand byte layout (formats 1, 2) .................. pack_layout(),
                                                                      pack_ws_bytes()
+  §6f   accuracy-aware planning: the bounds of imd_err_estimate ..... error_estimate()
+  §6g.11 rigorous rho from a previous output (stage 1 of C1) ....... rho_recipe()
 TLA+ models are scaled-down copies of the same rules; scaled_moduli() and
 scaled_constants() produce their parameters with the same greedy rule.
 """
@@ -518,6 +520,46 @@ def error_estimate(N, k, rounding, dispatch="EMULATE", outputs=1, metric=ERR_NOR
     else:
         out.update(unit_typical=float(E[1]), typical=float(out["bound"][1]))
     return out
+
+
+# ---------------------------------------------------------------------------
+# §6g.11 the rigorous rho from a previous output (NOTES-C1 §4.2, IR7): the reference of
+# immerdink.precision.rho_from_output (test host_precision: bit-identical)
+
+DBL_MIN = 2.0**-1022                 # the smallest normal double
+
+
+def rho_recipe(C, row_ub, col_ub, U, e=0):
+    """rho_hat >= rho_ij = ||a_i|| ||b_j|| / |x_ij| for one output, evaluated in FP64 exactly as
+    precision.rho_from_output does; None if the output is uncertified.
+
+    The call ran at (N, rounding, k) with alpha = 2^e and beta = 0, so it wrote C = RN(2^e D)
+    (§3.7), D its product; row_ub >= ||a_i||_2 and col_ub >= ||b_j||_2 are the caller's
+    doubles; U >= the NORMWISE bound coefficient (imd_err_estimate's 'bound'), so that
+    |D - x| <= U ||a_i|| ||b_j|| for D finite and normal (PROOFS L3c).
+      D = ldexp(C, -e): exact for C finite and normal; for e < 0 also |C| > 2^-1022 (a C of
+        exactly 2^-1022 can be a subnormal 2^e D rounded up). Uncertified unless D is normal.
+      n = nextafter(row_ub col_ub, +inf) >= ||a|| ||b||;
+      t = nextafter(U n, +inf) >= U n;  den = nextafter(|D| - t, 0) <= |D| - U n;
+      certified iff den > 0 and rho_hat = nextafter(n / den, +inf) is finite.
+    Then |x| >= |D| - |D - x| >= |D| - U n >= den > 0 and rho <= n / (|D| - U n) <= rho_hat:
+    each RN result is within half an ulp (also in the subnormal range), so one ulp outward
+    bounds it."""
+    if not math.isfinite(C) or (e < 0 and abs(C) <= DBL_MIN):
+        return None
+    try:
+        D = math.ldexp(C, -e)
+    except OverflowError:
+        return None
+    if not (math.isfinite(D) and abs(D) >= DBL_MIN):
+        return None
+    n = math.nextafter(row_ub * col_ub, math.inf)
+    t = math.nextafter(U * n, math.inf)
+    den = math.nextafter(abs(D) - t, 0.0)
+    if not den > 0:
+        return None
+    rho = math.nextafter(n / den, math.inf)
+    return rho if math.isfinite(rho) else None
 
 
 # ---------------------------------------------------------------------------
@@ -1951,6 +1993,122 @@ def _check_composed(N, k, rnd, dispatch, a, b, D):
                 be = error_estimate(N, k, rnd, dispatch, 1, ERR_ELEMENTWISE, cond=max(rho, 1.0),
                                     **kw)["bound"][0]
                 need(err <= be * abs(exact), f"N={N} {rnd} {dispatch} k={k}: ELEMENTWISE")
+
+
+def _up(q):
+    """The smallest double >= the rational q (q > 0, below the overflow threshold)."""
+    f = float(q)
+    return f if Fraction(f) >= q else math.nextafter(f, math.inf)
+
+
+@check("§6g.11 rigorous rho from a previous output")
+def cert_rho_recipe():
+    """DESIGN v1.19 §6g.11 (NOTES-C1 §4.2, IR7): rho_recipe's rho_hat >= rho in exact
+    rationals wherever it certifies.
+    (1) Emulated elements (emulate_element, RN and TRUNC, N = 3..14, k = 7 and 40), random
+    rows and cancelling rows whose |x| is 0.3..30 times U ||a|| ||b|| (where |D| lies just
+    above or below U n), alpha = 2^e with e in {0, 5, -7}, U the smallest double >= the exact
+    NORMWISE bound (with nu = sqrt k and with the rows' l1 ratios), row_ub / col_ub the
+    2-norms rounded up: certified implies x != 0 and rho_hat >= ||a|| ||b|| / |x|.
+    (2) The boundary, on random (U, row_ub, col_ub) over wide exponent ranges: |D| from
+    3 ulps below to 6 ulps above RN(U n), alpha = 2^e with e in {0, 9, -9}: certified implies
+    |D| > U row_ub col_ub exactly and rho_hat >= f(row_ub col_ub), f(y) = y / (|D| - U y)
+    (f increases, so this covers every ||a|| ||b|| <= row_ub col_ub); and the evaluation is
+    tight: certified exactly when |D| is at least 2 ulps above RN(U n).
+    (3) Uncertified: D zero, subnormal or non-finite; C = 2^-1022 with e < 0 (it may be a
+    rounded subnormal) while e < 0 with |C| one ulp above it certifies; n, D or rho_hat
+    overflowing."""
+    rng = random.Random(1123)
+    counts = {"elements": 0, "certified": 0, "near": 0, "boundary": 0}
+    for N in (3, 5, 8, 14):
+        for rnd in (RN, TRUNC):
+            for k in (7, 40):
+                U0 = _up(error_estimate(N, k, rnd)["bound"][1])
+                for trial in range(14):
+                    if trial < 6:
+                        a, b = _rand_row(rng, k, -40, 40), _rand_row(rng, k, -40, 40)
+                    else:          # cancelling: |x| ~ c U ||a|| ||b||, c in 0.3..30
+                        a = [_rand_double(rng, -3, 3) for _ in range(k)]
+                        b = [_rand_double(rng, -3, 3) for _ in range(k)]
+                        na = math.sqrt(sum(v * v for v in a))
+                        nb = math.sqrt(sum(v * v for v in b))
+                        part = sum(Fraction(x) * Fraction(y) for x, y in zip(a[:-1], b[:-1]))
+                        goal = Fraction(rng.choice((0.3, 0.9, 1.05, 1.3, 3, 30))) * \
+                            Fraction(U0) * Fraction(na * nb) * rng.choice((1, -1))
+                        b[-1] = float((goal - part) / Fraction(a[-1]))
+                    r = emulate_element(a, b, N, rnd, chunk=5)
+                    x = sum(Fraction(p) * Fraction(q) for p, q in zip(a, b))
+                    na2 = sum(Fraction(v)**2 for v in a)
+                    nb2 = sum(Fraction(v)**2 for v in b)
+                    if na2 == 0 or nb2 == 0:
+                        continue
+                    counts["elements"] += 1
+                    row_ub = _up(sqrt_enclosure(na2)[1])
+                    col_ub = _up(sqrt_enclosure(nb2)[1])
+                    nu_a = max(_up(sum(abs(Fraction(v)) for v in a) / sqrt_enclosure(na2)[0]), 1.0)
+                    nu_b = max(_up(sum(abs(Fraction(v)) for v in b) / sqrt_enclosure(nb2)[0]), 1.0)
+                    U1 = _up(error_estimate(N, k, rnd, l1_ratio_a=nu_a, l1_ratio_b=nu_b)["bound"][1])
+                    for U in (U0, U1):
+                        for e in (0, 5, -7):
+                            C = float(Fraction(r["D"]) * Fraction(2)**e)
+                            rho = rho_recipe(C, row_ub, col_ub, U, e)
+                            if rho is None:
+                                continue
+                            counts["certified"] += 1
+                            need(x != 0, f"N={N} {rnd} k={k}: certified a zero x")
+                            need(Fraction(rho)**2 * x * x >= na2 * nb2,
+                                 f"N={N} {rnd} k={k} e={e}: rho_hat {rho} < rho")
+                            if abs(Fraction(r["D"])) < Fraction(11, 10) * Fraction(U) * \
+                                    Fraction(row_ub) * Fraction(col_ub):
+                                counts["near"] += 1
+    need(counts["certified"] > counts["elements"] and counts["near"] > 0,
+         f"vacuous: {counts}")
+    # (2) the boundary, exact
+    for _ in range(400):
+        U = math.ldexp(1 + rng.random(), rng.randint(-60, -3))
+        row_ub = math.ldexp(1 + rng.random(), rng.randint(-480, 480))
+        col_ub = math.ldexp(1 + rng.random(), rng.randint(-480, 480))
+        n_d = math.nextafter(row_ub * col_ub, math.inf)
+        L = Fraction(U) * Fraction(n_d)
+        base = float(L)
+        if not DBL_MIN * 2**12 < base < 2.0**1000:
+            continue
+        y = Fraction(row_ub) * Fraction(col_ub)
+        sgn = rng.choice((1.0, -1.0))
+        D = base
+        for _ in range(3):
+            D = math.nextafter(D, 0.0)
+        for j in range(-3, 7):
+            for e in (0, 9, -9):
+                C = float(Fraction(sgn * D) * Fraction(2)**e)
+                rho = rho_recipe(C, row_ub, col_ub, U, e)
+                counts["boundary"] += 1
+                margin = Fraction(D) - Fraction(U) * y
+                if rho is not None:
+                    need(margin > 0, f"certified |D| <= U n: U={U!r} row={row_ub!r} D={D!r}")
+                    need(Fraction(rho) * margin >= y, f"rho_hat below the claim at j={j}")
+                need((rho is not None) == (j >= 2),
+                     f"|D| {j} ulps from RN(U n): certified {rho is not None} (U={U!r}, D={D!r})")
+            D = math.nextafter(D, math.inf)
+    # (3) the uncertified classes and the alpha edge: (C, row_ub, col_ub, U, e, certified)
+    tiny = 2.0**-600
+    edges = [(D, 1.0, 1.0, 2.0**-40, 0, False)
+             for D in (0.0, -0.0, 5e-324, -2.0**-1030, DBL_MIN / 2, math.inf, -math.inf,
+                       math.nan)]
+    edges += [(DBL_MIN, tiny, tiny, 2.0**-60, 0, True),        # D = 2^-1022 is normal
+              (DBL_MIN, tiny, tiny, 2.0**-40, -1, False),      # may be a rounded subnormal
+              (math.nextafter(DBL_MIN, 1.0), tiny, tiny, 2.0**-40, -1, True),
+              (2.0**-1000, tiny, tiny, 2.0**-40, 30, False),   # D = 2^-1030 subnormal
+              (1.0, 2.0**600, 2.0**600, 2.0**-40, 0, False),   # n overflows
+              (2.0**-30, 2.0**1000, 1.0, 2.0**-1070, 0, False),  # rho_hat overflows
+              (2.0**1000, 1.0, 1.0, 2.0**-40, -100, False)]    # D overflows
+    for C, ru, cu, U, e, want in edges:
+        need((rho_recipe(C, ru, cu, U, e) is not None) == want,
+             f"C={C!r} row={ru!r} col={cu!r} U={U!r} e={e}: certified should be {want}")
+    return (f"{counts['elements']} emulated elements ({counts['certified']} certified rho_hat "
+            f">= rho, {counts['near']} with |D| < 1.1 U n), {counts['boundary']} boundary "
+            f"evaluations exact (certified iff |D| >= 2 ulps above RN(U n)), {len(edges)} "
+            f"edge cases")
 
 
 @check("§2-§3.6 scaled TLA+ parameters")

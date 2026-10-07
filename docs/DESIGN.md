@@ -82,7 +82,11 @@ v1.19 (§6g, stage 0 of docs/NOTES-C1.md, ROADMAP C1(a)) adds adaptive precision
 publishes the footprint guarantees a caller needs to size one workspace and one packed buffer
 for every phase (§6a F1–F3: workspace and pack bytes nondecreasing in N and g, `imd_pack`'s
 write extent), the rule for re-packing one buffer at another N (§6b.7), certificates of the
-internal layout facts (I1–I3, not ABI), and a host-side Python guard (`PackedBuffer`). No
+internal layout facts (I1–I3, not ABI), and a host-side Python guard (`PackedBuffer`). Its
+stage 1 (§6g.10–§6g.12, ROADMAP C1(b)) chooses N per phase on the host: the Python
+`PrecisionPlan` composes the §6f queries per phase (per-role pack cost, pack-mode masks and a
+BUDGET status, share groups ranked jointly, an optional DIRECT level), and `rho_from_output`
+gives the rigorous ρ of an ELEMENTWISE target from a previous output (`cert_rho_recipe`). No
 semantic, layout, launch, pack-format, API, calibration-format or TLA+ change; changed text is
 marked **[v1.19]**.
 The change lists are at the end.
@@ -2413,6 +2417,7 @@ lifetimes and exact footprints.
 | `immerdink/device.py` | `Handle`, `Plan`, `Pack`, `PlanCache`, `Layout`, `contract`, `workspace_size`, `pack_spec`, the status exceptions. |
 | `immerdink/host.py` | unchanged (§6a); the device API reuses its public queries (`lowering`, `pack_desc_for`, `pack_layout`, `PackSpec`, `Desc`, `ImmerdinkError`). |
 | `immerdink/planner.py` | [v1.11, §6e] the host queries for hot paths: `Query`, `Planner`, `Memo`, lazy result views over host.py's C structs (bit-identical results, ~1–2 µs per query). |
+| `immerdink/precision.py` | [v1.19, §6g.10–§6g.11] precision phases chosen from targets on the host: `PrecisionPlan` (composes a Planner's queries per phase switch; computes in Python, so not in planner.py) and `rho_from_output` (the rigorous ρ of a previous output; needs numpy). Not imported by `import immerdink`. |
 
 `import immerdink` loads no library and needs no GPU; libimmerdink is loaded on first use:
 `lib=` / `immerdink.load_library(path)`, else `$IMMERDINK_LIB` (the .so), else
@@ -4682,7 +4687,8 @@ These are for the reviewer: NOTES-B2 §7.4.
 ## 6g. Adaptive precision: precision phases (ROADMAP C1) [v1.19]
 
 Design: docs/NOTES-C1.md, stage 0 (§4.1), with its resolved questions Q1–Q3 and the
-independent reviewer's binding decisions IR8–IR10, IR14, IR17 and IR20. Iterative methods
+independent reviewer's binding decisions IR8–IR10, IR14, IR17 and IR20; stage 1 (§4.2,
+§6g.10–§6g.12 here), with Q4, Q5 and IR2, IR3, IR7, IR8, IR15 and IR24. Iterative methods
 need full precision only near convergence. So a caller runs each contraction at the smallest
 N its current target needs, and switches N between calls, at iteration boundaries where it
 returns to the host anyway.
@@ -4700,9 +4706,10 @@ returns to the host anyway.
   N′ ≤ N. No consumer needs one operand at two precisions at once, which is the only case a
   prefix format pays for (NOTES-C1 §1.3, §3.3).
 - **C1(b), choosing N from a target, stays on the host** with the §6f queries
-  (`imd_err_min_moduli`, rank with an accuracy). NOTES-C1 stage 1 adds a thin Python
-  `PrecisionPlan` on top of them. Choosing N on the device is rejected, and device statistics
-  (NOTES-C1 stage 5) are deferred with triggers.
+  (`imd_err_min_moduli`, rank with an accuracy). Stage 1 adds a thin Python `PrecisionPlan`
+  on top of them (§6g.10) and the rigorous ρ-from-output helper `rho_from_output` (§6g.11),
+  with no ABI change. Choosing N on the device is rejected, and device statistics (NOTES-C1
+  stage 5) are deferred with triggers.
 - **The policy stays with the caller:** immerdink never changes N on its own (ehrenfest D8:
   precision is user-directed).
 
@@ -4956,6 +4963,223 @@ it.
 - The gain depends on the final N the consumer needs and on the shape (NOTES-C1 §2.3–§2.4,
   §4.10). Gains at N ∉ {8, 10, 14, 16} rest on the performance model outside its hold-out
   until NOTES-C1's M-c passes.
+
+### 6g.10 Choosing N per phase: `PrecisionPlan` (stage 1) **[test: host_precision]**
+
+C1(b) on the host. A thin helper composes the §6f queries per phase: the target → N rule of
+`imd_err_min_moduli`, then one rank over the allowed levels. **No ABI change** (host API
+13; NOTES-C1 §4.9). The policy stays with the caller: residual → target is caller code
+(`bench/accuracy/schedule.py` is an example), and immerdink never changes N on its own.
+
+```python
+from immerdink import planner, precision
+from immerdink.host import Accuracy
+pp = precision.PrecisionPlan(planner.Planner(), contractions, levels=(6, 8, 10, 12, 14),
+                             rounding="RN", mode="EMULATE", share=(), packs=None, reuse=None,
+                             budget=0, monotone=True, vec_modes=("GENERATE",), perf=None)
+# contractions: {name: (spec, extents[, strides][, calls_per_iteration])},
+#               or {name: dict(spec=, extents=, strides=, calls=, beta=)} (beta: C is read)
+pp.configs(iterations=None)   # {name: {level: Choice or None}}: create these plans first
+ph = pp.phase({name: Accuracy(...)}, iterations=None, fail_budget=None)
+ph.N, ph.g, ph.vec_mode, ph.mode, ph.packed, ph.status    # dicts by name (N: the level)
+ph.pack_bytes, ph.reuse, ph.assumed_reuse, ph.err_bound, ph.err_typical
+ph.time_s, ph.tflops_eq       # one iteration, calls-weighted (TFLOPS-eq = sum 2bmnk / time)
+ph.choices[name].options()    # Plan keywords; .pack_specs: the packed roles' PackSpecs
+pp.footprints()               # exact bytes per level and their maxima
+pp.reset()                    # forget the monotone floor (a new solve, geometry or restart)
+```
+
+- **Placement.** `python/immerdink/precision.py`, not planner.py. `PrecisionPlan` computes in
+  Python (levels, the monotone floor, share groups, the per-role pack cost), and §6e.4's
+  "nothing is computed in Python" covers planner.py, whose hot-path queries are unchanged.
+  It calls only a `planner.Planner`'s queries (`min_moduli`, `rank`, `pack_desc_for`,
+  `predict_pack`, `predict` for a band, `workspace_size`, `lowering`) and `host.pack_layout`:
+  no GPU, no data. The Planner's calibration and memo are used; `perf` sets the regime, the
+  cache state and the clock of the rank and pack predictions.
+- **Levels.** Increasing N in 2..20; 3–5 levels are recommended, since every level is a plan
+  (and a pack) per contraction. `levels` may end with the sentinel `"DIRECT"` (NOTES-C1
+  IR15): native FP64 when no emulated level meets a target. It is not in the default:
+  DIRECT runs at 1:64 on the 4090.
+- **Per-role pack cost** (NOTES-C1 IR2). Rank takes one int32 `reuse` for every packed
+  operand, but a contraction's two roles can be reused differently (an invariant integral
+  against amplitudes remade every iteration). So `phase()` makes one rank call per
+  contraction with reuse = 1 and every candidate, and re-keys each one:
+  `time_s = contract_s + Σ_{packed roles} pack_s(role, N) / reuse(role)`, added in the order
+  A, B, with `pack_s(role, N)` = `predict_pack` of `pack_desc_for(role)` at N, memoized per
+  (contraction, role, N). The re-keying is exact: a candidate's `time_s` is its only
+  reuse-dependent field (its `pack_s` is the sum of the two roles' predictions, which
+  `host_precision` checks), and feasibility (status, budget, accuracy) is the candidate's,
+  unchanged. Choices are ordered feasible first by the composed time, then by rank's own
+  tie order (total_bytes, N, g, vec mode, packed). The band `time_lo_s` / `time_hi_s` is
+  composed the same way from the contract's prediction. A per-role reuse inside
+  `imd_perf_rank_request_t` is not adopted; it is revisited only if a hot-path consumer needs
+  it inside one C rank call.
+- **Reuse per role**, `reuse={name: {"A" | "B": kind}}`: `"call"` = 1, `"iteration"` (the
+  default: the pack is remade every iteration) = the calls per iteration, `"phase"` = those ×
+  `phase()`'s `iterations` (the phase length; without it, as `"iteration"`, conservative, and
+  `Phase.assumed_reuse` records it), or an int. An invariant operand is re-packed at each
+  phase switch, so `"phase"` is its value.
+- **The phase rule**, per contraction c (NOTES-C1 §4.2):
+  1. n_c = `min_moduli(target, levels[0] .. the top emulated level)`. A lowering error
+     raises. The RN κ ≥ T(N) levels are +∞ in the estimate, so they are skipped. If no
+     emulated level meets the target: DIRECT if listed and its bound (γ_k, §6f.2) meets it,
+     status `DIRECT`; otherwise the top emulated level, status `MISSED` (its candidates are
+     ranked with the target, so their err fields are in its metric, and chosen by status and
+     budget).
+  2. The floor f_c is the smallest level ≥ n_c.
+  3. With `monotone` (the default), f_c = max(f_c, the previous phase's final level of c),
+     DIRECT being the top. `reset()` clears it.
+  4. Outside a share group: the best composed candidate over the levels ≥ f_c (all g, the
+     vec modes, the allowed pack modes, the target, the budget). This equals the fastest
+     `configs()[c][N]` over N ≥ f_c, also where time is not linear in N (§2.3 of NOTES-C1);
+     it replaces §6f.3's `rank([n, n + 1])`, the two-level case.
+  5. A share group (below) is ranked jointly.
+  6. **BUDGET** (NOTES-C1 IR8): if no level ≥ the floor fits the budget, the floor level
+     and its SUCCESS candidate with the least total_bytes, status `BUDGET`. `MISSED` takes
+     precedence over `BUDGET`, and `BUDGET` over `DIRECT`; otherwise the status is `MET`.
+  7. **TYPICAL** targets: p in §6f.2 is per call. With `iterations` and `fail_budget` P,
+     every TYPICAL target of the phase gets p = P / (iterations × Σ_c calls per iteration):
+     a union bound over the phase's calls. Without them, each Accuracy's own `fail_prob`.
+     BOUND is the default basis (NOTES-C1 Q5); TYPICAL for intermediate phases is an explicit
+     opt-in.
+- **Pack-mode masks and the budget** (NOTES-C1 IR8). `packs={name: modes}` (any of `"NONE"`,
+  `"A"`, `"B"`, `"AB"`; default in-line) are ranked at every level, so the packing may differ
+  by N: a large DF block can stay in-line at N = 14 and be packed at lower N. `budget` keeps
+  rank's meaning, immerdink-owned bytes per contraction (workspace + plan + packs + pack
+  workspace). The caller subtracts its own resident tensors, the FP64 source of every packed
+  operand included (§6b.10 #4); a joint budget over several contractions is caller policy,
+  for which `footprints()` reports per-level totals.
+- **Share groups** (NOTES-C1 IR24), `share=[(group, members)]`: contractions that read one
+  packed operand use one N. A member is `(name, "A" | "B")`, the role that reads the group's
+  pack, or a bare name (equal N only). A shared role is always packed (the masks apply to the
+  other roles), and its pack cost is divided by the calls of every member that reads it
+  (`"iteration"`: their summed calls per iteration; an int: the total); the members' reuse
+  kinds for it must agree. The group floor is the members' maximum f_c. For each level
+  N ≥ that floor, the group time is Σ_members calls × the member's best composed time at N;
+  the least wins (ties: the smaller N) for every member. Time is usually monotone in N, so
+  this normally returns the floor, but not when the packing and reuse terms differ by level.
+  Groups that share a contraction are merged for N. Whether the members can really read one
+  pack (one key) is checked where it matters, by plan creation (PACK_MISMATCH).
+- **`configs(iterations)`** returns the best configuration at every level (status `OK`, or
+  `BUDGET` with the least total_bytes; None where no plan exists, e.g. RN with κ ≥ T(N)). A
+  fixed N's estimate is the same for every candidate, so it needs no target, and a phase's
+  choice at a level is this one (for the same `iterations`). The caller creates every one of
+  these plans before the iteration loop and freezes its `PlanCache` for capture (§6g.1):
+  RESIDENT plan creation synchronizes, and with `k4_tune` each level's plans autotune.
+- **`footprints()`**: per contraction and level, the maximum workspace and plan device bytes
+  over the allowed pack modes × vec modes × g (the largest g that succeeds, by F1, §6a); per
+  packed operand (a share group's counts once) its `pack_bytes` and `imd_pack` workspace per
+  level; each one's maximum (sizing once, C-ws and C-pack, NOTES-C1 Q2) and the per-level
+  totals (no workspace shared). None marks a level without a configuration. No caller has
+  to rely on I3 (§6g.3): the maxima come from the queries over the allowed modes.
+- **Relaxed Krylov methods** (NOTES-C1 IR3) may loosen the matvec precision as the residual
+  falls [literature: Bouras–Frayssé; Simoncini–Szyld; van den Eshof–Sleijpen]. They use
+  `monotone=False` with a decreasing schedule (a matvec tolerance ∝ tol / ‖r_k‖).
+  Fixed-point, Newton-type and residual-driven iterations, iterative refinement included,
+  tighten: `monotone=True`, the default.
+- **The forcing rule, as caller code** (`bench/accuracy/schedule.py`): after iteration t,
+  each contraction c gets an ABSOLUTE target η·r_t·w_c (Σ w_c = 1), with `norm_product_c`
+  refreshed per phase; N rises only at iteration boundaries; BOUND for the final phase and
+  TYPICAL, with p = P / C, for intermediate ones if the caller accepts it.
+- **Cost.** Per contraction per phase switch: one `min_moduli` (about 1 µs), one rank over
+  the levels ≥ the floor (C cost about one prediction per candidate), the memoized pack
+  predictions, and the Python re-keying of every candidate. Measured on one core of the
+  i9-13900K (three contractions: the CC ring of §6e.1 at v = 64, o = 32, the DF build
+  acQ,bdQ→acbd at 64⁴ with Q = 2032, and 4096³; levels 6–14; NORMWISE targets 1e−8, 1e−10,
+  1e−12; median of 7): `phase()` takes 0.31–0.34 ms in-line with one vec mode and 3.4–3.8 ms
+  with every pack mode and both vec modes; `configs()` takes 0.48–6.1 ms (immerdink-eval
+  `results/c1/stage1_phase_cost.txt`). It runs at phase switches, off the hot path;
+  ehrenfest's hot-path rank calls are untouched.
+- **Limits.** The choice is the performance model's [M], outside its hold-out at
+  N ∉ {8, 10, 14, 16} until NOTES-C1's M-c passes. Rank's footprint tie order
+  (`TIES_BY_FOOTPRINT`) is not applied to the composed times. A phase names every
+  contraction.
+
+### 6g.11 The rigorous ρ from a previous output: `rho_from_output` **[cert: cert_rho_recipe]** **[test: host_precision]**
+
+An ELEMENTWISE target needs `cond` = ρ ≥ max ‖a_i‖‖b_j‖ / |x_ij| over the outputs that must
+meet it (§6f.1), and ρ needs |x|. The rigorous recipe takes it from a previous call's output
+(NOTES-C1 IR7); it ships as a tested helper, not as documentation:
+
+```python
+rho_hat, certified = precision.rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding,
+                                               k, alpha=1.0, beta=0.0, l1_ratio=None,
+                                               mode="EMULATE")
+cond = rho_hat[certified].max()     # over the outputs that must meet the target
+```
+
+- **Inputs.** A call at (N, rounding, k, mode) with α = 2^e and β = 0 wrote C = RN(2^e D)
+  (§3.7), D its product. `C` is a float64 host array (copy it, or the part needed, to the
+  host: the helper moves no data). `row_norm_ub`, `col_norm_ub` are upper bounds of the GEMM
+  view's row and column 2-norms (§6f.1's obligation: really upper bounds), as arrays that
+  broadcast against C (1-D vectors for a 2-D C). Real norms, not σ-derived ones: a zero row
+  has σ := 0, so its bound d·2⁰ is vacuous. `l1_ratio`: as `Accuracy`'s (ν = √k without it).
+- **Restrictions.** β must be 0 and α = 2^e, else ValueError: D = ldexp(C, −e) is exact,
+  while D cannot be recovered from RN(α·D) for another α (§3.7). For β = 1 accumulations (CC
+  residual builders) take ρ from a probe call with β = 0 into a scratch buffer, once per
+  phase.
+- **U** is the NORMWISE `bound` of `imd_err_estimate` at (N, rounding, k) for the call's
+  dispatch (EMULATE; DIRECT for mode DIRECT or k = 1), the library's own value: E·(1 + u) + u
+  evaluated as E + E·u + u, times (1 + 2⁻⁴⁰) (§6f.3), so |D − x| ≤ U‖a_i‖‖b_j‖ for D finite
+  and normal (PROOFS L3c).
+- **Claim.** For D_ij finite and normal with |D_ij| > U·n_ij, n_ij ≥ ‖a_i‖‖b_j‖:
+  ρ_ij ≤ n_ij / (|D_ij| − U·n_ij), because |x| ≥ |D| − |D − x| ≥ |D| − U·n.
+- **FP64 evaluation, ρ̂ rounded outward:** D = ldexp(C, −e); n = nextafter(row × col, +∞);
+  t = nextafter(U·n, +∞); den = nextafter(|D| − t, 0); ρ̂ = nextafter(n / den, +∞). Each RN
+  result lies within half an ulp, also in the subnormal range, so one ulp outward bounds it.
+  An output is **certified** iff C and D are finite, D is normal (|D| ≥ 2⁻¹⁰²²), for e < 0
+  also |C| > 2⁻¹⁰²² (a C of exactly 2⁻¹⁰²² can be a subnormal 2^e·D rounded up), den > 0 and
+  ρ̂ is finite. The rest (zero, subnormal or non-finite outputs, |D| ≤ U·n, overflows) get
+  ρ̂ = +∞ and `certified` False; the caller decides whether they must meet the target. With
+  true norm bounds, ρ̂ ≥ 1. The evaluation costs 2 ulps: |D| at least 2 ulps above RN(U·n)
+  is certified (`cert_rho_recipe`).
+- **Scope.** ρ̂ is rigorous for that call's data and a prediction for the next iteration's;
+  NOTES-C1 M-d1 measures how often the lagged ρ misses. Per output, ρ̂ is also an
+  a-posteriori elementwise bound for that call, and it locates the rows for output-selective
+  refinement (NOTES-C1 §3.1 B6, a caller recipe).
+- **Cost** [E]: one pass over C, plus the caller's norms, a pass over A and B unless it has
+  them (about 2× a pass over C at square shapes): about 9 % of a 4096³ N = 14 call when every
+  norm is recomputed. The norms of an invariant operand are computed once per phase, and the
+  ρ that sets N is needed once per phase decision. A stage-5 statistics hook in K5 (deferred,
+  NOTES-C1 §4.6) would need no norms at all (L6 uses ‖a·2^σ‖ ≤ d).
+- spec/params.py `rho_recipe` is the scalar reference; the helper is its numpy version, bit
+  for bit (`host_precision`).
+
+### 6g.12 Stage 1: tests, certificate, spec
+
+- **`host_precision`** (CPU, `tests/test_precision.py`, in `tools/test.sh`'s CPU-only pass;
+  needs numpy):
+  - `phase()` equals a brute force from host.py's queries on random plans (levels, masks,
+    reuse kinds, budgets, vec modes, share groups, three-phase target sequences in every
+    metric and basis): every level, g, vec mode and allowed pack mode enumerated with
+    `pack_desc_for`, `predict`, `predict_pack`, `workspace_size`, `lowering` and
+    `pack_layout`, the targets checked with `err_estimate` at the lowering's (N, k, dispatch,
+    b·m·n), the rule above applied from first principles. The chosen configuration, its
+    status, its composed time (bit for bit), its per-role figures and its err fields match;
+    each choice equals the `configs()` lookup; rank's `pack_s` equals the per-role sum; the
+    band composes.
+  - Scenarios: every reuse kind, the `"phase"` fallback and `assumed_reuse`; a shared role
+    divided by the members' summed calls, members at one N above the group floor; N monotone
+    until `reset()`, falling with `monotone=False`; DIRECT only when no emulated level meets
+    and only if listed, and the monotone top; BUDGET (the floor and the least total_bytes)
+    and MISSED's precedence; TYPICAL p = P / (iterations × calls); RN κ ≥ T levels; argument
+    errors.
+  - `footprints()` equals the maximum of the C queries over the allowed pack modes × vec
+    modes × every g, per level, with its totals.
+  - `rho_from_output` equals `params.rho_recipe` bit for bit (random and boundary values,
+    every α = 2^e class, specials, broadcast and batched forms); ρ̂ ≥ ρ in exact rationals on
+    emulated outputs (`params.emulate_element`); ValueError / TypeError cases.
+- **[cert] `cert_rho_recipe`** (`params.py --check`), in exact rationals: on emulated elements
+  (both roundings, N = 3–14, random and cancelling rows whose |x| is 0.3–30 × U‖a‖‖b‖,
+  α = 2^e, U the tightest double above the exact NORMWISE bound, with ν = √k and with the
+  rows' ℓ1 ratios), certified implies x ≠ 0 and ρ̂ ≥ ρ; at the boundary (|D| from 3 ulps
+  below to 6 above RN(U·n), α = 2^e), certified implies |D| > U·n exactly and
+  ρ̂ ≥ n / (|D| − U·n), and the evaluation is tight (certified exactly from 2 ulps above);
+  the uncertified classes (zero, subnormal, non-finite, C = 2⁻¹⁰²² with e < 0, overflows).
+- **No TLA+ change** (the §6f.5 argument): the helper composes pure functions of descriptors
+  and plain structs; its only state is the Python object's monotone floor, and it holds no C
+  object with a lifetime. The ρ recipe is a [cert], not a protocol property.
+- **No ABI change:** host API 13; Python only (NOTES-C1 §4.9).
 
 ---
 
@@ -5662,7 +5886,7 @@ and host API; every value the same integer (bit-identical, tested on every contr
   0 = off); the struct and format are unchanged. Text: COLD described as a modelling convention,
   the write-back reading of ω as a hypothesis.
 
-## v1.19 (§6g adaptive precision, stage 0: precision phases on host API 13; no semantic, layout, launch, pack-format, API, calibration-format or TLA+ change)
+## v1.19 (§6g adaptive precision, stages 0 and 1: precision phases on host API 13, N chosen per phase on the host; no semantic, layout, launch, pack-format, API, calibration-format or TLA+ change)
 
 Design: docs/NOTES-C1.md §4.1 (stage 0), as amended by the independent reviewer's binding
 decisions (IR1–IR29, NOTES-C1 §5.3).
@@ -5711,3 +5935,18 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
   The design-phase scripts and records are in immerdink-eval (`scripts/c1/design-phase/`,
   `results/c1/design-phase/`), listed with their sha256 in
   `findings/c1-design-phase-manifest.md`.
+- **Stage 1** (NOTES-C1 §4.2 with IR2, IR3, IR7, IR8, IR15, IR24; Python only, host API 13):
+  - **§6g.10:** `immerdink.precision.PrecisionPlan` (new module; planner.py unchanged):
+    per phase, `min_moduli`, then one rank per contraction over the levels ≥ the floor with
+    reuse = 1, re-keyed by contract_s + Σ pack_s(role, N) / reuse(role) (per-role reuse
+    'call' / 'iteration' / 'phase' / int, the 'phase' fallback recorded); pack-mode masks per
+    contraction and a BUDGET status (rank's budget meaning kept); share groups ranked jointly
+    over every level ≥ the group floor; an optional final `"DIRECT"` level; a monotone floor
+    with `reset()` (`monotone=False` for relaxed Krylov methods); p = P / C for TYPICAL
+    targets; `configs()` (every level's plan, created before the loop) and `footprints()`
+    (per-level and maximum bytes from the queries).
+  - **§6g.11:** `precision.rho_from_output` (β = 0, α = 2^e only), the rigorous ρ of an
+    ELEMENTWISE target from a previous output; spec/params.py `rho_recipe` is its reference,
+    and `cert_rho_recipe` checks it in exact rationals.
+  - **§6d.1:** the module row. **Tests:** `host_precision` (CPU, in the CPU-only pass).
+    **Example:** `bench/accuracy/schedule.py`, the forcing rule as caller code.
