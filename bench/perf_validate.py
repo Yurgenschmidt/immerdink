@@ -13,12 +13,17 @@ measured call (< 100 us, 100 us - 1 ms, >= 1 ms) against the §6c.5 targets; TFL
 time alongside.
 
 v1.10: each record is predicted in the cache state it was measured in (REPEAT: the bench's
-repeat calls; COLD for --l2 flush) in the BURST regime (--record-clock: at its NVML clock, for a
+repeat calls; COLD for --l2 flush, whose phases are REPEAT state, v1.17) in the BURST regime (--record-clock: at its NVML clock, for a
 calibration fitted with perf_fit --clock-normalize). The prediction bands (§6c.1) are checked: the share of calls
 inside their [lo, hi] band, by 2-fold cross-validation over the cases (bands from one half,
 coverage on the other); --bands out.calib writes the calibration with the bands of the whole
 hold-out set (format 2). --sustained: the SUSTAINED prediction of method-sustained windows
 (power model as calibrated; the leave-one-out check is perf_fit's).
+
+v1.18 (DESIGN §6c.8): a --l2 flush record's total is the CLEAN state (an L2 flushed by reads);
+method-pair records in the hold-out are reported as the measured and predicted CLEAN - REPEAT
+and WARM - REPEAT per pair (an effect size, no target); sustained DIRECT windows are predicted
+in mode DIRECT.
 """
 
 import argparse
@@ -47,11 +52,32 @@ def evaluate(samples, calib, lib=None):
     rows = []
     for s in samples:
         p = s.again(calib)
-        ph = [(q.name, s.measured[q.name], q.time_s, q.cls) for q in p.phases
+        # v1.17: a --l2 flush record's phases are REPEAT state (imd_bench flushes before the
+        # timed calls only); its total is COLD (v1.18: CLEAN)
+        pp = s.again(calib, "REPEAT") if "l2=flush" in s.label else p
+        ph = [(q.name, s.measured[q.name], q.time_s, q.cls) for q in pp.phases
               if q.name in s.measured]
         rows.append((s.label, s.timed_s, p.time_s, p.flops_eq, ph, s.case, p.time_lo_s,
                      p.time_hi_s))
     return rows
+
+
+def pair_report(records, calib, lib=None):
+    """v1.18 (DESIGN §6c.8): the method-pair records: measured vs predicted (CLEAN - REPEAT)
+    and (WARM - REPEAT), in us and % of the REPEAT call. Returns the printable lines."""
+    cases = perf_fit.pair_cases(records)
+    if not cases:
+        return []
+    out = [f"{'cache pair (hold-out)':<22} {'N':>3} {'repeat':>10} {'clean-rep meas':>15} "
+           f"{'pred':>9} {'warm-rep meas':>14} {'pred':>9}"]
+    for (case, spec, ext, N), t in sorted(cases.items()):
+        e = perf_fit.parse_ext(ext)
+        pr = {st: host.predict(spec, e, N=N, cache=st, regime="BURST", calib=calib, lib=lib).time_s
+              for st in ("CLEAN", "REPEAT", "WARM")}
+        out.append(f"{case:<22} {N:>3} {1e3 * t['repeat']:>8.4f}ms "
+                   f"{1e6 * (t['cold'] - t['repeat']):>+11.1f} us {1e6 * (pr['CLEAN'] - pr['REPEAT']):>+6.1f} us "
+                   f"{1e6 * (t['warm'] - t['repeat']):>+10.1f} us {1e6 * (pr['WARM'] - pr['REPEAT']):>+6.1f} us")
+    return out
 
 
 def summarize(rows, markdown=False):
@@ -217,6 +243,8 @@ def main(argv=None):
         records += [json.loads(line) for line in open(f) if line.strip()]
     calib = host.Calibration.load(a.calib, a.lib) if a.calib else host.Calibration.default(a.lib)
     rows = evaluate(perf_fit.samples_from_records(records, a.lib, calib), calib, a.lib)
+    for line in pair_report(records, calib, a.lib):
+        print(line)
     if a.per_call:
         print(f"{'call':<44} {'TFLOPS-eq meas':>14} {'pred':>8} {'time meas':>11} {'pred':>11} {'err':>7}")
         for r in sorted(rows, key=lambda r: r[1]):
@@ -273,7 +301,8 @@ def main(argv=None):
         errs = []
         for r in srows:
             p = host.predict(r["spec"], r["ext"], N=r["N"], g=r["g"], vec_mode=r["vec"],
-                             regime="SUSTAINED", cache="REPEAT", calib=calib, lib=a.lib)
+                             mode=r["mode"], regime="SUSTAINED", cache="REPEAT", calib=calib,
+                             lib=a.lib)
             errs.append(abs(p.time_s - r["t"]) / r["t"])
             print(f"{r['label'][:40]:<40} {p.flops_eq / r['t'] * 1e-12:>14.2f} "
                   f"{p.tflops_eq:>7.2f} {1e3 * r['t']:>8.3f}ms {1e3 * p.time_s:>8.3f}ms "

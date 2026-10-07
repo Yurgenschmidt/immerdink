@@ -40,7 +40,8 @@ struct PerfPhases {
 // k4_select for the calibration's sm_count, else that configuration; the calibration gives the
 // SM count, the L2 of K4's DRAM term and the occupancy of the chains (cal.kernel, resolved:
 // see perf_resolve_calib). v1.15 (DESIGN §6c.1 "The eps path — retired"): no eps fraction (the
-// v1.14 pack emitter costs the same for every eps; the op_eps slots are 0).
+// v1.14 pack emitter costs the same for every eps). v1.17: KF slot 4 = elem, PACK slot 3 =
+// dram (the PACK L2-hit rule reads cal.pack_l2_hit_bytes).
 IMD_HOST_INTERNAL void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags,
                                             int32_t k4, const imd_perf_calib_t& cal,
                                             PerfPhases* out);

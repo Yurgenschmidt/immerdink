@@ -263,24 +263,74 @@ long run(int N, bool trunc, int threads, uint64_t seed, Coverage& cov, long* che
 
 template <int E>
 long run_n(int N, bool trunc, int threads, uint64_t seed, Coverage* cov, long* checked) {
-  // cov[0]: the W = 3 run, cov[1]: the W = 2 run (N <= 16); coverage is checked per W.
-  long bad = run<E, 3>(N, trunc, threads, seed, cov[0], checked);  // W = 3 is valid for every N
+  // cov[W - 1]: the run with W words, for every W >= W(N) (W = 3 is valid at every N, W = 2
+  // at N <= 16); coverage is checked per W.
+  long bad = run<E, 3>(N, trunc, threads, seed, cov[2], checked);
   if (imd::kernels::pack_words(N) == 2)
     bad += run<E, 2>(N, trunc, threads, seed + 1, cov[1], checked);
+  return bad;
+}
+
+// v1.16 §3.4.1 (review 2026-10-06): shl_clamped is PTX shl.b64, x << n for n < 64 and 0 for
+// every n >= 64 (the C++ shift is undefined there). Counts 0..255 and 2^32 - 1 on a few x.
+__global__ void shl_kernel(const uint64_t* x, int nx, const uint32_t* n, int nn, uint64_t* out) {
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= nx * nn) return;
+  out[t] = imd::kernels::shl_clamped(x[t / nn], n[t % nn]);
+}
+
+int check_shl_clamped() {
+  const std::vector<uint64_t> xs = {1, 0x8000000000000000ull, 0xFFFFFFFFFFFFFFFFull,
+                                    0x0123456789ABCDEFull, (1ull << 53) - 1};
+  std::vector<uint32_t> ns;
+  for (uint32_t n = 0; n < 256; ++n) ns.push_back(n);
+  ns.push_back(0xFFFFFFFFu);
+  ns.push_back(0x80000000u);
+  const int nx = static_cast<int>(xs.size()), nn = static_cast<int>(ns.size()), tot = nx * nn;
+  uint64_t *dx, *dout;
+  uint32_t* dn;
+  CUDA_CHECK(cudaMalloc(&dx, sizeof(uint64_t) * nx));
+  CUDA_CHECK(cudaMalloc(&dn, sizeof(uint32_t) * nn));
+  CUDA_CHECK(cudaMalloc(&dout, sizeof(uint64_t) * tot));
+  CUDA_CHECK(cudaMemcpy(dx, xs.data(), sizeof(uint64_t) * nx, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dn, ns.data(), sizeof(uint32_t) * nn, cudaMemcpyHostToDevice));
+  shl_kernel<<<(tot + 255) / 256, 256>>>(dx, nx, dn, nn, dout);
+  CUDA_CHECK(cudaGetLastError());
+  std::vector<uint64_t> out(tot);
+  CUDA_CHECK(cudaMemcpy(out.data(), dout, sizeof(uint64_t) * tot, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaFree(dx));
+  CUDA_CHECK(cudaFree(dn));
+  CUDA_CHECK(cudaFree(dout));
+  int bad = 0;
+  for (int i = 0; i < nx; ++i)
+    for (int j = 0; j < nn; ++j) {
+      const uint64_t want = ns[j] >= 64 ? 0 : xs[i] << ns[j];
+      if (out[i * nn + j] != want) {
+        if (bad < 5)
+          std::printf("shl_clamped(%#llx, %u) = %#llx, want %#llx\n",
+                      static_cast<unsigned long long>(xs[i]), ns[j],
+                      static_cast<unsigned long long>(out[i * nn + j]),
+                      static_cast<unsigned long long>(want));
+        ++bad;
+      }
+    }
+  std::printf("shl_clamped: %d counts x %d values (0..255, 2^31, 2^32 - 1), %d mismatches\n",
+              nn, nx, bad);
   return bad;
 }
 
 }  // namespace
 
 int main() {
-  static_assert(imd::kernels::pack_words(16) == 2 && imd::kernels::pack_words(17) == 3,
+  static_assert(imd::kernels::pack_words(2) == 2 && imd::kernels::pack_words(16) == 2 &&
+                    imd::kernels::pack_words(17) == 3,
                 "W rule (cert_pack_words)");
   long bad = 0, checked = 0;
-  int fails = 0;
+  int fails = check_shl_clamped() != 0;
   for (int N = c::kNMin; N <= c::kNMax; ++N) {
-    Coverage covw[2];  // [0]: W = 3, [1]: W = 2 (review L1: "all eps hit" per W)
+    Coverage covw[3];  // [W - 1], W = 2, 3 (review L1: "all eps hit" per W)
     for (Coverage& cv : covw) cv.eps.assign(c::kEpsMax + 1, 0);
-    const int n_w = imd::kernels::pack_words(N) == 2 ? 2 : 1;
+    const int w_min = imd::kernels::pack_words(N);
     long bn = 0;
     for (int tr = 0; tr < 2; ++tr) {
       const bool trunc = tr == 1;
@@ -291,7 +341,7 @@ int main() {
     }
     int missing = 0;
     bool cov_ok = true;
-    for (int w = 0; w < n_w; ++w) {
+    for (int w = w_min - 1; w < 3; ++w) {
       const Coverage& cv = covw[w];
       int miss_w = 0;
       for (int e = 0; e <= c::kTables.eps_max[N]; ++e) miss_w += cv.eps[e] == 0;
@@ -299,12 +349,12 @@ int main() {
       cov_ok = cov_ok && miss_w == 0 && cv.top > 0 && cv.rounding > 0 && cv.ties > 0 &&
                (N < 9 || cv.q1 > 0) && (N < 17 || cv.q2 > 0);
     }
-    Coverage cov = covw[0];  // the report: both W summed
-    if (n_w == 2) {
-      cov.q1 += covw[1].q1, cov.q2 += covw[1].q2, cov.top += covw[1].top;
-      cov.rounding += covw[1].rounding, cov.ties += covw[1].ties;
+    Coverage cov = covw[2];  // the report: every W summed
+    for (int w = w_min - 1; w < 2; ++w) {
+      cov.q1 += covw[w].q1, cov.q2 += covw[w].q2, cov.top += covw[w].top;
+      cov.rounding += covw[w].rounding, cov.ties += covw[w].ties;
     }
-    std::printf("N=%2d W=%d: %ld mismatches; eps 0..%d all hit: %s (q=1: %ld, q=2: %ld, |a'| at "
+    std::printf("N=%2d W=%d..3: %ld mismatches; eps 0..%d all hit: %s (q=1: %ld, q=2: %ld, |a'| at "
                 "bitlen T: %ld, rounding path: %ld, ties: %ld)\n",
                 N, imd::kernels::pack_words(N), bn, c::kTables.eps_max[N], missing ? "NO" : "yes",
                 cov.q1, cov.q2, cov.top, cov.rounding, cov.ties);

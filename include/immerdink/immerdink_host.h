@@ -27,7 +27,7 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 11 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 13 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
@@ -51,7 +51,16 @@ extern "C" {
                                       imd_perf_calib_t energy_byte_f_pj, optional
                                       calibration key power.byte_f_pj; the eps path
                                       retired (§6c.1): eps_fraction ignored, eps_s /
-                                      eps_fraction out 0, op_eps keys optional */
+                                      eps_fraction out 0, op_eps keys optional;
+                                  12: performance model v1.17 (§6c): imd_perf_calib_t
+                                      pack_l2_hit_bytes (key warm.pack_l2_bytes), optional
+                                      keys kf.elem, pack.dram; param names KF 4 "elem",
+                                      PACK 3 "dram", KL 4 NULL; op_eps keys retired;
+                                  13: performance model v1.18 (§6c.8): imd_perf_calib_t
+                                      clock_boost_mhz, power_act_w, power_act_gap_us,
+                                      energy_dram_pj, warm_call_ns, warm_clean_byte_ns,
+                                      pack_l2_planes (optional keys), IMD_PERF_CACHE_CLEAN;
+                                      clock_mhz out up to the boost clock */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -399,12 +408,13 @@ IMD_API const char* imd_status_string(imd_status_t status);
 /* Kernel classes (one parameter set each; file key prefix in parentheses). */
 enum {
   IMD_PERF_CLASS_K0 = 0,         /* (k0) K0 vectors, imd_pack's prep: launch, byte, chain   */
-  IMD_PERF_CLASS_KF = 1,         /* (kf) fused small launch: launch, byte, op, row, op_eps,
-                                    chain                                                   */
+  IMD_PERF_CLASS_KF = 1,         /* (kf) fused small launch: launch, byte, op, row, elem
+                                    (v12: the per-element chain), chain                     */
   IMD_PERF_CLASS_KL = 2,         /* (kl) fused large launch, imd_pack: launch, byte, op,
-                                    l2byte, op_eps, wave                                    */
-  IMD_PERF_CLASS_PACK = 3,       /* (pack) K2 / K3, groups 2..: launch, byte, op, op_eps,
-                                    chain, wave (the tile loads in sequence)                 */
+                                    l2byte, -, wave                                         */
+  IMD_PERF_CLASS_PACK = 3,       /* (pack) K2 / K3, groups 2..: launch, byte, op, dram (v12:
+                                    the bytes that are not L2-hit re-reads), chain, wave (the
+                                    tile loads in sequence)                                  */
   IMD_PERF_CLASS_K4_128x256 = 4, /* (k4_128x256) K4: max(round model, byte): round, mac1,
                                     byte (slot 4), mac_ktail (slot 5, in the round model)   */
   IMD_PERF_CLASS_K4_128x128 = 5, /* (k4_128x128) round, mac1, mac2, byte, mac_ktail         */
@@ -474,9 +484,14 @@ enum { IMD_PERF_REGIME_DEFAULT = 0,   /* SUSTAINED if the calibration has a powe
 enum { IMD_PERF_CACHE_COLD = 0,       /* the inputs come from DRAM                           */
        IMD_PERF_CACHE_WARM = 1,       /* the input was the previous call's output; modeled as
                                          REPEAT (provisional: one method, square GEMM pairs,
-                                         N = 14 / 16). Recommended in that case.             */
-       IMD_PERF_CACHE_REPEAT = 2      /* the calibration's state: the same call just ran (the
-                                         inputs resident only if the whole footprint fits)   */ };
+                                         N = 14 / 16). Recommended in that case. The v1.18
+                                         pairs measure WARM 4.5-11.9 % below REPEAT on held-
+                                         out shapes (NOTES-B2 §12; open).                     */
+       IMD_PERF_CACHE_REPEAT = 2,     /* the calibration's state: the same call just ran (the
+                                         inputs resident only if the whole footprint fits)   */
+       IMD_PERF_CACHE_CLEAN = 3       /* v13 (§6c.8): the inputs evicted and the L2 clean (an
+                                         L2 flushed by reads, e.g. imd_bench --l2 flush). COLD
+                                         = evicted by other, dirty work (a call in a sequence) */ };
 enum { IMD_PERF_ORDER_TIME = 0,       /* rank: by predicted time (the default; v6's order)   */
        IMD_PERF_ORDER_TIES_BY_FOOTPRINT = 1 /* rank: the ties with the best first, by footprint */ };
 enum { IMD_PERF_BAND_SMALL = 0, IMD_PERF_BAND_MID = 1, IMD_PERF_BAND_LARGE = 2 }; /* predicted
@@ -523,6 +538,31 @@ typedef struct {
   double energy_byte_f_pj; /* per DRAM byte, scaled like the ops by (f / clock_eff)^gamma
                               (SM / L2-side energy of the traffic; key power.byte_f_pj,
                               optional, 0 when absent)                                       */
+  /* ---- v12 (DESIGN v1.17 §6c.1, §6c.3). A caller with a v7..v11 struct_size is read
+   *      (predictors, imd_perf_calib_format) with pack_l2_hit_bytes = warm_l2_bytes when
+   *      pack.dram > 0, else 0 (no effect then). Exact for the shipped calibration (both
+   *      sizes 0.8 x L2); for another file with pack.dram > 0 a degraded view (pass NULL). */
+  double pack_l2_hit_bytes; /* L_hit: a K2 / K3 re-read of an operand hits L2 when the call's
+                              group working set is at most this (key warm.pack_l2_bytes,
+                              optional, 0 when absent: no hits)                             */
+  /* ---- v13 (DESIGN v1.18 §6c.8). Optional keys, 0 when absent (0 predicts as API 12). A
+   *      caller with a v7..v12 struct_size is read with these fields 0: for a file with the
+   *      v1.18 keys (the shipped one) a degraded, unvalidated view; pass NULL. ---- */
+  double clock_boost_mhz;   /* f_top: the top of the clock range (BURST; SUSTAINED solved on
+                               [clock_min, f_top]; time flat above clock_eff). 0: clock_eff
+                               (key power.clock_boost_mhz; 0 or >= clock_eff_mhz)            */
+  double power_act_w;       /* busy-GPU power at clock_eff, x busy share x (f/f_ref)^(1+gamma)
+                               (key power.act_w)                                              */
+  double power_act_gap_us;  /* launch gap of the busy share b = 1 - launches x gap / t_burst
+                               (key power.act_gap_us)                                         */
+  double energy_dram_pj;    /* per byte of a call whose footprint exceeds warm_l2_bytes,
+                               unscaled (key power.dram_pj)                                   */
+  double warm_call_ns;      /* REPEAT / WARM: per-call saving when an input is resident
+                               (key warm.call_ns)                                             */
+  double warm_clean_byte_ns; /* CLEAN: credit per byte of min(written footprint, warm_l2_bytes)
+                               on the call phase (key warm.clean_byte)                        */
+  double pack_l2_planes;    /* 1: the PACK group working set counts one group's W planes;
+                               0: the v1.17 set (key warm.pack_l2_planes, 0 or 1)             */
 } imd_perf_calib_t;
 
 /* The shipped calibration (RTX 4090, sm_89). out->struct_size must be set; SUCCESS. A
@@ -584,8 +624,9 @@ IMD_API const char* imd_perf_calib_error_name(int32_t reason);
 IMD_API imd_status_t imd_perf_calib_format(const imd_perf_calib_t* calib, char* buf,
                                            size_t capacity, size_t* length);
 /* Static names: a class's key prefix ("k0", ..., "call"), a parameter's name ("launch",
- * "byte", "op", "row", "l2byte", "chain", "round", "mac1".. "mac3", "flop", "call"; NULL for a slot
- * the class does not use) and a phase's name; NULL out of range. */
+ * "byte", "op", "row", "l2byte", "chain", "round", "mac1".. "mac3", "flop", "call"; v12:
+ * "elem", "dram"; NULL for a slot the class does not use) and a phase's name; NULL out of
+ * range. */
 IMD_API const char* imd_perf_class_name(int32_t cls);
 IMD_API const char* imd_perf_param_name(int32_t cls, int32_t j);
 IMD_API const char* imd_perf_phase_name(int32_t phase);
@@ -610,7 +651,8 @@ typedef struct {
   int32_t cache;         /* IMD_PERF_CACHE_*                                                */
   double clock_mhz;      /* > 0: an NVML-scale SM clock for capped / sustained operation
                             (e.g. a measured settled clock; overrides the regime); values at
-                            or above the effective clock (clock_eff_mhz) mean BURST; 0: none */
+                            or above the top clock (v13: clock_boost_mhz if > 0, else
+                            clock_eff_mhz) mean BURST; 0: none                              */
   /* ---- v8 (§6f; a struct_size of version 7: accuracy NULL) ---- */
   const struct imd_err_request_s* accuracy; /* metric, target and statistics of err_*;
                                                NULL: NORMWISE, no target                    */
@@ -654,7 +696,9 @@ typedef struct {
   /* ---- v7 ---- */
   int32_t regime;        /* the regime used (DEFAULT resolved)                              */
   int32_t cache;         /* the cache state used                                            */
-  double clock_mhz;      /* the SM clock assumed, at most clock_eff_mhz (0: no clock model) */
+  double clock_mhz;      /* the SM clock assumed: at most clock_eff_mhz, v13 at most the top
+                            clock (the power is evaluated there; the time uses
+                            min(clock, clock_eff)); 0: no clock model                       */
   double power_w;        /* the call's average board power at that clock (0: no power model) */
   double warm_bytes;     /* input bytes served from L2 (WARM)                               */
   double time_lo_s;      /* [time_lo_s, time_hi_s]: an interval aimed at 80 % coverage (2-fold

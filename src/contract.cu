@@ -1603,17 +1603,55 @@ cudaError_t k5_occupancy(int n, int variant, int32_t* out) {
   else return cudaErrorInvalidValue;
 }
 
+// v1.16 §3.4.1: one W instantiation (2, 3) of a pack kernel.
+template <int W>
+cudaError_t pack_occupancy(int32_t kernel, int32_t* out) {
+  switch (kernel) {
+    case IMD_PERF_KERNEL_KF16: return occupancy_of(kf_scale_pack<kK0SmallModes, 16, W>, kThreads, out);
+    case IMD_PERF_KERNEL_KF4: return occupancy_of(kf_scale_pack<kK0SmallModes, 4, W>, kThreads, out);
+    case IMD_PERF_KERNEL_KL8: return occupancy_of(kl_scale_pack<8, W>, kTileElems / 8, out);
+    case IMD_PERF_KERNEL_KL4: return occupancy_of(kl_scale_pack<4, W>, kTileElems / 4, out);
+    case IMD_PERF_KERNEL_PACK: return occupancy_of(k23_pack<W>, kThreads, out);
+    default: return cudaErrorInvalidValue;
+  }
+}
+
+bool is_pack_kernel(int32_t kernel) {
+  return kernel == IMD_PERF_KERNEL_KF16 || kernel == IMD_PERF_KERNEL_KF4 ||
+         kernel == IMD_PERF_KERNEL_KL8 || kernel == IMD_PERF_KERNEL_KL4 ||
+         kernel == IMD_PERF_KERNEL_PACK;
+}
+
 }  // namespace
 
+cudaError_t kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out) {
+  if (w == 0) return kernel_occupancy(kernel, out);
+  if (!is_pack_kernel(kernel)) return cudaErrorInvalidValue;
+  switch (w) {
+    case 2: return pack_occupancy<2>(kernel, out);
+    case 3: return pack_occupancy<3>(kernel, out);
+    default: return cudaErrorInvalidValue;
+  }
+}
+
 cudaError_t kernel_occupancy(int32_t kernel, int32_t* out) {
+  // v1.16 §3.4.1: a pack kernel reports its most constrained W instantiation (fewest CTAs per
+  // SM, then most registers; the first such W of 3, 2). On sm_89 the CTAs per SM are equal for
+  // both W (contract_api checks it) and W = 3 has the most registers: the v1.14 row.
+  if (is_pack_kernel(kernel)) {
+    int32_t best[4] = {0, 0, 0, 0};
+    for (int w = 3; w >= 2; --w) {
+      int32_t r[4];
+      const cudaError_t e = kernel_occupancy_w(kernel, w, r);
+      if (e != cudaSuccess) return e;
+      if (w == 3 || r[0] < best[0] || (r[0] == best[0] && r[1] > best[1]))
+        for (int i = 0; i < 4; ++i) best[i] = r[i];
+    }
+    for (int i = 0; i < 4; ++i) out[i] = best[i];
+    return cudaSuccess;
+  }
   switch (kernel) {
     case IMD_PERF_KERNEL_K0: return occupancy_of(k0_vec<kK0SmallModes>, kThreads, out);
-    // v1.14 §3.4.1: the pack kernels' W = 3 instantiations (DESIGN §6c is unchanged in v1.14)
-    case IMD_PERF_KERNEL_KF16: return occupancy_of(kf_scale_pack<kK0SmallModes, 16, 3>, kThreads, out);
-    case IMD_PERF_KERNEL_KF4: return occupancy_of(kf_scale_pack<kK0SmallModes, 4, 3>, kThreads, out);
-    case IMD_PERF_KERNEL_KL8: return occupancy_of(kl_scale_pack<8, 3>, kTileElems / 8, out);
-    case IMD_PERF_KERNEL_KL4: return occupancy_of(kl_scale_pack<4, 3>, kTileElems / 4, out);
-    case IMD_PERF_KERNEL_PACK: return occupancy_of(k23_pack<3>, kThreads, out);
     case IMD_PERF_KERNEL_ZERO_ROWS: return occupancy_of(k23_zero_rows, kThreads, out);
     case IMD_PERF_KERNEL_DIRECT: return occupancy_of(k_direct, kThreads, out);
     case IMD_PERF_KERNEL_BETA: return occupancy_of(k5_beta_only, kThreads, out);

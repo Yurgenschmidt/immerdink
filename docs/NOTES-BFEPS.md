@@ -73,7 +73,88 @@ Decisions (DESIGN §6c.1 "The eps path — retired"):
   old ramp, op_eps values have no effect, optional keys round-trip), `host_c_api` (NaN still
   rejected, eps out 0).
 
-## 4. Open
+## 4. Leftovers (DESIGN v1.16, branch `emitter-w1`, 2026-10-06)
 
-- W = 1 for N ≤ 8 (T < 2³²: one `dp4a`) is possible and not done (a third instantiation).
+Raw data, scripts and logs: eval workspace `results/openitems/emitter/` (write-up
+`findings/openitems-emitter.md`).
+
+### 4.1 W = 1 for N ≤ 8: evaluated, not adopted
+
+N = 8 is the largest N with T(N) < 2³² (T(8): 32 bits, T(9): 36; `cert_pack_words`), so for
+N ≤ 8 X = |a'| fits one u32 word: `X = u32(μ) << ε` and one `dp4a` per residue. It was
+implemented in full (`PackEmitterT<E, 1>`, `mod_p_words32<1>`, W = 1 instantiations of
+`k23_pack`, `kf_scale_pack`, `kl_scale_pack`, `pack_words` 1 / 2 / 3, generated
+`kPackW1MaxN`, `kPackXBits1`, the certificate, unit tests: 51.2 M residues, 0 mismatches;
+contract and `imd_pack` cases bit-exact) and measured against v1.15 (1e8a439).
+
+- **Code** (ptxas, sm_89): `k23_pack` 2496 → 2360 SASS instructions but **104 registers**
+  (W = 2: 84, W = 3: 117; still 2 CTAs per SM, shared-memory bound); KF E = 16 126 vs 128
+  registers; KL unchanged at its cap (64, spills 4 / 4 B as W = 2).
+- **A/B** (RTX 4090, `bench/run_ab.sh`, three interleaved rounds, sweep
+  `results/openitems/emitter/sweep_w1.txt`: 512², s256 g = N and g = 3, 1024³ g = N and
+  g = 4, 4096³, 1024² × 16384, DF acQ,bdQ 64⁴ × 2048, `imd_pack` 2048²; N = 4, 6, 8 with
+  N = 13, 16 as the control where only the v1.16 shift changed). **C bit-identical by hash
+  in every record.** Per-phase medians over the rounds, after / before:
+
+  | shape (path) | N | call | pack phases |
+  |---|---|---|---|
+  | 4096³ (KL E = 8) | 6 / 8 | 0.999 / 1.000 | KL A 0.993 / 0.999, KL B 0.995 / 0.993 |
+  | DF acQ,bdQ (KL) | 6 / 8 | 0.997 / 0.999 | KL A 0.986 / 0.987, KL B 0.993 / 1.001 |
+  | 1024² × 16384 (KL E = 4) | 6 / 8 | 0.990 / 0.985 | KL A 0.988 / 0.966, KL B 0.985 / 0.965 |
+  | `imd_pack` 2048² (KL) | 6 / 8 | 0.972 / 0.965 | pack KL 0.957 / 0.930 |
+  | 1024³ (KF E = 16) | 4 / 6 / 8 | 1.03 / 1.02 / 1.01 (±10 % noise) | KF 0.898 / 0.937 / 0.958 |
+  | 1024³ g = 4 (K2/K3) | 6 / 8 | 0.996 / 0.991 (noise) | KF 0.983 / 0.941, K2 0.997 / 0.983, K3 0.988 / 0.911 |
+  | 512² (KF E = 16) | 4 / 6 / 8 | 0.96 / 0.89 / 1.00 (noise) | KF 0.997 / 0.973 / 1.000 |
+  | s256 g = N / g = 3 (KF E = 4, K2/K3 parts) | 6 / 8 | ±5–30 % process noise | no resolvable change |
+  | control: same shapes at N = 13 / 16 | | 0.990–1.002 (stable shapes) | 0.992–1.002 (stable shapes) |
+
+  Geometric means without the s256 tiny calls: pack phases **0.973** at N ≤ 8 (control
+  0.997), calls 0.987 (control 0.996).
+- **Cost of the third instantiation** (Release, one nvcc job, two alternating runs each):
+  contract.cu 16.27 / 16.28 s → 18.11 / 18.13 s (+11 %); sm_89 cubin 4.62 → 5.24 MB
+  (+13 %); `libimmerdink.so` 6.58 → 7.33 MB (+11 %).
+- **Decision:** the adoption bar was a ≥ 3 % pack-phase gain with no call regression above
+  0.5 %. The pack phases gained 2.7 % overall (≈ 1 % on the KL phases of the large shapes,
+  where the measurement is precise; the larger KF gains at 1024³ sit inside ±10 %
+  per-process noise and do not show in the call), so W = 1 is **not adopted**; the code was
+  reverted (commit history of `emitter-w1`), the analysis kept here and in DESIGN §3.4.1.
+  At N ≤ 8 a residue costs few instructions next to the operand read and the N int8 stores
+  of each element (the KL phases are memory-bound), so one `dp4a` less barely shows.
+- **For the performance model:** nothing changes at N ≤ 8 (W = 2 stays); the per-phase
+  ratios above are the size of the effect a W = 1 kernel would have had.
+
+### 4.2 Defined W = 2 shift (L3)
+
+`X = μ << ε` (u64, ε ≤ 62 in the contract) is undefined C++ for ε ≥ 64, which only a σ bug
+could produce, and the debug assert catches it only with asserts on. v1.16 writes the shift
+as PTX `shl.b64` (inline asm `shl_clamped`; PTX clamps the count at 64, result 0): defined
+for every ε, identity in the contract. Alternatives measured on the sm_89 cubin: `ε & 63`
++8 to +40 SASS instructions per W = 2 kernel, `ε < 64 ? μ << ε : 0` up to +112. PTX shl
+keeps registers and spills, instruction counts −2 % (KF E = 16) to +0.2 % (KL E = 8), not
+byte-identical (the C++ shift let the compiler assume ε < 64); W = 3 kernels byte-identical
+(its shifts were already defined: b ≤ 31, q ≥ 3 selects as q = 2). Timing at N = 13, 16 (the
+control rows above, where this is the only change): neutral, C bit-identical.
+
+### 4.3 The s bound (L4)
+
+`s ≤ 10·255·255 = 650,250` in DESIGN §3.4.1 takes every weight as 255. Exact maxima of
+s = Σ b_i w_i (cert_pack_words): 210,472 at W = 2 (X < 2⁶³, moduli of N ≤ 16), 264,156 at
+W = 3 (X < 2⁷⁸, p = 253); over X ≤ T(N) 258,500 (N = 20, p = 253); with all ten bytes at 255
+302,940 (p = 253). (A figure of 254,377 was quoted for this maximum; it matches none of these
+definitions and could not be reproduced.) All are < 2¹⁹; the reduction needs s < 2²⁴.
+
+### 4.4 W-aware occupancy (L1)
+
+`kernel_occupancy` measured the W = 3 instantiation of every pack kernel while N ≤ 16 runs
+W = 2 (`k23_pack` 84 vs 117 registers). v1.16 adds `kernel_occupancy_w(kernel, W)` (test
+hook `imd_test_kernel_occupancy_w`, benchmark hook `imd_prof_kernel_occupancy_w`, imd_bench
+occupancy record `kernels_w`) and defines the reported row as the most constrained W
+(fewest CTAs per SM, then most registers) = the W = 3 row, unchanged, so the shipped
+calibration stays valid. `contract_api` asserts that CTAs per SM are equal for W = 2 and 3
+(kf16 2, kf4 4, kl8 2, kl4 1, pack 2), which is all the model's occupancy features use. If a
+kernel change ever breaks the equality, the test fails and the model needs per-W rows
+(`kernels_w` already records them).
+
+### 4.5 Still open
+
 - `quantize` keeps its per-element s ≥ 0 / s < 0 branch (not per modulus).

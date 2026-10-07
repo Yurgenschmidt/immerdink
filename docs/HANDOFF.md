@@ -74,7 +74,65 @@ first.
   pJ/op + e_byte^f 301 pJ/B, γ = 1). Open: recollect **all 14** sustained windows on the
   current library (all ran pre-v1.14 commit 0787164; the refit used the 9 N ≤ 14 ones); KF
   N-dependence (N = 8 1.2× slow), K3 pack 1.07–1.20× slow, N = 18–20 hold-out cases
-  (NOTES-B2 §10); W = 1 for N ≤ 8 (NOTES-BFEPS §4).
+  (NOTES-B2 §10). W = 1 for N ≤ 8 was evaluated and not adopted (DESIGN v1.16, branch
+  `emitter-w1`, NOTES-BFEPS §4: pack −2.7 %, below the 3 % bar, for +11 % library size);
+  v1.16 also makes the W = 2 shift defined (PTX shl) and the occupancy query W-aware.
+- **Model fix (2026-10-06, branch `model-fix` on `emitter-w1`, not pushed; DESIGN v1.17 §6c,
+  host API 12, NOTES-B2 §11):** two additive optional features in the freed eps slots,
+  `kf.elem` (KF per-element chain) and `pack.dram` (PACK bytes that are not L2-hit re-reads,
+  L_hit = `warm.pack_l2_bytes` = 0.8 × L2), calibration format 2 kept (absent = 0 predicts
+  bit-identically; `op_eps` keys retired), f_ref by a parabola vertex with a nested
+  leave-one-out figure, the `--l2 flush` phase fix. Shipped calibration refit on the current
+  library with **all 14 sustained windows recollected**: hold-out (189 calls) 3.8 / 12.9 /
+  23.2 %, 2.6 / 9.6 / 13.9 %, 2.2 / 6.6 / 16.8 % (< 100 µs, 100 µs – 1 ms, ≥ 1 ms; median /
+  p90 / max), better than old θ (eps ignored) on medians and p90s, maxima +1.5 / +1.0 points
+  on single K4-bound calls (within run-to-run noise below 100 µs, borderline at ≥ 1 ms); K3
+  phase 13.3 / 22.4 → 4.9 / 14.7 %. Open: KF roofline and cache-term cap, W = 3 KF on tiny
+  E = 4 shapes, K4 on tiny shapes, capped clock 0.8–3.4 % high and the power gaps (r_mm −43 %,
+  the small high-clock windows u_s512 / u_s1024 −6 … −23 %; needs memory-bound and small
+  windows at several clocks), L_hit between 57 and 77 MB (S is a proxy without K4's planes);
+  reviewer question: format 2 kept (reviewer: keep it). Hold-out caveats (NOTES-B2 §11
+  [review]): the features were chosen on 178 of the 189 calls; the PACK L2-hit side is
+  checked in-sample only.
+  Verified: full `tools/test.sh` 13/13 CPU + 35/35 GPU, `params.py --check` 30/30,
+  `test_oracle` all pass. GPU: 56 min of sweep wall time (over the 45 min budget).
+- **Perf minor (2026-10-06, branch `perf-minor` on origin/dev 684f459, not pushed; DESIGN
+  v1.18 §6c.8, host API 13, NOTES-B2 §12):** the model-fix "Remaining" items after two offline
+  analyses (eval `findings/perfminor-time.md`, `perfminor-power.md`). Adopted, all optional
+  keys (format 2 kept, absent = 0 predicts as API 12): cache term with a per-call REPEAT saving
+  `warm.call_ns` and a clean-L2 credit `warm.clean_byte` in a new state
+  `IMD_PERF_CACHE_CLEAN` (COLD stays the default: evicted by other, dirty work); the PACK set
+  with K4's W planes (`warm.pack_l2_planes`, L_hit 1.1 × L2); power with busy-GPU power
+  `power.act_w` / `act_gap_us`, DRAM energy `power.dram_pj`, boost clock
+  `power.clock_boost_mhz` (BURST at the boost clock, time flat above f_ref, `clock_mhz` out up
+  to it), γ 2.5 as a prior; `imd_bench` sustained `--mode direct` variant fixed. Not adopted:
+  KF read / write split (format bump: `kf.row` non-zero in format 1), KF roofline (refuted),
+  E = 4 per-modulus term (fits 0), fixed PACK hit price. Shipped calibration refit (sustained
+  windows reused: 24 of 26 from model-fix / perfminor on the same kernels): hold-out (199 calls)
+  < 100 µs 3.9 / 10.8 / 15.8 → 3.7 / 12.2 / 19.0 %, 100 µs – 1 ms 2.7 / 10.3 / 15.7 → 2.7 / 6.9 /
+  13.4 %, ≥ 1 ms 2.4 / 6.6 / 16.0 → 2.6 / 6.4 / 16.4 % (median / p90 / max vs the v1.17
+  calibration on the same records; against a v1.17 refit on the same records ≥ 1 ms median
+  1.6 → 2.6 and < 100 µs p90 9.8 → 12.2: a trade-off), 1024³ N = 14 +14.9 → +6.3 % (in-sample
+  for the cache term: x_s1024 pairs; the held-out cache evidence is the three v_x* pairs);
+  SUSTAINED nested LOO on 26 windows t 2.34 → 1.62 %, clock 6.6 → 1.3 %, power max 81 → 10 %.
+  **Review fixes (branch `perf-minor-final`, CPU only):** the power / SUSTAINED clock solve now
+  divides by the request's cache-state time (was COLD time while fitted on REPEAT windows),
+  perf_fit recomputes the boost clock per LOO fold; power keys refit offline (f_ref 2483):
+  nested LOO 1.40 %, clock 0.7 %; BURST and COLD predictions and the hold-out unchanged; doc
+  fixes and open items in NOTES-B2 §12 "Review" / "Remaining".
+  **c dropped (branch `perf-minor-noc`, CPU only; the independent reviewer's binding
+  verdict, NOTES-B2 §12 "Decision: c dropped"):** shipped calibration refit with `perf_fit
+  --cache-terms delta,omega` (now the default; `warm.call_ns` absent = 0, the key stays
+  supported): L_w 0.85 × L2, Δ 1.31 ps/B, ω 0.104 ps/B, f_ref 2479, nested LOO 1.42 %; hold-out
+  < 100 µs 3.7 / 12.2 / 19.0 → 3.8 / 10.7 / 17.1 %, 100 µs – 1 ms 2.7 / 6.9 / 13.4 → 2.7 / 8.2 /
+  13.3 %, ≥ 1 ms 2.6 / 6.4 / 16.4 → 2.5 / 6.4 / 16.4 %; 1024³ N = 14 +6.3 → +10.8 %; small COLD
+  calls ≈ 1.2 µs faster (64³ N = 14 16.68 → 15.45 µs); two of the three held-out cache pairs
+  worse (clean credit 11.5 → 6.7 µs). The per-call saving is not identifiable: open, tied to
+  the launch-timing question (power reviewer item 5).
+  Open: reviewer questions (COLD's meaning, `clock_mhz` scale), the per-call saving c
+  (dropped, above; with the launch-timing check), streaming K2 of g < N KL
+  calls (+2 … +5 %), pre-packed g < N in the S rule, tiny-shape K4 / KF. GPU: 18.7 min (90 min
+  sweep wall time, mostly gate waits for other GPU users).
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).

@@ -834,7 +834,7 @@ struct Bench {
     // v1.10: the bench's state (the same call repeated) at the reference clock; the default
     // eps fraction (the v6 bench passed 0 here by value-initialization).
     imd_perf_request_t preq{sizeof(imd_perf_request_t), 0, k4_plan, 0, -1.0,
-                            IMD_PERF_REGIME_BURST, o.l2_flush ? IMD_PERF_CACHE_COLD : IMD_PERF_CACHE_REPEAT, 0.0};
+                            IMD_PERF_REGIME_BURST, o.l2_flush ? IMD_PERF_CACHE_CLEAN : IMD_PERF_CACHE_REPEAT, 0.0};
     imd_perf_t pred{};
     pred.struct_size = sizeof pred;
     imd_perf_predict(&A, &B, &C, &opt, nullptr, &preq, nullptr, &pred);
@@ -1282,8 +1282,24 @@ struct Bench {
       js += (k ? ", " : "") + jstr(imd_perf_kernel_name(k)) + ": [" + std::to_string(v[0]) + ", " +
             std::to_string(v[1]) + ", " + std::to_string(v[2]) + ", " + std::to_string(v[3]) + "]";
     }
+    // v1.16 §3.4.1: the pack kernels per emitter word count W (2, 3); "kernels" holds the
+    // most constrained W's row (the performance model's).
+    std::string jw = "{";
+    const int pack_kernels[] = {IMD_PERF_KERNEL_KF16, IMD_PERF_KERNEL_KF4, IMD_PERF_KERNEL_KL8,
+                                IMD_PERF_KERNEL_KL4, IMD_PERF_KERNEL_PACK};
+    for (int k : pack_kernels) {
+      jw += (jw.size() > 1 ? ", " : "") + jstr(imd_perf_kernel_name(k)) + ": {";
+      for (int w = 2; w <= 3; ++w) {
+        int32_t v[4] = {0, 0, 0, 0};
+        if (imd_prof_kernel_occupancy_w(k, w, v) != 0) throw Failure("imd_prof_kernel_occupancy_w");
+        jw += (w > 2 ? ", " : "") + jstr(std::to_string(w)) + ": [" + std::to_string(v[0]) + ", " +
+              std::to_string(v[1]) + ", " + std::to_string(v[2]) + ", " + std::to_string(v[3]) + "]";
+      }
+      jw += "}";
+    }
     Json j;
     j.str("method", "occupancy").str("variant", "").integer("N", 0).raw("kernels", js + "}");
+    j.raw("kernels_w", jw + "}");
     j.str("status", "ok");
     emit(j);
 #else
@@ -1426,6 +1442,8 @@ struct Bench {
     e.integer("g", (long long)((g == 0 || g >= N) ? N : g));
     std::string vs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
     if (vec_mode == IMD_VEC_RESIDENT) vs += " vec=resident";
+    // v1.18: the mode as method imd writes it (bench/perf_fit.py read a DIRECT window as EMULATE)
+    if (o.mode == IMD_DIRECT) vs += " mode=direct";
     record("sustained", vs + " sustained", N, T, nullptr, flops(), P->wsb, e);
   }
 

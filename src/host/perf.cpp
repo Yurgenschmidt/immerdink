@@ -1,4 +1,4 @@
-// The performance model (DESIGN v1.8 / v1.10 §6c): features of every phase from the plan's
+// The performance model (DESIGN v1.8 / v1.10 / v1.17 / v1.18 §6c): features of every phase from the plan's
 // lowering and the shared launch rules, the calibration file (formats 1 and 2),
 // imd_perf_predict, imd_perf_predict_pack, imd_perf_rank. Pure: no allocation visible to the
 // caller, thread-safe, and no global or static mutable state but one, test-only: the
@@ -50,9 +50,9 @@ const char* const kClassNames[IMD_PERF_CLASS_COUNT] = {
 // Feature names per class (nullptr: the class does not use that slot).
 const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
     {"launch", "byte", "chain", nullptr, nullptr, nullptr},          // k0
-    {"launch", "byte", "op", "row", "op_eps", "chain"},              // kf
-    {"launch", "byte", "op", "l2byte", "op_eps", "wave"},            // kl
-    {"launch", "byte", "op", "op_eps", "chain", "wave"},             // pack
+    {"launch", "byte", "op", "row", "elem", "chain"},                // kf (v1.17: elem)
+    {"launch", "byte", "op", "l2byte", nullptr, "wave"},             // kl (slot 4: retired op_eps)
+    {"launch", "byte", "op", "dram", "chain", "wave"},               // pack (v1.17: dram)
     {"round", "mac1", nullptr, nullptr, "byte", "mac_ktail"},        // k4_128x256 (1 CTA per SM)
     {"round", "mac1", "mac2", nullptr, "byte", "mac_ktail"},         // k4_128x128 (2)
     {"round", "mac1", "mac2", nullptr, "byte", "mac_ktail"},         // k4_64x128  (2)
@@ -63,29 +63,34 @@ const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
     {"call", "launch", nullptr, nullptr, nullptr, nullptr},          // call (signed: a correction)
 };
 // v1.10: the parameters new in format 2 (a format-1 file has none of them; they are 0 there).
+// v1.17: kf.elem, pack.dram are format-2 parameters too (optional, below).
 constexpr bool kFormat2Param[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, true, false, false, false},   // k0.chain
-    {},                                          // kf (kf.chain is format 1)
+    {false, false, false, false, true, false},   // kf.elem (v1.17; kf.chain is format 1)
     {false, false, false, false, false, true},   // kl.wave
-    {false, false, false, false, true, true},    // pack.chain, pack.wave
+    {false, false, false, true, true, true},     // pack.dram (v1.17), pack.chain, pack.wave
     {}, {}, {}, {},
     {false, false, false, true, true, false},    // k5.chain, k5.dram
     {false, false, false, true, false, false},   // direct.chain
     {false, false, true, false, false, false},   // beta.chain
     {}};
-// v1.15 (§6c.1 "The eps path — retired"): the op_eps slots. Their feature is always 0; their
-// keys are optional (absent = 0) in formats 1 and 2 and written only when non-zero.
+// v1.17 (§6c.1, §6c.2): the slots the eps path freed hold kf.elem and pack.dram, optional
+// (absent = 0) format-2 parameters written only when non-zero, so a calibration without them
+// predicts and formats exactly as in host API 11.
 constexpr bool optional_param(int cl, int j) {
-  return (cl == IMD_PERF_CLASS_KF && j == 4) || (cl == IMD_PERF_CLASS_KL && j == 4) ||
-         (cl == IMD_PERF_CLASS_PACK && j == 3);
+  return (cl == IMD_PERF_CLASS_KF && j == 4) || (cl == IMD_PERF_CLASS_PACK && j == 3);
 }
+// v1.15 / v1.17: the retired op_eps keys (formats 1 and 2): accepted (a number >= 0, at most
+// once) and discarded, never written.
+constexpr const char* kRetiredKeys[] = {"kf.op_eps", "kl.op_eps", "pack.op_eps"};
+constexpr int kRetiredKeyCount = sizeof kRetiredKeys / sizeof kRetiredKeys[0];
 // v1.10 (§6c.1 "Clock regimes"): the slots whose time scales with the SM clock (ops, chains,
 // L2 traffic, K4's round model); DRAM bytes, launches and the call term do not.
 constexpr bool kClockBound[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, true, false, false, false},   // k0: chain
-    {false, false, true, true, true, true},      // kf: op, row, op_eps, chain
-    {false, false, true, true, true, false},     // kl: op, l2byte, op_eps (not wave: memory)
-    {false, false, true, true, true, false},     // pack: op, op_eps, chain (not wave: memory)
+    {false, false, true, true, false, true},     // kf: op, row, chain (v1.17: not elem, latency)
+    {false, false, true, true, false, false},    // kl: op, l2byte (not wave: memory)
+    {false, false, true, false, true, false},    // pack: op, chain (not dram, wave: memory)
     {true, true, true, true, false, true},       // k4: the round model, not the DRAM term
     {true, true, true, true, false, true},
     {true, true, true, true, false, true},
@@ -109,7 +114,9 @@ static_assert(IMD_PERF_CLASS_K4_128x256 + IMD_K4_64x64 == IMD_PERF_CLASS_K4_64x6
 // Version-6 struct sizes (the v7 fields are appended; DESIGN §6c.3).
 constexpr uint32_t kCalibV1Size = offsetof(imd_perf_calib_t, kernel);
 constexpr uint32_t kCalibV7Size = offsetof(imd_perf_calib_t, energy_byte_f_pj);  // v7..v10
-constexpr uint32_t kCalibV11Size = sizeof(imd_perf_calib_t);
+constexpr uint32_t kCalibV11Size = offsetof(imd_perf_calib_t, pack_l2_hit_bytes);
+constexpr uint32_t kCalibV12Size = offsetof(imd_perf_calib_t, clock_boost_mhz);
+constexpr uint32_t kCalibV13Size = sizeof(imd_perf_calib_t);
 constexpr uint32_t kRequestV1Size = offsetof(imd_perf_request_t, regime);
 constexpr uint32_t kPerfV1Size = offsetof(imd_perf_t, regime);
 constexpr uint32_t kRankRequestV1Size = offsetof(imd_perf_rank_request_t, regime);
@@ -128,6 +135,8 @@ static_assert(kRankRequestV1Size == 64, "imd_perf_rank_request_t v1 layout chang
 static_assert(kRequestV1Size == 24, "imd_perf_request_t v1 layout changed");
 static_assert(kCalibV7Size == 1232 + 16 * 128 + 8 * 10 + 8 * 6 + 8 * 32 + 8, "v7 calib");
 static_assert(kCalibV11Size == kCalibV7Size + 8, "v11 calib");
+static_assert(kCalibV12Size == kCalibV11Size + 8, "v12 calib");
+static_assert(kCalibV13Size == kCalibV12Size + 7 * 8, "v13 calib");
 static_assert(kRequestV7Size == 40, "v7 request");
 static_assert(kPerfV7Size == 1648 + 8 + 8 * 5 + 16 * 16, "v7 prediction");
 static_assert(kRankRequestV7Size == 88, "v7 rank request");
@@ -219,7 +228,9 @@ void migrate_v7_fields(imd_perf_calib_t* cal) {
   cal->clock_eff_mhz = cal->clock_min_mhz = cal->power_cap_w = cal->power_idle_w = 0;
   cal->energy_tc_pj = cal->energy_alu_pj = cal->energy_byte_pj = cal->energy_byte_f_pj = 0;
   cal->energy_gamma = 2;
-  cal->warm_l2_bytes = cal->warm_l2byte_ns = 0;
+  cal->warm_l2_bytes = cal->warm_l2byte_ns = cal->pack_l2_hit_bytes = 0;
+  cal->clock_boost_mhz = cal->power_act_w = cal->power_act_gap_us = cal->energy_dram_pj = 0;
+  cal->warm_call_ns = cal->warm_clean_byte_ns = cal->pack_l2_planes = 0;  // v1.18
   cal->tie_ratio = 1;
   for (auto& b : cal->band_call) b[0] = b[1] = 1;
   for (auto& b : cal->band_class) b[0] = b[1] = 1;
@@ -270,13 +281,16 @@ double grid_chain(const imd_perf_calib_t& cal, int32_t kernel, int64_t outputs, 
   return chain_of(launch_blocks(outputs), 1, units, u, resident_of(cal, kernel), cal.sm_count);
 }
 
-// KF's per-thread chain on the busiest SM (DESIGN §6c.1): its launch (kf_* rules, shared with
-// contract.cu) has B = tiles x parts blocks; each thread holds E values of a tile and emits the
-// residues of ceil(g / parts) moduli for each of them in sequence (v1.15: no eps factor).
-double kf_chain(const ExecPlan& e, const imd_perf_calib_t& cal) {
+// KF's launch (kf_* rules, shared with contract.cu): B = tiles x parts blocks of E = 16 (or,
+// for a small grid, 4) values per thread, r of them resident per SM.
+struct KfShape {
+  int64_t tiles = 0, parts = 1;
+  double E = 16;
+  int32_t resident = 1;
+};
+KfShape kf_launch_shape(const ExecPlan& e, const imd_perf_calib_t& cal) {
   const int32_t sms = cal.sm_count;
   const int lg_tk = kf_lg_tk(e.k_hat);
-  const int gs = e.g;
   const auto tiles_for = [&](int lg_te) {
     int64_t t = 0;
     for (int x = 0; x < 2; ++x)
@@ -284,14 +298,33 @@ double kf_chain(const ExecPlan& e, const imd_perf_calib_t& cal) {
         t += kf_operand_tiles(lg_te, lg_tk, e.b, x == 0 ? e.m : e.n, e.pack_radix[x]);
     return t;
   };
-  int64_t tiles = tiles_for(12);
-  const bool small = kf_small(tiles, gs, sms);
-  if (small) tiles = tiles_for(10);
-  if (tiles <= 0) return 0;
-  const int64_t parts = pack_moduli_parts(tiles, gs, sms);
-  const int32_t r = resident_of(cal, small ? IMD_PERF_KERNEL_KF4 : IMD_PERF_KERNEL_KF16);
-  return chain_of(launch_blocks(tiles, 1), parts, tiles, (small ? 4.0 : 16.0) * dbl((gs + parts - 1) / parts),
-                  r, sms);
+  KfShape k;
+  k.tiles = tiles_for(12);
+  const bool small = kf_small(k.tiles, e.g, sms);
+  if (small) k.tiles = tiles_for(10);
+  if (k.tiles <= 0) return KfShape{};
+  k.parts = pack_moduli_parts(k.tiles, e.g, sms);
+  k.E = small ? 4.0 : 16.0;
+  k.resident = resident_of(cal, small ? IMD_PERF_KERNEL_KF4 : IMD_PERF_KERNEL_KF16);
+  return k;
+}
+
+// KF's per-thread chain on the busiest SM (DESIGN §6c.1): each thread holds E values of a tile
+// and emits the residues of ceil(g / parts) moduli for each of them in sequence (v1.15: no eps
+// factor).
+double kf_chain(const ExecPlan& e, const imd_perf_calib_t& cal) {
+  const KfShape k = kf_launch_shape(e, cal);
+  if (k.tiles <= 0) return 0;
+  return chain_of(launch_blocks(k.tiles, 1), k.parts, k.tiles,
+                  k.E * dbl((e.g + k.parts - 1) / k.parts), k.resident, cal.sm_count);
+}
+
+// v1.17 (DESIGN §6c.1): KF's per-element chain on the busiest SM: the same launch, u = E (each
+// moduli part loads, quantizes and reduces its E values once, whatever its residue count).
+double kf_elem_chain(const ExecPlan& e, const imd_perf_calib_t& cal) {
+  const KfShape k = kf_launch_shape(e, cal);
+  if (k.tiles <= 0) return 0;
+  return chain_of(launch_blocks(k.tiles, 1), k.parts, k.tiles, k.E, k.resident, cal.sm_count);
 }
 
 double u128_to_double(u128 v) { return static_cast<double>(v); }
@@ -299,7 +332,7 @@ double u128_to_double(u128 v) { return static_cast<double>(v); }
 // KL of one operand (rows, padded rows, g moduli of group 1, KL tile): launch, DRAM bytes
 // (read the operand once, write group 1's residues, sigma and the flag), residue ops, the
 // L2 re-read of rows longer than two tiles (passes 2 and 3 re-read the middle chunks), the
-// op_eps slot 0 (v1.15: retired), and (v1.10) the chain of its launch (kl_launch: rows per
+// slot 4 0 (the retired op_eps), and (v1.10) the chain of its launch (kl_launch: rows per
 // batch rows_b, radix; lg_rows >= 0 for imd_pack's tile).
 void add_kl(PerfPhases* P, const imd_perf_calib_t& cal, int32_t phase, double rows, double pad,
             double k, double k_hat, double g, bool along_rows, int64_t k_hat_i,
@@ -386,8 +419,9 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         in += 8 * rows[x] * k;
       }
       const double chain = kf_chain(e, cal);
-      // v1.15: slot 4 (op_eps) is 0 and the chain has no (1 + f) factor (§6c.1)
-      add_phase(&P, IMD_PERF_PHASE_KF, IMD_PERF_CLASS_KF, 1, {1, bytes, ops, r, 0, chain}, bytes)
+      // v1.15: the chain has no (1 + f) factor; v1.17: slot 4 = the per-element chain (§6c.1)
+      add_phase(&P, IMD_PERF_PHASE_KF, IMD_PERF_CLASS_KF, 1,
+                {1, bytes, ops, r, kf_elem_chain(e, cal), chain}, bytes)
           .in_bytes = in;
     } else {  // KL per in-line operand (v1.6: every in-line operand without KF)
       for (int x = 0; x < 2; ++x)
@@ -399,6 +433,18 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     // K2 / K3: the groups of an in-line operand that KF / KL did not pack (groups 2..G):
     // per group one read of the operand and the group's residues (+ the zero-rows launch of B).
     const int64_t G = (e.N + e.g - 1) / e.g;
+    // v1.17 (§6c.1): the call's group working set S, the in-line operands plus one group's
+    // residues. At most L_hit, an operand's re-reads by its K2 / K3 launches hit L2
+    // (cal.pack_l2_hit_bytes; 0: never). A proxy (review 2026-10-06): it leaves out K4's W
+    // planes per group and a pre-packed operand's residues; L_hit is fitted on squares.
+    // v1.18 (§6c.8): with pack_l2_planes = 1, S also counts one group's W planes (K4's
+    // group-bytes rule, the plan's K-chunks); a pre-packed operand's residues are still out.
+    const K4Counts kc = plan_k4_counts(e, production_launch_limits());
+    double S = 0;
+    for (int y = 0; y < 2; ++y)
+      if (inl[y]) S += 8 * rows[y] * k + g * pad[y] * kh;
+    if (cal.pack_l2_planes > 0) S += g * b * m * nh * (2.0 * static_cast<double>(kc.k_chunks) - 1);
+    const bool l2_hit = cal.pack_l2_hit_bytes > 0 && S <= cal.pack_l2_hit_bytes;
     for (int x = 0; x < 2; ++x) {
       if (!inl[x]) continue;
       const bool first_done = fused || (fl & (1 << x));
@@ -419,16 +465,18 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
         // a few blocks per SM cannot hide DRAM latency)
         wave += chain_of(L.grid_x, L.parts, L.tiles, 1.0, resident_of(cal, IMD_PERF_KERNEL_PACK), sms);
       }
-      // v1.15: slot 3 (op_eps) is 0 and the chain has no (1 + f) factor (§6c.1)
+      // v1.15: the chain has no (1 + f) factor; v1.17: slot 3 = the bytes that are not L2-hit
+      // re-reads (every read after the operand's first in this call, when S <= L_hit; §6c.1)
+      const double hit = l2_hit ? dbl(groups - (first_done ? 0 : 1)) * 8 * rows[x] * k : 0;
       add_phase(&P, x == 0 ? IMD_PERF_PHASE_PACK_A : IMD_PERF_PHASE_PACK_B, IMD_PERF_CLASS_PACK,
                 groups * per,
-                {static_cast<double>(groups * per), bytes, moduli * rows[x] * k, 0, chain, wave},
+                {static_cast<double>(groups * per), bytes, moduli * rows[x] * k, bytes - hit,
+                 chain, wave},
                 bytes);
     }
     // K4: the A3 round model of the configuration, over the groups and the K-chunks.
     const int32_t cfg = k4 >= 0 ? k4 : k4_select(e, sms);
     P.k4_config = cfg;
-    const K4Counts kc = plan_k4_counts(e, production_launch_limits());
     const int64_t chunk = c::kKcPrime;
     const int64_t gsz[2] = {e.g, e.N % e.g}, gcnt[2] = {e.N / e.g, e.N % e.g ? 1 : 0};
     const int64_t last = e.k_hat - (kc.k_chunks - 1) * chunk;
@@ -631,8 +679,12 @@ bool calib_valid(const imd_perf_calib_t& c) {
   for (const double v : {c.clock_eff_mhz, c.clock_min_mhz, c.power_cap_w, c.power_idle_w,
                          c.energy_tc_pj, c.energy_alu_pj, c.energy_byte_pj, c.energy_byte_f_pj,
                          c.energy_gamma,
-                         c.warm_l2_bytes, c.warm_l2byte_ns, c.tie_ratio})
+                         c.warm_l2_bytes, c.warm_l2byte_ns, c.tie_ratio, c.pack_l2_hit_bytes,
+                         c.clock_boost_mhz, c.power_act_w, c.power_act_gap_us, c.energy_dram_pj,
+                         c.warm_call_ns, c.warm_clean_byte_ns})
     if (!finite_nonneg(v)) return false;
+  if (c.pack_l2_planes != 0 && c.pack_l2_planes != 1) return false;  // v1.18
+  if (c.clock_boost_mhz > 0 && !(c.clock_boost_mhz >= c.clock_eff_mhz)) return false;
   if (c.power_cap_w > 0 && !(c.clock_eff_mhz > 0 && c.clock_min_mhz > 0 &&
                              c.clock_min_mhz <= c.clock_eff_mhz))
     return false;
@@ -666,8 +718,28 @@ constexpr ScalarKey kScalarKeys[] = {
     {"rank.tie_ratio", &imd_perf_calib_t::tie_ratio}};
 constexpr int kScalarKeyCount = sizeof kScalarKeys / sizeof kScalarKeys[0];
 const char* const kBandCallKeys[3] = {"band.call_small", "band.call_mid", "band.call_large"};
-// v1.15 (host API 11, DESIGN §6c.7): the one optional format-2 key (absent = 0).
-constexpr const char* kByteFKey = "power.byte_f_pj";
+// The optional format-2 scalar keys (absent = 0; written only when non-zero, right after the
+// required key `after`, so the text of a calibration without them is unchanged). v1.15 (host
+// API 11, DESIGN §6c.7): power.byte_f_pj. v1.17 (API 12, §6c.1): warm.pack_l2_bytes, L_hit of
+// the PACK hit rule (0: no hits). v1.18 (API 13, §6c.8): the busy power, its launch gap, the
+// DRAM energy, the boost clock, the PACK set's planes flag (0 or 1), the per-call REPEAT saving
+// and the clean-L2 credit.
+struct OptKey {
+  const char* key;
+  double imd_perf_calib_t::*field;
+  double imd_perf_calib_t::*after;
+};
+constexpr OptKey kOptKeys[] = {
+    {"power.byte_f_pj", &imd_perf_calib_t::energy_byte_f_pj, &imd_perf_calib_t::energy_byte_pj},
+    {"warm.pack_l2_bytes", &imd_perf_calib_t::pack_l2_hit_bytes, &imd_perf_calib_t::warm_l2byte_ns},
+    {"power.act_w", &imd_perf_calib_t::power_act_w, &imd_perf_calib_t::energy_gamma},
+    {"power.act_gap_us", &imd_perf_calib_t::power_act_gap_us, &imd_perf_calib_t::energy_gamma},
+    {"power.dram_pj", &imd_perf_calib_t::energy_dram_pj, &imd_perf_calib_t::energy_gamma},
+    {"power.clock_boost_mhz", &imd_perf_calib_t::clock_boost_mhz, &imd_perf_calib_t::energy_gamma},
+    {"warm.pack_l2_planes", &imd_perf_calib_t::pack_l2_planes, &imd_perf_calib_t::warm_l2byte_ns},
+    {"warm.call_ns", &imd_perf_calib_t::warm_call_ns, &imd_perf_calib_t::warm_l2byte_ns},
+    {"warm.clean_byte", &imd_perf_calib_t::warm_clean_byte_ns, &imd_perf_calib_t::warm_l2byte_ns}};
+constexpr int kOptKeyCount = sizeof kOptKeys / sizeof kOptKeys[0];
 
 // A v7..v10-sized caller has no energy_byte_f_pj: the folded view (DESIGN §6c.2), the
 // unscaled form with the total byte energy. A degraded, unvalidated view (never fitted, not an
@@ -677,6 +749,17 @@ void fold_byte_f(imd_perf_calib_t* cal, uint32_t struct_size) {
     cal->energy_byte_pj += cal->energy_byte_f_pj;
     cal->energy_byte_f_pj = 0;
   }
+}
+
+// v1.17 review (DESIGN §6c.3): a v7..v11-sized struct has no pack_l2_hit_bytes. The predictors
+// and imd_perf_calib_format read it as warm_l2_bytes when pack.dram > 0 (exact for a v1.17-style
+// file whose two L2 sizes are equal; v1.18 review: the v1.18 shipped file has L_w 67.9 MB, L_hit
+// 83 MB and S with planes, so its v7..v11 view is degraded: pass NULL) and as 0 otherwise (every
+// file before v1.17 is unchanged, its text gains no key).
+void v11_pack_l2(imd_perf_calib_t* cal, uint32_t struct_size) {
+  if (struct_size >= kCalibV7Size && struct_size < kCalibV12Size && cal->format == 2)
+    cal->pack_l2_hit_bytes =
+        cal->param[IMD_PERF_CLASS_PACK * kP + 3] > 0 ? cal->warm_l2_bytes : 0;
 }
 
 // A rejected calibration (host API 10, DESIGN §6c.3): the line (0: none), the reason
@@ -720,8 +803,9 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
   constexpr int kKernelSlot = kFixed + IMD_PERF_PARAM_CAPACITY;
   constexpr int kScalarSlot = kKernelSlot + IMD_PERF_KERNEL_COUNT;
   constexpr int kBandSlot = kScalarSlot + kScalarKeyCount;  // 3 call bands, then the classes
-  constexpr int kOptSlot = kBandSlot + 3 + IMD_PERF_CLASS_COUNT;  // power.byte_f_pj (optional)
-  constexpr int kSeen = kOptSlot + 1;
+  constexpr int kOptSlot = kBandSlot + 3 + IMD_PERF_CLASS_COUNT;  // the optional keys (kOptKeys)
+  constexpr int kRetiredSlot = kOptSlot + kOptKeyCount;           // the retired op_eps keys
+  constexpr int kSeen = kRetiredSlot + kRetiredKeyCount;
   int32_t seen[kSeen] = {};   // the line of each key seen (0: not seen)
   int32_t first_v2_line = 0;  // the first line of a format-2-only key
   std::string first_v2_key;
@@ -743,7 +827,8 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
     }
     if (slot < kScalarSlot) return std::string("kernel.") + kernel_name(slot - kKernelSlot);
     if (slot < kBandSlot) return kScalarKeys[slot - kScalarSlot].key;
-    if (slot == kOptSlot) return kByteFKey;
+    if (slot >= kRetiredSlot) return kRetiredKeys[slot - kRetiredSlot];
+    if (slot >= kOptSlot) return kOptKeys[slot - kOptSlot].key;
     const int b = slot - kBandSlot;
     return b < 3 ? std::string(kBandCallKeys[b]) : std::string("band.") + kClassNames[b - 3];
   };
@@ -814,12 +899,24 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
         dst[0] = d[0], dst[1] = d[1];
         slot = kBandSlot + idx, v2 = true;
       }
-    } else if (key == kByteFKey) {
-      double d = 0;
-      if (!parse_number(val, &d) || d < 0) return bad("a finite number >= 0");
-      r.energy_byte_f_pj = d;
-      slot = kOptSlot, v2 = true;
     } else {
+      for (int i = 0; i < kOptKeyCount && slot < 0; ++i)
+        if (key == kOptKeys[i].key) {
+          double d = 0;
+          if (kOptKeys[i].field == &imd_perf_calib_t::pack_l2_planes) {
+            if (!parse_number(val, &d) || (d != 0 && d != 1)) return bad("0 or 1");
+          } else if (!parse_number(val, &d) || d < 0) {
+            return bad("a finite number >= 0");
+          }
+          r.*(kOptKeys[i].field) = d;
+          slot = kOptSlot + i, v2 = true;
+        }
+      for (int i = 0; i < kRetiredKeyCount && slot < 0; ++i)
+        if (key == kRetiredKeys[i]) {  // v1.17: accepted in formats 1 and 2, discarded
+          double d = 0;
+          if (!parse_number(val, &d) || d < 0) return bad("a finite number >= 0");
+          slot = kRetiredSlot + i;
+        }
       for (int i = 0; i < kScalarKeyCount && slot < 0; ++i)
         if (key == kScalarKeys[i].key) {
           double d = 0;
@@ -863,7 +960,7 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
     if (eol == text.size()) break;
   }
   // Required: format, gpu, sm_count, the peaks and every parameter of the format but the
-  // optional op_eps (v1.15); format 2
+  // optional kf.elem / pack.dram (v1.17); format 2
   // also every kernel, scalar and band key. A format-2 key in a format-1 file is rejected.
   const auto missing = [&](int slot) {
     return calib_fail(err, 0, IMD_PERF_CALIB_ERR_MISSING_KEY, slot_key(slot), "missing key");
@@ -880,7 +977,7 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
           !optional_param(cl, j) && seen[kFixed + cl * kP + j] == 0)
         return missing(kFixed + cl * kP + j);
   if (f2) {
-    for (int i = kKernelSlot; i < kOptSlot; ++i)  // power.byte_f_pj is optional
+    for (int i = kKernelSlot; i < kOptSlot; ++i)  // the keys from kOptSlot on are optional
       if (seen[i] == 0) return missing(i);
     if (r.power_cap_w > 0 && !(r.clock_eff_mhz > 0 && r.clock_min_mhz > 0 &&
                                r.clock_min_mhz <= r.clock_eff_mhz))
@@ -889,6 +986,9 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
     if (!(r.tie_ratio >= 1 && r.tie_ratio <= 1.25))
       return calib_fail(err, 0, IMD_PERF_CALIB_ERR_INCONSISTENT, "rank.tie_ratio",
                         "must be in [1, 1.25]");
+    if (r.clock_boost_mhz > 0 && !(r.clock_boost_mhz >= r.clock_eff_mhz))  // v1.18
+      return calib_fail(err, 0, IMD_PERF_CALIB_ERR_INCONSISTENT, "power.clock_boost_mhz",
+                        "must be 0 or >= power.clock_eff_mhz");
     for (int k = IMD_PERF_KERNEL_COUNT; k < IMD_PERF_KERNEL_CAPACITY; ++k) r.kernel[k] = {};
     for (int cl = IMD_PERF_CLASS_COUNT; cl < IMD_PERF_CLASS_CAPACITY; ++cl)
       r.band_class[cl][0] = r.band_class[cl][1] = 1;
@@ -944,7 +1044,7 @@ std::string format_calib(const imd_perf_calib_t& c) {
   for (int cl = 0; cl < IMD_PERF_CLASS_COUNT; ++cl)
     for (int j = 0; j < kP; ++j) {
       if (kParamNames[cl][j] == nullptr || (!f2 && kFormat2Param[cl][j])) continue;
-      if (optional_param(cl, j) && c.param[cl * kP + j] == 0) continue;  // v1.15: op_eps
+      if (optional_param(cl, j) && c.param[cl * kP + j] == 0) continue;  // v1.17: elem, dram
       s += kClassNames[cl];
       s += '.';
       s += kParamNames[cl][j];
@@ -968,15 +1068,18 @@ std::string format_calib(const imd_perf_calib_t& c) {
     s += " = ";
     append_number(&s, c.*(sk.field));
     s += '\n';
-    if (sk.field == &imd_perf_calib_t::energy_byte_pj && c.energy_byte_f_pj != 0) {
-      // v1.15: written only when non-zero (the text of a calibration without it is unchanged)
-      s += kByteFKey;
+    // v1.15 / v1.17 / v1.18: the optional keys after their anchor, only when non-zero (the
+    // text of a calibration without them is unchanged)
+    for (const OptKey& ok : kOptKeys) {
+      if (ok.after != sk.field || c.*(ok.field) == 0) continue;
+      s += ok.key;
       s += " = ";
-      append_number(&s, c.energy_byte_f_pj);
+      append_number(&s, c.*(ok.field));
       s += '\n';
     }
   }
-  s += "# Prediction bands (§6c.1): p10 p90 of measured / predicted on the hold-out set.\n";
+  s += "# Prediction bands (§6c.1): lo hi quantiles of measured / predicted on the hold-out set\n"
+       "# (bench/perf_validate.py: the narrowest pair with 80 % cross-validated coverage).\n";
   const auto band = [&](const std::string& key, const double* b) {
     s += key + " = ";
     append_number(&s, b[0]);
@@ -1033,6 +1136,7 @@ imd_status_t resolve_calib(const imd_perf_calib_t* in, imd_perf_calib_t* scratch
     if (cal->format != 1 && cal->format != 2) return IMD_STATUS_INVALID_VALUE;
     cal->format = 1;
   }
+  v11_pack_l2(cal, in->struct_size);
   if (!calib_valid(*cal)) return IMD_STATUS_INVALID_VALUE;
   if (cal->format == 1) {
     to_format1_params(cal);
@@ -1139,20 +1243,68 @@ struct Req {
   ErrReq err;  // v8 (§6f): the accuracy request (default: NORMWISE, no target)
 };
 
-// The time of every phase at clock scale s = f_eff / f (no cache term), and its sum. The power
-// model and the SUSTAINED clock use this COLD time in every cache state (documented
-// approximation: the REPEAT saving is up to 16 % only on calls that fit the L2, which are far
-// below the power cap, so the solved clock is the same).
-double call_seconds(const imd_perf_calib_t& cal, const PerfPhases& P, double scale) {
+// The request's cache terms (DESIGN §6c.1 "Cache state", v1.18 §6c.8): the parameters are COLD
+// costs (the fitter adds the calibration records' resident-input saving back); a REPEAT / WARM
+// call saves warm.l2byte per resident input byte (and v1.18 warm.call_ns once when an input is
+// resident) in the phases that read them first; CLEAN credits the call phase with the
+// write-back a clean L2 does not pay. COLD: no term.
+struct CacheTerms {
+  double inputs = 0;    // I, the call's input bytes
+  double res = 0;       // resident input bytes
+  double cache_ns = 0;  // split over the reading phases by in_bytes / I, clamped at 0 per phase
+  double clean_ns = 0;  // on the call phase
+};
+
+CacheTerms cache_terms(const imd_perf_calib_t& cal, const PerfPhases& P, int32_t cache) {
+  CacheTerms c;
+  const double Lw = cal.warm_l2_bytes, I = P.inputs;
+  const double res_repeat = std::clamp(Lw - (P.footprint - I), 0.0, I);
+  // WARM is modeled as REPEAT (NOTES-B2 §6: a call whose A was the previous call's C ran
+  // within -7 ... +3 % of the same call repeated; v1.18 review: the held-out pairs of §12
+  // measure WARM 4.5-11.9 % below REPEAT, open). v1.18 (§6c.8): CLEAN (an L2 flushed by reads)
+  // has COLD's res = 0 and a credit on the call phase for the write-back a clean L2 does not
+  // pay; REPEAT / WARM save c per call when an input is resident. COLD (inputs evicted by
+  // other, dirty work) is unchanged.
+  const bool cold = cache == IMD_PERF_CACHE_COLD || cache == IMD_PERF_CACHE_CLEAN;
+  c.inputs = I;
+  c.res = cold ? 0.0 : res_repeat;
+  c.cache_ns = -c.res * cal.warm_l2byte_ns - (c.res > 0 ? cal.warm_call_ns : 0.0);
+  c.clean_ns = cache == IMD_PERF_CACHE_CLEAN
+                   ? -cal.warm_clean_byte_ns *
+                         std::min(std::max(P.footprint - I, 0.0), std::max(Lw, 0.0))
+                   : 0.0;
+  return c;
+}
+
+// One phase's time at clock scale s = f_eff / f with the request's cache terms (the time
+// prediction and the power / clock solve use this one function).
+double phase_seconds(const imd_perf_calib_t& cal, const PerfPhase& p, double scale,
+                     const CacheTerms& c) {
+  double t = perf_phase_seconds(cal, p, scale);
+  if (c.inputs > 0 && p.in_bytes > 0) t = std::max(0.0, t + c.cache_ns * 1e-9 * p.in_bytes / c.inputs);
+  if (p.cls == IMD_PERF_CLASS_CALL && c.clean_ns != 0) t += c.clean_ns * 1e-9;
+  return t;
+}
+
+// The call's time at clock scale s in the cache state of `c` (the sum of its phases). v1.18
+// review (§6c.8): the power model and the SUSTAINED clock divide by this time of the request's
+// state (they used the COLD time in every state while the power fit uses the windows'
+// measured REPEAT time); a default-constructed CacheTerms is COLD.
+double call_seconds(const imd_perf_calib_t& cal, const PerfPhases& P, double scale,
+                    const CacheTerms& c = CacheTerms()) {
   double t = 0;
-  for (int i = 0; i < P.n; ++i) t += perf_phase_seconds(cal, P.ph[i], scale);
+  for (int i = 0; i < P.n; ++i) t += phase_seconds(cal, P.ph[i], scale, c);
   return t;
 }
 
 // The call's average power at clock f (DESIGN §6c.1 "Clock regimes", v1.15 §6c.7): idle +
 // ((tensor-core, ALU and clock-scaled byte energy) (f / f_ref)^gamma + DRAM energy) / time; 0
 // without a power model. With energy_byte_f_pj = 0 the added term is +0: bit-identical to v1.10.
-double call_power(const imd_perf_calib_t& cal, const PerfPhases& P, double f, double t) {
+// v1.18 (§6c.8): + the busy power P_act b (f / f_ref)^(1 + gamma), b = max(0, 1 - launches gap /
+// t_burst) with the fixed COLD time at f_ref (so P stays monotone in f), and the unscaled DRAM
+// energy of a call whose footprint exceeds warm.l2_bytes; both +0 with their keys 0.
+double call_power(const imd_perf_calib_t& cal, const PerfPhases& P, double f, double t,
+                  double t_burst) {
   if (!(cal.power_cap_w > 0) || !(cal.clock_eff_mhz > 0)) return 0;
   double tc = 0, alu = 0, bytes = 0;
   for (int i = 0; i < P.n; ++i) {
@@ -1165,28 +1317,51 @@ double call_power(const imd_perf_calib_t& cal, const PerfPhases& P, double f, do
       alu += p.x[2];
   }
   const double dyn = std::pow(f / cal.clock_eff_mhz, cal.energy_gamma);
+  const double dram = P.footprint > cal.warm_l2_bytes ? bytes : 0.0;
   const double joules = ((cal.energy_tc_pj * tc + cal.energy_alu_pj * alu +
                           cal.energy_byte_f_pj * bytes) * dyn +
-                         cal.energy_byte_pj * bytes) * 1e-12;
-  return cal.power_idle_w + (t > 0 ? joules / t : 0);
+                         cal.energy_byte_pj * bytes + cal.energy_dram_pj * dram) * 1e-12;
+  double act = 0;
+  if (cal.power_act_w > 0 && t_burst > 0) {
+    const double busy = std::max(0.0, 1 - static_cast<double>(P.launches) *
+                                              cal.power_act_gap_us * 1e-6 / t_burst);
+    act = cal.power_act_w * busy * dyn * (f / cal.clock_eff_mhz);
+  }
+  return cal.power_idle_w + act + (t > 0 ? joules / t : 0);
+}
+
+// v1.18 (§6c.8): the top of the clock range: the boost clock, else the effective clock.
+double top_clock(const imd_perf_calib_t& cal) {
+  return cal.clock_boost_mhz > 0 ? cal.clock_boost_mhz : cal.clock_eff_mhz;
+}
+
+// The clock-bound scale of the time at clock f: f_ref / min(f, f_ref) (v1.18: the time is flat
+// above f_ref), 1 without a clock model.
+double time_scale(const imd_perf_calib_t& cal, double f) {
+  return f > 0 ? cal.clock_eff_mhz / std::min(f, cal.clock_eff_mhz) : 1.0;
 }
 
 // The clock of the request (DESIGN §6c.1): an explicit clock, else BURST = f_ref, SUSTAINED =
 // f_ref below the cap, else the f in [f_min, f_ref] where the call's power meets the cap
-// (bisection; f_min if even that is above). 0: no clock model (f_ref = 0).
+// (bisection; f_min if even that is above). 0: no clock model (f_ref = 0). v1.18 (§6c.8): f_top
+// (the boost clock if set) in place of f_ref as the top of the range; the time above f_ref is
+// the f_ref time.
 double resolve_clock(const imd_perf_calib_t& cal, const PerfPhases& P, const Req& q,
-                     int32_t* regime_used) {
+                     const CacheTerms& ct, int32_t* regime_used) {
   const bool has_power = cal.power_cap_w > 0 && cal.clock_eff_mhz > 0;
   int32_t reg = q.regime;
   if (reg == IMD_PERF_REGIME_DEFAULT) reg = has_power ? IMD_PERF_REGIME_SUSTAINED : IMD_PERF_REGIME_BURST;
   *regime_used = reg;
-  const double fr = cal.clock_eff_mhz;
-  if (!(fr > 0)) return 0;
-  if (q.clock > 0) return std::min(q.clock, fr);  // at or above the effective clock: BURST
-  if (reg == IMD_PERF_REGIME_BURST || !has_power) return fr;
-  const auto power_at = [&](double f) { return call_power(cal, P, f, call_seconds(cal, P, fr / f)); };
-  if (power_at(fr) <= cal.power_cap_w) return fr;
-  double lo = cal.clock_min_mhz, hi = fr;
+  if (!(cal.clock_eff_mhz > 0)) return 0;
+  const double ft = top_clock(cal);
+  if (q.clock > 0) return std::min(q.clock, ft);  // at or above the top clock: BURST
+  if (reg == IMD_PERF_REGIME_BURST || !has_power) return ft;
+  const double tb = call_seconds(cal, P, 1.0);  // t_B: the COLD time at f_ref
+  const auto power_at = [&](double f) {  // t(f) in the request's state (non-increasing in f)
+    return call_power(cal, P, f, call_seconds(cal, P, time_scale(cal, f), ct), tb);
+  };
+  if (power_at(ft) <= cal.power_cap_w) return ft;
+  double lo = cal.clock_min_mhz, hi = ft;
   if (power_at(lo) >= cal.power_cap_w) return lo;
   for (int it = 0; it < 40 && hi - lo > 0.05; ++it) {  // P increases in f; 0.05 MHz
     const double mid = 0.5 * (lo + hi);
@@ -1203,25 +1378,15 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   r->sm_count = cal.sm_count;
   r->kernel_launches = P.launches;
   int32_t regime = IMD_PERF_REGIME_BURST;
-  const double f = resolve_clock(cal, P, q, &regime);
-  const double scale = f > 0 ? cal.clock_eff_mhz / f : 1.0;
-  // COLD / WARM (DESIGN §6c.1 "Cache state"): the parameters are COLD costs (the fitter adds the
-  // calibration records' resident-input saving back); a REPEAT / WARM call saves warm.l2byte per
-  // resident input byte in the phases that read them first.
-  const double Lw = cal.warm_l2_bytes, I = P.inputs;
-  const double res_repeat = std::clamp(Lw - (P.footprint - I), 0.0, I);
-  // WARM is modeled as REPEAT (measured on the 4090, NOTES-B2 §6: a call whose A was the
-  // previous call's C runs within -7 ... +3 % of the same call repeated; COLD, an evicted L2,
-  // is the real effect: up to +16 % for calls whose footprint fits the L2).
-  const double res = q.cache == IMD_PERF_CACHE_COLD ? 0.0 : res_repeat;
-  const double cache_ns = -res * cal.warm_l2byte_ns;
+  const CacheTerms ct = cache_terms(cal, P, q.cache);
+  const double f = resolve_clock(cal, P, q, ct, &regime);
+  const double scale = time_scale(cal, f);
   double t = 0, bound = 0, lo = 0, hi = 0;
   for (int i = 0; i < P.n; ++i) {
     const PerfPhase& p = P.ph[i];
     imd_perf_phase_t& o = r->phase[i];
     o.phase = p.phase, o.cls = p.cls, o.launches = p.launches;
-    o.time_s = perf_phase_seconds(cal, p, scale);
-    if (I > 0 && p.in_bytes > 0) o.time_s = std::max(0.0, o.time_s + cache_ns * 1e-9 * p.in_bytes / I);
+    o.time_s = phase_seconds(cal, p, scale, ct);
     o.bytes = p.bytes, o.ops = p.ops;
     const double peak = p.peak == 1 ? cal.peak_int8_ops_per_s
                         : p.peak == 2 ? cal.peak_fp64_flops_per_s
@@ -1246,8 +1411,10 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   r->regime = regime;
   r->cache = q.cache;
   r->clock_mhz = f;
-  r->power_w = f > 0 && P.n > 0 ? call_power(cal, P, f, call_seconds(cal, P, scale)) : 0;
-  r->warm_bytes = res;
+  r->power_w = f > 0 && P.n > 0
+                   ? call_power(cal, P, f, t, call_seconds(cal, P, 1.0))  // t: this state's time
+                   : 0;
+  r->warm_bytes = ct.res;
 }
 
 int32_t dispatch_of(const ExecPlan& e) {
@@ -1302,7 +1469,7 @@ bool eps_valid(double f) { return f < 0 || (f >= 0 && f <= 1); }
 
 bool v7_valid(int32_t regime, int32_t cache, double clock) {
   return regime >= IMD_PERF_REGIME_DEFAULT && regime <= IMD_PERF_REGIME_SUSTAINED &&
-         cache >= IMD_PERF_CACHE_COLD && cache <= IMD_PERF_CACHE_REPEAT && std::isfinite(clock) &&
+         cache >= IMD_PERF_CACHE_COLD && cache <= IMD_PERF_CACHE_CLEAN && std::isfinite(clock) &&
          clock >= 0;
 }
 
@@ -1422,6 +1589,7 @@ imd_status_t imd_perf_calib_format(const imd_perf_calib_t* calib, char* buf, siz
   std::memset(&c, 0, sizeof c);
   std::memcpy(&c, calib, std::min<size_t>(calib->struct_size, sizeof c));
   if (calib->struct_size < imd::detail::kCalibV7Size && c.format == 2) c.format = 1;
+  imd::detail::v11_pack_l2(&c, calib->struct_size);
   if (!imd::detail::calib_valid(c)) return IMD_STATUS_INVALID_VALUE;
   if (c.format == 1) imd::detail::to_format1_params(&c);
   for (const auto& [p, cap] : {std::pair<const char*, size_t>{c.gpu, sizeof c.gpu},
