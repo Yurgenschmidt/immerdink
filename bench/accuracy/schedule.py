@@ -30,7 +30,8 @@ report-only, not a C1 gate; immerdink-eval findings/c1-evidence.md):
   - fixed-point iterations (Jacobi, DIIS, PPL + ring): the forcing-rule ramps above match
     fixed N = 14 (no more iterations, the final residual within 2x). With DIIS, reset its
     history at each precision switch: no iteration lost, final residual 1.5e-16 against
-    2.1e-15;
+    2.1e-15. The gain comes from restarting a DIIS that stalls: plain DIIS stalls near 1-2e-15
+    with or without switches (the exact-arithmetic reference also ends at 2.09e-15);
   - subspace methods (block Davidson): at each switch, collapse to the Ritz block and
     recompute its sigma = HV at the new N, or the ramp stalls. Even so the ramp took 16
     iterations to 1e-10 against 11 at fixed N = 14 (+5), so it pays only if the per-iteration

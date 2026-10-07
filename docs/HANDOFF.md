@@ -207,7 +207,10 @@ first.
 - Heavy jobs run inside `tools/memcap.sh` (shared cgroup budget, RAM/2). The tools already do.
 - PCIe was stuck at gen1 on 2026-10-03 and recovered after the reboot (gen4 x16, 21 GB/s).
 - Nsight Systems at `~/nsight-systems-2026.5.1/target-linux-x64/nsys`; `ncu` in the immerdink
-  env; GPU counters enabled for all users.
+  env; GPU counters enabled for all users. Run `ncu` only with `--clock-control none` (its
+  default, `boost`, locks the clocks), under the GPU lock, once a busy check shows no
+  ehrenfest timing tests running, in holds of at most 5 minutes (NOTES-K5-bimodal ran it with
+  `--clock-control none` under the lock; NOTES-C1 §4.6, "Correction").
 - Benchmarks: `bench/run_sweep.sh` / `bench/run_ab.sh` (quiet-gated, warm-up, retries,
   clock-state records). Correctness tests are not quiet-gated.
 

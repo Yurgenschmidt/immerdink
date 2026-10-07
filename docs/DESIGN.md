@@ -5504,9 +5504,10 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
     BOUND and TYPICAL. This is §4.3's success criterion, met on every system.
   - *DIIS:* reset the DIIS history at each precision switch. It costs no iteration and
     lowers the final residual (1.5e−16 against 2.1e−15 without the reset). The lower
-    residual comes from restarting a DIIS that stalls: plain DIIS stalls at 2.1e−15 with or
-    without precision switches (fixed N = 14, with no switch, also ends at 2.09e−15), so the
-    stall is not caused by the switch.
+    residual comes from restarting a DIIS that stalls: plain DIIS stalls near 1–2e−15 with
+    or without precision switches (the ramps without the reset end at 1.18e−15 to 2.09e−15;
+    fixed N = 14, with no switch, and the exact-arithmetic reference also end at 2.09e−15), so
+    the stall is not caused by the switch.
   - *Subspace methods (block Davidson):* at each N switch, collapse the subspace to the Ritz
     block and recompute its σ = HV at the new N; otherwise the low-N products stay in the
     subspace and the ramp stalls (4.1e−8 attainable). Even with the recompute the ramp needs
@@ -6466,9 +6467,15 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     trigger; the K5-statistics row states stage 5's cost bar without `ncu` (IR26).
   - Close-out review (approve-with-fixes, 2026-10-07): §6g.9 states `PrecisionPlan`'s
     shared-pack limit, the candidate member role `"A=B"` and its trigger; §6g.12's DIIS
-    bullet says plain DIIS stalls with or without switches; the header says stage 5 was
-    deferred by IR26, not by the CPU study. IR26's "counters are admin-only" premise was
-    wrong, and the no-`ncu` bar stands for other reasons (NOTES-C1 §4.6, "Correction").
+    bullet says plain DIIS stalls near 1–2e−15 with or without switches; the header says
+    stage 5 was deferred by IR26, not by the CPU study. IR26's "counters are admin-only"
+    premise was wrong (GPU counters are open to all users). Stage 5's cost bar keeps its
+    content (A/B timing at stock clocks under the GPU lock, the compiler's register count,
+    the occupancy query) because it is a time bar and these measure time directly; `ncu`'s
+    serialized replay does not reproduce production timing. `ncu` is not part of the bar but
+    not forbidden: as a diagnostic, only with `--clock-control none` (its default, `boost`,
+    locks the clocks), under the GPU lock (NOTES-C1 §4.6, "Correction"; the §7 row's
+    "restated without `ncu`" stands).
   - The definition of done (NOTES-C1 §4.11): **C2 is done** (M-a published; stage 3 shipped
     with L3c and L7 in Lean; stage 4 closed and stage 6 deferred, each with its trigger;
     ROADMAP C2 retitled). **C1 is not:** stages 0 and 1, the round-2 stage-0 GPU tests and
