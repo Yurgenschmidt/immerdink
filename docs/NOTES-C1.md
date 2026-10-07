@@ -132,8 +132,8 @@ what has been built since is recorded under "Implementation status".
     docstrings, which the stage-1 work owns (also a ROADMAP C1 open item).
 - **Stage 3 (§4.4) is done, 2026-10-07**, after the M-a summary (IR12, IR28); CPU and Lean
   only, no ABI change (host API 13). Implemented at 7b04b04, then approved with fixes by an
-  independent reviewer; the fixes are applied, and the verdicts on its design questions are
-  §5.7.
+  independent reviewer; the fixes are applied at 4176732, and the verdicts on its design
+  questions are §5.7.
   - *DESIGN v1.19 §3.8 "Segmented accumulation":* the K-segmentation caller recipe (§2.7, Q15
     (a)), L7's bound in every metric with its caveats, a rigorous request transform for
     choosing N (L7d, §5.7 S3-1) and M-a's evidence on when it pays. The §7 rows are rewritten
