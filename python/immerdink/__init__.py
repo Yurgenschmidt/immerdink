@@ -8,11 +8,14 @@
   end) on caller-owned float64 CUDA arrays (__cuda_array_interface__, DLPack or
   `DeviceArray` raw pointers), a ctypes binding of libimmerdink's C ABI. Importing loads no
   library; libimmerdink is loaded on first use.
+- Precision phases (DESIGN v1.19 §6g): a plan and a pack per N; `PackSpec.with_moduli` and
+  `PackedBuffer` (a packed buffer re-packed at several N, guarded on the host).
 """
 
 from .device import (  # noqa: F401
     AliasingError, AllocFailedError, CudaError, DeviceArray, Handle, ImmerdinkError,
     InsufficientWorkspaceError, InvalidValueError, Layout, MisalignedError, NotSupportedError,
-    Pack, PackMismatchError, Plan, PlanCache, contract, default_handle, default_plan_cache,
-    get_cai_stream_policy, load_library, pack_spec, set_cai_stream_policy, workspace_size)
+    Pack, PackedBuffer, PackMismatchError, PackRecord, Plan, PlanCache, contract,
+    default_handle, default_plan_cache, get_cai_stream_policy, load_library, pack_spec,
+    set_cai_stream_policy, workspace_size)
 from .host import PackSpec  # noqa: F401

@@ -30,7 +30,7 @@ import ctypes as C
 import ctypes.util
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "workspace_size",
            "workspace_layout", "plan_bytes", "lowering", "g_tradeoff", "PackSpec", "pack_layout",
@@ -502,6 +502,13 @@ class PackSpec:
     contracted: tuple = ()
     batch: tuple = ()
     rows: tuple = ()
+
+    def with_moduli(self, N):
+        """This descriptor at another N (DESIGN v1.19 §6g, a precision phase): every other
+        field, the orders included, unchanged. N is part of a pack's key, so a pack serves
+        one N; a buffer of pack_bytes at the largest N holds the pack at any smaller N (§6a
+        C-pack)."""
+        return replace(self, num_moduli=int(N))
 
 
 class _PackArg:
