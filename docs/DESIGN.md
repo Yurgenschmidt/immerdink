@@ -5262,9 +5262,19 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 
 - **Inputs.** A call at (N, rounding, k, mode) with α = 2^e and β = 0 wrote C = RN(2^e D)
   (§3.7), D its product. `C` is a float64 host array (copy it, or the part needed, to the
-  host: the helper moves no data). `row_norm_ub`, `col_norm_ub` are upper bounds of the GEMM
-  view's row and column 2-norms (§6f.1's obligation: really upper bounds). A row bound lies
-  along axis −2 and a column bound along axis −1:
+  host: the helper moves no data) in the GEMM view (…, m, n) (§1.1). A tensor output whose
+  modes interleave A's and B's free modes, such as the CC ring's abij of
+  `"kjbc,kiac->abij"` (§6e.1, §6g.10's cost figures, the `precision.py` module example), is
+  permuted to (batch modes, A's free modes, B's free modes) and reshaped first, its bounds
+  in the same order: the helper pairs bounds with outputs by position only. `row_norm_ub`,
+  `col_norm_ub` are upper bounds of the GEMM view's row and column 2-norms (§6f.1's
+  obligation: really upper bounds), as FP values: float arrays (float16 and float32 widen to
+  float64 exactly) or integers of magnitude ≤ 2⁵³. A bound that conversion to float64 would
+  round to nearest, possibly below the caller's bound, is refused: an integer above 2⁵³
+  (ValueError), a long double, an object array (Fractions, Decimals, Python ints beyond 64
+  bits), complex or bool (TypeError). numpy converts a Python list before the check, so an
+  integer above 2⁵³ mixed with floats in a list is already rounded: pass numpy float arrays.
+  A row bound lies along axis −2 and a column bound along axis −1:
   - **C of shape (m, n):** a scalar; a 1-D `row_norm_ub` of length m and a 1-D
     `col_norm_ub` of length n, each on its own axis (another length, 1 included, is a
     ValueError); a row bound (m, 1) and a column bound (1, n).
@@ -5354,7 +5364,8 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
     bound of another length raises. On a batched C (3-D and 4-D), a vector shared by every
     batch in the full-ndim spelling (also with the batch dims spelled out, or a scalar on one
     side) equals each batch's 2-D call bit for bit; per-batch (…, m, 1) × (…, 1, n) bounds
-    and per-batch scalars (…, 1, 1) on unequal batches (one and two batch dims) equal each
+    and per-batch scalars (…, 1, 1) on unequal batches (one and two batch dims), and on a
+    4-D C bounds shared over one batch axis only, (b0, 1, m, 1) × (1, b1, 1, n), equal each
     batch's own 2-D call, with no certified ρ̂ below row_i·col_j / |C_ij| in exact
     rationals. Every 1-D and 2-D bound on a batched C raises: per-batch scalars without
     keepdims, (b,) at b = m and at b = n and (b, 1) at b = m; the (b, m) / (b, n) norms at
@@ -5365,7 +5376,10 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
     first on a (b,) row bound at b = m = n = 3, 9 of 27 certified outputs below ρ. U ≥
     params' exact bound (its upper enclosure) at N = 2–20, k = 1–40000, both roundings and
     dispatches; ρ̂ ≥ ρ in exact rationals on emulated outputs (`params.emulate_element`);
-    ValueError / TypeError cases.
+    ValueError / TypeError cases. Norm bounds convert to float64 exactly (float16, float32
+    and integers ≤ 2⁵³ equal the float64 call) or are refused (2⁵³ + 1 as an array and as a
+    list, a uint64 above 2⁵³, Fractions, Decimals, 2⁷⁰, a long double wider than 64 bits,
+    complex, bool).
 - **[cert] `cert_rho_recipe`** (`params.py --check`), in exact rationals: on emulated elements
   (both roundings, every N = 2–20, random and cancelling rows whose |x| is 0.3–30 × U‖a‖‖b‖,
   α = 2^e, U the tightest double above the exact NORMWISE bound, with ν = √k and with the
@@ -6184,6 +6198,14 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     call and the rejected ones in exact rationals (§6g.12). The S1-10 optimism bound reads
     "the DIRECT members' summed share of the calls, per iteration" (§6g.10, the `reuse` and
     `Phase` docstrings).
+  - **Stage-1 third review fixes** (approve-with-fixes, should-fix items only; NOTES-C1 §5.5
+    S1-7, S1-11): `rho_from_output` converts a norm bound to float64 exactly or refuses it
+    (an integer above 2⁵³: ValueError; a long double, an object array of Fractions, Decimals
+    or big ints, complex or bool: TypeError), since rounding to nearest could fall below the
+    caller's bound; §6g.11 and the docstring say that C and its bounds are in the GEMM view
+    (a tensor output with interleaved modes is permuted and reshaped first);
+    `host_precision` adds bounds shared over one batch axis only on a 4-D C and the dtype
+    cases (§6g.12).
 - **Stage 3** (NOTES-C1 §4.4 with IR5, IR12, IR15; C2; no ABI change, host API 13):
   - **§3.8 "Segmented accumulation":** the K-segmentation caller recipe (S calls, β = 1
     after the first, moved base pointers; per-band σ, flags, RN acceptance and packs), its

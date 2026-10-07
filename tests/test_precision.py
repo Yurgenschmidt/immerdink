@@ -33,14 +33,18 @@ a brute force from host.py's queries and against spec/params.py. CPU only.
     shape[-1] == 1 and a column bound shape[-2] == 1; on a batched C (ndim 3 and 4) a bound
     is a scalar or has exactly C.ndim dims (MF4): shared r[None, ..., :, None] x
     c[None, ..., None, :] bounds == each batch's 2-D call, per-batch (..., m, 1) x (..., 1, n)
-    bounds and per-batch scalars (..., 1, 1) on unequal batches == each batch's 2-D call with
-    no certified rho_hat below row_i col_j / |C_ij| in exact rationals, while 1-D and 2-D
+    bounds, per-batch scalars (..., 1, 1) and bounds shared over some batch axes only
+    ((b0, 1, m, 1) x (1, b1, 1, n)) on unequal batches == each batch's 2-D call with no
+    certified rho_hat below row_i col_j / |C_ij| in exact rationals, while 1-D and 2-D
     bounds raise ((b,) at b == m and b == n, (b, 1) at b == m, a shared (m,), (m, 1), (n,),
     (1, n); (b, m) / (b, n) norms without keepdims at b == m and b == m == n), as do
     transposed, elementwise and partial-batch ones (a form accepted by a mutated rule fails
     with its count of certified outputs below the true rho); rho_hat >= rho in exact
     rationals on emulated outputs (params.emulate_element), the ValueError / TypeError cases
-    (beta != 0, alpha != 2^e, bad norms, 1-D lengths, shapes, dtype).
+    (beta != 0, alpha != 2^e, bad norms, 1-D lengths, shapes, dtype); norm bounds convert to
+    float64 exactly (float16 / float32 and integers <= 2^53 == the float64 call) or are
+    refused (an integer above 2^53, a long double, Fractions, Decimals, big ints, complex,
+    bool).
 """
 
 import argparse
@@ -50,6 +54,7 @@ import os
 import random
 import sys
 import time
+from decimal import Decimal
 from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -841,8 +846,9 @@ def suite_rho(rng, verbose):
                                        rounding="RN", k=10, lib=LIB)
     need(rb.shape == (2, 2, 2) and ob.all(), "batched C")
     # per-batch bounds have C.ndim dims (keepdims): a row bound shape[-1] == 1, a column
-    # bound shape[-2] == 1. Per-batch (..., m, 1) x (..., 1, n) bounds and per-batch scalars
-    # (..., 1, 1) on unequal batches (one batch's rows and another's columns 100x) == each
+    # bound shape[-2] == 1. Per-batch (..., m, 1) x (..., 1, n) bounds, per-batch scalars
+    # (..., 1, 1) and, on a 4-D C, bounds shared over one batch axis only, (b0, 1, m, 1) x
+    # (1, b1, 1, n), on unequal batches (one batch's rows and another's columns 100x) == each
     # batch's own 2-D call, and no certified rho_hat is below row_i col_j / |C_ij| in exact
     # rationals. Every 1-D or 2-D form raises (MF4), each on a shape where numpy's
     # trailing-axis broadcasting would pair it with the wrong axis: per-batch scalars without
@@ -865,11 +871,15 @@ def suite_rho(rng, verbose):
         sr, sc = up(na.max(axis=-1)), up(nc.max(axis=-1))               # bs: per batch
         rsh = up(na.reshape(-1, m).max(axis=0))                         # (m,): shared
         csh = up(nc.reshape(-1, n).max(axis=0))                         # (n,)
-        for rr, cc, per in ((ra[..., None], cb[..., None, :], lambda p: (ra[p], cb[p])),
-                            (sr[..., None, None], sc[..., None, None],
-                             lambda p: (float(sr[p]), float(sc[p]))),
-                            (sr[..., None, None], cb[..., None, :],
-                             lambda p: (float(sr[p]), cb[p]))):
+        forms = [(ra[..., None], cb[..., None, :], lambda p: (ra[p], cb[p])),
+                 (sr[..., None, None], sc[..., None, None],
+                  lambda p: (float(sr[p]), float(sc[p]))),
+                 (sr[..., None, None], cb[..., None, :], lambda p: (float(sr[p]), cb[p]))]
+        if len(bs) > 1:     # shared over some batch axes only: (b0, 1, m, 1) x (1, b1, 1, n)
+            rp = ra.max(axis=1, keepdims=True)[..., None]
+            cp = cb.max(axis=0, keepdims=True)[..., None, :]
+            forms.append((rp, cp, lambda p: (rp[p[0], 0, :, 0], cp[0, p[1], 0, :])))
+        for rr, cc, per in forms:
             rho, ok = precision.rho_from_output(C, rr, cc, N=14, rounding="RN", k=k, lib=LIB)
             need(rho.shape == C.shape and ok.any(),
                  f"per-batch bounds {rr.shape} x {cc.shape} on C {C.shape}")
@@ -1009,13 +1019,36 @@ def suite_rho(rng, verbose):
                f"rho norms {row} {col}")
     raises(TypeError, lambda: precision.rho_from_output(C.astype(np.float32), [1.0, 1.0],
                                                         [1.0, 1.0], **kw), "rho float32 C")
+    # norm bounds convert to float64 exactly or are refused: np.asarray(x, float64) rounds to
+    # nearest, which can fall below the caller's bound (2^53 + 1 -> 2^53, 1/3 -> below)
+    C = np.array([[3.0, -2.0], [1e-3, 5.0]])
+    ref, rok = precision.rho_from_output(C, [3.0, 2.0**53], [7.0, 1.0], **kw)
+    for row, col in ((np.array([3, 2**53]), np.array([7, 1], dtype=np.uint8)),
+                     (np.array([3.0, 2.0**53], dtype=np.float32), np.float16([7.0, 1.0])),
+                     ([3, 2**53], [7, 1])):
+        got, ok = precision.rho_from_output(C, row, col, **kw)
+        need((got == ref).all() and (ok == rok).all(),
+             f"exact norm bounds {np.asarray(row).dtype} x {np.asarray(col).dtype} != float64")
+    for row, exc in ((np.array([3, 2**53 + 1]), ValueError), ([3, 2**53 + 1], ValueError),
+                     (np.array([3, 2**64 - 1], dtype=np.uint64), ValueError),
+                     ([Fraction(1, 3), Fraction(1)], TypeError),
+                     ([Decimal("0.1"), Decimal(1)], TypeError), ([3, 2**70], TypeError),
+                     (np.array([3.0, 1.0], dtype=np.longdouble), TypeError),
+                     (np.array([3 + 0j, 1]), TypeError), (np.array([True, True]), TypeError)):
+        dt = np.asarray(row).dtype
+        if dt.kind == "f" and dt.itemsize <= 8:
+            continue                        # a long double of 64 bits widens exactly
+        raises(exc, lambda: precision.rho_from_output(C, row, [7.0, 1.0], **kw),
+               f"rho norm bound {row!r}")
+        raises(exc, lambda: precision.rho_from_output(C, [7.0, 1.0], row, **kw),
+               f"rho column bound {row!r}")
     if verbose:
         print(f"  ok  rho_from_output: {STATS['rho']} outputs == params.rho_recipe bit for "
               f"bit, {cert} emulated outputs with rho_hat >= rho exactly, U >= params' bound "
               f"at {nU} points, 1-D norms on a 2-D C and shared full-ndim norms on batched "
               f"C == the 2-D call, {nb} outputs of per-batch norms with rho_hat >= the true rho "
               "exactly (1-D, 2-D, off-axis and partial-batch forms on a batched C raise), "
-              "argument errors", flush=True)
+              "norm bounds converted exactly or refused, argument errors", flush=True)
 
 
 def main():

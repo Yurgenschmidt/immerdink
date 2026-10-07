@@ -58,7 +58,10 @@ what has been built since is recorded under "Implementation status".
   were paired with C's rows or columns where b = m or b = n and certified ρ̂/ρ down to 0.0081;
   a 2-D C keeps the S1-7 rule. `host_precision` checks it, a mutation that drops the rule
   fails it, and the only in-repo caller (`bench/accuracy/md1_converge.py`, 1-D bounds on a
-  2-D D) is unaffected. The
+  2-D D) is unaffected. A third review approved MF4 as implemented (S1-11, binding) with
+  should-fix items, applied: a test of bounds shared over one batch axis only, norm bounds
+  converted to float64 exactly or refused (an integer above 2⁵³, a long double, Fractions,
+  Decimals), and the GEMM view of a tensor output stated (S1-7). The
   provenance of DESIGN §6g.10's cost figures (IR9 style) is
   immerdink-eval `findings/c1-stage1-phase-cost.md`, with the script committed there
   (39d9f9f) and both records untracked, listed with their sha256; a re-run on 51dba1e
@@ -69,7 +72,10 @@ what has been built since is recorded under "Implementation status".
   wrong; its fixes are applied too, and its verdicts are §5.6 S2-14–S2-18. A second re-review
   (approve-with-fixes) found that the provenance text still claimed more re-running than had
   been done; it is corrected below, the remaining records are re-run on committed code (all
-  bit for bit), and its verdicts are §5.6 S2-19–S2-20.
+  bit for bit), and its verdicts are §5.6 S2-19–S2-20. A third re-review (approve-with-fixes)
+  found that "gates (i) and (ii) rest on reproduced records only" left out the deadband
+  (d* = 3 comes from Tier S, not re-run); corrected below with the d = 0 figures, and its
+  verdicts are §5.6 S2-21–S2-22.
   - *Code:* `oracle.kweights` with its multi-partner mode and test_oracle (12) at 5cd8ff3; the
     study (`bench/accuracy/kw_engine.py`, `c2_fixtures.py`, `c2_gate.py`, `c2_summary.py`,
     `md1_converge.py`) at 7260a95; the review fixes at f97696a; the re-review's at 928b49c.
@@ -116,26 +122,49 @@ what has been built since is recorded under "Implementation status".
       and M-d1 diis (22) and ppl (11): **121 records, all bit for bit**, no stored field
       missing; the only fields added are Tier L's ρ ≤ 1e8 column and the real B6 blocks'
       later `rho_cap` / `excluded_outputs`. So every 52054e9-era record that is not
-      superseded is reproduced on committed code, and with the spot check every M-d1 record
-      behind the success criterion and the caller guidance (jacobi, diis, ppl, davidson, cg).
-      Gates (i) and (ii) rest on reproduced records only: guard = 0 on every real R1–R6
-      contraction, and all 16 guard-accepted Tier-L records (decay_opp and opp_nonsep at
-      every size, 0–7 sampled outputs above 2× each, 2–19 per fixture, max ratio 247).
-    - *Not re-run:* Tier S beyond the smoke check (241 of 245 runs at 8b58101; d* = 3 and
-      Tier S's share of gate (iii) rest on them) and the pilot (a sizing run no table uses);
+      superseded is reproduced on committed code: M-d1 jacobi in the spot check at 928b49c
+      (`md1_converge.py` has the same sha256 at both commits), the rest in this re-run at
+      5925219 (the commit messages of 04363db and immerdink-eval beb07e7 credit all of it to
+      5925219; corrected in the third re-review). With the spot check's davidson and cg,
+      every M-d1 record behind the success criterion and the caller guidance (jacobi, diis,
+      ppl, davidson, cg) is reproduced.
+    - *What gates (i) and (ii) rest on* (third re-review: the earlier "on reproduced records
+      only" left out the deadband):
+      1. The records they are evaluated on are all reproduced: guard = 0 on every real
+         record (R1–R7; gate (i) reads R1–R6), and all 16 guard-accepted Tier-L records at
+         d* (decay_opp and opp_nonsep at every size, 0–7 sampled outputs above 2× each, 2–19
+         per fixture, max ratio 247).
+      2. The deadband they are evaluated at, d* = 3, comes from Tier S, which is not
+         reproduced on committed code (next item).
+      3. The verdict holds at both deadbands that Tier L and the real operands compute, 0 and
+         3 (they compute no other, so a different d* could not be evaluated on these records).
+         At d = 0 every R1–R5 record (R2b included) has guard14 = 0 (G14 from −5 to 0), and
+         R6 and R7 have Δ ≡ 0, so w ≡ 0 at any d. Gate (ii) fails at d = 0 too: the same 16
+         Tier-L records (6 fixtures) are guard-accepted, with 1–14 sampled outputs above 2×
+         fast's error per fixture (0–6 per record), max ratio 99.1 (opp_nonsep 2048 × 3600).
+         Checked on `repro_5925219/`.
+    - *Not re-run:* Tier S beyond the smoke check (241 of 245 runs at 8b58101). Tier S, d* = 3
+      and the trend over m are **not reproduced on committed code (8b58101-era,
+      smoke-checked 4 of 245)**, nor is Tier S's share of gate (iii); before a stage-4
+      revival (its trigger: a real-operand family meeting (i)) or any paper or external use
+      of Tier S figures, the d*-deciding subset is re-run on committed code under a newly
+      declared budget (§5.6 S2-21). Also not re-run: the pilot (a sizing run no table uses);
       the superseded files (`real_pre_ew8`, `md1_rho_levels14`, `md1_rho_local`, `cg_v1`,
       `davidson_v2`, `davidson_strongcoupling`); and the records written since the first
       round, which carry a dirty flag and the sha256 of every study file instead: the review
       round's 30 B6 records (51dba1e, a858225) and the IR7 re-run's 4 `md1_rho` records
       (d89988a), whose files match f97696a's (S2-18).
-  - *CPU budget:* M-a about 51 of its 90 CPU-min, including about 6 min of duplicated work by
-    an orphaned process (§5.6 S2-7), the review's B6 runs at m = 512 (1.6 min), the
-    re-review's spot check (1.7 min) and the full re-run at 5925219 (11.8 min); M-d1 about
+  - *CPU budget:* M-a about 51 of its 90 CPU-min: the first round's about 36 (Tier S 24,
+    Tier L 8, real operands 3, self-tests and pilot 1), including about 6 min of duplicated
+    work by an orphaned process (§5.6 S2-7), then the review's B6 runs at m = 512 (1.6 min),
+    the re-review's spot check (1.7 min) and the full re-run at 5925219 (11.8 min); M-d1 about
     27 of its 30, including the IR7 re-run (1.7 min), the re-review's spot check (4.8 min)
     and the diis and ppl re-runs at 5925219 (5.7 min).
   - **Mechanical outcomes** (the pre-registered rules, IR27):
-    - d* = 3 (Q11). Every deadband rejected all 30 random-structure runs, and the median gains
-      on decay_opp and opp_nonsep are within 0.25 moduli; ties go to 3.
+    - d* = 3 (Q11; from Tier S, not reproduced on committed code: 8b58101-era, smoke-checked
+      4 of 245). Every deadband rejected all 30 random-structure runs, and the median gains
+      on decay_opp and opp_nonsep are within 0.25 moduli; ties go to 3. The gate verdict
+      below holds at d = 0 as well (*What gates (i) and (ii) rest on*, item 3, above).
     - **Stage 4 fails its gate (§4.5) and is closed**, with the revival trigger "a real-operand
       family meeting (i)". (i): no real R1–R6 contraction of the ≥ 2048³ class has guard = 1
       (G ≤ 0 on all of them). (ii) is not met as pre-registered either: each guard-accepted
@@ -3495,7 +3524,10 @@ re-review fixes"); its verdicts on the three questions the fixes raised are unde
 and S1-10. A second re-review was approve-with-fixes too: one must-fix item (MF4, under S1-7,
 binding) and three should-fix items (the MF3 sentence of DESIGN §6g.11, the S1-10 wording
 of the docstrings, and the probe's forms with an exact-rational check in the test), all
-applied ("Stage-1 second re-review fixes").
+applied ("Stage-1 second re-review fixes"). A third review of the MF4 fix approved it with
+should-fix items only (a test of bounds shared over some batch axes, the exact conversion of
+norm bounds, the GEMM view of a tensor output in DESIGN §6g.11), all applied ("Stage-1 third
+review fixes"); its verdict on the question MF4 left open is S1-11.
 - **S1-1. Parameters beyond §4.2's signature.** `vec_modes` (§4.2 ranks "the given vec modes"
   but names no parameter); `perf` (regime, cache, clock of rank and the pack predictions: the
   `Planner` carries only the calibration and the memo, not the regime or cache §4.2's comment
@@ -3605,7 +3637,23 @@ applied ("Stage-1 second re-review fixes").
   accepts 17 unsound forms (the pre-MF4 code 11; the other 6 are partial-batch forms, which
   only the ndim rule now rejects), with 2–28 certified outputs below ρ each. The only
   in-repo caller, `bench/accuracy/md1_converge.py`, passes 1-D bounds on a 2-D D and is
-  unaffected.
+  unaffected. *Third review (should-fix items, applied):* (a) the "each batch dim C's or 1"
+  half of the rule is pinned by a test: on a 4-D C, bounds shared over one batch axis only,
+  (b0, 1, m, 1) × (1, b1, 1, n), equal each batch's 2-D call with no certified ρ̂ below the
+  true ρ (the reviewer's probe found them accepted and sound). (b) Norm bounds were
+  converted with `np.asarray(…, dtype=float64)`, which rounds to nearest, so an integer
+  above 2⁵³, a Fraction or a Decimal could become a value below the caller's upper bound
+  before the upward-rounded recipe ran (pre-existing). Decided conservatively: a bound is
+  converted exactly or refused. Float arrays of at most 64 bits widen exactly and integers
+  of magnitude ≤ 2⁵³ convert exactly; an integer above 2⁵³ raises ValueError, and a long
+  double, an object array (Fractions, Decimals, Python ints beyond 64 bits), complex or bool
+  raise TypeError. A Python list is converted by numpy before the check (an integer above
+  2⁵³ among floats is already rounded), which the docstring and DESIGN §6g.11 say: pass
+  numpy float arrays. Every in-repo caller passes float64. (c) DESIGN §6g.11 and the
+  docstring say that C and its bounds are in the GEMM view: a tensor output whose modes
+  interleave A's and B's free modes (the ring's abij of "kjbc,kiac->abij", as in the module
+  example) is permuted to (batch modes, A's free modes, B's free modes) and reshaped first,
+  since the helper pairs bounds with outputs by position only.
 - **S1-8. `fail_budget`** is per phase (§4.2 step 7: P over the phase's calls). A run budget is
   the caller's split; the example calls `phase()` every iteration with `iterations=1` and
   P / T_max. *Verdict: accepted.*
@@ -3632,6 +3680,21 @@ applied ("Stage-1 second re-review fixes").
   pack). Revisit only if a consumer runs share groups with DIRECT members in practice; the
   fix would then be a hybrid: each level's configuration from `configs()`, the actual
   readers only for the level comparison and the reported time.
+- **S1-11 (from the MF4 fix). Is a separate dim-by-dim check of a batched bound needed?**
+  With ndim = C.ndim enforced, MF4 relies on the existing "broadcasts exactly to C.shape"
+  check for "each batch dim C's or 1" and the row and column extents, rather than a check of
+  its own that would name the argument. *Verdict: accepted as implemented (binding); no
+  separate check is required.* When every array has C.ndim dims, broadcasting cannot
+  realign axes, so `np.broadcast_shapes(row, col, C) == C.shape` holds exactly when each dim
+  of each bound is C's or 1: the rule is enforced exactly, and only the error text is more
+  general (it names both shapes). The reviewer re-ran `host_precision` and both mutants (the
+  ndim rule dropped; the pre-MF4 code of 74a1eed), which fail with the reported message, and
+  an adversarial probe of 5509 realistic bound pairs on 3-D, 4-D and 2-D C (max over any
+  subset of axes, keepdims on or off, then optionally `[..., None]` or `[..., None, :]`):
+  the MF4 code accepted 384 forms with 0 certified outputs below the true ρ in exact
+  rationals, the pre-MF4 code 216 unsound ones. Only explicit mis-spellings at full ndim
+  (batch-indexed values placed on the row or column axis) get through, and no shape rule can
+  detect those.
 
 ### 5.6 Stage 2: the implementation's design questions (independent reviewer, 2026-10-07)
 
@@ -3832,6 +3895,45 @@ findings and `b6_split_cost.py`. Its verdicts, binding:
   perturbing the stored records). The (i) INCOMPLETE line stays in the output even when the
   verdict is FAILS, so a revival assessment sees the undetermined contraction; it must stay
   that way.
+
+**Third re-review** (independent reviewer, 2026-10-07; approve-with-fixes). One must-fix:
+"Gates (i) and (ii) rest on reproduced records only" (Status and the findings, from the
+second re-review's fixes) overstated the provenance. Both gates are evaluated at d* = 3, and
+d* comes from Tier S, which is not re-run; Tier L and the real records compute only d = 0
+and 3, so another d* could not even be evaluated on them. The verdict does not depend on it
+(checked by the reviewer and again on `repro_5925219/`): at d = 0 every R1–R5 record has
+guard14 = 0, R6 and R7 have Δ ≡ 0, and gate (ii) fails on the same 16 guard-accepted Tier-L
+records, 1–14 outputs above 2× per fixture, max ratio 99.1. Fixed: Status, stage 2,
+*What gates (i) and (ii) rest on*, three statements (the records are reproduced; d* is
+not; the verdict holds at both computed deadbands), and the same in the findings. Its
+should-fix items, applied: jacobi's reproduction is credited to the 928b49c spot check, the
+rest to 5925219 (the commit messages of 04363db and immerdink-eval beb07e7 said all of it
+at 5925219); `repro_check.py` reports duplicate identity keys in either file and the stored
+records with no re-run (coverage "N of N"); the first round's CPU tally reads about 36
+(the findings' "37" did not add up); and the stage-1 items (§5.5 S1-7). Its
+verdicts, binding:
+- **S2-21. Tier S is not re-run in full** (about 24 CPU-min, which would put M-a at about 75
+  of 90). *Verdict: not now (binding); Tier S stays labelled as not reproduced, under
+  conditions.* Tier S has a hard sub-budget of 25 CPU-min, about 24 already spent, so a full
+  re-run would break it although the M-a total fits. Tier S feeds only d* = 3 (a tie-break:
+  every deadband rejected all 30 random-structure runs) and its share of gate (iii), which
+  is met; the stage-4 verdict does not depend on it, since (i) and (ii) fail at both
+  computed deadbands on reproduced records. *Binding:* NOTES and the findings keep Tier S,
+  d* and the trend over m labelled "not reproduced on committed code (8b58101-era,
+  smoke-checked 4 of 245)". Before any stage-4 revival or any paper or external use of Tier S
+  figures, the d*-deciding subset is re-run on committed code under a newly declared budget:
+  m = 512, the random-structure fixtures plus decay_opp and opp_nonsep, 5 seeds. (The
+  verdict wrote "stage-4 revival (T1–T3)"; T1–T3 are stage 5's triggers, §4.6, and stage 4's
+  revival trigger is "a real-operand family meeting (i)", §4.5. The condition is read as
+  binding on a stage-4 revival, whatever triggers it.)
+- **S2-22. The 4 `md1_rho` records (IR7, d89988a, content-tied) are not re-run**, to keep
+  M-d1 under its hard 30 CPU-min. *Verdict: accepted (binding).* They used `precision.py`
+  sha256 574c404 (51dba1e); between 51dba1e and 5925219, `rho_from_output` changed only in
+  argument validation and docstrings, the numeric recipe is unchanged, and so is the library
+  (sha256 466acdb4…). `md1_converge.rho_hat` passes 1-D bounds on a 2-D D, a path MF3 and
+  MF4 leave alone (and float64 bounds, so the third review's exact conversion leaves it
+  alone too). The 1-of-228 ρ-miss result still describes the shipped helper; a re-run would
+  put M-d1 at about 28.6 of 30 on an approximate tally.
 
 ### 5.7 Stage 3: the implementation's design questions (independent reviewer, 2026-10-07)
 

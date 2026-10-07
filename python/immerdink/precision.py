@@ -747,6 +747,23 @@ class PrecisionPlan:
 # ------------------------------------------------------------------------------------------
 # The rigorous rho from a previous output (DESIGN v1.19 §6g.11; NOTES-C1 §4.2, IR7)
 
+def _norm_bound(arg, x):
+    """A norm bound as float64, converted exactly or refused: np.asarray(x, dtype=float64)
+    rounds to nearest, which can fall below the caller's upper bound."""
+    import numpy as np
+    b = np.asarray(x)
+    if b.dtype.kind == "f" and b.dtype.itemsize <= 8:      # float16/32/64: widen exactly
+        return b.astype(np.float64, copy=False)
+    if b.dtype.kind in "iu":
+        if b.size and (b.max() > 2**53 or b.min() < -2**53):
+            raise ValueError(f"{arg}: an integer bound above 2^53 in magnitude does not convert "
+                             "to float64 exactly; pass it rounded up as a float")
+        return b.astype(np.float64)
+    raise TypeError(f"{arg} of dtype {b.dtype}: a norm bound is a float (at most 64-bit) or "
+                    "integer array; converting it to float64 would round it to nearest, "
+                    "possibly below the bound (round it up to float64 first)")
+
+
 def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, beta=0.0,
                     l1_ratio=None, mode="EMULATE", lib=None):
     """(rho_hat, certified): upper bounds rho_hat_ij >= rho_ij = ||a_i|| ||b_j|| / |x_ij| from
@@ -754,10 +771,20 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
     ELEMENTWISE target's `cond` (DESIGN §6f.1: the max over the outputs that must meet it).
     Rigorous for that call's data, a prediction for the next iteration's.
 
-    C: a float64 host array (numpy; copy a device C or the part needed to the host first).
+    C: a float64 host array (numpy; copy a device C or the part needed to the host first) in
+    the GEMM view (..., m, n) (DESIGN §1.1): a tensor output whose modes interleave A's and
+    B's free modes, e.g. abij of "kjbc,kiac->abij", is permuted to (batch modes, A's free
+    modes, B's free modes) and reshaped first, its bounds in the same order; the helper pairs
+    bounds with outputs by position only.
     row_norm_ub, col_norm_ub: upper bounds of the GEMM view's row 2-norms ||a_i|| and column
-    2-norms ||b_j|| (§6f.1's obligation: really upper bounds, e.g. rounded up). A row bound
-    lies along axis -2 and a column bound along axis -1:
+    2-norms ||b_j|| (§6f.1's obligation: really upper bounds, e.g. rounded up), as FP values:
+    float arrays (float16 / float32 widen to float64 exactly) or integers of magnitude
+    <= 2^53. A bound that float64 conversion would round to nearest, possibly below the
+    caller's bound, is refused: an integer above 2^53 (ValueError); a wider float (long
+    double), Fractions, Decimals, Python ints beyond 64 bits (object), complex or bool
+    (TypeError). A Python list is converted by numpy before this check (an integer above 2^53
+    mixed with floats is already rounded), so pass numpy float arrays. A row bound lies along
+    axis -2 and a column bound along axis -1:
     - C of shape (m, n): a scalar; a 1-D row_norm_ub of length m and a 1-D col_norm_ub of
       length n, each on its own axis; a row bound (m, 1) and a column bound (1, n).
     - A batched C (..., m, n), C.ndim >= 3: a scalar, or a bound with exactly C.ndim dims, a
@@ -783,9 +810,9 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
     entries are +inf. With true norm bounds rho_hat >= 1.
     ValueError: beta != 0 (for beta = 1 accumulations take rho from a probe call with
     beta = 0 into a scratch buffer, once per phase), alpha not a power of two (D cannot be
-    recovered exactly from RN(alpha D)), a negative or NaN norm bound, a bound off its axis
-    or of another ndim (above), shapes that do not broadcast to C. TypeError: C not
-    float64."""
+    recovered exactly from RN(alpha D)), a negative or NaN norm bound, an integer bound above
+    2^53, a bound off its axis or of another ndim (above), shapes that do not broadcast to C.
+    TypeError: C not float64, a norm bound of another dtype (above)."""
     import numpy as np
     if beta != 0:
         raise ValueError("rho_from_output needs beta = 0 (take rho from a beta = 0 probe call)")
@@ -807,8 +834,8 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
     C = np.asarray(C)
     if C.dtype != np.float64:
         raise TypeError(f"C must be float64, got {C.dtype}")
-    row = np.asarray(row_norm_ub, dtype=np.float64)
-    col = np.asarray(col_norm_ub, dtype=np.float64)
+    row = _norm_bound("row_norm_ub", row_norm_ub)
+    col = _norm_bound("col_norm_ub", col_norm_ub)
     if C.ndim >= 2:     # a row bound lies along axis -2, a column bound along axis -1
         lead = "None, " * (C.ndim - 2)
         for arg, b, own, along, what, form, shared in (
