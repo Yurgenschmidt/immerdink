@@ -37,6 +37,8 @@ Map to docs/DESIGN.md (v1). Each certificate in CHECKS names its section.
                                                                      pack_ws_bytes()
   §6f   accuracy-aware planning: the bounds of imd_err_estimate ..... error_estimate()
   §6g.11 rigorous rho from a previous output (stage 1 of C1) ....... rho_recipe()
+  §3.8  segmented accumulation, the K-segmentation recipe (L7) ...... kseg_gamma(), kseg_unit(),
+                                                                     kseg_request()
 TLA+ models are scaled-down copies of the same rules; scaled_moduli() and
 scaled_constants() produce their parameters with the same greedy rule.
 """
@@ -560,6 +562,46 @@ def rho_recipe(C, row_ub, col_ub, U, e=0):
         return None
     rho = math.nextafter(n / den, math.inf)
     return rho if math.isfinite(rho) else None
+
+
+# ---------------------------------------------------------------------------
+# §3.8 segmented accumulation: the K-segmentation recipe's error terms (PROOFS L7;
+# NOTES-C1 §4.4, stage 3). S bands, each one call (alpha = 1, beta = 0 for band 1, beta = 1
+# after it): C_1 = D_1, C_s = RN(C_{s-1} + D_s).
+
+KSEG_S_MAX = 2**26                   # gamma_{S-1} (1 + u) <= S u needs (S-1)(S+1) u <= 1
+KSEG_REQ_SCALE = 1 - 2.0**-50        # kseg_request's relative margin (exact as a double)
+
+
+def kseg_gamma(S):
+    """gamma_{S-1} = (S-1) u / (1 - (S-1) u), exact: the recursive-summation factor of S
+    terms (PROOFS L7 step 2). S >= 1; gamma_0 = 0."""
+    if not 1 <= S <= KSEG_S_MAX:
+        raise ValueError("S outside 1..2^26")
+    j = S - 1
+    return j * UNIT_ROUNDOFF / (1 - j * UNIT_ROUNDOFF)
+
+
+def kseg_unit(E, S):
+    """PROOFS L7's per-band coefficient W = u + (1+u) E + gamma_{S-1} (1+u)(1+E), exact, for a
+    band whose L3c unit bound is E (error_estimate's 'unit_bound' at that band's k_s and nu):
+    |C_S - x| <= sum_s n_s W_s with n_s = ||a_i^s|| ||b_j^s||."""
+    u, g = UNIT_ROUNDOFF, kseg_gamma(S)
+    E = Fraction(E)
+    return u + (1 + u) * E + g * (1 + u) * (1 + E)
+
+
+def kseg_request(t_eff, S):
+    """The NORMWISE target t' to request (imd_err_min_moduli / rank, nu = sqrt k) for a
+    segmented call whose L7 coefficient must stay <= t_eff (DESIGN §3.8, the recipe's step 4):
+        t' = RN(RN(min(t_eff, 1) (1 - 2^-50)) - 4 S 2^-53)    in FP64, as a caller evaluates it;
+    0.0 if t' <= 0 (the target is out of reach of S bands). Soundness (cert_kseg_composition):
+    E (1+u) + u <= t' implies kseg_unit(E, S) <= t_eff exactly, also when t_eff is itself the
+    RN of the caller's quotient (t / r, t / rho_S, t / M_S)."""
+    if not (math.isfinite(t_eff) and t_eff > 0) or not 1 <= S <= KSEG_S_MAX:
+        raise ValueError("t_eff must be finite and > 0, S in 1..2^26")
+    t = min(t_eff, 1.0) * KSEG_REQ_SCALE - 4 * S * 2.0**-53
+    return t if t > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -2136,6 +2178,254 @@ def cert_rho_recipe():
             f"{counts['boundary']} boundary "
             f"evaluations exact (certified iff |D| >= 2 ulps above RN(U n)), {len(edges)} "
             f"edge cases")
+
+
+def _m5_pair(rng, fam, k):
+    """One row a and one column b of length k from an M5 family (bench/accuracy/contractions.py
+    gen: uniform, decay_same, decay_opp, outliers, cancel; magnitudes along K as there, with
+    a random row / column factor for the 3 decades along rows and columns) or constant rows
+    (non-representable entries, whose quantization errors add coherently)."""
+    def u(a, b):
+        return a + (b - a) * rng.random()
+    sg = lambda: rng.choice((-1.0, 1.0))  # noqa: E731
+    if fam == "uniform":
+        return [u(-1, 1) for _ in range(k)], [u(-1, 1) for _ in range(k)]
+    if fam in ("decay_same", "decay_opp"):
+        t = [h / max(k - 1, 1) for h in range(k)]
+        da = [10.0 ** (-1 - 9 * x) for x in t]
+        db = da if fam == "decay_same" else da[::-1]
+        ra, rb = 10.0 ** (-3 * rng.random()), 10.0 ** (-3 * rng.random())
+        return ([sg() * u(0.5, 1) * x * ra for x in da], [sg() * u(0.5, 1) * x * rb for x in db])
+    if fam == "outliers":
+        a = [rng.gauss(0, 1) for _ in range(k)]
+        b = [rng.gauss(0, 1) for _ in range(k)]
+        for _ in range(2):
+            a[rng.randrange(k)] *= 10.0 ** u(3, 8)
+            b[rng.randrange(k)] *= 10.0 ** u(3, 8)
+        return a, b
+    if fam == "cancel":                       # pairs h, h + k/2 cancel to relative 1e-6
+        h2 = k // 2
+        a = [u(-1, 1) for _ in range(h2)]
+        b = [u(-1, 1) for _ in range(h2)]
+        return (a + [x * (1 + 1e-6 * u(-1, 1)) for x in a] + [u(-1, 1)] * (k - 2 * h2),
+                b + [-x for x in b] + [u(-1, 1)] * (k - 2 * h2))
+    if fam == "const":
+        va, vb = 0.1 * (1 + rng.random()), 0.3 * (1 + rng.random())
+        return [va] * k, [vb * sg()] * k
+    raise ValueError(fam)
+
+
+def _kseg_element(a, b, N, rnd, bounds):
+    """One segmented output in exact arithmetic: the bands' D_s (emulate_element, alpha = 1,
+    beta = 0) and C_S with C_s = RN(C_{s-1} + D_s) (float(Fraction) rounds correctly, also
+    to a subnormal: an addition never has an underflow error)."""
+    Ds, C = [], None
+    for b0, b1 in zip(bounds, bounds[1:]):
+        D = emulate_element(a[b0:b1], b[b0:b1], N, rnd, chunk=7)["D"]
+        Ds.append(D)
+        C = D if C is None else float(Fraction(C) + Fraction(D))
+    return C, Ds
+
+
+@check("§3.8 segmented accumulation (PROOFS L7, the K-segmentation recipe)")
+def cert_kseg_composition():
+    """DESIGN v1.19 §3.8 "Segmented accumulation" (NOTES-C1 §4.4, stage 3): L7 against exact
+    rationals. Rows from every M5 family plus constant rows; S in {1, 2, 3, 4} near-equal
+    contiguous bands; N in {3, 4, 5, 8, 14, 20}; RN and TRUNC; every band's own D_s
+    (emulate_element) and C_s = RN(C_{s-1} + D_s). With E_s the LOWER enclosure of
+    error_estimate's unit bound at (N, k_s, rounding) and n_s from lower square-root
+    enclosures (so each check is at least as strict as the claim):
+    (1) the claim |C_S - x| <= sum_s n_s W_s (W_s = kseg_unit(E_s, S)), with per-band nu
+        (each band's own l1 ratios, rounded up) and with nu = sqrt k_s;
+    (2) the metric forms with W_bar = max_s W_s: NORMWISE <= W_bar ||a|| ||b|| and
+        <= kseg_unit(E(k, nu = sqrt k)) ||a|| ||b|| (every E_s <= E(k), so the segmented
+        bound exceeds the unsegmented one by the u-level gamma (1+u)(1+E) only),
+        N_S = sum n_s <= ||a|| ||b||; ELEMENTWISE <= W_bar rho |x| (rho >= ||a|| ||b|| / |x|);
+        ABSOLUTE <= W_bar M + (1 + gamma) S 2^-1075, also on rows whose products underflow;
+        S = 1 is L3c's NORMWISE bound (gamma_0 = 0);
+    (3) the recipe's request: E (1+u) + u <= kseg_request(t_eff, S) implies W(E) <= t_eff,
+        on random t_eff = RN(t / r) and S, at the largest admissible E;
+    (4) the nu counterexample a = (1, eps, ..., eps): a band's nu exceeds the whole row's,
+        and the band bound with the whole row's nu is violated;
+    (5) the lost single rounding: at N = 20 some S = 2 output's error exceeds the
+        unsegmented ELEMENTWISE bound (u + E rho (1+u)) |x| that the plain call meets;
+    (6) gamma is necessary: sum_s n_s (u + (1+u) E_s) fails on rows aligned band by band."""
+    rng = random.Random(7307)
+    u = UNIT_ROUNDOFF
+    cnt = {"elements": 0, "bands": 0, "underflow": 0, "requests": 0, "max_ratio": Fraction(0)}
+
+    def ub(r):                                    # the smallest double >= a rational >= 1
+        return max(_up(r), 1.0)
+
+    def unit_lo(N, ks, rnd, nu_a=0.0, nu_b=0.0):
+        return error_estimate(N, ks, rnd, l1_ratio_a=nu_a, l1_ratio_b=nu_b)["unit_bound"][0]
+
+    def check(a, b, N, rnd, S, underflow=False):
+        k = len(a)
+        bounds = [0]
+        for s in range(S):
+            bounds.append(bounds[-1] + k // S + (1 if s < k % S else 0))
+        C, Ds = _kseg_element(a, b, N, rnd, bounds)
+        x = sum(Fraction(p) * Fraction(q) for p, q in zip(a, b))
+        err = abs(Fraction(C) - x)
+        na2 = sum(Fraction(v)**2 for v in a)
+        nb2 = sum(Fraction(v)**2 for v in b)
+        g = kseg_gamma(S)
+        Wn, Wr, NS = [], [], Fraction(0)          # W_s (measured nu), W_s (nu = sqrt k_s)
+        bound_nu, bound_rk = Fraction(0), Fraction(0)
+        EK = unit_lo(N, k, rnd)                   # the unsegmented E(k), nu = sqrt k (lower)
+        for s, (b0, b1) in enumerate(zip(bounds, bounds[1:])):
+            sa, sb = a[b0:b1], b[b0:b1]
+            a2 = sum(Fraction(v)**2 for v in sa)
+            b2 = sum(Fraction(v)**2 for v in sb)
+            n_lo = sqrt_enclosure(a2 * b2)[0]
+            NS += n_lo
+            if a2 and b2:
+                nu_a = ub(sum(abs(Fraction(v)) for v in sa) / sqrt_enclosure(a2)[0])
+                nu_b = ub(sum(abs(Fraction(v)) for v in sb) / sqrt_enclosure(b2)[0])
+            else:
+                nu_a = nu_b = 0.0
+            Es_nu = unit_lo(N, b1 - b0, rnd, nu_a, nu_b)
+            Es_rk = unit_lo(N, b1 - b0, rnd)
+            need(S == 1 or error_estimate(N, b1 - b0, rnd)["unit_bound"][1] <= EK,
+                 f"N={N} {rnd} k_s={b1 - b0}: E_s > E(k)")
+            Wn.append(kseg_unit(Es_nu, S))
+            Wr.append(kseg_unit(Es_rk, S))
+            bound_nu += n_lo * Wn[-1]
+            bound_rk += n_lo * Wr[-1]
+            cnt["bands"] += 1
+        what = f"N={N} {rnd} S={S} k={k}"
+        need(NS * NS <= na2 * nb2, f"{what}: N_S > ||a|| ||b||")
+        Wbar = max(Wr)
+        nab_hi = sqrt_enclosure(na2 * nb2)[1]
+        # ABSOLUTE: always (the underflow term covers gradual underflow of a band's D_s)
+        need(err <= Wbar * nab_hi + (1 + g) * S * ERR_UNDERFLOW, f"{what}: ABSOLUTE")
+        cnt["elements"] += 1
+        if underflow:
+            cnt["underflow"] += 1
+            return
+        need(err <= bound_nu, f"{what}: L7 with per-band nu")
+        need(err <= bound_rk, f"{what}: L7 with nu = sqrt k_s")
+        need(err * err <= Wbar * Wbar * na2 * nb2, f"{what}: NORMWISE W_bar")
+        need(err * err <= kseg_unit(EK, S)**2 * na2 * nb2, f"{what}: NORMWISE vs E(k)")
+        if S == 1:
+            need(Wr[0] == EK * (1 + u) + u, f"{what}: S = 1 is not L3c")
+        if x != 0:
+            rho = Fraction(_up(nab_hi / abs(x))) if nab_hi / abs(x) < 2**1000 else None
+            if rho is not None:
+                need(err <= Wbar * rho * abs(x), f"{what}: ELEMENTWISE")
+        if bound_rk:
+            cnt["max_ratio"] = max(cnt["max_ratio"], err / bound_rk)
+
+    # (1) + (2): every M5 family plus constant rows
+    fams = ("uniform", "decay_same", "decay_opp", "outliers", "cancel", "const")
+    for N in (3, 4, 5, 8, 14, 20):
+        for rnd in (RN, TRUNC):
+            for S in (1, 2, 3, 4):
+                for k in (12, 61):
+                    for fam in fams:
+                        a, b = _m5_pair(rng, fam, k)
+                        check(a, b, N, rnd, S)
+    # long constant rows at small N, where the bound is closest to the error
+    for N in (3, 4, 5):
+        for rnd in (RN, TRUNC):
+            for S in (2, 4):
+                a, b = _m5_pair(rng, "const", 600)
+                check(a, b, N, rnd, S)
+    # products that underflow (x and some D_s subnormal): the ABSOLUTE form only
+    for N in (4, 8, 20):
+        for rnd in (RN, TRUNC):
+            for S in (2, 3):
+                a = [math.ldexp(1 + rng.random(), -540 - rng.randrange(8)) * rng.choice((1, -1))
+                     for _ in range(10)]
+                b = [math.ldexp(1 + rng.random(), -540 - rng.randrange(8)) * rng.choice((1, -1))
+                     for _ in range(10)]
+                check(a, b, N, rnd, S, underflow=True)
+    need(cnt["max_ratio"] > 0, "vacuous: no error")
+
+    # (3) the request transform, exact, at the largest admissible E = (t' - u) / (1 + u)
+    for _ in range(3000):
+        t = math.ldexp(1 + rng.random(), rng.randint(-52, 2))
+        r = rng.choice((1.0, math.ldexp(1 + rng.random(), rng.randint(-40, 0)),
+                        math.ldexp(1 + rng.random(), rng.randint(0, 60))))
+        S = rng.choice((1, 2, 3, 4, 7, 64, 4096, KSEG_S_MAX))
+        t_eff = t / r
+        if not (math.isfinite(t_eff) and t_eff > 0):
+            continue
+        tp = kseg_request(t_eff, S)
+        if tp == 0.0:                             # out of reach of S bands: nothing to check
+            continue
+        Emax = (Fraction(tp) - u) / (1 + u)
+        if Emax < 0:
+            continue
+        need(kseg_unit(Emax, S) <= Fraction(t) / Fraction(r),
+             f"kseg_request({t_eff!r}, {S}) = {tp!r} unsound")
+        cnt["requests"] += 1
+    need(cnt["requests"] > 1000, "request check vacuous")
+
+    # (4) the nu counterexample: a = (1, eps, ..., eps), b likewise, S = 2 bands of 300
+    viol = None
+    for trial in range(8):
+        ea, eb = 1e-6 * (1 + rng.random()), 1e-6 * (1 + rng.random())
+        k, N, rnd = 600, rng.choice((3, 4, 5)), rng.choice((RN, TRUNC))
+        a = [1.0] + [ea] * (k - 1)
+        b = [1.0] + [eb] * (k - 1)
+        na2 = sum(Fraction(v)**2 for v in a)
+        nu_whole = ub(sum(abs(Fraction(v)) for v in a) / sqrt_enclosure(na2)[0])
+        sa, sb = a[300:], b[300:]
+        a2 = sum(Fraction(v)**2 for v in sa)
+        nu_band = sum(abs(Fraction(v)) for v in sa) / sqrt_enclosure(a2)[1]
+        need(nu_whole < 1.01 and nu_band > 17, f"nu counterexample: {nu_whole} vs {float(nu_band)}")
+        D2 = emulate_element(sa, sb, N, rnd, chunk=7)["D"]
+        x2 = sum(Fraction(p) * Fraction(q) for p, q in zip(sa, sb))
+        n2_hi = sqrt_enclosure(a2 * sum(Fraction(v)**2 for v in sb))[1]
+        E_whole_hi = error_estimate(N, 300, rnd, l1_ratio_a=nu_whole,
+                                    l1_ratio_b=nu_whole)["unit_bound"][1]
+        if abs(Fraction(D2) - x2) > (u + (1 + u) * E_whole_hi) * n2_hi:
+            viol = (N, rnd, float(abs(Fraction(D2) - x2) / ((u + (1 + u) * E_whole_hi) * n2_hi)))
+            break
+    need(viol is not None, "the whole-row nu never failed as a band bound")
+
+    # (5) the lost single rounding: segmented error above the plain call's ELEMENTWISE bound
+    lost = None
+    E20 = error_estimate(20, 40, RN)["unit_bound"][1]
+    for trial in range(400):
+        a, b = _m5_pair(rng, "uniform", 40)
+        C, _ = _kseg_element(a, b, 20, RN, [0, 20, 40])
+        x = sum(Fraction(p) * Fraction(q) for p, q in zip(a, b))
+        if x == 0:
+            continue
+        nab = sqrt_enclosure(sum(Fraction(v)**2 for v in a) * sum(Fraction(v)**2 for v in b))[1]
+        rho = nab / abs(x)
+        plain = emulate_element(a, b, 20, RN, chunk=7)["D"]
+        lim = (u + E20 * rho * (1 + u)) * abs(x)
+        need(abs(Fraction(plain) - x) <= lim, "plain call above L3c's ELEMENTWISE bound")
+        if abs(Fraction(C) - x) > lim:
+            lost = (trial, float(abs(Fraction(C) - x) / (u * abs(x))))
+            break
+    need(lost is not None, "no output lost the single rounding")
+
+    # (6) gamma is necessary: without it (sum_s n_s (u + (1+u) E_s)) the bound fails on rows
+    # aligned band by band (b_s a multiple of a_s, so n_s = |x_s|), at N = 20
+    no_gamma = None
+    E2 = error_estimate(20, 2, RN)["unit_bound"][1]
+    for trial in range(400):
+        a = [1 + rng.random() for _ in range(4)]
+        b = [a[0] * 0.75, a[1] * 0.75, a[2] * 1.5, a[3] * 1.5]
+        C, _ = _kseg_element(a, b, 20, RN, [0, 2, 4])
+        x = sum(Fraction(p) * Fraction(q) for p, q in zip(a, b))
+        lim = sum(sqrt_enclosure(sum(Fraction(v)**2 for v in a[i:i + 2]) *
+                                 sum(Fraction(v)**2 for v in b[i:i + 2]))[1]
+                  for i in (0, 2)) * (u + (1 + u) * E2)
+        if abs(Fraction(C) - x) > lim:
+            no_gamma = trial
+            break
+    need(no_gamma is not None, "the bound without gamma never failed")
+    return (f"{cnt['elements']} segmented elements ({cnt['bands']} bands; {cnt['underflow']} "
+            f"underflowing, ABSOLUTE only), max err / L7 bound {float(cnt['max_ratio']):.3f}; "
+            f"{cnt['requests']} request transforms sound; whole-row nu fails a band at "
+            f"N={viol[0]} {viol[1]} ({viol[2]:.1f}x); S = 2 at N = 20 loses the single rounding "
+            f"(err {lost[1]:.2f} u|x|); without gamma L7 fails (aligned bands, N = 20)")
 
 
 @check("§2-§3.6 scaled TLA+ parameters")

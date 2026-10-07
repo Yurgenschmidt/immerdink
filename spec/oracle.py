@@ -1649,6 +1649,73 @@ def kweights_apply(T: Tensor, labels, qstride, w, sign: int = 1) -> Tensor:
     return Tensor(buf, T.base, T.desc)
 
 
+# ---------------------------------------------------------------------------------------
+# K-segmentation (NOTES-C1 §2.7, §4.4 stage 3; DESIGN v1.19 §3.8 "Segmented accumulation")
+# ---------------------------------------------------------------------------------------
+#
+# A caller recipe, not a library mode (NOTES-C1 Q15 (a)): the caller splits K into S
+# contiguous bands and issues one ordinary call per band, the first with its own alpha and
+# beta and every later one with beta = 1, so band s is accumulated into C by §3.7's single
+# fma: C <- fma(1, C, E_s) = RN(C + E_s). Each band is its own call, with its own plan k_s,
+# sigma / tau and RN acceptance. contract_segments() is that sequence of contract() calls,
+# literally; with alpha = 1 and beta = 0 its result is PROOFS L7's C_S.
+
+def segment_bounds(k: int, S: int) -> list:
+    """The boundaries [0, k_1, ..., k_S = k] of S near-equal contiguous K bands: the first
+    k mod S bands are one longer (numpy.array_split's split, as bench/accuracy/c2_gate.py's
+    `segmented` uses). InvalidValue unless 1 <= S <= k."""
+    if not (isinstance(S, int) and isinstance(k, int) and 1 <= S <= k):
+        raise InvalidValue(f"segment_bounds: S={S!r} outside 1..k={k!r}")
+    q, r = divmod(k, S)
+    out = [0]
+    for s in range(S):
+        out.append(out[-1] + q + (1 if s < r else 0))
+    return out
+
+
+def contract_segments(A, B, C, N: int, rounding: str = "RN", bounds=None,
+                      alpha: float = 1.0, beta: float = 0.0, g: int | None = None,
+                      chunk: int = K_C_ALIGNED, m=None, n=None, k=None,
+                      trace: dict | None = None):
+    """The K-segmentation recipe as a literal composition of contract() (NOTES-C1 §4.4).
+
+    bounds = [b_0 = 0 < b_1 < ... < b_S = k] (default segment_bounds(k, 2)): band s holds the
+    canonical K positions b_{s-1} <= h < b_s. Band 1 is contract(A[:, band], B[band, :], C,
+    alpha, beta); band s > 1 is contract(..., C_{s-1}, alpha, 1.0), i.e. C_s = fma(1, C_{s-1},
+    E_s) with E_s = D_s (alpha = 1) or RN(alpha D_s) (§3.7). Each band is a separate call: its
+    own plan at k_s = b_s - b_{s-1} (RN acceptance kappa_s < T per band, so NotSupported only
+    if a band is too long), its own sigma / tau, its own non-finite scan (a flagged row of one
+    band takes the native path in that band only). C is read only if beta != 0 (band 1).
+    InvalidValue for bounds that are not strictly increasing from 0 to k (an empty band; k = 0
+    has no band). `trace`, if a dict, receives bounds, the per-band contract() traces
+    ("segments") and the partial results C_1..C_S ("partial")."""
+    if m is None:
+        m = len(A)
+    if k is None:
+        k = len(A[0]) if m else len(B)
+    if n is None:
+        n = len(B[0]) if k else len(C[0])
+    if bounds is None:
+        bounds = segment_bounds(k, 2) if k >= 2 else [0, k]
+    bounds = list(bounds)
+    if len(bounds) < 2 or bounds[0] != 0 or bounds[-1] != k or \
+            any(b1 <= b0 for b0, b1 in zip(bounds, bounds[1:])):
+        raise InvalidValue(f"contract_segments: bounds {bounds!r} do not partition [0, {k})")
+    traces, partial, Cs = [], [], C
+    for s, (b0, b1) in enumerate(zip(bounds, bounds[1:])):
+        As = [A[i][b0:b1] for i in range(m)]
+        Bs = [B[h] for h in range(b0, b1)]
+        t = {} if trace is not None else None
+        Cs = contract(As, Bs, Cs, alpha, beta if s == 0 else 1.0, N, rounding, g=g,
+                      chunk=chunk, m=m, n=n, k=b1 - b0, trace=t)
+        if trace is not None:
+            traces.append(t)
+            partial.append([row[:] for row in Cs])
+    if trace is not None:
+        trace.update(bounds=bounds, segments=traces, partial=partial)
+    return Cs
+
+
 if __name__ == "__main__":
     print("moduli:", MODULI_SOURCE)
     print("K_c =", K_C, " K_c' =", K_C_ALIGNED)

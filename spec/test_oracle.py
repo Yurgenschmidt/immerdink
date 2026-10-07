@@ -40,6 +40,11 @@ What is checked (numbers refer to the oracle task list, sections to DESIGN.md):
       other labels), the guard against materialized weighted rows, exactness of every scaled
       entry, joint-K-permutation invariance, determinism, L5c in exact rationals, the CRT
       precondition and z on the weighted operands, DIRECT results bitwise unchanged.
+  (13) K-segmentation (NOTES-C1 §4.4, stage 3): oracle.contract_segments against an
+      independent composition of per-band contract() calls and exact RN(C + E_s) steps,
+      S = 1 bitwise equal to contract(), per-band sigma / z / CRT precondition, PROOFS L7's
+      proof skeleton in exact rationals, alpha / beta, band-local flags, per-band RN
+      acceptance, the decay_opp gain, validation.
   NB residue-group size g cannot influence the oracle's result by construction (each plane
   is computed independently from the same quantized operands); g-independence of the real
   buffer schedule is the Pipeline spec's job. The g loop in (3) only checks plumbing.
@@ -2037,6 +2042,196 @@ def test_kweights():
                            f"guard seen on fixtures: {s_found['guard0']}")
 
 
+def seg_compose(A, B, C, N, rnd, bounds, alpha=1.0, beta=0.0):
+    """Independent composition of the K-segmentation recipe: each band's product D_s from a
+    plain contract() call (alpha = 1, beta = 0), E_s = RN(alpha D_s), and the accumulation
+    by exact rationals and one correct rounding (round_fraction): C_1 = RN(beta C + E_1) (or
+    E_1 for beta = 0), C_s = RN(C_{s-1} + E_s). Returns (C_S, the per-band D lists)."""
+    m, n = len(A), len(B[0])
+    Ds, out = [], None
+    for b0, b1 in zip(bounds, bounds[1:]):
+        D = o.contract([r[b0:b1] for r in A], B[b0:b1], [[0.0] * n for _ in range(m)],
+                       1.0, 0.0, N, rnd)
+        Ds.append(D)
+        E = [[x if alpha == 1.0 else o.round_fraction(fr(alpha) * fr(x)) for x in r] for r in D]
+        if out is None:
+            out = E if beta == 0.0 else \
+                [[o.round_fraction(fr(beta) * fr(C[i][j]) + fr(E[i][j])) for j in range(n)]
+                 for i in range(m)]
+        else:
+            out = [[o.round_fraction(fr(out[i][j]) + fr(E[i][j])) for j in range(n)]
+                   for i in range(m)]
+    return out, Ds
+
+
+def test_segments():
+    """(13) K-segmentation (NOTES-C1 §4.4, stage 3; DESIGN §3.8 "Segmented accumulation"):
+    oracle.contract_segments against an independent composition (seg_compose), S = 1 bitwise
+    equal to contract(), segment_bounds against the array_split rule, each band's sigma from
+    the band alone and its z = sum a'b' with the CRT precondition, PROOFS L7's proof skeleton
+    in exact rationals (every band's L3a l1 bound plus u|D_s|, plus gamma_{S-1} sum |D_s|),
+    determinism across chunk lengths and g, alpha / beta and an unread C, band-local flags,
+    the per-band RN acceptance, the decay_opp gain, validation."""
+    rng = random.Random(7303)
+    cnt = {"cases": 0, "outputs": 0, "bands": 0, "l7_tight": Fraction(0)}
+    # --- segment_bounds: the array_split rule (the first k mod S bands one longer)
+    for k in range(1, 41):
+        for S in range(1, k + 1):
+            bd = o.segment_bounds(k, S)
+            lens = [b1 - b0 for b0, b1 in zip(bd, bd[1:])]
+            assert bd[0] == 0 and bd[-1] == k and len(lens) == S
+            assert lens == [k // S + (1 if s < k % S else 0) for s in range(S)]
+    for bad in ((5, 0), (5, 6), (0, 1)):
+        try:
+            o.segment_bounds(*bad)
+            raise AssertionError(f"segment_bounds{bad} accepted")
+        except o.InvalidValue:
+            pass
+
+    # --- random fixtures: composition, per-band sigma / z / CRT, L7 skeleton, determinism
+    fams = ("uniform", "decay_same", "decay_opp", "opp_nonsep", "outliers", "phi4")
+    for trial in range(48):
+        fam = fams[trial % len(fams)]
+        m, n, k = rng.randrange(1, 4), rng.randrange(1, 4), rng.randrange(4, 41)
+        A, B = kw_fixture(fam, m, n, k, rng)
+        N, rnd = rng.choice([3, 4, 6, 8, 14, 20]), rng.choice(["RN", "TRUNC"])
+        S = rng.randrange(1, 5)
+        bounds = o.segment_bounds(k, S) if trial % 2 == 0 else \
+            [0] + sorted(rng.sample(range(1, k), S - 1)) + [k]
+        t = {}
+        R = o.contract_segments(A, B, [[0.0] * n for _ in range(m)], N, rnd, bounds, trace=t)
+        Rc, Ds = seg_compose(A, B, None, N, rnd, bounds)
+        assert all(same_bits(x, y) for r1, r2 in zip(R, Rc) for x, y in zip(r1, r2)), trial
+        assert t["bounds"] == bounds and len(t["segments"]) == S and t["partial"][-1] == R
+        if S == 1:
+            R1 = o.contract(A, B, [[0.0] * n for _ in range(m)], 1.0, 0.0, N, rnd)
+            assert all(same_bits(x, y) for r1, r2 in zip(R, R1) for x, y in zip(r1, r2))
+        for chunk, g in ((1, 1), (3, None), (7, 2)):
+            Rd = o.contract_segments(A, B, [[0.0] * n for _ in range(m)], N, rnd, bounds,
+                                     chunk=chunk, g=min(g or N, N))
+            assert all(same_bits(x, y) for r1, r2 in zip(R, Rd) for x, y in zip(r1, r2))
+        Bt = [[B[h][j] for h in range(k)] for j in range(n)]
+        u = U
+        gam = Fraction(S - 1) * u / (1 - (S - 1) * u)
+        delta = Fraction(1, 2) if rnd == "RN" else Fraction(1)
+        for s, (b0, b1) in enumerate(zip(bounds, bounds[1:])):
+            ts, ks = t["segments"][s], b1 - b0
+            plan = ts["plan"]
+            assert plan.k == ks
+            for i in range(m):
+                assert ts["sigma"][i] == o.scale_vector(A[i][b0:b1], o.Plan(N, ks, rnd))[0]
+            for j in range(n):
+                assert ts["tau"][j] == o.scale_vector(Bt[j][b0:b1], o.Plan(N, ks, rnd))[0]
+            for i in range(m):
+                for j in range(n):
+                    qa, qb = ts["QA"][i], ts["QB"][j]
+                    assert sum(abs(o.qvalue(a) * o.qvalue(b)) for a, b in zip(qa, qb)) <= plan.H
+                    assert ts["z"][i][j] == sum(o.qvalue(a) * o.qvalue(b) for a, b in zip(qa, qb))
+            cnt["bands"] += 1
+        # L7's proof skeleton, exact: |C_S - x| <= sum_s (L3a_s + u|D_s|) + gamma sum_s |D_s|
+        for i in range(m):
+            for j in range(n):
+                x = sum(fr(a) * fr(b) for a, b in zip(A[i], Bt[j]))
+                rhs, sumD = Fraction(0), Fraction(0)
+                for s, (b0, b1) in enumerate(zip(bounds, bounds[1:])):
+                    ts = t["segments"][s]
+                    sg, ta = ts["sigma"][i], ts["tau"][j]
+                    l1a = sum(abs(fr(v)) for v in A[i][b0:b1])
+                    l1b = sum(abs(fr(v)) for v in Bt[j][b0:b1])
+                    l3a = delta * (Fraction(2) ** -ta * l1a + Fraction(2) ** -sg * l1b) + \
+                        (b1 - b0) * delta ** 2 * Fraction(2) ** -(sg + ta)
+                    Dij = abs(fr(Ds[s][i][j]))
+                    rhs += l3a + u * Dij
+                    sumD += Dij
+                rhs += gam * sumD
+                err = abs(fr(R[i][j]) - x)
+                assert err <= rhs, (trial, i, j)
+                if rhs:
+                    cnt["l7_tight"] = max(cnt["l7_tight"], err / rhs)
+                cnt["outputs"] += 1
+        cnt["cases"] += 1
+
+    # --- alpha / beta: band 1 carries the caller's beta, later bands beta = 1; C unread at
+    # beta = 0
+    for trial in range(12):
+        m, n, k = 2, 3, rng.randrange(6, 30)
+        A, B = kw_fixture(rng.choice(fams), m, n, k, rng)
+        C0 = [[rng.uniform(-1, 1) for _ in range(n)] for _ in range(m)]
+        bounds = o.segment_bounds(k, rng.randrange(2, 5))
+        alpha, beta = rng.choice([(1.0, 1.0), (0.375, 0.0), (3.0, -0.5), (1.0, 2.0 ** -40)])
+        N, rnd = rng.choice([4, 8, 14]), rng.choice(["RN", "TRUNC"])
+        Cin = Poison(m) if beta == 0.0 else C0
+        R = o.contract_segments(A, B, Cin, N, rnd, bounds, alpha=alpha, beta=beta)
+        Rc, _ = seg_compose(A, B, C0, N, rnd, bounds, alpha, beta)
+        assert all(same_bits(x, y) for r1, r2 in zip(R, Rc) for x, y in zip(r1, r2)), trial
+
+    # --- band-local flags: an Inf in band 2 makes that band native, band 1 stays emulated
+    A = [[0.5, -0.25, 0.125, 1.0, math.inf, 2.0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]
+    B = [[1.0, -1.0], [0.5, 0.25], [2.0, 1.0], [1.0, 1.0], [0.0, 1.0], [1.0, -2.0]]
+    t = {}
+    R = o.contract_segments(A, B, [[0.0] * 2 for _ in range(2)], 8, "RN", [0, 3, 6], trace=t)
+    assert t["segments"][0]["fA"] == [False, False] and t["segments"][1]["fA"] == [True, False]
+    D1 = o.contract([r[:3] for r in A], B[:3], [[0.0] * 2] * 2, 1.0, 0.0, 8)[0]
+    for j in range(2):
+        nat = o.native_dot(A[0][3:], [B[h][j] for h in range(3, 6)])
+        want = o.fma(1.0, D1[j], nat)
+        assert same_bits(R[0][j], want), (R[0][j], want)
+    assert math.isnan(R[0][0]) and R[0][1] == math.inf     # Inf * 0 in column 0, as natively
+
+    # --- RN acceptance is per band: k = 32042 > rn_feasible_kmax(2) = 32041 is rejected
+    # whole at N = 2 and accepted as two bands of 16021
+    k = 32042
+    a = [[(1.0 + h % 7) * 2.0 ** -(h % 5) for h in range(k)]]
+    b = [[(-1.0) ** h * (1.0 + h % 3)] for h in range(k)]
+    try:
+        o.contract(a, b, [[0.0]], 1.0, 0.0, 2, "RN")
+        raise AssertionError("N = 2 RN accepted k = 32042")
+    except o.NotSupported:
+        pass
+    R = o.contract_segments(a, b, [[0.0]], 2, "RN", [0, 16021, k])
+    Rc, _ = seg_compose(a, b, None, 2, "RN", [0, 16021, k])
+    assert same_bits(R[0][0], Rc[0][0])
+
+    # --- the gain on banded anti-correlated data (NOTES-C1 §2.7): max normwise error relative
+    # to the plain norms, decay_opp, k = 240, N = 10: S = 4 bands below the unsegmented call
+    rng2 = random.Random(11)
+    m, n, k = 3, 3, 240
+    A, B = kw_fixture("decay_opp", m, n, k, rng2)
+    Bt = [[B[h][j] for h in range(k)] for j in range(n)]
+
+    def max_nw(R):
+        worst = Fraction(0)
+        for i in range(m):
+            for j in range(n):
+                x = sum(fr(p) * fr(q) for p, q in zip(A[i], Bt[j]))
+                na2 = sum(fr(v) ** 2 for v in A[i])
+                nb2 = sum(fr(v) ** 2 for v in Bt[j])
+                worst = max(worst, (fr(R[i][j]) - x) ** 2 / (na2 * nb2))
+        return float(worst) ** 0.5
+    e1 = max_nw(o.contract(A, B, [[0.0] * n for _ in range(m)], 1.0, 0.0, 10, "RN"))
+    e4 = max_nw(o.contract_segments(A, B, [[0.0] * n for _ in range(m)], 10, "RN",
+                                    o.segment_bounds(k, 4)))
+    assert e4 * 100 < e1, (e1, e4)
+
+    # --- validation
+    A, B = [[1.0] * 4], [[1.0] for _ in range(4)]
+    for bad in ([0, 0, 4], [1, 4], [0, 3], [0, 3, 2, 4], [0], [0, 2, 5]):
+        try:
+            o.contract_segments(A, B, [[0.0]], 8, "RN", bad)
+            raise AssertionError(f"bounds {bad} accepted")
+        except o.InvalidValue:
+            pass
+    try:
+        o.contract_segments([[]], [], [[0.0]], 8, "RN", k=0)
+        raise AssertionError("k = 0 accepted")
+    except o.InvalidValue:
+        pass
+    RESULTS["segments"] = (f"{cnt['cases']} cases ({cnt['bands']} bands, {cnt['outputs']} outputs; "
+                           f"max err / L7 skeleton bound {float(cnt['l7_tight']):.3f}), "
+                           f"decay_opp N = 10 max normwise {e1:.2e} unsegmented vs {e4:.2e} at "
+                           f"S = 4")
+
+
 def sigma_extremes():
     """Theoretical sigma range (§3.2 step 5): k=1 row holding the least subnormal at N=20
     (largest sigma); k = 2^40 rows of values just below 2^1024 at N=2, TRUNC (smallest)."""
@@ -2132,14 +2327,15 @@ def main():
                      ("lazy lowering (9)", test_lazy_lower),
                      ("packed operands (10)", test_packed),
                      ("k alignment (11, v1.13 §4b)", test_k_align),
-                     ("K-weights (12, NOTES-C1)", test_kweights)):
+                     ("K-weights (12, NOTES-C1)", test_kweights),
+                     ("K-segments (13, NOTES-C1)", test_segments)):
         t1 = time.time()
         fn()
         print(f"PASS  {name:24s} {time.time() - t1:7.1f}s", flush=True)
     hi, hi_rn, lo = sigma_extremes()
     print()
     print("moduli source:", o.MODULI_SOURCE)
-    for key in ("tensor", "packed", "k_align", "kweights", "params_crosscheck", "fma_checked", "crt_L128_N17_overflows", "neg_rn_without_kappa",
+    for key in ("tensor", "packed", "k_align", "kweights", "segments", "params_crosscheck", "fma_checked", "crt_L128_N17_overflows", "neg_rn_without_kappa",
                 "rn_boundary_N2_k32041", "sweep_runs", "determinism_runs"):
         print(f"{key}: {RESULTS[key]}")
     print(f"bound tightness: max |emul-exact|/l1-bound = {BOUND_STATS['l1_max_ratio']:.3f}; "

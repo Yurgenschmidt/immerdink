@@ -86,9 +86,11 @@ internal layout facts (I1–I3, not ABI), and a host-side Python guard (`PackedB
 stage 1 (§6g.10–§6g.12, ROADMAP C1(b)) chooses N per phase on the host: the Python
 `PrecisionPlan` composes the §6f queries per phase (per-role pack cost, pack-mode masks and a
 BUDGET status, share groups ranked jointly, an optional DIRECT level), and `rho_from_output`
-gives the rigorous ρ of an ELEMENTWISE target from a previous output (`cert_rho_recipe`). No
-semantic, layout, launch, pack-format, API, calibration-format or TLA+ change; changed text is
-marked **[v1.19]**.
+gives the rigorous ρ of an ELEMENTWISE target from a previous output (`cert_rho_recipe`). Its
+stage 3 (NOTES-C1 §4.4, C2) adds the K-segmentation caller recipe to §3.8 with its error bound
+(PROOFS L7, `cert_kseg_composition`, `oracle.contract_segments`) and rewrites the §7 rows that
+the C1/C2 study decided. No semantic, layout, launch, pack-format, API, calibration-format or
+TLA+ change; changed text is marked **[v1.19]**.
 The change lists are at the end.
 
 Sources:
@@ -479,6 +481,85 @@ Typical errors are smaller. Choosing N is the caller's job, guided by
 `params.py --table`. **[v1.12]** It can also be left to the host library: §6f computes this
 bound (and a typical estimate) per configuration from the caller's operand statistics, and
 `imd_err_min_moduli` / `imd_perf_rank` return the cheapest N that meets an error target.
+
+#### [v1.19] Segmented accumulation: the K-segmentation recipe **[proof: PROOFS L7; cert: cert_kseg_composition; oracle: contract_segments, test (13)]**
+
+A **caller recipe with no API** (docs/NOTES-C1.md §2.7, §4.4; Q15 (a), confirmed by M-a,
+§5.6 S2-13). It splits K into S bands and runs each band as its own call. On data whose
+magnitudes along K are anti-correlated **in contiguous bands** (decay_opp-like), each band's
+norm product ‖a^s‖‖b^s‖ is far below ‖a‖‖b‖, and fewer moduli reach a target. It costs S calls,
+and it gives up §3.7's single final rounding.
+
+**Recipe.**
+1. **Bands.** Partition K into S bands, e.g. `oracle.segment_bounds(k, S)` (near-equal and
+   contiguous). For a tensor, band s is a sub-view along one contracted label that A and B
+   share: the same descriptors with that label's extent cut to the band, and both base
+   pointers advanced by start × that label's stride in each operand. L7 holds for any
+   partition; the gain needs bands that follow the magnitude profile.
+2. **Calls.** Band 1 is an ordinary call with the caller's α and β. Bands 2 … S follow in a
+   fixed order on the same stream, with the same α and **β = 1**, so
+   `C_s = fma(1, C_{s−1}, E_s) = RN(C_{s−1} + E_s)` (§3.7). Bands of equal k_s share one plan
+   (only the base pointers move); unequal ones need one plan per distinct k_s. Every band is
+   an ordinary call:
+   - its own σ and τ, and its own non-finite scan (a row with an Inf or NaN takes the native
+     path only in the band that holds it);
+   - its own RN acceptance κ_s < T(N), so a k too long for RN at small N can run in bands;
+   - its own N if the caller wants (L7 takes E_s per band);
+   - packs per band: one pack per band sub-view, keyed by its k_s (§6b).
+3. **Result.** Deterministic for fixed bands, order and N. `oracle.contract_segments(A, B, C,
+   N, rounding, bounds, alpha, beta)` is the literal composition of `contract` and the
+   bit-exact reference (spec/test_oracle.py (13) checks it against an independent
+   composition).
+
+**Error** (PROOFS L7; α = 1, β = 0; finite inputs, no overflow). Per output (i, j), with
+`n_s = ‖a_i^s‖‖b_j^s‖`, E_s the §6f.2 E of band s (`imd_err_estimate`'s `unit_bound` at
+(N, k_s, rounding) with **the band's** ℓ1 ratios, or 0 = √k_s) and `γ = (S−1)u/(1 − (S−1)u)`:
+```
+|C_S − x| ≤ Σ_s n_s·W_s,      W_s = u + (1+u)·E_s + γ·(1+u)·(1+E_s)
+```
+- `N_S = Σ_s n_s ≤ ‖a_i‖‖b_j‖` (Cauchy–Schwarz over the bands). With `W̄ = max_s W_s`:
+  NORMWISE `≤ W̄·‖a_i‖‖b_j‖`; ELEMENTWISE `≤ W̄·ρ_S·|x|` for `ρ_S ≥ N_S/|x|` (ρ_S ≤ ρ);
+  ABSOLUTE `≤ W̄·M̄ + (1+γ)·S·2⁻¹⁰⁷⁵` for `M̄ ≥ N_S` (the last term: a band's product that
+  underflows gradually; the additions themselves are exact in the subnormal range).
+- **Against §6f.2 with ν = √k** (ℓ1 ratios 0) at the same N: `E_s ≤ E(k)`, so the NORMWISE and
+  ABSOLUTE bounds exceed the unsegmented ones by `γ(1+u)(1+E)·‖a‖‖b‖` only, about (S−1)u.
+- **A whole-row ℓ1 ratio does not bound a band's**: a row (1, ε, …, ε) has a ratio near 1
+  while a band without its first entry has √k_s. Use 0 (√k_s) or ratios measured per band;
+  the certificate shows the bound with the whole row's ratio failing on such a band.
+- **ELEMENTWISE is worse at high N**: W̄ρ_S carries `(u + γ(1+u))·ρ_S` where §6f.2 has u.
+  At N = 20 an S = 2 output errs by 2.9 u|x|, beyond the bound the unsegmented call meets
+  (`cert_kseg_composition`).
+- α ≠ 1 or β ≠ 0: as §6f.2 (one more rounding for α; β's first fma is not expressed).
+
+**Choosing N (rigorous; L7d).** The gain is `N_S < ‖a‖‖b‖`, which the plain statistics do not
+see. With the per-band norms (one pass over A and B, as §6g.11's norms):
+1. `t_eff = t/r` for a NORMWISE target t relative to the plain norms, with
+   `r ≥ max_ij N_S,ij/(‖a_i‖‖b_j‖)` (r = 1 is always valid and gains nothing);
+   `t_eff = t/ρ_S` for ELEMENTWISE, with ρ_S over the outputs that must meet the target (for
+   example from a previous output's N_S/|C|, as §6g.11 does for ρ); `t_eff = t/M̄` for
+   ABSOLUTE (no underflow). One RN division is allowed.
+2. `t′ = RN(RN(min(t_eff, 1)·(1 − 2⁻⁵⁰)) − 4S·2⁻⁵³)` in FP64 (`params.kseg_request`;
+   S ≤ 2²⁶). If `t′ ≤ 0`, no N meets the target with S bands.
+3. Request NORMWISE target t′ with ℓ1 ratios 0: `imd_err_min_moduli` / rank on the whole
+   contraction (E(k) bounds every E_s) or on each band's sub-view. Its N meets the target:
+   `E(1+u) + u ≤ t′` implies `W ≤ t_eff`.
+
+**When it pays** (M-a, the ≥ 2048³ class; immerdink-eval `findings/c1-evidence.md`).
+- On banded anti-correlated synthetic profiles S = 2 saves 2–4 moduli at equal sampled max
+  elementwise error (decay_opp 3–4, opp_nonsep 2–3; −0.5 to +1 on the other families). For
+  example decay_opp 2048 × 2048 × 3600 at 1e−10 elementwise needs N = 16 instead of 20:
+  18.8 against 17.4 TFLOPS-eq (1.61 against 1.73 ms) [M]. K-equilibration needs 1–4 moduli
+  fewer than S = 2 on every such case, but its library form is closed (§7).
+- On the real psi4 operands S = 2 saves at most one modulus (normwise 1e−15), where its time
+  is still +4 % to +62 % over fast mode's [M] (R2b: 2 % faster, inside the model's error),
+  and it loses elementwise accuracy at 1e−10 / 1e−12 on the outputs with ρ ≤ 1e8.
+- Costs per call: S-fold K0, K5 and W-plane writes plus the β = 1 read of C ([E] +10–93 % at
+  S = 2–4 on 4096³, DF and 8192³; NOTES-C1 §2.7).
+- [M] figures at N ∉ {8, 10, 14, 16} are model-only until the small-N hold-out M-c passes
+  (NOTES-C1 IR4).
+
+Use it for banded anti-correlated K profiles at normwise or absolute targets well above S·u,
+not for elementwise targets near u.
 
 ---
 
@@ -5263,7 +5344,15 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 | V0 int32 planes | 4× the bytes per plane, for nothing, once the epilogue reduces mod p. |
 | Register-fused CRT (V3) | Exceeds 255 registers/thread at useful tiles (MEMORY_MODEL §6). |
 | FP CRT ([OZ2] double-double) | Exact integer arithmetic is simpler, checkable, and division-free. |
-| Accurate mode in v1 | Needs the other operand (Ā·B̄), which breaks operand packing. Revisit for inputs with very wide dynamic range. |
+| Accurate mode ([SC25]'s partner-aware σ/τ shifts) — **[v1.19]** re-examined for wide dynamic range (NOTES-C1 §2.5, §2.8, M-a) | Still rejected. It needs one more operand pass (KF/KL lose their group-1 fusion), and σ depends on the partner, which breaks operand packing (D1). It also converts headroom poorly: by an estimate from the §3.8 bound, confirmed by NOTES-C1 §2.5–§2.6's data (not a theorem), partner-aware shifts realize about G/7.8 moduli of a G-bit headroom where K-weights realize about G/3.9. Measured [C]: ≤ 0.3 moduli on dense data, ≤ 0.34 for the faithful 6-bit form even on decay_opp, about 3 with exact or envelope bounds on separable anti-correlated data. M-a at the ≥ 2048³ class (immerdink-eval `findings/c1-evidence.md`): the never-worse envelope rule (NOTES-C1 Appendix B, recorded as the proven partner-aware option) saves 1.5–3.5 moduli at equal elementwise error on decay_opp and opp_nonsep (K-equilibration 4–7), −0.5 to +1 on random-structure data, and none on the real psi4 operands. Its revival trigger (≥ 2 moduli beyond both K-equilibration and K-segmentation on a non-separable family of that class) is not met: 0 cases. |
+| K-equilibration in the library: power-of-two K-weights with `imd_kweights` and caller pre-scaling, then library-internal weighted packs (NOTES-C1 stages 4, 6) | Closed by its pre-registered gate (NOTES-C1 §4.5). No real-operand contraction of the ≥ 2048³ class (psi4 DF and MP2 operands of benzene and water on the consumer's contraction list) passes the L5c guard: their K profiles are aligned (G ≤ 0), and with the caller's costs K-equilibration is 2–47 % slower there [M]. It saves about 6 moduli only on synthetic anti-correlated profiles. The exact rule stays as `oracle.kweights`. **Trigger:** a real-operand family meeting gate (i), judged with the re-registered (ii) of NOTES-C1 §4.5; stage 6 only after a shipped stage 4 passes M-e (§4.7). |
+| K-segmentation as a library mode (a SEGMENTS flag or a segment loop; NOTES-C1 Q15) | A documented caller recipe instead (§3.8 "Segmented accumulation", PROOFS L7): it works today with β = 1 and moved base pointers. M-a: on every guard-accepted Tier-L case it needs 1–4 more moduli than K-equilibration; on the real operands it saves at most one modulus (normwise 1e−15) at +4 % to +62 % of fast mode's time [M], and it gives up the single rounding. An API only if a real workload shows value beyond the recipe. |
+| More bits per modulus via larger moduli (e.g. Karatsuba-split residues) | More INT8 GEMMs per bit on sm_89 [I]: a residue of a modulus above 256 needs two int8 parts and three GEMMs per modulus, against one per 8-bit modulus. The FP8 analogue, Ozaki-II with Karatsuba-split FP8 residues (arXiv:2603.10634), needs 3 FP8 GEMMs per modulus and about 2.5× the multiplications of the INT8 scheme for 53 bits. |
+| N-range plan: one plan serving every N′ ∈ [N_lo, N_hi] (NOTES-C1 §3.2) | Parked. A call at N′ is launch-identical to the single-N′ plan, so it gains nothing per call; precision phases use a plan per N (§6g). It would save only plan count, host bytes and creation time (0.011–0.15 ms per N, once). **Trigger:** a consumer that cannot re-plan per phase, or a measurement showing that plan count, plan creation or RESIDENT memory matters. |
+| Multi-N packs; round-to-odd reference-integer packs; lower-N planes from a higher-N pack (NOTES-C1 §3.1 A3, A4, A6) | A multi-N pack has the same bytes as separate packs and saves one FP64 read per pack creation, for N-set key semantics. A round-to-odd pack takes 5 / 8 / 9 / 11 B per element at N_max = 8 / 14 / 16 / 20 (≥ FP64 from N_max = 14), each call still reads ≥ 8 B per element, and it saves only the S pass that KL already fuses. Lower-N planes cannot come from a higher-N pack: σ depends on N, rounding is not modular, and the CRT over a prefix gives z mod P(N′) (PackedOperand `neg_n`). |
+| Choosing N on the device within a call | N fixes the launch sequence, the K5 instantiation, W, the workspace and σ itself, and kernel scope forbids the sync. N is chosen on the host per phase (§6g.10). |
+| Ozaki-I slice mode: prefix slices, one pack for every precision (C1(c), NOTES-C1 §2.9, §3.3) | Parked. Faster than Ozaki-II only on benign data below about 1e−8, break-even near 1e−10, 1.25–1.75× slower at FP64 level [E], no win beyond S = 2 slices on heavy-tailed rows; and no operand is needed at two N at once. **Triggers:** a consumer needs one operand at two or more precisions at once under memory pressure, or M-d measures phase-switch re-packs at ≥ 5 % of a phase. A revival must beat the prefix-plane option and the share-group raise cost, and builds its TLA+ then. |
+| K5 statistics and a device a-posteriori certificate (lemma L6; NOTES-C1 stage 5) | Deferred: no consumer issues elementwise targets, and the host-side `rho_from_output` (§6g.11) gives a rigorous ρ now. **Triggers** (NOTES-C1 §4.6): T1, a consumer issues ELEMENTWISE requests per phase and the recipe's measured cost is ≥ 3 % of its run; T2, a consumer needs a rigorous per-call elementwise certificate on every call; T3, Eric asks for it. |
 | FP8 / INT4 paths | FP8 can't hold residues exactly at speed on Ada. INT4 forces p ≤ 16. |
 
 ---
@@ -5956,7 +6045,7 @@ and host API; every value the same integer (bit-identical, tested on every contr
   0 = off); the struct and format are unchanged. Text: COLD described as a modelling convention,
   the write-back reading of ω as a hypothesis.
 
-## v1.19 (§6g adaptive precision, stages 0 and 1: precision phases on host API 13, N chosen per phase on the host; no semantic, layout, launch, pack-format, API, calibration-format or TLA+ change)
+## v1.19 (§6g adaptive precision, stages 0, 1 and 3: precision phases on host API 13, N chosen per phase on the host, the K-segmentation recipe; no semantic, layout, launch, pack-format, API, calibration-format or TLA+ change)
 
 Design: docs/NOTES-C1.md §4.1 (stage 0), as amended by the independent reviewer's binding
 decisions (IR1–IR29, NOTES-C1 §5.3).
@@ -6036,3 +6125,23 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     (b, n) norms without keepdims were paired with C's rows or columns at b = m and certified
     ρ̂ ≈ 0.006 ρ (§6g.11, MF3); S1-10 (a shared role's reuse stays fixed while a member is at
     DIRECT) is binding and documented in §6g.10 and the `reuse` and `Phase` docstrings.
+- **Stage 3** (NOTES-C1 §4.4 with IR5, IR12, IR15; C2; no ABI change, host API 13):
+  - **§3.8 "Segmented accumulation":** the K-segmentation caller recipe (S calls, β = 1
+    after the first, moved base pointers; per-band σ, flags, RN acceptance and packs), its
+    error bound with the per-metric forms and caveats (whole-row ℓ1 ratios do not transfer
+    to a band; ELEMENTWISE loses the single rounding), the rigorous request transform
+    `t′ = RN(RN(min(t_eff, 1)(1 − 2⁻⁵⁰)) − 4S·2⁻⁵³)`, and M-a's evidence on when it pays.
+  - **PROOFS L7** (L7a recursive summation γ_{S−1}, L7b the segmented bound, L7c the metric
+    forms, L7d the request); L5 and L6 stay reserved (stage 4 closed, stage 5 deferred).
+    **Lean:** L3c (ν form, compositions, normal-range final rounding), the summation lemma
+    and L7 `kseg_compose` (proofs/, NOTES-C1 IR5).
+  - **spec/params.py** `kseg_gamma`, `kseg_unit`, `kseg_request` and `cert_kseg_composition`
+    (L7 against exact rationals over every M5 family and constant rows, S = 1–4,
+    N ∈ {3, 4, 5, 8, 14, 20}, RN and TRUNC, per-band ν, every metric, underflowing products;
+    the request transform; the whole-row-ν counterexample, the lost single rounding and the
+    necessity of γ). **spec/oracle.py** `segment_bounds`, `contract_segments` (a literal
+    composition of `contract`); spec/test_oracle.py (13).
+  - **§7:** accurate mode (re-examined with M-a's figures), K-equilibration in the library
+    (closed by its gate, with the trigger), K-segmentation as a library mode, larger moduli
+    (with arXiv:2603.10634), the N-range plan, multi-N / round-to-odd packs, device-chosen N,
+    Ozaki-I slices and the K5 statistics, each with its trigger where deferred.

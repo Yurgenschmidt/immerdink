@@ -133,6 +133,17 @@ first.
   (dropped, above; with the launch-timing check), streaming K2 of g < N KL
   calls (+2 … +5 %), pre-packed g < N in the S rule, tiny-shape K4 / KF. GPU: 18.7 min (90 min
   sweep wall time, mostly gate waits for other GPU users).
+- **Adaptive precision C1 / C2 (2026-10-07, branch `claude/ozaki-kernels-immerdink-1089fd`,
+  not pushed; DESIGN v1.19 §6g and §3.8, host API 13, no ABI change):** the design and the
+  state of every stage are docs/NOTES-C1.md (read its Status first). Stage 0: precision phases
+  (a plan and a pack per N, published footprint monotonicity F1–F3, the re-pack rule,
+  `PackedBuffer`). Stage 1: `immerdink.precision.PrecisionPlan` and `rho_from_output`.
+  Stage 2 (CPU): M-a closed stage 4 (caller-side K-equilibration fails its gate on real psi4
+  operands) and deferred stage 6; M-d1 met its criterion. Stage 3: the K-segmentation caller
+  recipe (§3.8, PROOFS L7, `cert_kseg_composition`, `oracle.contract_segments`) and L3c + L7
+  in Lean. Open: the stage-3 review (NOTES-C1 §5.7), M-b (CPU), M-c and M-d2 (GPU), and the
+  M-d1 caller guidance into DESIGN §6g.12. Evaluation records and summaries are in
+  immerdink-eval `results/c1/` and `findings/c1-*.md`.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).

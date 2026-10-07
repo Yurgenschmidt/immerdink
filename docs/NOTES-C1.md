@@ -125,11 +125,32 @@ what has been built since is recorded under "Implementation status".
       after an output passed near zero). The report-only cases became caller guidance (§1.3).
   - **Not yet run:** M-b (the [M] re-runs of IR9 and the share-group raise cost of IR15; CPU,
     round 1), and M-c and M-d2 (GPU, round 2). Stage 3 may start: the M-a summary is published
-    (§4.11).
+    (§4.11). (It has since been implemented; below.)
   - **Open:** the M-d1 caller guidance (§1.3: the DIIS reset, Davidson's recompute and its +5
     iterations, CG's relaxation scaled by the iteration count) lives only here. It is to be
     carried into DESIGN §6g.12, `bench/accuracy/schedule.py` and the `precision.py`
     docstrings, which the stage-1 work owns (also a ROADMAP C1 open item).
+- **Stage 3 (§4.4) is implemented, 2026-10-07**, after the M-a summary (IR12, IR28); CPU and
+  Lean only, no ABI change (host API 13). Not yet reviewed: its design questions are §5.7.
+  - *DESIGN v1.19 §3.8 "Segmented accumulation":* the K-segmentation caller recipe (§2.7, Q15
+    (a)), L7's bound in every metric with its caveats, a rigorous request transform for
+    choosing N (L7d, §5.7 S3-1) and M-a's evidence on when it pays. The §7 rows are rewritten
+    and cite M-a (IR12): final, not "provisional", since the M-a summary is published. [M]
+    figures at N ∉ {8, 10, 14, 16} stay tagged until M-c (IR4).
+  - *PROOFS L7* (L7a recursive summation γ_{S−1}, L7b the bound, L7c the metric forms, L7d
+    the request); L5 and L6 stay reserved.
+  - *Lean (IR5): done.* L3c (the ν form `l3c_unit`, the NORMWISE / ELEMENTWISE / ABSOLUTE
+    compositions with the normal-range final rounding and the subnormal term, the native
+    chain `fma_chain`), the summation lemma γ_k (`Summation.recsum`) and L7 (`kseg_compose`,
+    `kseg_rows` from the band rows, `kseg_normwise`, the exact half of L7d) in
+    `proofs/Proofs/{Error,Summation,Segments}.lean`; `tools/check_proofs.sh` passes (69
+    headline theorems, standard axioms only). So the "C2 done" condition "stage 3 has
+    shipped, including L3c and L7 in Lean" (§4.11) is met once the stage is reviewed.
+  - *spec/params.py:* `kseg_gamma`, `kseg_unit`, `kseg_request` and `cert_kseg_composition`
+    (§4.4's grid, plus underflowing products, the request transform, an actual violation for
+    the whole-row ν counterexample, the lost single rounding at N = 20, and the necessity of
+    γ). *spec/oracle.py:* `segment_bounds`, `contract_segments`; spec/test_oracle.py (13).
+  - *ROADMAP* C2 records stage 3; Q6 and Q7 were applied in stage 0 (IR18).
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -1662,6 +1683,10 @@ TFLOPS-eq first, with time alongside.
 **Stage 3 delivers** L7 in PROOFS with its Lean proof `kseg_compose`, `cert_kseg_composition`,
 `oracle.contract_segments`, the K-segmentation caller recipe (§2.7, with L7's caveats), and the
 DESIGN §7 rows below.
+
+**Implemented 2026-10-07** (Status; design questions §5.7): DESIGN §3.8 "Segmented
+accumulation" and §7, PROOFS L7 (L7a–L7d), the Lean below, and the code deliverables. The text
+of this section is the design it was built from.
 
 **Order and size** (IR12, IR28, IR5). Stage 3 starts after the M-a summary exists, and its §7
 rows cite M-a. It is re-sized from S to M for the Lean prerequisite below.
@@ -3682,6 +3707,49 @@ provenance statements named the wrong commit for most records (now Status, stage
   independent of lowering's swap (S2-5 (d)); the B6 findings table shows the reaching and the
   unreaching seeds separately and says why no split pays at m = n = 512; the M-d1 caller
   guidance's move into DESIGN is tracked as an open item (Status, stage 2).
+
+### 5.7 Stage 3: the implementation's design questions (pending the independent reviewer)
+
+The stage-3 implementation raised the questions below. Each was decided conservatively, in the
+spirit of §4.4, implemented and documented; they await the independent reviewer.
+- **S3-1. A request transform for the recipe (L7d).** §4.4 gives L7's bound but not how a
+  caller turns a target into N. Decided: DESIGN §3.8 states one rigorous route through the
+  existing API. The caller forms t_eff from per-band norm statistics (t/r NORMWISE relative to
+  the plain norms, t/ρ_S ELEMENTWISE, t/M̄ ABSOLUTE), computes
+  `t′ = RN(RN(min(t_eff, 1)(1 − 2⁻⁵⁰)) − 4S·2⁻⁵³)` in FP64, and requests NORMWISE t′ with
+  ℓ1 ratios 0. PROOFS L7d proves that the chosen N meets the target; `cert_kseg_composition`
+  checks the FP evaluation in exact rationals on 2137 random (t, r, S); Lean has its exact half.
+  No helper ships (Q15 (a): no API); `params.kseg_request` is the reference. Alternative not
+  taken: no auto-N guidance (a caller could then only use the unsegmented ν = √k request, which
+  certifies the segmented result but never sees its gain).
+- **S3-2. `contract_segments`' signature.** §4.4 names (A, B, C, N, rounding, bounds). Decided:
+  `bounds` is the boundary list [0, k_1, …, k], default two near-equal bands
+  (`segment_bounds(k, 2)`, numpy's array_split as `c2_gate.segmented`); and `alpha`, `beta`,
+  `g`, `chunk` and `trace` are passed through, band 1 carrying the caller's β and the later
+  bands β = 1, a literal composition of the calls a caller makes. An empty band or bounds
+  that do not partition [0, k) are INVALID_VALUE; a band's own RN rejection propagates.
+- **S3-3. Per-band N and packs.** §2.7 says "S calls of one plan". The recipe allows each band
+  its own N and, for unequal k_s, one plan per distinct k_s (L7 takes E_s per band, so the
+  bound holds unchanged); packs are per band sub-view, keyed by k_s.
+- **S3-4. The §7 rows beyond §4.4's list.** Added: "K-equilibration in the library" (closed by
+  its gate, with the trigger, since stage 4's outcome belongs in §7 under IR29) and
+  "K-segmentation as a library mode" (Q15). The rows cite M-a and are final, not "provisional
+  until M-a". The larger-moduli row cites arXiv:2603.10634 after checking it: Uchino, Ozaki
+  and Imamura, Ozaki-II with Karatsuba-split FP8 residues, 3 FP8 GEMMs per modulus and about
+  2.5× the multiplications of INT8 Ozaki-II for 53 bits. That is an FP8 fact cited as the
+  analogue; the INT8 statement stays [I].
+- **S3-5. The certificate goes beyond §4.4's list.** The ν counterexample shows an actual
+  violation of the band bound with the whole row's ν (3.0× at N = 3), not only ν_s > ν; the
+  certificate also shows the lost single rounding (an S = 2 output at N = 20 errs by 2.9 u|x|,
+  beyond the bound the plain call meets) and that γ is necessary (the bound without it fails
+  on rows aligned band by band). Underflowing products are checked in the ABSOLUTE form with
+  the (1+γ)·S·2⁻¹⁰⁷⁵ term.
+- **S3-6. Lean scope.** IR5 lists L3c, its compositions, the final rounding and γ_k before L7.
+  Also proved: the native chain's γ_k (L3c (3)) as a corollary of the summation lemma, E's
+  monotonicity (L7c (4)) and `kseg_rows`, which chains L7 from band rows through L3c (1).
+  L3c's final rounding uses `|D − y| ≤ u|y|` (L3c's text); L3b keeps `|D − y| ≤ u|D|`.
+- **S3-7. HANDOFF.** docs/HANDOFF.md tracked state up to v1.18 and no C1/C2 work; one bullet
+  now points to this file's Status for stages 0–3.
 
 ---
 
