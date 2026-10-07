@@ -232,6 +232,23 @@ what has been built since is recorded under "Implementation status".
     and rejects non-integer bounds; the certificate's tautological S = 1 check compares with
     `error_estimate`'s own NORMWISE bound; ROADMAP C2's comparison with K-equilibration is
     scoped to the guard-accepted Tier-L cases.
+- **Round 2, the stage-0 GPU tests (§4.11): pass on committed code, 2026-10-07**, at 4ba78b1
+  (host API 13; `libimmerdink.so` sha256 `c4bdcc4f…`, the stage-0 re-review build above, and
+  `libimmerdink_host.so` `466acdb4…`; `tools/test.sh`'s build step compiled nothing).
+  `packed_repack_n`, `workspace_shared_n`, `graph_phases` (cold captures at N = 10 and, packed,
+  N = 12, bit-exact), `pack_write_extent` (113 packs, 612 packed contracts, all 42 KL launch
+  shapes, 12 of them at radix > 1) and `pack_write_extent_memcheck` (clean; the 16-byte-short
+  mutation is reported) pass, and so does everything else: `tools/test.sh`'s 56 ctest tests (the
+  GPU ones in chunks under the GPU lock), `spec/params.py --check` (33 of 33) and
+  `spec/test_oracle.py`. Nothing needed fixing. So C1's done condition "the round-2 stage-0 GPU
+  tests pass" is met.
+  - *IR17:* F3's second half stays published as stage 0 left it (DESIGN §6a, §6b.4, §6g.2,
+    §6g.8, the `imd_pack` comment in `immerdink.h`); it is not re-published.
+  - *IR10:* the verdict (no plan-time preload) is DESIGN §6g.6, now naming its 1e6e709 build.
+    The first-call benchmark was not re-run: no file under `src/` has changed since that build.
+  - *Records:* the logs are in immerdink-eval `results/c1/round2_tests_4ba78b1/` (untracked,
+    with a manifest of the commands, the conditions and each log's sha256); summary
+    `findings/c1-round2-stage0-gpu-tests.md` (b352778).
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.

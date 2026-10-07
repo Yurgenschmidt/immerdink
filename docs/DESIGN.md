@@ -4948,7 +4948,8 @@ fresh process that first plans and calls at another N, so the numbers are a swit
 start-up. Call times run from just before the enqueue to completion, the same measure for the
 steady call (median of 20) and the first one. Records: immerdink-eval
 `results/c1/stage0_first_call.jsonl` (`bench/first_call.py --table` prints this table from
-them, with the GPU-event times alongside), summary `findings/c1-stage0-first-call.md`.
+them, with the GPU-event times alongside), summary `findings/c1-stage0-first-call.md`. The
+library was built at 1e6e709 (host API 13); the summary gives its sha256.
 
 | m = n = k | N | steady call | first call at the new N | first plan creation | re-pack of A (GPU) | cold capture: first / steady replay |
 |---:|---:|---|---|---:|---:|---:|
