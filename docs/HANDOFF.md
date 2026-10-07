@@ -96,6 +96,27 @@ first.
   checked in-sample only.
   Verified: full `tools/test.sh` 13/13 CPU + 35/35 GPU, `params.py --check` 30/30,
   `test_oracle` all pass. GPU: 56 min of sweep wall time (over the 45 min budget).
+- **Perf minor (2026-10-06, branch `perf-minor` on origin/dev 684f459, not pushed; DESIGN
+  v1.18 §6c.8, host API 13, NOTES-B2 §12):** the model-fix "Remaining" items after two offline
+  analyses (eval `findings/perfminor-time.md`, `perfminor-power.md`). Adopted, all optional
+  keys (format 2 kept, absent = 0 predicts as API 12): cache term with a per-call REPEAT saving
+  `warm.call_ns` and a clean-L2 credit `warm.clean_byte` in a new state
+  `IMD_PERF_CACHE_CLEAN` (COLD stays the default: evicted by other, dirty work); the PACK set
+  with K4's W planes (`warm.pack_l2_planes`, L_hit 1.1 × L2); power with busy-GPU power
+  `power.act_w` / `act_gap_us`, DRAM energy `power.dram_pj`, boost clock
+  `power.clock_boost_mhz` (BURST at the boost clock, time flat above f_ref, `clock_mhz` out up
+  to it), γ 2.5 as a prior; `imd_bench` sustained `--mode direct` variant fixed. Not adopted:
+  KF read / write split (format bump: `kf.row` non-zero in format 1), KF roofline (refuted),
+  E = 4 per-modulus term (fits 0), fixed PACK hit price. Shipped calibration refit (sustained
+  windows reused: 24 of 26 from model-fix / perfminor on the same kernels): hold-out (199 calls)
+  < 100 µs 3.9 / 10.8 / 15.8 → 3.7 / 12.2 / 19.0 %, 100 µs – 1 ms 2.7 / 10.3 / 15.7 → 2.7 / 6.9 /
+  13.4 %, ≥ 1 ms 2.4 / 6.6 / 16.0 → 2.6 / 6.4 / 16.4 % (median / p90 / max vs the v1.17
+  calibration on the same records; no class worse beyond noise), 1024³ N = 14 +14.9 → +6.3 %;
+  SUSTAINED nested LOO on 26 windows t 2.34 → 1.62 %, clock 6.6 → 1.3 %, power max 81 → 10 %.
+  Open: reviewer questions (COLD's meaning, `clock_mhz` scale, keep the per-call saving c,
+  which costs small REPEAT calls ≈ 1 µs: `v_n18d` −3.5 points), streaming K2 of g < N KL
+  calls (+2 … +5 %), pre-packed g < N in the S rule, tiny-shape K4 / KF. GPU: 18.7 min (90 min
+  sweep wall time, mostly gate waits for other GPU users).
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).

@@ -3818,7 +3818,8 @@ fit). So the hold-out is a check of the long-run state, and of shape only at 163
 
 Status: designed from the two offline analyses of 2026-10-06 (evaluation workspace
 `findings/perfminor-time.md`, `findings/perfminor-power.md`), implemented on branch
-`perf-minor` (host API 13), refit and validated in NOTES-B2 §12. Every new calibration key
+`perf-minor` (host API 13), refit and validated in NOTES-B2 §12 (shipped: every part below
+marked adopted; the v1.18 changelog has the figures). Every new calibration key
 is optional (absent = 0) and calibration format 2 is kept: a file without them predicts
 bit-identically to host API 12 (tested), and API ≤ 12 rejects a file with any of them
 (unknown key), so no file is read with features it was not fitted with (§6c.2 "Why format 2
@@ -3877,7 +3878,8 @@ enum { ..., IMD_PERF_CACHE_CLEAN = 3 };  /* the inputs evicted and the L2 clean 
   unit parameters (exact NNLS over the 3 columns; no formula in Python). The REPEAT phases of
   the calibration records are raised to COLD by the C model's per-phase `COLD − REPEAT` as
   before (c enters through the split; ω is a call-phase term and never enters the raise). The
-  "Δ = 0 when every measured effect is below 3 %" rule is kept.
+  "Δ = 0 when every measured effect is below 3 %" rule is kept. `--cache-form v110` is the
+  v1.10 fit and `--cache-terms` fits a subset of (Δ, c, ω), for A/Bs.
 - **Which records use CLEAN:** method pair's COLD and the totals of `--l2 flush` records (their
   phases stay REPEAT, v1.17). Method packed's interleaved calls stay COLD (their L2 holds the
   other calls' dirty lines).
@@ -5172,3 +5174,15 @@ and host API; every value the same integer (bit-identical, tested on every contr
   three cache pairs and the 352³ N = 14–20 series in `sweep_perf_validate.txt`;
   `perf_validate.py` reports the pairs.
 - **§6c.4 tests:** see §6c.8 "Tests".
+- **Shipped calibration** (2026-10-06, branch `perf-minor`, NOTES-B2 §12): one full refit on the
+  v1.18 library (calibration and cache sweeps and hold-out measured; 26 sustained windows, 24 of
+  them reused from the model-fix and perfminor runs on the same kernels): L_w 0.90 × L2, Δ 1.29
+  ps/B, c 1.23 µs, ω 0.169 ps/B; PACK S with planes, L_hit 83 MB; busy power e_tc 0.577 pJ/op,
+  e_alu 92 pJ/op, P_act 154 W, e_dram 96 pJ/B, γ 2.5, boost 2788 MHz, f_ref 2484 MHz (nested
+  leave-one-out 1.62 %, v1.15 form on the same 26 windows 2.34 %; clock 1.3 vs 6.6 %, power max
+  9.9 vs 80.6 %). Hold-out (199 calls) against the v1.17 calibration on the same records:
+  < 100 µs 3.9 / 10.8 / 15.8 → 3.7 / 12.2 / 19.0 %, 100 µs – 1 ms 2.7 / 10.3 / 15.7 → 2.7 / 6.9 /
+  13.4 %, ≥ 1 ms 2.4 / 6.6 / 16.0 → 2.6 / 6.4 / 16.4 % (no class worse beyond run-to-run noise;
+  KF phase 8.9 / 24.4 → 6.6 / 21.1, K3 5.2 / 16.3 → 4.2 / 14.0; 1024³ N = 14 +14.9 → +6.3 %).
+  Reviewer questions: COLD's meaning, `clock_mhz` on the NVML scale, and whether to keep c
+  (it costs the small REPEAT calls ≈ 1 µs; NOTES-B2 §12 ablations).
