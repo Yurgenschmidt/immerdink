@@ -1513,8 +1513,10 @@ def kweights(X: Tensor, partners, deadband: int = KW_DEADBAND, max_abs: int = KW
                    G undefined, guard = 1 vacuously, gain = INT32_MIN. Without KW_GUARD:
                    guard = -1, gain = INT32_MIN. ZERO_ON_FAIL with guard = 0: w := 0.
 
-    Report: guard, gain, gain_row_min / gain_col_min (the plan's A rows / B columns, for the
-    pair that sets G), median (INT32_MIN if no Delta is defined), num_weighted (w != 0),
+    Report: guard, gain, gain_row_min / gain_col_min (for the pair that sets G: the rows of
+    the caller's A and the columns of the caller's B, as passed to that pair's plan; KwPartner
+    x_role says which of them X is. Independent of lowering's operand swap, so the same for
+    row- and column-major C), median (INT32_MIN if no Delta is defined), num_weighted (w != 0),
     max_abs_w, clamped (w != w0); oracle detail: k_s, labels, qstride, w0, clamped_max_abs,
     clamped_fp64 (the FP64 clamp binding after the max_abs one), pairs (gain_x, gain_y, G per
     partner), extrema (c_X, m_X, c_Y, m_Y lists, None where undefined).
@@ -1588,7 +1590,7 @@ def kweights(X: Tensor, partners, deadband: int = KW_DEADBAND, max_abs: int = KW
             gx = _kw_gain_min(X, v, x_post, plan, wk)
             gy = _kw_gain_min(p.Y, v, y_post, plan, [-s for s in wk])
             gp = None if gx is None or gy is None else gx + gy
-            ga, gb = (gx, gy) if p.x_role == "A" else (gy, gx)   # the plan's A rows, B cols
+            ga, gb = (gx, gy) if p.x_role == "A" else (gy, gx)   # caller's A rows, B cols
             gains.append(dict(gain_x=gx, gain_y=gy, G=gp, gain_a=ga, gain_b=gb))
             if gp is not None and (G is None or gp < G):
                 G, at = gp, t

@@ -264,23 +264,32 @@ def statuses_real(r):
     return REAL_STATUS.get(r["family"], "both")
 
 
-def gate_verdict(perf, Lr, real, multi, batch, dstar):
+def gate_verdict(perf, S, Lr, real, multi, batch, dstar):
     """The stage-4 gate (NOTES-C1 §4.5, IR27) applied mechanically. (i): some real R1-R6
     contraction of the >= 2048^3 class has guard = 1 at d* and either (b) a net [M] + [E]
     TFLOPS-eq gain >= 5 % at a gate target (ew 1e-8 / 1e-10, nw 1e-10 / 1e-12 relative to the
     plain norms; caller costs from the operand status, REAL_STATUS) or (c) an elementwise
-    target <= 1e-8 fast mode cannot reach at N <= 20 that K-eq reaches. (ii): no Tier-L or real
-    fixture has a sampled output of a guard-accepted K-eq d* run above 2x fast's error at the
-    same N (the per-output count (1)). (iii): no FP64-clamp violation in any run."""
+    target <= 1e-8 fast mode cannot reach at N <= 20 that K-eq reaches. A guard-accepted
+    contraction whose (b) and (c) this script does not compute (R6, several partners: no
+    [M] composition here) leaves (i) INCOMPLETE, not failed, unless another contraction meets
+    it. (ii): no Tier-L or real fixture has a sampled output of a guard-accepted K-eq d* run
+    above 2x fast's error at the same N (the per-output count (1)). (iii): no FP64-clamp
+    violation in any run that scales an operand: every K-eq w of Tier S, Tier L and the real
+    operands (fresh and stale), and every several-partner and batched w (B6 scales nothing).
+    Stage 4 PASSES if all three are met, is INCOMPLETE if (i) is and nothing fails, and FAILS
+    otherwise."""
     kq = f"keq_d{dstar}"
-    out, ok_i = [], False
+    out, ok_i, undet = [], False, []
     for r in real:
         if r["family"] not in ("R1", "R2", "R2b", "R3", "R4", "R5", "R6"):
             continue
         if r["family"] == "R6":                         # several partners: the union w
             g = r["weights"]["shared"]
+            if g["guard"] == 1:
+                undet.append(label(r))
             out.append(f"  - {label(r)}: guard {g['guard']} (G {g['G']}) -> (i) not met"
-                       if g["guard"] != 1 else f"  - {label(r)}: guard 1, (b)/(c) not computed")
+                       if g["guard"] != 1 else f"  - {label(r)}: guard 1, (b)/(c) not computed "
+                       f"-> (i) undetermined")
             continue
         if not admissible(r):
             out.append(f"  - {label(r)}: not gate-admissible (2mnk < 1.7e10)")
@@ -304,9 +313,11 @@ def gate_verdict(perf, Lr, real, multi, batch, dstar):
         out.append(f"  - {label(r)}: guard {g['guard14']} (G {g['G14']}); (b) best net gain "
                    + (f"{max(gains) * 100:+.0f} %" if gains else "-") +
                    f"; (c) {'yes' if c_ok else 'no'} -> (i) {'met' if met else 'not met'}")
-    lines = [f"- (i) {'MET' if ok_i else 'NOT MET'}: no real R1-R6 contraction of the "
-             f">= 2048^3 class has guard = 1 with (b) or (c)" if not ok_i else
-             "- (i) MET"] + out
+    lines = ["- (i) MET" if ok_i else
+             f"- (i) INCOMPLETE: no contraction meets it, and (b)/(c) are not computed for "
+             f"{', '.join(undet)} (guard = 1)" if undet else
+             "- (i) NOT MET: no real R1-R6 contraction of the >= 2048^3 class has guard = 1 "
+             "with (b) or (c)"] + out
     bad, diag = [], []
     for r in Lr + real:
         v = r.get("regress", {}).get(f"d{dstar}")
@@ -326,15 +337,28 @@ def gate_verdict(perf, Lr, real, multi, batch, dstar):
                             sorted(fx_.items())) if bad else "no output above 2x"))
     lines.append(f"  - diagnostic, the noise-robust (2) and (3) (the re-registered (ii) of a "
                  f"revival, §4.5): {len(diag)} runs flagged")
-    viol = sum(v.get("fp64_violations", 0) for x in Lr + real for v in x.get("keq", {}).values())
+    scaled = S + Lr + real
+    viol = sum(v.get("fp64_violations", 0) for x in scaled for v in x.get("keq", {}).values())
+    viol += sum(v.get("fp64_violations", 0) for x in scaled for v in x.get("stale", {}).values())
     viol += sum(v.get("fp64_violations", 0) for x in multi + real
                 for v in x.get("weights", {}).values())
     viol += sum(x.get("fp64_violations", 0) for x in batch + real if "guard" in x)
-    lines.append(f"- (iii) {'MET' if viol == 0 else 'NOT MET'}: {viol} FP64-clamp violations")
-    passed = ok_i and not bad and viol == 0
-    lines.append(f"- **Stage 4: {'PASSES' if passed else 'FAILS'}**" +
-                 ("" if passed else " -> closed with the revival trigger \"a real-operand family "
-                  "meeting (i)\"; stage 6 deferred (its gate needs a shipped stage 4)"))
+    nw = sum(len(x.get("keq", {})) + len(x.get("stale", {})) for x in scaled) + \
+        sum(len(x.get("weights", {})) for x in multi + real) + \
+        sum(1 for x in batch + real if "guard" in x)
+    lines.append(f"- (iii) {'MET' if viol == 0 else 'NOT MET'}: {viol} FP64-clamp violations "
+                 f"over {nw} weight vectors (Tier S, Tier L and real K-eq, fresh and stale; "
+                 f"several-partner and batched)")
+    if ok_i and not bad and viol == 0:
+        verdict = "PASSES"
+    elif not ok_i and undet and not bad and viol == 0:
+        verdict = "INCOMPLETE ((i) undetermined)"
+    else:
+        verdict = "FAILS"
+    lines.append(f"- **Stage 4: {verdict}**" +
+                 (" -> closed with the revival trigger \"a real-operand family meeting (i)\"; "
+                  "stage 6 deferred (its gate needs a shipped stage 4)" if verdict == "FAILS"
+                  else ""))
     return "\n".join(lines)
 
 
@@ -467,7 +491,7 @@ def main():
     dstar = 3 if dstar is None else dstar
     if real or Lr:
         P("\n### Stage-4 gate (NOTES-C1 §4.5, IR27), applied mechanically\n")
-        P(gate_verdict(perf, Lr, [x for x in real], multi, batch, dstar))
+        P(gate_verdict(perf, S, Lr, [x for x in real], multi, batch, dstar))
     for name, recs, schemes in (("Tier S", S, ["keq_d0", "keq_d2", "keq_d3", "keq_d5", "kseg2",
                                                  "kseg4", f"keq_d{dstar}+kseg2", "env", "sc25"]),
                                 ("Tier L", Lr, ["keq_d0", f"keq_d{dstar}", "kseg2",

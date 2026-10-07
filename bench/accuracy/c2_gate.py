@@ -686,18 +686,41 @@ def self_test_modes(rng_seed=20261008, verbose=True):
     one w over every lambda; per-lambda w) on small cases against oracle.kweights: its
     multi-partner mode (X in role A and in role B, P = 2..3) and its batched descriptors (a
     batch label in A, B and C), and oracle.kweights_gemm per slice. Checks w, G per pair, G,
-    the guard and num_weighted. Raises AssertionError on any mismatch; returns counts."""
+    the guard and num_weighted. Raises AssertionError on any mismatch; returns counts.
+    Coverage, asserted at the end so that a fixture or RNG change cannot silently remove it:
+    guard 0 and 1 at P = 1, 2 and 3; X in role A and in role B at P >= 2; the FP64 clamp
+    binding (clamped_fp64 > 0) at P = 1 and at P >= 2; w = 0 (num_weighted = 0, §5.6 S2-4) in
+    a several-partner case, a batched descriptor and a slice; guard 0 and 1 on the batched
+    descriptors and on the slices. Not covered here: G undefined (an operand side without a
+    nonzero finite row); test_oracle (12) covers it in oracle.kweights."""
     rng = np.random.default_rng(rng_seed)
     g_of = lambda G: o.INT32_MIN if G is None else G  # noqa: E731
     cnt = dict(multi=0, pairs=0, batched=0, slices=0)
-    for t in range(12):
+    cov = dict(P_guard=set(), P_role=set(), fp64_P=set(), w0=set(), batched_guard=set(),
+               slice_guard=set())
+
+    def note(kind, P, role, rep):
+        cov["P_guard"].add((P, rep["guard"]))
+        cov["P_role"].add((min(P, 2), role))
+        if rep["clamped_fp64"] > 0:
+            cov["fp64_P"].add(min(P, 2))
+        if rep["num_weighted"] == 0:
+            cov["w0"].add(kind)
+
+    for t in range(15):
         k, P = int(rng.integers(3, 24)), int(rng.integers(2, 4))
         x_role = "A" if t % 2 == 0 else "B"
         cen = rng.integers(-40, 40, k)
         X = _kw_case(rng, int(rng.integers(2, 4)), cen)
         Ys = [_kw_case(rng, int(rng.integers(2, 4)), (-cen if p == 0 else cen) +
                        rng.integers(-20, 21, k)) for p in range(P)]
-        if t % 3 == 0:                  # a partner row near the bottom of the range (the
+        if t == 12:                     # w = 0: every partner is X itself (Delta = 0)
+            Ys = [X.copy() for _ in range(P)]
+        elif t >= 13:                   # P = 3, every partner opposite to X: guard = 1
+            P = 3
+            Ys = [_kw_case(rng, int(rng.integers(2, 4)), -cen + rng.integers(-2, 3, k), 2)
+                  for _ in range(P)]
+        if t % 3 == 0 and t < 12:       # a partner row near the bottom of the range (the
             Ys[-1][0] = np.ldexp(rng.uniform(1, 2, k),        # FP64 clamp's m_Y side)
                                  rng.integers(-1074, -1040, k))
         d = int(rng.choice([0, 2, 3]))
@@ -714,18 +737,22 @@ def self_test_modes(rng_seed=20261008, verbose=True):
         assert [g_of(g) for g in sh["G_pairs"]] == [g_of(q["G"]) for q in rep["pairs"]], t
         assert g_of(sh["G"]) == rep["gain"] and sh["guard"] == rep["guard"], t
         assert sh["num_weighted"] == rep["num_weighted"] and sh["fp64_violations"] == 0, t
+        note("multi", P, x_role, rep)
         for p, part in enumerate(parts):
             wp, rp = o.kweights(TX, [part], deadband=d)
             assert rec["w"][f"own{p}"] == wp, (t, p)
             assert g_of(rec["weights"][f"own{p}"]["G_pairs"][p]) == rp["gain"], (t, p)
+            note("own", 1, x_role, rp)
             cnt["pairs"] += 1
         cnt["multi"] += 1
-    for t in range(6):
+    for t in range(7):
         b, m, n = int(rng.integers(2, 5)), int(rng.integers(2, 4)), int(rng.integers(2, 4))
         k = int(rng.integers(3, 20))
         cen, shift = rng.integers(-30, 30, k), rng.integers(-15, 16, k)
         As = [_kw_case(rng, m, cen + (shift if lam % 2 else 0)) for lam in range(b)]
         Bs = [_kw_case(rng, n, -cen + rng.integers(-10, 11, k)) for _ in range(b)]
+        if t == 6:                      # w = 0: B_lambda = A_lambda (Delta = 0 everywhere)
+            n, Bs = m, [A.copy() for A in As]
         d = int(rng.choice([0, 2, 3]))
         rec = run_batched(As, Bs, dict(seed=t), dict(dstar=d), None, keep_w=True)
         TA = o.Tensor([x for A in As for x in A.ravel().tolist()], 0,
@@ -737,17 +764,29 @@ def self_test_modes(rng_seed=20261008, verbose=True):
         sh = rec["guard"]["shared"]
         assert rep["labels"] == ["h"] and rec["w"]["shared"] == w, (t, "batched w")
         assert g_of(sh["G"]) == rep["gain"] and sh["guard"] == rep["guard"], t
+        note("batched", 1, "A", rep)
+        cov["batched_guard"].add(rep["guard"])
         for lam in range(b):
             wl, rl = o.kweights_gemm(As[lam].tolist(), Bs[lam].T.tolist(), 14, "RN", deadband=d)
             assert rec["w"]["per_batch"][lam] == wl, (t, lam)
             assert g_of(rec["G_per_batch"][lam]) == rl["gain"], (t, lam)
+            note("slice", 1, "A", rl)
+            cov["slice_guard"].add(rl["guard"])
             cnt["slices"] += 1
         cnt["batched"] += 1
+    want = dict(P_guard={(P, g) for P in (1, 2, 3) for g in (0, 1)},
+                P_role={(P, r) for P in (1, 2) for r in "AB"}, fp64_P={1, 2},
+                w0={"multi", "batched", "slice"}, batched_guard={0, 1}, slice_guard={0, 1})
+    for key, need in want.items():
+        assert need <= cov[key], (f"self-test coverage lost: {key}", sorted(need - cov[key]))
+    cnt["coverage"] = {key: sorted(v) for key, v in cov.items()}
     if verbose:
         print(f"c2_gate self-test: run_multi == oracle.kweights on {cnt['multi']} cases "
               f"(P = 2..3, X in role A and B; {cnt['pairs']} own-w pairs), run_batched == "
               f"oracle.kweights on {cnt['batched']} batched descriptors ({cnt['slices']} "
-              f"per-lambda slices == kweights_gemm)", flush=True)
+              f"per-lambda slices == kweights_gemm); coverage asserted: guard 0 and 1 at "
+              f"P = 1, 2, 3, a binding FP64 clamp at P = 1 and P >= 2, w = 0 in each mode",
+              flush=True)
     return cnt
 
 
