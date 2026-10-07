@@ -5114,14 +5114,25 @@ it.
     4096³, DF, QZ and the PPL view, and 0.005–0.028 below on 1024³ and skinny. On the Jacobi
     view it is 0.044–0.047 above (0.830 against 0.786).
   - **M-d2 has not run** (2026-10-07). It waits for the MC-3 path (NOTES-C1 §5.9 "M-d2
-    ordering", binding).
-    - Its protocol and driver are pre-registered: `bench/accuracy/md2_time.py`, 3254b15;
-      NOTES-C1 §4.3, with the protocol decisions in §5.10, not yet reviewed.
+    ordering", binding; upheld in review, §5.10 MD2-0: MC-3a first, closed without a
+    calibration change only as MC-3a's recorded outcome or by Eric's decision).
+    - Its protocol and driver are pre-registered: `bench/accuracy/md2_time.py`,
+      re-registered after review at daf3583 (sha256 `b4cb9326…`; NOTES-C1 §4.3).
+    - The review (approve-with-fixes; NOTES-C1 §5.10, binding) upheld MD2-0 to MD2-7.
+      The fixes:
+      - the judge decides per system *and* data set, by rules (a)–(d): contaminated or
+        not bit-exact records are inadmissible, and a bit-exact failure stops M-d2; one
+        re-run at most; the first admissible record decides;
+      - provenance checks: a clean tree, the driver's sha256, the fixed protocol
+        parameters, the bars' configuration per record, and the library's embedded
+        calibration equal to the registered file.
     - On the shipped calibration, its `predict` reproduces the bars: 0.750 (the PPL view),
       0.664 (DF) and 0.673 (4096³), with bands of ± 15 % capped at 0.8.
-    - [M] (NOTES-C1 §5.10 MD2-4): with the PPL view's invariant B packed per phase, the
-      schedule is predicted at 0.876 of fixed N = 14 packed, against 0.750 in-line. The
-      re-packs of the 680 MB operand compete with packed calls of 0.67–1.59 ms.
+    - [M, model-only, outside hold-out] (NOTES-C1 §5.10 MD2-4): with the PPL view's
+      invariant B packed per phase, the schedule is predicted at 0.876 of fixed N = 14
+      packed, against 0.750 in-line. The re-packs of the 680 MB operand compete with packed
+      calls of 0.67–1.59 ms. Like for like, packing B gives P14/S14 = 0.509 at the same
+      schedule and PF14/F14 = 0.436 at fixed N = 14 (§6g.12, caller note).
   - NOTES-C1's M-b re-ran these [M] figures on this worktree's library (host API 13): every
     design-phase record reproduces byte for byte, and `PrecisionPlan`'s own choices give the
     same schedule ratios (immerdink-eval `findings/c1-m-b.md`).
@@ -5451,6 +5462,15 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
   and plain structs; its only state is the Python object's monotone floor, and it holds no C
   object with a lifetime. The ρ recipe is a [cert], not a protocol property.
 - **No ABI change:** host API 13; Python only (NOTES-C1 §4.9).
+- **Caller note: packing the invariant operand** [M, model-only, outside hold-out] (NOTES-C1
+  §2.4, §5.10 MD2-4). On the PPL view (100 × 9216 × 9216), packing the invariant B (680 MB)
+  per phase lowers the schedule's gain to 1.14× (P14/PF14 = 0.876), against 1.33× in-line,
+  since each pack costs 1.72–2.41 ms.
+  - Packing B is the larger lever: P14/S14 = 0.509 at the same schedule, and
+    PF14/F14 = 0.436 at fixed N = 14.
+  - DF and 4096³ barely change (P14/PF14 = 0.667, 0.678).
+  - NOTES-C1's M-d2 measures P14/PF14, reported and not gated; its figures replace these
+    once it runs.
 
 ---
 
@@ -6326,11 +6346,20 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     class target). The v1.18 hold-out is judged on all its cases and on the 69 whose GEMM
     view matches no fit case.
 - **M-d2, pre-registered and not run** (NOTES-C1 §4.3, §5.10; 2026-10-07; no library,
-  calibration or ABI change). `bench/accuracy/md2_time.py` (3254b15) has three modes:
-  - `predict` (CPU) checks that the shipped calibration reproduces the registered bars;
+  calibration or ABI change). `bench/accuracy/md2_time.py` (3254b15; re-registered after
+  review at daf3583) has four modes:
+  - `predict` (CPU) checks that the shipped calibration reproduces the registered bars, and
+    that the library's embedded calibration equals the registered file;
   - `run` (GPU) times the 16-call schedules end to end, in-line (gated) and with the
     invariant operand re-packed per phase (reported). It refuses the M-d2 systems until
-    the ordering of §5.9 is met;
-  - `judge` (CPU) applies the bands.
+    the ordering of §5.9 is met, and any record the protocol's provenance checks or re-run
+    rules would reject;
+  - `judge` (CPU) applies the bands per system and data set by the pre-registered rules
+    (a)–(d) of NOTES-C1 §4.3, and refuses records outside the protocol;
+  - `selftest` (CPU) checks those rules on synthetic records.
 
-  A smoke on two non-M-d2 shapes checked the tooling.
+  A smoke on two non-M-d2 shapes checked the tooling, at 3254b15 and again at daf3583.
+  - Review (approve-with-fixes; NOTES-C1 §5.10, binding): MD2-0 to MD2-7 upheld. M-d2 waits
+    for MC-3a. The judge's verdict was keyed by system only, so one data set recorded twice
+    passed; it is now keyed per data set, with the admissibility and provenance rules
+    above. A caller note on packing the invariant operand is in §6g.12.

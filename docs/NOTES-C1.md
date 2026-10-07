@@ -425,18 +425,38 @@ what has been built since is recorded under "Implementation status".
     figure of the Jacobi error.
 - **M-d2 (§4.3) has not run: the binding ordering holds** (§5.9 "M-d2 ordering": M-d2 waits
   until the MC-3 path closes, and MC-3 has not started). A workflow task of 2026-10-07 asked
-  for M-d2; no M-d2 system was run on the GPU. Instead, before any M-d2 measurement:
-  - *Protocol and driver pre-registered* at 3254b15: `bench/accuracy/md2_time.py`, whose
-    docstring is the protocol (§4.3 "M-d2", "Pre-registered protocol"). It has three modes:
-    `predict` (CPU), `run` (GPU, one fresh process per system and data set) and `judge`
-    (CPU).
+  for M-d2; no M-d2 system was run on the GPU. The independent reviewer upheld this (§5.10
+  MD2-0, binding): MC-3a comes first. MC-3 may close without a calibration change only as
+  MC-3a's recorded outcome or by Eric's explicit decision. Instead, before any M-d2
+  measurement:
+  - *Protocol and driver pre-registered,* first at 3254b15. After the review
+    (approve-with-fixes, §5.10) they were **re-registered at daf3583**, which is normative:
+    `bench/accuracy/md2_time.py`, sha256 `b4cb932621ee…` (in full in §4.3), whose docstring
+    is the protocol (§4.3 "M-d2", "Pre-registered protocol"). It has four modes: `predict`
+    (CPU), `run` (GPU, one fresh process per system and data set), `judge` (CPU) and
+    `selftest` (CPU, the decision and provenance rules, 60 checks).
+    - `judge` decides per system *and data set* by the pre-registered rules (a)–(d) (§4.3):
+      contaminated or not bit-exact records are inadmissible, a bit-exact failure stops
+      M-d2, one re-run at most, and the first admissible record decides. 3254b15's judge
+      keyed its verdict by system only, so one data set recorded twice passed.
+    - `judge` refuses a records file holding an M-d2 record that fails a provenance check:
+      - the registered calibration file;
+      - the loaded library's shipped (build-time embedded) calibration equal to that file,
+        as canonical text and as bit-identical predictions;
+      - a clean tree and a `--md2-cleared` reason;
+      - the judging driver's own sha256;
+      - the fixed protocol parameters;
+      - the bars' configuration at every level (g = N, GENERATE, in-line, RN).
     - `run` refuses the four M-d2 systems unless `--md2-cleared` names why the ordering is
-      met.
-    - `judge` refuses records made under any calibration other than the registered one
-      (IR23).
-    - The implementer's protocol decisions are §5.10 MD2-0 to MD2-7, not yet reviewed.
-  - *The bars reproduce* from the shipped calibration (`d31f62ca…`; `predict` at 3254b15 on
-    `libimmerdink_host.so` `466acdb4…`; CPU, one thread, under memcap, FREE):
+      met. Before any GPU work, it also refuses a record that would fail those checks, or
+      that rules (a)–(c) forbid.
+    - The protocol decisions MD2-0 to MD2-7 and the reviewer's verdicts are in §5.10: all
+      upheld, MD2-3, MD2-6 and MD2-7 with the fixes above. MD2-8 (which driver counts as
+      registered) arose while applying the fixes and is not reviewed.
+  - *The bars reproduce* from the shipped calibration (`d31f62ca…`). This is `predict` at
+    daf3583 on `libimmerdink_host.so` `466acdb4…`; CPU, one thread, under memcap, FREE.
+    Its tables are identical to 3254b15's. The library's shipped calibration equals the
+    registered file, as canonical text and as predictions on the six systems.
     - S14/F14 = 0.7501 (PPL view), 0.6635 (DF) and 0.6728 (4096³), i.e. the registered
       0.750 / 0.664 / 0.673. Rank's choice and g = N agree, and `PrecisionPlan` picks
       g = N at every level. The Jacobi view gives 0.7865.
@@ -444,16 +464,33 @@ what has been built since is recorded under "Implementation status".
       [0.550, 1.022] is reported only.
   - *Tooling check only, not M-d2 evidence:* the driver ran on two shapes that are not M-d2
     systems: 512³ with A invariant, and a PPL-like 100 × 576 × 576 with B invariant. Both
-    data sets, 5 reps, under the GPU lock, about 1.4 min of wall time in all.
-    - Packed and in-line agree bit for bit at every level, and every run was queued ahead.
-    - Worst spreads 0.45–3.1 %.
-    - Records: immerdink-eval `results/c1/m_d2/` (untracked); summary
-      `findings/c1-m-d2.md`.
-  - *[M] observation for the reviewer* (§5.10 MD2-4). On the PPL view the bar is the
-    in-line ratio. A caller who packs the invariant B (680 MB) per phase is predicted at
-    P14/PF14 = 0.876, above the 0.8 cap: the four packs cost 1.72–2.41 ms each, against
-    packed calls of 0.67–1.59 ms. That caller is still 2.6× faster in absolute terms than
-    in-line (P14/F14 = 0.382). DF and 4096³ change little packed (0.667, 0.678).
+    data sets, 5 reps, under the GPU lock. It ran at 3254b15 and again at daf3583
+    (42 s of wall time, each lock hold about 10 s).
+    - At daf3583, packed and in-line agree bit for bit at every level. Every run was
+      queued ahead (0 of 10 gated S14/F14 runs not queued ahead, per record). Worst
+      spreads 0.51–2.65 %, and every record is admissible.
+    - Measured S14/F14 against [M]: 0.860 and 0.855 against 0.859 on 512³; 0.723 and
+      0.714 against 0.681 on the PPL-like shape (+6.2 % and +4.8 %). These ratios check
+      the tooling. They are not model evidence.
+    - The rules end to end, on relabelled copies of these records (CPU):
+      - one data set recorded twice gives INCOMPLETE (3254b15's judge said PASS);
+      - a contaminated record is inadmissible;
+      - two inadmissible attempts give INCOMPLETE, with the cause to be recorded;
+      - a bit-exact failure stops M-d2;
+      - a dirty tree, another driver or other protocol parameters are refused.
+
+      With no GPU visible, `run` refused each case the rules forbid and wrote nothing.
+    - Records: immerdink-eval `results/c1/m_d2/` (untracked; `reregister/` for daf3583);
+      summary `findings/c1-m-d2.md`.
+  - *Caller note [M, model-only, outside hold-out]* (§5.10 MD2-4, §2.4). The PPL view's bar
+    is an in-line ratio. With the invariant B (680 MB) packed per phase, the schedule gain
+    is 1.14× (P14/PF14 = 0.876, above the 0.8 cap), against 1.33× in-line: the four packs
+    cost 1.72–2.41 ms each, against packed calls of 0.67–1.59 ms.
+    - Packing B is the larger lever. At the same schedule, P14/S14 = 0.509 (about 1.97×);
+      at fixed N = 14, PF14/F14 = 0.436. P14/F14 = 0.382 combines both effects.
+    - DF and 4096³ barely change packed (P14/PF14 = 0.667, 0.678).
+    - The bars are unchanged, and the packed runs stay reported only. M-d2's measured
+      P14/PF14 replaces these figures once it runs.
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -921,6 +958,14 @@ most 0.004 (the Jacobi view, 0.7865 → 0.7826) [M; M-b, immerdink-eval
   1600×100×1600 the same schedule is predicted at 0.79× of fixed N = 14 (1.27×), and on an
   o = 10, v = 96 PPL view (100 × 9216 × 9216) at 0.75× (1.33×) [M, review]. Many-small-plans
   workloads gain about 10–25 % (§2.3).
+- **A caller who packs the PPL view's invariant B per phase gains less from the schedule**
+  [M, model-only, outside hold-out]: 1.14× (P14/PF14 = 0.876) against 1.33× in-line, because
+  each per-phase pack of the 680 MB B costs 1.72–2.41 ms.
+  - Packing B is the larger lever: at the same schedule P14/S14 = 0.509 (about 1.97×), and
+    at fixed N = 14 PF14/F14 = 0.436.
+  - DF and 4096³ barely change (P14/PF14 = 0.667, 0.678).
+  - M-d2's measured P14/PF14 replaces these figures once it runs (Status "M-d2", §5.10
+    MD2-4).
 - **All of it comes from running at a lower N**, which per-N plans already allow (§3, A1 vs A2).
 - **These rest on predictions at N = 6 and 9**, and the default levels rest on N = 6 and 12. No
   calibration or hold-out case covers 6 or 9, and 12 has a single cache-sweep row (§1.2 item 8).
@@ -2106,9 +2151,18 @@ under 100 µs (10–13 %).
     prediction band, i.e. its predicted ratio, stated next to the bar, ± the §6c.5 p90 error of
     its call class; and it is ≤ 0.8 on the PPL view, DF and 4096³. The gain against a fixed
     N = 8–9 is reported even if small.
-  - **Pre-registered protocol** (2026-10-07, before any M-d2 measurement; the driver
-    `bench/accuracy/md2_time.py` at 3254b15, whose docstring is normative; the decisions
-    are §5.10, not yet reviewed). Not run: it waits for the MC-3 path (Status "M-d2").
+  - **Pre-registered protocol** (2026-10-07, before any M-d2 measurement). Not run: it waits
+    for the MC-3 path (Status "M-d2").
+    - *Normative driver:* `bench/accuracy/md2_time.py` at **daf3583**, sha256
+      `b4cb932621eea6fdacc6fb67f13479d65ecb9544517b31e77b90870c68792c18`; its docstring is
+      normative. It replaces 3254b15 (sha256 `95ed2f6c…`), whose judge the review found
+      wrong (§5.10).
+    - *Decisions:* §5.10 MD2-0 to MD2-7, reviewed (approve-with-fixes; the verdicts are
+      binding).
+    - *If the calibration changes (MC-3a):* re-run M-b's [M] figures and `predict` (which
+      then exits 1). Update the bars, the band classes and `REGISTERED_CALIB` in the
+      driver, and commit before any M-d2 run. That re-registers the driver: a new commit
+      and sha256 here.
     - *Configuration:* `PrecisionPlan.configs()` over the levels 6, 8, 9, 10, 14, in-line,
       GENERATE, RN: M-b's view, which gives g = N at every level here. The invariant
       operand is B (the integrals) for the PPL view and DF, and A for 4096³ and for the
@@ -2137,6 +2191,35 @@ under 100 µs (10–13 %).
         [0.5721, 0.7740] (4096³); the Jacobi view's [0.550, 1.022] is reported only.
       - A system passes when both data sets are inside; M-d2 passes when all three
         systems pass.
+    - *Admissibility, re-runs and the decision* (the reviewer's binding rule, §5.10 MD2-6;
+      per system and data set; `selftest` checks it):
+      - (a) A record with `contaminated` true, or without a bit-exact match at every
+        level, is inadmissible: neither PASS nor FAIL. A bit-exact failure is a library
+        defect and stops M-d2 (M-d2 STOPPED) until it is fixed and recorded.
+      - (b) At most one re-run, in a fresh process after a FREE busy check in its own call,
+        appended to the same records file.
+      - (c) The first admissible record in file order decides, and every record is
+        reported. A later record never replaces it, and a record past the second is
+        excess, never considered.
+      - (d) If both attempts are inadmissible, the pair is INCOMPLETE, and M-d2 is not
+        decided until the cause is recorded here.
+
+      A system fails when either data set is outside. M-d2 fails when any system fails,
+      and is INCOMPLETE while any pair is undecided.
+    - *Provenance:* `judge` refuses a records file holding an M-d2 record that fails any of
+      the following, and `run` refuses to make one, before any GPU work:
+      - the registered calibration file (`d31f62ca…`);
+      - the loaded library's shipped calibration (embedded at build time) equal to that
+        file, as canonical text and as bit-identical predictions (`calib_check`);
+      - a clean tree and a non-empty `--md2-cleared`;
+      - the judging driver's own sha256;
+      - the protocol's fixed parameters (15 reps, 2 attempts, 3 s warm-up, 1 GiB primer,
+        seed 1, 5 %);
+      - the bars' configuration at every level (N moduli, g = N, GENERATE, in-line, RN,
+        EMULATE).
+
+      `run` also refuses a re-run of a decided pair, a third record, and any M-d2 system
+      after a bit-exact failure.
     - *Budget:* about 3 min of GPU in all for 8 processes, each well under 1 min per lock
       hold, with a busy check before each chunk (≤ 5 min).
 
@@ -3170,7 +3253,8 @@ dependencies:
   narrow-KL hold-out, and the per-phase conditions); then M-b's [M] figures and M-d2's bars
   re-derived if the calibration changes. Still strictly before M-d2.
 - M-d2 against its pre-registered bands, after the MC-3 path closes (§5.9 "M-d2 ordering").
-  *Its protocol and driver are pre-registered (3254b15, §4.3, §5.10), and it has not run.*
+  *Its protocol and driver are pre-registered (re-registered after review at daf3583, §4.3,
+  §5.10), and it has not run.*
   Once the ordering is met, it is eight `md2_time.py run` processes and one `judge`.
 - Then the mechanical gate decisions: stage 4 by its pre-registered rule (§4.5); stage 5
   deferred (a trigger check only, §4.6); stage 6 by its rule (§4.7).
@@ -4721,43 +4805,128 @@ of this section; they are binding.
     `sweep_disjoint_selftest` comment in `tests/CMakeLists.txt` now names the Q24 checks;
     the KF observation (MC-3a above).
 
-### 5.10 M-d2: the protocol's design questions (implementer, 2026-10-07; not yet reviewed)
+### 5.10 M-d2: the protocol's design questions (implementer and independent reviewer, 2026-10-07)
 
 Evidence: Status "M-d2"; §4.3 "Pre-registered protocol"; `bench/accuracy/md2_time.py`
-(3254b15); immerdink-eval `findings/c1-m-d2.md`. Each question was decided conservatively.
-None has an independent reviewer's verdict yet. They are to be put to the reviewer before
-M-d2 runs, and the verdicts recorded here.
+(3254b15, re-registered at daf3583); immerdink-eval `findings/c1-m-d2.md`. The implementer
+decided each question conservatively, and an independent reviewer then ruled on each; the
+verdicts are binding. The review was **approve-with-fixes**, and every fix is applied at
+daf3583 (the driver) and in the docs. No library, calibration or ABI change.
+
+Must-fix items:
+1. **The judge did not enforce MD2-3.** It keyed its verdict by system only, and `run`
+   appends to one records file, so two records of the same data set passed with no
+   decay_opp record. The reviewer reproduced it on the CPU: a smoke `normal` record
+   relabelled sq4096 at S14/F14 = 0.70, written twice, gave `sq4096: PASS`.
+   - *Fix:* the decision is keyed by (system, data), and a system needs a decisive record
+     for both normal and decay_opp.
+   - The same relabelled case now gives INCOMPLETE (Status "M-d2").
+2. **The contamination, duplicate and correctness rules were missing.** The judge counted a
+   contaminated record, or one that failed the bit-exact check, toward PASS or FAIL. That
+   left "re-run until clean or inside" as an open forking path in a pre-registered gate.
+   - *Fix:* rules (a)–(d), now in §4.3 and the driver's docstring.
+   - (a) Contaminated or not bit-exact means inadmissible, and a bit-exact failure stops
+     M-d2.
+   - (b) One re-run at most.
+   - (c) The first admissible record decides, and every record is reported.
+   - (d) Two inadmissible attempts leave the pair INCOMPLETE until the cause is recorded.
+   - `run` refuses what the rules forbid.
+3. **Re-registration before any M-d2 measurement.** The fixed driver is committed (daf3583,
+   sha256 `b4cb9326…`). §4.3, Status and the findings name it as normative in place of
+   3254b15 / `95ed2f6c…`. The verdicts are recorded here, with a summary in DESIGN §6g.9.
+
+Should-fix items:
+- *Provenance checks, all applied.* `judge` refuses, and `run` will not make, an M-d2 record
+  that fails any of the following:
+  - a clean tree, a `--md2-cleared` reason, and the judging driver's sha256;
+  - the bars' configuration at every level (N moduli, g = N, GENERATE, in-line, RN,
+    EMULATE), read from each record rather than assumed;
+  - the fixed protocol parameters. The implementer added this one: `--reps` and the other
+    parameters are flags, so a run with other values would not be the protocol;
+  - a functional calibration check (`calib_check`). The library embeds its calibration at
+    build time, so the file hash alone could pass a stale build. The loaded library's
+    shipped calibration must equal the registered file, as canonical text and as
+    bit-identical predictions (in-line DEFAULT/COLD and BURST/REPEAT, and the pack, at
+    every level). It passes at daf3583. A changed parameter fails it, and so does a changed
+    notes line.
+- *MD2-4 wording and labels.* The like-for-like figures are added, P14/S14 = 0.509 and
+  PF14/F14 = 0.436 beside P14/F14 = 0.382. Every schedule figure using N = 6 or 9 is
+  marked [M, model-only, outside hold-out] (IR4).
+- *The MD2-4 caller note* is in §2.4 and DESIGN §6g.12.
+- *The report cites both smoke ratios or neither.* They are tooling checks, not model
+  evidence (Status "M-d2").
+- *Optional, done:* `judge` counts the gated S14/F14 runs not queued ahead, apart from the
+  pooled fraction.
+
+The questions and verdicts:
 - **MD2-0. A request to run M-d2 while MC-3 is open.** A workflow task of 2026-10-07 asked
   for M-d2 on the shipped calibration. *Decision:* not run. The §5.9 "M-d2 ordering"
   verdict is binding, and running first would create the out-of-order evidence and the two
-  M-d2 results it rules out. The tooling is pre-registered instead, and `run` encodes the
-  ordering (`--md2-cleared`). *For the reviewer or Eric:* either pursue MC-3 (MC-3a) first,
-  or close it without a calibration change; M-d2 then runs on the bars unchanged.
+  M-d2 results it rules out. The tooling was pre-registered instead, and `run` encodes the
+  ordering (`--md2-cleared`).
+  ***Verdict: UPHELD; M-d2 does not run now (binding). The path is MC-3a first.***
+  - MC-3 may be closed without a calibration change only as MC-3a's recorded outcome (the
+    feature fails its pass conditions and is not adopted, with a §5.9-style verdict) or by
+    Eric's explicit decision. A workflow request, or the wish to unblock M-d2, is not
+    grounds to close it.
+  - If MC-3a changes the calibration: re-run M-b's [M] figures and `predict` (which exits
+    1); update the bars, the band classes and `REGISTERED_CALIB`; commit before any M-d2
+    run.
+  - If MC-3 closes unchanged, M-d2 runs on 0.750 / 0.664 / 0.673 as registered.
+
+  *Rationale:* several binding decisions put M-c and its recalibration strictly before
+  M-d2: §5.9, IR23, the order of work and the definition of done. A workflow task carries
+  no authority to override them. The n1 refit showed that the PPL view's prediction is
+  sensitive to the KL parameters (+11 … +20 %), so MC-3a may move a gated bar. M-d2 records
+  made now would have to be discarded, giving two M-d2 results, or could leak per-phase PPL
+  errors into MC-3a's feature choice, which MC-3a restricts to the allowed records. The
+  reviewer re-ran `predict` at 99de0ef: byte-identical.
 - **MD2-1. What is timed.** *Decision:* end-to-end 16-call runs, back to back on one stream
   through the device API. The gated statistic is the ratio of the median run totals. It is
   not composed from per-N single-call medians: M-c's indicative §6g.9 figures did that, and
   the verdict excludes them from M-d2. The phase switches (another plan; the first call at
   a new N) are inside the runs. The paired per-rep ratios are reported.
+  ***Verdict: UPHELD.*** This is the quantity the bars predict, and the paired ratios and
+  the per-phase table never adjust the bars or the band.
 - **MD2-2. The band.** *Decision:* relative, bar × (1 ∓ p90), not bar ∓ p90 in absolute
   ratio units. That is narrower (± 0.11 rather than ± 0.15 on the PPL view), and p90 is a
   relative error. The class comes from the predicted (DEFAULT/COLD) calls; if a system's
   levels span classes, it takes the largest p90 among them. The cap ≤ 0.8 applies to the
   gated three.
+  ***Verdict: UPHELD.*** §6c.5's p90 is a relative error of the total. Fixing the class from
+  the predictions, not from measured times, removes a data-dependent choice of band. Every
+  level of the gated three is predicted ≥ 1 ms (DF at N = 6 is the closest, at 1.202 ms),
+  so p90 = 15 %. *No action:* §6c.5's targets are validated in BURST/REPEAT, the bars in
+  DEFAULT/COLD, and the gated ratios move by under 1 % between the two (0.7501/0.7501,
+  0.6635/0.6696, 0.6728/0.6796).
 - **MD2-3. Data.** *Decision:* both normal and decay_opp are gated, and a system passes only
   when both are inside. This is stricter than either alone. decay_opp is
   `c2_fixtures.synthetic` on the GEMM view, with K in the spec's mode order.
+  ***Verdict: UPHELD, with the implementation fixed*** (must-fix 1): the judge checks
+  {normal, decay_opp} per system.
 - **MD2-4. In-line bars against packed use.** The registered bars are in-line ratios, the
   configuration of the [M] figures. The re-pack runs (P14 / PF14) are reported, not gated.
-  *Observation [M]:* on the PPL view a caller who packs the invariant B per phase is
-  predicted at P14/PF14 = 0.876, above the 0.8 cap, though 2.6× faster in absolute terms
-  than in-line (P14/F14 = 0.382). The four packs of the 680 MB B (1.72–2.41 ms each)
-  compete with packed calls of 0.67–1.59 ms. DF (0.667) and 4096³ (0.678) change little.
-  *Decision:* the binding bars stand. *For the reviewer:* whether §2.4's PPL statement or
-  the guidance for callers should say that the in-line gain (1.33×) overstates a
-  packed-B caller's (1.14× [M]).
+  *Observation [M, model-only, outside hold-out]:* on the PPL view a caller who packs the
+  invariant B per phase is predicted at P14/PF14 = 0.876, above the 0.8 cap. The four
+  packs of the 680 MB B (1.72–2.41 ms each) compete with packed calls of 0.67–1.59 ms.
+  - Like for like, packing B at the same schedule gives P14/S14 = 0.509 (about 1.97×), and
+    at fixed N = 14 PF14/F14 = 0.436. P14/F14 = 0.382 combines the schedule and packing
+    effects.
+  - DF (0.667) and 4096³ (0.678) change little.
+
+  *Decision:* the binding bars stand. The implementer asked whether §2.4 or the caller
+  guidance should say that the in-line gain (1.33×) overstates a packed-B caller's (1.14×).
+  ***Verdict: bars unchanged (binding); the packed runs stay reported only. YES to a caller
+  note*** in §2.4 and DESIGN §6g.12, labelled [M, model-only, outside hold-out], with the
+  like-for-like figures. *Rationale:* §5.9 binds the in-line bars, and a packed gate added
+  after registration would change the gate after the fact. A caller who packs the invariant
+  integrals, the realistic consumer, would read 1.33× as their gain. N = 6 and 9 and the
+  large-pack predictions lie outside the hold-out until M-c passes. M-d2's measured
+  P14/PF14 replaces the figures once it runs.
 - **MD2-5. "The gain against a fixed N = 8–9".** *Decision:* read as §2.4's schedule ending
   at N = 9, S9 = 6×N6 + 10×N9 against F9, plus the per-call t14/t8 and t14/t9 from F8 and
   F9. All reported.
+  ***Verdict: UPHELD.*** It is §2.4's own schedule, word for word.
 - **MD2-6. Method details.** *Decision:*
   - a 3 s warm-up of the system's own N = 14 call (warm_run.sh's 3 s, on the system itself
     rather than 4096³), then every level once, so no first call is timed;
@@ -4768,9 +4937,28 @@ M-d2 runs, and the verdicts recorded here.
   - warm_run.sh's 5 % spread rule with M-c's 2 attempts;
   - the raw entry points `contract_ptr` / `pack_ptr` in the timed loop, with the checked
     calls (`contract`, `Pack.pack` into a `PackedBuffer`) in the bit-exact check.
+
+  ***Verdict: UPHELD, amended*** by must-fix 2 (rules (a)–(d)) and by the provenance
+  should-fix items. *Rationale:* the warm-up loads every kernel instantiation before any
+  timed call. The primer gets each run enqueued without a host gap (the smoke: enqueue
+  ≤ 0.23 ms against a 1.1 ms primer, 35 of 35 runs). The flushed L2 at each run's first
+  call affects S14 and F14 alike and is immaterial at ≥ 1 ms. Rotation balances position
+  effects. Stock clocks is the regime of §6c.5 and of M-c. What was missing was what
+  happens to a contaminated, duplicated or non-bit-exact record.
 - **MD2-7. Configuration.** *Decision:* `PrecisionPlan.configs()` with GENERATE only and
   in-line, the bars' configuration (M-b's view). It picks g = N at every level on all four
   systems (`predict`).
+  ***Verdict: UPHELD; the judge verifies it per record.*** The configuration is chosen at
+  run time through the loaded library, so each record is checked rather than assumed (done:
+  each record carries every level's num_moduli, g, vec mode, packed, rounding and mode).
+- **MD2-8. Which driver is "the registered one"** (implementer, while applying the review).
+  A file cannot contain its own sha256.
+  *Decision:* `judge` requires each M-d2 record's `driver_sha256` to equal the judging
+  driver's own, and the record's tree to be clean (`dirty` false, this driver included).
+  The judge is then byte-identical to the committed driver that made the record. §4.3 and
+  the findings name the registered commit and sha256, and `judge` prints its own for
+  comparison. Any later change to the driver re-registers it. Not reviewed; conservative:
+  a separate registration file was considered and judged no stronger.
 
 ---
 
