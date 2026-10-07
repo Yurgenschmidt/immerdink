@@ -51,7 +51,14 @@ what has been built since is recorded under "Implementation status".
   with one more fix, applied: a `rho_from_output` bound of ndim ≥ 2 must lie along its own
   axis and carry none or all of C's batch dims (MF3, S1-7). It made S1-10 binding as
   implemented (a shared role's reuse stays fixed while a member is at DIRECT) and confirmed
-  that groups joined only through a DIRECT member are ranked separately (S1-5). The
+  that groups joined only through a DIRECT member are ranked separately (S1-5). A second
+  re-review approved with one more fix (MF4, S1-7, binding), applied: on a batched C
+  (C.ndim ≥ 3) a `rho_from_output` bound is a scalar or has exactly C.ndim dims, and every
+  1-D or 2-D bound raises, since per-batch scalars written without keepdims, (b,) or (b, 1),
+  were paired with C's rows or columns where b = m or b = n and certified ρ̂/ρ down to 0.0081;
+  a 2-D C keeps the S1-7 rule. `host_precision` checks it, a mutation that drops the rule
+  fails it, and the only in-repo caller (`bench/accuracy/md1_converge.py`, 1-D bounds on a
+  2-D D) is unaffected. The
   provenance of DESIGN §6g.10's cost figures (IR9 style) is
   immerdink-eval `findings/c1-stage1-phase-cost.md`, with the script committed there
   (39d9f9f) and both records untracked, listed with their sha256; a re-run on 51dba1e
@@ -1395,10 +1402,15 @@ rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, beta=
   cannot be recovered exactly from RN(α·D) (§3.7: E = RN(α·D); DESIGN.md:432).
 - *Inputs.* A call at N with α = 2^e and β = 0, so its output C gives D = ldexp(C, −e). Upper
   bounds n_ij ≥ ‖a_i‖‖b_j‖ from the caller's row and column 2-norms, computed so that they really
-  are upper bounds (§6f.1's existing obligation). *[Stage-1 reviews, §5.5 S1-7, binding:]* for
-  C.ndim ≥ 2 each bound lies along its own axis: a 1-D row bound is axis −2 and a 1-D column
-  bound axis −1, each of exactly that length; a row bound of ndim ≥ 2 has shape[−1] = 1 and a
-  column bound shape[−2] = 1, with none or all of C's batch dims; anything else raises.
+  are upper bounds (§6f.1's existing obligation). *[Stage-1 reviews, §5.5 S1-7, binding:]*
+  each bound lies along its own axis, a row bound axis −2 and a column bound axis −1. For a
+  2-D C: a scalar, a 1-D row bound of exactly length m and a 1-D column bound of exactly
+  length n, a row bound (m, 1) and a column bound (1, n). For a batched C (C.ndim ≥ 3; second
+  re-review, MF4): a scalar, or a bound with exactly C.ndim dims, each batch dim C's or 1, a
+  row bound with shape[−1] = 1 and a column bound with shape[−2] = 1 ((…, m, 1), (…, 1, n),
+  (1, …, m, 1), (b, …, 1, 1)); a 1-D or 2-D bound on a batched C raises, with the keepdims
+  spelling in the message (e.g. `r[None, :, None]` for one shared across batches). Anything
+  else raises. A 0-D or 1-D C broadcasts its bounds elementwise.
 - *U.* Let U = the NORMWISE `bound` of `imd_err_estimate` at that (N, rounding, k), with
   ν = √k unless the caller's ℓ1 ratios hold. It is evaluated as compose() does,
   E + E·u + u (accuracy.cpp:48-58), times (1 + 2^−40); never as E·(1 + u), since 1 + 2^−53
@@ -3450,7 +3462,10 @@ change list, "Stage-1 review fixes"). A re-review of the fixes was approve-with-
 one must-fix item (MF3, under S1-7) and four should-fix items (partial batch dims of a norm
 bound, S1-10 in the API docstrings and here, a docstring reflow), all applied ("Stage-1
 re-review fixes"); its verdicts on the three questions the fixes raised are under S1-5, S1-7
-and S1-10.
+and S1-10. A second re-review was approve-with-fixes too: one must-fix item (MF4, under S1-7,
+binding) and three should-fix items (the MF3 sentence of DESIGN §6g.11, the S1-10 wording
+of the docstrings, and the probe's forms with an exact-rational check in the test), all
+applied ("Stage-1 second re-review fixes").
 - **S1-1. Parameters beyond §4.2's signature.** `vec_modes` (§4.2 ranks "the given vec modes"
   but names no parameter); `perf` (regime, cache, clock of rank and the pack predictions: the
   `Planner` carries only the calibration and the memo, not the regime or cache §4.2's comment
@@ -3527,7 +3542,40 @@ and S1-10.
   row bound, an (m, 1) column bound and an elementwise (m, n) bound now raise.
   `host_precision` checks per-batch keepdims bounds on unequal batches (one and two batch
   dims) against each batch's own 2-D call bit for bit, and ρ̂ ≥ row_i·col_j / |C_ij| in
-  exact rationals; every rejected form raises.
+  exact rationals; every rejected form raises. *Second re-review: the rule made structural
+  for a batched C (binding, MF4); it overrides MF2's "for any batch dims" for C.ndim ≥ 3
+  only.* The MF3 rule still accepted per-batch scalars written without keepdims and paired
+  them with C's rows or columns. The reviewer's probe (A[0] and B[−1] scaled by 100, the
+  bounds rounded up, N = 14, k = 16, every output checked against the true ρ in exact
+  rationals): (a) a row bound `norm(A, axis=-1).max(-1)` of shape (b,) on C (b, m, n) with
+  b = m was taken as the axis −2 vector: at b = m = 3, n = 5, 45 outputs certified, 15 below
+  ρ, min ρ̂/ρ 0.0081; at b = m = n = 4, 20 below, 0.0101. (b) A column bound of shape (b,)
+  with b = n: at b = m = n = 4, 16 below, 0.0113; at b = 3, m = 5, n = 3, 10 below, 0.0105.
+  (c) A row bound of shape (b, 1), e.g. `norm(A.reshape(b, -1), axis=1, keepdims=True)`,
+  with b = m passed the shape[−1] = 1 check and gave the same 0.0081. The documented
+  (b, 1, 1) forms gave 0 below. No 1-D or 2-D bound on a batched C can be told apart from a
+  per-batch scalar where b equals m or n, so the fix is structural. **The rule:** for
+  C.ndim ≥ 3 a bound is a 0-D scalar or has exactly C.ndim dims, each batch dim C's or 1, a
+  row bound with shape[−1] = 1 and a column bound with shape[−2] = 1 ((…, m, 1), (…, 1, n),
+  (1, …, m, 1), (b, …, 1, 1) and so on); any 1-D or 2-D bound on a batched C raises
+  ValueError, and the message names the keepdims spelling (e.g. `r[None, :, None]` for a
+  bound shared across batches). For C.ndim = 2 the rule is unchanged (a scalar, a 1-D bound
+  on its own axis of exact length, (m, 1) / (1, n)); a 0-D or 1-D C still broadcasts
+  elementwise; the partial-batch check is subsumed by the ndim rule. `host_precision` now
+  checks, on 3-D and 4-D C: a vector shared by every batch in the full-ndim spelling (also
+  with the batch dims spelled out, or a scalar on one side) equals each batch's 2-D call bit
+  for bit; per-batch keepdims bounds and per-batch scalars (…, 1, 1) on unequal batches
+  equal each batch's 2-D call with no certified ρ̂ below the true ρ in exact rationals; the
+  probe's forms ((b,) rows at b = m, (b,) columns at b = n, (b, 1) rows at b = m), shared
+  1-D (m,) and 2-D (m, 1) / (1, n) bounds, the MF3 forms and partial-batch bounds raise. A
+  rejected form that is accepted fails with its count of certified outputs below the true ρ.
+  *Mutation check:* with the ndim rule dropped, and on the pre-MF4 code, the test fails
+  first with "norms (3,) x (3, 1, 3) on C (3, 3, 3): accepted, 27 outputs certified, 9 of them
+  with rho_hat below the true rho"; collecting every accepted form instead, the mutant
+  accepts 17 unsound forms (the pre-MF4 code 11; the other 6 are partial-batch forms, which
+  only the ndim rule now rejects), with 2–28 certified outputs below ρ each. The only
+  in-repo caller, `bench/accuracy/md1_converge.py`, passes 1-D bounds on a 2-D D and is
+  unaffected.
 - **S1-8. `fail_budget`** is per phase (§4.2 step 7: P over the phase's calls). A run budget is
   the caller's split; the example calls `phase()` every iteration with `iterations=1` and
   P / T_max. *Verdict: accepted.*
@@ -3546,9 +3594,9 @@ and S1-10.
   loop cover every phase (graph capture, `PlanCache.freeze`); a near-tie reordered in
   floating point could pick a configuration whose plan was never created, a hard failure in
   the loop. The cost is a model figure only: the other members' pack term, and
-  `Phase.time_s`, are optimistic by at most pack_s × (the DIRECT member's calls / the summed
-  calls) per iteration, in a phase that already runs a native FP64 (1:64) contraction, which
-  dominates its time. Numerics, budgets and footprints are unaffected. The same covers the
+  `Phase.time_s`, are optimistic by at most pack_s × (the DIRECT members' summed calls / the
+  summed calls) per iteration, in a phase that already runs a native FP64 (1:64) contraction,
+  which dominates its time. Numerics, budgets and footprints are unaffected. The same covers the
   shared role staying packed when one member alone reads it in that phase. The `reuse` and
   `Phase` docstrings say so (`Phase.reuse` reports e.g. {B: 4} where one call reads the
   pack). Revisit only if a consumer runs share groups with DIRECT members in practice; the

@@ -152,7 +152,8 @@ class Phase:
     shared pack is repeated under every member that reads it, while footprints() counts it
     once, keyed by its group), reuse ({role: calls per pack}; a shared role's still counts a
     member at DIRECT in this phase, which reads no pack, so the other members' times are then
-    optimistic [M]: PrecisionPlan's `reuse`), assumed_reuse ({role: "iteration"} where
+    optimistic [M], by at most pack_s x the DIRECT members' summed share of the calls per
+    iteration: PrecisionPlan's `reuse`), assumed_reuse ({role: "iteration"} where
     'phase' fell back for want of `iterations`), err_bound / err_typical (in each target's
     metric) are dicts by name; time_s = the calls-weighted sum of the composed times (one
     iteration), tflops_eq = sum of calls x 2bmnk / time_s."""
@@ -264,8 +265,9 @@ class PrecisionPlan:
         Phase.assumed_reuse), or the int. A shared role: the members' summed calls (an int:
         the total), the members' kinds must agree; fixed at construction, so it still counts
         a member at DIRECT in a phase (which reads no pack). The other members' pack term,
-        and Phase.time_s, are then optimistic [M], by at most pack_s x that member's share of
-        the calls, and every phase's choice stays a configs() plan (NOTES-C1 §5.5 S1-10).
+        and Phase.time_s, are then optimistic [M], by at most pack_s x the DIRECT members'
+        summed share of the calls per iteration, and every phase's choice stays a configs()
+        plan (NOTES-C1 §5.5 S1-10).
     budget: immerdink-owned device bytes per contraction (workspace + plan + packs + pack
         workspace), rank's meaning; an int for all or {name: int}; 0 = none. The caller
         subtracts its own resident tensors, the FP64 source of a packed operand included.
@@ -754,14 +756,21 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
 
     C: a float64 host array (numpy; copy a device C or the part needed to the host first).
     row_norm_ub, col_norm_ub: upper bounds of the GEMM view's row 2-norms ||a_i|| and column
-    2-norms ||b_j|| (§6f.1's obligation: really upper bounds, e.g. rounded up). For C.ndim >= 2
-    each bound lies along its own axis, for any batch dims: a scalar; a 1-D row_norm_ub is
-    the vector along axis -2 (length C.shape[-2]) and a 1-D col_norm_ub the one along axis -1
-    (length C.shape[-1]); a row bound of ndim >= 2 has shape[-1] == 1 ((m, 1) or a per-batch
-    (..., m, 1), keepdims=True) and a column bound shape[-2] == 1 ((1, n) or (..., 1, n)),
-    with none or all of C's batch dims. Anything else is a ValueError, e.g. numpy's (b, m) /
-    (b, n) norms without keepdims, which trailing-axis broadcasting would pair with C's rows
-    and columns. For a 0-D / 1-D C the bounds broadcast elementwise.
+    2-norms ||b_j|| (§6f.1's obligation: really upper bounds, e.g. rounded up). A row bound
+    lies along axis -2 and a column bound along axis -1:
+    - C of shape (m, n): a scalar; a 1-D row_norm_ub of length m and a 1-D col_norm_ub of
+      length n, each on its own axis; a row bound (m, 1) and a column bound (1, n).
+    - A batched C (..., m, n), C.ndim >= 3: a scalar, or a bound with exactly C.ndim dims, a
+      row bound (..., m, 1) and a column bound (..., 1, n), each batch dim C's or 1 (shared
+      over that batch axis), keepdims=True: np.linalg.norm(A, axis=-1, keepdims=True) per
+      batch, (b, 1, 1) one value per batch, r[None, :, None] / c[None, None, :] one vector
+      shared by every batch of a 3-D C. A 1-D or 2-D bound on a batched C is a ValueError:
+      numpy's per-batch reductions without keepdims, (b,), (b, 1), (b, m) or (b, n), cannot
+      be told apart from a row or column vector when b equals m or n, and trailing-axis
+      broadcasting pairs them with C's rows or columns.
+    Anything else is a ValueError too: a 1-D bound of another length (1 included), a
+    transposed (1, m) row or (m, 1) column bound, an elementwise (m, n) one. For a 0-D / 1-D
+    C the bounds broadcast elementwise.
     Real norms, not sigma-derived ones (a zero row's sigma bound is vacuous). l1_ratio: None
     (nu = sqrt k), one value for both, or (l1_ratio_a, l1_ratio_b), as host.Accuracy.
     U is the NORMWISE `bound` of imd_err_estimate at (N, rounding, k) for the call's dispatch
@@ -775,7 +784,8 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
     ValueError: beta != 0 (for beta = 1 accumulations take rho from a probe call with
     beta = 0 into a scratch buffer, once per phase), alpha not a power of two (D cannot be
     recovered exactly from RN(alpha D)), a negative or NaN norm bound, a bound off its axis
-    (above), shapes that do not broadcast to C. TypeError: C not float64."""
+    or of another ndim (above), shapes that do not broadcast to C. TypeError: C not
+    float64."""
     import numpy as np
     if beta != 0:
         raise ValueError("rho_from_output needs beta = 0 (take rho from a beta = 0 probe call)")
@@ -800,18 +810,23 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
     row = np.asarray(row_norm_ub, dtype=np.float64)
     col = np.asarray(col_norm_ub, dtype=np.float64)
     if C.ndim >= 2:     # a row bound lies along axis -2, a column bound along axis -1
-        for arg, b, own, along, what, form in (
-                ("row_norm_ub", row, -2, -1, "rows", "(..., m, 1)"),
-                ("col_norm_ub", col, -1, -2, "columns", "(..., 1, n)")):
+        lead = "None, " * (C.ndim - 2)
+        for arg, b, own, along, what, form, shared in (
+                ("row_norm_ub", row, -2, -1, "rows", "(..., m, 1)", f"r[{lead}:, None]"),
+                ("col_norm_ub", col, -1, -2, "columns", "(..., 1, n)", f"c[{lead}None, :]")):
+            if C.ndim >= 3 and b.ndim not in (0, C.ndim):
+                raise ValueError(
+                    f"{arg} of shape {b.shape} on a batched C {C.shape}: a bound is a scalar "
+                    f"or has C's {C.ndim} dims, {form} with each batch dim C's or 1 "
+                    f"(keepdims=True; {shared} for one shared by every batch); a 1-D or 2-D "
+                    "bound cannot be told apart from a per-batch one where a batch extent "
+                    "equals m or n")
             if b.ndim == 1 and b.shape[0] != C.shape[own]:
                 raise ValueError(f"a 1-D {arg} has length {b.shape[0]}, C has "
                                  f"{C.shape[own]} {what} (axis {own})")
             if b.ndim >= 2 and b.shape[along] != 1:
                 raise ValueError(f"{arg} of shape {b.shape} on C {C.shape}: a bound of the "
                                  f"{what} has shape[{along}] == 1, {form} (keepdims=True)")
-            if 2 < b.ndim < C.ndim:
-                raise ValueError(f"{arg} of shape {b.shape} on C {C.shape}: it carries some "
-                                 "of C's batch dims (none or all)")
         if row.ndim == 1:
             row = row[:, None]
     try:

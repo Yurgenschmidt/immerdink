@@ -5199,9 +5199,9 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   shared term is one constant within a level), but in floating point it could reorder
   near-ties and pick a configuration whose plan was never created, a hard failure in the
   loop (graph capture, a frozen `PlanCache`). The optimism is at most pack_s × (the DIRECT
-  member's calls / the summed calls) per iteration, in a phase that already runs a native
-  FP64 (1:64) contraction, which dominates its time; numerics, budgets and footprints are
-  unaffected. The same holds for the shared role staying packed when one member alone
+  members' summed calls / the summed calls) per iteration, in a phase that already runs a
+  native FP64 (1:64) contraction, which dominates its time; numerics, budgets and footprints
+  are unaffected. The same holds for the shared role staying packed when one member alone
   reads it in that phase. `Phase.reuse` reports the fixed figure (e.g. {B: 4} where one
   call reads the pack). To revisit only if a consumer runs share groups with DIRECT members
   in practice: then take each level's configuration from `configs()` and use the actual
@@ -5263,25 +5263,32 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 - **Inputs.** A call at (N, rounding, k, mode) with α = 2^e and β = 0 wrote C = RN(2^e D)
   (§3.7), D its product. `C` is a float64 host array (copy it, or the part needed, to the
   host: the helper moves no data). `row_norm_ub`, `col_norm_ub` are upper bounds of the GEMM
-  view's row and column 2-norms (§6f.1's obligation: really upper bounds). For C.ndim ≥ 2
-  each bound lies along its own axis, for any batch dims:
-  - a scalar;
-  - a 1-D `row_norm_ub` is the vector along axis −2 (length C.shape[−2]) and a 1-D
-    `col_norm_ub` the one along axis −1 (length C.shape[−1]), each on its own; another
-    length, 1 included, is a ValueError;
-  - a row bound of ndim ≥ 2 has shape[−1] = 1 ((m, 1), or per batch (…, m, 1), numpy's
-    `keepdims=True`) and a column bound shape[−2] = 1 ((1, n) or (…, 1, n)), carrying none or
-    all of C's batch dims;
-  - anything else is a ValueError: numpy's per-batch norms without `keepdims`, (b, m) and
-    (b, n), a transposed (1, m) row or (m, 1) column bound, an elementwise (m, n) one, or a
-    bound with some of C's batch dims (numpy would align them with C's trailing batch dims).
-  For a 0-D or 1-D C the bounds broadcast elementwise. numpy's trailing-axis rule alone pairs
-  a bound with the wrong axis whenever two of C's extents are equal: `row_norm_ub[j]` with
-  column j at m = n (a batched C, or a 1-D row bound with a (1, n) column bound;
-  independent review of stage 1, MF2), and the batch index with a row or column at b = m or
-  b = n (the (b, m) / (b, n) norms; re-review, MF3). Both certified ρ̂ far below ρ: ≈ 1
-  where ρ ≥ 100, and ρ̂/ρ ≈ 0.006. Real norms, not σ-derived ones: a zero row has σ := 0, so
-  its bound d·2⁰ is vacuous. `l1_ratio`: as `Accuracy`'s (ν = √k without it).
+  view's row and column 2-norms (§6f.1's obligation: really upper bounds). A row bound lies
+  along axis −2 and a column bound along axis −1:
+  - **C of shape (m, n):** a scalar; a 1-D `row_norm_ub` of length m and a 1-D
+    `col_norm_ub` of length n, each on its own axis (another length, 1 included, is a
+    ValueError); a row bound (m, 1) and a column bound (1, n).
+  - **A batched C (…, m, n), C.ndim ≥ 3:** a scalar, or a bound with exactly C.ndim dims, a
+    row bound (…, m, 1) and a column bound (…, 1, n) (numpy's `keepdims=True`), each batch
+    dim C's or 1 (shared over that batch axis): per-batch norms
+    `np.linalg.norm(A, axis=-1, keepdims=True)`, one value per batch (b, 1, 1), one vector
+    shared by every batch `r[None, :, None]` / `c[None, None, :]` (at C.ndim = 3). A 1-D or
+    2-D bound on a batched C is a ValueError, and so is a bound of any other ndim: the error
+    names the keepdims spelling.
+  - Anything else is a ValueError too: a transposed (1, m) row or (m, 1) column bound, an
+    elementwise (m, n) one.
+  For a 0-D or 1-D C the bounds broadcast elementwise. The rule is structural because numpy's
+  trailing-axis broadcasting pairs a bound with the wrong axis whenever two extents are equal,
+  and certified ρ̂ far below ρ each time: `row_norm_ub[j]` with column j at m = n (1-D bounds
+  on a batched C, or a 1-D row bound with a (1, n) column bound; independent review of stage
+  1, MF2: ρ̂ ≈ 1 where ρ ≥ 100); numpy's per-batch norms without keepdims, a (b, n) column
+  bound at b = m and a (b, m) row bound at b = m = n (re-review, MF3: ρ̂/ρ ≈ 0.006); and
+  per-batch scalars without keepdims, a (b,) row bound at b = m, a (b,) column bound at
+  b = n and a (b, 1) row bound at b = m (second re-review, MF4: ρ̂/ρ = 0.0081–0.0113). On a
+  batched C no 1-D or 2-D bound can be told apart from a per-batch one where b equals m or
+  n, so only scalars and full-ndim bounds pass. Real norms, not σ-derived ones: a zero row
+  has σ := 0, so its bound d·2⁰ is vacuous. `l1_ratio`: as `Accuracy`'s (ν = √k without
+  it).
 - **Restrictions.** β must be 0 and α = 2^e, else ValueError: D = ldexp(C, −e) is exact,
   while D cannot be recovered from RN(α·D) for another α (§3.7). For β = 1 accumulations (CC
   residual builders) take ρ from a probe call with β = 0 into a scratch buffer, once per
@@ -5342,14 +5349,23 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
   - `footprints()` equals the maximum of the C queries over the allowed pack modes × vec
     modes × every g, per level, with its totals.
   - `rho_from_output` equals `params.rho_recipe` bit for bit (random and boundary values,
-    every α = 2^e class, specials, broadcast and batched forms); 1-D bounds on batched C, at
-    m = n and mixed with 2-D bounds equal the explicit (m, 1) × (1, n) result, and a 1-D bound
-    of another length raises; per-batch (…, m, 1) × (…, 1, n) bounds on unequal batches
-    (one and two batch dims) equal each batch's own 2-D call, with ρ̂ ≥ row_i·col_j / |C_ij|
-    in exact rationals, while the (b, m) / (b, n) forms at b = m and b = m = n, transposed,
-    elementwise and partial-batch bounds raise; U ≥ params' exact bound (its upper
-    enclosure) at N = 2–20, k = 1–40000, both roundings and dispatches; ρ̂ ≥ ρ in exact
-    rationals on emulated outputs (`params.emulate_element`); ValueError / TypeError cases.
+    every α = 2^e class, specials, broadcast and batched forms). On a 2-D C, 1-D bounds at
+    m = n and mixed with 2-D bounds equal the explicit (m, 1) × (1, n) result, and a 1-D
+    bound of another length raises. On a batched C (3-D and 4-D), a vector shared by every
+    batch in the full-ndim spelling (also with the batch dims spelled out, or a scalar on one
+    side) equals each batch's 2-D call bit for bit; per-batch (…, m, 1) × (…, 1, n) bounds
+    and per-batch scalars (…, 1, 1) on unequal batches (one and two batch dims) equal each
+    batch's own 2-D call, with no certified ρ̂ below row_i·col_j / |C_ij| in exact
+    rationals. Every 1-D and 2-D bound on a batched C raises: per-batch scalars without
+    keepdims, (b,) at b = m and at b = n and (b, 1) at b = m; the (b, m) / (b, n) norms at
+    b = m and b = m = n; a shared (m,), (m, 1), (n,) or (1, n) bound on a 3-D and a 4-D C.
+    So do bounds of another ndim and transposed, elementwise and partial-batch ones. A form
+    the rule would wrongly accept fails with its count of certified outputs below the true ρ
+    (exact rationals): the mutation that drops the ndim rule, and the pre-MF4 code, fail
+    first on a (b,) row bound at b = m = n = 3, 9 of 27 certified outputs below ρ. U ≥
+    params' exact bound (its upper enclosure) at N = 2–20, k = 1–40000, both roundings and
+    dispatches; ρ̂ ≥ ρ in exact rationals on emulated outputs (`params.emulate_element`);
+    ValueError / TypeError cases.
 - **[cert] `cert_rho_recipe`** (`params.py --check`), in exact rationals: on emulated elements
   (both roundings, every N = 2–20, random and cancelling rows whose |x| is 0.3–30 × U‖a‖‖b‖,
   α = 2^e, U the tightest double above the exact NORMWISE bound, with ν = √k and with the
@@ -6157,6 +6173,17 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     (b, n) norms without keepdims were paired with C's rows or columns at b = m and certified
     ρ̂ ≈ 0.006 ρ (§6g.11, MF3); S1-10 (a shared role's reuse stays fixed while a member is at
     DIRECT) is binding and documented in §6g.10 and the `reuse` and `Phase` docstrings.
+  - **Stage-1 second re-review fixes** (approve-with-fixes; NOTES-C1 §5.5 S1-7, MF4): on a
+    batched C (C.ndim ≥ 3) a `rho_from_output` bound is a scalar or has exactly C.ndim dims
+    (each batch dim C's or 1, a row bound shape[−1] = 1, a column bound shape[−2] = 1), and
+    every 1-D or 2-D bound raises a ValueError that names the keepdims spelling, since
+    per-batch scalars without keepdims, (b,) or (b, 1), were paired with C's rows at b = m
+    or columns at b = n and certified ρ̂/ρ = 0.0081–0.0113 (§6g.11). This narrows MF2's "for
+    any batch dims" to C.ndim = 2, where the rule is unchanged, and subsumes the
+    partial-batch check. `host_precision` checks the batched forms against each batch's 2-D
+    call and the rejected ones in exact rationals (§6g.12). The S1-10 optimism bound reads
+    "the DIRECT members' summed share of the calls, per iteration" (§6g.10, the `reuse` and
+    `Phase` docstrings).
 - **Stage 3** (NOTES-C1 §4.4 with IR5, IR12, IR15; C2; no ABI change, host API 13):
   - **§3.8 "Segmented accumulation":** the K-segmentation caller recipe (S calls, β = 1
     after the first, moved base pointers; per-band σ, flags, RN acceptance and packs), its

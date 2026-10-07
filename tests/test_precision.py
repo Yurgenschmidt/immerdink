@@ -28,15 +28,19 @@ a brute force from host.py's queries and against spec/params.py. CPU only.
   - rho_from_output == spec/params.py rho_recipe bit for bit (random and boundary values,
     every alpha = 2^e class), U == imd_err_estimate's NORMWISE bound for the call's dispatch
     and >= params' exact bound (the upper end of its enclosure) at N = 2..20, both dispatches;
-    a 1-D row bound is axis -2 and a 1-D column bound axis -1 for any C.ndim >= 2 (batched,
-    m == n, mixed with 2-D bounds: == the explicit (m, 1) x (1, n) result); a row bound of
-    ndim >= 2 has shape[-1] == 1 and a column bound shape[-2] == 1, with none or all of C's
-    batch dims (per-batch (..., m, 1) x (..., 1, n) bounds on unequal batches == each batch's
-    2-D call and rho_hat >= row_i col_j / |C_ij| exactly; (b, m) / (b, n) norms without
-    keepdims at b == m and b == m == n, transposed, elementwise and partial-batch bounds
-    raise), rho_hat >= rho in exact rationals on emulated outputs (params.emulate_element),
-    the ValueError / TypeError cases (beta != 0, alpha != 2^e, bad norms, 1-D lengths, shapes,
-    dtype).
+    on a 2-D C a 1-D row bound is axis -2 and a 1-D column bound axis -1 (m == n, mixed with
+    2-D bounds: == the explicit (m, 1) x (1, n) result), a row bound of ndim 2 has
+    shape[-1] == 1 and a column bound shape[-2] == 1; on a batched C (ndim 3 and 4) a bound
+    is a scalar or has exactly C.ndim dims (MF4): shared r[None, ..., :, None] x
+    c[None, ..., None, :] bounds == each batch's 2-D call, per-batch (..., m, 1) x (..., 1, n)
+    bounds and per-batch scalars (..., 1, 1) on unequal batches == each batch's 2-D call with
+    no certified rho_hat below row_i col_j / |C_ij| in exact rationals, while 1-D and 2-D
+    bounds raise ((b,) at b == m and b == n, (b, 1) at b == m, a shared (m,), (m, 1), (n,),
+    (1, n); (b, m) / (b, n) norms without keepdims at b == m and b == m == n), as do
+    transposed, elementwise and partial-batch ones (a form accepted by a mutated rule fails
+    with its count of certified outputs below the true rho); rho_hat >= rho in exact
+    rationals on emulated outputs (params.emulate_element), the ValueError / TypeError cases
+    (beta != 0, alpha != 2^e, bad norms, 1-D lengths, shapes, dtype).
 """
 
 import argparse
@@ -751,6 +755,32 @@ def check_against_params(C, row, col, U, e, rho, ok, what):
             STATS["rho"] += 1
 
 
+def rho_below(C, rho, ok, na, nc):
+    """How many certified outputs of a batched C have rho_hat < na_i nc_j / |C_ij| in exact
+    rationals (na: the rows' 2-norms, bs + (m,); nc: the columns', bs + (n,))."""
+    low = 0
+    for q in zip(*np.nonzero(ok)):
+        p, i, j = q[:-2], q[-2], q[-1]
+        if Fraction(float(rho[q])) * abs(Fraction(float(C[q]))) < \
+                Fraction(float(na[p + (i,)])) * Fraction(float(nc[p + (j,)])):
+            low += 1
+    return low
+
+
+def must_reject(C, rr, cc, k, na, nc, what):
+    """rho_from_output raises ValueError on this norm-bound form. Had it accepted the form (the
+    rule dropped), the failure first counts the certified outputs whose rho_hat is below the
+    true rho in exact rationals, the unsoundness the rule prevents."""
+    try:
+        rho, ok = precision.rho_from_output(C, rr, cc, N=14, rounding="RN", k=k, lib=LIB)
+    except ValueError:
+        return
+    low = rho_below(C, rho, ok, na, nc)
+    need(low == 0, f"{what}: accepted, {int(ok.sum())} outputs certified, {low} of them with "
+         "rho_hat below the true rho")
+    raise Fail(f"{what}: no ValueError")
+
+
 def suite_rho(rng, verbose):
     specials = [0.0, -0.0, 5e-324, -2.0**-1030, 2.0**-1022, -2.0**-1022,
                 math.nextafter(2.0**-1022, 1.0), math.inf, -math.inf, math.nan, 2.0**1023]
@@ -799,7 +829,7 @@ def suite_rho(rng, verbose):
         need(rho.shape == C.shape and ok.shape == C.shape, "rho shapes")
         check_against_params(C, row, col, U, e, rho, ok,
                              f"rho trial {trial} (N={N} {rnd} k={k} {mode} e={e})")
-    # broadcasting forms: (m, 1) x (1, n), a batch (b, m, n)
+    # broadcasting forms: (m, 1) x (1, n) on a 2-D C, (b, m, 1) x (1, 1, n) on a batch
     C = np.array([[3.0, -2.0], [1e-3, 5.0]])
     r1, o1 = precision.rho_from_output(C, [1.0, 2.0], [3.0, 4.0], N=8, rounding="RN", k=10,
                                        lib=LIB)
@@ -810,66 +840,109 @@ def suite_rho(rng, verbose):
     rb, ob = precision.rho_from_output(Cb, np.ones((2, 2, 1)), np.ones((1, 1, 2)) * 4.0, N=8,
                                        rounding="RN", k=10, lib=LIB)
     need(rb.shape == (2, 2, 2) and ob.all(), "batched C")
-    # a 1-D row bound is always axis -2 and a 1-D column bound axis -1, each on its own, for
-    # any C.ndim >= 2, also where m == n (numpy alone would pair row[j] with column j)
-    row, col = np.array([1.0, 1.0, 100.0]), np.array([1.0, 2.0, 3.0])
-    for C in (np.ones((3, 3)), np.ones((2, 3, 3)), np.ones((2, 1, 3, 3)),
-              np.arange(1.0, 25.0).reshape(2, 3, 4)):
-        m, n = C.shape[-2:]
-        r, c = np.resize(row, m), np.resize(col, n)
-        ref, rok = precision.rho_from_output(C, r[:, None], c[None, :], N=14, rounding="RN",
-                                             k=10, lib=LIB)
-        need(rok.all() and (ref >= np.multiply.outer(r, c) / np.abs(C)).all(),
-             f"explicit shapes on C {C.shape}: rho_hat < row_i col_j / |C_ij|")
-        for rr, cc in ((r, c), (r, c[None, :]), (r[:, None], c)):
-            got, ok = precision.rho_from_output(C, rr, cc, N=14, rounding="RN", k=10, lib=LIB)
-            need(got.shape == C.shape and (got == ref).all() and (ok == rok).all(),
-                 f"1-D norms on C {C.shape} (row {np.shape(rr)}, col {np.shape(cc)}) != the "
-                 "explicit (m, 1) x (1, n) result")
-        for rr, cc in ((np.resize(r, m + 1), c), (r, np.resize(c, n + 1)), (r[:1], c),
-                       (r, c[:1])):     # length 1 too: numpy would broadcast it silently
-            raises(ValueError, lambda: precision.rho_from_output(C, rr, cc, N=14, rounding="RN",
-                                                                 k=10, lib=LIB),
-                   f"1-D norm of the wrong length on C {C.shape}")
-    # a row bound of ndim >= 2 is constant along the columns (shape[-1] == 1) and a column
-    # bound along the rows (shape[-2] == 1), with none or all of C's batch dims. Per-batch
-    # (..., m, 1) x (..., 1, n) bounds on unequal batches == each batch's own 2-D call, and
-    # rho_hat >= row_i col_j / |C_ij| exactly; numpy's norms without keepdims ((b, m), (b, n):
-    # trailing-axis broadcasting pairs the batch index with a row or column where b == m or
-    # b == n), transposed bounds and bounds with some of C's batch dims raise
+    # per-batch bounds have C.ndim dims (keepdims): a row bound shape[-1] == 1, a column
+    # bound shape[-2] == 1. Per-batch (..., m, 1) x (..., 1, n) bounds and per-batch scalars
+    # (..., 1, 1) on unequal batches (one batch's rows and another's columns 100x) == each
+    # batch's own 2-D call, and no certified rho_hat is below row_i col_j / |C_ij| in exact
+    # rationals. Every 1-D or 2-D form raises (MF4), each on a shape where numpy's
+    # trailing-axis broadcasting would pair it with the wrong axis: per-batch scalars without
+    # keepdims, (b,) at b == m (rows) or b == n (columns) and (b, 1) at b == m; per-batch
+    # norms without keepdims, (b, m) / (b, n), at b == m and b == m == n; one shared vector
+    # (m,), (m, 1), (n,), (1, n); and transposed, elementwise and partial-batch bounds. Had a
+    # form been accepted (the rule dropped), the failure counts its certified outputs below
+    # the true rho in exact rationals
     nrng, nb = np.random.default_rng(rng.getrandbits(32)), 0
-    for bs, m, n in (((3,), 3, 3), ((4,), 4, 7), ((2, 2), 3, 4), ((3, 2), 2, 2)):
+    for bs, m, n in (((3,), 3, 3), ((3,), 3, 5), ((3,), 5, 3), ((4,), 4, 4), ((4,), 4, 7),
+                     ((2, 2), 3, 4), ((3, 2), 2, 2), ((2, 3), 3, 3)):
         k = 16
         A, B = nrng.standard_normal(bs + (m, k)), nrng.standard_normal(bs + (k, n))
         A[(0,) * len(bs)] *= 100.0              # one batch's rows, another's columns 100x
         B[(-1,) * len(bs)] *= 100.0
         C = A @ B
-        ra = np.nextafter(np.linalg.norm(A, axis=-1) * (1 + 2.0**-40), np.inf)  # bs + (m,)
-        cb = np.nextafter(np.linalg.norm(B, axis=-2) * (1 + 2.0**-40), np.inf)  # bs + (n,)
-        rho, ok = precision.rho_from_output(C, ra[..., None], cb[..., None, :], N=14,
-                                            rounding="RN", k=k, lib=LIB)
-        need(rho.shape == C.shape and ok.any(), f"per-batch bounds on C {C.shape}")
-        for p in np.ndindex(bs):
-            ref, rok = precision.rho_from_output(C[p], ra[p], cb[p], N=14, rounding="RN", k=k,
-                                                 lib=LIB)
-            need((rho[p] == ref).all() and (ok[p] == rok).all(),
-                 f"per-batch bounds on C {C.shape}: batch {p} != its own 2-D call")
-            for i in range(m):
-                for j in range(n):
-                    nb += 1
-                    need(not ok[p][i, j] or Fraction(float(rho[p][i, j])) *
-                         abs(Fraction(float(C[p][i, j]))) >=
-                         Fraction(float(ra[p][i])) * Fraction(float(cb[p][j])),
-                         f"per-batch bounds on C {C.shape}: rho_hat < row_i col_j / |C_ij| "
-                         f"at {p + (i, j)}")
-        bad = [(ra, cb), (ra[..., None], cb), (ra, cb[..., None, :]),
+        na, nc = np.linalg.norm(A, axis=-1), np.linalg.norm(B, axis=-2)  # bs + (m,), (n,)
+        up = lambda x: np.nextafter(x * (1 + 2.0**-40), np.inf)  # noqa: E731
+        ra, cb = up(na), up(nc)
+        sr, sc = up(na.max(axis=-1)), up(nc.max(axis=-1))               # bs: per batch
+        rsh = up(na.reshape(-1, m).max(axis=0))                         # (m,): shared
+        csh = up(nc.reshape(-1, n).max(axis=0))                         # (n,)
+        for rr, cc, per in ((ra[..., None], cb[..., None, :], lambda p: (ra[p], cb[p])),
+                            (sr[..., None, None], sc[..., None, None],
+                             lambda p: (float(sr[p]), float(sc[p]))),
+                            (sr[..., None, None], cb[..., None, :],
+                             lambda p: (float(sr[p]), cb[p]))):
+            rho, ok = precision.rho_from_output(C, rr, cc, N=14, rounding="RN", k=k, lib=LIB)
+            need(rho.shape == C.shape and ok.any(),
+                 f"per-batch bounds {rr.shape} x {cc.shape} on C {C.shape}")
+            for p in np.ndindex(bs):
+                ref, rok = precision.rho_from_output(C[p], *per(p), N=14, rounding="RN", k=k,
+                                                     lib=LIB)
+                need((rho[p] == ref).all() and (ok[p] == rok).all(),
+                     f"per-batch bounds {rr.shape} x {cc.shape} on C {C.shape}: batch {p} "
+                     "!= its own 2-D call")
+            low = rho_below(C, rho, ok, na, nc)
+            need(low == 0, f"per-batch bounds {rr.shape} x {cc.shape} on C {C.shape}: {low} "
+                 "certified outputs with rho_hat < row_i col_j / |C_ij|")
+            nb += C.size
+        rk, ck = ra[..., None], cb[..., None, :]
+        bad = [(sr, ck), (rk, sc), (sr[..., None], ck), (rk, sc[..., None]),
+               (rsh, ck), (rsh[:, None], ck), (rk, csh), (rk, csh[None, :]),
+               (ra, cb), (ra[..., None], cb), (ra, cb[..., None, :]),
                (ra[..., None, :], cb[..., None, :]), (ra[..., None], cb[..., None])]
         if len(bs) > 1:     # some of C's batch dims: numpy aligns them with the trailing ones
-            bad += [(ra[0][..., None], cb[..., None, :]), (ra[..., None], cb[0][..., None, :])]
+            bad += [(ra[0][..., None], ck), (rk, cb[0][..., None, :])]
         for rr, cc in bad:
-            raises(ValueError, lambda: precision.rho_from_output(C, rr, cc, N=14, rounding="RN",
-                                                                 k=k, lib=LIB),
-                   f"norms {rr.shape} x {cc.shape} on C {C.shape}")
+            must_reject(C, rr, cc, k, na, nc, f"norms {rr.shape} x {cc.shape} on C {C.shape}")
+    # on a 2-D C a 1-D row bound is axis -2 and a 1-D column bound axis -1, each on its own,
+    # also where m == n (numpy alone would pair row[j] with column j), of exactly that
+    # length. On a batched C a bound is a scalar or has C.ndim dims (MF4): one shared by
+    # every batch, r[None, ..., :, None] x c[None, ..., None, :], equals each batch's 2-D call
+    # bit for bit, also with the batch dims spelled out or a scalar on one side, and every
+    # 1-D or 2-D bound raises, as does one of another ndim
+    row, col = np.array([1.0, 1.0, 100.0]), np.array([1.0, 2.0, 3.0])
+    for C in (np.ones((3, 3)), np.ones((2, 3, 3)), np.ones((2, 1, 3, 3)),
+              np.arange(1.0, 25.0).reshape(2, 3, 4), np.arange(1.0, 49.0).reshape(2, 2, 3, 4)):
+        m, n = C.shape[-2:]
+        r, c = np.resize(row, m), np.resize(col, n)
+        if C.ndim == 2:
+            ref, rok = precision.rho_from_output(C, r[:, None], c[None, :], N=14,
+                                                 rounding="RN", k=10, lib=LIB)
+            need(rok.all() and (ref >= np.multiply.outer(r, c) / np.abs(C)).all(),
+                 f"explicit shapes on C {C.shape}: rho_hat < row_i col_j / |C_ij|")
+            for rr, cc in ((r, c), (r, c[None, :]), (r[:, None], c)):
+                got, ok = precision.rho_from_output(C, rr, cc, N=14, rounding="RN", k=10,
+                                                    lib=LIB)
+                need(got.shape == C.shape and (got == ref).all() and (ok == rok).all(),
+                     f"1-D norms on C {C.shape} (row {np.shape(rr)}, col {np.shape(cc)}) != "
+                     "the explicit (m, 1) x (1, n) result")
+            for rr, cc in ((np.resize(r, m + 1), c), (r, np.resize(c, n + 1)), (r[:1], c),
+                           (r, c[:1])):     # length 1 too: numpy would broadcast it silently
+                raises(ValueError, lambda: precision.rho_from_output(
+                    C, rr, cc, N=14, rounding="RN", k=10, lib=LIB),
+                    f"1-D norm of the wrong length on C {C.shape}")
+            continue
+        bs, one = C.shape[:-2], (1,) * (C.ndim - 2)
+        rs, cs = r.reshape(one + (m, 1)), c.reshape(one + (1, n))
+        for rr, cc, r2, c2 in ((rs, cs, r, c), (np.broadcast_to(rs, bs + (m, 1)), cs, r, c),
+                               (rs, np.broadcast_to(cs, bs + (1, n)), r, c),
+                               (2.0, cs, 2.0, c), (rs, 3.0, r, 3.0)):
+            got, ok = precision.rho_from_output(C, rr, cc, N=14, rounding="RN", k=10, lib=LIB)
+            need(got.shape == C.shape and ok.all(), f"shared norms on C {C.shape}")
+            for p in np.ndindex(bs):
+                ref, rok = precision.rho_from_output(C[p], r2, c2, N=14, rounding="RN", k=10,
+                                                     lib=LIB)
+                need((got[p] == ref).all() and (ok[p] == rok).all(),
+                     f"shared norms {np.shape(rr)} x {np.shape(cc)} on C {C.shape}: batch "
+                     f"{p} != its 2-D call")
+        for rr, cc in ((r, c), (r, c[None, :]), (r[:, None], c), (r[:, None], c[None, :]),
+                       (r, cs), (rs, c), (r[:, None], cs), (rs, c[None, :]),
+                       (r[None, :, None], cs), (rs, c[None, None, :]),   # ndim 3
+                       (rs[None], cs), (rs, cs[None]),                   # ndim C.ndim + 1
+                       (np.resize(r, m + 1), cs), (r[:1], cs)):
+            if np.ndim(rr) == C.ndim and np.ndim(cc) == C.ndim:
+                continue                    # (the ndim-3 forms on a 3-D C are rs, cs)
+            raises(ValueError, lambda: precision.rho_from_output(C, rr, cc, N=14,
+                                                                 rounding="RN", k=10, lib=LIB),
+                   f"norms {np.shape(rr)} x {np.shape(cc)} on C {C.shape}")
     r3 = np.ones(3)          # a 2-D C: transposed and elementwise bounds raise
     for rr, cc in ((r3[None, :], r3), (r3, r3[:, None]), (np.ones((3, 3)), r3),
                    (r3, np.ones((3, 3)))):
@@ -939,8 +1012,10 @@ def suite_rho(rng, verbose):
     if verbose:
         print(f"  ok  rho_from_output: {STATS['rho']} outputs == params.rho_recipe bit for "
               f"bit, {cert} emulated outputs with rho_hat >= rho exactly, U >= params' bound "
-              f"at {nU} points, 1-D norms on batched and mixed forms, {nb} outputs of "
-              "per-batch norms (off-axis forms raise), argument errors", flush=True)
+              f"at {nU} points, 1-D norms on a 2-D C and shared full-ndim norms on batched "
+              f"C == the 2-D call, {nb} outputs of per-batch norms with rho_hat >= the true rho "
+              "exactly (1-D, 2-D, off-axis and partial-batch forms on a batched C raise), "
+              "argument errors", flush=True)
 
 
 def main():
