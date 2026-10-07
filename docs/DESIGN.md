@@ -2398,6 +2398,10 @@ What §6b left to the implementation, as implemented (libimmerdink_host `src/hos
 Python. It is a **binding**, not a second implementation: every number (sizes, legality,
 statuses) and every byte of the result comes from libimmerdink / libimmerdink_host through
 the §6 / §6a / §6b C ABI; Python adds no numerics, no sizing logic, no data movement.
+**[v1.19]** One carve-out: `immerdink/precision.py` (§6g.10–§6g.11) is a caller-side helper,
+not part of the binding. Its one numeric, `rho_from_output`'s ρ̂, has its reference and
+certificate in spec/params.py (`rho_recipe`, bit for bit; `cert_rho_recipe`), and its sizes
+(`footprints()`) are sums and maxima of exact query results. It moves no data.
 
 **Decisions (Eric, 2026-10-04).** ctypes over the C ABI, as `host.py` (no compiled
 extension, no nanobind, no new build dependency; the C API stays the single source of
@@ -2417,7 +2421,7 @@ lifetimes and exact footprints.
 | `immerdink/device.py` | `Handle`, `Plan`, `Pack`, `PlanCache`, `Layout`, `contract`, `workspace_size`, `pack_spec`, the status exceptions. |
 | `immerdink/host.py` | unchanged (§6a); the device API reuses its public queries (`lowering`, `pack_desc_for`, `pack_layout`, `PackSpec`, `Desc`, `ImmerdinkError`). |
 | `immerdink/planner.py` | [v1.11, §6e] the host queries for hot paths: `Query`, `Planner`, `Memo`, lazy result views over host.py's C structs (bit-identical results, ~1–2 µs per query). |
-| `immerdink/precision.py` | [v1.19, §6g.10–§6g.11] precision phases chosen from targets on the host: `PrecisionPlan` (composes a Planner's queries per phase switch; computes in Python, so not in planner.py) and `rho_from_output` (the rigorous ρ of a previous output; needs numpy). Not imported by `import immerdink`. |
+| `immerdink/precision.py` | [v1.19, §6g.10–§6g.11] precision phases chosen from targets on the host: `PrecisionPlan` (composes a Planner's queries per phase switch; computes in Python, so not in planner.py) and `rho_from_output` (the rigorous ρ of a previous output; needs numpy). A caller-side helper, the one carve-out from "no numerics, no sizing logic" above. Not imported by `import immerdink`. |
 
 `import immerdink` loads no library and needs no GPU; libimmerdink is loaded on first use:
 `lib=` / `immerdink.load_library(path)`, else `$IMMERDINK_LIB` (the .so), else
@@ -5009,8 +5013,11 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   (contraction, role, N). The re-keying is exact: a candidate's `time_s` is its only
   reuse-dependent field (its `pack_s` is the sum of the two roles' predictions, which
   `host_precision` checks), and feasibility (status, budget, accuracy) is the candidate's,
-  unchanged. Choices are ordered feasible first by the composed time, then by rank's own
-  tie order (total_bytes, N, g, vec mode, packed). The band `time_lo_s` / `time_hi_s` is
+  unchanged. Within a level, choices are ordered feasible first by the composed time, then
+  by rank's own tie order (total_bytes, N, g, vec mode, packed). Between levels of equal
+  composed time (one contraction's, or a share group's sum) the smaller N wins, the
+  least-memory choice by F1; no test pins it, since the model has produced no such exact
+  tie. The band `time_lo_s` / `time_hi_s` is
   composed the same way from the contract's prediction. A per-role reuse inside
   `imd_perf_rank_request_t` is not adopted; it is revisited only if a hot-path consumer needs
   it inside one C rank call.
@@ -5031,12 +5038,16 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
      DIRECT being the top. `reset()` clears it.
   4. Outside a share group: the best composed candidate over the levels ≥ f_c (all g, the
      vec modes, the allowed pack modes, the target, the budget). This equals the fastest
-     `configs()[c][N]` over N ≥ f_c, also where time is not linear in N (§2.3 of NOTES-C1);
-     it replaces §6f.3's `rank([n, n + 1])`, the two-level case.
-  5. A share group (below) is ranked jointly.
+     `configs()[c][N]` over N ≥ f_c (ties: the smaller N), also where time is not linear in
+     N (§2.3 of NOTES-C1); it replaces §6f.3's `rank([n, n + 1])`, the two-level case.
+  5. A share group (below) is ranked jointly; a member whose floor is DIRECT leaves it for
+     the phase.
   6. **BUDGET** (NOTES-C1 IR8): if no level ≥ the floor fits the budget, the floor level
-     and its SUCCESS candidate with the least total_bytes, status `BUDGET`. `MISSED` takes
-     precedence over `BUDGET`, and `BUDGET` over `DIRECT`; otherwise the status is `MET`.
+     and its SUCCESS candidate with the least total_bytes, status `BUDGET` if that candidate
+     meets the target, otherwise `MISSED`. `MISSED` takes precedence over `BUDGET`, and
+     `BUDGET` over `DIRECT`; otherwise the status is `MET`. (The rule never puts a member
+     at a level that misses a met target, so the guard is a safety net; `host_precision`
+     exercises it directly.)
   7. **TYPICAL** targets: p in §6f.2 is per call. With `iterations` and `fail_budget` P,
      every TYPICAL target of the phase gets p = P / (iterations × Σ_c calls per iteration):
      a union bound over the phase's calls. Without them, each Accuracy's own `fail_prob`.
@@ -5060,6 +5071,17 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   this normally returns the floor, but not when the packing and reuse terms differ by level.
   Groups that share a contraction are merged for N. Whether the members can really read one
   pack (one key) is checked where it matters, by plan creation (PACK_MISMATCH).
+  **A member at DIRECT** (its floor, step 1 or 3) reads no pack, so it leaves the group's N
+  coupling for that phase (independent review of stage 1, MF1): it is settled alone, as
+  outside a group (in-line, g = 1, status `DIRECT`, `BUDGET` or `MISSED`), and the other
+  members are ranked jointly over the emulated levels ≥ their maximum f_c. It links nothing
+  in that phase either: groups merged only through it are ranked separately. Before this
+  fix, every member was dragged to DIRECT, and a member whose target DIRECT's γ_k misses
+  (a TYPICAL target met at N = 12) was reported `BUDGET` at native FP64 (1:64). The shared
+  role's reuse is fixed at construction and keeps counting the DIRECT member's calls, so every
+  phase's choice remains the `configs()` lookup bit for bit. In that phase the other members'
+  pack term is then priced as if those calls read the pack: an optimistic [M] figure in a rare
+  case (NOTES-C1 §5.5 S1-10).
 - **`configs(iterations)`** returns the best configuration at every level (status `OK`, or
   `BUDGET` with the least total_bytes; None where no plan exists, e.g. RN with κ ≥ T(N)). A
   fixed N's estimate is the same for every candidate, so it needs no target, and a phase's
@@ -5067,9 +5089,13 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   these plans before the iteration loop and freezes its `PlanCache` for capture (§6g.1):
   RESIDENT plan creation synchronizes, and with `k4_tune` each level's plans autotune.
 - **`footprints()`**: per contraction and level, the maximum workspace and plan device bytes
-  over the allowed pack modes × vec modes × g (the largest g that succeeds, by F1, §6a); per
-  packed operand (a share group's counts once) its `pack_bytes` and `imd_pack` workspace per
-  level; each one's maximum (sizing once, C-ws and C-pack, NOTES-C1 Q2) and the per-level
+  over the allowed pack modes × vec modes × every g that succeeds. For the workspace alone,
+  the largest succeeding g would do by F1's downward statement (ABI, §6a), but at that g the
+  plan device bytes would rest on I2, a certificate and not ABI (§6g.3); so every g is
+  queried, a one-off sizing call (about N more lowerings per level × mode × vec mode). Per
+  packed operand its `pack_bytes` and `imd_pack` workspace per level: a shared pack counts
+  once, keyed by its group, while `Phase.pack_bytes` repeats it under every member that
+  reads it. Each one's maximum (sizing once, C-ws and C-pack, NOTES-C1 Q2) and the per-level
   totals (no workspace shared). None marks a level without a configuration. No caller has
   to rely on I3 (§6g.3): the maxima come from the queries over the allowed modes.
 - **Relaxed Krylov methods** (NOTES-C1 IR3) may loosen the matvec precision as the residual
@@ -5111,9 +5137,16 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 - **Inputs.** A call at (N, rounding, k, mode) with α = 2^e and β = 0 wrote C = RN(2^e D)
   (§3.7), D its product. `C` is a float64 host array (copy it, or the part needed, to the
   host: the helper moves no data). `row_norm_ub`, `col_norm_ub` are upper bounds of the GEMM
-  view's row and column 2-norms (§6f.1's obligation: really upper bounds), as arrays that
-  broadcast against C (1-D vectors for a 2-D C). Real norms, not σ-derived ones: a zero row
-  has σ := 0, so its bound d·2⁰ is vacuous. `l1_ratio`: as `Accuracy`'s (ν = √k without it).
+  view's row and column 2-norms (§6f.1's obligation: really upper bounds). For C.ndim ≥ 2 a
+  1-D `row_norm_ub` is always the vector along axis −2 (length C.shape[−2]) and a 1-D
+  `col_norm_ub` always the one along axis −1 (length C.shape[−1]), each on its own and for
+  any batch dims; another length, 1 included, is a ValueError. Other bounds (scalars,
+  explicit (…, m, 1) and (…, 1, n) shapes, elementwise ones for a 0-D or 1-D C) broadcast to
+  C's shape. numpy's trailing-axis rule alone would pair `row_norm_ub[j]` with column j
+  whenever m = n (a batched C, or a 1-D row bound with a (1, n) column bound) and certify
+  ρ̂ ≈ 1 where ρ ≥ 100 (independent review of stage 1, MF2). Real norms, not σ-derived ones:
+  a zero row has σ := 0, so its bound d·2⁰ is vacuous. `l1_ratio`: as `Accuracy`'s (ν = √k
+  without it).
 - **Restrictions.** β must be 0 and α = 2^e, else ValueError: D = ldexp(C, −e) is exact,
   while D cannot be recovered from RN(α·D) for another α (§3.7). For β = 1 accumulations (CC
   residual builders) take ρ from a probe call with β = 0 into a scratch buffer, once per
@@ -5121,7 +5154,11 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 - **U** is the NORMWISE `bound` of `imd_err_estimate` at (N, rounding, k) for the call's
   dispatch (EMULATE; DIRECT for mode DIRECT or k = 1), the library's own value: E·(1 + u) + u
   evaluated as E + E·u + u, times (1 + 2⁻⁴⁰) (§6f.3), so |D − x| ≤ U‖a_i‖‖b_j‖ for D finite
-  and normal (PROOFS L3c).
+  and normal (PROOFS L3c). For DIRECT it is γ_k (§6f.2), which exceeds the EMULATE bound at
+  large N, so the EMULATE U would be unsound there (hence `mode=`). `host_precision` checks
+  U ≥ params' exact bound (the upper end of its enclosure) at N = 2–20 for both dispatches,
+  and `cert_rho_recipe` checks the recipe on the native FMA chain as well as on emulated
+  elements.
 - **Claim.** For D_ij finite and normal with |D_ij| > U·n_ij, n_ij ≥ ‖a_i‖‖b_j‖:
   ρ_ij ≤ n_ij / (|D_ij| − U·n_ij), because |x| ≥ |D| − |D − x| ≥ |D| − U·n.
 - **FP64 evaluation, ρ̂ rounded outward:** D = ldexp(C, −e); n = nextafter(row × col, +∞);
@@ -5161,18 +5198,26 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
   - Scenarios: every reuse kind, the `"phase"` fallback and `assumed_reuse`; a shared role
     divided by the members' summed calls, members at one N above the group floor; N monotone
     until `reset()`, falling with `monotone=False`; DIRECT only when no emulated level meets
-    and only if listed, and the monotone top; BUDGET (the floor and the least total_bytes)
-    and MISSED's precedence; TYPICAL p = P / (iterations × calls); RN κ ≥ T levels; argument
-    errors.
+    and only if listed, and the monotone top; a share-group member at DIRECT leaves the
+    group for the phase (both member forms; the others keep one N; it links no groups; the
+    shared reuse and the `configs()` lookup kept); BUDGET (the floor and the least
+    total_bytes) and MISSED's precedence, and `BUDGET` never on a missed target; TYPICAL
+    p = P / (iterations × calls); RN κ ≥ T levels; argument errors. The brute force applies
+    the same DIRECT rule from first principles.
   - `footprints()` equals the maximum of the C queries over the allowed pack modes × vec
     modes × every g, per level, with its totals.
   - `rho_from_output` equals `params.rho_recipe` bit for bit (random and boundary values,
-    every α = 2^e class, specials, broadcast and batched forms); ρ̂ ≥ ρ in exact rationals on
-    emulated outputs (`params.emulate_element`); ValueError / TypeError cases.
+    every α = 2^e class, specials, broadcast and batched forms); 1-D bounds on batched C, at
+    m = n and mixed with 2-D bounds equal the explicit (m, 1) × (1, n) result, and a 1-D bound
+    of another length raises; U ≥ params' exact bound (its upper enclosure) at N = 2–20,
+    k = 1–40000, both roundings and dispatches; ρ̂ ≥ ρ in exact rationals on emulated
+    outputs (`params.emulate_element`); ValueError / TypeError cases.
 - **[cert] `cert_rho_recipe`** (`params.py --check`), in exact rationals: on emulated elements
-  (both roundings, N = 3–14, random and cancelling rows whose |x| is 0.3–30 × U‖a‖‖b‖,
+  (both roundings, every N = 2–20, random and cancelling rows whose |x| is 0.3–30 × U‖a‖‖b‖,
   α = 2^e, U the tightest double above the exact NORMWISE bound, with ν = √k and with the
-  rows' ℓ1 ratios), certified implies x ≠ 0 and ρ̂ ≥ ρ; at the boundary (|D| from 3 ulps
+  rows' ℓ1 ratios) and on native elements (the §3.7 FMA chain in exact arithmetic, RN at
+  each step, k = 1, 2, 7, 40, U the tightest double above γ_k: the DIRECT and k = 1 case),
+  certified implies x ≠ 0 and ρ̂ ≥ ρ; at the boundary (|D| from 3 ulps
   below to 6 above RN(U·n), α = 2^e), certified implies |D| > U·n exactly and
   ρ̂ ≥ n / (|D| − U·n), and the evaluation is tight (certified exactly from 2 ulps above);
   the uncertified classes (zero, subnormal, non-finite, C = 2⁻¹⁰²² with e < 0, overflows).
@@ -5950,3 +5995,13 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     and `cert_rho_recipe` checks it in exact rationals.
   - **§6d.1:** the module row. **Tests:** `host_precision` (CPU, in the CPU-only pass).
     **Example:** `bench/accuracy/schedule.py`, the forcing rule as caller code.
+  - **Stage-1 review fixes** (independent reviewer, approve-with-fixes; verdicts in NOTES-C1
+    §5.5): a share-group member at DIRECT leaves the group's N coupling for the phase (it
+    had dragged every member to DIRECT and mislabelled a missed target `BUDGET`), and
+    `BUDGET` is reported only for a candidate that meets its target (§6g.10); a 1-D norm
+    bound of `rho_from_output` is always axis −2 (rows) or −1 (columns), since numpy alone
+    certified ρ̂ ≈ 1 where ρ ≥ 100 on a batched C or mixed bounds with m = n (§6g.11);
+    `footprints()` takes the maximum over every succeeding g, so the plan device bytes do not
+    rest on I2; `cert_rho_recipe` covers every N = 2–20 and the native FMA chain;
+    `PrecisionPlan` lowers at the lowest level for flops_eq; §6d's carve-out for
+    precision.py.

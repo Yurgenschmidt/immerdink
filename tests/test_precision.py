@@ -18,15 +18,20 @@ a brute force from host.py's queries and against spec/params.py. CPU only.
     assumed_reuse, int), a shared role divided by the members' summed calls; a level above
     the floor chosen where the model predicts it faster (a shape found at run time), alone and
     in a share group; N monotone over phases until reset(), relaxed with monotone=False;
-    DIRECT only when no emulated level meets and only if listed; BUDGET (the floor and the
-    least total_bytes) and MISSED's precedence; TYPICAL p = P / (iterations x calls); RN
-    kappa >= T levels; argument errors;
+    DIRECT only when no emulated level meets and only if listed; a share-group member at
+    DIRECT leaves the group for the phase (both member forms; the others keep one N; it links
+    no groups); BUDGET (the floor and the least total_bytes) and MISSED's precedence, BUDGET
+    never on a missed target; TYPICAL p = P / (iterations x calls); RN kappa >= T levels;
+    argument errors;
   - footprints() == the maximum of the C queries over the allowed pack modes x vec modes x
     every g, per level, and their totals;
   - rho_from_output == spec/params.py rho_recipe bit for bit (random and boundary values,
-    every alpha = 2^e class), U == imd_err_estimate's NORMWISE bound for the call's dispatch,
-    rho_hat >= rho in exact rationals on emulated outputs (params.emulate_element), the
-    ValueError / TypeError cases (beta != 0, alpha != 2^e, bad norms, shapes, dtype).
+    every alpha = 2^e class), U == imd_err_estimate's NORMWISE bound for the call's dispatch
+    and >= params' exact bound (the upper end of its enclosure) at N = 2..20, both dispatches;
+    a 1-D row bound is axis -2 and a 1-D column bound axis -1 for any C.ndim >= 2 (batched,
+    m == n, mixed with 2-D bounds: == the explicit (m, 1) x (1, n) result), rho_hat >= rho in
+    exact rationals on emulated outputs (params.emulate_element), the ValueError / TypeError
+    cases (beta != 0, alpha != 2^e, bad norms, 1-D lengths, shapes, dtype).
 """
 
 import argparse
@@ -221,15 +226,18 @@ def expected_reuse(cfg, iterations):
     return out, assumed
 
 
-def components(cfg):
-    comp = {n: {n} for n in cfg["names"]}
+def components(cfg, names):
+    """The contractions of `names` that share groups tie to one N (a DIRECT member, outside
+    `names`, reads no pack and links nothing)."""
+    comp = {n: {n} for n in names}
     for ms in cfg["share"].values():
-        merged = set().union(*(comp[n] for n, _ in ms))
+        ms = [n for n, _ in ms if n in comp]
+        merged = set().union(*(comp[n] for n in ms))
         for n in merged:
             comp[n] = merged
     seen, out = set(), []
     for n in cfg["names"]:
-        if n not in seen:
+        if n in comp and n not in seen:
             out.append(sorted(comp[n], key=cfg["names"].index))
             seen |= comp[n]
     return out
@@ -239,7 +247,6 @@ def brute_phase(cfg, accs, prev, iterations):
     """{name: (level, status, candidate dict)} by the §4.2 rule from first principles."""
     levels = cfg["levels"]
     emu = [x for x in levels if x != DIRECT]
-    order = {lv: i for i, lv in enumerate(levels)}
     reuse, _ = expected_reuse(cfg, iterations)
     floors, mets = {}, {}
     for name in cfg["names"]:
@@ -257,18 +264,19 @@ def brute_phase(cfg, accs, prev, iterations):
         else:
             floors[name], mets[name] = emu[-1], False
     out = {}
-    for comp in components(cfg):
-        floor = max((floors[n] for n in comp), key=order.__getitem__)
-        if floor == DIRECT:
-            for n in comp:
-                cands = level_cands(CASES[n], emu[-1], cfg, ("NONE",), mode="DIRECT", gs=(1,))
-                b = best(cands, reuse[n], cfg["budget"].get(n, 0))
-                st = "DIRECT" if mets[n] else "MISSED"
-                if b is None:
-                    b = least_bytes(cands, reuse[n])
-                    st = "MISSED" if not mets[n] else "BUDGET"
-                out[n] = (DIRECT, st, b)
+    for n in cfg["names"]:       # DIRECT: alone, in-line, g = 1, whatever its share groups
+        if floors[n] != DIRECT:
             continue
+        cands = level_cands(CASES[n], emu[-1], cfg, ("NONE",), mode="DIRECT", gs=(1,))
+        b = best(cands, reuse[n], cfg["budget"].get(n, 0))
+        st = "DIRECT" if mets[n] else "MISSED"
+        if b is None:
+            b = least_bytes(cands, reuse[n])
+            if mets[n]:
+                st = "BUDGET" if met_at(CASES[n], emu[-1], accs[n], mode="DIRECT") else "MISSED"
+        out[n] = (DIRECT, st, b)
+    for comp in components(cfg, [n for n in cfg["names"] if floors[n] != DIRECT]):
+        floor = max(floors[n] for n in comp)
         Ns = [x for x in emu if x >= floor]
         per = {n: {N: level_cands(CASES[n], N, cfg, expected_modes(cfg, n)) for N in Ns}
                for n in comp}
@@ -287,7 +295,7 @@ def brute_phase(cfg, accs, prev, iterations):
             if b is None:
                 b = least_bytes(per[n][N], reuse[n])
                 if mets[n]:
-                    st = "BUDGET"
+                    st = "BUDGET" if met_at(CASES[n], N, accs[n]) else "MISSED"
             out[n] = (N, st, b)
     return out, reuse
 
@@ -422,11 +430,11 @@ def suite_random(pl, rng, count, verbose):
                                    (ch.status == "MISSED" and not c2.feasible) else "OK"),
                      f"{what} {n}: configs status {c2.status} for a {ch.status} choice")
                 STATS["configs"] += 1
-            for n in cfg["names"]:
-                g = [grp for grp, ms in cfg["share"].items() if any(m == n for m, _ in ms)]
-                if g:
-                    lv = {ph.N[m] for m, _ in cfg["share"][g[0]]}
-                    need(len(lv) == 1, f"{what}: share group members at {lv}")
+            for grp, ms in cfg["share"].items():    # one N, but a DIRECT member leaves
+                lv = {ph.N[m] for m, _ in ms if ph.N[m] != DIRECT}
+                need(len(lv) <= 1, f"{what}: share group members at {lv}")
+                if any(ph.N[m] == DIRECT for m, _ in ms):
+                    STATUSES["shared DIRECT"] = STATUSES.get("shared DIRECT", 0) + 1
             if cfg["monotone"]:
                 for n in cfg["names"]:
                     if n in prev:
@@ -546,6 +554,61 @@ def suite_scenarios(pl, verbose):
         if want == DIRECT:
             need(ph.mode["m"] == "DIRECT" and ph.packed["m"] == "NONE", "DIRECT choice")
             need(pp.phase({"m": acc(1e-3)}).N["m"] == DIRECT, "DIRECT is the monotone top")
+    # a share-group member at DIRECT reads no pack, so it leaves the group for the phase and
+    # does not drag the others along: y's TYPICAL target is met at N = 12 and missed by
+    # DIRECT's gamma_k, x needs DIRECT, z (loose) stays coupled to y only through a group
+    # without x
+    sq, lv3 = ("ik,kj->ij", dict(i=64, k=4096, j=64)), (8, 10, 12)
+    g_k = host.err_estimate(12, 4096, dispatch="DIRECT", outputs=64 * 64,
+                            accuracy=Accuracy("NORMWISE"), lib=LIB).bound
+    e12 = host.err_estimate(12, 4096, outputs=64 * 64,
+                            accuracy=Accuracy("NORMWISE", basis="TYPICAL"), lib=LIB)
+    need(e12.typical < g_k < e12.bound, "DIRECT-member scenario: gamma_k not inside N = 12's "
+         "(typical, bound)")
+    tg = {"x": acc((g_k + e12.bound) / 2), "z": acc(1e-3),
+          "y": Accuracy("NORMWISE", (e12.typical + g_k) / 2, basis="TYPICAL")}
+    zf = min(x for x in lv3 if x >= host.min_moduli(*sq, accuracy=tg["z"], n_lo=8, n_hi=12,
+                                                    lib=LIB).num_moduli)
+    for share, coupled in (([("G", [("x", "B"), ("y", "B")])], False),
+                           ([("G", ["x", "y"])], False), ([("G", ["x", "y", "z"])], True),
+                           ([("G", [("x", "A"), ("y", "A")]), ("H", [("x", "B"), ("z", "B")])],
+                            False)):
+        pp = precision.PrecisionPlan(pl, {"x": sq, "y": sq, "z": sq}, levels=lv3 + (DIRECT,),
+                                     share=share)
+        cf = pp.configs()
+        ph = pp.phase(tg)
+        what = f"DIRECT member of {share}"
+        need((ph.N["x"], ph.status["x"], ph.mode["x"]) == (DIRECT, "DIRECT", "DIRECT"),
+             f"{what}: x {ph.N['x']} {ph.status['x']}")
+        need((ph.N["y"], ph.status["y"]) == (12, "MET") and ph.choices["y"].feasible and
+             ph.err_typical["y"] <= tg["y"].target, f"{what}: y {ph.N['y']} {ph.status['y']}")
+        zt = {N: cf["z"][N].time_s for N in lv3 if N >= zf}
+        zbest = min(zt, key=lambda N: (zt[N], N))
+        need(ph.N["z"] == (12 if coupled else zbest) and ph.status["z"] == "MET",
+             f"{what}: z at {ph.N['z']}, want {12 if coupled else zbest}")
+        if not coupled:
+            need(zbest != 12, f"{what}: z's best level is 12, the scenario cannot tell")
+        for n in "yz":      # the choice is configs()'s; a shared role keeps its reuse
+            c2 = cf[n][ph.N[n]]
+            need((c2.residue_group, c2.vec_mode, c2.packed, c2.time_s, c2.reuse) ==
+                 (ph.choices[n].residue_group, ph.choices[n].vec_mode, ph.packed[n],
+                  ph.choices[n].time_s, ph.reuse[n]), f"{what}: {n} != configs()")
+        if share[0][1][0] == ("x", "B"):
+            need(ph.packed["y"] == "B" and ph.reuse["y"] == {"B": 2},
+                 f"{what}: the shared role's reuse {ph.reuse['y']}")
+    # DIRECT with a budget nothing fits: BUDGET where DIRECT meets the target, MISSED where it
+    # does not (the monotone top); and _settle's guard on its own: a least-bytes fallback
+    # whose candidate misses the target is never BUDGET (the rule makes this unreachable)
+    pp = precision.PrecisionPlan(pl, {"x": sq}, levels=lv3 + (DIRECT,), budget=1)
+    ph = pp.phase({"x": tg["x"]})
+    need((ph.N["x"], ph.status["x"]) == (DIRECT, "BUDGET"), f"DIRECT BUDGET: {ph.status}")
+    ph = pp.phase({"x": tg["y"]})
+    need((ph.N["x"], ph.status["x"]) == (DIRECT, "MISSED"), f"DIRECT MISSED: {ph.status}")
+    reuse, _ = pp._reuse(None)
+    got = pp._ranked(pp._c["x"], (12,), reuse, tg["x"])[12]
+    need(got and all(ch.candidate.infeasible & host.INFEASIBLE["ACCURACY"] for ch in got),
+         "guard: N = 12 should miss x's target")
+    need(pp._settle(pp._c["x"], got, "MET").status == "MISSED", "guard: BUDGET on a miss")
     # BUDGET: the floor level and its least total_bytes; MISSED takes precedence
     pp = precision.PrecisionPlan(pl, {"m": ("ik,kj->ij", big.extents)}, levels=(6, 8, 10),
                                  packs={"m": set(MODES)}, budget=1 << 20)
@@ -607,8 +670,8 @@ def suite_scenarios(pl, verbose):
     if verbose:
         print(f"  ok  scenarios: per-role reuse and its band, shared role, a faster higher "
               f"level (N = {N_up} -> {N_up + 1}, alone and in a share group), monotone / reset / "
-              f"relaxed, DIRECT sentinel, BUDGET and MISSED, TYPICAL p = P/C, kappa >= T, "
-              f"argument errors", flush=True)
+              f"relaxed, DIRECT sentinel, a DIRECT member leaves its share group, BUDGET and "
+              f"MISSED, TYPICAL p = P/C, kappa >= T, argument errors", flush=True)
 
 
 # ------------------------------------------------------------------------------------------
@@ -742,6 +805,27 @@ def suite_rho(rng, verbose):
     rb, ob = precision.rho_from_output(Cb, np.ones((2, 2, 1)), np.ones((1, 1, 2)) * 4.0, N=8,
                                        rounding="RN", k=10, lib=LIB)
     need(rb.shape == (2, 2, 2) and ob.all(), "batched C")
+    # a 1-D row bound is always axis -2 and a 1-D column bound axis -1, each on its own, for
+    # any C.ndim >= 2, also where m == n (numpy alone would pair row[j] with column j)
+    row, col = np.array([1.0, 1.0, 100.0]), np.array([1.0, 2.0, 3.0])
+    for C in (np.ones((3, 3)), np.ones((2, 3, 3)), np.ones((2, 1, 3, 3)),
+              np.arange(1.0, 25.0).reshape(2, 3, 4)):
+        m, n = C.shape[-2:]
+        r, c = np.resize(row, m), np.resize(col, n)
+        ref, rok = precision.rho_from_output(C, r[:, None], c[None, :], N=14, rounding="RN",
+                                             k=10, lib=LIB)
+        need(rok.all() and (ref >= np.multiply.outer(r, c) / np.abs(C)).all(),
+             f"explicit shapes on C {C.shape}: rho_hat < row_i col_j / |C_ij|")
+        for rr, cc in ((r, c), (r, c[None, :]), (r[:, None], c)):
+            got, ok = precision.rho_from_output(C, rr, cc, N=14, rounding="RN", k=10, lib=LIB)
+            need(got.shape == C.shape and (got == ref).all() and (ok == rok).all(),
+                 f"1-D norms on C {C.shape} (row {np.shape(rr)}, col {np.shape(cc)}) != the "
+                 "explicit (m, 1) x (1, n) result")
+        for rr, cc in ((np.resize(r, m + 1), c), (r, np.resize(c, n + 1)), (r[:1], c),
+                       (r, c[:1])):     # length 1 too: numpy would broadcast it silently
+            raises(ValueError, lambda: precision.rho_from_output(C, rr, cc, N=14, rounding="RN",
+                                                                 k=10, lib=LIB),
+                   f"1-D norm of the wrong length on C {C.shape}")
     # rho_hat >= rho in exact rationals on emulated outputs (params.emulate_element)
     cert = 0
     for trial in range(10):
@@ -776,10 +860,18 @@ def suite_rho(rng, verbose):
                     need(X[i][j] != 0 and Fraction(float(rho[i, j]))**2 * X[i][j]**2 >=
                          na2[i] * nb2[j], f"emulated rho_hat < rho (N={N} {rnd} k={k})")
     need(cert > 0, "no emulated output certified")
-    # U is the NORMWISE bound of the call's dispatch, never below params' exact bound
-    for N, k, rnd in ((3, 7, "RN"), (8, 300, "TRUNC"), (20, 5000, "RN")):
-        U = U_of(N, k, rnd, "EMULATE")
-        need(Fraction(U) >= P.error_estimate(N, k, rnd)["bound"][0], "U below the exact bound")
+    # U is the NORMWISE bound of the call's dispatch, never below params' exact bound (the
+    # upper end of its enclosure)
+    nU = 0
+    for N in range(2, 21):
+        for k in (1, 2, 7, 300, 5000, 40000):
+            for rnd in ("RN", "TRUNC"):
+                for dispatch in ("EMULATE", "DIRECT"):
+                    U = U_of(N, k, rnd, dispatch)
+                    ref = P.error_estimate(N, k, rnd, dispatch)["bound"]
+                    need(U == math.inf if ref is None else Fraction(U) >= ref[1],
+                         f"U below the exact bound (N={N} k={k} {rnd} {dispatch})")
+                    nU += 1
     # argument errors
     C = np.ones((2, 2))
     kw = dict(N=8, rounding="RN", k=10, lib=LIB)
@@ -796,7 +888,8 @@ def suite_rho(rng, verbose):
                                                         [1.0, 1.0], **kw), "rho float32 C")
     if verbose:
         print(f"  ok  rho_from_output: {STATS['rho']} outputs == params.rho_recipe bit for "
-              f"bit, {cert} emulated outputs with rho_hat >= rho exactly, U, argument errors",
+              f"bit, {cert} emulated outputs with rho_hat >= rho exactly, U >= params' bound "
+              f"at {nU} points, 1-D norms on batched and mixed forms, argument errors",
               flush=True)
 
 

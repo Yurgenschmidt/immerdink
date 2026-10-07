@@ -2005,11 +2005,14 @@ def _up(q):
 def cert_rho_recipe():
     """DESIGN v1.19 §6g.11 (NOTES-C1 §4.2, IR7): rho_recipe's rho_hat >= rho in exact
     rationals wherever it certifies.
-    (1) Emulated elements (emulate_element, RN and TRUNC, N = 3..14, k = 7 and 40), random
-    rows and cancelling rows whose |x| is 0.3..30 times U ||a|| ||b|| (where |D| lies just
-    above or below U n), alpha = 2^e with e in {0, 5, -7}, U the smallest double >= the exact
-    NORMWISE bound (with nu = sqrt k and with the rows' l1 ratios), row_ub / col_ub the
+    (1) Emulated elements (emulate_element, RN and TRUNC, every N = 2..20, k = 7 and 40),
+    random rows and cancelling rows whose |x| is 0.3..30 times U ||a|| ||b|| (where |D| lies
+    just above or below U n), alpha = 2^e with e in {0, 5, -7}, U the smallest double >= the
+    exact NORMWISE bound (with nu = sqrt k and with the rows' l1 ratios), row_ub / col_ub the
     2-norms rounded up: certified implies x != 0 and rho_hat >= ||a|| ||b|| / |x|.
+    (1') Native elements (mode DIRECT or k = 1: rho_from_output's U is then gamma_k): the
+    §3.7 FMA chain in exact arithmetic (_native_fma_dot, RN at each step), k = 1, 2, 7, 40,
+    random and cancelling rows as in (1), U the smallest double >= gamma_k: the same claim.
     (2) The boundary, on random (U, row_ub, col_ub) over wide exponent ranges: |D| from
     3 ulps below to 6 ulps above RN(U n), alpha = 2^e with e in {0, 9, -9}: certified implies
     |D| > U row_ub col_ub exactly and rho_hat >= f(row_ub col_ub), f(y) = y / (|D| - U y)
@@ -2019,50 +2022,72 @@ def cert_rho_recipe():
     rounded subnormal) while e < 0 with |C| one ulp above it certifies; n, D or rho_hat
     overflowing."""
     rng = random.Random(1123)
-    counts = {"elements": 0, "certified": 0, "near": 0, "boundary": 0}
-    for N in (3, 5, 8, 14):
+    counts = {"elements": 0, "certified": 0, "near": 0, "native_elements": 0,
+              "native_certified": 0, "native_near": 0, "boundary": 0}
+
+    def rows(trial, k, U0):
+        if trial < 6 or k < 2:
+            return _rand_row(rng, k, -40, 40), _rand_row(rng, k, -40, 40)
+        # cancelling: |x| ~ c U ||a|| ||b||, c in 0.3..30
+        a = [_rand_double(rng, -3, 3) for _ in range(k)]
+        b = [_rand_double(rng, -3, 3) for _ in range(k)]
+        na = math.sqrt(sum(v * v for v in a))
+        nb = math.sqrt(sum(v * v for v in b))
+        part = sum(Fraction(x) * Fraction(y) for x, y in zip(a[:-1], b[:-1]))
+        goal = Fraction(rng.choice((0.3, 0.9, 1.05, 1.3, 3, 30))) * \
+            Fraction(U0) * Fraction(na * nb) * rng.choice((1, -1))
+        b[-1] = float((goal - part) / Fraction(a[-1]))
+        return a, b
+
+    def check(a, b, D, Us, what, pre=""):
+        """rho_hat >= rho on one element at each U and alpha = 2^e (a zero row: skipped)."""
+        x = sum(Fraction(p) * Fraction(q) for p, q in zip(a, b))
+        na2 = sum(Fraction(v)**2 for v in a)
+        nb2 = sum(Fraction(v)**2 for v in b)
+        if na2 == 0 or nb2 == 0:
+            return
+        counts[pre + "elements"] += 1
+        row_ub = _up(sqrt_enclosure(na2)[1])
+        col_ub = _up(sqrt_enclosure(nb2)[1])
+        for U in Us(a, b, na2, nb2):
+            for e in (0, 5, -7):
+                C = float(Fraction(D) * Fraction(2)**e)
+                rho = rho_recipe(C, row_ub, col_ub, U, e)
+                if rho is None:
+                    continue
+                counts[pre + "certified"] += 1
+                need(x != 0, f"{what}: certified a zero x")
+                need(Fraction(rho)**2 * x * x >= na2 * nb2, f"{what} e={e}: rho_hat {rho} < rho")
+                if abs(Fraction(D)) < Fraction(11, 10) * Fraction(U) * Fraction(row_ub) * \
+                        Fraction(col_ub):
+                    counts[pre + "near"] += 1
+
+    for N in range(N_MIN, N_MAX + 1):
         for rnd in (RN, TRUNC):
             for k in (7, 40):
                 U0 = _up(error_estimate(N, k, rnd)["bound"][1])
+
+                def Us(a, b, na2, nb2):
+                    nu_a = max(_up(sum(abs(Fraction(v)) for v in a) / sqrt_enclosure(na2)[0]),
+                               1.0)
+                    nu_b = max(_up(sum(abs(Fraction(v)) for v in b) / sqrt_enclosure(nb2)[0]),
+                               1.0)
+                    return (U0, _up(error_estimate(N, k, rnd, l1_ratio_a=nu_a,
+                                                   l1_ratio_b=nu_b)["bound"][1]))
                 for trial in range(14):
-                    if trial < 6:
-                        a, b = _rand_row(rng, k, -40, 40), _rand_row(rng, k, -40, 40)
-                    else:          # cancelling: |x| ~ c U ||a|| ||b||, c in 0.3..30
-                        a = [_rand_double(rng, -3, 3) for _ in range(k)]
-                        b = [_rand_double(rng, -3, 3) for _ in range(k)]
-                        na = math.sqrt(sum(v * v for v in a))
-                        nb = math.sqrt(sum(v * v for v in b))
-                        part = sum(Fraction(x) * Fraction(y) for x, y in zip(a[:-1], b[:-1]))
-                        goal = Fraction(rng.choice((0.3, 0.9, 1.05, 1.3, 3, 30))) * \
-                            Fraction(U0) * Fraction(na * nb) * rng.choice((1, -1))
-                        b[-1] = float((goal - part) / Fraction(a[-1]))
-                    r = emulate_element(a, b, N, rnd, chunk=5)
-                    x = sum(Fraction(p) * Fraction(q) for p, q in zip(a, b))
-                    na2 = sum(Fraction(v)**2 for v in a)
-                    nb2 = sum(Fraction(v)**2 for v in b)
-                    if na2 == 0 or nb2 == 0:
-                        continue
-                    counts["elements"] += 1
-                    row_ub = _up(sqrt_enclosure(na2)[1])
-                    col_ub = _up(sqrt_enclosure(nb2)[1])
-                    nu_a = max(_up(sum(abs(Fraction(v)) for v in a) / sqrt_enclosure(na2)[0]), 1.0)
-                    nu_b = max(_up(sum(abs(Fraction(v)) for v in b) / sqrt_enclosure(nb2)[0]), 1.0)
-                    U1 = _up(error_estimate(N, k, rnd, l1_ratio_a=nu_a, l1_ratio_b=nu_b)["bound"][1])
-                    for U in (U0, U1):
-                        for e in (0, 5, -7):
-                            C = float(Fraction(r["D"]) * Fraction(2)**e)
-                            rho = rho_recipe(C, row_ub, col_ub, U, e)
-                            if rho is None:
-                                continue
-                            counts["certified"] += 1
-                            need(x != 0, f"N={N} {rnd} k={k}: certified a zero x")
-                            need(Fraction(rho)**2 * x * x >= na2 * nb2,
-                                 f"N={N} {rnd} k={k} e={e}: rho_hat {rho} < rho")
-                            if abs(Fraction(r["D"])) < Fraction(11, 10) * Fraction(U) * \
-                                    Fraction(row_ub) * Fraction(col_ub):
-                                counts["near"] += 1
+                    a, b = rows(trial, k, U0)
+                    check(a, b, emulate_element(a, b, N, rnd, chunk=5)["D"], Us,
+                          f"N={N} {rnd} k={k}")
     need(counts["certified"] > counts["elements"] and counts["near"] > 0,
          f"vacuous: {counts}")
+    # (1') native elements: U = gamma_k (no N, rounding or nu in the DIRECT bound)
+    for k in (1, 2, 7, 40):
+        Ug = _up(error_estimate(8, k, RN, "DIRECT")["bound"][1])
+        for trial in range(40):
+            a, b = rows(trial % 14, k, Ug)
+            check(a, b, _native_fma_dot(a, b), lambda *_: (Ug,), f"DIRECT k={k}", "native_")
+    need(counts["native_certified"] > counts["native_elements"] and counts["native_near"] > 0,
+         f"vacuous (native): {counts}")
     # (2) the boundary, exact
     for _ in range(400):
         U = math.ldexp(1 + rng.random(), rng.randint(-60, -3))
@@ -2106,7 +2131,9 @@ def cert_rho_recipe():
         need((rho_recipe(C, ru, cu, U, e) is not None) == want,
              f"C={C!r} row={ru!r} col={cu!r} U={U!r} e={e}: certified should be {want}")
     return (f"{counts['elements']} emulated elements ({counts['certified']} certified rho_hat "
-            f">= rho, {counts['near']} with |D| < 1.1 U n), {counts['boundary']} boundary "
+            f">= rho, {counts['near']} with |D| < 1.1 U n), {counts['native_elements']} native "
+            f"({counts['native_certified']} certified, {counts['native_near']} near), "
+            f"{counts['boundary']} boundary "
             f"evaluations exact (certified iff |D| >= 2 ulps above RN(U n)), {len(edges)} "
             f"edge cases")
 

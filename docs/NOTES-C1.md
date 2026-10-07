@@ -43,9 +43,12 @@ what has been built since is recorded under "Implementation status".
   (host API 13). `python/immerdink/precision.py` (`PrecisionPlan` with the IR2 composition,
   masks and BUDGET, joint share groups, the DIRECT sentinel; `rho_from_output`),
   spec/params.py `rho_recipe` and `cert_rho_recipe`, the CPU test `host_precision` (a brute
-  force from host.py's queries), and the example `bench/accuracy/schedule.py`. The
-  implementation's design questions are §5.5, decided conservatively and put to the
-  independent reviewer.
+  force from host.py's queries), and the example `bench/accuracy/schedule.py`. It was
+  approved with fixes by an independent reviewer; the fixes are applied, and the verdicts on
+  the implementation's design questions are §5.5. The binding ones: a share-group member at
+  DIRECT leaves the group for the phase, `BUDGET` only on a met target (S1-5, S1-3), and a
+  1-D norm bound of `rho_from_output` is always axis −2 or −1 (S1-7). One question raised by
+  the fix (S1-10) is pending.
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -1211,10 +1214,13 @@ one infeasible.
    Σ_members calls × (the member's best composed time at N), with the shared pack's cost counted
    once per pack through the members' summed reuse. The N with the least group time is chosen
    for every member. Time is usually monotone in N, so this normally returns the group floor, but
-   not when the packing and reuse terms differ by level.
+   not when the packing and reuse terms differ by level. *[Stage-1 review, §5.5 S1-5, binding:]*
+   a member whose floor is DIRECT reads no pack, so it leaves the group for that phase and is
+   settled alone; the other members are ranked jointly over the emulated levels ≥ their max f_c.
 6. **BUDGET** (IR8). If no candidate at any level ≥ the floor fits the budget, N is the floor
    level, the status is BUDGET, and the reported candidate is the plan-time SUCCESS candidate with
-   the least total_bytes at that level. MISSED takes precedence over BUDGET.
+   the least total_bytes at that level. MISSED takes precedence over BUDGET. *[Stage-1 review,
+   §5.5 S1-3:]* BUDGET only if that candidate meets the target; otherwise MISSED.
 7. **TYPICAL targets.** p in §6f.2 is the failure probability *per call* (DESIGN §6f.2,
    [review] p). With `iterations` and `fail_budget` P given, `phase()` passes
    p = P / (iterations · Σ_c calls_per_iteration_c) to every TYPICAL target of the phase: a
@@ -3202,10 +3208,13 @@ decided conservatively and then put to an independent reviewer, whose verdicts a
   accepted.* N_MAX is 20; the superset covers the W = 3 boundary (N ≥ 17) and the whole
   published F1/F2 range.
 
-### 5.5 Stage 1: the implementation's design questions (pending the independent reviewer)
+### 5.5 Stage 1: the implementation's design questions (independent reviewer, 2026-10-07)
 
-Each was decided conservatively, in the spirit of §4.2, and is implemented and documented as
-stated (DESIGN §6g.10–§6g.11).
+The stage-1 implementation raised nine questions that §4.2 did not settle. Each was decided
+conservatively, in the spirit of §4.2, implemented and documented (DESIGN §6g.10–§6g.11), and
+put to an independent reviewer, whose verdicts are binding. The review was approve-with-fixes:
+two must-fix items (MF1, MF2) and nine should-fix items (SF1–SF9), all applied (DESIGN v1.19
+change list, "Stage-1 review fixes").
 - **S1-1. Parameters beyond §4.2's signature.** `vec_modes` (§4.2 ranks "the given vec modes"
   but names no parameter); `perf` (regime, cache, clock of rank and the pack predictions: the
   `Planner` carries only the calibration and the memo, not the regime or cache §4.2's comment
@@ -3213,33 +3222,69 @@ stated (DESIGN §6g.10–§6g.11).
   builders accumulate); `configs(iterations)` (so a `"phase"` reuse prices the same in
   `configs()` as in the phase, and the phase's choice is a `configs()` plan); `mode=` of
   `rho_from_output` (a DIRECT call's U is γ_k, which exceeds the EMULATE bound at large N, so
-  using the EMULATE U there would be unsound).
+  using the EMULATE U there would be unsound). *Verdict: accepted; `mode=` on condition of its
+  evidence (SF3).* Each fills a real gap without touching planner.py or the ABI. The evidence
+  is added: `cert_rho_recipe` (1′) checks the recipe on the native FMA chain in exact
+  arithmetic with U = γ_k, and `host_precision` checks U ≥ params' exact bound for both
+  dispatches at N = 2–20.
 - **S1-2. Share-group members** are `(name, "A" | "B")`, the role reading the group's pack, or
   a bare name (equal N only). Groups that share a contraction are merged for N; one role is in
   at most one group. Whether the members' packs have one key is left to plan creation
   (PACK_MISMATCH), not checked by `PrecisionPlan`. A shared role's int reuse is the total
-  calls per pack, and the members' kinds must agree.
+  calls per pack, and the members' kinds must agree. *Verdict: accepted.* PACK_MISMATCH is
+  the library's authoritative one-key check; a Python copy would be a second, weaker source of
+  truth. The docs now say that `Phase.pack_bytes` repeats a shared pack under every member
+  and `footprints()` counts it once (SF9).
 - **S1-3. Statuses.** The normal status is `MET`; precedence MISSED > BUDGET > DIRECT.
   `configs()` reports `OK` or `BUDGET`. In a share group where no level fits every member,
   the group takes its floor; members that fit there are MET, the others BUDGET. Ties between
-  levels of a group go to the smaller N.
+  levels of a group go to the smaller N. *Verdict: accepted, amended.* `BUDGET` may be
+  reported only when the reported candidate meets its target; a fallback whose candidate has
+  the ACCURACY bit is `MISSED` (`_settle`'s guard). The tie rule (smaller N between levels of
+  equal composed time) is documented for single contractions too (SF6).
 - **S1-4. MISSED** contractions are ranked with their target, so the reported err fields are in
-  its metric, and chosen by status and budget only (the accuracy bit ignored).
+  its metric, and chosen by status and budget only (the accuracy bit ignored). *Verdict:
+  accepted.*
 - **S1-5. DIRECT** choices are in-line (no packs), g = 1, with the plan's num_moduli the top
   emulated level (a DIRECT plan ignores it); `Phase.N` reports `"DIRECT"`. Under the monotone
-  floor DIRECT stays, and a target DIRECT misses is reported MISSED there.
+  floor DIRECT stays, and a target DIRECT misses is reported MISSED there. *Verdict: accepted
+  for single contractions; amended for share groups (binding, MF1).* A DIRECT call reads no
+  pack, and the one-N rule exists only for the shared pack, so a member at DIRECT leaves its
+  group's N coupling for that phase: it is settled alone, and the other members are ranked
+  jointly over the emulated levels ≥ their maximum floor. The implementation had dragged
+  every member to DIRECT; the reviewer reproduced a member whose TYPICAL target is met at
+  N = 12 and missed by γ_k reported `BUDGET` at native FP64. The brute force of
+  `host_precision` encoded the same rule, so the fix changed both, and a scenario pins it
+  (both member forms, a coupled third member, and a member that linked two groups).
 - **S1-6. Footprints.** Per level, the maximum over the allowed pack modes × vec modes at the
   largest g whose query succeeds (F1, ABI); the plan device bytes are included; the totals
-  share no workspace; a shared pack counts once, keyed by its group.
+  share no workspace; a shared pack counts once, keyed by its group. *Verdict: accepted,
+  amended (SF4).* At the largest g the workspace follows from F1's downward statement, but the
+  plan device bytes would rest on I2, a certificate and not ABI; `footprints()` now takes the
+  maximum over every g that succeeds.
 - **S1-7. `rho_from_output` details.** A C of exactly 2⁻¹⁰²² with e < 0 is uncertified (it
   may be a subnormal 2^e·D rounded up, so D is not recoverable); a ρ̂ that overflows is
   uncertified; α must be a positive power of two (−2^e would also be exact, but §4.2 says
   2^e); norm bounds broadcast against C (1-D vectors for a 2-D C) and are validated (NaN or
-  negative: ValueError); uncertified entries are +∞.
+  negative: ValueError); uncertified entries are +∞. *Verdict: accepted, amended (binding,
+  MF2).* The uncertified classes are required for soundness; −2^e may be added later with one
+  certificate line if a consumer needs α = −1. The broadcast rule was unsound: for a batched C,
+  or mixed 1-D and 2-D bounds with m = n, numpy paired `row_norm_ub[j]` with column j and
+  certified ρ̂ ≈ 1 where ρ ≥ 100. Now, for C.ndim ≥ 2, a 1-D row bound is always axis −2 and
+  a 1-D column bound axis −1, each of exactly that length.
 - **S1-8. `fail_budget`** is per phase (§4.2 step 7: P over the phase's calls). A run budget is
   the caller's split; the example calls `phase()` every iteration with `iterations=1` and
-  P / T_max.
-- **S1-9. A phase names every contraction** (a subset raises ValueError).
+  P / T_max. *Verdict: accepted.*
+- **S1-9. A phase names every contraction** (a subset raises ValueError). *Verdict: accepted.*
+- **S1-10 (new, from the MF1 fix; pending the reviewer).** In a phase where a share-group
+  member is at DIRECT, the shared role's reuse still counts that member's calls: it is fixed
+  at construction (the members' summed calls), so every phase's choice stays the `configs()`
+  lookup bit for bit (configuration and composed time) and the plans created before the loop
+  cover it. The other members' pack term is then priced as if those calls read the pack, an
+  optimistic [M] figure in a rare case. Counting only the readers per phase would price it
+  exactly; within a level it changes every candidate's time by one constant, so in exact
+  arithmetic the configuration at a level is unchanged, but the composed times would no
+  longer equal `configs()`'s, and floating-point rounding could reorder near-ties.
 
 ---
 

@@ -148,11 +148,12 @@ class Choice:
 class Phase:
     """The configuration of every contraction for one phase (PrecisionPlan.phase): a view of
     its Choices. N[name] is the level (an int, or "DIRECT"); g, vec_mode, packed, status
-    ("MET", "MISSED", "BUDGET", "DIRECT"), pack_bytes ({role: bytes} of the packed roles),
-    reuse ({role: calls per pack}), assumed_reuse ({role: "iteration"} where 'phase' fell back
-    for want of `iterations`), err_bound / err_typical (in each target's metric) are dicts by
-    name; time_s = the calls-weighted sum of the composed times (one iteration), tflops_eq =
-    sum of calls x 2bmnk / time_s."""
+    ("MET", "MISSED", "BUDGET", "DIRECT"), pack_bytes ({role: bytes} of the packed roles; a
+    shared pack is repeated under every member that reads it, while footprints() counts it
+    once, keyed by its group), reuse ({role: calls per pack}), assumed_reuse ({role:
+    "iteration"} where 'phase' fell back for want of `iterations`), err_bound / err_typical
+    (in each target's metric) are dicts by name; time_s = the calls-weighted sum of the
+    composed times (one iteration), tflops_eq = sum of calls x 2bmnk / time_s."""
     __slots__ = ("choices", "calls", "assumed", "_flops")
 
     def __init__(self, choices, calls, assumed, flops):
@@ -196,7 +197,8 @@ class Phase:
 class Footprints:
     """Exact bytes for sizing once (DESIGN §6g.2 C-ws, C-pack) or per level, from the queries
     (never recomputed): the maximum over what a phase may choose at that level, i.e. the
-    allowed pack modes x vec modes x g (the largest g that succeeds: F1, §6a). levels: the
+    allowed pack modes x vec modes x every g that succeeds (no reliance on I2, a certificate
+    and not ABI, for the plan device bytes). levels: the
     PrecisionPlan's. Per contraction name: workspace and plan_device_bytes {level: bytes,
     None where no configuration exists}, workspace_max. Per packed operand (key (name, role),
     or the share group's name for a shared pack): pack_bytes and pack_ws_bytes (imd_pack's
@@ -250,7 +252,8 @@ class PrecisionPlan:
         role that reads the group's one packed operand. Members get one N, ranked jointly over
         every level >= the group floor (IR24); a shared role is always packed (the other roles
         follow `packs`), and its pack cost is divided by the calls of every member reading it.
-        Groups that share a contraction are merged for N.
+        Groups that share a contraction are merged for N. A member at DIRECT in a phase reads
+        no pack and leaves the group for that phase (the others keep one N).
     packs: {name: mode or set of modes} ("NONE", "A", "B", "AB"; default {"NONE"}): the
         allowed pack modes, ranked at every level, so the packing may differ by N (IR8).
     reuse: {name: {"A" | "B": "call" | "iteration" | "phase" | int}} per packed role (default
@@ -313,7 +316,6 @@ class PrecisionPlan:
             ks = {repr(self._c[n].kinds[r]) for n, r in members if r is not None}
             if len(ks) > 1:
                 raise ValueError(f"share group {g!r}: its members' reuse kinds differ ({ks})")
-        self._comp = self._components()
         self._lock = threading.Lock()
         self._packs = {}       # (name, role, N) -> (PackSpec, planner.Prediction)
         self._floor = {}       # name -> the previous phase's final level (monotone)
@@ -405,14 +407,18 @@ class PrecisionPlan:
         return out
 
     def _flops(self, name, q):
-        """2 b m n k of the GEMM view, as the C library's flops_eq (the lowering's sizes)."""
-        lw = q.lowering(self.emulated[-1], 1, "GENERATE", rounding="TRUNC", mode=self.mode)
+        """2 b m n k of the GEMM view, as the C library's flops_eq (the lowering's sizes). b,
+        m, n, k do not depend on N, and a size past uint64 is closed upward in N (F1), so the
+        lowest level lowers wherever any level does."""
+        lw = q.lowering(self.emulated[0], 1, "GENERATE", rounding="TRUNC", mode=self.mode)
         if not lw.lowered:
             raise ImmerdinkError(STATUS.index(lw.status), f"{name}: imd_lowering")
         return 2.0 * float(lw.b) * float(lw.m) * float(lw.n) * float(lw.k)
 
-    def _components(self):
-        parent = {n: n for n in self._c}
+    def _components(self, names):
+        """The contractions of `names` that share groups tie to one N, as tuples in the
+        construction order: a member outside `names` (a DIRECT one) links nothing."""
+        parent = {n: n for n in names}
 
         def find(x):
             while parent[x] != x:
@@ -420,11 +426,13 @@ class PrecisionPlan:
                 x = parent[x]
             return x
         for ms in self.share.values():
-            for n, _ in ms[1:]:
-                parent[find(n)] = find(ms[0][0])
+            ms = [n for n, _ in ms if n in parent]
+            for n in ms[1:]:
+                parent[find(n)] = find(ms[0])
         comps = {}
         for n in self._c:
-            comps.setdefault(find(n), []).append(n)
+            if n in parent:
+                comps.setdefault(find(n), []).append(n)
         return [tuple(v) for v in comps.values()]
 
     # -- the composition (IR2) --------------------------------------------------------------
@@ -568,12 +576,15 @@ class PrecisionPlan:
           2. the floor f_c = the smallest level >= n_c;
           3. monotone: f_c = max(f_c, the previous phase's final level; DIRECT is the top);
           4. outside a share group: the best composed candidate over the levels >= f_c (one
-             rank call with the accuracy, the pack-mode mask and the budget);
-          5. a share group: for each level N >= the group floor (the members' max f_c), the
-             calls-weighted sum of the members' best composed times; the least wins (ties:
-             the smaller N), for every member;
+             rank call with the accuracy, the pack-mode mask and the budget); between levels
+             of equal composed time, the smaller N;
+          5. a share group: a member at DIRECT reads no pack, so it leaves the group for the
+             phase (settled alone, as outside a group); for the others, for each level N >=
+             their max f_c, the calls-weighted sum of their best composed times; the least
+             wins (ties: the smaller N), for every one of them;
           6. BUDGET: no level >= the floor fits: the floor level and its least-total_bytes
-             SUCCESS candidate; MISSED takes precedence over BUDGET, BUDGET over DIRECT;
+             SUCCESS candidate, status BUDGET if it meets the target (else MISSED); MISSED
+             takes precedence over BUDGET, BUDGET over DIRECT;
           7. with `iterations` (the phase length) and `fail_budget` P, every TYPICAL target
              gets fail_prob P / (iterations x the calls per iteration of every contraction).
         targets: {name: host.Accuracy with a target > 0} for every contraction. Raises
@@ -607,8 +618,13 @@ class PrecisionPlan:
                         ok = self._direct_met(c, accs[name])
                 floors[name], met[name] = f, ok
             choices = {}
-            for comp in self._comp:
+            for name, c in self._c.items():    # DIRECT reads no pack: outside every group
+                if floors[name] == DIRECT:
+                    got = self._direct(c, reuse, accs[name], ignore_accuracy=not met[name])
+                    choices[name] = self._settle(c, got, "DIRECT" if met[name] else "MISSED")
+            for comp in self._components([n for n in self._c if floors[n] != DIRECT]):
                 choices.update(self._choose(comp, floors, met, accs, reuse))
+            choices = {n: choices[n] for n in self._c}
             if self.monotone:
                 for name, ch in choices.items():
                     self._floor[name] = ch.level
@@ -616,16 +632,10 @@ class PrecisionPlan:
                      {n: c.flops_eq for n, c in self._c.items()})
 
     def _choose(self, comp, floors, met, accs, reuse):
-        floor = floors[comp[0]]
-        for n in comp[1:]:
-            floor = self._at_least(floor, floors[n])
-        if floor == DIRECT:
-            out = {}
-            for n in comp:
-                c = self._c[n]
-                got = self._direct(c, reuse, accs[n], ignore_accuracy=not met[n])
-                out[n] = self._settle(c, got, "DIRECT" if met[n] else "MISSED")
-            return out
+        """One N for the emulated members of a component: the least calls-weighted sum of
+        their best composed times over the levels >= their maximum floor (ties: the smaller
+        N); none fits every member: the floor."""
+        floor = max(floors[n] for n in comp)
         Ns = tuple(x for x in self.emulated if x >= floor)
         got = {}
         for n in comp:
@@ -643,6 +653,8 @@ class PrecisionPlan:
                 for n in comp}
 
     def _settle(self, c, choices, status):
+        """The best feasible choice with `status`; none: the least total_bytes, status BUDGET
+        if it meets the target, else MISSED (MISSED takes precedence)."""
         ch = self._best(choices)
         if ch is None:
             ch = self._least_bytes(choices)
@@ -650,7 +662,8 @@ class PrecisionPlan:
                 raise ImmerdinkError(STATUS.index("NOT_SUPPORTED"),
                                      f"{c.name}: no plan at the chosen level")
             if status != "MISSED":
-                status = "BUDGET"
+                status = "MISSED" if ch.candidate.infeasible & host.INFEASIBLE["ACCURACY"] \
+                    else "BUDGET"
         ch.status = status
         return ch
 
@@ -669,27 +682,21 @@ class PrecisionPlan:
         for name, c in self._c.items():
             ws[name], pdev[name] = {}, {}
             for level in self.levels:
-                w, d = [], []
                 if level == DIRECT:
-                    for vec in self.vec_modes:
-                        got = self._sizes(c, self.emulated[-1], vec, "NONE", "DIRECT")
-                        if got is not None:
-                            w.append(got[0])
-                            d.append(got[1])
+                    cfgs = [(self.emulated[-1], vec, "NONE", "DIRECT") for vec in self.vec_modes]
                 else:
-                    for m in c.modes:
-                        for vec in self.vec_modes:
-                            got = self._sizes(c, level, vec, m, self.mode)
-                            if got is None:
-                                continue
-                            w.append(got[0])
-                            d.append(got[1])
-                            for role, lay in got[2].items():
-                                op = op_of[(name, role)]
-                                packs.setdefault(op, {}).setdefault(level, set()).add(
-                                    lay.pack_bytes)
-                                pws.setdefault(op, {}).setdefault(level, set()).add(
-                                    lay.pack_ws_bytes)
+                    cfgs = [(level, vec, m, self.mode) for m in c.modes for vec in self.vec_modes]
+                w, d = [], []
+                for cfg in cfgs:
+                    for got in self._sizes(c, *cfg):
+                        w.append(got[0])
+                        d.append(got[1])
+                        for role, lay in got[2].items():
+                            op = op_of[(name, role)]
+                            packs.setdefault(op, {}).setdefault(level, set()).add(
+                                lay.pack_bytes)
+                            pws.setdefault(op, {}).setdefault(level, set()).add(
+                                lay.pack_ws_bytes)
                 ws[name][level], pdev[name][level] = _max(w), _max(d)
         pb = {op: {lv: _max(v.get(lv, ())) for lv in self.levels} for op, v in packs.items()}
         pw = {op: {lv: _max(v.get(lv, ())) for lv in self.levels} for op, v in pws.items()}
@@ -707,10 +714,11 @@ class PrecisionPlan:
                           _max(totals.values()))
 
     def _sizes(self, c, N, vec, packed, mode):
-        """(workspace, plan device bytes, {role: PackLayout}) of the largest g that succeeds
-        at (N, vec, packed, mode) (F1: nondecreasing in g), or None if none does."""
-        q, roles = c.query, _ROLES[packed]
-        for g in range(N, 0, -1):
+        """[(workspace, plan device bytes, {role: PackLayout})] of every g that succeeds at
+        (N, vec, packed, mode): footprints() takes the maximum over them, so it relies on
+        neither F1's order in g nor I2 (a certificate, not ABI) for the plan device bytes."""
+        q, roles, out = c.query, _ROLES[packed], []
+        for g in range(1, N + 1):
             try:
                 specs = {r: q.pack_desc_for(_OPERAND[r], N, g, vec, rounding=self.rounding,
                                             mode=mode) for r in roles}
@@ -725,8 +733,8 @@ class PrecisionPlan:
             lays = {r: host.pack_layout(s, lib=self.planner.lib) for r, s in specs.items()}
             if any(l.status != "SUCCESS" for l in lays.values()):
                 continue
-            return w, lw.plan_device_bytes, lays
-        return None
+            out.append((w, lw.plan_device_bytes, lays))
+        return out
 
 
 # ------------------------------------------------------------------------------------------
@@ -741,8 +749,11 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
 
     C: a float64 host array (numpy; copy a device C or the part needed to the host first).
     row_norm_ub, col_norm_ub: upper bounds of the GEMM view's row 2-norms ||a_i|| and column
-    2-norms ||b_j|| (§6f.1's obligation: really upper bounds, e.g. rounded up), as arrays that
-    broadcast against C (for a 2-D C, 1-D vectors of length m and n are rows and columns).
+    2-norms ||b_j|| (§6f.1's obligation: really upper bounds, e.g. rounded up). For C.ndim >= 2
+    a 1-D row_norm_ub is always the vector along axis -2 (length C.shape[-2]) and a 1-D
+    col_norm_ub always the one along axis -1 (length C.shape[-1]), each on its own and for any
+    batch dims (another length: ValueError); other bounds (scalars, explicit (..., m, 1) /
+    (..., 1, n) shapes, or for a 0-D / 1-D C elementwise ones) broadcast to C's shape.
     Real norms, not sigma-derived ones (a zero row's sigma bound is vacuous). l1_ratio: None
     (nu = sqrt k), one value for both, or (l1_ratio_a, l1_ratio_b), as host.Accuracy.
     U is the NORMWISE `bound` of imd_err_estimate at (N, rounding, k) for the call's dispatch
@@ -755,8 +766,8 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
     entries are +inf. With true norm bounds rho_hat >= 1.
     ValueError: beta != 0 (for beta = 1 accumulations take rho from a probe call with
     beta = 0 into a scratch buffer, once per phase), alpha not a power of two (D cannot be
-    recovered exactly from RN(alpha D)), a negative or NaN norm bound, shapes that do not
-    broadcast to C. TypeError: C not float64."""
+    recovered exactly from RN(alpha D)), a negative or NaN norm bound, a 1-D bound of the
+    wrong length, shapes that do not broadcast to C. TypeError: C not float64."""
     import numpy as np
     if beta != 0:
         raise ValueError("rho_from_output needs beta = 0 (take rho from a beta = 0 probe call)")
@@ -780,8 +791,15 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
         raise TypeError(f"C must be float64, got {C.dtype}")
     row = np.asarray(row_norm_ub, dtype=np.float64)
     col = np.asarray(col_norm_ub, dtype=np.float64)
-    if C.ndim == 2 and row.ndim == 1 and col.ndim == 1:
-        row, col = row[:, None], col[None, :]
+    if C.ndim >= 2:     # a 1-D bound is always the rows' (axis -2) or the columns' (axis -1)
+        if row.ndim == 1:
+            if row.shape[0] != C.shape[-2]:
+                raise ValueError(f"a 1-D row_norm_ub has length {row.shape[0]}, C has "
+                                 f"{C.shape[-2]} rows (axis -2)")
+            row = row[:, None]
+        if col.ndim == 1 and col.shape[0] != C.shape[-1]:
+            raise ValueError(f"a 1-D col_norm_ub has length {col.shape[0]}, C has "
+                             f"{C.shape[-1]} columns (axis -1)")
     try:
         shape = np.broadcast_shapes(row.shape, col.shape, C.shape)
     except ValueError:
