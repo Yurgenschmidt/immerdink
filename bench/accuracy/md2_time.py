@@ -10,12 +10,32 @@ band (pre-registered protocol; DESIGN v1.19 §6g.9-§6g.10).
 
 ORDERING (binding, NOTES-C1 §5.9 "M-d2 ordering", §5.10 MD2-0). M-d2 runs only after M-c's
 MC-3 path closes (MC-3a's recorded outcome, or Eric's explicit decision). `run` refuses the
-M-d2 systems (ppl, df, sq4096, jacobi) unless --md2-cleared names why the ordering is met
+M-d2 systems (ppl, df, sq4096, jacobi) unless --md2-cleared cites the commit (an ancestor of
+the run's own) and the NOTES-C1 section ("NOTES-C1 §n.m") that record MC-3's closure
 (recorded in every record); the tooling checks `smoke` (512^3) and `smoke_t` (a small
 PPL-like tensor case), not M-d2 systems, run without it. If the calibration changes (MC-3a),
 the bars, the band classes and REGISTERED_CALIB below are re-derived with `predict` and
 committed BEFORE any M-d2 run (IR23), and this driver is re-registered (NOTES-C1 §4.3 names
 its commit and sha256); `judge` refuses records whose calibration is not the registered one.
+
+RECORDS, FREEZE AND CONTINUATION (binding, NOTES-C1 §4.3, §5.10 MD2-8 as amended):
+- One normative records file: immerdink-eval results/c1/m_d2/md2.jsonl. Every M-d2 record
+  `run` ever writes, in any file, is an attempt under rules (b) and (c) below and is
+  reported; starting another file resets nothing.
+- Until the first M-d2 record exists, re-registering this driver is a commit plus NOTES-C1
+  §4.3 and the findings naming it. From the first M-d2 record on, the driver is FROZEN: it
+  is re-registered only with an independent-review verdict recorded in NOTES-C1 §5.10.
+  Records made under an earlier driver stay reported and binding, judged by the driver that
+  made them (`git show <commit>:bench/accuracy/md2_time.py`, run in a checkout of <commit>).
+- After rule (d) (two inadmissible attempts) or M-d2 STOPPED, nothing continues
+  automatically. A further attempt, a new records file, or a restart after a library fix
+  needs a recorded reviewer verdict or Eric's decision (NOTES-C1) that names the cause or
+  the fix and the new file; every earlier record stays reported.
+- A records file `judge` refuses (a provenance failure, below) is a procedural breach, not
+  a reset: it is recorded in NOTES-C1 (which record, how it got there), and continuing in a
+  new file needs a recorded reviewer verdict or Eric's decision.
+- The library: `run` takes the M-d2 systems from ROOT/build/libimmerdink.so only, built at
+  the registered commit before the first M-d2 run (the findings name its sha256).
 
 The protocol (pre-registered before any M-d2 measurement):
 - Systems (NOTES-C1 §4.3): the o = 10, v = 96 PPL view ijcd,abcd->ijab (GEMM view
@@ -66,8 +86,10 @@ The protocol (pre-registered before any M-d2 measurement):
   NOTES-C1 §5.10 MD2-3, MD2-6; `selftest` checks them). Per (system, data):
   (a) a record is INADMISSIBLE, neither PASS nor FAIL, when contaminated is not false (the
       kept attempt's worst S14/F14 spread > 5 %) or bitexact_packed_vs_inline is not true at
-      every level. A bit-exact failure (false at any level) is a library defect: it STOPS
-      M-d2 (judge: M-d2 STOPPED) until the defect is fixed and recorded.
+      every level. A bit-exact failure (false at any level) on any record, an M-d2 system's
+      or a smoke's, is a library defect: it STOPS M-d2 (judge: M-d2 STOPPED; NOTES-C1 §4.3:
+      on any record made with the M-d2 library, in any file) until the defect is fixed and
+      recorded.
   (b) At most one re-run, in a fresh process after a FREE busy check in its own call,
       appending to the same records file. `run` refuses a re-run once an admissible record
       exists, a third record, and any M-d2 system once the file holds a bit-exact failure.
@@ -75,21 +97,26 @@ The protocol (pre-registered before any M-d2 measurement):
       record is reported; a later record never replaces the first, and a record past the
       second is reported as excess, never considered.
   (d) If both attempts are inadmissible, the pair is INCOMPLETE, and M-d2 is not decided
-      until the cause is recorded (NOTES-C1).
+      until the cause is recorded (NOTES-C1); nothing continues automatically (above).
   A gated system PASSES when its normal and decay_opp pairs are both INSIDE, FAILS when
-  either is OUTSIDE, else is INCOMPLETE. M-d2: STOPPED on any bit-exact failure of an M-d2
-  record; else PASS when all three systems pass; FAIL when any fails; else INCOMPLETE.
+  either is OUTSIDE, else is INCOMPLETE. M-d2: STOPPED on any bit-exact failure in the file;
+  else PASS when all three systems pass; FAIL when any fails; else INCOMPLETE.
 - Provenance (an M-d2 record that fails any of these is not the protocol's: `run` refuses
   to make it, before any timing, and `judge` refuses the whole records file):
   the calibration file's sha256 is REGISTERED_CALIB; calib_check.ok, i.e. the loaded host
   library's shipped (build-time embedded) calibration equals that file's, as canonical text
   and as bit-identical predictions (in-line DEFAULT/COLD and BURST/REPEAT, and the pack, at
-  every level); dirty is false (no tracked change, this driver included); md2_cleared is
-  non-empty; driver_sha256 equals the judging driver's own sha256 (so the judge is the
-  committed driver that made the record; NOTES-C1 §4.3 names the registered one); the
-  protocol's --reps 15, --attempts 2, --warmup-s 3, --primer-mib 1024, --seed 1 and the 5 %
-  spread rule; every level's configuration is the bars': N moduli, g = N, GENERATE, in-line
-  (packed NONE), RN, EMULATE.
+  every level); registered_check, i.e. the loaded host library reproduces the system's
+  registered bar (rank's choice and g = N, to 3 decimals) and its p90 class (`predict`'s
+  check, so a model-code change under an unchanged calibration is caught); dirty is false
+  (no tracked change, this driver included); md2_cleared cites the closure's commit (an
+  ancestor of the record's commit) and NOTES-C1 section; driver_sha256 equals the judging
+  driver's own sha256 (so the judge is the committed driver that made the record; NOTES-C1
+  §4.3 names the registered one); the protocol's --reps 15, --attempts 2, --warmup-s 3,
+  --primer-mib 1024, --seed 1 and the 5 % spread rule; every level's configuration is the
+  bars': N moduli, g = N, GENERATE, in-line (packed NONE), RN, EMULATE. Per file, the M-d2
+  records share one library: one (lib_sha256, host_lib_sha256, host_api). `run` also
+  refuses an M-d2 system unless --lib is ROOT/build/libimmerdink.so.
 - Reported: per phase of S14 measured vs predicted (DEFAULT/COLD and BURST/REPEAT), TFLOPS-eq
   first with time alongside; the paired per-rep S14/F14 ratios; S9/F9 and t14/t8, t14/t9
   (the gain against fixed N = 8-9); P14/PF14, P14/F14 and each re-pack's time against
@@ -105,6 +132,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -158,6 +186,11 @@ CALIB_FILE = os.path.join(ROOT, "src", "host", "calib", "rtx4090_sm89.calib")
 BAR_CONFIG = dict(vec_mode="GENERATE", packed="NONE", rounding="RN", mode="EMULATE")
 MAX_SPREAD, ATTEMPTS, WARMUP_S, REPS, PHI, SEED, PRIMER_MIB = 5.0, 2, 3.0, 15, 0.5, 1, 1024
 MAX_RECORDS = 2                     # per (system, data): the first and one re-run
+# The one library the M-d2 systems run on (built at the registered commit; NOTES-C1 §4.3)
+DEFAULT_LIB = os.path.join(ROOT, "build", "libimmerdink.so")
+# --md2-cleared cites the commit and the NOTES-C1 section that record MC-3's closure
+CLEARED_COMMIT = re.compile(r"\b[0-9a-f]{7,40}\b")
+CLEARED_SECTION = re.compile(r"NOTES-C1 §\d+(\.\d+)*")
 
 
 def sha256(path):
@@ -171,6 +204,15 @@ DRIVER_SHA256 = sha256(os.path.abspath(__file__))
 def git(*args):
     r = subprocess.run(["git", "-C", ROOT, *args], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else None
+
+
+def git_is_ancestor(cited, commit):
+    """True when the commit `cited` names is `commit` or one of its ancestors."""
+    if not commit:
+        return False
+    r = subprocess.run(["git", "-C", ROOT, "merge-base", "--is-ancestor", cited, commit],
+                       capture_output=True, text=True)
+    return r.returncode == 0
 
 
 def provenance(lib_path, host_lib_path):
@@ -235,20 +277,46 @@ def config_problems(levels):
     return bad
 
 
-def provenance_problems(rec):
+def cleared_problems(text, commit, ancestor=git_is_ancestor):
+    """Why an --md2-cleared reason does not cite MC-3's closure ([] if it does): it names a
+    NOTES-C1 section ("NOTES-C1 §n.m") and a commit that is `commit` or an ancestor of it
+    (the closure was committed before the run)."""
+    text = str(text or "").strip()
+    if not text:
+        return ["no --md2-cleared reason"]
+    bad = []
+    if not CLEARED_SECTION.search(text):
+        bad.append("--md2-cleared cites no NOTES-C1 section ('NOTES-C1 §n.m') recording "
+                   "MC-3's closure")
+    if not any(ancestor(c, commit) for c in CLEARED_COMMIT.findall(text)):
+        bad.append("--md2-cleared cites no commit recording MC-3's closure that is the "
+                   f"record's commit ({str(commit)[:7]}) or an ancestor of it")
+    return bad
+
+
+def provenance_problems(rec, ancestor=git_is_ancestor):
     """Why an M-d2 record is not the pre-registered protocol's ([] if it is): the judge
     refuses a records file that holds one, and `run` refuses to make one."""
     bad = []
     if rec.get("calib_file_sha256") != REGISTERED_CALIB:
         bad.append(f"calibration file {rec.get('calib_file_sha256')} is not the registered "
                    "one; re-derive and commit the bars first (IR23)")
-    if (rec.get("calib_check") or {}).get("ok") is not True:
+    cc = rec.get("calib_check")
+    if not cc:
+        bad.append("no calib_check")
+    elif cc.get("ok") is not True:
         bad.append("the library's shipped calibration is not the registered file's "
                    "(calib_check)")
+    rc = rec.get("registered_check")
+    if not rc:
+        bad.append("no registered_check")
+    elif rc.get("same") is not True or rc.get("p90_same") is not True:
+        bad.append(f"the host library does not reproduce the registered bar "
+                   f"{rc.get('registered')!r} and p90 (registered_check: derived "
+                   f"{rc.get('derived')!r}, p90 {rc.get('p90')!r})")
     if rec.get("dirty") is not False:
         bad.append(f"tree dirty = {rec.get('dirty')!r}, not false")
-    if not str(rec.get("md2_cleared") or "").strip():
-        bad.append("no --md2-cleared reason")
+    bad += cleared_problems(rec.get("md2_cleared"), rec.get("commit"), ancestor)
     if rec.get("driver_sha256") != DRIVER_SHA256:
         bad.append(f"driver {str(rec.get('driver_sha256'))[:12]}… is not this driver "
                    f"({DRIVER_SHA256[:12]}…)")
@@ -261,17 +329,42 @@ def provenance_problems(rec):
     return bad
 
 
+def library_problems(recs):
+    """Why the M-d2 records of one file do not share one library ([] if they do): one
+    (lib_sha256, host_lib_sha256, host_api), each recorded."""
+    ids = sorted({(r.get("lib_sha256"), r.get("host_lib_sha256"), r.get("host_api"))
+                  for r in recs if r["system"] in MD2_SYSTEMS}, key=repr)
+    bad = []
+    if any(None in t for t in ids):
+        bad.append("an M-d2 record without lib_sha256, host_lib_sha256 or host_api")
+    if len(ids) > 1:
+        bad.append(f"the M-d2 records come from {len(ids)} libraries: " + "; ".join(
+            f"lib {str(a)[:12]}…, host lib {str(b)[:12]}…, host API {c}" for a, b, c in ids))
+    return bad
+
+
+def file_problems(recs, ancestor=git_is_ancestor):
+    """Why `judge` refuses a records file: [(where, problems)], [] if it judges it."""
+    out = [(f"record {i + 1} ({r['system']} {r['data']})", p) for i, r in enumerate(recs)
+           if r["system"] in MD2_SYSTEMS for p in (provenance_problems(r, ancestor),) if p]
+    lp = library_problems(recs)
+    if lp:
+        out.append(("the M-d2 records", lp))
+    return out
+
+
 def inadmissible(rec):
-    """Why a record is inadmissible, neither PASS nor FAIL (rule (a)); [] if admissible."""
+    """Why a record is inadmissible, neither PASS nor FAIL (rule (a)); [] if admissible:
+    contaminated not false, or the bit-exact check not true at every level."""
     why = []
     if rec.get("contaminated") is not False:
         why.append(f"contaminated (worst spread > {MAX_SPREAD:g} %)")
     be = rec.get("bitexact_packed_vs_inline") or {}
     if bitexact_failed(rec):
         why.append("packed != in-line at N = " + ", ".join(str(N) for N in bitexact_failed(rec)))
-    missing = [N for N in LEVELS if str(N) not in be]
+    missing = [N for N in LEVELS if be.get(str(N)) is not True and be.get(str(N)) is not False]
     if missing:
-        why.append("no bit-exact check at N = " + ", ".join(map(str, missing)))
+        why.append("no bit-exact result (true / false) at N = " + ", ".join(map(str, missing)))
     return why
 
 
@@ -279,6 +372,12 @@ def bitexact_failed(rec):
     """The levels whose packed-vs-in-line check failed: a library defect (stops M-d2)."""
     be = rec.get("bitexact_packed_vs_inline") or {}
     return [N for N in LEVELS if be.get(str(N)) is False]
+
+
+def stopped(recs):
+    """The records whose bit-exact failure stops M-d2: any record in the file, an M-d2
+    system's or a smoke's (rule (a))."""
+    return [r for r in recs if bitexact_failed(r)]
 
 
 def s14_f14(rec):
@@ -297,6 +396,7 @@ def decide(recs):
     roles, idx = [None] * len(recs), {}
     for i, r in enumerate(recs):
         idx.setdefault((r["system"], r["data"]), []).append(i)
+    stop = bool(stopped(recs))
     pairs = {}
     for key, ii in idx.items():
         decisive = None
@@ -321,15 +421,19 @@ def decide(recs):
         else:
             used = min(len(ii), MAX_RECORDS)
             pairs[key] = dict(outcome="INCOMPLETE", record=None, S14_F14=None,
-                              why="both attempts inadmissible: record the cause before M-d2 "
-                                  "is decided" if used == MAX_RECORDS else
+                              why="both attempts inadmissible: record the cause; a further "
+                                  "attempt needs a recorded reviewer verdict or Eric's "
+                                  "decision (NOTES-C1 §4.3)" if used == MAX_RECORDS else
+                                  "M-d2 STOPPED by a bit-exact failure: no re-run; a restart "
+                                  "after the fix needs a recorded reviewer verdict or Eric's "
+                                  "decision (NOTES-C1 §4.3)" if stop else
                                   "no admissible record yet (one re-run allowed)")
     systems = {}
     for name in GATED:
         o = [pairs.get((name, d), {}).get("outcome", "INCOMPLETE") for d in DATA]
         systems[name] = ("PASS" if all(x == "INSIDE" for x in o) else
                          "FAIL" if "OUTSIDE" in o else "INCOMPLETE")
-    if any(bitexact_failed(r) for r in recs if r["system"] in MD2_SYSTEMS):
+    if stop:
         md2 = "STOPPED"
     else:
         md2 = ("PASS" if all(x == "PASS" for x in systems.values()) else
@@ -341,16 +445,18 @@ def rerun_problems(prior, name, data):
     """Why `run` may not add a record of (name, data) to a records file holding `prior`
     (rules (a)-(c)); [] if it may."""
     bad = []
-    stop = [r for r in prior if r["system"] in MD2_SYSTEMS and bitexact_failed(r)]
+    stop = stopped(prior)
     if stop:
         bad.append(f"M-d2 is STOPPED: the records hold a bit-exact failure ({stop[0]['system']} "
-                   f"{stop[0]['data']}), a library defect (rule (a))")
+                   f"{stop[0]['data']}), a library defect (rule (a)); a restart after the fix "
+                   "needs a recorded reviewer verdict or Eric's decision (NOTES-C1 §4.3)")
     same = [r for r in prior if (r["system"], r["data"]) == (name, data)]
     if any(not inadmissible(r) for r in same):
         bad.append(f"{name} {data} is decided: the records hold an admissible one (rule (c))")
     elif len(same) >= MAX_RECORDS:
         bad.append(f"{name} {data}: the one re-run is used (rule (b)); record the cause of the "
-                   "inadmissible attempts")
+                   "inadmissible attempts; a further attempt needs a recorded reviewer verdict "
+                   "or Eric's decision (NOTES-C1 §4.3)")
     return bad
 
 
@@ -419,6 +525,21 @@ def predictions(name, host_lib):
                 totals=totals, ratios=rat)
 
 
+def registered_check(name, p):
+    """`predict`'s check of an M-d2 system on the loaded host library (p = predictions()):
+    the registered bar (the Jacobi view: its registered prediction) reproduces to 3 decimals
+    from rank's choice and from g = N, and the levels' classes give the registered p90."""
+    s = SYSTEMS[name]
+    reg = s["bar"] if s["bar"] is not None else s["predicted"]
+    r = p["ratios"]
+    got = {k: round(r[k]["S14_F14"], 3) for k in ("t_cold", "t_gN_cold")}
+    same = all(abs(v - reg) < 5e-4 for v in got.values())
+    classes = {p["levels"][str(N)]["class"] for N in LEVELS}
+    p90 = max(cls(p["levels"][str(N)]["t_cold"])[1] for N in LEVELS)
+    return dict(registered=reg, derived=got, same=same, classes=sorted(classes), p90=p90,
+                p90_same=p90 == s["p90"])
+
+
 def band(name):
     s = SYSTEMS[name]
     r = s["bar"] if s["bar"] is not None else s.get("predicted")
@@ -463,20 +584,12 @@ def cmd_predict(a):
             print(f"  band: {b['ratio']:.3f} x (1 -/+ {b['p90']:.2f}) = [{b['lo']:.4f}, "
                   f"{b['hi']:.4f}]{' (capped at 0.8)' if b['cap'] else ''}"
                   f"{'' if b['gated'] else ', reported only'}")
-        s = SYSTEMS[name]
-        if name in GATED or name == "jacobi":
-            reg = s["bar"] if s["bar"] is not None else s["predicted"]
-            got = {k: round(r[k]["S14_F14"], 3) for k in ("t_cold", "t_gN_cold")}
-            same = all(abs(v - reg) < 5e-4 for v in got.values())
-            classes = {p["levels"][str(N)]["class"] for N in LEVELS}
-            p90 = max(cls(p["levels"][str(N)]["t_cold"])[1] for N in LEVELS)
-            p["registered_check"] = dict(registered=reg, derived=got, same=same,
-                                         classes=sorted(classes), p90=p90,
-                                         p90_same=p90 == s["p90"])
-            print(f"  registered {reg:.3f}: derived {got} -> {'same' if same else 'DIFFERENT'}; "
-                  f"classes {sorted(classes)} -> p90 {p90:.2f} "
-                  f"{'as registered' if p90 == s['p90'] else 'DIFFERENT'}")
-            ok &= same and p90 == s["p90"]
+        if name in MD2_SYSTEMS:
+            rc = p["registered_check"] = registered_check(name, p)
+            print(f"  registered {rc['registered']:.3f}: derived {rc['derived']} -> "
+                  f"{'same' if rc['same'] else 'DIFFERENT'}; classes {rc['classes']} -> p90 "
+                  f"{rc['p90']:.2f} {'as registered' if rc['p90_same'] else 'DIFFERENT'}")
+            ok &= rc["same"] and rc["p90_same"]
     calib_ok = out["provenance"]["calib_file_sha256"] == REGISTERED_CALIB
     cc = out["calib_check"] = calib_check(hl, MD2_SYSTEMS + ("smoke", "smoke_t"))
     out["registered_calib"] = REGISTERED_CALIB
@@ -601,8 +714,12 @@ def cmd_run(a):
     name = a.system
     if name in MD2_SYSTEMS and not a.md2_cleared:
         print(f"{name} is an M-d2 system: M-d2 waits until M-c's MC-3 path closes (NOTES-C1 "
-              "§5.9 'M-d2 ordering', binding). Pass --md2-cleared REASON once it has.",
-              file=sys.stderr)
+              "§5.9 'M-d2 ordering', binding). Once it has, pass --md2-cleared citing the "
+              "commit and the NOTES-C1 section that record the closure.", file=sys.stderr)
+        return 2
+    if name in MD2_SYSTEMS and os.path.realpath(a.lib) != os.path.realpath(DEFAULT_LIB):
+        print(f"{name} is an M-d2 system: it runs on {DEFAULT_LIB} only (built at the "
+              f"registered commit; NOTES-C1 §4.3), not {a.lib}", file=sys.stderr)
         return 2
     s = SYSTEMS[name]
     lib = imd.load_library(a.lib)
@@ -621,10 +738,13 @@ def cmd_run(a):
                                  vec_modes=("GENERATE",), monotone=False).configs()[name]
     rec["levels"] = {str(N): level_config(cf[N]) for N in LEVELS}
     if name in MD2_SYSTEMS:
+        rec["registered_check"] = registered_check(name, predictions(name, hl))
         # Provenance and rules (b) / (a) before any GPU work: a record that would not be
         # admissible protocol evidence is not made (judge refuses the file otherwise).
+        prior = read_records(a.out)
         problems = provenance_problems(rec)
-        problems += rerun_problems(read_records(a.out), name, a.data)
+        problems += library_problems(prior + [rec])
+        problems += rerun_problems(prior, name, a.data)
         if problems:
             print(f"{name} {a.data}: not run:\n  " + "\n  ".join(problems), file=sys.stderr)
             return 2
@@ -770,7 +890,8 @@ def cmd_run(a):
          "INADMISSIBLE: " + "; ".join(inadmissible(rec))))
     if bitexact_failed(rec):
         print(f"STOP: packed != in-line at N = {bitexact_failed(rec)}, a library defect "
-              "(rule (a)); M-d2 is stopped until it is fixed and recorded", file=sys.stderr)
+              "(rule (a)); M-d2 is stopped until it is fixed and recorded, and a restart needs "
+              "a recorded reviewer verdict or Eric's decision (NOTES-C1 §4.3)", file=sys.stderr)
         return 3
     return 0
 
@@ -781,13 +902,15 @@ def cmd_run(a):
 def cmd_judge(a):
     from immerdink import host
     recs = read_records(a.records)
-    refused = [(i, r, p) for i, r in enumerate(recs) if r["system"] in MD2_SYSTEMS
-               for p in (provenance_problems(r),) if p]
+    refused = file_problems(recs)
     if refused:
-        for i, r, p in refused:
-            print(f"record {i + 1} ({r['system']} {r['data']}) is not the pre-registered "
-                  "protocol's:\n  " + "\n  ".join(p), file=sys.stderr)
-        print(f"{a.records} is not an M-d2 records file: nothing judged", file=sys.stderr)
+        for where, p in refused:
+            print(f"{where}: not the pre-registered protocol's:\n  " + "\n  ".join(p),
+                  file=sys.stderr)
+        print(f"{a.records} is not an M-d2 records file: nothing judged. This is a "
+              "procedural breach, not a reset: record it in NOTES-C1 "
+              "(which record, how it got there); continuing in a new file needs a recorded "
+              "reviewer verdict or Eric's decision (NOTES-C1 §4.3)", file=sys.stderr)
         return 2
     roles, pairs, systems, md2 = decide(recs)
     hl = host.load(a.host_lib)
@@ -911,9 +1034,19 @@ def cmd_selftest(a):
         if got != want:
             fails.append(f"{what}: got {got!r}, want {want!r}")
 
+    # a stand-in for git: the record's commit, and the one ancestor that records the closure
+    head, closure = "1" * 40, "c105ed0" + "0" * 33
+
+    def anc(cited, commit):
+        return commit == head and closure.startswith(cited)
+
+    cleared = f"MC-3 closed: MC-3a's recorded outcome at {closure[:9]}, NOTES-C1 §5.11"
+
     def rec(system, data, ratio, **kw):
-        r = dict(kind="md2_run", system=system, data=data, md2_cleared="selftest",
+        r = dict(kind="md2_run", system=system, data=data, md2_cleared=cleared, commit=head,
                  calib_file_sha256=REGISTERED_CALIB, calib_check=dict(ok=True), dirty=False,
+                 registered_check=dict(same=True, p90_same=True),
+                 lib_sha256="a" * 64, host_lib_sha256="b" * 64, host_api=13,
                  driver_sha256=DRIVER_SHA256,
                  protocol=dict(reps=REPS, attempts=ATTEMPTS, warmup_s=WARMUP_S,
                                primer_mib=PRIMER_MIB, seed=SEED, max_spread_pct=MAX_SPREAD),
@@ -934,6 +1067,17 @@ def cmd_selftest(a):
     def outcome(recs, system, data):
         return decide(recs)[1].get((system, data), {}).get("outcome")
 
+    # the registered constants, pinned as literals (a change to any is a re-registration)
+    check("bars and p90", [(SYSTEMS[s]["bar"], SYSTEMS[s]["p90"]) for s in GATED],
+          [(0.750, 0.15), (0.664, 0.15), (0.673, 0.15)])
+    check("protocol constants", (LEVELS, MAX_SPREAD, ATTEMPTS, WARMUP_S, REPS, PHI, SEED,
+                                 PRIMER_MIB, MAX_RECORDS, CAP, DATA, GATED, MD2_SYSTEMS),
+          ((6, 8, 9, 10, 14), 5.0, 2, 3.0, 15, 0.5, 1, 1024, 2, 0.8, ("normal", "decay_opp"),
+           ("ppl", "df", "sq4096"), ("ppl", "df", "sq4096", "jacobi")))
+    check("the runs", RUNS, {
+        "S14": ([(5, 6), (4, 8), (4, 10), (3, 14)], False), "F14": ([(16, 14)], False),
+        "S9": ([(6, 6), (10, 9)], False), "F9": ([(16, 9)], False), "F8": ([(16, 8)], False),
+        "P14": ([(5, 6), (4, 8), (4, 10), (3, 14)], True), "PF14": ([(16, 14)], True)})
     # the reviewer's reproduction: one data set twice is not both data sets (MD2-3)
     recs = [rec("sq4096", "normal", 0.70), rec("sq4096", "normal", 0.70)]
     roles, pairs, systems, md2 = decide(recs)
@@ -955,14 +1099,19 @@ def cmd_selftest(a):
     check("decay_opp outside: M-d2", md2, "FAIL")
     check("an outside pair decides FAIL with another pair missing",
           decide([rec("df", "normal", 0.9)])[2]["df"], "FAIL")
-    # band edges: relative band, cap 0.8 on the gated three
+    # band edges: relative band, cap 0.8 on the gated three; every band pinned as literals
     b = band("ppl")
     check("ppl band", (b["lo"], b["hi"]), (0.750 * (1 - 0.15), 0.8))
     for r_, want in ((b["lo"], "INSIDE"), (math.nextafter(b["lo"], 0), "OUTSIDE"),
                      (0.8, "INSIDE"), (math.nextafter(0.8, 1), "OUTSIDE")):
         check(f"ppl at {r_!r}", outcome([rec("ppl", "normal", r_)], "ppl", "normal"), want)
+    b = band("df")
+    check("df band", (b["lo"], b["hi"]), (0.664 * (1 - 0.15), 0.664 * (1 + 0.15)))
     b = band("sq4096")
     check("sq4096 band", (b["lo"], b["hi"]), (0.673 * (1 - 0.15), 0.673 * (1 + 0.15)))
+    check("the bands, rounded", [tuple(round(band(s)[k], 4) for k in ("lo", "hi"))
+                                 for s in GATED],
+          [(0.6375, 0.8), (0.5644, 0.7636), (0.5721, 0.774)])
     b = band("jacobi")
     check("jacobi band (reported)", (b["lo"], b["hi"], b["gated"]),
           (0.786 * (1 - 0.30), 0.786 * (1 + 0.30), False))
@@ -980,6 +1129,13 @@ def cmd_selftest(a):
     nobe = rec("df", "normal", 0.664, bitexact_packed_vs_inline={"6": True})
     check("bit-exact check missing: inadmissible", outcome([nobe], "df", "normal"), "INCOMPLETE")
     check("bit-exact check missing: not a defect", bitexact_failed(nobe), [])
+    # a bit-exact value that is not literally true is inadmissible, and not a defect
+    for v in (None, 0, 1, "yes", "true"):
+        r_ = rec("df", "normal", 0.664,
+                 bitexact_packed_vs_inline={str(N): True for N in LEVELS} | {"10": v})
+        check(f"bit-exact {v!r} at a level: inadmissible", outcome([r_], "df", "normal"),
+              "INCOMPLETE")
+        check(f"bit-exact {v!r} at a level: not STOPPED", decide(all_pass() + [r_])[3], "PASS")
     # rule (c): the first admissible record decides; a later one never replaces it
     check("outside, then inside", outcome([rec("df", "normal", 0.9), rec("df", "normal", 0.664)],
                                           "df", "normal"), "OUTSIDE")
@@ -990,10 +1146,12 @@ def cmd_selftest(a):
     roles, pairs, _, _ = decide(recs)
     check("two inadmissible, then a third", pairs[("df", "normal")]["outcome"], "INCOMPLETE")
     check("two inadmissible: the cause", pairs[("df", "normal")].get("why", "").startswith("both"), True)
+    check("two inadmissible: no automatic continuation",
+          "reviewer verdict or Eric's decision" in pairs[("df", "normal")].get("why", ""), True)
     check("the third's role", roles[2][0], "excess: past the one re-run, not considered")
     check("one inadmissible: re-run allowed",
           decide([bad])[1][("df", "normal")].get("why", "").startswith("no admissible"), True)
-    # a bit-exact failure on an M-d2 record stops M-d2, whatever else holds
+    # a bit-exact failure on any record in the file stops M-d2, whatever else holds
     nbe = {str(N): N != 10 for N in LEVELS}
     check("bit-exact failure (Jacobi view)", decide(all_pass() + [
         rec("jacobi", "normal", 0.786, bitexact_packed_vs_inline=nbe)])[3], "STOPPED")
@@ -1001,13 +1159,17 @@ def cmd_selftest(a):
         rec("df", "normal", 0.664), rec("df", "normal", 0.664, bitexact_packed_vs_inline=nbe)
     ])[3], "STOPPED")
     check("bit-exact failure on a smoke record", decide(all_pass() + [
-        rec("smoke", "normal", 0.86, bitexact_packed_vs_inline=nbe)])[3], "PASS")
+        rec("smoke", "normal", 0.86, bitexact_packed_vs_inline=nbe)])[3], "STOPPED")
     check("bit-exact failure: the levels", bitexact_failed(rec("df", "normal", 0.6,
                                                                bitexact_packed_vs_inline=nbe)),
           [10])
     check("bit-exact failure: inadmissible", outcome(
         [rec("df", "normal", 0.664, bitexact_packed_vs_inline=nbe)], "df", "normal"),
         "INCOMPLETE")
+    why = decide([rec("df", "normal", 0.664, bitexact_packed_vs_inline=nbe)])[1][
+        ("df", "normal")].get("why", "")
+    check("STOPPED: the failing pair offers no re-run",
+          (why.startswith("M-d2 STOPPED"), "one re-run allowed" in why), (True, False))
     # what `run` refuses (rules (a)-(c))
     check("run: first record", rerun_problems([], "df", "normal"), [])
     check("run: after an inadmissible one", rerun_problems([bad], "df", "normal"), [])
@@ -1017,17 +1179,32 @@ def cmd_selftest(a):
     check("run: re-run used", len(rerun_problems([bad, bad], "df", "normal")), 1)
     check("run: stopped", len(rerun_problems(
         [rec("ppl", "normal", 0.7, bitexact_packed_vs_inline=nbe)], "df", "normal")), 1)
+    check("run: stopped by a smoke record", len(rerun_problems(
+        [rec("smoke_t", "normal", 0.7, bitexact_packed_vs_inline=nbe)], "df", "normal")), 1)
+    check("run: a value that is not true is no stop", rerun_problems(
+        [rec("ppl", "normal", 0.7, bitexact_packed_vs_inline={"6": None})], "df", "normal"), [])
     # provenance: a clean record passes; each departure is refused
-    check("provenance: clean", provenance_problems(rec("ppl", "normal", 0.75)), [])
+    check("provenance: clean", provenance_problems(rec("ppl", "normal", 0.75), anc), [])
+    check("file: clean", file_problems(all_pass() + both("jacobi", 0.786, 0.786), anc), [])
     lv = {str(N): dict(num_moduli=N, g=N) | BAR_CONFIG for N in LEVELS}
     for what, kw in (
             ("dirty", dict(dirty=True)), ("dirty unknown", dict(dirty=None)),
             ("no reason", dict(md2_cleared="")), ("blank reason", dict(md2_cleared="  ")),
             ("no reason (None)", dict(md2_cleared=None)),
+            ("a reason with no citation", dict(md2_cleared="MC-3 closed")),
+            ("no NOTES-C1 section", dict(md2_cleared=f"MC-3 closed at {closure[:9]}")),
+            ("no commit", dict(md2_cleared="MC-3 closed, NOTES-C1 §5.11")),
+            ("a commit that is no ancestor", dict(md2_cleared="MC-3 closed at abcdef0, "
+                                                              "NOTES-C1 §5.11")),
+            ("the closure after the run", dict(commit="2" * 40)),
+            ("no commit recorded", dict(commit=None)),
             ("another driver", dict(driver_sha256="0" * 64)),
             ("another calibration file", dict(calib_file_sha256="0" * 64)),
             ("library calibration differs", dict(calib_check=dict(ok=False))),
             ("no calibration check", dict(calib_check=None)),
+            ("bar not reproduced", dict(registered_check=dict(same=False, p90_same=True))),
+            ("p90 class not reproduced", dict(registered_check=dict(same=True, p90_same=False))),
+            ("no registered check", dict(registered_check=None)),
             ("reps", dict(protocol=dict(rec("ppl", "normal", 0.75)["protocol"], reps=5))),
             ("seed", dict(protocol=dict(rec("ppl", "normal", 0.75)["protocol"], seed=2))),
             ("g != N", dict(levels=lv | {"9": dict(lv["9"], g=3)})),
@@ -1040,7 +1217,20 @@ def cmd_selftest(a):
                                                                         vec_mode="GENERATE")
                                                            for N in LEVELS}))):
         check(f"provenance refuses: {what}",
-              bool(provenance_problems(rec("ppl", "normal", 0.75, **kw))), True)
+              bool(provenance_problems(rec("ppl", "normal", 0.75, **kw), anc)), True)
+    check("provenance: 'no calib_check' named",
+          provenance_problems(rec("ppl", "normal", 0.75, calib_check=None), anc),
+          ["no calib_check"])
+    # one library per file: the M-d2 records share (lib_sha256, host_lib_sha256, host_api)
+    for what, kw in (("another library", dict(lib_sha256="c" * 64)),
+                     ("another host library", dict(host_lib_sha256="c" * 64)),
+                     ("another host API", dict(host_api=12)),
+                     ("no library recorded", dict(lib_sha256=None))):
+        recs = all_pass()[:-1] + [rec("sq4096", "decay_opp", 0.673, **kw)]
+        check(f"file refused: {what}", bool(file_problems(recs, anc)), True)
+    check("file: a smoke record of another library is no M-d2 record",
+          file_problems(all_pass() + [rec("smoke", "normal", 0.86, lib_sha256="c" * 64,
+                                          md2_cleared=None)], anc), [])
     print(f"md2_time selftest: {n[0] - len(fails)} of {n[0]} checks passed")
     for f in fails:
         print("  FAIL " + f)
@@ -1065,7 +1255,8 @@ def main():
     r.add_argument("--primer-mib", type=int, default=PRIMER_MIB)
     r.add_argument("--seed", type=int, default=SEED)
     r.add_argument("--md2-cleared", default=None,
-                   help="why M-d2's ordering (NOTES-C1 §5.9) is met; required for the M-d2 systems")
+                   help="why M-d2's ordering (NOTES-C1 §5.9) is met, citing the commit and the "
+                   "NOTES-C1 section that record MC-3's closure; required for the M-d2 systems")
     j = sub.add_parser("judge", help="evaluate run records against the bands (CPU)")
     j.add_argument("records")
     j.add_argument("--host-lib", default=host_default)

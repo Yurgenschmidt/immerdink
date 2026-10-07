@@ -94,6 +94,14 @@ if(Python3_FOUND)
   # (sweep_perf_validate.txt). CPU only, standard library, under a second.
   add_test(NAME sweep_disjoint_selftest
            COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/sweep_disjoint.py" --self-test)
+  # NOTES-C1 §4.3 M-d2 (§5.10): bench/accuracy/md2_time.py's pre-registered rules on
+  # synthetic records: the decision per system and data set (rules (a)-(d), STOPPED on any
+  # bit-exact failure in the file), the bars, bands and protocol constants pinned as
+  # literals, and the provenance checks (calibration, registered_check, the --md2-cleared
+  # citation, driver, parameters, configuration, one library per file). Registering it does
+  # not change the driver's sha256. CPU only, standard library, under a second.
+  add_test(NAME md2_time_selftest
+           COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/md2_time.py" selftest)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
