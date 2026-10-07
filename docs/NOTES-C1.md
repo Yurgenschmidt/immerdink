@@ -189,9 +189,10 @@ what has been built since is recorded under "Implementation status".
       without a reset, and PPL + ring. **IR7 is closed:** with the shipped `rho_from_output`
       (51dba1e's), the lagged ρ̂ missed in 1 of 228 MET calls (PPL at 1e−6, realized 1.013e−6,
       after an output passed near zero). The report-only cases became caller guidance (§1.3).
-  - **Not yet run:** M-b (the [M] re-runs of IR9 and the share-group raise cost of IR15; CPU,
-    round 1), and M-c and M-d2 (GPU, round 2). Stage 3 may start: the M-a summary is published
-    (§4.11). (Stage 3 has since been implemented, and M-b has since run; both below.)
+  - **Not run in stage 2:** M-b (the [M] re-runs of IR9 and the share-group raise cost of
+    IR15; CPU, round 1), and M-c and M-d2 (GPU, round 2). Stage 3 could start once the M-a
+    summary was published (§4.11). Stage 3 and M-b have since run (below); M-c and M-d2 have
+    not.
   - **Open:** the M-d1 caller guidance (§1.3: the DIIS reset, Davidson's recompute and its +5
     iterations, CG's relaxation scaled by the iteration count) lives only here. It is to be
     carried into DESIGN §6g.12, `bench/accuracy/schedule.py` and the `precision.py`
@@ -252,8 +253,8 @@ what has been built since is recorded under "Implementation status".
 - **M-b (§4.3; IR9, IR15 (3), IR23) is done, 2026-10-07**: CPU only, one thread, under memcap,
   FREE only, on this worktree's `build/libimmerdink_host.so` (sha256 `466acdb4…`, host API 13;
   `ninja -n` finds nothing to rebuild at 4ba78b1). Summary immerdink-eval
-  `findings/c1-m-b.md`, scripts `scripts/c1/m_b_rerun.py` and `m_b.py` (96f7c4f), records
-  `results/c1/m_b/` (untracked, sha256 in the summary).
+  `findings/c1-m-b.md`, scripts `scripts/c1/m_b_rerun.py` and `m_b.py` (96f7c4f; review
+  fixes 601253f), records `results/c1/m_b/` (untracked, sha256 in the summary).
   - *The design-phase [M] records reproduce byte for byte:* the design-phase scripts, run
     unchanged with only the library path redirected, print `perf.json`, `perf_summary.md`,
     `c2cost.md`, `nsweep.out`, `phases.out`, `predict_cc.out` and `slice_eval/cost.out`
@@ -261,7 +262,8 @@ what has been built since is recorded under "Implementation status".
     `c2_summary.md` and `b6_split_cost.txt`. No prediction changed.
   - *The cited figures:* 191 [M] and [E] figures of §2.3–§2.7, §4.2, §4.3 and DESIGN §3.8,
     recomputed from fresh queries: 169 print as cited; 7 differ in the last digit only
-    (≤ 0.42 %, kept by IR9's 0.5 % rule); 6 differ by more. One is a text error, corrected in
+    (≤ 0.42 %: mis-roundings of unchanged predictions just below a tie, corrected in place after
+    the M-b review, §2.3 and §2.6); 6 differ by more. One is a text error, corrected in
     §2.3: the 4096² re-pack is 9–11 % of one call, not "about 11 %" (8.8 % at N = 14). Five
     are [E] estimates, kept and annotated: §2.7's first-round K-segmentation costs at S = 4 are
     3× the rounded S = 2 figures (reconstructed: +52 / +95 / +31 %, and +32 % for DF at S = 2),
@@ -272,9 +274,27 @@ what has been built since is recorded under "Implementation status".
   - *The share-group raise cost* (IR15 (3); §3.3; [M], outside the hold-out at levels not in
     {8, 10, 14, 16}): on ehrenfest ccsd.py's pairwise DF contractions at the psi4 sizes, 0 in
     11 of 12 forcing-rule cases with the real norm products and +16.5 % in the twelfth
-    (benzene/cc-pVDZ at 1e−8, through R5); −32 % to +25 % of the group's time per iteration
-    when one member's floor is a level apart, up to +102 % from N = 6 to 14. The joint ranking
-    chose the group floor in all 292 scenarios.
+    (benzene/cc-pVDZ at 1e−8, through R5) on the default levels 6/8/10/12/14 (+8.1 % on the
+    integer levels 6–14 and on 6/8/9/10/14); −32 % to +25 % of the separate-packs time per
+    iteration when one member's floor is a level apart, up to +102 % from N = 6 to 14. The
+    joint ranking chose the group floor in all 292 scenarios (316 with the other grids). The
+    B role of R1, R2, hh and Lld1 is modelled in-line and the norms are the bare factors'
+    (§3.3 limits).
+  - *Review fixes (approve-with-fixes, §5.8), 2026-10-07:* the raise is not what a slice
+    revival could save; §3.3 and DESIGN §7 now give that bound from the same records: 0 in
+    all 12 forcing cases, up to 9.1 % (one level apart) or 16.0 % in the synthetic patterns
+    [M, model-only]. The raise figures carry their level grid and modelling limits (§3.3); the
+    pack keys are checked at every level 6–14; the 7 mis-rounded cells are corrected (§2.3,
+    §2.6), as are §4.2's peak-bandwidth figure (8.5 %, not 8.6 %) and §2.4's "at most 0.004".
+    `m_b.py` was re-run at eval 601253f (CPU, one thread, under memcap, FREE): the earlier
+    records reproduce bit for bit on their old fields (`figures.jsonl`, `schedules_pp.jsonl`
+    byte for byte, 292 of 292 scenarios).
+  - *Open (outside C1 scope):* `PrecisionPlan` cannot express one contraction reading a
+    group's single pack through both roles: `_share` rejects a member listed twice, and a role
+    is "A" or "B". The DF-CCSD self-contractions R1, R2, hh and Lld1 need it (equal A and B
+    pack keys at every level 6–14). Trigger: B2, the ehrenfest integration declaring DF factor
+    sharing. Candidate extension: a member role "AB" (both roles read the group's pack, its
+    cost counted once).
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -664,19 +684,21 @@ Max normwise error, worst over the sizes 64²×256 … 256²×4096:
 - **Re-run by M-b** (2026-10-07, this worktree's library, sha256 `466acdb4…`, host API 13;
   immerdink-eval `findings/c1-m-b.md`): the scripts' stored outputs reproduce byte for byte, and
   every figure of §2.3 and §2.4 recomputed from fresh queries prints as cited except the
-  re-pack share below (a text error, corrected) and five table cells that differ in the last
-  digit only (1024³ N = 6 24.35, 4096³ N = 4 82.85, 8192³ N = 10 47.45, DF N = 12 30.85
-  TFLOPS-eq, QZ N = 16 18.895 ms; ≤ 0.21 %, kept by IR9's 0.5 % rule).
+  re-pack share below (a text error, corrected) and five table cells that were mis-rounded:
+  the unchanged predictions 24.348 (1024³, N = 6), 82.848 (4096³, N = 4), 47.449 (8192³,
+  N = 10) and 30.849 TFLOPS-eq (DF, N = 12) and 18.8945 ms (QZ, N = 16) lie just below a tie
+  and were printed 24.4, 82.9, 47.5, 30.9 and 18.90. They are corrected in place below (M-b
+  review; ≤ 0.21 %, so IR9's 0.5 % rule did not require it).
 
 TFLOPS-eq (time):
 
 | shape | N = 4 | 6 | 8 | 10 | 12 | 14 | 16 | 20 |
 |---|---|---|---|---|---|---|---|---|
-| 1024³ | 30.2 (71 µs) | 24.4 (88) | 21.8 (99) | 18.5 (116) | 17.1 (125) | 14.3 (150) | 13.7 (157) | 11.3 (190) |
-| 4096³ | 82.9 (1.66 ms) | 61.2 (2.25) | 48.1 (2.86) | 39.8 (3.46) | 33.9 (4.05) | 29.2 (4.70) | 26.0 (5.30) | 20.9 (6.58) |
-| 8192³ | 106.1 (10.4 ms) | 75.4 (14.6) | 58.1 (18.9) | 47.5 (23.2) | 40.1 (27.4) | 34.5 (31.9) | 30.4 (36.1) | 24.4 (45.0) |
-| DF acQ,bdQ→acbd 64⁴, Q = 2032 | – | 56.7 (1.20 ms) | 44.0 (1.55) | 36.3 (1.88) | 30.9 (2.21) | 26.3 (2.59) | 23.4 (2.92) | 18.6 (3.66) |
-| QZ kiQ,acQ→kiac (o 21, v 489, Q 1122) | 32.3 (7.32 ms) | 25.9 (9.15) | 21.3 (11.09) | 18.3 (12.96) | 16.0 (14.82) | 13.9 (17.02) | 12.5 (18.90) | – |
+| 1024³ | 30.2 (71 µs) | 24.3 (88) | 21.8 (99) | 18.5 (116) | 17.1 (125) | 14.3 (150) | 13.7 (157) | 11.3 (190) |
+| 4096³ | 82.8 (1.66 ms) | 61.2 (2.25) | 48.1 (2.86) | 39.8 (3.46) | 33.9 (4.05) | 29.2 (4.70) | 26.0 (5.30) | 20.9 (6.58) |
+| 8192³ | 106.1 (10.4 ms) | 75.4 (14.6) | 58.1 (18.9) | 47.4 (23.2) | 40.1 (27.4) | 34.5 (31.9) | 30.4 (36.1) | 24.4 (45.0) |
+| DF acQ,bdQ→acbd 64⁴, Q = 2032 | – | 56.7 (1.20 ms) | 44.0 (1.55) | 36.3 (1.88) | 30.8 (2.21) | 26.3 (2.59) | 23.4 (2.92) | 18.6 (3.66) |
+| QZ kiQ,acQ→kiac (o 21, v 489, Q 1122) | 32.3 (7.32 ms) | 25.9 (9.15) | 21.3 (11.09) | 18.3 (12.96) | 16.0 (14.82) | 13.9 (17.02) | 12.5 (18.89) | – |
 
 - **Time ratio N = 14 / N = 8:** 1.52 (1024³), 1.64 (4096³), 1.69 (8192³), 1.67 (DF). With both
   operands packed (contract only) it is 1.75 on every shape.
@@ -729,7 +751,8 @@ gives 1.09× (1024³), 1.12× (4096³) and 1.13× (8192³ and DF).
 These use g = N predictions. `PrecisionPlan`'s own choices (`configs()` over the levels 6, 8,
 9, 10, 14, in-line, GENERATE) are g = N at every level of every shape here, so they give the
 same ratios to three digits; with both vec modes (RESIDENT everywhere) the ratios move by at
-most 0.003 [M; M-b, immerdink-eval `results/c1/m_b/schedules_pp.jsonl`].
+most 0.004 (the Jacobi view, 0.7865 → 0.7826) [M; M-b, immerdink-eval
+`results/c1/m_b/schedules_pp.jsonl`].
 
 - Re-packing one invariant 4096² operand at each of the three switches costs about 1.1 ms, about
   2 % of the 50.6 ms schedule [M].
@@ -898,13 +921,14 @@ median / worst pair.
   | target | N, fast → K-eq | shape | TFLOPS-eq (time) | speedup, upper bound |
   |---|---|---|---|---|
   | 1e−10 | 19 → 12 (k = 3600) | 4096³ | 21.9 (6.27 ms) → 33.9 (4.05 ms) | 1.55× |
-  | 1e−10 | 19 → 12 (k = 3600) | DF | 19.5 (3.49 ms) → 30.9 (2.21 ms) | 1.58× |
+  | 1e−10 | 19 → 12 (k = 3600) | DF | 19.5 (3.49 ms) → 30.8 (2.21 ms) | 1.58× |
   | 1e−10 | 18 → 12 (k = 600) | 4096³ | | 1.47× |
   | 1e−6 | 16 → 9 | 4096³ | 26.0 (5.30 ms) → 43.5 (3.16 ms) | 1.68× |
 
-  Re-run by M-b: unchanged (DF N = 12 is 30.85 TFLOPS-eq, the last digit only). The recurring
-  costs below reproduce at 0.9 TB/s (the design phase's bandwidth assumption); the last one is
-  1.195×.
+  Re-run by M-b: unchanged. DF N = 12 is 30.849 TFLOPS-eq, printed 30.9 before the M-b
+  review, now 30.8. The recurring costs below reproduce at 0.9 TB/s (the design phase's
+  bandwidth assumption); the last one is 1.19504×, printed 1.19 before the M-b review, now
+  1.20.
 - **Recurring costs** for operands rebuilt every iteration (t2, dressed integrals; §1.3) [E]:
   - Pre-scaling costs one FP64 read and write, 16 B per element, per changed operand per call,
     unless it is fused into the operand's producer kernel. That is about 0.3 ms per 4096²
@@ -914,7 +938,7 @@ median / worst pair.
     current.
   - At 4096³, 1e−10, the 1.55× becomes about 1.44× with one unfused changing operand and about
     1.35× with two [E, review]. Re-running the guarded helper every call as well gives about
-    1.27× and 1.19× [E].
+    1.27× and 1.20× [E].
   - Scaled copies cost memory where a tensor is also contracted over other indices (§4.5
     Risks).
   - The Q13 gate and M-e count all of these terms.
@@ -967,7 +991,9 @@ max normwise error:
 
   [M, composition], N = 14. With it, S = 2 at N = 14 is 1.15× (DF) to 1.31× (8192³) faster
   than fast mode at N = 20, and S = 4 on DF is still a net loss (0.82×) [M, model-only,
-  outside hold-out: N = 20 is outside {8, 10, 14, 16}].
+  outside hold-out: N = 20 is outside {8, 10, 14, 16}]. The [M] composition is the reference
+  figure for any decision; the [E] stays as the first-round DRAM-roofline cross-check. Both are
+  replaced only when a GPU measurement of the recipe exists (§5.8 MB-1).
 - **Numerics.** Segmentation adds S − 1 FP64 roundings, so the result is no longer correctly
   rounded once, and its ELEMENTWISE bound is provably worse at high N (L7).
 - **Against K-equilibration on decay_opp:** K-eq gives about 6 moduli at about 0 per-call cost
@@ -1160,14 +1186,45 @@ If revived, the design is as P1 drafted it, with these corrections:
     (M-b, [M], model-only and outside the hold-out where a level is not in {8, 10, 14, 16};
     immerdink-eval `findings/c1-m-b.md`):* on ccsd.py's pairwise DF contractions at the psi4
     sizes, with the forcing rule's equal ABSOLUTE targets and the real norm products, the
-    members of a group share a floor in 11 of 12 (molecule, target) cases, so
-    the raise costs nothing; the twelfth (benzene/cc-pVDZ, 1e−8) costs +16.5 % per iteration
-    (20.45 against 23.83 TFLOPS-eq, 4.020 against 3.450 ms), hh's floor reaching R2 and L2
-    through R5. With one member's floor a level apart (ΔN = 2) the raise is −32 % to +25 % of
-    the group's time per iteration: negative where the separate variant's second pack of a
-    dressed factor (re-packed every iteration) outweighs the raised calls, largest where the
-    raised member dominates the group (R2's v⁴ output); from N = 6 to 14, up to +102 %. A
-    slice revival that avoids the raise would save at most that.
+    members of a group share a floor in 11 of 12 (molecule, target) cases on `PrecisionPlan`'s
+    default levels (6, 8, 10, 12, 14), so the raise costs nothing; the twelfth
+    (benzene/cc-pVDZ, 1e−8) costs +16.5 % per iteration (20.45 against 23.83 TFLOPS-eq, 4.020
+    against 3.450 ms), hh's floor reaching R2 and L2 through R5. That figure belongs to the
+    default ΔN = 2 grid: on the integer levels 6–14 and on §2.4's 6/8/9/10/14 the same 11
+    cases cost nothing and the twelfth, with hh's floor at 9, costs +8.1 % (22.07 against
+    23.85 TFLOPS-eq, 3.726 against 3.448 ms; +8.7 % against the best separate). With one
+    member's floor a level apart (ΔN = 2) the raise is −32 % to +25 % of the separate-packs
+    time per iteration: negative where the separate variant's second pack of a dressed factor
+    (re-packed every iteration) outweighs the raised calls, largest where the raised member
+    dominates the group (R2's v⁴ output); from N = 6 to 14, up to +102 %.
+  - *What a slice revival could save* is not the raise cost. The raise (shared against
+    separate packs) is a difference of two overheads. A pack serving every N saves at most the
+    best configuration without one (shared, separate packs, or best separate, where a lone
+    member may stay in-line) minus the ideal: each member at its own floor, every grouped role
+    reading its group's one pack, priced as an ordinary pack at the group's top floor, with no
+    slice-mode per-call penalty. *Measured (M-b review, same records, [M, model-only, outside
+    hold-out]), as a share of the best configuration's time per iteration:*
+    - The 12 forcing-rule cases: 0 (to rounding), on each of the three grids. In the twelfth,
+      separate packs are 0.014 ms (0.42 %) above the ideal (0.0066 ms, 0.19 %, with each pack
+      priced at the shared plan's raised N instead), but the best separate, with hh's and R5's
+      Boo roles in-line, is already 0.006 ms below it.
+    - The 280 synthetic floor patterns: 0–9.1 % one level apart and 0–16.0 % over all (the
+      most: benzene/cc-pVTZ Bvv with R5 or L2 at 8 and the other at 14, where the raise is
+      +1.1 %); in 67 of them it exceeds max(raise, 0) by more than 0.5 points.
+    - It is largest where a dressed factor's pack (re-packed every iteration) is a large share
+      of small calls, which is where the raise is cheapest or negative (Bvv at cc-pVTZ:
+      5.9–9.1 % one level apart, raise −13 to −11 %). It is small where the raise is largest
+      (the Bvv group at cc-pVDZ, which R2 dominates: at most 3.2 %, raise up to +25 % one level
+      apart), since separate packs already avoid most of the raise there.
+  - *Limits of these figures:* (a) R1, R2, hh and Lld1 read one factor through both roles, and
+    their A and B pack keys are equal at every level 6–14 (`m_b.py`'s key check). A
+    `PrecisionPlan` share group takes one role per contraction, so their B role is modelled
+    in-line: the figures are for that configuration, not the consumer's best (open item,
+    Status, M-b). (b) The norm products are the bare (t1 = 0) psi4 factors'; Bvo takes Bov's,
+    and the dressed Boo, Bvv and Bvo norms differ by O(t1). (c) The level grid, above. (d) R2 is
+    eq 11's first pairwise step in the order M-a's R2 fixed; ring, p2, sub and add (t2 or u with
+    Bov twice) are left out because M-a fixed no pairwise order for them. A Bov·Bov first step
+    would have Lld1's extents and norm product, so Lld1's floor (not measured).
 
 ---
 
@@ -1581,10 +1638,10 @@ rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, beta=
   iteration's.
 - *Cost* [E]. One pass over C, plus the caller's norms: a pass over A and B, about 2× a pass
   over C at square shapes. At 4096³, N = 14, that is about 3 % for C and 6 % for the norms, so
-  about 9 % of a call when every norm is recomputed (M-b: 3.2 + 6.3 = 9.5 % at 0.9 TB/s, 8.6 %
-  at the 1.008 TB/s peak, against the [M] call of 4.70 ms). Norms of an invariant operand are
-  computed once per phase. The ρ that sets N is needed once per phase decision, so this cost amortizes
-  over the phase.
+  about 9 % of a call when every norm is recomputed (M-b: 24·4096² B, 3.2 + 6.3 = 9.5 % at
+  0.9 TB/s and 8.5 % at the 1.008 TB/s peak, against the [M] call of 4.701 ms). Norms of an
+  invariant operand are computed once per phase. The ρ that sets N is needed once per phase
+  decision, so this cost amortizes over the phase.
 - σ-derived norms, ‖a_i‖ ≤ d·2^{−σ_i} (L1b), are valid for nonzero rows only. A zero row has
   σ := 0, so its bound d·2^0 is vacuous and can inflate the maximum by up to about T. So the
   recipe uses real norms unless the caller knows its zero rows.
@@ -1782,10 +1839,11 @@ CC-shaped cases, schedule totals against fixed N, and the re-pack cost per switc
   `466acdb4…`, host API 13), reproduce every stored [M] record byte for byte, and so do stage
   2's (M-a's `perf` blocks, `c2_summary.md`, `b6_split_cost.txt`). Of 191 cited figures
   recomputed from fresh queries, 169 print as cited, 7 differ in the last digit only
-  (≤ 0.42 %, kept), and 6 differ by more: §2.3's re-pack share (a text error, corrected: 9–11 %,
+  (≤ 0.42 %), and 6 differ by more: §2.3's re-pack share (a text error, corrected: 9–11 %,
   not "about 11 %"), four of §2.7's first-round [E] K-segmentation costs and §4.2's "about 9 %"
-  [E] (kept as estimates and annotated, §2.7). §2.7 also gets the [M] composition of the S
-  calls.
+  [E] (kept as estimates and annotated in §2.7 and §4.2). §2.7 also gets the [M] composition
+  of the S calls. The 7 last-digit cases were mis-roundings of unchanged predictions, just
+  below a tie; corrected in place after the M-b review (§2.3, §2.6; §5.8 MB-2).
 - *M-d2's bars* (below), unrounded: 0.750 (PPL view, best g), 0.664 (DF), 0.673 (4096³);
   0.786 on the Jacobi view. The best-g and g = N predictions coincide on these shapes
   (`PrecisionPlan` picks g = N at every level), so the bars hold whichever M-d2 runs.
@@ -1794,7 +1852,9 @@ CC-shaped cases, schedule totals against fixed N, and the re-pack cost per switc
   psi4 sizes, with four groups: Bvv {R2, R5, L2}, Boo {hh, R5}, Bvo {R1, L1} (t1-dressed,
   re-packed every iteration) and Bov {L1, Lld1, Lld2} (bare, re-packed per phase). L2 reads Boo
   with another pack key than hh and R5 (`imd_pack_layout` digests), so it is not in the Boo
-  group. The joint ranking chose the group floor in all 292 scenarios.
+  group. The joint ranking chose the group floor in all 292 scenarios. The review added the
+  bound on what a slice revival could save (§3.3), the forcing cases on two more level grids
+  and the pack keys at every level 6–14 (§5.8).
 
 **M-c (GPU, round 2): small-N hold-out** (IR4; decided by the independent reviewer). It runs
 **strictly before M-d2**.
@@ -3513,6 +3573,10 @@ its cost figures are estimates.
     changing default behaviour. The prefix-plane option and the raise cost are exactly the
     cheaper alternatives a slice revival must beat. An unverified claim must not enter DESIGN as
     fact.
+  - *M-b review (§5.8), a reading of (3), not a change:* the raise cost is measured as asked,
+    but a revival must beat the best configuration without slices (the shared group paying the
+    raise, separate packs, or in-line), and the most it could save is bounded in §3.3; the raise
+    figures themselves are not that bar.
 - **IR16. Batched fixtures** (gap 16: Q12's escape clause could not fire).
   - *Decision:* real R7 with core orbitals and a synthetic batch, with a pre-registered trigger
     (§4.3, Q12).
@@ -4111,6 +4175,52 @@ should-fix items, all applied (Status, stage 3).
 - **S3-7. HANDOFF.** docs/HANDOFF.md tracked state up to v1.18 and no C1/C2 work; one bullet
   now points to this file's Status for stages 0–3. *Verdict: approved* (one pointer bullet
   with the open items, no duplicated state).
+
+### 5.8 M-b: the design questions (independent reviewer, 2026-10-07)
+
+M-b (§4.3) raised the five questions below. Each was decided conservatively and put to an
+independent reviewer, whose verdicts are binding. The review was approve-with-fixes: one
+must-fix item and seven should-fix items, all applied (Status, M-b). The must-fix: the raise
+cost (shared against separate packs) is a difference of two overheads, not what a pack serving
+every N could save, so the sentence "a slice revival that avoids the raise would save at most
+that" (§3.3) and DESIGN §7's use of the raise figures as a revival's bar were wrong. §3.3 and
+§7 now give that bound from the records, with its pricing stated: 0 in all 12 forcing-rule
+cases, 0–9.1 % one level apart and up to 16.0 % in the synthetic floor patterns [M,
+model-only]. The reviewer's ideal priced the packs at the shared plan's N (separate packs then
+0.19 % above it in the twelfth case); `m_b.py` prices each pack at its own group's top floor,
+which gives the larger, more conservative bound, and also counts the best separate
+configuration, which in the twelfth case is already below that ideal.
+- **MB-1. §2.7's K-segmentation cost, [E] against [M].** The first-round [E] (+17 / +31 / +10 %
+  at S = 2, +51 / +93 / +30 % at S = 4) lies above the model's own composition of the S calls
+  (+13 / +24 / +8 %, +40 / +72 / +24 %). Decided: keep both. *Verdict: keep both, as
+  committed in DESIGN §3.8 and §2.7.* The [M] composition is the reference figure for any
+  decision; the [E] stays as the first-round DRAM-roofline cross-check; both are replaced only
+  when a GPU measurement of the recipe exists. The [M] composition is the method of every
+  other K-seg [M] figure (`c2_gate.perf_block`, DESIGN §3.8's 18.8 against 17.4 TFLOPS-eq) and
+  prices what the [E] leaves out (K0 per call, the β = 1 read, the W planes' L2 residency); the
+  [E]'s S = 4 row is its own linear formula on rounded S = 2 inputs, an upper-side estimate, not
+  an error. No gate depends on these figures.
+- **MB-2. The 0.5 % rule.** Seven figures differed in the last printed digit only and were
+  left as cited. *Verdict: correct them.* IR9's threshold says when a changed prediction forces
+  a replacement; it is no reason to keep a printed value that is not the correct rounding of an
+  unchanged one. All seven lay just below a tie (24.348, 82.848, 47.449, 30.849 twice, 18.8945,
+  1.19504). Applied: §2.3 and §2.6, with a note.
+- **MB-3. The Boo share group.** {hh, R5}, with L2's Boo role (another pack key) left in-line;
+  only groups whose members have equal pack keys. *Verdict: accepted; check the key digests at
+  every level used.* The library rejects a pack read under another key (PACK_MISMATCH).
+  Applied: `m_b.py` now checks every level 6–14, which covers the default grid and the two
+  grids of the level-grid check: one key in every group at every level, on every molecule.
+- **MB-4. The raise-cost baseline.** Members at equal floors still share one pack per
+  (operand, floor), plus a "best separate" variant where a lone member may stay in-line.
+  *Verdict: accepted; report both.* Equal-floor sharing is the correct reading of IR15 (3)'s
+  comparator (making equal floors pay separate packs would only inflate the no-raise cost), and
+  "best separate" adds the in-line option `PrecisionPlan` already ranks. Neither variant is the
+  bar for a slice revival (the must-fix).
+- **MB-5. Contraction set and scenarios.** ccsd.py's two-operand DF contractions, R2 at
+  cc-pVDZ only, equal weights in the forcing rule, the invariant Bov re-packed once per
+  4-iteration phase. *Verdict: accepted as M-b's scope; state the caveats next to the
+  figures:* the B roles of the one-factor contractions modelled in-line, the bare norms, the
+  level grid, and R2's rationale. Applied in §3.3, DESIGN §6g.10 and §7, and the findings.
 
 ---
 
