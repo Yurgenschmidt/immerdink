@@ -6,9 +6,10 @@
 # (IMD_TEST_EXACT=1: the pack, imd_pack's workspace, the contract workspace) under
 # compute-sanitizer --tool memcheck --padding 4096 (a padding buffer after every allocation,
 # so an access just past one is never inside another):
-#   - production: memcheck clean on every imd_pack launch shape and every packed contract
-#     (KF, K1 + K2 / K3, KL, KL with 64-row tiles for the in-line partner), each == the
-#     plain call;
+#   - production: memcheck clean on every imd_pack launch shape (the suite asserts that its
+#     cases cover all of them, KL's radix > 1 row mapping included) and every packed contract
+#     (KF, K1 + K2 / K3, KL, KL with 64-row tiles for the in-line partner; some under each
+#     K4 configuration), each == the plain call;
 #   - IMD_TEST_PACK_SHORT=16 (the packed allocation 16 bytes short of pack_bytes while
 #     imd_pack is told pack_bytes), one case: memcheck MUST report an invalid global write.
 # So the sentinel test's "no byte beyond pack_bytes" holds on exactly sized allocations too,

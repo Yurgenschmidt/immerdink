@@ -4,6 +4,7 @@
 
     QUIET_GATE=1 tools/run_quiet.sh python3 bench/first_call.py --sweep --out first_call.jsonl
     python3 bench/first_call.py --N 10 --size 1024 --mode plain      # one fresh-process run
+    python3 bench/first_call.py --table first_call.jsonl               # the tables, no GPU
 
 --sweep runs one FRESH process per (shape, N, mode) and prints a table (TFLOPS-eq first, time
 alongside); a single run prints one JSON line. In each process:
@@ -224,24 +225,30 @@ def tflops(flop, seconds):
 
 
 def table(rows):
-    print("plain: switch to a never-launched N (TFLOPS-eq first, time alongside; ms)")
-    print(f"{'size':>5} {'N':>3} | {'plan 1st':>8} {'plan 2nd':>8} | {'1st call TF':>11} "
-          f"{'ms':>8} | {'steady TF':>9} {'ms':>7} | {'extra ms':>8} | {'pack 1st':>8} "
-          f"{'pack ms':>7}")
+    """The sweep's tables. Every call time runs from just before the enqueue to completion
+    (total_s), the same measure for the steady call (median) and the first one (DESIGN §6g.6
+    publishes these); the GPU time between events follows in brackets."""
+    def tm(x):
+        return (f"{tflops(r['flop'], x['total_s']):>6.1f} {1e3 * x['total_s']:>7.3f} "
+                f"({x['gpu_ms']:>7.3f})")
+
+    print("plain: switch to a never-launched N (TFLOPS-eq first, time alongside; ms, GPU-event "
+          "ms in brackets; extra = first - steady, us)")
+    print(f"{'size':>5} {'N':>3} | {'plan 1st':>8} {'plan 2nd':>8} | {'steady TF':>9} {'ms':>7} "
+          f"{'(GPU)':>9} | {'1st TF':>6} {'ms':>7} {'(GPU)':>9} | {'extra':>6} {'enqueue':>7} | "
+          f"{'re-pack':>7} {'pack 1st':>8}")
     for r in rows:
         if r["mode"] != "plain":
             continue
         f, st = r["contract_first"], r["contract_steady"]
-        extra = 1e3 * f["total_s"] - st["gpu_ms"]
         print(f"{r['size']:>5} {r['N']:>3} | {1e3 * r['plan_create_first_s']:>8.3f} "
-              f"{1e3 * r['plan_create_again_s']:>8.3f} | "
-              f"{tflops(r['flop'], f['total_s']):>11.2f} {1e3 * f['total_s']:>8.3f} | "
-              f"{tflops(r['flop'], st['gpu_ms'] / 1e3):>9.2f} {st['gpu_ms']:>7.3f} | "
-              f"{extra:>8.3f} | {1e3 * r['pack_first']['total_s']:>8.3f} "
-              f"{r['pack_steady']['gpu_ms']:>7.3f}")
+              f"{1e3 * r['plan_create_again_s']:>8.3f} | {'':>2}{tm(st)} | {tm(f)} | "
+              f"{1e6 * (f['total_s'] - st['total_s']):>+6.1f} "
+              f"{1e6 * (f['enqueue_s'] - st['enqueue_s']):>+7.1f} | "
+              f"{r['pack_steady']['gpu_ms']:>7.3f} {1e3 * r['pack_first']['total_s']:>8.3f}")
     print("\ngraph: cold capture at a never-launched N, first vs steady replay")
-    print(f"{'size':>5} {'N':>3} | {'capture':>7} | {'1st TF':>7} {'1st ms':>8} | "
-          f"{'steady TF':>9} {'ms':>7} | {'1st/steady':>10}")
+    print(f"{'size':>5} {'N':>3} | {'capture':>7} | {'steady TF':>9} {'ms':>7} {'(GPU)':>9} | "
+          f"{'1st TF':>6} {'ms':>7} {'(GPU)':>9} | {'1st/steady':>10} {'(GPU)':>6}")
     for r in rows:
         if r["mode"] != "graph":
             continue
@@ -250,9 +257,8 @@ def table(rows):
                   f"end {r.get('end_capture_error')})")
             continue
         f, st = r["replay_first"], r["replay_steady"]
-        print(f"{r['size']:>5} {r['N']:>3} | {'ok':>7} | {tflops(r['flop'], f['total_s']):>7.2f} "
-              f"{1e3 * f['total_s']:>8.3f} | {tflops(r['flop'], st['gpu_ms'] / 1e3):>9.2f} "
-              f"{st['gpu_ms']:>7.3f} | {r['first_over_steady_total']:>10.2f}")
+        print(f"{r['size']:>5} {r['N']:>3} | {'ok':>7} | {'':>2}{tm(st)} | {tm(f)} | "
+              f"{r['first_over_steady_total']:>10.2f} ({r['first_over_steady_gpu']:>4.2f})")
 
 
 def main():
@@ -267,7 +273,13 @@ def main():
     ap.add_argument("--sizes", default="1024,4096")
     ap.add_argument("--Ns", default="6,8,10,14")
     ap.add_argument("--out", help="append the JSON lines here (--sweep)")
+    ap.add_argument("--table", metavar="JSONL",
+                    help="print the sweep's tables from these records (no GPU work)")
     a = ap.parse_args()
+    if a.table:
+        with open(a.table) as f:
+            table([json.loads(line) for line in f if line.strip()])
+        return 0
     if not a.sweep:
         print(json.dumps(run_one(a.lib, a.N, a.size, a.mode, a.reps)))
         return 0

@@ -4,7 +4,8 @@ at several N share one workspace and one packed buffer, bit for bit against spec
 
     python3 tests/test_phases.py [--lib build/libimmerdink.so] [--shim ...] --suite NAME [-v]
 
-Each suite is its own ctest, so each runs in a fresh process (graph_phases relies on it).
+Each suite is its own ctest, so each runs in a fresh process (graph_phases relies on it, and
+main refuses graph_phases after another suite).
   repack_n            (ctest packed_repack_n) X packed at N = 14 into a buffer of
                       pack_bytes(14) and contracted; re-packed at N = 8 in place and
                       contracted with the N = 8 plan; both bit-exact; every packed byte ==
@@ -12,13 +13,15 @@ Each suite is its own ctest, so each runs in a fresh process (graph_phases relie
                       smoke check: F3's evidence is write_extent); the stale N = 14 plan with
                       a PackedBuffer raises PackMismatchError before any launch, and with the
                       raw buffer returns SUCCESS and a wrong C (the documented limit, §6b.7 /
-                      §6b.10 #3); back to N = 14. Role A and the post-swap B role (tail rows).
+                      §6b.10 #3); back to N = 14. Role A and the post-swap B role (tail rows),
+                      each case's role asserted. imd_pack's workspace: the maximum over N.
   workspace_shared_n  one workspace of imd_workspace_size(N = 14, g = 0) for plans N in
                       {5, 8, 14} (several g, both vec modes), called alternately on one
                       stream, in-line and with a packed operand re-packed before each call
                       into one buffer of pack_bytes(14) (C-ws, C-pack); all bit-exact; no
                       allocation (the LD_PRELOAD shim); the guard zones around the workspace
-                      and the buffer untouched.
+                      and the buffer untouched. imd_pack's workspace: the maximum over N
+                      (outside F1-F3).
   graph_phases        one CUDA graph per phase, N = 6 (warm: launched before capture) and
                       N = 10 (COLD: captured before any launch at N = 10 in this process,
                       CUDA_MODULE_LOADING=LAZY), sharing one workspace, replayed alternately on
@@ -30,19 +33,26 @@ Each suite is its own ctest, so each runs in a fresh process (graph_phases relie
                       filled with a sentinel, twice (0xA5, then 0x5A): every byte outside keeps
                       the sentinel and every byte inside is the same both times (all written)
                       and == oracle.pack (when small); the same for imd_pack's workspace. Every
-                      imd_pack launch shape: KL read along rows (tiles of 64 / 32 / 16 / 8 rows)
-                      and along k-bar, rows on chip (8 values per thread) and re-read chunks (4),
-                      W = 2 and 3; kp_prep's gaps and tail; r in {1, 15, 16, 17, 33}, b in {1,
-                      3}; the K alignment 16 and AUTO (64 for k > 96); N in {2, 3, 8, 14, 20};
-                      RN and TRUNC. Each pack, in an EXACTLY sized allocation, is then read by
-                      imd_contract_packed with the in-line partner on every producer path
-                      (fused -1: KF or KL by rule; 0: K1 + K2 / K3; 2: KL; 3: KL with 64-row
-                      tiles), each == the plain imd_contract bit for bit (imd_pack_desc_for
-                      packs reproduce it).
+                      imd_pack launch shape, ASSERTED (write_extent_shape, the 42 of
+                      WRITE_EXTENT_SHAPES): KL read along rows (tiles of 64 / 32 / 16 / 8 rows;
+                      one or two chunks on chip, 8 values per thread, or re-read chunks, 4),
+                      each with radix 1 and radix > 1 (batch-fastest X; two row modes), and
+                      along k-bar (tiles of 64 .. 1 rows; the 1-row tile with 1, 2 or >= 3
+                      chunks); W = 2 and 3; kp_prep's gaps and tail, and its kK0MaxModes
+                      instance (nine fused modes); a gathered K (k_affine = 0); r in {1, 15,
+                      16, 17, 33}, b in {1, 3, 5}; the K alignment 16 and AUTO (64 for k > 96);
+                      N in {2, 3, 8, 14, 17, 20}; RN and TRUNC; pack_pivot's transcription ==
+                      the library's on every case's plan view. Each pack, in an EXACTLY sized
+                      allocation, is then read by imd_contract_packed with the in-line partner
+                      on every producer path (fused -1: KF or KL by rule; 0: K1 + K2 / K3; 2:
+                      KL; 3: KL with 64-row tiles; every 12th case under each of the four K4
+                      configurations too), each == the plain imd_contract bit for bit
+                      (imd_pack_desc_for packs reproduce it); both post-swap roles asserted.
 Environment: IMD_TEST_EXACT=1 (write_extent): every allocation exactly sized, no guard zones,
 no oracle (for compute-sanitizer memcheck --padding: tests/memcheck_pack_extent.sh);
 IMD_TEST_PACK_SHORT=n: the packed allocation n bytes short of pack_bytes while imd_pack is
-told pack_bytes (the mutation memcheck must report); IMD_TEST_MAX_CASES=n: the first n cases.
+told pack_bytes (the mutation memcheck must report); IMD_TEST_MAX_CASES=n: the first n cases
+(no coverage assertion).
 """
 
 import argparse
@@ -206,17 +216,18 @@ def suite_repack_n(lib, cuda, shim, verbose):
     rng = np.random.default_rng(1414)
     prng = random.Random(1414)
     cases = [
-        # (name, A, B, C, x): x = the caller's operand packed
+        # (name, A, B, C, x, role): x = the caller's operand packed, role its post-swap role
+        # (0: A, 1: B), asserted
         ("ik,kj->ij k=130 (role A)", *tc.matrix(prng, 21, 19, 130, a_kfast=True, b_kfast=False,
-                                                c_jfast=True), 0),
+                                                c_jfast=True), 0, 0),
         # C i-fastest: the role swap puts the caller's A in the post-swap B role, r = 17 rows
         # of each of b = 3 batches at batch stride r k_hat, the tail after the last block
         ("lik,lkj->lij k=40 (post-swap B role, tail)",
          o.Desc([3, 17, 40], tc.layout(prng, [3, 17, 40]), [L, I, K]),
          o.Desc([3, 40, 6], tc.layout(prng, [3, 40, 6], order=[1, 2, 0]), [L, K, J]),
-         o.Desc([3, 17, 6], tc.layout(prng, [3, 17, 6], order=[1, 2, 0]), [L, I, J]), 0),
+         o.Desc([3, 17, 6], tc.layout(prng, [3, 17, 6], order=[1, 2, 0]), [L, I, J]), 0, 1),
     ]
-    for name, A, B, Cd, x in cases:
+    for name, A, B, Cd, x, want_role in cases:
         spec = spec_of(A, B, Cd)
         ops = [Operand(cuda, d, rng) for d in (A, B, Cd)]
         X = ops[x]
@@ -226,15 +237,21 @@ def suite_repack_n(lib, cuda, shim, verbose):
             packs = {N: (pk[N], None) if x == 0 else (None, pk[N]) for N in pk}
             plans = {N: imd.Plan(spec, *lays(A, B, Cd), N=N, packs=packs[N]) for N in pk}
             role = plans[14].lowering.swapped ^ (x == 1)       # 1: the post-swap B role
+            if role != want_role:
+                raise Fail(f"{name}: X in the post-swap {'AB'[role]} role, the case is about "
+                           f"{'AB'[want_role]}")
             pb14, pb8 = pk[14].pack_bytes, pk[8].pack_bytes
             if not (pb8 <= pb14 and pk[8].workspace_bytes == pk[14].workspace_bytes and
                     plans[8].workspace_bytes <= plans[14].workspace_bytes):
                 raise Fail(f"{name}: sizes not monotone in N (F1 / F2 / I1)")
             alloc = cuda.malloc(pb14 + GUARD)
             cuda.memset(alloc, 0xA5, pb14 + GUARD)
-            pws = cuda.malloc(pk[14].workspace_bytes)
+            # imd_pack's own workspace is outside F1-F3 (its independence of N is I1, a
+            # certificate): sized once as the maximum of the per-N queries
+            npw = max(p.workspace_bytes for p in pk.values())
+            pws = cuda.malloc(npw)
             ws = cuda.malloc(plans[14].workspace_bytes)
-            W, PW = (ws.value, plans[14].workspace_bytes), (pws.value, pk[14].workspace_bytes)
+            W, PW = (ws.value, plans[14].workspace_bytes), (pws.value, npw)
             buf = imd.PackedBuffer((alloc.value, pb14))
             want = {N: oracle(ops, 1.0, 0.5, N) for N in pk}
             opack = {N: bytes(o.pack(X.tensor(), oracle_pack_desc(ps14.with_moduli(N))))
@@ -359,13 +376,15 @@ def suite_workspace_shared_n(lib, cuda, shim, verbose):
                 raise Fail(f"{name}: a packed phase needs more than the N=14 sizes (C-ws, C-pack)")
             pbuf_alloc = cuda.malloc(pb + GUARD)
             cuda.memset(pbuf_alloc, 0x5A, pb + GUARD)
-            pws = cuda.malloc(pk[14].workspace_bytes)
+            # imd_pack's own workspace is outside F1-F3 (I1 is a certificate): the maximum
+            # of the per-phase queries, as a caller sizing once does
+            npws = max(pk[N].workspace_bytes for N in Ns)
+            pws = cuda.malloc(npws)
             buf = imd.PackedBuffer((pbuf_alloc.value, pb))
             a0 = shim.allocs()
             for rnd in range(2):
                 for N in (Ns if rnd == 0 else Ns[::-1]):
-                    pk[N].pack(ops[0].arr, buf, workspace=(pws.value, pk[N].workspace_bytes),
-                               stream=s)
+                    pk[N].pack(ops[0].arr, buf, workspace=(pws.value, npws), stream=s)
                     pplans[N].contract(ops[0].arr, ops[1].arr, Cs[phases[0]].arr,
                                        workspace=(ws.value + GUARD, npw), stream=s,
                                        packed=(buf, None))
@@ -507,48 +526,84 @@ def suite_graph_phases(lib, cuda, shim, verbose):
 # write_extent (pack_write_extent, F3)
 # ---------------------------------------------------------------------------------------
 
+I2, K2, K3, L2, L3, R3 = 11, 12, 13, 14, 15, 16     # extra labels (write_extent)
+
+
 def write_extent_cases():
-    """(N, rounding, A policy, r, k, b, X stored rows-fastest, X is the caller's A). Every
-    KL launch shape of imd_pack (host/analysis.hpp kl_launch, pack_kl_lg_rows_for): read along
-    rows (r > 1), k_hat <= 64 / 128 / 256 / 1024 (64 / 32 / 16 / 8-row tiles, rows on chip)
-    and > 1024 (re-read chunks, 4 values per thread); along k-bar, tiles of 64 .. 1 rows (tk =
-    pow2 >= k_hat in [64, 4096]), k_hat <= 8192 (8 values) and > 8192 (4 values); each with W
-    = 2 (N <= 16) and 3 (N = 20), RN and TRUNC (A = 64 wherever k > 96 allows it); r and b
-    with and without a tail."""
+    """(N, rounding, A policy, r, k, b, X's storage kind, X is the caller's A). X is b x r x
+    k stored
+      "rows"     rows fastest (radix 1: the row mode has the smallest stride);
+      "kbar"     k fastest;
+      "batch"    the batch mode fastest, then rows, then k (b > 1, r > 1): KL reads along
+                 rows with radix r (rho = lo + r d, a warp along the batches);
+      "rows2"    r = (r1, r2): two row modes, the second fastest in X but second in the
+                 plan's row order (C stores the first fastest): radix r1, from the rows;
+      "kgather"  k = (k1, k2): two K modes X cannot fuse (k_affine = 0: KL loads v_k);
+      "many"     nine modes (3 rows, 3 K, 3 batches) with gaps: nine fused modes, so kp_prep
+                 runs its kK0MaxModes instance (r, k, b are fixed by the kind).
+    Together they cover every launch shape of imd_pack's KL (host/analysis.hpp kl_launch,
+    pack_kl_lg_rows_for; write_extent_shape), which suite_write_extent asserts: read along
+    rows, k_hat <= 64 / 128 / 256 (64 / 32 / 16-row tiles) and 8-row tiles with one or two
+    chunks on chip (8 values per thread) or re-read chunks (4 values), each with radix 1 and
+    radix > 1; along k-bar, tiles of 64 .. 1 rows (tk = pow2 >= k_hat in [64, 4096]), the
+    1-row tile with one or two chunks (8 values) or more (4 values); each with W = 2 (N <=
+    16) and 3 (N >= 17), RN and TRUNC (A = 64 wherever k > 96 allows it); r and b with and
+    without a tail."""
     ks = (2, 17, 97, 200, 600, 1030, 5000, 9000)
     rs = (1, 15, 16, 17, 33)
     combos = [(N, rnd, pol, b) for N in (2, 3, 8, 14, 20) for rnd in ("RN", "TRUNC")
               for pol in (16, "AUTO") for b in (1, 3)]
     out, i = [], 0
     for k in ks:
-        for rows_fast in (True, False):
+        for kind in ("rows", "kbar"):
             for r in rs:
                 N, rnd, pol, b = combos[(i * 7) % len(combos)]
-                out.append((N, rnd, pol, r, k, b, rows_fast, i % 2 == 0))
+                out.append((N, rnd, pol, r, k, b, kind, i % 2 == 0))
                 i += 1
     # the largest planes at W = 3; along k-bar with 8-row tiles (k_hat in (256, 512]); rows
     # on chip in 8- and 32-row tiles at W = 3, RN and TRUNC (gaps of the cycle above)
-    out += [(20, "TRUNC", "AUTO", 33, 9000, 1, False, True),
-            (20, "RN", 16, 17, 1030, 3, True, False),
-            (20, "RN", "AUTO", 17, 300, 3, False, True), (8, "TRUNC", 16, 15, 300, 1, False, False),
-            (20, "RN", 16, 33, 600, 1, True, True), (20, "RN", "AUTO", 15, 600, 3, True, False),
-            (14, "TRUNC", "AUTO", 17, 97, 3, True, True), (3, "TRUNC", 16, 33, 97, 1, True, False)]
+    out += [(20, "TRUNC", "AUTO", 33, 9000, 1, "kbar", True),
+            (20, "RN", 16, 17, 1030, 3, "rows", False),
+            (20, "RN", "AUTO", 17, 300, 3, "kbar", True),
+            (8, "TRUNC", 16, 15, 300, 1, "kbar", False),
+            (20, "RN", 16, 33, 600, 1, "rows", True),
+            (20, "RN", "AUTO", 15, 600, 3, "rows", False),
+            (14, "TRUNC", "AUTO", 17, 97, 3, "rows", True),
+            (3, "TRUNC", 16, 33, 97, 1, "rows", False)]
+    # 8-row tiles with one chunk (k_hat in (256, 512]) along rows, the 1-row tile with one
+    # chunk (k_hat in (2048, 4096]) along k-bar; W = 2 and 3
+    out += [(8, "RN", "AUTO", 17, 300, 3, "rows", True),
+            (20, "TRUNC", 16, 33, 300, 1, "rows", False),
+            (14, "TRUNC", 16, 15, 3000, 3, "kbar", False),
+            (20, "RN", "AUTO", 17, 3000, 1, "kbar", True)]
+    # radix > 1 (review 2026-10-07 must-fix 1): batch-fastest X on every along-rows tile (64,
+    # 32, 16 rows; 8 rows with one and two chunks on chip; re-read chunks), W = 2 and 3
+    kb = [17, 97, 200, 300, 600, 1030, 5000]
+    for j, k in enumerate(kb):
+        for N in (8, 20) if j % 2 == 0 else (14, 17):
+            r, b = (15, 17, 33)[(j + N) % 3], (3, 5)[(j + N) % 2]
+            out.append((N, ("RN", "TRUNC")[(j + N) % 2], (16, "AUTO")[j % 2], r, k, b, "batch",
+                        (j + N) % 2 == 0))
+    # radix > 1 from two row modes; a gathered K; nine fused modes (kp_prep kK0MaxModes)
+    out += [(8, "RN", 16, (3, 11), 300, 1, "rows2", True),
+            (20, "TRUNC", "AUTO", (5, 7), 1030, 1, "rows2", False),
+            (14, "RN", "AUTO", (4, 9), 97, 1, "rows2", True),
+            (8, "TRUNC", 16, 33, (10, 13), 1, "kgather", True),
+            (20, "RN", "AUTO", 17, (40, 31), 3, "kgather", False),
+            (8, "RN", "AUTO", 12, 105, 12, "many", True),
+            (17, "TRUNC", 16, 12, 105, 12, "many", False)]
     return out
 
 
-def suite_write_extent(lib, cuda, shim, verbose):
-    if not lib.has_test_hooks:
-        raise Fail("suite write_extent needs the test hooks (fused paths, K alignment)")
-    rng = np.random.default_rng(1417)
-    prng = random.Random(1417)
-    n_pack, n_contract, n_oracle, shapes = 0, 0, 0, set()
-    cases = write_extent_cases()
-    for t, (N, rnd, pol, r, k, b, rows_fast, x_is_a) in enumerate(cases[:MAX_CASES or None]):
-        # X (b x r x k; rows fastest or k fastest) and a partner of 7 columns
-        np_ = 7
+def write_extent_descs(prng, t, case):
+    """(A, B, C, x) of write_extent case t: X (kind as in write_extent_cases) and a partner of
+    7 columns; C stored last mode fastest, or (t % 3 == 0) first mode fastest."""
+    N, rnd, pol, r, k, b, kind, x_is_a = case
+    np_ = 7
+    if kind in ("rows", "kbar", "batch"):
         ext_x = [b, r, k] if b > 1 else [r, k]
         lab_x = [L, I, K] if b > 1 else [I, K]
-        ordx = ([1, 2, 0] if b > 1 else [0, 1]) if rows_fast else None
+        ordx = {"rows": [1, 2, 0] if b > 1 else [0, 1], "kbar": None, "batch": [0, 1, 2]}[kind]
         Xd = o.Desc(ext_x, tc.layout(prng, ext_x, order=ordx), lab_x)
         ext_p = [b, k, np_] if b > 1 else [k, np_]
         lab_p = [L, K, J] if b > 1 else [K, J]
@@ -557,10 +612,102 @@ def suite_write_extent(lib, cuda, shim, verbose):
         lab_c = [L, I, J] if b > 1 else [I, J]
         Cd = o.Desc(ext_c, tc.layout(prng, ext_c, order=None if t % 3 else
                                      list(range(len(ext_c)))), lab_c)
-        A, B = (Xd, Pd) if x_is_a else (Pd, Xd)
-        x = 0 if x_is_a else 1
-        name = (f"write_extent[{t}] N={N} {rnd} A={pol} r={r} k={k} b={b} "
-                f"{'rows' if rows_fast else 'k-bar'}-fastest X as {'AB'[x]}")
+    elif kind == "rows2":
+        # X: I2 fastest, then K, then I; C: I fastest, so the plan (and the pack) orders the
+        # rows I, I2 and the smallest X stride is the second row mode
+        (r1, r2) = r
+        Xd = o.Desc([r1, r2, k], tc.layout(prng, [r1, r2, k], order=[1, 2, 0]), [I, I2, K])
+        Pd = o.Desc([k, np_], tc.layout(prng, [k, np_]), [K, J])
+        Cd = o.Desc([r1, r2, np_], tc.layout(prng, [r1, r2, np_], order=[0, 1, 2]), [I, I2, J])
+    elif kind == "kgather":
+        # X: K fastest, then I, then K2: K and K2 never fuse in X (r > 1)
+        (k1, k2) = k
+        ext_x = [b, r, k1, k2] if b > 1 else [r, k1, k2]
+        lab_x = [L, I, K, K2] if b > 1 else [I, K, K2]
+        ordx = [2, 1, 3, 0] if b > 1 else [1, 0, 2]
+        Xd = o.Desc(ext_x, tc.layout(prng, ext_x, order=ordx), lab_x)
+        ext_p = [b, k1, k2, np_] if b > 1 else [k1, k2, np_]
+        lab_p = [L, K, K2, J] if b > 1 else [K, K2, J]
+        Pd = o.Desc(ext_p, tc.layout(prng, ext_p), lab_p)
+        ext_c = [b, r, np_] if b > 1 else [r, np_]
+        lab_c = [L, I, J] if b > 1 else [I, J]
+        Cd = o.Desc(ext_c, tc.layout(prng, ext_c), lab_c)
+    else:   # "many": r = 2 x 3 x 2, k = 5 x 3 x 7, b = 2 x 2 x 3, every X mode after a gap
+        rows, kk, bb = ([I, I2, R3], [2, 3, 2]), ([K, K2, K3], [5, 3, 7]), ([L, L2, L3], [2, 2, 3])
+        lab_x, ext_x = rows[0] + kk[0] + bb[0], rows[1] + kk[1] + bb[1]
+        ordx = list(range(len(ext_x)))
+        prng.shuffle(ordx)
+        Xd = o.Desc(ext_x, tc.layout(prng, ext_x, order=ordx, pad=1.0), lab_x)
+        Pd = o.Desc(kk[1] + bb[1] + [np_], tc.layout(prng, kk[1] + bb[1] + [np_]),
+                    kk[0] + bb[0] + [J])
+        Cd = o.Desc(rows[1] + bb[1] + [np_], tc.layout(prng, rows[1] + bb[1] + [np_]),
+                    rows[0] + bb[0] + [J])
+    A, B = (Xd, Pd) if x_is_a else (Pd, Xd)
+    return A, B, Cd, 0 if x_is_a else 1
+
+
+def pack_pivot(groups, h_step):
+    """host/index_map.cpp pack_pivot (the gather tiling), transcribed: groups = (extent,
+    stride) of the row class's fused modes, then L's, first fastest; h_step = the first K
+    mode's stride. (along_rows, radix): along rows iff the smallest nonzero |stride| of the
+    groups is below |h_step| (or h_step = 0); radix = the extents before that mode."""
+    best, radix, best_radix = None, 1, 1
+    for e, s in groups:
+        if s and (best is None or abs(s) < best):
+            best, best_radix = abs(s), radix
+        radix *= e
+    if best is not None and (h_step == 0 or best < abs(h_step)):
+        return True, best_radix
+    return False, 1
+
+
+def write_extent_shape(pv, N):
+    """imd_pack's KL launch (pack_exec's one-operand view: rows R then L, host/analysis.cpp)
+    for pack view pv: (along_rows, lg_th, values per thread, chunks per row (3: >= 3), W,
+    radix > 1), by host/analysis.hpp pack_kl_lg_rows_for and kl_launch."""
+    along, radix = pack_pivot(pv.fused["R"] + pv.fused["L"],
+                              pv.fused["K"][0][1] if pv.fused["K"] else 0)
+    lg_tk = 6
+    while lg_tk < (9 if along else 12) and (1 << lg_tk) < pv.k_hat:
+        lg_tk += 1
+    nc = -(-pv.k_hat // (1 << lg_tk))
+    return (along, 12 - lg_tk, 4 if nc > 2 else 8, min(nc, 3), params.pack_words(N), radix > 1)
+
+
+# every launch shape imd_pack's KL can take, in write_extent_shape's terms
+WRITE_EXTENT_SHAPES = (
+    {(True, lg, v, nc, W, rx) for lg, v, nc in ((6, 8, 1), (5, 8, 1), (4, 8, 1), (3, 8, 1),
+                                                (3, 8, 2), (3, 4, 3))
+     for W in (2, 3) for rx in (False, True)} |
+    {(False, lg, v, nc, W, False) for lg, v, nc in [(lg, 8, 1) for lg in range(7)] +
+     [(0, 8, 2), (0, 4, 3)] for W in (2, 3)})
+
+
+def suite_write_extent(lib, cuda, shim, verbose):
+    if not lib.has_test_hooks:
+        raise Fail("suite write_extent needs the test hooks (fused paths, K alignment)")
+    rng = np.random.default_rng(1417)
+    prng = random.Random(1417)
+    n_pack, n_contract, n_oracle = 0, 0, 0
+    shapes, roles, extra = set(), set(), set()
+    cases = write_extent_cases()
+    descs = [write_extent_descs(prng, t, c) for t, c in enumerate(cases)]
+    for t, (N, rnd, pol, r, k, b, kind, x_is_a) in enumerate(cases[:MAX_CASES or None]):
+        A, B, Cd, x = descs[t]
+        name = (f"write_extent[{t}] N={N} {rnd} A={pol} r={r} k={k} b={b} {kind} X as "
+                f"{'AB'[x]}")
+        tA, tB, tC = (hz.make_tensor(d.extent, d.stride, d.label) for d in (A, B, Cd))
+        st, lw = lib.lowering(tA, tB, tC)
+        if st != "SUCCESS":
+            raise Fail(f"{name}: lowering {st}")
+        # pack_pivot == the library's on the plan's view (the same C++ function)
+        for y in (0, 1):
+            fm = [(f[0], f[1 + y]) for f in lw["fused"]["IJ"[y]] + lw["fused"]["L"]]
+            h = lw["fused"]["K"][0][1 + y] if lw["fused"]["K"] else 0
+            if pack_pivot(fm, h) != lw["pivot"][y]:
+                raise Fail(f"{name}: pack_pivot {pack_pivot(fm, h)} != the library's "
+                           f"{lw['pivot'][y]} (operand {y})")
+        roles.add(int(lw["swapped"]) ^ x)       # 1: X in the post-swap B role
         ops = [Operand(cuda, d, rng) for d in (A, B, Cd)]
         try:
             with tc.k_align(lib, pol):
@@ -574,14 +721,20 @@ def suite_write_extent(lib, cuda, shim, verbose):
                 if (pb, pw) != (pv.pack_bytes, pv.pack_ws):
                     raise Fail(f"{name}: pack sizes {pb}, {pw}; oracle {pv.pack_bytes}, "
                                f"{pv.pack_ws}")
-                shapes.add((pv.format, 3 if N > 16 else 2, rows_fast, k))
+                shapes.add(write_extent_shape(pv, N))
+                if len(pv.fused["K"]) > 1:
+                    extra.add("gathered K")
+                if sum(len(pv.fused[c]) for c in "RKL") > 8:
+                    extra.add("kp_prep kK0MaxModes")
                 pX = ops[x].arr.ptr
                 try:
                     if not EXACT:
                         n_oracle += _sentinel_packs(lib, cuda, h, pX, pb, pw, od, ops[x], name)
                     n_pack += 1
+                    # every K4 configuration on every 12th case (the rule's on the others)
                     n_contract += _exact_contracts(lib, cuda, h, pX, pb, pw, od, A, B, Cd, N,
-                                                   rnd, ops, x, name)
+                                                   rnd, ops, x, name,
+                                                   (-1, 0, 1, 2, 3) if t % 12 == 0 else (-1,))
                 finally:
                     lib.pack_destroy(h)
         finally:
@@ -589,11 +742,18 @@ def suite_write_extent(lib, cuda, shim, verbose):
                 y.free()
         if verbose and (t % 10 == 0 or t == len(cases) - 1):
             print(f"  ok  {name} (pack_bytes {pb})", flush=True)
+    if not MAX_CASES:       # the cases must cover every pack launch shape (must-fix 1)
+        missing = WRITE_EXTENT_SHAPES - shapes
+        if missing or roles != {0, 1} or len(extra) != 2:
+            raise Fail(f"write_extent coverage: KL launch shapes missing {sorted(missing)}; "
+                       f"post-swap roles {sorted(roles)}; {sorted(extra)}")
     how = ("exact allocations, no sentinel / oracle" if EXACT else
            f"two sentinels each, {n_oracle} == oracle.pack")
     print(f"  {n_pack} packs ({how}), "
           f"{n_contract} packed contracts on exactly sized packs == the plain call; "
-          f"{len(shapes)} (format, W, rows-fastest, k) pack shapes", flush=True)
+          f"{len(shapes)} KL launch shapes (along, tile rows, values, chunks, W, radix > 1), "
+          f"{sum(s[5] for s in shapes)} with radix > 1; post-swap roles "
+          f"{''.join('AB'[q] for q in sorted(roles))}; {', '.join(sorted(extra))}", flush=True)
 
 
 def _sentinel_packs(lib, cuda, h, pX, pb, pw, od, X, name):
@@ -635,10 +795,11 @@ def _sentinel_packs(lib, cuda, h, pX, pb, pw, od, X, name):
         cuda.free(dW)
 
 
-def _exact_contracts(lib, cuda, h, pX, pb, pw, od, A, B, Cd, N, rnd, ops, x, name):
+def _exact_contracts(lib, cuda, h, pX, pb, pw, od, A, B, Cd, N, rnd, ops, x, name, k4s=(-1,)):
     """The pack in an EXACTLY sized allocation (IMD_TEST_PACK_SHORT: that many bytes short),
-    read by imd_contract_packed with the in-line partner on every producer path; each C == the
-    plain imd_contract's, bit for bit. Returns the packed contracts run."""
+    read by imd_contract_packed with the in-line partner on every producer path, under each
+    K4 configuration of k4s (-1: the rule); each C == the plain imd_contract's (the rule's),
+    bit for bit. Returns the packed contracts run."""
     tA, tB, tC = (hz.make_tensor(d.extent, d.stride, d.label) for d in (A, B, Cd))
     dP = cuda.malloc(pb - SHORT)
     dW = cuda.malloc(pw) if pw else None
@@ -658,8 +819,10 @@ def _exact_contracts(lib, cuda, h, pX, pb, pw, od, A, B, Cd, N, rnd, ops, x, nam
                        f"<= {nws_plain})")
         del keep
         ref = None
-        for fmode in (None, -1, 0, 2, 3):          # None: the plain imd_contract (reference)
+        # None: the plain imd_contract (the reference); then each K4 configuration x path
+        for fmode, k4 in [(None, -1)] + [(f, c) for c in k4s for f in (-1, 0, 2, 3)]:
             lib.set_fused(-1 if fmode is None else fmode)
+            lib.set_k4_config(k4)
             try:
                 if fmode is None:
                     st, plan = lib.plan_create(tA, tB, tC, N, 0, tc.RND[rnd])
@@ -670,8 +833,9 @@ def _exact_contracts(lib, cuda, h, pX, pb, pw, od, A, B, Cd, N, rnd, ops, x, nam
                     nws = wsb.value
             finally:
                 lib.set_fused(-1)
+                lib.set_k4_config(-1)
             if st != "SUCCESS":
-                raise Fail(f"{name}: plan (fused {fmode}) {st}")
+                raise Fail(f"{name}: plan (fused {fmode}, K4 {k4}) {st}")
             dWs = cuda.malloc(nws) if nws else None
             try:
                 ops[2].reset()
@@ -689,19 +853,24 @@ def _exact_contracts(lib, cuda, h, pX, pb, pw, od, A, B, Cd, N, rnd, ops, x, nam
                 finally:
                     lib.reset_k5_mapping()
                 if st != "SUCCESS":
-                    raise Fail(f"{name}: contract (fused {fmode}) {st}")
+                    raise Fail(f"{name}: contract (fused {fmode}, K4 {k4}) {st}")
                 got = ops[2].result()
             finally:
                 if dWs is not None:
                     cuda.free(dWs)
                 lib.plan_destroy(plan)
             if fmode is None:
+                # the reference is not vacuous: it wrote C, and (small cases) == the oracle
+                if not len(tc.bit_mismatches(got, ops[2].buf)):
+                    raise Fail(f"{name}: the plain imd_contract left C unchanged")
+                if not EXACT and int(np.prod(Cd.extent)) * o.pack_lower(od).k <= 200000:
+                    same_bits(got, oracle(ops, 1.0, 0.5, N, rnd), f"{name} plain imd_contract")
                 ref = got
             else:
                 bad = tc.bit_mismatches(got, ref)
                 if len(bad):
-                    raise Fail(f"{name}: packed contract (fused {fmode}) != the plain call in "
-                               f"{len(bad)} elements")
+                    raise Fail(f"{name}: packed contract (fused {fmode}, K4 {k4}) != the plain "
+                               f"call in {len(bad)} elements")
                 n += 1
     finally:
         cuda.free(dP)
@@ -721,6 +890,9 @@ def main():
     ap.add_argument("--suite", action="append", choices=sorted(SUITES), required=True)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+    if "graph_phases" in args.suite[1:]:
+        ap.error("graph_phases must be the first suite of its process: it is a cold capture "
+                 "only while nothing at N = 10 or 12 has run")
     lib, cuda = hz.Library(args.lib), Cuda()
     imd.load_library(args.lib)               # the device API on the same library
     shim = Shim(args.shim)
