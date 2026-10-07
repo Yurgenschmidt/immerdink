@@ -1,0 +1,15 @@
+# C1 M-c, Q24 (docs/NOTES-C1.md §4.3, Q24): N-specific calibration cases, run after M-c missed
+# the < 100 us target of DESIGN §6c.5. N = 4, 5, 6, 7, 9, 10, 12, 13 (the M-c levels) on shapes
+# disjoint from the hold-out (bench/sweep_perf_validate.txt) and from M-c (bench/sweep_mc.txt),
+# checked by bench/sweep_disjoint.py: the fused small path (KF), the Jacobi-view class that
+# missed (KL, a narrow n, all inputs inside the REPEAT window, square and tensor forms), a
+# large square, a DF tensor and a PPL-like narrow m. Fitted together with the shipped
+# calibration's records (calibration format 2, no new key, no new feature).
+# name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
+q_kf1     | ik,kj->ij | i=1280,k=960,j=1280 | imd | 4,5,6,7,9,10,12,13 | --reps 100 --phase-reps 10 --max-seconds 1
+q_kl1     | ik,kj->ij | i=1408,k=1408,j=96 | imd | 4,5,6,7,9,10,12,13 | --reps 300 --phase-reps 10 --max-seconds 1
+q_kl2     | abcd,cdij->abij | a=36,b=36,c=36,d=36,i=12,j=12 | imd | 4,6,9,12,13 | --reps 300 --phase-reps 10 --max-seconds 1
+q_kl4     | ik,kj->ij | i=1792,k=1280,j=128 | imd | 5,7,10,13 | --reps 300 --phase-reps 10 --max-seconds 1
+q_kl3     | ik,jk->ij | i=2560,j=2560,k=2560 | imd | 4,5,6,7,9,10,12,13 | --reps 20 --phase-reps 5 --max-seconds 1
+q_df40    | acQ,bdQ->acbd | a=40,b=40,c=40,d=40,Q=1536 | imd | 4,6,9,12,13 | --reps 20 --phase-reps 5 --max-seconds 1
+q_ppl     | ik,jk->ij | i=96,j=6144,k=6144 | imd | 4,6,9,12,13 | --reps 20 --phase-reps 5 --max-seconds 1
