@@ -44,7 +44,8 @@ effective clock is the vertex of a parabola through the LOO scan near its argmin
 and the nested leave-one-out error of that choice is printed; the phases of --l2 flush records
 (REPEAT state: imd_bench flushes before the timed calls only) are raised to COLD.
 
-v1.18 (DESIGN §6c.8, host API 13): the cache fit adds the per-call REPEAT saving (warm.call_ns)
+v1.18 (DESIGN §6c.8, host API 13): the cache fit adds the per-call REPEAT saving (warm.call_ns;
+since perf-minor-noc not fitted by default, --cache-terms delta,c,omega fits it)
 and the clean-L2 credit (warm.clean_byte): method pair's COLD and the totals of --l2 flush
 records are the CLEAN state (an L2 flushed by reads), L_w is scanned over 0.30-1.20 x L2; the
 PACK set counts one group's W planes (warm.pack_l2_planes = 1, --pack-l2-frac 1.1); the power
@@ -1014,8 +1015,11 @@ def main(argv=None):
     ap.add_argument("--cache-form", choices=("clean", "v110"), default="clean",
                     help="cache fit: 'clean' (v1.18: Delta, per-call c, clean credit omega; L_w "
                          "0.30-1.20 x L2) or 'v110' (Delta only, L_w 0.1-1.0 x L2)")
-    ap.add_argument("--cache-terms", default="delta,c,omega",
-                    help="clean cache fit: the fitted subset of delta,c,omega (the others 0; an A/B)")
+    ap.add_argument("--cache-terms", default="delta,omega",
+                    help="clean cache fit: the fitted subset of delta,c,omega (the others 0). "
+                         "Default delta,omega: the per-call REPEAT saving c is not identifiable "
+                         "from the pair records (NOTES-B2 §12 \"Decision: c dropped\"); "
+                         "delta,c,omega is the perf-minor fit")
     ap.add_argument("--byte-pj", type=float, default=0.0,
                     help="scaled form: the fixed unscaled byte energy (pJ per DRAM byte; 0, or "
                          "a stated prior), written as power.byte_pj")

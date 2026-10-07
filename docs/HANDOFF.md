@@ -120,8 +120,17 @@ first.
   perf_fit recomputes the boost clock per LOO fold; power keys refit offline (f_ref 2483):
   nested LOO 1.40 %, clock 0.7 %; BURST and COLD predictions and the hold-out unchanged; doc
   fixes and open items in NOTES-B2 §12 "Review" / "Remaining".
-  Open: reviewer questions (COLD's meaning, `clock_mhz` scale, keep the per-call saving c,
-  which costs small REPEAT calls ≈ 1 µs: `v_n18d` −3.5 points), streaming K2 of g < N KL
+  **c dropped (branch `perf-minor-noc`, CPU only; the independent reviewer's binding
+  verdict, NOTES-B2 §12 "Decision: c dropped"):** shipped calibration refit with `perf_fit
+  --cache-terms delta,omega` (now the default; `warm.call_ns` absent = 0, the key stays
+  supported): L_w 0.85 × L2, Δ 1.31 ps/B, ω 0.104 ps/B, f_ref 2479, nested LOO 1.42 %; hold-out
+  < 100 µs 3.7 / 12.2 / 19.0 → 3.8 / 10.7 / 17.1 %, 100 µs – 1 ms 2.7 / 6.9 / 13.4 → 2.7 / 8.2 /
+  13.3 %, ≥ 1 ms 2.6 / 6.4 / 16.4 → 2.5 / 6.4 / 16.4 %; 1024³ N = 14 +6.3 → +10.8 %; small COLD
+  calls ≈ 1.2 µs faster (64³ N = 14 16.68 → 15.45 µs); two of the three held-out cache pairs
+  worse (clean credit 11.5 → 6.7 µs). The per-call saving is not identifiable: open, tied to
+  the launch-timing question (power reviewer item 5).
+  Open: reviewer questions (COLD's meaning, `clock_mhz` scale), the per-call saving c
+  (dropped, above; with the launch-timing check), streaming K2 of g < N KL
   calls (+2 … +5 %), pre-packed g < N in the S rule, tiny-shape K4 / KF. GPU: 18.7 min (90 min
   sweep wall time, mostly gate waits for other GPU users).
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,

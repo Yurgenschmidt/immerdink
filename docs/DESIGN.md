@@ -3036,9 +3036,10 @@ calibration or hold-out record used `--l2 flush`, so no shipped fit was affected
 stays as a reported no-op) and NOTES-B2 says so.** A format-1 calibration has Δ = 0.
 **[v1.18]** The flush *reads* its buffer, so a flushed (and method pair's COLD) record starts
 with a clean L2, which a REPEAT call does not have; and the REPEAT saving has a per-call part.
-§6c.8 adds `warm.call_ns` (c, applied when res > 0), `warm.clean_byte` (ω) and the state
-`IMD_PERF_CACHE_CLEAN` (COLD minus ω·min(F − I, L_w) on the call phase); COLD keeps its
-meaning (evicted by other, dirty work) and stays the default.
+§6c.8 adds `warm.call_ns` (c, applied when res > 0; supported, **0 in the shipped
+calibration** since perf-minor-noc), `warm.clean_byte` (ω) and the state
+`IMD_PERF_CACHE_CLEAN` (COLD minus ω·min(F − I, L_w) on the call phase); COLD stays the default
+(the model's state of a call inside a sequence, not a measured one, §6c.8).
 
 #### [v1.10] Prediction intervals and ties
 
@@ -3213,7 +3214,7 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   size, as before). With `pack.dram` = 0 (every file before v1.17) L_hit has no effect, so
   the view is the full calibration and its text gains no key. For the v1.17 shipped file the
   fallback was exact (its `warm.l2_bytes` = `warm.pack_l2_bytes` = 60397977.6 B, 0.8 × L2).
-  **[v1.18 review]** For the v1.18 shipped file it is **not**: L_w = 67.9 MB, L_hit = 83 MB
+  **[v1.18 review]** For the v1.18 shipped file it is **not**: L_w = 67.9 MB (64.2 MB since perf-minor-noc), L_hit = 83 MB
   and S counts K4's planes, and the v1.18 fields read as 0, so an API-7…11 caller gets a
   degraded, unvalidated view (pass NULL), as for any other file with `pack.dram` > 0. The test
   checks the exact case on a v1.17-style file (L_hit = L_w, no v1.18 keys) and that the
@@ -3827,7 +3828,11 @@ fit). So the hold-out is a check of the long-run state, and of shape only at 163
 Status: designed from the two offline analyses of 2026-10-06 (evaluation workspace
 `findings/perfminor-time.md`, `findings/perfminor-power.md`), implemented on branch
 `perf-minor` (host API 13), refit and validated in NOTES-B2 §12 (shipped: every part below
-marked adopted; the v1.18 changelog has the figures). Every new calibration key
+marked adopted; the v1.18 changelog has the figures). **[perf-minor-noc]** The per-call REPEAT
+saving c (`warm.call_ns`) is **dropped from the shipped fit** by the independent reviewer's
+verdict (NOTES-B2 §12 "Decision: c dropped"): not identifiable from the pair records; the key
+stays supported (optional, 0 = off) for a future calibration, and the question stays open with
+the launch-timing check below. Every new calibration key
 is optional (absent = 0) and calibration format 2 is kept: a file without them predicts
 bit-identically to host API 12 (tested), and API ≤ 12 rejects a file with any of them
 (unknown key), so no library reads a file with features it was not fitted with (§6c.2 "Why
@@ -3878,28 +3883,36 @@ enum { ..., IMD_PERF_CACHE_CLEAN = 3 };  /* the inputs evicted and the L2 clean 
                                              reads, e.g. imd_bench --l2 flush); host API 13 */
 ```
 
-- The parameters θ stay **COLD** costs, and COLD keeps its meaning and stays the default:
-  *the inputs are not resident and the L2 holds other work's (dirty) lines* — the state of a
-  call that follows other kernels in a sequence (ehrenfest). [Design question of the time
-  analysis, decided here: the alternative, "COLD = evicted and clean" (what the bench
-  measures), would make every default prediction of a large call 13 µs faster than a call in a
-  sequence sees.] **[v1.18 review]** COLD itself is never measured. For a call with res = 0 it
-  equals the measured REPEAT; for res > 0 it is CLEAN + ω·min(F − I, L_w), an extrapolation
-  of the additive form that **no record validates** (with the shipped calibration COLD is
-  2.8 / 6.7 / ≈ 6 % slower than CLEAN on 256³ / 512³ / 1024³ at N = 14, at most ω·L_w ≈
-  11.5 µs on large calls). If the timing reading above is the right one, a call queued in a
-  sequence is closer to CLEAN and the default is pessimistic by up to ω·L_w.
+- The parameters θ stay **COLD** costs, and COLD stays the default. COLD is a **modelling
+  convention**, not a measured state: *the inputs are not resident* (res = 0) and the call pays
+  what a REPEAT call with res = 0 pays, i.e. the CLEAN credit is not applied. It is meant as the
+  state of a call that follows other kernels in a sequence (ehrenfest); whether such a call's
+  L2 really holds dirty lines it must write back, or the measured CLEAN / REPEAT gap is launch
+  timing, is open (the reading above). [Design question of the time analysis, decided here:
+  the alternative, "COLD = CLEAN" (what the bench's flushed records measure), would make every
+  default prediction of a large call ω·L_w faster.] **[v1.18 review]** COLD itself is never
+  measured. For a call with res = 0 it equals the measured REPEAT; for res > 0 it is CLEAN +
+  ω·min(F − I, L_w), an extrapolation of the additive form that **no record validates** (with
+  the shipped calibration, no c, COLD is 1.8 / 4.1 / 3.8 % slower than CLEAN on 256³ / 512³ /
+  1024³ at N = 14, at most ω·L_w ≈ 6.7 µs on large calls; with c it was 2.8 / 6.7 / 6.3 % and
+  11.5 µs). If the timing reading above is the right one, a call queued in a sequence is closer
+  to CLEAN and the default is pessimistic by up to ω·L_w. **[perf-minor-noc]** With c fitted,
+  the fitter adds c back onto every REPEAT phase record, so θ (the COLD costs) carried ≈ 1.2 µs
+  per small call that no COLD measurement backs (64³ N = 14 COLD 16.68 µs with c, 15.45 without;
+  REPEAT 15.37 / 15.36): one reason c is 0 in the shipped file.
 - REPEAT / WARM: `cache_ns = −Δ·res − c·[res > 0]`, split over the reading phases by
-  `in_bytes / I` and clamped at 0 per phase as in v1.10 (res = `res_repeat`).
-- CLEAN: `res = 0` (as COLD) and the **call** phase gains `−ω·min(F − I, L_w)` (the write-back
-  of up to L_w dirty bytes that a clean L2 does not pay; F − I is the call's written footprint).
-  ω ≈ 0.19 ps/B is far below a DRAM write rate (most of the write-back overlaps the call's own
-  traffic), so the credit is below 20 % of the time to write F − I bytes and a CLEAN time is
-  never negative. Bands as in every state.
-  **[v1.18 review]** The credit saturates at ω·L_w ≈ 11.5 µs too early: every res = 0 pair
-  whose measured clean saving is larger is under-predicted (x_r1 N = 14 and x_s1536 N = 8 by
-  5.9 µs, in-sample; the held-out v_x3072 by 9.3 µs), so `min(F − I, L_w)` is probably the
-  wrong form for large write-backs (open). WARM stays modelled as REPEAT although the pairs
+  `in_bytes / I` and clamped at 0 per phase as in v1.10 (res = `res_repeat`); c = 0 in the
+  shipped calibration (perf-minor-noc), so there REPEAT = COLD − Δ·res as in v1.10.
+- CLEAN: `res = 0` (as COLD) and the **call** phase gains `−ω·min(F − I, L_w)` (an effect-size
+  credit, read as the write-back of up to L_w dirty bytes that a clean L2 does not pay, a
+  hypothesis; F − I is the call's written footprint). ω ≈ 0.10 ps/B (shipped, no c; 0.17 with
+  c) is far below a DRAM write rate, so the credit is below 20 % of the time to write F − I
+  bytes and a CLEAN time is never negative. Bands as in every state.
+  **[v1.18 review]** The credit saturates at ω·L_w (≈ 6.7 µs shipped; 11.5 µs with c) too
+  early: every res = 0 pair whose measured clean saving is larger is under-predicted (x_r1
+  N = 14 and x_s1536 N = 8 by 10.7 µs in-sample, the held-out v_x3072 by 14.1 µs and v_x1280
+  by 4.7 µs; with c 5.9 / 9.3 / 0.1 µs), so `min(F − I, L_w)` is probably the wrong form for
+  large write-backs (open). WARM stays modelled as REPEAT although the pairs
   measure WARM − REPEAT of −4.5 / −7.2 / −11.9 % on the held-out pairs and down to −7 % on the
   calibration pairs (the model: 0; open, with the timing question above).
 - **Fit** (`perf_fit.fit_warm`): L_w scanned over 0.30–1.20 × L2 in steps of 0.05; for each,
@@ -3909,7 +3922,10 @@ enum { ..., IMD_PERF_CACHE_CLEAN = 3 };  /* the inputs evicted and the L2 clean 
   the calibration records are raised to COLD by the C model's per-phase `COLD − REPEAT` as
   before (c enters through the split; ω is a call-phase term and never enters the raise). The
   "Δ = 0 when every measured effect is below 3 %" rule is kept. `--cache-form v110` is the
-  v1.10 fit and `--cache-terms` fits a subset of (Δ, c, ω), for A/Bs.
+  v1.10 fit and `--cache-terms` fits a subset of (Δ, c, ω); **[perf-minor-noc]** the default
+  is `delta,omega` (c = 0; `delta,c,omega` is the perf-minor fit). Shipped (no c): L_w = 0.85 ×
+  L2, Δ = 1.31 ps/B, ω = 0.104 ps/B, pair relative SSE 0.0222 (with c: 0.90 × L2, 1.29, c =
+  1.23 µs, 0.169, 0.0136).
 - **Which records use CLEAN:** method pair's COLD and the totals of `--l2 flush` records (their
   phases stay REPEAT, v1.17). Method packed's interleaved calls stay COLD (their L2 holds the
   other calls' dirty lines).
@@ -4051,7 +4067,7 @@ do when present (`warm.pack_l2_planes` changes the S that `warm.pack_l2_bytes` t
 `power.act_w` > 0 makes γ also the exponent of the busy term, and `warm.l2_bytes` now also
 gates the DRAM energy), so an API-7…12-sized struct reads the shipped file as a model that was
 never fitted. Measured with the shipped file (COLD, N = 14): SUSTAINED no longer reaches the
-cap on large calls (4096³ N = 14: 4397 µs at 342 W against NULL's 4614 µs at the 450 W cap), and BURST is ≈ −7 % on the 4096² × 512 and
+cap on large calls (4096³ N = 14: 4396 µs at 340 W against NULL's 4608 µs at the 450 W cap; with c 4397 / 342 / 4614), and BURST is ≈ −7 % on the 4096² × 512 and
 3584² × 512 g = 4 shapes (v1.17's S calls them hits). Refusing such a struct was considered
 (`imd_perf_calib_default` / `_parse` failing for a size below v13 when a v1.18 key is set);
 not done because the degraded-view rule of v6 / v7…v10 / v7…v11 callers is the established
@@ -5264,7 +5280,8 @@ and host API; every value the same integer (bit-identical, tested on every contr
   refit on the same records ≥ 1 ms median 1.6 → 2.6 and < 100 µs p90 9.8 → 12.2, a trade-off;
   KF phase 8.9 / 24.4 → 6.6 / 21.1, K3 5.2 / 16.3 → 4.2 / 14.0; 1024³ N = 14 +14.9 → +6.3 %).
   Reviewer questions: COLD's meaning, `clock_mhz` on the NVML scale, and whether to keep c
-  (it costs the small REPEAT calls ≈ 1 µs; NOTES-B2 §12 ablations).
+  (it costs the small REPEAT calls ≈ 1 µs; NOTES-B2 §12 ablations). **Superseded by
+  perf-minor-noc below (c dropped).**
 - **Review amendments** (two independent reviews of `perf-minor`, 2026-10-06; branch
   `perf-minor-final`, NOTES-B2 §12 "Review"): **the power and the SUSTAINED clock divide by
   the request's cache-state time** t(f) (they used the COLD time in every state while the fit
@@ -5277,3 +5294,14 @@ and host API; every value the same integer (bit-identical, tested on every contr
   early saturation, the D_dram step and the uncapped BURST power, and the v7…v12-sized struct
   as a stated exception to §6c.2 (the v11 L_hit fallback is no longer exact for the shipped
   file).
+- **c dropped** (perf-minor-noc, the independent reviewer's binding verdict, CPU only;
+  NOTES-B2 §12 "Decision: c dropped"): the shipped calibration is the refit of the same records
+  with `perf_fit --cache-terms delta,omega` (now the default): `warm.call_ns` absent (= 0),
+  L_w 0.85 × L2, Δ 1.31 ps/B, ω 0.104 ps/B; f_ref 2479 MHz, nested leave-one-out 1.42 % (with c
+  1.40), clock 0.7 %, power max 9.2 %; hold-out < 100 µs 3.7 / 12.2 / 19.0 → 3.8 / 10.7 / 17.1 %,
+  100 µs – 1 ms 2.7 / 6.9 / 13.4 → 2.7 / 8.2 / 13.3 %, ≥ 1 ms 2.6 / 6.4 / 16.4 → 2.5 / 6.4 /
+  16.4 %; 1024³ N = 14 +6.3 → +10.8 %; small COLD calls ≈ 1.2 µs faster (64³ N = 14 16.68 →
+  15.45 µs). The per-call saving is not identifiable from these records: an open item tied to
+  the launch-timing question (power reviewer item 5). The key stays supported (optional,
+  0 = off); the struct and format are unchanged. Text: COLD described as a modelling convention,
+  the write-back reading of ω as a hypothesis.
