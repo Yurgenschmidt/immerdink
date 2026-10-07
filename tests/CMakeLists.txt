@@ -67,6 +67,12 @@ if(Python3_FOUND)
   add_test(NAME host_accuracy
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_accuracy.py"
                    --host-lib "$<TARGET_FILE:immerdink_host>" -v)
+  # DESIGN v1.19 §6g (NOTES-C1 §4.1): the footprints precision phases rely on, on the library
+  # == spec/params.py: F1 / F2 (published from API 13 on: workspace and pack bytes
+  # nondecreasing in N and g), C-ws / C-pack, and the internal facts I1-I3. CPU only.
+  add_test(NAME host_footprint_monotone
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_footprint.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" -v)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
@@ -204,6 +210,33 @@ if(Python3_FOUND)
     set_tests_properties(packed_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
+
+  # DESIGN v1.19 §6g (NOTES-C1 §4.1, stage 0): precision phases on the GPU vs spec/oracle.py,
+  # one fresh process per suite (graph_phases captures phases whose N never ran in its
+  # process): a buffer re-packed in place at another N (PackedBuffer refuses the stale plan),
+  # one workspace for plans at every N, CUDA graphs per phase with cold captures, and F3's
+  # write extent of imd_pack (sentinels, every pack launch shape) with packed contracts on
+  # exactly sized packs on every producer path.
+  foreach(pair packed_repack_n:repack_n workspace_shared_n:workspace_shared_n
+               graph_phases:graph_phases pack_write_extent:write_extent)
+    string(REPLACE ":" ";" pair "${pair}")
+    list(GET pair 0 name)
+    list(GET pair 1 suite)
+    add_test(NAME ${name}
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_phases.py"
+                     --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+    set_tests_properties(${name} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                         ENVIRONMENT "LD_PRELOAD=${shim}")
+  endforeach()
+  # F3 under compute-sanitizer memcheck: every allocation exactly sized, clean; a pack
+  # allocation 16 bytes short must be reported (tests/memcheck_pack_extent.sh).
+  if(_imd_san)
+    add_test(NAME pack_write_extent_memcheck
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/memcheck_pack_extent.sh" "${_imd_san}"
+                     "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_phases.py"
+                     "$<TARGET_FILE:immerdink>")
+    set_tests_properties(pack_write_extent_memcheck PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800)
+  endif()
 
   # DESIGN v1.9 §6d: the Python device API (python/immerdink: Plan, Pack, contract) on the
   # GPU, bit for bit vs spec/oracle.py, with the allocation shim (pytest; CAI / DLPack

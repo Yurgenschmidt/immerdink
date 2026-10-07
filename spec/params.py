@@ -41,6 +41,7 @@ scaled_constants() produce their parameters with the same greedy rule.
 
 import argparse
 import functools
+import inspect
 import json
 import math
 import os
@@ -2197,6 +2198,122 @@ def cert_pack_layout():
     ex = workspace_size(8192, 8192, 8192, 1, 14, 14, packed=("A", "B"))
     return (f"{n_cases} (b, r, k, N) layouts, {len(worked) + len(pw)} hand-computed examples; "
             f"8192^3 N=14 both packed: {ex / 2**30:.3f} GiB workspace")
+
+
+@check("§6g footprint monotone")
+def cert_footprint_monotone():
+    """DESIGN v1.19 §6g / §6a (NOTES-C1 §4.1): precision phases size their buffers once.
+    Published (§6a, from host API 13 on): F1 workspace_size, in-line or with packed roles, is
+    nondecreasing in N at every fixed g >= 1, in g in [1, N], and in N with g = 0 (= N); F2
+    pack_bytes is nondecreasing in N. Hence C-ws: ws(N, g) <= ws(N_max, g_max) whenever
+    g <= g_max and N <= N_max (g = 0 counted as N), and C-pack: pack_bytes(N') <=
+    pack_bytes(N_max). Internal facts, NOT ABI (a format change must revisit them): I1 the
+    pack's sig and flag offsets and bytes, the res offset and pack_ws_bytes do not depend on
+    N, and res(N') lies inside res(N_max) (a prefix of it); I2 the plan device bytes do not
+    depend on N or g; I3 packing more roles never increases ws(N, g). And the proof's
+    structure, region by region: RA and RB grow with g only, W with N only and is the last
+    region, every other §4a region is independent of (N, g)."""
+    rng = random.Random(1019)
+    roles_sets = [(), ("A",), ("B",), ("A", "B")]
+    Ns = range(N_MIN, N_MAX + 1)
+    keys = [(N, g) for N in Ns for g in range(0, N + 1)]
+    counts = {"ws": 0, "packs": 0}
+
+    def check_ws(m, n, k, b, mode, vec, A):
+        tabs = {}
+        for packed in roles_sets:
+            t = tabs[packed] = {(N, g): workspace_size(m, n, k, b, N, g, mode, vec, packed, A)
+                                for N, g in keys}
+            counts["ws"] += len(t)
+            what = f"(m,n,k,b)=({m},{n},{k},{b}) mode {mode} vec {vec} A={A} packed {packed}"
+            for N in Ns:
+                need(t[(N, 0)] == t[(N, N)], f"g = 0 is not g = N: {what}")
+                for g in range(1, N):
+                    need(t[(N, g)] <= t[(N, g + 1)], f"F1 in g at N={N}, g={g}: {what}")
+                if N < N_MAX:
+                    for g in range(0, N + 1):
+                        need(t[(N, g)] <= t[(N + 1, g)], f"F1 in N at N={N}, g={g}: {what}")
+            # C-ws, directly (it follows from F1 and g <= N): sampled phase sets
+            for _ in range(24):
+                Nm = rng.randint(N_MIN, N_MAX)
+                gm = rng.randint(1, Nm)
+                N = rng.randint(N_MIN, Nm)
+                g = rng.randint(0, min(N, gm))
+                if g == 0 and N > gm:
+                    continue                    # g = 0 counts as N
+                need(t[(N, g)] <= t[(Nm, gm)], f"C-ws ({N},{g}) vs ({Nm},{gm}): {what}")
+        # I3: a packed role drops sX, fX, RX and adds no region
+        for sub in roles_sets:
+            for sup in roles_sets:
+                if set(sub) < set(sup):
+                    need(all(tabs[sup][key] <= tabs[sub][key] for key in keys),
+                         f"I3: packing {sup} > {sub} for ({m},{n},{k},{b}) A={A}")
+
+    def check_regions(m, n, k, b, vec, A, packed):
+        # the proof's structure: per region, which of (N, g) its bytes grow with
+        base = {r[0]: r[2] - r[1] for r in region_offsets(m, n, k, b, 2, 1, EMULATE, vec,
+                                                           packed, A)}
+        for N in Ns:
+            for g in range(1, N + 1):
+                regs = region_offsets(m, n, k, b, N, g, EMULATE, vec, packed, A)
+                if not regs:
+                    continue
+                if k > 1:
+                    need(regs[-1][0] == "W", "W is not the last region")
+                for name, lo, hi in regs:
+                    by = hi - lo
+                    if name in ("RA", "RB"):
+                        need(by == g * base[name], f"{name} not g x its g = 1 bytes")
+                    elif name == "W":
+                        need(by * 2 == N * base[name], "W not N x its per-modulus bytes")
+                    else:
+                        need(by == base[name], f"{name} depends on (N, g)")
+
+    ms, ks, bs = (1, 15, 16, 17, 257), (0, 1, 2, 96, 97, 1025, 131009), (0, 1, 3)
+    shapes = [(m, n, k, b) for m in ms for n in ms for k in ks for b in bs]
+    for m, n, k, b in shapes:
+        for vec in (VEC_GENERATE, VEC_RESIDENT):
+            for A in (K_ALIGN, K_ALIGN_PAD):
+                check_ws(m, n, k, b, EMULATE, vec, A)
+        check_ws(m, n, k, b, DIRECT, VEC_GENERATE, None)
+    for _ in range(300):    # random shapes, random configurations
+        m, n = rng.randint(1, 3000), rng.randint(1, 3000)
+        k, b = rng.choice((rng.randint(2, 200), rng.randint(2, 300000))), rng.randint(1, 40)
+        check_ws(m, n, k, b, EMULATE, rng.choice((VEC_GENERATE, VEC_RESIDENT)),
+                 rng.choice((None, K_ALIGN, K_ALIGN_PAD)))
+    for m, n, k, b in ((17, 33, 5, 3), (1000, 3, 200, 2), (257, 1, 131009, 1), (1, 16, 97, 3)):
+        for vec in (VEC_GENERATE, VEC_RESIDENT):
+            for packed in roles_sets:
+                check_regions(m, n, k, b, vec, None, packed)
+    # I2: the plan device bytes are a function of the shape and vec_mode alone (§4a)
+    need(list(inspect.signature(plan_device_bytes).parameters) == ["m", "n", "k", "b", "vec"],
+         "plan_device_bytes takes N or g: revisit I2")
+
+    # F2, I1, C-pack: the pack layout across N (both formats)
+    for fmt in sorted(PACK_FORMATS):
+        for b in (1, 3, 7):
+            for r in (1, 15, 16, 17, 33, 257):
+                for k in (2, 15, 16, 17, 96, 97, 1000, 131008, 131009):
+                    lays = {N: pack_layout(b, r, k, N, fmt) for N in Ns}
+                    counts["packs"] += len(lays)
+                    top_regs, top = lays[N_MAX]
+                    for N in Ns:
+                        regs, total = lays[N]
+                        d = {name: (off, nb) for name, off, nb in regs}
+                        td = {name: (off, nb) for name, off, nb in top_regs}
+                        need(d["sig"] == td["sig"] and d["flag"] == td["flag"],
+                             f"I1: sig / flag move with N (b={b} r={r} k={k} fmt {fmt})")
+                        need(d["res"][0] == td["res"][0] and d["res"][1] <= td["res"][1],
+                             f"I1: res(N={N}) not a prefix of res(N_max)")
+                        need(total <= top, "C-pack")
+                        if N < N_MAX:
+                            need(total <= lays[N + 1][1], f"F2: pack_bytes falls at N={N}")
+    # pack_ws_bytes has no N argument (I1)
+    need(list(inspect.signature(pack_ws_bytes).parameters) == ["b", "r", "k"],
+         "pack_ws_bytes takes N: revisit I1")
+    return (f"{counts['ws']} workspace sizes ({len(shapes)} grid shapes + 300 random, every "
+            f"(N, g), packed roles, vec modes, A = 16 / 64), {counts['packs']} pack layouts: "
+            f"F1, F2, C-ws, C-pack, I1-I3")
 
 
 # DESIGN §4a table typed literally (independent of _REGIONS / workspace_size).
