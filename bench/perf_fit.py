@@ -818,7 +818,7 @@ def pair_cases(records):
 
 
 def fit_warm(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=True,
-             form="clean"):
+             form="clean", terms=("delta", "c", "omega")):
     """L_w (a scan over fractions of the nominal L2) and Delta >= 0 (least squares, relative):
     measured t_state - t_repeat against the model's (res_repeat - res_state) bytes, which the C
     model gives as its COLD minus REPEAT time at a unit Delta. Delta = 0 when
@@ -828,7 +828,7 @@ def fit_warm(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=
     measured (CLEAN - REPEAT) / REPEAT against the C model's columns (COLD - REPEAT) at unit
     Delta, at unit c, and (CLEAN - COLD) at unit omega. form "v110": the v1.10 fit."""
     if form == "clean":
-        return fit_warm_clean(cases, meta, params, extra, l2, lib, min_effect, verbose)
+        return fit_warm_clean(cases, meta, params, extra, l2, lib, min_effect, verbose, terms)
     effects = []
     for (case, spec, ext, N), t in sorted(cases.items()):
         effects.append((case, N, t["cold"] / t["repeat"] - 1, t["warm"] / t["repeat"] - 1, t))
@@ -924,8 +924,11 @@ def nnls_plain(A, y):
     return best
 
 
-def fit_warm_clean(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=True):
-    """v1.18 (DESIGN §6c.8): see fit_warm."""
+def fit_warm_clean(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=True,
+                   terms=("delta", "c", "omega")):
+    """v1.18 (DESIGN §6c.8): see fit_warm. terms: the fitted subset of (delta, c, omega); the
+    others are 0 (an A/B of a term, perf_fit --cache-terms)."""
+    keep = [i for i, n in enumerate(("delta", "c", "omega")) if n in terms]
     effects = pair_effects(cases, verbose)
     big = max((max(abs(ec), abs(ew)) for _, _, ec, ew, _ in effects), default=0.0)
     zero = {"warm.l2_bytes": 0.0, "warm.l2byte": 0.0, "warm.call_ns": 0.0, "warm.clean_byte": 0.0}
@@ -936,7 +939,9 @@ def fit_warm_clean(cases, meta, params, extra, l2, lib=None, min_effect=0.03, ve
     best = None
     for frac in np.round(np.arange(0.30, 1.2001, 0.05), 2):
         A, y, _ = cache_columns(cases, meta, params, extra, frac * l2, lib)
-        err, th = nnls_plain(A, y)
+        err, th_k = nnls_plain(A[:, keep], y)
+        th = np.zeros(3)
+        th[keep] = th_k
         if best is None or err < best[0] - 1e-15:
             best = (err, float(frac), th)
     err, frac, (delta, c, om) = best
@@ -999,6 +1004,8 @@ def main(argv=None):
     ap.add_argument("--cache-form", choices=("clean", "v110"), default="clean",
                     help="cache fit: 'clean' (v1.18: Delta, per-call c, clean credit omega; L_w "
                          "0.30-1.20 x L2) or 'v110' (Delta only, L_w 0.1-1.0 x L2)")
+    ap.add_argument("--cache-terms", default="delta,c,omega",
+                    help="clean cache fit: the fitted subset of delta,c,omega (the others 0; an A/B)")
     ap.add_argument("--byte-pj", type=float, default=0.0,
                     help="scaled form: the fixed unscaled byte energy (pJ per DRAM byte; 0, or "
                          "a stated prior), written as power.byte_pj")
@@ -1128,7 +1135,8 @@ def main(argv=None):
     # the parameters are COLD costs (a REPEAT prediction subtracts the saving again).
     cases = pair_cases(records) if extra is not None else {}
     if cases:
-        wm, _ = fit_warm(cases, meta, params0, extra, l2, a.lib, form=a.cache_form)
+        wm, _ = fit_warm(cases, meta, params0, extra, l2, a.lib, form=a.cache_form,
+                         terms=tuple(a.cache_terms.split(",")))
         extra.update(wm)
         if wm["warm.l2byte"] > 0 or wm.get("warm.call_ns", 0) > 0:
             calw = host.Calibration.from_values(meta, params0, a.lib, extra)

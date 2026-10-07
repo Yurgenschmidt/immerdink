@@ -3156,7 +3156,9 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
     which API ≤ 10 requires (MISSING_KEY), and it contains `power.byte_f_pj` when non-zero
     (unknown key). Only a file that still carries all three `op_eps` keys and no `byte_f`
     loads in both. "Format 2" names the key grammar this library reads, not a promise that
-    older libraries read every file it writes.
+    older libraries read every file it writes. [v1.18] Likewise a file with any v1.18 key (the
+    shipped one) does not load in API ≤ 12 (unknown key); `host_perf` checks that the shipped
+    file omits the `op_eps` keys and carries `power.byte_f_pj` or a v1.18 key.
   - **[v1.17, host API 12] optional:** `kf.elem`, `pack.dram` (parameters, ≥ 0) and
     `warm.pack_l2_bytes` (L_hit of §6c.1, ≥ 0; the field `pack_l2_hit_bytes`), each absent
     = 0 and written only when non-zero; format-2 keys (rejected in a format-1 file). With
