@@ -111,8 +111,15 @@ first.
   windows reused: 24 of 26 from model-fix / perfminor on the same kernels): hold-out (199 calls)
   < 100 µs 3.9 / 10.8 / 15.8 → 3.7 / 12.2 / 19.0 %, 100 µs – 1 ms 2.7 / 10.3 / 15.7 → 2.7 / 6.9 /
   13.4 %, ≥ 1 ms 2.4 / 6.6 / 16.0 → 2.6 / 6.4 / 16.4 % (median / p90 / max vs the v1.17
-  calibration on the same records; no class worse beyond noise), 1024³ N = 14 +14.9 → +6.3 %;
+  calibration on the same records; against a v1.17 refit on the same records ≥ 1 ms median
+  1.6 → 2.6 and < 100 µs p90 9.8 → 12.2: a trade-off), 1024³ N = 14 +14.9 → +6.3 % (in-sample
+  for the cache term: x_s1024 pairs; the held-out cache evidence is the three v_x* pairs);
   SUSTAINED nested LOO on 26 windows t 2.34 → 1.62 %, clock 6.6 → 1.3 %, power max 81 → 10 %.
+  **Review fixes (branch `perf-minor-final`, CPU only):** the power / SUSTAINED clock solve now
+  divides by the request's cache-state time (was COLD time while fitted on REPEAT windows),
+  perf_fit recomputes the boost clock per LOO fold; power keys refit offline (f_ref 2483):
+  nested LOO 1.40 %, clock 0.7 %; BURST and COLD predictions and the hold-out unchanged; doc
+  fixes and open items in NOTES-B2 §12 "Review" / "Remaining".
   Open: reviewer questions (COLD's meaning, `clock_mhz` scale, keep the per-call saving c,
   which costs small REPEAT calls ≈ 1 µs: `v_n18d` −3.5 points), streaming K2 of g < N KL
   calls (+2 … +5 %), pre-packed g < N in the S rule, tiny-shape K4 / KF. GPU: 18.7 min (90 min

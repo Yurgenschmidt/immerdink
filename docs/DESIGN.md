@@ -4051,7 +4051,7 @@ do when present (`warm.pack_l2_planes` changes the S that `warm.pack_l2_bytes` t
 `power.act_w` > 0 makes γ also the exponent of the busy term, and `warm.l2_bytes` now also
 gates the DRAM energy), so an API-7…12-sized struct reads the shipped file as a model that was
 never fitted. Measured with the shipped file (COLD, N = 14): SUSTAINED no longer reaches the
-cap on large calls (4096³: §12 figures in NOTES-B2), and BURST is ≈ −7 % on the 4096² × 512 and
+cap on large calls (4096³ N = 14: 4397 µs at 342 W against NULL's 4614 µs at the 450 W cap), and BURST is ≈ −7 % on the 4096² × 512 and
 3584² × 512 g = 4 shapes (v1.17's S calls them hits). Refusing such a struct was considered
 (`imd_perf_calib_default` / `_parse` failing for a size below v13 when a v1.18 key is set);
 not done because the degraded-view rule of v6 / v7…v10 / v7…v11 callers is the established
@@ -4071,7 +4071,11 @@ features on both sides of L_hit; CLEAN = COLD minus `ω·min(F − I, L_w)` on t
 only, REPEAT = COLD minus `Δ·res + c` exactly when res > 0; BURST with a boost reports f_top
 and the v1.17 BURST time; SUSTAINED ≤ BURST in speed, the capped solve brackets the cap within
 0.05 MHz with P_act > 0 and e_dram > 0, a higher clock never predicts a longer time, P(f)
-monotone in f; a v12-sized struct reads the fields as 0. `host_c_api`: the v13 size and
+monotone in f; a v12-sized struct reads the fields as 0. [v1.18 review] At a fixed clock
+(P − idle)·t is the same in every cache state (the power divides by the state's own time), a
+faster state draws more power, and the SUSTAINED REPEAT / WARM / CLEAN solve brackets the cap;
+the v11 view is exact for a v1.17-style file and is the documented degraded view of the
+shipped one. `host_c_api`: the v13 size and
 offsets, `IMD_PERF_CACHE_CLEAN` accepted, 4 rejected.
 
 ---
@@ -5253,9 +5257,11 @@ and host API; every value the same integer (bit-identical, tested on every contr
   ps/B, c 1.23 µs, ω 0.169 ps/B; PACK S with planes, L_hit 83 MB; busy power e_tc 0.577 pJ/op,
   e_alu 92 pJ/op, P_act 154 W, e_dram 96 pJ/B, γ 2.5, boost 2788 MHz, f_ref 2484 MHz (nested
   leave-one-out 1.62 %, v1.15 form on the same 26 windows 2.34 %; clock 1.3 vs 6.6 %, power max
-  9.9 vs 80.6 %). Hold-out (199 calls) against the v1.17 calibration on the same records:
+  9.9 vs 80.6 %; after the review amendments below: f_ref 2483 MHz, nested 1.40 % vs 2.70 %,
+  clock 0.7 vs 6.6 %, power max 9.8 vs 80.6 %). Hold-out (199 calls) against the v1.17 calibration on the same records:
   < 100 µs 3.9 / 10.8 / 15.8 → 3.7 / 12.2 / 19.0 %, 100 µs – 1 ms 2.7 / 10.3 / 15.7 → 2.7 / 6.9 /
-  13.4 %, ≥ 1 ms 2.4 / 6.6 / 16.0 → 2.6 / 6.4 / 16.4 % (no class worse beyond run-to-run noise;
+  13.4 %, ≥ 1 ms 2.4 / 6.6 / 16.0 → 2.6 / 6.4 / 16.4 % (no class worse beyond run-to-run noise against that calibration; [review] against a v1.17
+  refit on the same records ≥ 1 ms median 1.6 → 2.6 and < 100 µs p90 9.8 → 12.2, a trade-off;
   KF phase 8.9 / 24.4 → 6.6 / 21.1, K3 5.2 / 16.3 → 4.2 / 14.0; 1024³ N = 14 +14.9 → +6.3 %).
   Reviewer questions: COLD's meaning, `clock_mhz` on the NVML scale, and whether to keep c
   (it costs the small REPEAT calls ≈ 1 µs; NOTES-B2 §12 ablations).

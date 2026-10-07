@@ -6,7 +6,7 @@ sm_count = 128
 date = 2026-10-06
 version = immerdink ec44099, host API 13
 clocks = stock, not locked; SM 2265-2805 MHz after calls; max 3120 MHz, 10501 MHz; post-warm-up power 102.47-321.54 W
-notes = fit on 449 calls (506 records) by bench/perf_fit.py; 26 sustained windows, 24 reused (same kernels), NOTES-B2 §12
+notes = 449 calls (506 records), perf_fit.py; 26 sustained windows, 24 reused (same kernels); power refit after review; NOTES-B2 §12
 peak_dram_bytes_per_s = 1.008e+12
 peak_int8_ops_per_s = 6.606e+14
 peak_fp64_flops_per_s = 1.29e+12
@@ -158,17 +158,17 @@ kernel.k5_n20_e2 = 5 48 0 256
 kernel.k5_n20_e4 = 4 64 8704 256
 kernel.k5b_n20 = 4 60 8448 256
 # Clock / power model and cache state (§6c.1).
-power.clock_eff_mhz = 2484
+power.clock_eff_mhz = 2483
 power.clock_min_mhz = 1806.2
 power.cap_w = 450
 power.idle_w = 60
-power.tc_pj = 0.5766728497660569
-power.alu_pj = 91.98906960911793
+power.tc_pj = 0.5760926376635424
+power.alu_pj = 91.89651596860953
 power.byte_pj = 0
 power.gamma = 2.5
-power.act_w = 154.27772292346546
+power.act_w = 154.06045224693173
 power.act_gap_us = 1
-power.dram_pj = 95.93976474161717
+power.dram_pj = 95.93976474212228
 power.clock_boost_mhz = 2787.6099999999997
 warm.l2_bytes = 67947724.8
 warm.l2byte = 0.0012860088714628842
@@ -177,7 +177,8 @@ warm.pack_l2_planes = 1
 warm.call_ns = 1226.3210944741547
 warm.clean_byte = 0.00016884295450836362
 rank.tie_ratio = 1.0587382869536777
-# Prediction bands (§6c.1): p10 p90 of measured / predicted on the hold-out set.
+# Prediction bands (§6c.1): lo hi quantiles of measured / predicted on the hold-out set
+# (bench/perf_validate.py: the narrowest pair with 80 % cross-validated coverage).
 band.call_small = 0.8981213832011781 1.1743438747915778
 band.call_mid = 0.8940476312920513 1.079288436940006
 band.call_large = 0.9237202774143288 1.0943140657579655
