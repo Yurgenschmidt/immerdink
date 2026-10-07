@@ -2,8 +2,9 @@
 
 ## Status
 
-**Final status of the C1/C2 cycle, 2026-10-07** (branch `claude/ozaki-kernels-immerdink-1089fd`,
-not pushed). This block closes the cycle's record. The "Implementation status" below is the
+**Status at the C1/C2 close-out, 2026-10-07: C2 done; C1 open (next: MC-3a, then M-d2)**
+(branch `claude/ozaki-kernels-immerdink-1089fd`, not pushed). This block is the current
+summary; C1's record continues with MC-3a. The "Implementation status" below is the
 detailed log, written as the work went; where they differ, this block is current. Every figure
 here names its source; the libraries are `build/libimmerdink_host.so` sha256 `466acdb4…`
 (host API 13, byte-identical to the design-phase [M] library, IR14) and, for the GPU records,
@@ -25,7 +26,11 @@ the `libimmerdink.so` builds named per item.
   - Met: stages 0 and 1 shipped with their tests and certificates (`host_footprint_monotone`,
     `host_precision`, `cert_footprint_monotone`, `cert_rho_recipe`).
   - Met: the round-2 stage-0 GPU tests pass, at 4ba78b1 (`libimmerdink.so` `c4bdcc4f…`;
-    immerdink-eval `findings/c1-round2-stage0-gpu-tests.md`).
+    immerdink-eval `findings/c1-round2-stage0-gpu-tests.md`). The first-call measurement
+    (IR10), one of §4.11's round-2 stage-0 GPU items, was not repeated there: it was measured
+    at stage 0 (1e6e709, `libimmerdink.so` `b8baa75d…`; `findings/c1-stage0-first-call.md`)
+    and still stands, because no file under `src/` has changed since 1e6e709 (`include/` in
+    comments only).
   - **Not met: M-c has not passed.** It ran on 2026-10-07 and failed one §6c.5 target: the
     < 100 µs median error is 15.8 % against 15 % (16.1 % in a repeat). The Q24 refit was not
     adopted (§5.9 MC-1). The only authorized path to a pass, the MC-3 feature(s) as amended
@@ -40,7 +45,9 @@ the `libimmerdink.so` builds named per item.
   - Met: the ROADMAP C1 row shows the Q6 decision column and "stage 5 deferred (triggers
     T1–T3)" (the latter added at this close-out).
 - Every deferral names its trigger in DESIGN §7 or the ROADMAP: met (stage 4, stage 5, stage 6,
-  the N-range plan, Ozaki-I slices, K-segmentation as a library mode, accurate mode).
+  the N-range plan, Ozaki-I slices, K-segmentation as a library mode, accurate mode, and the
+  `PrecisionPlan` shared-pack role "A=B", whose trigger is in the ROADMAP C1 row since the
+  close-out review).
 - *Checks at the close-out* (2026-10-07; FREE, CPU only, one thread, under memcap; on fec6c42
   plus the close-out's edits, which touch only docs and docstrings; `ninja -n`: nothing to
   rebuild; `libimmerdink_host.so` `466acdb4…`, `libimmerdink.so` `c4bdcc4f…`): `tools/test.sh`'s
@@ -51,14 +58,22 @@ the `libimmerdink.so` builds named per item.
   at 4ba78b1 (the later changes are bench tools, `imd_bench --data decay_opp` among them, and
   two CPU tests).
   Logs: immerdink-eval `results/c1/closeout/` (untracked); summary `findings/c1-closeout.md`.
+- *Close-out review* (approve-with-fixes, 2026-10-07): this block retitled (C1 is open, not
+  closed), IR26's premise corrected (§4.6, "Correction"), the trigger check's scope named, the
+  first-call clause and the `PrecisionPlan` "A=B" item with its trigger added, "C1 is complete
+  without stage 5" reworded. *Re-checked* after a FREE busy check, CPU only, one thread, on
+  1c48022 plus the review edits (docs and the `monotone` docstring): `tools/test.sh`'s
+  `cpu_only` list read verbatim, 18 of 18 pass; library sha256s unchanged. Logs:
+  immerdink-eval `results/c1/closeout/review/` (untracked).
 
 **What shipped.** No ABI, calibration-format or TLA+ change: host API 13. `src/` has not changed
 since the design draft (39972b7), `include/` only in comments.
 - *C1(a), precision phases* (DESIGN §6g.1–§6g.9): a plan and a pack per N; F1–F3, C-ws and
   C-pack published from API 13 on; certificates I1–I3; the re-pack-in-place rule;
   `PackSpec.with_moduli` and `PackedBuffer`. No plan-time preload: the first call at a
-  never-launched N costs at most 9 µs more than a steady one, and a cold capture's first
-  replay is 0.98–1.10× the steady one (1e6e709 build, `libimmerdink.so` `b8baa75d…`;
+  never-launched N takes at most 9 µs more than a steady one end to end (enqueue to
+  completion), with 12–35 µs more host enqueue time, most of it overlapping the GPU; a cold
+  capture's first replay is 0.98–1.10× the steady one (1e6e709 build, `libimmerdink.so` `b8baa75d…`;
   immerdink-eval `findings/c1-stage0-first-call.md`).
 - *C1(b) on the host* (DESIGN §6g.10–§6g.12): `PrecisionPlan` and the rigorous
   `rho_from_output`, and the M-d1 caller guidance, carried into DESIGN §6g.12 at this
@@ -90,9 +105,14 @@ since the design draft (39972b7), `include/` only in comments.
 - *Stage 5 (K5 statistics and the device certificate), deferred (IR26):* no consumer issues
   elementwise targets (ehrenfest D8; ccsd.py issues no accuracy request), and the host-side
   `rho_from_output` gives a rigorous ρ now. Triggers T1–T3 (§4.6). *Trigger check at the
-  close-out* (IR28's "a trigger check only"; read-only, ehrenfest at c7983281): no Python file
-  there imports immerdink, and none issues an accuracy request (its "ELEMENTWISE" matches are
-  elementwise operations, not targets), so T1 and T2 have not fired; T3 has no record.
+  close-out* (IR28's "a trigger check only"; read-only, 2026-10-07). Scope: `~/repos/ehrenfest`
+  (c7983281), `~/repos/ehrenfest-main` (36a76b07) and all 19 worktrees under
+  `~/repos/ehrenfest-ipdps`, the consumer path §4.3 names; repeated by the close-out reviewer
+  over the same scope. No Python file there imports immerdink, and none uses `err_request`,
+  `min_moduli`, `PrecisionPlan` or `rho_from_output` (its "ELEMENTWISE" matches are its tiling
+  code's elementwise operations, not targets); the other mentions of immerdink are notes on
+  the shared GPU and its lock (`docs/formal/device_release/SPEC.md`, scratch notes and a
+  scratch GPU-check script). So T1 and T2 have not fired; T3 has no record.
 - *Also decided:* accurate mode re-rejected (§2.8; its Appendix B trigger is not met, 0 cases);
   the N-range plan and Ozaki-I slices parked with triggers (§3.2, §3.3); K-segmentation and B6
   stay caller recipes (Q15 (a); B6 shows no value at the sizes measured).
@@ -102,8 +122,10 @@ per-phase account first, at most two optional keys, a fresh narrow-KL hold-out c
 before the refit, the pass checks, a fresh M-c run), then M-d2 (§4.3; eight `run` processes
 into one records file and one `judge`). Until M-c passes, figures at N ∉ {8, 10, 14, 16} keep
 the mark [M, model-only, outside hold-out]. Open outside C1: a `PrecisionPlan` member role
-"AB" for a self-contraction reading one shared pack through both roles (trigger B2; M-b
-below).
+"A=B" for a self-contraction reading one shared pack through both roles (M-b below; named
+"AB" before the close-out review, which renamed it because `"AB"` is the pack-mode value for
+two separate packs). Trigger, in the ROADMAP C1 row: the ehrenfest-side integration of the
+B2 performance model declaring DF-factor sharing.
 
 **Revised after two independent reviews, 2026-10-07, then amended by the binding decisions of the
 independent design reviewer, 2026-10-07** (branch `claude/ozaki-kernels-immerdink-1089fd`). The
@@ -397,7 +419,10 @@ what has been built since is recorded under "Implementation status".
     is "A" or "B". The DF-CCSD self-contractions R1, R2, hh and Lld1 need it (equal A and B
     pack keys at every level 6–14). Trigger: B2, the ehrenfest integration declaring DF factor
     sharing. Candidate extension: a member role "AB" (both roles read the group's pack, its
-    cost counted once).
+    cost counted once). *Renamed "A=B" at the close-out review (2026-10-07): `"AB"` already
+    names the pack mode with two separate packs (DESIGN §6g.10). The trigger is the
+    ehrenfest-side integration of the B2 performance model declaring DF-factor sharing (not
+    the ROADMAP B2 row, which is done); it is in the ROADMAP C1 row.*
 - **M-c (§4.3; IR4, Q24) ran, 2026-10-07, and failed: one §6c.5 target was missed** (binding
   verdict, §5.9 MC-2). The Q24 recalibration was tried and **not adopted** (MC-1, upheld), so
   the shipped calibration is unchanged and the [M, model-only, outside hold-out] marks stay;
@@ -691,7 +716,7 @@ order of work and a definition of done. They override the earlier text wherever 
   (§4.2).
 - **IR25** (open item 8): binding run limits for the stage-4/5 TLA+ models (§4.5).
 - **IR26**: stage 5's gate is not met. Stage 5 is formally deferred with triggers T1–T3, and its
-  cost bar is restated without `ncu` (§4.6). C1 is complete without it.
+  cost bar is restated without `ncu` (§4.6). C1's definition of done does not need it.
 - **IR27**: pre-registered gate rules for stages 4 and 6 (§4.5, §4.7).
 - **IR28**: the order of work, as round 1 (CPU) and round 2 (GPU) (§4.11).
 - **IR29**: a definition of done for C1 and C2 (§4.11).
@@ -708,10 +733,14 @@ order of work and a definition of done. They override the earlier text wherever 
   own psi4 script. If psi4 cannot run, the Eric-approved dump is the named fallback.
 - **Stage 5 is formally deferred (IR26).** It has triggers T1–T3, and T3 is Eric asking for the
   device certificate.
-- **At the close-out (2026-10-07): C2 is done, C1 is not** (Status, "Final status"). C1 waits on
-  MC-3a (a performance-model feature and refit, GPU) and then M-d2. MC-3 can close without a
-  calibration change only as MC-3a's recorded outcome or by Eric's explicit decision (§5.10
-  MD2-0).
+- **At the close-out (2026-10-07): C2 is done, C1 is open** (Status, "Status at the C1/C2
+  close-out"). C1 continues with MC-3a (a performance-model feature and refit, GPU) and then
+  M-d2. MC-3 can close without a calibration change only as MC-3a's recorded outcome or by
+  Eric's explicit decision (§5.10 MD2-0).
+- **IR26's premise was wrong (close-out review, 2026-10-07).** GPU performance counters are
+  open to all users on this machine, as HANDOFF and the ROADMAP say, not admin-only. The
+  no-`ncu` cost bar for stage 5 stands on other grounds (§4.6, "Correction"). Nothing on the
+  machine was changed.
 
 **Decision summary.** §3 gives the reasons, §4 the stages.
 
@@ -904,7 +933,9 @@ order of work and a definition of done. They override the earlier text wherever 
   - *Fixed-point iterations and DIIS.* The forcing-rule ramps match fixed N = 14: the same
     iterations, and the final residual within 2×. With DIIS, reset the history at each
     precision switch. That costs no iteration and improves the final residual, 1.5e−16
-    against 2.1e−15.
+    against 2.1e−15. The gain comes from restarting a DIIS that stalls: plain DIIS stalls at
+    2.1e−15 with or without switches (fixed N = 14 also ends at 2.09e−15), so the stall is not
+    the switch's (close-out review, 2026-10-07).
   - *Subspace methods (block Davidson).* At each N switch, collapse the subspace to the Ritz
     block and recompute its σ = HV. Otherwise the old low-N products stay in the subspace and
     the ramp stalls. Even with the recompute, the ramp took 16 iterations against 11 at fixed
@@ -3001,7 +3032,19 @@ and that must not change. The bar is restated as compiler resource usage (`-Xptx
 `cuobjdump --dump-resource-usage`), occupancy from
 `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, and A/B timing.
 
-**C1 is complete without stage 5.** C1(b), auto-N from the M5 elementwise rule, is delivered
+*Correction (close-out review, 2026-10-07; the binding text above is kept as written).* The
+premise is wrong: GPU performance counters are open to all users on this machine, as HANDOFF
+("Machine notes") and the ROADMAP say. Checked read-only: `RmProfilingAdminOnly: 0` in
+`/proc/driver/nvidia/params`, and `/etc/modprobe.d/nvidia-profiling.conf` sets
+`NVreg_RestrictProfilingToAdminUsers=0`. The no-`ncu` cost bar still stands, for other
+reasons: `ncu`'s default `--clock-control base` locks the GPU clocks, which the project rules
+forbid, and its kernel replay serializes kernels and holds the GPU that ehrenfest's
+timing-sensitive tests share. So the bar stays compiler resource usage, the occupancy query
+and A/B timing at stock clocks under the GPU lock. Nothing on the machine changes, and nothing
+needs sudo. The other places that state the premise (the stage-5 tests below, Q20's IR26
+amendment, Appendix A item 52) point here.
+
+**C1's definition of done does not need stage 5.** C1(b), auto-N from the M5 elementwise rule, is delivered
 host-side by stage 1: `min_moduli`/rank, `PrecisionPlan`, and the rigorous `rho_from_output`
 helper, whose per-output ρ̂ also yields an a-posteriori bound for that call.
 
@@ -3159,6 +3202,8 @@ zero_exempt=False) -> float`, whose result goes into an ordinary
   - The cost bar (A/B timing), with the register count from the compiler and the occupancy from
     `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, for `stats` NULL in every variant and at
     every N. No `ncu`: GPU performance counters are admin-only on this machine (IR26).
+    *Corrected 2026-10-07: the counters are open to all users; no `ncu` still holds, because
+    of its clock locking and kernel replay on the shared GPU (§4.6, "Correction").*
 - `host_accuracy`:
   - `imd_stats_cond` equals a brute force, with and without ZERO_EXEMPT; NOT_SUPPORTED when
     nothing is certified;
@@ -3451,8 +3496,9 @@ never as open.
   - the ROADMAP C2 row is retitled per Q7.
 - Every deferral names its trigger in DESIGN §7 or the ROADMAP.
 
-*Checked at the close-out, 2026-10-07* (Status, "Final status of the C1/C2 cycle"): **C2 is
-done**; **C1 is not**, since M-c has not passed (it failed, and MC-3a has not started) and M-d2
+*Checked at the close-out, 2026-10-07* (Status, "Status at the C1/C2 close-out"): **C2 is
+done**; **C1 is not, and stays open** (it is neither closed nor deferred; its record continues
+with MC-3a), since M-c has not passed (it failed, and MC-3a has not started) and M-d2
 has not run. Every other condition of both, and the trigger rule, is met.
 
 ---
@@ -3807,7 +3853,9 @@ costs no time, but it can still raise register allocation, and K5 runs at 82–9
 **Amended (IR26).** Not with `ncu`, since GPU counters are admin-only on this machine. Registers
 come from `-Xptxas -v` / `cuobjdump --dump-resource-usage`, occupancy from
 `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, and time from A/B runs. This applies only if a
-trigger revives stage 5.
+trigger revives stage 5. *Corrected 2026-10-07: GPU counters are open to all users on this
+machine; the amendment stands for other reasons, `ncu`'s clock locking and its kernel replay
+on the shared GPU (§4.6, "Correction").*
 
 **Q21. Do zero-z outputs count as misses in cond-from-stats?**
 (a) Yes, by default, with an exemption flag;
@@ -4099,9 +4147,10 @@ its cost figures are estimates.
 
 **Gates, order and completion.**
 - **IR26. The stage-5 gate is not met.** Stage 5 is formally deferred with triggers T1–T3, and
-  its cost bar is restated without `ncu` (§4.6). C1 is complete without stage 5. The evidence is
-  read-only: ehrenfest makes precision user-directed and issues no accuracy requests, and its
-  Ozaki work is frozen.
+  its cost bar is restated without `ncu` (§4.6). C1's definition of done does not need stage 5.
+  The evidence is read-only: ehrenfest makes precision user-directed and issues no accuracy
+  requests, and its Ozaki work is frozen. *(Its "admin-only counters" premise was wrong; the
+  no-`ncu` bar stands on other grounds: §4.6, "Correction", 2026-10-07.)*
 - **IR27. Pre-registered gate rules for stages 4 and 6** (§4.5, §4.7), applied mechanically in
   the next round. Writing them down before M-a reports prevents post-hoc gate choices.
 - **IR28. Order of work** (§4.11): round 1 (CPU) and round 2 (GPU), following the dependencies.
@@ -5364,7 +5413,9 @@ version of these notes:**
 51. **§4.5's "every partner of a pre-scaled packed operand must carry the same w"** gave no rule
     for choosing that w across several partners (IR6).
 52. **The stage-5 cost bar named `ncu`**, but GPU performance counters are admin-only on this
-    machine (IR26).
+    machine (IR26). *Corrected 2026-10-07: that premise is wrong (the counters are open to all
+    users); the correction to the bar stands, because `ncu` locks clocks by default and its
+    replay holds the shared GPU (§4.6, "Correction").*
 53. **The stage-0 GPU tests** assumed a phase's first launch could happen inside a capture
     without any check. K5<N> gets no plan-time attribute call, so lazy module loading may land
     there (IR10).

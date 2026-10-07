@@ -89,10 +89,11 @@ BUDGET status, share groups ranked jointly, an optional DIRECT level), and `rho_
 gives the rigorous ρ of an ELEMENTWISE target from a previous output (`cert_rho_recipe`). Its
 stage 3 (NOTES-C1 §4.4, C2) adds the K-segmentation caller recipe to §3.8 with its error bound
 (PROOFS L7, `cert_kseg_composition`, `oracle.contract_segments`) and rewrites the §7 rows that
-the C1/C2 study decided. That study's CPU evidence (NOTES-C1 §4.3) decided the gates: caller-side
-K-equilibration (stage 4) is closed and library-internal weights (stage 6) deferred, device
-statistics (stage 5) are deferred, each with its trigger in §7, and the convergence study's
-caller guidance is in §6g.12. The performance model's small-N hold-out (M-c) failed, so levels
+the C1/C2 study decided. That study's CPU evidence (NOTES-C1 §4.3) decided the stage-4 and
+stage-6 gates: caller-side K-equilibration (stage 4) is closed and library-internal weights
+(stage 6) deferred. Device statistics (stage 5) were deferred earlier, on read-only consumer
+evidence (NOTES-C1 IR26). Each has its trigger in §7, and the convergence study's caller
+guidance is in §6g.12. The performance model's small-N hold-out (M-c) failed, so levels
 outside N ∈ {8, 10, 14, 16} stay [M, model-only, outside hold-out] (§6g.9), and the GPU timing
 of the schedules (M-d2) has not run. No semantic, layout, launch, pack-format, API,
 calibration-format or TLA+ change; changed text is marked **[v1.19]**.
@@ -5148,6 +5149,13 @@ it.
   - NOTES-C1's M-b re-ran these [M] figures on this worktree's library (host API 13): every
     design-phase record reproduces byte for byte, and `PrecisionPlan`'s own choices give the
     same schedule ratios (immerdink-eval `findings/c1-m-b.md`).
+- `PrecisionPlan` (§6g.10) cannot express a self-contraction that reads one share group's
+  single pack through both roles: a role is `"A"` or `"B"`, and a member listed twice is
+  rejected. The DF-CCSD self-contractions R1, R2, hh and Lld1 need it (equal A and B pack
+  keys at every level 6–14; NOTES-C1 M-b). The candidate extension is a member role `"A=B"`
+  (both roles read the group's pack, its cost counted once; not the pack mode `"AB"`, which
+  means two separate packs). **Trigger** (ROADMAP C1): the ehrenfest-side integration of the
+  B2 performance model declaring DF-factor sharing.
 
 ### 6g.10 Choosing N per phase: `PrecisionPlan` (stage 1) **[test: host_precision]**
 
@@ -5495,7 +5503,10 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
     to 1e−7 and 1e−10, the final residual within 2× (ratio 0.07–1.00), for η ∈ {0.1, 0.01},
     BOUND and TYPICAL. This is §4.3's success criterion, met on every system.
   - *DIIS:* reset the DIIS history at each precision switch. It costs no iteration and
-    lowers the final residual (1.5e−16 against 2.1e−15 without the reset).
+    lowers the final residual (1.5e−16 against 2.1e−15 without the reset). The lower
+    residual comes from restarting a DIIS that stalls: plain DIIS stalls at 2.1e−15 with or
+    without precision switches (fixed N = 14, with no switch, also ends at 2.09e−15), so the
+    stall is not caused by the switch.
   - *Subspace methods (block Davidson):* at each N switch, collapse the subspace to the Ritz
     block and recompute its σ = HV at the new N; otherwise the low-N products stay in the
     subspace and the ramp stalls (4.1e−8 attainable). Even with the recompute the ramp needs
@@ -6453,6 +6464,11 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     `PrecisionPlan` docstring and `bench/accuracy/schedule.py` point to it.
   - §7: the K-equilibration row states stage 4's revival trigger in full and stage 6's
     trigger; the K5-statistics row states stage 5's cost bar without `ncu` (IR26).
+  - Close-out review (approve-with-fixes, 2026-10-07): §6g.9 states `PrecisionPlan`'s
+    shared-pack limit, the candidate member role `"A=B"` and its trigger; §6g.12's DIIS
+    bullet says plain DIIS stalls with or without switches; the header says stage 5 was
+    deferred by IR26, not by the CPU study. IR26's "counters are admin-only" premise was
+    wrong, and the no-`ncu` bar stands for other reasons (NOTES-C1 §4.6, "Correction").
   - The definition of done (NOTES-C1 §4.11): **C2 is done** (M-a published; stage 3 shipped
     with L3c and L7 in Lean; stage 4 closed and stage 6 deferred, each with its trigger;
     ROADMAP C2 retitled). **C1 is not:** stages 0 and 1, the round-2 stage-0 GPU tests and

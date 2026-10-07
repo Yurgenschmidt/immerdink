@@ -135,9 +135,9 @@ first.
   sweep wall time, mostly gate waits for other GPU users).
 - **Adaptive precision C1 / C2 (2026-10-07, branch `claude/ozaki-kernels-immerdink-1089fd`,
   not pushed; DESIGN v1.19 §6g and §3.8, host API 13, no ABI, calibration-format or TLA+
-  change):** the design and the final state of the cycle are docs/NOTES-C1.md (read its Status,
-  "Final status of the C1/C2 cycle", first). **C2 is done** by its definition of done (NOTES-C1
-  §4.11); **C1 is not**: M-c failed and M-d2 has not run.
+  change):** the design and the current state are docs/NOTES-C1.md (read its Status, "Status
+  at the C1/C2 close-out", first). **C2 is done** by its definition of done (NOTES-C1 §4.11);
+  **C1 is open**: M-c failed and M-d2 has not run, and its record continues with MC-3a.
   - Shipped: stage 0, precision phases (a plan and a pack per N, published footprint
     monotonicity F1–F3, the re-pack rule, `PackedBuffer`); stage 1,
     `immerdink.precision.PrecisionPlan` and `rho_from_output`; stage 3, the K-segmentation
@@ -160,12 +160,14 @@ first.
     driver `bench/accuracy/md2_time.py` are pre-registered at 35eeb46 (NOTES-C1 §4.3, §5.10;
     one normative records file, the driver frozen from the first M-d2 record on). MC-3 closes
     without a calibration change only as MC-3a's recorded outcome or by Eric's decision.
-  - Open outside C1: a `PrecisionPlan` member role "AB" (one shared pack read through both
-    roles), trigger B2.
+  - Open outside C1: a `PrecisionPlan` member role "A=B" (one shared pack read through both
+    roles; named "AB" before the close-out review), trigger the ehrenfest-side integration of
+    the B2 performance model declaring DF-factor sharing (ROADMAP C1).
   - Close-out checks (2026-10-07, CPU only): `tools/test.sh`'s 18 CPU-only ctest tests,
     `spec/params.py --check` 33 of 33 and `spec/test_oracle.py` pass (immerdink-eval
     `findings/c1-closeout.md`); the GPU suite last ran at 4ba78b1 (56 of 56; no `src/` or
-    `include/` change since).
+    `include/` change since). The close-out review's fixes (docs and one docstring) re-ran the
+    18 CPU-only tests: pass.
   - Evaluation records and summaries are in immerdink-eval `results/c1/` and
     `findings/c1-*.md`.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,

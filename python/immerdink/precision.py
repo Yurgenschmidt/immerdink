@@ -281,7 +281,7 @@ class PrecisionPlan:
         iterations, so a ramp may not pay there); for Krylov methods (CG), start tight and
         relax (monotone=False): a ramp that starts low stalls, and a tolerance tol/||r_k||
         leaves a residual gap unless scaled by the expected iteration count, e.g.
-        tol/(m_max ||r_k||).
+        tol/(m_max ||r_k||) (inexact-Krylov theory; the scaled rule is not measured in M-d1).
     perf: {"regime", "cache", "clock_mhz"}: rank / predict_pack request fields (default: the
         library's DEFAULT regime, COLD).
     Thread-safe; phase() calls are serialized (they update the monotone floor)."""
