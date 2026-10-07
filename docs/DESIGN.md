@@ -5113,6 +5113,15 @@ it.
     computed from M-c's single-call medians, is 0.003–0.023 above its [M] ratio on 2000³,
     4096³, DF, QZ and the PPL view, and 0.005–0.028 below on 1024³ and skinny. On the Jacobi
     view it is 0.044–0.047 above (0.830 against 0.786).
+  - **M-d2 has not run** (2026-10-07). It waits for the MC-3 path (NOTES-C1 §5.9 "M-d2
+    ordering", binding).
+    - Its protocol and driver are pre-registered: `bench/accuracy/md2_time.py`, 3254b15;
+      NOTES-C1 §4.3, with the protocol decisions in §5.10, not yet reviewed.
+    - On the shipped calibration, its `predict` reproduces the bars: 0.750 (the PPL view),
+      0.664 (DF) and 0.673 (4096³), with bands of ± 15 % capped at 0.8.
+    - [M] (NOTES-C1 §5.10 MD2-4): with the PPL view's invariant B packed per phase, the
+      schedule is predicted at 0.876 of fixed N = 14 packed, against 0.750 in-line. The
+      re-packs of the 680 MB operand compete with packed calls of 0.67–1.59 ms.
   - NOTES-C1's M-b re-ran these [M] figures on this worktree's library (host API 13): every
     design-phase record reproduces byte for byte, and `PrecisionPlan`'s own choices give the
     same schedule ratios (immerdink-eval `findings/c1-m-b.md`).
@@ -6316,3 +6325,12 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     more than 1 point; a fresh narrow-KL hold-out, committed before the refit, meets every
     class target). The v1.18 hold-out is judged on all its cases and on the 69 whose GEMM
     view matches no fit case.
+- **M-d2, pre-registered and not run** (NOTES-C1 §4.3, §5.10; 2026-10-07; no library,
+  calibration or ABI change). `bench/accuracy/md2_time.py` (3254b15) has three modes:
+  - `predict` (CPU) checks that the shipped calibration reproduces the registered bars;
+  - `run` (GPU) times the 16-call schedules end to end, in-line (gated) and with the
+    invariant operand re-packed per phase (reported). It refuses the M-d2 systems until
+    the ordering of §5.9 is met;
+  - `judge` (CPU) applies the bands.
+
+  A smoke on two non-M-d2 shapes checked the tooling.

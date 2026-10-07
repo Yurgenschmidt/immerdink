@@ -423,6 +423,37 @@ what has been built since is recorded under "Implementation status".
     fit case). Also applied: the exact n1 change list, which overlaps share N with a fit
     sample (4 of 7), the anchors' baseline next to "16–21 points", and the run-to-run
     figure of the Jacobi error.
+- **M-d2 (§4.3) has not run: the binding ordering holds** (§5.9 "M-d2 ordering": M-d2 waits
+  until the MC-3 path closes, and MC-3 has not started). A workflow task of 2026-10-07 asked
+  for M-d2; no M-d2 system was run on the GPU. Instead, before any M-d2 measurement:
+  - *Protocol and driver pre-registered* at 3254b15: `bench/accuracy/md2_time.py`, whose
+    docstring is the protocol (§4.3 "M-d2", "Pre-registered protocol"). It has three modes:
+    `predict` (CPU), `run` (GPU, one fresh process per system and data set) and `judge`
+    (CPU).
+    - `run` refuses the four M-d2 systems unless `--md2-cleared` names why the ordering is
+      met.
+    - `judge` refuses records made under any calibration other than the registered one
+      (IR23).
+    - The implementer's protocol decisions are §5.10 MD2-0 to MD2-7, not yet reviewed.
+  - *The bars reproduce* from the shipped calibration (`d31f62ca…`; `predict` at 3254b15 on
+    `libimmerdink_host.so` `466acdb4…`; CPU, one thread, under memcap, FREE):
+    - S14/F14 = 0.7501 (PPL view), 0.6635 (DF) and 0.6728 (4096³), i.e. the registered
+      0.750 / 0.664 / 0.673. Rank's choice and g = N agree, and `PrecisionPlan` picks
+      g = N at every level. The Jacobi view gives 0.7865.
+    - Bands: [0.6375, 0.8000], [0.5644, 0.7636] and [0.5721, 0.7740]; the Jacobi view's
+      [0.550, 1.022] is reported only.
+  - *Tooling check only, not M-d2 evidence:* the driver ran on two shapes that are not M-d2
+    systems: 512³ with A invariant, and a PPL-like 100 × 576 × 576 with B invariant. Both
+    data sets, 5 reps, under the GPU lock, about 1.4 min of wall time in all.
+    - Packed and in-line agree bit for bit at every level, and every run was queued ahead.
+    - Worst spreads 0.45–3.1 %.
+    - Records: immerdink-eval `results/c1/m_d2/` (untracked); summary
+      `findings/c1-m-d2.md`.
+  - *[M] observation for the reviewer* (§5.10 MD2-4). On the PPL view the bar is the
+    in-line ratio. A caller who packs the invariant B (680 MB) per phase is predicted at
+    P14/PF14 = 0.876, above the 0.8 cap: the four packs cost 1.72–2.41 ms each, against
+    packed calls of 0.67–1.59 ms. That caller is still 2.6× faster in absolute terms than
+    in-line (P14/F14 = 0.382). DF and 4096³ change little packed (0.667, 0.678).
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -2075,6 +2106,39 @@ under 100 µs (10–13 %).
     prediction band, i.e. its predicted ratio, stated next to the bar, ± the §6c.5 p90 error of
     its call class; and it is ≤ 0.8 on the PPL view, DF and 4096³. The gain against a fixed
     N = 8–9 is reported even if small.
+  - **Pre-registered protocol** (2026-10-07, before any M-d2 measurement; the driver
+    `bench/accuracy/md2_time.py` at 3254b15, whose docstring is normative; the decisions
+    are §5.10, not yet reviewed). Not run: it waits for the MC-3 path (Status "M-d2").
+    - *Configuration:* `PrecisionPlan.configs()` over the levels 6, 8, 9, 10, 14, in-line,
+      GENERATE, RN: M-b's view, which gives g = N at every level here. The invariant
+      operand is B (the integrals) for the PPL view and DF, and A for 4096³ and for the
+      Jacobi view's W.
+    - *Runs*, 16 calls each, back to back on one stream through `Plan.contract_ptr`:
+      - S14 = 5×N6 + 4×N8 + 4×N10 + 3×N14 and F14 = 16×N14: the gated pair;
+      - S9 = 6×N6 + 10×N9, F9 and F8: reported (the gain against fixed N = 8–9);
+      - P14, S14 with the invariant operand packed into one buffer before each phase (the
+        initial pack and the three re-packs), and PF14, one pack at 14 and then 16 packed
+        calls: reported (re-pack times against `imd_perf_predict_pack`).
+
+      Before timing, packed and in-line results are checked bit for bit at every level.
+    - *Timing:* GPU events, after a 1 GiB memset primer so that the host enqueues each run
+      ahead of the GPU (`queued_ahead`).
+      - One fresh process per system and data set, under `tools/run_quiet.sh`: the quiet
+        gate, the GPU lock and memcap, FREE only, stock clocks (§6c.5's regime, as in M-c).
+      - A 3 s warm-up of the system's own N = 14 call, then every level once.
+      - 15 reps in rotated order. If the S14 or F14 spread exceeds 5 %, a second attempt
+        runs and the attempt with the smaller worst spread is kept.
+    - *Data:* normal ((u − ½)·exp(0.5 g)) and decay_opp (`c2_fixtures`). Both are gated.
+    - *Statistic:* r = the median of the S14 run totals / the median of the F14 run totals.
+      It must lie inside bar × (1 ∓ p90) and be ≤ 0.8. Every level of the three gated
+      systems is predicted ≥ 1 ms, so p90 = 15 %; a system whose levels span classes takes
+      the largest p90 among them (the Jacobi view: 30 %).
+      - The bands are [0.6375, 0.8000] (PPL view), [0.5644, 0.7636] (DF) and
+        [0.5721, 0.7740] (4096³); the Jacobi view's [0.550, 1.022] is reported only.
+      - A system passes when both data sets are inside; M-d2 passes when all three
+        systems pass.
+    - *Budget:* about 3 min of GPU in all for 8 processes, each well under 1 min per lock
+      hold, with a busy check before each chunk (≤ 5 min).
 
 **GPU rules.** Run under `_wip/gpu.lock` (the tools take it), behind the quiet gate, under
 memcap, and only when the ehrenfest busy check says FREE (silent mode otherwise). Report
@@ -3106,6 +3170,8 @@ dependencies:
   narrow-KL hold-out, and the per-phase conditions); then M-b's [M] figures and M-d2's bars
   re-derived if the calibration changes. Still strictly before M-d2.
 - M-d2 against its pre-registered bands, after the MC-3 path closes (§5.9 "M-d2 ordering").
+  *Its protocol and driver are pre-registered (3254b15, §4.3, §5.10), and it has not run.*
+  Once the ordering is met, it is eight `md2_time.py run` processes and one `judge`.
 - Then the mechanical gate decisions: stage 4 by its pre-registered rule (§4.5); stage 5
   deferred (a trigger check only, §4.6); stage 6 by its rule (§4.7).
 
@@ -4654,6 +4720,57 @@ of this section; they are binding.
     version said "within 1 point"); the
     `sweep_disjoint_selftest` comment in `tests/CMakeLists.txt` now names the Q24 checks;
     the KF observation (MC-3a above).
+
+### 5.10 M-d2: the protocol's design questions (implementer, 2026-10-07; not yet reviewed)
+
+Evidence: Status "M-d2"; §4.3 "Pre-registered protocol"; `bench/accuracy/md2_time.py`
+(3254b15); immerdink-eval `findings/c1-m-d2.md`. Each question was decided conservatively.
+None has an independent reviewer's verdict yet. They are to be put to the reviewer before
+M-d2 runs, and the verdicts recorded here.
+- **MD2-0. A request to run M-d2 while MC-3 is open.** A workflow task of 2026-10-07 asked
+  for M-d2 on the shipped calibration. *Decision:* not run. The §5.9 "M-d2 ordering"
+  verdict is binding, and running first would create the out-of-order evidence and the two
+  M-d2 results it rules out. The tooling is pre-registered instead, and `run` encodes the
+  ordering (`--md2-cleared`). *For the reviewer or Eric:* either pursue MC-3 (MC-3a) first,
+  or close it without a calibration change; M-d2 then runs on the bars unchanged.
+- **MD2-1. What is timed.** *Decision:* end-to-end 16-call runs, back to back on one stream
+  through the device API. The gated statistic is the ratio of the median run totals. It is
+  not composed from per-N single-call medians: M-c's indicative §6g.9 figures did that, and
+  the verdict excludes them from M-d2. The phase switches (another plan; the first call at
+  a new N) are inside the runs. The paired per-rep ratios are reported.
+- **MD2-2. The band.** *Decision:* relative, bar × (1 ∓ p90), not bar ∓ p90 in absolute
+  ratio units. That is narrower (± 0.11 rather than ± 0.15 on the PPL view), and p90 is a
+  relative error. The class comes from the predicted (DEFAULT/COLD) calls; if a system's
+  levels span classes, it takes the largest p90 among them. The cap ≤ 0.8 applies to the
+  gated three.
+- **MD2-3. Data.** *Decision:* both normal and decay_opp are gated, and a system passes only
+  when both are inside. This is stricter than either alone. decay_opp is
+  `c2_fixtures.synthetic` on the GEMM view, with K in the spec's mode order.
+- **MD2-4. In-line bars against packed use.** The registered bars are in-line ratios, the
+  configuration of the [M] figures. The re-pack runs (P14 / PF14) are reported, not gated.
+  *Observation [M]:* on the PPL view a caller who packs the invariant B per phase is
+  predicted at P14/PF14 = 0.876, above the 0.8 cap, though 2.6× faster in absolute terms
+  than in-line (P14/F14 = 0.382). The four packs of the 680 MB B (1.72–2.41 ms each)
+  compete with packed calls of 0.67–1.59 ms. DF (0.667) and 4096³ (0.678) change little.
+  *Decision:* the binding bars stand. *For the reviewer:* whether §2.4's PPL statement or
+  the guidance for callers should say that the in-line gain (1.33×) overstates a
+  packed-B caller's (1.14× [M]).
+- **MD2-5. "The gain against a fixed N = 8–9".** *Decision:* read as §2.4's schedule ending
+  at N = 9, S9 = 6×N6 + 10×N9 against F9, plus the per-call t14/t8 and t14/t9 from F8 and
+  F9. All reported.
+- **MD2-6. Method details.** *Decision:*
+  - a 3 s warm-up of the system's own N = 14 call (warm_run.sh's 3 s, on the system itself
+    rather than 4096³), then every level once, so no first call is timed;
+  - a 1 GiB memset primer before each run, so that the host enqueues the run ahead of the
+    GPU. Its cost is that each run's first call starts with a flushed L2, which is
+    immaterial for ≥ 1 ms calls;
+  - 15 reps in rotated order;
+  - warm_run.sh's 5 % spread rule with M-c's 2 attempts;
+  - the raw entry points `contract_ptr` / `pack_ptr` in the timed loop, with the checked
+    calls (`contract`, `Pack.pack` into a `PackedBuffer`) in the bit-exact check.
+- **MD2-7. Configuration.** *Decision:* `PrecisionPlan.configs()` with GENERATE only and
+  in-line, the bars' configuration (M-b's view). It picks g = N at every level on all four
+  systems (`predict`).
 
 ---
 

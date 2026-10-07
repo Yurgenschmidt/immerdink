@@ -151,7 +151,9 @@ first.
   as MC-3a (NOTES-C1 §5.9 MC-3, MC-3a, MC-6: DESIGN §6c text from a per-phase account
   first, at most two optional keys fitted against the phase marks, a fresh narrow-KL
   hold-out committed before the refit, the v1.18 hold-out judged with and without its 7
-  view overlaps, and a fresh 160-call M-c run); then M-d2 (GPU), which waits for it; and
+  view overlaps, and a fresh 160-call M-c run); then M-d2 (GPU), which waits for it (its
+  protocol and driver `bench/accuracy/md2_time.py` are pre-registered, NOTES-C1 §4.3,
+  §5.10; not run); and
   the M-d1 caller guidance into DESIGN §6g.12.
   Evaluation records and summaries are in
   immerdink-eval `results/c1/` and `findings/c1-*.md`.
