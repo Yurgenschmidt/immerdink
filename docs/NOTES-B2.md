@@ -1569,3 +1569,19 @@ c, the small COLD calls ≈ 1.0–1.2 µs faster. The v12-sized struct view (fig
 - [review] A v7…v12-sized caller struct reads the shipped file as a never-fitted model (a
   stated exception, DESIGN §6c.2 / §6c.8 "Host API 13"); an adapter like `fold_byte_f` is
   possible if a caller ever needs it (none known: ehrenfest passes NULL).
+- [C1 M-c, 2026-10-07] **The REPEAT saving is wrong for KL-path calls with a narrow n whose
+  inputs fit the REPEAT window.** Source: NOTES-C1 Status "M-c"; immerdink-eval
+  `findings/c1-m-c.md`, `results/c1/m_c/cold_check.md`.
+  - The Jacobi view (`abcd,cdij->abij`, 1600 × 100 × 1600) is predicted 26–29 % too fast at
+    every N ≤ 10, the anchors included.
+  - So are 1408 × 96 × 1408, a 1296 × 144 × 1296 tensor and 1792 × 128 × 1280 (−12 to −35 %).
+  - The in-sample `c_skin1280` (−20.4 / −10.6 %) and `c_k3hit` (−10.8 / −6.4 %) have the same
+    signature.
+  - The rule credits all 15–22 MB of inputs as resident. The measured REPEAT time matches the
+    COLD prediction (−10 to +12 %), while KF calls (1024³, 1280² × 960) do get the saving.
+  - No setting of `warm.l2_bytes` / `warm.l2byte` fixes it without losing the KF saving. A
+    refit with N-specific cases of this class (`bench/sweep_calib_n.txt`) absorbs it into
+    `kl.wave` (2.16 → 4.45 µs), which raises the 100 × 9216 × 9216 view by about 10 points.
+    It was not adopted.
+  - Candidate fix (a feature, not a refit): count the KL pack planes written between two calls
+    in the REPEAT footprint, as `warm.pack_l2_planes` does for PACK, under an optional key.

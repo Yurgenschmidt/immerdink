@@ -191,7 +191,7 @@ what has been built since is recorded under "Implementation status".
       after an output passed near zero). The report-only cases became caller guidance (§1.3).
   - **Not run in stage 2:** M-b (the [M] re-runs of IR9 and the share-group raise cost of
     IR15; CPU, round 1), and M-c and M-d2 (GPU, round 2). Stage 3 could start once the M-a
-    summary was published (§4.11). Stage 3 and M-b have since run (below); M-c and M-d2 have
+    summary was published (§4.11). Stage 3, M-b and M-c have since run (below); M-d2 has
     not.
   - **Open:** the M-d1 caller guidance (§1.3: the DIIS reset, Davidson's recompute and its +5
     iterations, CG's relaxation scaled by the iteration count) lives only here. It is to be
@@ -295,6 +295,61 @@ what has been built since is recorded under "Implementation status".
     pack keys at every level 6–14). Trigger: B2, the ehrenfest integration declaring DF factor
     sharing. Candidate extension: a member role "AB" (both roles read the group's pack, its
     cost counted once).
+- **M-c (§4.3; IR4, Q24) ran, 2026-10-07: one §6c.5 target missed.** The Q24 recalibration
+  was tried and **not adopted**, so the shipped calibration is unchanged and the [M,
+  model-only, outside hold-out] marks stay. C1's done condition on M-c is not met, and M-d2
+  (strictly after M-c) stays gated.
+  - *Sources:* summary immerdink-eval `findings/c1-m-c.md`; scripts `scripts/c1/m_c_*`;
+    records `results/c1/m_c/` (untracked, sha256 in the summary).
+  - *What ran:* 160 timed calls: 8 shapes × N ∈ {4, 5, 6, 7, 9, 10, 12, 13} plus the
+    anchors 8 and 14 × normal and decay_opp data (`bench/sweep_mc.txt`, 530ff81).
+    - The shapes and specs are those of the cited [M] figures (squares `ik,kj->ij`; 2000³ in
+      place of 2048³, which `bench/sweep_disjoint.py` finds in the calibration set as
+      `c_sq2048`).
+    - `imd_bench --data decay_opp` is new: `c2_fixtures.py`'s decay_opp generated on the
+      device.
+    - The run used DESIGN §6c.5's method unchanged: `bench/run_sweep.sh` (quiet gate, GPU
+      lock per case, 3 s warm-up), stock clocks with no lock, and `perf_validate.evaluate`
+      (BURST, REPEAT, shipped calibration).
+    - 4 chunks, each after a FREE busy check; 2.9 min of GPU time. The profiling build's
+      `libimmerdink_host.so` is `466acdb4…`, and no kernel source has changed since the
+      calibration's ec44099.
+  - *Result* (median / p90 / max |error| of the total):
+    - < 100 µs: **15.8 / 28.4 / 29.2 %, median missed** (target 15 / 30 %); a repeat of the
+      small calls gives 16.1 %.
+    - 100 µs – 1 ms: 2.5 / 14.7 / 28.3 %; ≥ 1 ms: 3.0 / 7.3 / 9.8 %. Both met over all
+      calls.
+    - Per N (reported, not judged): the ≥ 1 ms median is 1.8–5.4 % (5.4 % at N = 9, 5.0 % at
+      N = 5) and the p90 at most 9.6 %. The mid class exceeds its targets only at N = 10, and
+      only through the two Jacobi calls just above 100 µs.
+    - TFLOPS-eq measured / predicted: for example 4096³ at N = 6 is 62.3 / 62.5 (2.205 ms), DF
+      at N = 6 is 55.8 / 58.0 (1.223 ms), and the PPL view at N = 6 is 7.26 / 7.10 (2.340 ms).
+  - *Residual: a shape, not N.* The Jacobi view (1600 × 100 × 1600) is predicted 26–29 % too
+    fast at every N ≤ 10, the anchor N = 8 included, on both data sets.
+    - The REPEAT rule (§6c.1 "Cache state") credits its 21.8 MB of inputs as L2-resident. The
+      measured times match the COLD prediction (−1.5 to +10 %).
+    - The same holds for three Q24 cases of the class (KL path, narrow n) and for the
+      in-sample `c_skin1280` (−20 %). KF calls do get the saving.
+    - The < 100 µs class is 14 sq1024 calls (1.1–18.2 %) and 12 Jacobi calls (26–29 %), so its
+      median falls between the two groups.
+  - *N itself:*
+    - N = 9–13 track the anchors (median difference −0.3 to +1.1 points).
+    - N = 4–7 are mildly optimistic: 2–4 points faster than at the anchors (median over 16
+      series), at most 20.6 (sq1024 KF, N = 4).
+    - decay_opp is up to 5.8 % faster than normal data at N = 4 on the large shapes ([KT26]),
+      within the targets.
+    - Indicative §2.4 ratios from these medians (not M-d2): schedule against fixed N = 14
+      measured 0.684–0.767 on the large shapes against [M] 0.664–0.793; Jacobi 0.830 against
+      0.786.
+  - *Q24:* 43 N-specific calibration calls on 7 shapes disjoint from M-c and the hold-out
+    (`bench/sweep_calib_n.txt`, 78bc523; 0.5 min of GPU).
+    - A refit on the shipped fit's records plus these (`n1`; the baseline refit reproduces the
+      shipped parameters) meets M-c narrowly (< 100 µs median 14.7 %) and keeps the product
+      hold-out.
+    - It is not adopted (§5.9 MC-1). It misses on the repeat run (15.0 %). It absorbs the
+      cache-state error into `kl.wave` (2.16 → 4.45 µs), which moves the PPL view from
+      +2 … +10 % to +11 … +20 % and M-c's ≥ 1 ms p90 from 7.3 to 14.0 %.
+    - The fix is a model feature beyond Q24 (§5.9 MC-3; NOTES-B2 §12 "Remaining").
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -1872,6 +1927,10 @@ CC-shaped cases, schedule totals against fixed N, and the re-pack cost per switc
   existing format, with optional keys only (Q24; no new features).
 - **Until M-c passes**, DESIGN marks the default levels (6, 8, 10, 12, 14) and every §2.4 or
   §4.10 schedule gain that uses N ∉ {8, 10, 14, 16} as [M, model-only, outside hold-out].
+- *Outcome (2026-10-07): missed; the Q24 refit was not adopted* (Status, "M-c").
+  - The < 100 µs median is 15.8 % (target 15 %). The cause is the Jacobi view's REPEAT credit
+    at every N, the anchors included. The other classes are met over all calls.
+  - The marks stay. The verdicts on its design questions are §5.9.
 
 **M-d: scheduled iterations** (`bench/accuracy/schedule.py`). Convergence and time are measured
 separately. On the drafted small systems a time bar alone cannot discriminate: the ACCURACY §3
@@ -4221,6 +4280,49 @@ configuration, which in the twelfth case is already below that ideal.
   4-iteration phase. *Verdict: accepted as M-b's scope; state the caveats next to the
   figures:* the B roles of the one-factor contractions modelled in-line, the bare norms, the
   level grid, and R2's rationale. Applied in §3.3, DESIGN §6g.10 and §7, and the findings.
+
+### 5.9 M-c: the design questions (decided conservatively by the implementer, 2026-10-07; open for the independent reviewer)
+
+Evidence: Status "M-c"; immerdink-eval `findings/c1-m-c.md`.
+
+- **MC-1. Is the Q24 refit `n1` adopted?**
+  - What `n1` is: the shipped fit's records plus the 43 N-specific calls, the same
+    `perf_fit.py` arguments. The baseline refit reproduces the shipped parameters to rounding.
+  - What it does: it meets M-c's first run (< 100 µs median 14.7 %; ≥ 1 ms p90 14.0 %) and
+    keeps the product hold-out (3.9 / 10.7, 3.1 / 7.4, 2.3 / 7.4 %).
+  - *Decision: not adopted.*
+    - Its pass is not robust: it misses on the repeat run of the small calls (15.0 %).
+    - It fits a cache-state error with KL parameters (`kl.wave` 2.16 → 4.45 µs, `call.call`
+      1.02 → 0.38 µs), the per-shape compensation §6c.5 rules out.
+    - It moves the PPL view, an M-d2 gated system, to +11 … +20 %.
+    - Shipping it would change every [M] figure M-b has just certified.
+  - `results/c1/m_c/refit/n1.calib` is kept.
+- **MC-2. Does a miss the anchors share fail M-c?** It is a shape error at every N, not an N
+  error.
+  - *Decision: yes, as IR4 is written* ("judged per size class"). The anchors make the miss
+    attributable, as intended.
+  - *For the reviewer:* M-c does answer the N question.
+    - N = 9–13 track the anchors.
+    - N = 4–7 are 2–4 points optimistic (median).
+    - The two classes ≥ 100 µs are met over all calls. Per N, the ≥ 1 ms median is 1.8–5.4 %.
+    - A ruling that M-c passes for N could remove the marks for the ≥ 100 µs classes. The
+      Jacobi view would keep a REPEAT-state caveat; its COLD predictions, the form of the
+      [M] figures, are within −1.5 to +10 %.
+- **MC-3. The fix is a model feature, beyond Q24.**
+  - The REPEAT residency rule `clamp(L_w − (F − I), 0, I)` credits KL-path inputs that a
+    KL-plus-K4 call evicts before the next call.
+  - Candidate: an optional key in the v1.17 / v1.18 additive style. It would count the KL
+    pack planes written between two calls in the REPEAT footprint, as `warm.pack_l2_planes`
+    does for PACK; absent = 0, so no file is read with features it was not fitted with.
+    Alternatively: no REPEAT credit for operands a KL pack reads.
+  - *Decision: not built in M-c.* It needs DESIGN §6c text, `host_perf` tests, a refit and a
+    new hold-out run. Recorded as NOTES-B2 §12 "Remaining".
+- **MC-4. The squares' spec.** *Decision:* `ik,kj->ij`, the spec of §2.3's [M] figures, and
+  not the bench's usual `ik,jk->ij` (§2.3 notes a 3 % spec effect). Disjointness is checked on
+  GEMM views, so a calibration shape cannot hide behind the spec.
+- **MC-5. decay_opp data.** *Decision:* `imd_bench --data decay_opp` (c2_fixtures.py's family
+  on the device), since no existing mode decays along K. It is a bench-only change, committed
+  before the run.
 
 ---
 
