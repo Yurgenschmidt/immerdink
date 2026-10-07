@@ -25,6 +25,21 @@ The rule (NOTES-C1 §4.2):
   - relaxed (inexact) Krylov methods (--relaxed): monotone=False and a matvec tolerance
     proportional to tol / ||r_k||, so N falls as the residual does (NOTES-C1 §1.3).
 
+Caller guidance from M-d1 (DESIGN §6g.12, NOTES-C1 §1.3; CPU evidence on one fixture each,
+report-only, not a C1 gate; immerdink-eval findings/c1-evidence.md):
+  - fixed-point iterations (Jacobi, DIIS, PPL + ring): the forcing-rule ramps above match
+    fixed N = 14 (no more iterations, the final residual within 2x). With DIIS, reset its
+    history at each precision switch: no iteration lost, final residual 1.5e-16 against
+    2.1e-15;
+  - subspace methods (block Davidson): at each switch, collapse to the Ritz block and
+    recompute its sigma = HV at the new N, or the ramp stalls. Even so the ramp took 16
+    iterations to 1e-10 against 11 at fixed N = 14 (+5), so it pays only if the per-iteration
+    saving outweighs that;
+  - Krylov methods (CG): start tight and relax. Ramps that start low stall CG at N = 5-6.
+    The relaxed min(1e-2, tol / ||r_k||) converges but leaves a residual gap (7.1e-8 against
+    3.3e-10 at fixed N = 14), so scale the relaxation by the expected iteration count, e.g.
+    tol / (m_max ||r_k||) (not measured in M-d1).
+
 Every time and TFLOPS-eq figure printed is a performance-model prediction [M] (shipped
 calibration, DEFAULT regime, COLD). Levels outside N in {8, 10, 14, 16} are outside the
 model's hold-out until NOTES-C1 M-c passes [M, model-only, outside hold-out].

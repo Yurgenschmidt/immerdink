@@ -2,6 +2,106 @@
 
 ## Status
 
+**Final status of the C1/C2 cycle, 2026-10-07** (branch `claude/ozaki-kernels-immerdink-1089fd`,
+not pushed). This block closes the cycle's record. The "Implementation status" below is the
+detailed log, written as the work went; where they differ, this block is current. Every figure
+here names its source; the libraries are `build/libimmerdink_host.so` sha256 `466acdb4…`
+(host API 13, byte-identical to the design-phase [M] library, IR14) and, for the GPU records,
+the `libimmerdink.so` builds named per item.
+
+**Definition of done (§4.11, IR29), checked item by item against the branch and immerdink-eval:**
+- **C2 is done.**
+  - The M-a summary is published: immerdink-eval `findings/c1-evidence.md` (records
+    `results/c1/m_a/`, `real/`, untracked).
+  - Stage 3 has shipped, with L3c and L7 in Lean: DESIGN §3.8 "Segmented accumulation", PROOFS
+    L7, `proofs/Proofs/{Error,Summation,Segments}.lean` (71 headline theorems in
+    `proofs/AxiomCheck.lean`, standard axioms only, `tools/check_proofs.sh` passing after the
+    review fixes at 4176732).
+  - The stage-4 gate is decided by its pre-registered rule: **failed, stage 4 closed**, with the
+    revival trigger "a real-operand family meeting (i)" (§4.5, DESIGN §7, ROADMAP C2).
+  - The stage-6 gate is decided: **deferred**, with its trigger (§4.7, DESIGN §7, ROADMAP C2).
+  - ROADMAP C2 is retitled per Q7 (IR18).
+- **C1 is not done: two of its five conditions are not met.**
+  - Met: stages 0 and 1 shipped with their tests and certificates (`host_footprint_monotone`,
+    `host_precision`, `cert_footprint_monotone`, `cert_rho_recipe`).
+  - Met: the round-2 stage-0 GPU tests pass, at 4ba78b1 (`libimmerdink.so` `c4bdcc4f…`;
+    immerdink-eval `findings/c1-round2-stage0-gpu-tests.md`).
+  - **Not met: M-c has not passed.** It ran on 2026-10-07 and failed one §6c.5 target: the
+    < 100 µs median error is 15.8 % against 15 % (16.1 % in a repeat). The Q24 refit was not
+    adopted (§5.9 MC-1). The only authorized path to a pass, the MC-3 feature(s) as amended
+    (§5.9 MC-3a), has not started. Source: immerdink-eval `findings/c1-m-c.md`,
+    `results/c1/m_c/mc.jsonl` (sha256 `24fa699d…`, case list at 530ff81, profiling build at
+    530ff81 with `libimmerdink.so` `9181dc3f…` and `libimmerdink_host.so` `466acdb4…`, the
+    shipped calibration `d31f62ca…`, stock clocks with no lock as in §6c.5's validation).
+  - **Not met: "M-d1 and M-d2 are reported with their success criteria evaluated".** M-d1 is
+    reported and meets its criterion on every system; **M-d2 has not run**: the binding
+    ordering makes it wait for MC-3a (§5.9 "M-d2 ordering", §5.10 MD2-0). Its protocol and
+    driver are pre-registered (`bench/accuracy/md2_time.py` at 35eeb46, sha256 `90fa7f92…`).
+  - Met: the ROADMAP C1 row shows the Q6 decision column and "stage 5 deferred (triggers
+    T1–T3)" (the latter added at this close-out).
+- Every deferral names its trigger in DESIGN §7 or the ROADMAP: met (stage 4, stage 5, stage 6,
+  the N-range plan, Ozaki-I slices, K-segmentation as a library mode, accurate mode).
+- *Checks at the close-out* (2026-10-07; FREE, CPU only, one thread, under memcap; on fec6c42
+  plus the close-out's edits, which touch only docs and docstrings; `ninja -n`: nothing to
+  rebuild; `libimmerdink_host.so` `466acdb4…`, `libimmerdink.so` `c4bdcc4f…`): `tools/test.sh`'s
+  18 CPU-only ctest tests pass (`host_precision`, `host_footprint_monotone`,
+  `c2_engine_selftest`, `sweep_disjoint_selftest`, `md2_time_selftest` and `params_check`
+  among them), `spec/params.py --check` passes 33 of 33 and `spec/test_oracle.py` ALL PASS.
+  The GPU tests were not re-run: no file under `src/` or `include/` has changed since their run
+  at 4ba78b1 (the later changes are bench tools, `imd_bench --data decay_opp` among them, and
+  two CPU tests).
+  Logs: immerdink-eval `results/c1/closeout/` (untracked); summary `findings/c1-closeout.md`.
+
+**What shipped.** No ABI, calibration-format or TLA+ change: host API 13. `src/` has not changed
+since the design draft (39972b7), `include/` only in comments.
+- *C1(a), precision phases* (DESIGN §6g.1–§6g.9): a plan and a pack per N; F1–F3, C-ws and
+  C-pack published from API 13 on; certificates I1–I3; the re-pack-in-place rule;
+  `PackSpec.with_moduli` and `PackedBuffer`. No plan-time preload: the first call at a
+  never-launched N costs at most 9 µs more than a steady one, and a cold capture's first
+  replay is 0.98–1.10× the steady one (1e6e709 build, `libimmerdink.so` `b8baa75d…`;
+  immerdink-eval `findings/c1-stage0-first-call.md`).
+- *C1(b) on the host* (DESIGN §6g.10–§6g.12): `PrecisionPlan` and the rigorous
+  `rho_from_output`, and the M-d1 caller guidance, carried into DESIGN §6g.12 at this
+  close-out (§1.3 keeps it with its evidence). M-d1 (CPU, bit-exact emulation): the forcing-rule ramps match fixed N = 14 on
+  Jacobi, DIIS(8) with and without a reset, and PPL + ring; the lagged ρ̂ missed in 1 of 228
+  MET calls. Source: `findings/c1-evidence.md`, records `results/c1/m_d1/`, reproduced bit for
+  bit at 928b49c (jacobi, davidson, cg) and 5925219 (diis, ppl); the ρ-miss records are tied to
+  committed code by sha256 (§5.6 S2-18).
+- *C2:* `oracle.kweights` and the M-a study, the C2 deliverable now that the gate has failed
+  (Q8); the K-segmentation caller recipe with its rigorous bound and request transform
+  (`cert_kseg_composition`, `oracle.contract_segments`), and L3c, γ_k and L7 in Lean.
+- *Tooling kept for the open work:* M-c's sweeps and `bench/sweep_disjoint.py`, the M-d2 driver,
+  and the CPU ctests `c2_engine_selftest`, `sweep_disjoint_selftest` and `md2_time_selftest`.
+
+**What was closed or deferred, and why.**
+- *Stage 4 (caller-side K-equilibration), closed by its gate.* No real R1–R6 contraction of the
+  ≥ 2048³ class (psi4 DF and MP2 operands of benzene and water on ccsd.py's contraction list)
+  passes the guard: G ≤ 0 on all of them, and with the caller's costs K-equilibration is
+  2–47 % slower than fast mode there [M]. (ii) is not met as pre-registered either: 2–19
+  sampled outputs per guard-accepted Tier-L fixture above 2× fast's error, max ratio 247.
+  Source: `bench/accuracy/c2_summary.py` over records reproduced bit for bit at 5925219
+  (`results/c1/repro_5925219/`), M-a's [M] blocks reproduced by M-b on `466acdb4…`; the
+  deadband d* = 3 comes from Tier S, which is not reproduced on committed code (4 of 245 runs
+  smoke-checked), and the verdict holds at d = 0 too. Revival trigger: a real-operand family
+  meeting (i), judged with the re-registered (ii), after the d*-deciding Tier S subset is re-run
+  (§4.5, §5.6 S2-21).
+- *Stage 6 (library-internal weights), deferred:* its gate needs a shipped stage 4. Trigger
+  §4.7.
+- *Stage 5 (K5 statistics and the device certificate), deferred (IR26):* no consumer issues
+  elementwise targets (ehrenfest D8; ccsd.py issues no accuracy request), and the host-side
+  `rho_from_output` gives a rigorous ρ now. Triggers T1–T3 (§4.6).
+- *Also decided:* accurate mode re-rejected (§2.8; its Appendix B trigger is not met, 0 cases);
+  the N-range plan and Ozaki-I slices parked with triggers (§3.2, §3.3); K-segmentation and B6
+  stay caller recipes (Q15 (a); B6 shows no value at the sizes measured).
+
+**What remains for C1** (round 2, GPU): the MC-3a path (§5.9: the DESIGN §6c text from a
+per-phase account first, at most two optional keys, a fresh narrow-KL hold-out committed
+before the refit, the pass checks, a fresh M-c run), then M-d2 (§4.3; eight `run` processes
+into one records file and one `judge`). Until M-c passes, figures at N ∉ {8, 10, 14, 16} keep
+the mark [M, model-only, outside hold-out]. Open outside C1: a `PrecisionPlan` member role
+"AB" for a self-contraction reading one shared pack through both roles (trigger B2; M-b
+below).
+
 **Revised after two independent reviews, 2026-10-07, then amended by the binding decisions of the
 independent design reviewer, 2026-10-07** (branch `claude/ozaki-kernels-immerdink-1089fd`). The
 text below was written in the design phase, before anything was built, tested or run on the GPU;
@@ -193,10 +293,10 @@ what has been built since is recorded under "Implementation status".
     IR15; CPU, round 1), and M-c and M-d2 (GPU, round 2). Stage 3 could start once the M-a
     summary was published (§4.11). Stage 3, M-b and M-c have since run (below); M-d2 has
     not.
-  - **Open:** the M-d1 caller guidance (§1.3: the DIIS reset, Davidson's recompute and its +5
-    iterations, CG's relaxation scaled by the iteration count) lives only here. It is to be
-    carried into DESIGN §6g.12, `bench/accuracy/schedule.py` and the `precision.py`
-    docstrings, which the stage-1 work owns (also a ROADMAP C1 open item).
+  - **Done at the close-out (2026-10-07):** the M-d1 caller guidance (§1.3: the DIIS reset,
+    Davidson's recompute and its +5 iterations, CG's relaxation scaled by the iteration count,
+    and the lagged ρ̂'s miss rate) is in DESIGN §6g.12, pointed to from §6g.10, the
+    `PrecisionPlan` docstring (`monotone`) and `bench/accuracy/schedule.py`'s docstring.
 - **Stage 3 (§4.4) is done, 2026-10-07**, after the M-a summary (IR12, IR28); CPU and Lean
   only, no ABI change (host API 13). Implemented at 7b04b04, then approved with fixes by an
   independent reviewer; the fixes are applied at 4176732, and the verdicts on its design
@@ -605,6 +705,10 @@ order of work and a definition of done. They override the earlier text wherever 
   own psi4 script. If psi4 cannot run, the Eric-approved dump is the named fallback.
 - **Stage 5 is formally deferred (IR26).** It has triggers T1–T3, and T3 is Eric asking for the
   device certificate.
+- **At the close-out (2026-10-07): C2 is done, C1 is not** (Status, "Final status"). C1 waits on
+  MC-3a (a performance-model feature and refit, GPU) and then M-d2. MC-3 can close without a
+  calibration change only as MC-3a's recorded outcome or by Eric's explicit decision (§5.10
+  MD2-0).
 
 **Decision summary.** §3 gives the reasons, §4 the stages.
 
@@ -792,7 +896,8 @@ order of work and a definition of done. They override the earlier text wherever 
   relaxed). Both are report-only and document caller guidance; they are not C1 gates.
 - **Caller guidance from M-d1** (2026-10-07; CPU evidence on one fixture each, report-only, not
   a C1 gate; accepted with corrections by the independent reviewer, §5.6 S2-9; immerdink-eval
-  `findings/c1-evidence.md`):
+  `findings/c1-evidence.md`; carried into DESIGN §6g.12 at the close-out, which is the
+  caller-facing text):
   - *Fixed-point iterations and DIIS.* The forcing-rule ramps match fixed N = 14: the same
     iterations, and the final residual within 2×. With DIIS, reset the history at each
     precision switch. That costs no iteration and improves the final residual, 1.5e−16
@@ -1459,9 +1564,9 @@ If revived, the design is as P1 drafted it, with these corrections:
 | 1. `PrecisionPlan` and recipes | S | — | none | C1(b) on the host: per-role pack-cost composition, pack-mode masks and BUDGET, joint share groups, the DIRECT sentinel (IR2, IR8, IR24, IR15); the tested `rho_from_output` (`cert_rho_recipe`, IR7); schedule example |
 | 2. Evidence | S (CPU) + M (GPU) | — | none | M-a at full size with sampled outputs, real psi4 operands, and multi-partner and batched fixtures, with `oracle.kweights` (IR1, IR6, IR16, IR19); M-b re-runs of the [M] figures; M-c small-N hold-out (IR4); scheduled iterations (convergence on the CPU, time on the GPU) |
 | 3. L7 and the K-segmentation recipe | M (was S; IR5) | after the M-a summary (IR12, IR28) | none | L3c and γ_k in Lean, then L7 in PROOFS + Lean; `cert_kseg_composition`, `oracle.contract_segments`; DESIGN §7 rows citing M-a |
-| 4. `imd_kweights` + caller-side equilibration | S–M | pre-registered rule (IR27, §4.5) | host API +1 | C2, step 1, with L5 in PROOFS (+ Lean), its certificates and `GuardSound` |
+| 4. `imd_kweights` + caller-side equilibration | S–M | pre-registered rule (IR27, §4.5): **failed, closed** 2026-10-07, revival trigger in §4.5 | host API +1, not built | C2, step 1, with L5 in PROOFS (+ Lean), its certificates and `GuardSound` |
 | 5. K5 statistics + certificate | S–M | **not met: formally deferred**, triggers T1–T3 (IR26, §4.6) | host API +1, if built | C1(b) on the device, with L6 in PROOFS (+ Lean) and its certificates |
-| 6. Library-internal weights + weighted packs | M | pre-registered rule (IR27, §4.7); layout decided (IR21) | host API +1 | C2, step 2 |
+| 6. Library-internal weights + weighted packs | M | pre-registered rule (IR27, §4.7); layout decided (IR21): **deferred** 2026-10-07, trigger in §4.7 | host API +1, not built | C2, step 2 |
 
 Each lemma is proved in the stage that first relies on it (R2, §5.2). Its hand proof is
 recorded in §4.4 now. Stage 3 adds the Lean prerequisite L3c (IR5). §4.11 gives the order of
@@ -3342,6 +3447,10 @@ never as open.
   - the stage-6 gate has been decided: built if it passed, deferred with its trigger otherwise;
   - the ROADMAP C2 row is retitled per Q7.
 - Every deferral names its trigger in DESIGN §7 or the ROADMAP.
+
+*Checked at the close-out, 2026-10-07* (Status, "Final status of the C1/C2 cycle"): **C2 is
+done**; **C1 is not**, since M-c has not passed (it failed, and MC-3a has not started) and M-d2
+has not run. Every other condition of both, and the trigger rule, is met.
 
 ---
 

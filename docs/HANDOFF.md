@@ -1,4 +1,4 @@
-# Handoff (2026-10-04)
+# Handoff (2026-10-04; C1 / C2 state updated 2026-10-07)
 
 State of immerdink for a fresh session, written before switching the dev box to a
 console-only (no graphics) setup. Read this, `docs/ROADMAP.md` and the auto-loaded memory
@@ -134,37 +134,47 @@ first.
   calls (+2 … +5 %), pre-packed g < N in the S rule, tiny-shape K4 / KF. GPU: 18.7 min (90 min
   sweep wall time, mostly gate waits for other GPU users).
 - **Adaptive precision C1 / C2 (2026-10-07, branch `claude/ozaki-kernels-immerdink-1089fd`,
-  not pushed; DESIGN v1.19 §6g and §3.8, host API 13, no ABI change):** the design and the
-  state of every stage are docs/NOTES-C1.md (read its Status first). Stage 0: precision phases
-  (a plan and a pack per N, published footprint monotonicity F1–F3, the re-pack rule,
-  `PackedBuffer`). Stage 1: `immerdink.precision.PrecisionPlan` and `rho_from_output`.
-  Stage 2 (CPU): M-a closed stage 4 (caller-side K-equilibration fails its gate on real psi4
-  operands) and deferred stage 6; M-d1 met its criterion. Stage 3: the K-segmentation caller
-  recipe (§3.8, PROOFS L7, `cert_kseg_composition`, `oracle.contract_segments`) and L3c + L7
-  in Lean, reviewed (NOTES-C1 §5.7). M-b is done. M-c ran on 2026-10-07 and **failed**
-  (binding verdict, NOTES-C1 §5.9): the < 100 µs median was missed through a small-N
-  optimism on the KF path (1024³ at N = 4) and narrow-n KL calls, each necessary; the
-  narrow-n KL error is two effects that cancel at the call total (KL A keeps only part of
-  its REPEAT credit, the narrow pack KL B is slow in every cache state; per-phase table in
-  immerdink-eval `results/c1/m_c/phases.md`). The Q24 refit was not adopted and the marks
-  stay. Open: the MC-3 feature(s), authorized as the only path to an M-c pass and amended
-  as MC-3a (NOTES-C1 §5.9 MC-3, MC-3a, MC-6: DESIGN §6c text from a per-phase account
-  first, at most two optional keys fitted against the phase marks, a fresh narrow-KL
-  hold-out committed before the refit, the v1.18 hold-out judged with and without its 7
-  view overlaps, and a fresh 160-call M-c run); then M-d2 (GPU), which waits for it (its
-  protocol and driver `bench/accuracy/md2_time.py` are pre-registered, re-registered at
-  35eeb46 after two reviews, NOTES-C1 §4.3, §5.10; the reviews upheld the ordering: MC-3a
-  first; one normative records file, the driver frozen from the first M-d2 record on;
-  not run); and
-  the M-d1 caller guidance into DESIGN §6g.12.
-  Evaluation records and summaries are in
-  immerdink-eval `results/c1/` and `findings/c1-*.md`.
+  not pushed; DESIGN v1.19 §6g and §3.8, host API 13, no ABI, calibration-format or TLA+
+  change):** the design and the final state of the cycle are docs/NOTES-C1.md (read its Status,
+  "Final status of the C1/C2 cycle", first). **C2 is done** by its definition of done (NOTES-C1
+  §4.11); **C1 is not**: M-c failed and M-d2 has not run.
+  - Shipped: stage 0, precision phases (a plan and a pack per N, published footprint
+    monotonicity F1–F3, the re-pack rule, `PackedBuffer`); stage 1,
+    `immerdink.precision.PrecisionPlan` and `rho_from_output`; stage 3, the K-segmentation
+    caller recipe (§3.8, PROOFS L7, `cert_kseg_composition`, `oracle.contract_segments`) and
+    L3c + L7 in Lean; `oracle.kweights` and the M-a study (C2's deliverable); the M-d1 caller
+    guidance (DESIGN §6g.12). The round-2 stage-0 GPU tests pass (4ba78b1). M-b is done.
+  - Closed or deferred, each with its trigger (DESIGN §7, ROADMAP C1/C2): stage 4 (caller-side
+    K-equilibration) closed by its gate (no real psi4 contraction of the ≥ 2048³ class passes the guard); stage 6
+    (library-internal weights) deferred; stage 5 (K5 statistics + device certificate) deferred,
+    triggers T1–T3.
+  - **Open (C1, GPU):** M-c ran on 2026-10-07 and **failed** (binding, NOTES-C1 §5.9): the
+    < 100 µs median was missed (15.8 % against 15 %) through a small-N optimism on the KF path
+    (1024³ at N = 4) and narrow-n KL calls (KL A keeps only part of its REPEAT credit, the
+    narrow pack KL B is slow in every cache state; per-phase table in immerdink-eval
+    `results/c1/m_c/phases.md`); the Q24 refit was not adopted and the [M, model-only, outside
+    hold-out] marks stay. Next: the MC-3a path (NOTES-C1 §5.9 MC-3, MC-3a, MC-6: DESIGN §6c
+    text from a per-phase account first, at most two optional keys fitted against the phase
+    marks, a fresh narrow-KL hold-out committed before the refit, the v1.18 hold-out judged with
+    and without its 7 view overlaps, a fresh 160-call M-c run); then M-d2, whose protocol and
+    driver `bench/accuracy/md2_time.py` are pre-registered at 35eeb46 (NOTES-C1 §4.3, §5.10;
+    one normative records file, the driver frozen from the first M-d2 record on). MC-3 closes
+    without a calibration change only as MC-3a's recorded outcome or by Eric's decision.
+  - Open outside C1: a `PrecisionPlan` member role "AB" (one shared pack read through both
+    roles), trigger B2.
+  - Close-out checks (2026-10-07, CPU only): `tools/test.sh`'s 18 CPU-only ctest tests,
+    `spec/params.py --check` 33 of 33 and `spec/test_oracle.py` pass (immerdink-eval
+    `findings/c1-closeout.md`); the GPU suite last ran at 4ba78b1 (56 of 56; no `src/` or
+    `include/` change since).
+  - Evaluation records and summaries are in immerdink-eval `results/c1/` and
+    `findings/c1-*.md`.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
 - **D3 gate (Eric, 2026-10-04):** D3 begins with a design/theory discussion with Eric to narrow
   the questions. Do not start D3 agents or specs before that.
-- **Roadmap done:** A1, A2, A3, A4, A5 (2026-10-04, docs/NOTES-A5.md), D1, D4 part 1. Next by Eric's priority: D3 (packed
+- **Roadmap done:** A1, A2, A3, A4, A5 (2026-10-04, docs/NOTES-A5.md), D1, D4 part 1; C2
+  (2026-10-07, on the C1/C2 branch above, not merged). Next by Eric's priority: D3 (packed
   symmetric contractions; design preference: one generic kernel, else split; TLA+ first),
   then B2 (performance model that ehrenfest can call), B1, then C1 after Ozaki-II is polished.
   SE items are parked. For tiny-call timings use `imd_bench --methods duel` (two immerdink

@@ -274,6 +274,14 @@ class PrecisionPlan:
     monotone: True (default) for tightening iterations: a phase never lowers a contraction's
         N below its previous phase's final level until reset(); False for relaxed (inexact)
         Krylov methods, which loosen the matvec precision as the residual falls.
+        Caller guidance at a switch (DESIGN §6g.12; NOTES-C1 §1.3, M-d1: CPU evidence on one
+        fixture each, report-only): reset a DIIS history at each switch (no iteration lost,
+        a lower final residual); for subspace methods (Davidson), collapse to the Ritz block
+        and recompute its products at the new N (else the ramp stalls; even so it took +5
+        iterations, so a ramp may not pay there); for Krylov methods (CG), start tight and
+        relax (monotone=False): a ramp that starts low stalls, and a tolerance tol/||r_k||
+        leaves a residual gap unless scaled by the expected iteration count, e.g.
+        tol/(m_max ||r_k||).
     perf: {"regime", "cache", "clock_mhz"}: rank / predict_pack request fields (default: the
         library's DEFAULT regime, COLD).
     Thread-safe; phase() calls are serialized (they update the monotone floor)."""

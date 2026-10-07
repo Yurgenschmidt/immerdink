@@ -89,8 +89,13 @@ BUDGET status, share groups ranked jointly, an optional DIRECT level), and `rho_
 gives the rigorous ρ of an ELEMENTWISE target from a previous output (`cert_rho_recipe`). Its
 stage 3 (NOTES-C1 §4.4, C2) adds the K-segmentation caller recipe to §3.8 with its error bound
 (PROOFS L7, `cert_kseg_composition`, `oracle.contract_segments`) and rewrites the §7 rows that
-the C1/C2 study decided. No semantic, layout, launch, pack-format, API, calibration-format or
-TLA+ change; changed text is marked **[v1.19]**.
+the C1/C2 study decided. That study's CPU evidence (NOTES-C1 §4.3) decided the gates: caller-side
+K-equilibration (stage 4) is closed and library-internal weights (stage 6) deferred, device
+statistics (stage 5) are deferred, each with its trigger in §7, and the convergence study's
+caller guidance is in §6g.12. The performance model's small-N hold-out (M-c) failed, so levels
+outside N ∈ {8, 10, 14, 16} stay [M, model-only, outside hold-out] (§6g.9), and the GPU timing
+of the schedules (M-d2) has not run. No semantic, layout, launch, pack-format, API,
+calibration-format or TLA+ change; changed text is marked **[v1.19]**.
 The change lists are at the end.
 
 Sources:
@@ -5299,9 +5304,11 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   to rely on I3 (§6g.3): the maxima come from the queries over the allowed modes.
 - **Relaxed Krylov methods** (NOTES-C1 IR3) may loosen the matvec precision as the residual
   falls [literature: Bouras–Frayssé; Simoncini–Szyld; van den Eshof–Sleijpen]. They use
-  `monotone=False` with a decreasing schedule (a matvec tolerance ∝ tol / ‖r_k‖).
-  Fixed-point, Newton-type and residual-driven iterations, iterative refinement included,
-  tighten: `monotone=True`, the default.
+  `monotone=False` with a decreasing schedule (a matvec tolerance ∝ tol / ‖r_k‖, scaled by
+  the expected iteration count). Fixed-point, Newton-type and residual-driven iterations,
+  iterative refinement included, tighten: `monotone=True`, the default. What to do at a
+  switch (reset DIIS, recompute a subspace's products, start Krylov tight) is the M-d1
+  caller guidance in §6g.12.
 - **The forcing rule, as caller code** (`bench/accuracy/schedule.py`): after iteration t,
   each contraction c gets an ABSOLUTE target η·r_t·w_c (Σ w_c = 1), with `norm_product_c`
   refreshed per phase; N rises only at iteration boundaries; BOUND for the final phase and
@@ -5478,6 +5485,39 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
   - DF and 4096³ barely change (P14/PF14 = 0.667, 0.678).
   - NOTES-C1's M-d2 measures P14/PF14, reported and not gated; its figures replace these
     once it runs.
+- **Caller guidance: switching N inside an iterative method** (NOTES-C1 §1.3, M-d1; §5.6
+  S2-9). CPU evidence on one fixture each, run bit-exact with the oracle's arithmetic: it is
+  report-only guidance, not a C1 gate and not a library rule. Source: immerdink-eval
+  `findings/c1-evidence.md` ("M-d1"), records `results/c1/m_d1/` (untracked), reproduced bit
+  for bit on committed code (jacobi, davidson and cg at 928b49c; diis and ppl at 5925219).
+  - *Fixed-point iterations (Jacobi, DIIS) and PPL + ring:* the forcing-rule ramps
+    (`bench/accuracy/schedule.py`, `monotone=True`) match fixed N = 14: no more iterations
+    to 1e−7 and 1e−10, the final residual within 2× (ratio 0.07–1.00), for η ∈ {0.1, 0.01},
+    BOUND and TYPICAL. This is §4.3's success criterion, met on every system.
+  - *DIIS:* reset the DIIS history at each precision switch. It costs no iteration and
+    lowers the final residual (1.5e−16 against 2.1e−15 without the reset).
+  - *Subspace methods (block Davidson):* at each N switch, collapse the subspace to the Ritz
+    block and recompute its σ = HV at the new N; otherwise the low-N products stay in the
+    subspace and the ramp stalls (4.1e−8 attainable). Even with the recompute the ramp needs
+    16 iterations to 1e−10 against 11 at fixed N = 14 (+5; 11 against 7 to 1e−7) on an easy,
+    diagonally dominant case, so a ramp is not recommended for Davidson unless its
+    per-iteration saving outweighs that.
+  - *Krylov methods (CG): start tight and relax* (`monotone=False`). Rules that start low
+    and tighten stall CG at N = 5–6 (cond 1e6). A relaxed matvec tolerance
+    min(1e−2, tol/‖r_k‖) converges (1e−7 in 274 iterations against 251 at fixed N = 14, with
+    N falling from 12 to 6) but leaves a residual gap (7.1e−8 attainable, against 3.3e−10
+    at fixed N = 14 and 2.0e−10 with the FP64 matvec). Scale the relaxation by the expected
+    iteration count, e.g. tol/(m_max·‖r_k‖), as inexact-Krylov theory does; M-d1's rule had
+    no such factor and that scaled rule is not measured here.
+  - *A lagged ρ for ELEMENTWISE targets* (`rho_from_output` of the previous iteration's
+    output, §6g.11, choosing the next call's N): it missed the next call's target in 1 of
+    228 MET calls (PPL at 1e−6, realized 1.013e−6, after an output passed near zero; the
+    next call went to N = 16 and met it). The lagged ρ̂ predicts the next call's ρ and does
+    not bound it; ρ̂ certifies only the output it is computed from. These records
+    (`md1_rho.jsonl`, the IR7 re-run with the shipped helper) name d89988a with a dirty
+    tree and carry the sha256 of every study file, each equal to the committed file at
+    f97696a (`precision.py` also at 51dba1e; NOTES-C1 §5.6 S2-18): tied to committed code
+    by content, not re-run on it.
 
 ---
 
@@ -5492,14 +5532,14 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 | Register-fused CRT (V3) | Exceeds 255 registers/thread at useful tiles (MEMORY_MODEL §6). |
 | FP CRT ([OZ2] double-double) | Exact integer arithmetic is simpler, checkable, and division-free. |
 | Accurate mode ([SC25]'s partner-aware σ/τ shifts) — **[v1.19]** re-examined for wide dynamic range (NOTES-C1 §2.5, §2.8, M-a) | Still rejected. It needs one more operand pass (KF/KL lose their group-1 fusion), and σ depends on the partner, which breaks operand packing (D1). It also converts headroom poorly: by an estimate from the §3.8 bound, confirmed by NOTES-C1 §2.5–§2.6's data (not a theorem), partner-aware shifts realize about G/7.8 moduli of a G-bit headroom where K-weights realize about G/3.9. Measured [C]: ≤ 0.3 moduli on dense data, ≤ 0.34 for the faithful 6-bit form even on decay_opp, about 3 with exact or envelope bounds on separable anti-correlated data. M-a at the ≥ 2048³ class (immerdink-eval `findings/c1-evidence.md`): the never-worse envelope rule (NOTES-C1 Appendix B, recorded as the proven partner-aware option) saves 1.5–3.5 moduli at equal elementwise error on decay_opp and opp_nonsep (K-equilibration 4–7), −0.5 to +1 on random-structure data, and none on the real psi4 operands. Its revival trigger (≥ 2 moduli beyond both K-equilibration and K-segmentation on a non-separable family of that class) is not met: 0 cases. |
-| K-equilibration in the library: power-of-two K-weights with `imd_kweights` and caller pre-scaling, then library-internal weighted packs (NOTES-C1 stages 4, 6) | Closed by its pre-registered gate (NOTES-C1 §4.5). No real-operand contraction of the ≥ 2048³ class (psi4 DF and MP2 operands of benzene and water on the consumer's contraction list) passes the L5c guard: their K profiles are aligned (G ≤ 0), and with the caller's costs K-equilibration is 2–47 % slower there [M]. It saves about 6 moduli only on synthetic anti-correlated profiles. The exact rule stays as `oracle.kweights`. **Trigger:** a real-operand family meeting gate (i), judged with the re-registered (ii) of NOTES-C1 §4.5; stage 6 only after a shipped stage 4 passes M-e (§4.7). |
+| K-equilibration in the library: power-of-two K-weights with `imd_kweights` and caller pre-scaling, then library-internal weighted packs (NOTES-C1 stages 4, 6) | Closed by its pre-registered gate (NOTES-C1 §4.5). No real-operand contraction of the ≥ 2048³ class (psi4 DF and MP2 operands of benzene and water on the consumer's contraction list) passes the L5c guard: their K profiles are aligned (G ≤ 0), and with the caller's costs K-equilibration is 2–47 % slower there [M]. It saves about 6 moduli only on synthetic anti-correlated profiles. The exact rule stays as `oracle.kweights`, and `oracle.kweights` with M-a is C2's deliverable. **Stage 4** (caller-side, `imd_kweights`) **closed**, 2026-10-07; **revival trigger:** a real-operand family meeting gate (i) (guard = 1 on a real contraction of the ≥ 2048³ class, and a net TFLOPS-eq gain ≥ 5 % at equal target with every caller cost counted, or an elementwise target ≤ 1e−8 that fast mode cannot reach at N ≤ 20 becoming reachable), judged with the re-registered (ii) of NOTES-C1 §4.5, after the d*-deciding part of Tier S is re-run on committed code (NOTES-C1 §5.6 S2-21). **Stage 6** (library-internal weights and weighted packs) **deferred**, since its gate needs a shipped stage 4; **trigger:** a revived stage 4 that ships and passes M-e on its gate case, plus a real fixture on which library-internal weights remove ≥ 5 % of pre-scaling or scaled-copy cost on a recurring contraction (NOTES-C1 §4.7). |
 | K-segmentation as a library mode (a SEGMENTS flag or a segment loop; NOTES-C1 Q15) | A documented caller recipe instead (§3.8 "Segmented accumulation", PROOFS L7): it works today with β = 1 and moved base pointers. M-a: on every guard-accepted Tier-L case it needs 1–4 more moduli than K-equilibration; on the real operands it saves at most one modulus (normwise 1e−15) at +4 % to +62 % of fast mode's time [M], and it gives up the single rounding. An API only if a real workload shows value beyond the recipe. |
 | More bits per modulus via larger moduli (e.g. Karatsuba-split residues) | More INT8 GEMMs per bit on sm_89 [I]: a residue of a modulus above 256 needs two int8 parts and three GEMMs per modulus, against one per 8-bit modulus. The FP8 analogue, Ozaki-II with Karatsuba-split FP8 residues (arXiv:2603.10634), needs 3 FP8 GEMMs per modulus and about 2.5× the multiplications of the INT8 scheme for 53 bits. |
 | N-range plan: one plan serving every N′ ∈ [N_lo, N_hi] (NOTES-C1 §3.2) | Parked. A call at N′ is launch-identical to the single-N′ plan, so it gains nothing per call; precision phases use a plan per N (§6g). It would save only plan count, host bytes and creation time (0.011–0.15 ms per N, once). **Trigger:** a consumer that cannot re-plan per phase, or a measurement showing that plan count, plan creation or RESIDENT memory matters. |
 | Multi-N packs; round-to-odd reference-integer packs; lower-N planes from a higher-N pack (NOTES-C1 §3.1 A3, A4, A6) | A multi-N pack has the same bytes as separate packs and saves one FP64 read per pack creation, for N-set key semantics. A round-to-odd pack takes 5 / 8 / 9 / 11 B per element at N_max = 8 / 14 / 16 / 20 (≥ FP64 from N_max = 14), each call still reads ≥ 8 B per element, and it saves only the S pass that KL already fuses. Lower-N planes cannot come from a higher-N pack: σ depends on N, rounding is not modular, and the CRT over a prefix gives z mod P(N′) (PackedOperand `neg_n`). |
 | Choosing N on the device within a call | N fixes the launch sequence, the K5 instantiation, W, the workspace and σ itself, and kernel scope forbids the sync. N is chosen on the host per phase (§6g.10). |
 | Ozaki-I slice mode: prefix slices, one pack for every precision (C1(c), NOTES-C1 §2.9, §3.3) | Parked. Faster than Ozaki-II only on benign data below about 1e−8, break-even near 1e−10, 1.25–1.75× slower at FP64 level [E], no win beyond S = 2 slices on heavy-tailed rows; and no operand is needed at two N at once. **Triggers:** a consumer needs one operand at two or more precisions at once under memory pressure, or M-d measures phase-switch re-packs at ≥ 5 % of a phase. A revival must beat the prefix-plane option and the best configuration without slices (a shared pack, separate packs or in-line). On the DF-CCSD contraction set a pack serving every N could save nothing in the 12 forcing-rule cases with real operands (the best of those configurations is already at or below the ideal: each member at its own floor reading one pack) and up to 9.1 % per iteration with one member's floor a level apart (16.0 % at 8 against 14) in synthetic floor patterns [M, model-only, outside hold-out; the slice pack priced as an ordinary pack at the group's top floor, no slice per-call penalty; B roles of one-factor contractions in-line, bare-factor norms; NOTES-C1 §3.3, M-b]. The share-group raise cost (shared against separate packs) is not that bar. A revival builds its TLA+ then. |
-| K5 statistics and a device a-posteriori certificate (lemma L6; NOTES-C1 stage 5) | Deferred: no consumer issues elementwise targets, and the host-side `rho_from_output` (§6g.11) gives a rigorous ρ now. **Triggers** (NOTES-C1 §4.6): T1, a consumer issues ELEMENTWISE requests per phase and the recipe's measured cost is ≥ 3 % of its run; T2, a consumer needs a rigorous per-call elementwise certificate on every call; T3, Eric asks for it. |
+| K5 statistics and a device a-posteriori certificate (lemma L6; NOTES-C1 stage 5) | Deferred: no consumer issues elementwise targets, and the host-side `rho_from_output` (§6g.11) gives a rigorous ρ now. **Triggers** (NOTES-C1 §4.6): T1, a consumer issues ELEMENTWISE requests per phase and the recipe's measured cost is ≥ 3 % of its run; T2, a consumer needs a rigorous per-call elementwise certificate on every call; T3, Eric asks for it. On a trigger it is built as NOTES-C1 §4.6 designs it, with its cost bar restated without `ncu` (compiler resource usage, the occupancy query and A/B timing; IR26). C1's definition of done does not need it (IR26, IR29). |
 | FP8 / INT4 paths | FP8 can't hold residues exactly at speed on Ada. INT4 forces p ≤ 16. |
 
 ---
@@ -6192,7 +6232,7 @@ and host API; every value the same integer (bit-identical, tested on every contr
   0 = off); the struct and format are unchanged. Text: COLD described as a modelling convention,
   the write-back reading of ω as a hypothesis.
 
-## v1.19 (§6g adaptive precision, stages 0, 1 and 3: precision phases on host API 13, N chosen per phase on the host, the K-segmentation recipe; no semantic, layout, launch, pack-format, API, calibration-format or TLA+ change)
+## v1.19 (§6g adaptive precision, stages 0, 1 and 3: precision phases on host API 13, N chosen per phase on the host, the K-segmentation recipe; stage 4 closed and stages 5 and 6 deferred by their gates; no semantic, layout, launch, pack-format, API, calibration-format or TLA+ change)
 
 Design: docs/NOTES-C1.md §4.1 (stage 0), as amended by the independent reviewer's binding
 decisions (IR1–IR29, NOTES-C1 §5.3).
@@ -6298,6 +6338,27 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     (a tensor output with interleaved modes is permuted and reshaped first);
     `host_precision` adds bounds shared over one batch axis only on a 4-D C and the dtype
     cases (§6g.12).
+- **Stage 2, CPU evidence** (NOTES-C1 §4.3 with IR1, IR3, IR6, IR7, IR11, IR16, IR19, IR27;
+  M-a and M-d1; no library, ABI or §6 change; host API 13):
+  - **spec/oracle.py** `kweights`, the exact K-weight rule with its multi-partner mode
+    (union extrema, pairwise guard G = min_p G_p), spec/test_oracle.py (12). The study:
+    `bench/accuracy/kw_engine.py`, `c2_fixtures.py`, `c2_gate.py`, `c2_summary.py` and
+    `md1_converge.py`; ctest `c2_engine_selftest` (CPU). Summary immerdink-eval
+    `findings/c1-evidence.md`, records `results/c1/m_a/`, `m_d1/` and `real/` (untracked).
+  - **The gates, applied by the pre-registered rules** (NOTES-C1 §4.5–§4.7): stage 4
+    (caller-side K-equilibration) fails its gate and is **closed** (no real psi4 contraction
+    of the ≥ 2048³ class has guard = 1); stage 6 is **deferred**, since it needs a shipped
+    stage 4; stage 5 was already deferred (IR26). Their triggers are in §7. The accurate-mode
+    row of §7 cites M-a, and its Appendix B trigger is not met.
+  - **M-d1** meets its success criterion on every system (the forcing-rule ramps against
+    fixed N = 14), the lagged ρ̂ of §6g.11 missed in 1 of 228 MET calls (IR7 closed), and
+    the report-only Davidson and CG cases give the caller guidance of §6g.12.
+  - Reviewed four times (approve-with-fixes; NOTES-C1 §5.6). Provenance (NOTES-C1 Status):
+    every record the gates and M-d1's criterion rest on is reproduced bit for bit on
+    committed code (121 records at 5925219, M-d1 jacobi, davidson and cg at 928b49c; the
+    ρ-miss records are tied to it by sha256, NOTES-C1 §5.6 S2-18); Tier S, which sets
+    the deadband d* = 3, is not (8b58101-era, 4 of 245 runs smoke-checked), and the gate
+    verdict holds at d = 0 as well.
 - **Stage 3** (NOTES-C1 §4.4 with IR5, IR12, IR15; C2; no ABI change, host API 13):
   - **§3.8 "Segmented accumulation":** the K-segmentation caller recipe (S calls, β = 1
     after the first, moved base pointers; per-band σ, flags, RN acceptance and packs), its
@@ -6328,6 +6389,14 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     ρ_S rounded upward, its guarantee stated as W ≤ t̄ and "t′ ≤ 0" as "no N certified"; the
     underflow hypothesis of NORMWISE and ELEMENTWISE; the reference of a non-contiguous
     partition; `contract_segments` without A and B at α = 0.
+- **Round 2, the stage-0 GPU tests** (NOTES-C1 §4.11; 2026-10-07; no change): pass on
+  committed code at 4ba78b1 (host API 13; `libimmerdink.so` sha256 `c4bdcc4f…`,
+  `libimmerdink_host.so` `466acdb4…`): `packed_repack_n`, `workspace_shared_n`,
+  `graph_phases` (cold captures at N = 10 and, packed, N = 12), `pack_write_extent` (113
+  packs, 612 packed contracts, all 42 KL launch shapes, 12 at radix > 1) and
+  `pack_write_extent_memcheck`, with `tools/test.sh`'s 56 ctest tests, `params.py --check`
+  (33 of 33) and `spec/test_oracle.py` (immerdink-eval
+  `findings/c1-round2-stage0-gpu-tests.md`).
 - **M-c, the small-N hold-out** (NOTES-C1 §4.3, IR4, Q24; 2026-10-07; no library,
   calibration or ABI change):
   - Tooling: `bench/sweep_mc.txt` (160 calls), `bench/sweep_disjoint.py` (absence from the
@@ -6374,3 +6443,19 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     records file, the driver frozen from the first M-d2 record on (MD2-8 amended), no
     automatic continuation after two inadmissible attempts, STOPPED or a refused file;
     library identity and `--md2-cleared`'s citation checked; re-registered at 35eeb46.
+- **C1/C2 close-out** (NOTES-C1 §4.11, IR29; 2026-10-07; docs and docstrings only). No
+  library, calibration or ABI change in v1.19: host API 13. Since the C1 design draft
+  (39972b7) `src/` has not changed, `include/` only in comments (§6a F1–F3), and Python
+  gained `precision.py`, `PackSpec.with_moduli` and `PackedBuffer` (§6g.5, §6g.10).
+  - §6g.12: the M-d1 caller guidance (DIIS reset at a switch, a subspace's recompute and its
+    +5 iterations for Davidson, Krylov started tight and relaxed by a tolerance scaled with
+    the iteration count, the lagged ρ̂'s miss rate), carried over from NOTES-C1 §1.3; §6g.10, the
+    `PrecisionPlan` docstring and `bench/accuracy/schedule.py` point to it.
+  - §7: the K-equilibration row states stage 4's revival trigger in full and stage 6's
+    trigger; the K5-statistics row states stage 5's cost bar without `ncu` (IR26).
+  - The definition of done (NOTES-C1 §4.11): **C2 is done** (M-a published; stage 3 shipped
+    with L3c and L7 in Lean; stage 4 closed and stage 6 deferred, each with its trigger;
+    ROADMAP C2 retitled). **C1 is not:** stages 0 and 1, the round-2 stage-0 GPU tests and
+    M-d1 are done and stage 5 is deferred (T1–T3), but M-c failed and M-d2 has not run.
+    What remains is the MC-3a path (§6g.9; NOTES-C1 §5.9), then M-d2 (NOTES-C1 §4.3,
+    §5.10).
