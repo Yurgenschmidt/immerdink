@@ -752,8 +752,9 @@ void fold_byte_f(imd_perf_calib_t* cal, uint32_t struct_size) {
 }
 
 // v1.17 review (DESIGN §6c.3): a v7..v11-sized struct has no pack_l2_hit_bytes. The predictors
-// and imd_perf_calib_format read it as warm_l2_bytes when pack.dram > 0 (exact for the shipped
-// file, whose two L2 sizes are the same 0.8 x L2) and as 0 otherwise (no effect then: every
+// and imd_perf_calib_format read it as warm_l2_bytes when pack.dram > 0 (exact for a v1.17-style
+// file whose two L2 sizes are equal; v1.18 review: the v1.18 shipped file has L_w 67.9 MB, L_hit
+// 83 MB and S with planes, so its v7..v11 view is degraded: pass NULL) and as 0 otherwise (every
 // file before v1.17 is unchanged, its text gains no key).
 void v11_pack_l2(imd_perf_calib_t* cal, uint32_t struct_size) {
   if (struct_size >= kCalibV7Size && struct_size < kCalibV12Size && cal->format == 2)
@@ -1077,7 +1078,8 @@ std::string format_calib(const imd_perf_calib_t& c) {
       s += '\n';
     }
   }
-  s += "# Prediction bands (§6c.1): p10 p90 of measured / predicted on the hold-out set.\n";
+  s += "# Prediction bands (§6c.1): lo hi quantiles of measured / predicted on the hold-out set\n"
+       "# (bench/perf_validate.py: the narrowest pair with 80 % cross-validated coverage).\n";
   const auto band = [&](const std::string& key, const double* b) {
     s += key + " = ";
     append_number(&s, b[0]);
@@ -1241,13 +1243,57 @@ struct Req {
   ErrReq err;  // v8 (§6f): the accuracy request (default: NORMWISE, no target)
 };
 
-// The time of every phase at clock scale s = f_eff / f (no cache term), and its sum. The power
-// model and the SUSTAINED clock use this COLD time in every cache state (documented
-// approximation: the REPEAT saving is up to 16 % only on calls that fit the L2, which are far
-// below the power cap, so the solved clock is the same).
-double call_seconds(const imd_perf_calib_t& cal, const PerfPhases& P, double scale) {
+// The request's cache terms (DESIGN §6c.1 "Cache state", v1.18 §6c.8): the parameters are COLD
+// costs (the fitter adds the calibration records' resident-input saving back); a REPEAT / WARM
+// call saves warm.l2byte per resident input byte (and v1.18 warm.call_ns once when an input is
+// resident) in the phases that read them first; CLEAN credits the call phase with the
+// write-back a clean L2 does not pay. COLD: no term.
+struct CacheTerms {
+  double inputs = 0;    // I, the call's input bytes
+  double res = 0;       // resident input bytes
+  double cache_ns = 0;  // split over the reading phases by in_bytes / I, clamped at 0 per phase
+  double clean_ns = 0;  // on the call phase
+};
+
+CacheTerms cache_terms(const imd_perf_calib_t& cal, const PerfPhases& P, int32_t cache) {
+  CacheTerms c;
+  const double Lw = cal.warm_l2_bytes, I = P.inputs;
+  const double res_repeat = std::clamp(Lw - (P.footprint - I), 0.0, I);
+  // WARM is modeled as REPEAT (NOTES-B2 §6: a call whose A was the previous call's C ran
+  // within -7 ... +3 % of the same call repeated; v1.18 review: the held-out pairs of §12
+  // measure WARM 4.5-11.9 % below REPEAT, open). v1.18 (§6c.8): CLEAN (an L2 flushed by reads)
+  // has COLD's res = 0 and a credit on the call phase for the write-back a clean L2 does not
+  // pay; REPEAT / WARM save c per call when an input is resident. COLD (inputs evicted by
+  // other, dirty work) is unchanged.
+  const bool cold = cache == IMD_PERF_CACHE_COLD || cache == IMD_PERF_CACHE_CLEAN;
+  c.inputs = I;
+  c.res = cold ? 0.0 : res_repeat;
+  c.cache_ns = -c.res * cal.warm_l2byte_ns - (c.res > 0 ? cal.warm_call_ns : 0.0);
+  c.clean_ns = cache == IMD_PERF_CACHE_CLEAN
+                   ? -cal.warm_clean_byte_ns *
+                         std::min(std::max(P.footprint - I, 0.0), std::max(Lw, 0.0))
+                   : 0.0;
+  return c;
+}
+
+// One phase's time at clock scale s = f_eff / f with the request's cache terms (the time
+// prediction and the power / clock solve use this one function).
+double phase_seconds(const imd_perf_calib_t& cal, const PerfPhase& p, double scale,
+                     const CacheTerms& c) {
+  double t = perf_phase_seconds(cal, p, scale);
+  if (c.inputs > 0 && p.in_bytes > 0) t = std::max(0.0, t + c.cache_ns * 1e-9 * p.in_bytes / c.inputs);
+  if (p.cls == IMD_PERF_CLASS_CALL && c.clean_ns != 0) t += c.clean_ns * 1e-9;
+  return t;
+}
+
+// The call's time at clock scale s in the cache state of `c` (the sum of its phases). v1.18
+// review (§6c.8): the power model and the SUSTAINED clock divide by this time of the request's
+// state (they used the COLD time in every state while the power fit uses the windows'
+// measured REPEAT time); a default-constructed CacheTerms is COLD.
+double call_seconds(const imd_perf_calib_t& cal, const PerfPhases& P, double scale,
+                    const CacheTerms& c = CacheTerms()) {
   double t = 0;
-  for (int i = 0; i < P.n; ++i) t += perf_phase_seconds(cal, P.ph[i], scale);
+  for (int i = 0; i < P.n; ++i) t += phase_seconds(cal, P.ph[i], scale, c);
   return t;
 }
 
@@ -1301,7 +1347,7 @@ double time_scale(const imd_perf_calib_t& cal, double f) {
 // (the boost clock if set) in place of f_ref as the top of the range; the time above f_ref is
 // the f_ref time.
 double resolve_clock(const imd_perf_calib_t& cal, const PerfPhases& P, const Req& q,
-                     int32_t* regime_used) {
+                     const CacheTerms& ct, int32_t* regime_used) {
   const bool has_power = cal.power_cap_w > 0 && cal.clock_eff_mhz > 0;
   int32_t reg = q.regime;
   if (reg == IMD_PERF_REGIME_DEFAULT) reg = has_power ? IMD_PERF_REGIME_SUSTAINED : IMD_PERF_REGIME_BURST;
@@ -1310,9 +1356,9 @@ double resolve_clock(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   const double ft = top_clock(cal);
   if (q.clock > 0) return std::min(q.clock, ft);  // at or above the top clock: BURST
   if (reg == IMD_PERF_REGIME_BURST || !has_power) return ft;
-  const double tb = call_seconds(cal, P, 1.0);
-  const auto power_at = [&](double f) {
-    return call_power(cal, P, f, call_seconds(cal, P, time_scale(cal, f)), tb);
+  const double tb = call_seconds(cal, P, 1.0);  // t_B: the COLD time at f_ref
+  const auto power_at = [&](double f) {  // t(f) in the request's state (non-increasing in f)
+    return call_power(cal, P, f, call_seconds(cal, P, time_scale(cal, f), ct), tb);
   };
   if (power_at(ft) <= cal.power_cap_w) return ft;
   double lo = cal.clock_min_mhz, hi = ft;
@@ -1332,34 +1378,15 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   r->sm_count = cal.sm_count;
   r->kernel_launches = P.launches;
   int32_t regime = IMD_PERF_REGIME_BURST;
-  const double f = resolve_clock(cal, P, q, &regime);
+  const CacheTerms ct = cache_terms(cal, P, q.cache);
+  const double f = resolve_clock(cal, P, q, ct, &regime);
   const double scale = time_scale(cal, f);
-  // COLD / WARM (DESIGN §6c.1 "Cache state"): the parameters are COLD costs (the fitter adds the
-  // calibration records' resident-input saving back); a REPEAT / WARM call saves warm.l2byte per
-  // resident input byte in the phases that read them first.
-  const double Lw = cal.warm_l2_bytes, I = P.inputs;
-  const double res_repeat = std::clamp(Lw - (P.footprint - I), 0.0, I);
-  // WARM is modeled as REPEAT (measured on the 4090, NOTES-B2 §6: a call whose A was the
-  // previous call's C runs within -7 ... +3 % of the same call repeated; COLD, an evicted L2,
-  // is the real effect: up to +16 % for calls whose footprint fits the L2).
-  // v1.18 (§6c.8): CLEAN (an L2 flushed by reads) has COLD's res = 0 and a credit on the call
-  // phase for the write-back a clean L2 does not pay; REPEAT / WARM save c per call when an
-  // input is resident. COLD (inputs evicted by other, dirty work) is unchanged.
-  const bool cold = q.cache == IMD_PERF_CACHE_COLD || q.cache == IMD_PERF_CACHE_CLEAN;
-  const double res = cold ? 0.0 : res_repeat;
-  const double cache_ns = -res * cal.warm_l2byte_ns - (res > 0 ? cal.warm_call_ns : 0.0);
-  const double clean_ns = q.cache == IMD_PERF_CACHE_CLEAN
-                              ? -cal.warm_clean_byte_ns *
-                                    std::min(std::max(P.footprint - I, 0.0), std::max(Lw, 0.0))
-                              : 0.0;
   double t = 0, bound = 0, lo = 0, hi = 0;
   for (int i = 0; i < P.n; ++i) {
     const PerfPhase& p = P.ph[i];
     imd_perf_phase_t& o = r->phase[i];
     o.phase = p.phase, o.cls = p.cls, o.launches = p.launches;
-    o.time_s = perf_phase_seconds(cal, p, scale);
-    if (I > 0 && p.in_bytes > 0) o.time_s = std::max(0.0, o.time_s + cache_ns * 1e-9 * p.in_bytes / I);
-    if (p.cls == IMD_PERF_CLASS_CALL && clean_ns != 0) o.time_s += clean_ns * 1e-9;
+    o.time_s = phase_seconds(cal, p, scale, ct);
     o.bytes = p.bytes, o.ops = p.ops;
     const double peak = p.peak == 1 ? cal.peak_int8_ops_per_s
                         : p.peak == 2 ? cal.peak_fp64_flops_per_s
@@ -1385,9 +1412,9 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
   r->cache = q.cache;
   r->clock_mhz = f;
   r->power_w = f > 0 && P.n > 0
-                   ? call_power(cal, P, f, call_seconds(cal, P, scale), call_seconds(cal, P, 1.0))
+                   ? call_power(cal, P, f, t, call_seconds(cal, P, 1.0))  // t: this state's time
                    : 0;
-  r->warm_bytes = res;
+  r->warm_bytes = ct.res;
 }
 
 int32_t dispatch_of(const ExecPlan& e) {

@@ -484,7 +484,9 @@ enum { IMD_PERF_REGIME_DEFAULT = 0,   /* SUSTAINED if the calibration has a powe
 enum { IMD_PERF_CACHE_COLD = 0,       /* the inputs come from DRAM                           */
        IMD_PERF_CACHE_WARM = 1,       /* the input was the previous call's output; modeled as
                                          REPEAT (provisional: one method, square GEMM pairs,
-                                         N = 14 / 16). Recommended in that case.             */
+                                         N = 14 / 16). Recommended in that case. The v1.18
+                                         pairs measure WARM 4.5-11.9 % below REPEAT on held-
+                                         out shapes (NOTES-B2 §12; open).                     */
        IMD_PERF_CACHE_REPEAT = 2,     /* the calibration's state: the same call just ran (the
                                          inputs resident only if the whole footprint fits)   */
        IMD_PERF_CACHE_CLEAN = 3       /* v13 (§6c.8): the inputs evicted and the L2 clean (an

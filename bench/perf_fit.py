@@ -649,6 +649,16 @@ def boost_clock(rows):
     return float(statistics.median(f)) if f else 0.0
 
 
+def fold_power_kw(power_kw, train):
+    """v1.18 review (DESIGN §6c.8): the fit_power arguments of one fold. With boost_auto (no
+    --clock-boost-mhz) the boost clock is the training windows' own boost_clock, so a left-out
+    uncapped window never sets the clock it is predicted at; a given boost stays fixed."""
+    kw = dict(power_kw)
+    if kw.pop("boost_auto", False):
+        kw["boost"] = boost_clock(train)
+    return kw
+
+
 POWER_FORMS = ("busy", "scaled", "unscaled")
 
 
@@ -715,7 +725,7 @@ def power_validation(rows, meta, params, extra, fref, lib=None, verbose=True, id
         train = [r for r in rows if r["case"] != case]
         if len(train) < 4:
             continue
-        pw = fit_power(train, fref, idle=idle, **power_kw)
+        pw = fit_power(train, fref, idle=idle, **fold_power_kw(power_kw, train))
         cal = host.Calibration.from_values(meta, params, lib, dict(extra, **pw))
         for r in rows:
             if r["case"] != case:
@@ -778,7 +788,7 @@ def nested_fref_validation(rows, meta, params, extra, fref, lib, idle, power_kw,
         if not scan:
             continue
         fr = fref_select(scan, rule)
-        pw = fit_power(train, fr, idle=idle, **power_kw)
+        pw = fit_power(train, fr, idle=idle, **fold_power_kw(power_kw, train))
         cal = host.Calibration.from_values(meta, params, lib, dict(extra, **pw))
         for r in rows:
             if r["case"] == case:
@@ -1175,8 +1185,15 @@ def main(argv=None):
         if a.power_form == "busy":
             boost = boost_clock(rows) if a.clock_boost_mhz is None else a.clock_boost_mhz
             power_kw["boost"] = boost
+            # v1.18 review: the LOO / nested folds recompute it from their training windows
+            power_kw["boost_auto"] = a.clock_boost_mhz is None
+            uncapped = sum(1 for r in rows if not r["capped"])
             print(f"boost clock of the power solve: {boost:.0f} MHz ("
-                  f"{'given' if a.clock_boost_mhz is not None else 'median of the ' + str(sum(1 for r in rows if not r['capped'])) + ' uncapped windows'})")
+                  f"{'given' if a.clock_boost_mhz is not None else 'median of the ' + str(uncapped) + ' uncapped windows; recomputed in every fold'})")
+            if a.clock_boost_mhz is None and uncapped == 0:
+                print("WARNING: no sustained window below the power cap: no boost clock (the "
+                      "solve stops at f_ref) while the busy power P_act is still fitted; pass "
+                      "--clock-boost-mhz or add uncapped windows (DESIGN §6c.8)", file=sys.stderr)
         if len(rows) >= 4 and fref > 0:
             # The time model's effective clock (DESIGN §6c.1): the burst calibration's large calls
             # already ran below the boost clock (the limiter acts within a timed loop), so the
@@ -1199,7 +1216,7 @@ def main(argv=None):
                     for lab, tm, tp, fm, fp, pm, pp, ff in nest:
                         print(f"    {lab[:44]:<44} {100 * (tp - tm) / tm:>+6.1f}%  f {fm:.0f} / "
                               f"{fp:.0f} MHz  P {pm:.0f} / {pp:.0f} W  (fold f_ref {ff:.0f})")
-            pw = fit_power(rows, fr, idle=a.idle_w, **power_kw)
+            pw = fit_power(rows, fr, idle=a.idle_w, **fold_power_kw(power_kw, rows))
             print(f"power model ({a.power_form} form" +
                   (f", power.byte_pj held at {a.byte_pj:g} pJ/B" if a.power_form != "unscaled" else "")
                   + "): " + ", ".join(f"{k} {v:.4g}" for k, v in pw.items()))

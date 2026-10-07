@@ -1417,7 +1417,8 @@ def suite_perf_v117(cal):
     optional (absent = 0, written only when non-zero, format-2 keys); the new terms are
     additive (with their parameters 0 the features change but no time does); pack.dram with
     L_hit 0 charges every byte; a v11-sized struct reads L_hit as warm.l2_bytes when
-    pack.dram > 0, else 0 (review 2026-10-06: exact for the shipped calibration)."""
+    pack.dram > 0, else 0 (review 2026-10-06: exact for a v1.17-style file; v1.18 review: for
+    the v1.18 shipped file exactly the documented degraded view)."""
     count = 0
     shapes = [("ik,jk->ij", dict(i=1024, j=1024, k=1024)), ("ik,jk->ij", dict(i=1472, j=1472, k=1472)),
               ("ik,jk->ij", dict(i=1792, j=1792, k=1792)), ("ik,jk->ij", dict(i=1024, j=96, k=4096)),
@@ -1517,15 +1518,27 @@ def suite_perf_v117(cal):
     if st != 0 or preds(v11bc) != p0 or v11bc.format() != tb:
         raise Fail("a v11-sized struct with pack.dram = 0 is not the calibration without the keys")
     count += 1
-    # the shipped calibration: its v11 default view predicts exactly as NULL (the full one)
+    # v1.18 review: the fallback is exact for a v1.17-style file (L_hit = warm.l2_bytes, no
+    # v1.18 keys): its v11 view predicts as the full calibration
+    if cal.params["pack.dram"] > 0:
+        c117 = host.Calibration.from_values(cal.meta, cal.params, extra=dict(cal.extra, **dict(
+            {kk: 0.0 for kk in V118_KEYS}, **{"warm.pack_l2_bytes": cal.warm["warm.l2_bytes"]})))
+        t117 = c117.format().encode()
+        st, v11e, _ = _sized_calib("imd_perf_calib_parse_ex", V11_CALIB_SIZE, t117, len(t117))
+        if st != 0 or preds(host.Calibration(v11e, host.load())) != preds(c117):
+            raise Fail("a v1.17-style file's v11 view does not predict as the file")
+        count += 1
+    # the shipped calibration's v11 default view: exactly the documented degraded view (the
+    # v1.18 fields 0, L_hit = warm.l2_bytes when pack.dram > 0); since v1.18 not NULL's model
     st, v11d, _ = _sized_calib("imd_perf_calib_default_ex", V11_CALIB_SIZE)
     if st != 0:
         raise Fail("v11 view (default)")
-    if cal.params["pack.dram"] > 0 and cal.warm["warm.l2_bytes"] == cal.warm["warm.pack_l2_bytes"] \
-            and not any(cal.extra[kk] != 0.0 for kk in V118_KEYS):
-        if preds(host.Calibration(v11d, host.load())) != preds(None):
-            raise Fail("the shipped calibration's v11 view does not predict as NULL")
-        count += 1
+    deg = host.Calibration.from_values(cal.meta, cal.params, extra=dict(cal.extra, **dict(
+        {kk: 0.0 for kk in V118_KEYS},
+        **{"warm.pack_l2_bytes": cal.warm["warm.l2_bytes"] if cal.params["pack.dram"] > 0 else 0.0})))
+    if preds(host.Calibration(v11d, host.load())) != preds(deg):
+        raise Fail("the shipped calibration's v11 view is not the documented degraded view")
+    count += 1
     return count
 
 
@@ -1708,6 +1721,38 @@ def suite_perf_v118(cal):
             host.predict(*big, N=8, regime="BURST", calib=c0).power_w:
         raise Fail("DRAM energy not charged to a call beyond the L2")
     count += 2
+    # (5b) v1.18 review: the power divides by the request's cache-state time (energy / t of the
+    # state, so (P - idle) t is the same in every state at a given clock), and the SUSTAINED
+    # solve of a REPEAT / CLEAN request brackets the cap with that state's power
+    c_e = host.Calibration.from_values(cal.meta, cal.params, extra=dict(pw, **{
+        "warm.call_ns": 1200.0, "warm.clean_byte": 1.7e-4}))
+    c_ec = host.Calibration.from_values(cal.meta, cal.params, extra=dict(pw, **{
+        "warm.call_ns": 1200.0, "warm.clean_byte": 1.7e-4, "power.clock_boost_mhz": 2790.0,
+        "power.act_w": 160.0, "power.act_gap_us": 1.0, "power.dram_pj": 80.0}))
+    n_faster = 0
+    for sp, ex in shapes:
+        for N in (8, 14):
+            pc = host.predict(sp, ex, N=N, clock_mhz=2400.0, cache="COLD", calib=c_e)
+            if pc.status != "SUCCESS":
+                continue
+            for cc in ("REPEAT", "WARM", "CLEAN"):
+                pq = host.predict(sp, ex, N=N, clock_mhz=2400.0, cache=cc, calib=c_e)
+                ec, eq = (pc.power_w - 60.0) * pc.time_s, (pq.power_w - 60.0) * pq.time_s
+                if abs(eq - ec) > 1e-9 * ec:
+                    raise Fail(f"{cc} power not energy / its own time: {sp} {ex} N={N}")
+                if pq.time_s < pc.time_s * (1 - 1e-9):
+                    n_faster += 1
+                    if not pq.power_w > pc.power_w:
+                        raise Fail(f"a faster {cc} call does not draw more power")
+                ps = host.predict(sp, ex, N=N, regime="SUSTAINED", cache=cc, calib=c_ec)
+                if 1500.0 < ps.clock_mhz < 2790.0:
+                    lo_, hi_ = (host.predict(sp, ex, N=N, clock_mhz=ps.clock_mhz + d, cache=cc,
+                                             calib=c_ec).power_w for d in (-0.05, 0.05))
+                    if not lo_ <= 450.0 <= hi_:
+                        raise Fail(f"SUSTAINED {cc}: {ps.clock_mhz} MHz ({lo_} .. {hi_} W)")
+                count += 1
+    if not n_faster:
+        raise Fail("no REPEAT / CLEAN call faster than COLD: the state-time check is vacuous")
     # (6) a v12-sized struct: parse leaves the tail alone; it predicts as the calibration without
     # the seven keys
     data = tf.encode()
