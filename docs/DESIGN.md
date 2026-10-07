@@ -5113,9 +5113,11 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   i9-13900K (three contractions: the CC ring of §6e.1 at v = 64, o = 32, the DF build
   acQ,bdQ→acbd at 64⁴ with Q = 2032, and 4096³; levels 6–14; NORMWISE targets 1e−8, 1e−10,
   1e−12; median of 7): `phase()` takes 0.31–0.34 ms in-line with one vec mode and 3.4–3.8 ms
-  with every pack mode and both vec modes; `configs()` takes 0.48–6.1 ms (immerdink-eval
-  `results/c1/stage1_phase_cost.txt`). It runs at phase switches, off the hot path;
-  ehrenfest's hot-path rank calls are untouched.
+  with every pack mode and both vec modes; `configs()` takes 0.48–6.1 ms. A re-run on
+  51dba1e, after the stage-1 review fixes, reproduces these figures to within 0.04 ms
+  (immerdink-eval `findings/c1-stage1-phase-cost.md`: the committed script, both records
+  with their sha256, the product commits and the library's sha256). It runs at phase
+  switches, off the hot path; ehrenfest's hot-path rank calls are untouched.
 - **Limits.** The choice is the performance model's [M], outside its hold-out at
   N ∉ {8, 10, 14, 16} until NOTES-C1's M-c passes. Rank's footprint tie order
   (`TIES_BY_FOOTPRINT`) is not applied to the composed times. A phase names every

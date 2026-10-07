@@ -48,7 +48,10 @@ what has been built since is recorded under "Implementation status".
   the implementation's design questions are §5.5. The binding ones: a share-group member at
   DIRECT leaves the group for the phase, `BUDGET` only on a met target (S1-5, S1-3), and a
   1-D norm bound of `rho_from_output` is always axis −2 or −1 (S1-7). One question raised by
-  the fix (S1-10) is pending.
+  the fix (S1-10) is pending. The provenance of DESIGN §6g.10's cost figures (IR9 style) is
+  immerdink-eval `findings/c1-stage1-phase-cost.md`, with the script committed there
+  (39d9f9f) and both records untracked, listed with their sha256; a re-run on 51dba1e
+  reproduces the first record to within 0.04 ms.
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
