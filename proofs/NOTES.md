@@ -35,7 +35,7 @@ downloaded, never built from source.
 | L3c (3), the native FMA chain | `Summation.fma_chain` (γ_k) | `Proofs/Summation.lean` |
 | L7a (recursive summation, γ_k) | `Summation.recsum` (power form `recsum_pow`; `pow_sub_one_le_gam`, `gam_nonneg`) | `Proofs/Summation.lean` |
 | L7b (segmented bound) | `Segments.kseg_compose` (`kseg_compose_sub` with gradual underflow; per band `band_bound`); from the band rows through L3c (1): `kseg_rows` | `Proofs/Segments.lean` |
-| L7c (metric forms) | `Segments.bands_norm_le` (N_S ≤ ‖a‖‖b‖), `kseg_normwise`; E monotone (`E_s ≤ E(k)`): `Error.unitE_mono` | `Proofs/Segments.lean`, `Proofs/Error.lean` |
+| L7c (metric forms) | `Segments.bands_norm_le` (N_S ≤ ‖a‖‖b‖), `kseg_normwise`; E monotone (`E_s ≤ E(k)`): `Error.unitE_mono`; (7) ρ_S from the output: `kseg_wbar_le`, `kseg_rho_le` | `Proofs/Segments.lean`, `Proofs/Error.lean` |
 | L7d (the recipe's request) | `Segments.gam_mul_le`, `kseg_request_core` (the exact half) | `Proofs/Segments.lean` |
 
 ## Modelling choices
@@ -84,7 +84,9 @@ These choices are faithful to PROOFS.md, but they are not literal transcriptions
     restated.
   - L7d's FP evaluation of `t′` (two roundings, `params.kseg_request`) is not modelled;
     `kseg_request_core` proves the exact half, and `cert_kseg_composition` checks the
-    rounding.
+    rounding. Likewise L7c (7): `kseg_wbar_le` and `kseg_rho_le` are the exact statements;
+    their outward-rounded evaluation (`params.kseg_wbar_up`, `params.rho_recipe`) is checked
+    by `cert_kseg_composition` (7).
 
 ## Discrepancies with PROOFS.md and proposed text
 

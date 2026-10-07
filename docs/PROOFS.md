@@ -224,7 +224,9 @@ NOTES-C1 §4.4.
   bands of the canonical order). For a row a and a column b, `a^s` and `b^s` are their
   restrictions to K_s, `k_s = |K_s|`, `x_s = Σ_{h∈K_s} a_h b_h`, so `x = Σ_s x_s`.
 - D_s is the emulated product of band s: one call at (N_s, k_s, rounding) with α = 1 and
-  β = 0. Each band has its own σ_s, τ_s and N_s.
+  β = 0. Each band has its own σ_s, τ_s and N_s. A band of k_s = 1 is K-empty and runs
+  DIRECT (one fma, `D_s = RN(a_h b_h)`, so `|D_s − x_s| ≤ u|x_s|`): it satisfies everything
+  below with E_s = 0.
 - `C_1 = D_1` and `C_s = fl(C_{s−1} + D_s)`: the calls after the first use β = 1 at α = 1, and
   §3.7's `fma(1, C, E)` is one rounding of the exact sum.
 - `n_s = ‖a^s‖‖b^s‖`. E_s is L3c's E at (N_s, k_s, rounding) with the band's ν:
@@ -270,7 +272,13 @@ L7a with `d_s = D_s` gives `|C_S − Σ D_s| ≤ γ Σ|D_s|`. The triangle inequ
    ratio is near 1, while a band without the first entry has ratio √k_s. So compare only with
    the ν = √k bound, or measure ν per band.
 6. ELEMENTWISE is **worse** than L3c's `u + Eρ(1 + u)` at high N: W̄ρ_S contains
-   `(u + γ(1 + u))ρ_S` where L3c has u. Segmentation gives up the single final rounding. ∎
+   `(u + γ(1 + u))ρ_S` where L3c has u. Segmentation gives up the single final rounding.
+7. ρ_S from the output. With `U_s = E_s(1 + u) + u` and `U ≥ max_s U_s`:
+   `W̄ ≤ U + Su(1 + U)`, since `W_s = U_s + γ(1 + u)(1 + E_s)`, `γ(1 + u) ≤ Su` (L7d step 1,
+   S ≤ 2²⁶) and `E_s ≤ U_s`. If `|C_S| > W̄·N_S` then
+   `|x| ≥ |C_S| − |C_S − x| ≥ |C_S| − W̄·N_S > 0`, so `N_S/|x| ≤ N_S/(|C_S| − W̄·N_S)`, which
+   increases with N_S and W̄: upper bounds of both, rounded outward as in DESIGN §6g.11, give
+   a valid ρ_S. ∎
 
 **Claim L7d (the recipe's request).** Let `t_eff > 0` be RN of a positive rational t̄, let
 `S ≤ 2²⁶`, and let `t′ = RN(RN(min(t_eff, 1)·(1 − 2⁻⁵⁰)) − 4S·2⁻⁵³)` (`params.kseg_request`).
@@ -280,8 +288,10 @@ If `E(1 + u) + u ≤ t′` then `u + (1 + u)E + γ(1 + u)(1 + E) ≤ t̄`.
 1. `γ_{S−1}(1 + u) ≤ Su`: with j = S − 1 it is `j(1 + u) ≤ (j + 1)(1 − ju)`, i.e.
    `j(j + 2)u ≤ 1`, true for S ≤ 2²⁶.
 2. `E ≤ E(1 + u) + u ≤ t′ ≤ 1`, so the left side is `≤ t′ + Su(1 + t′) ≤ t′ + 2Su`.
-3. If `t_eff ≤ 1`: `t_eff ≤ t̄(1 + u)`, the product rounds up by at most a factor `1 + u`, and
-   `t′ > 0` rounds up by at most `1 + u` too, so
+3. If `t_eff ≤ 1`: everything is in the normal range, since `t′ ≥ u` (step 2) forces
+   `RN(min(t_eff, 1)(1 − 2⁻⁵⁰)) > 4Su ≥ 2⁻⁵¹`, so t_eff, t̄, the product and the difference
+   are all normal. Hence `t_eff ≤ t̄(1 + u)`, the product rounds up by at most a factor
+   `1 + u`, and `t′ > 0` rounds up by at most `1 + u` too, so
    `t′ ≤ t̄(1 − 2⁻⁵⁰)(1 + u)³ − 4Su < t̄(1 − 4u) − 4Su`, and `t′ + 2Su < t̄`.
 4. If `t_eff > 1` then `t̄ > 1` (RN is monotone and 1 is a double), and
    `t′ ≤ (1 − 2⁻⁵⁰)(1 + u) − 4Su`, so `t′ + 2Su < 1 < t̄`. ∎

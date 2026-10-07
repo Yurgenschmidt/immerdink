@@ -23,6 +23,7 @@ Results:
   `W_s = u + (1+u)E_s + γ_m(1+u)(1+E_s)` (and `kseg_compose_sub` with the `(1+γ)·S·η` term);
   `kseg_rows` chains it from the band rows through L3c (1) (`Error.l3c_unit`);
 * **L7c** `bands_norm_le` (`N_S ≤ ‖a‖‖b‖`) and `kseg_normwise`: `|C m − x| ≤ W̄·‖a‖‖b‖`;
+  (7) `kseg_wbar_le` (`W ≤ U + (m+1)u(1+U)`) and `kseg_rho_le` (ρ_S from the output);
 * **L7d** `gam_mul_le` (`γ_m(1+u) ≤ (m+1)u` for `m(m+2)u ≤ 1`) and `kseg_request_core`: the
   exact half of the recipe's request (`E(1+u) + u ≤ t′`, `t′ + 2Su ≤ t̄` ⇒ `W ≤ t̄`); the
   rounding of `t′` itself is checked by `cert_kseg_composition`.
@@ -198,5 +199,29 @@ theorem kseg_request_core {u E t' tbar : ℝ} (hu : 0 ≤ u) (hE : 0 ≤ E) {m :
       _ ≤ (m + 1) * u * 2 :=
           mul_le_mul_of_nonneg_left h2 (mul_nonneg (by positivity) hu)
   nlinarith
+
+/-- **L7c (7), W̄ from the NORMWISE coefficient.** If `E ≥ 0` and `E(1 + u) + u ≤ U`, then
+`W(E) ≤ U + (m + 1)u(1 + U)` (`params.kseg_wbar_up` evaluates the right side rounding
+upward). -/
+theorem kseg_wbar_le {u E U : ℝ} (hu : 0 ≤ u) (hE : 0 ≤ E) {m : ℕ}
+    (hmm : m * (m + 2) * u ≤ 1) (hm : m * u < 1) (hU : E * (1 + u) + u ≤ U) :
+    W u E m ≤ U + (m + 1) * u * (1 + U) := by
+  have hg := gam_mul_le hu hmm hm
+  have hEU : E ≤ U := by nlinarith [mul_nonneg hE hu]
+  have h1 : gam m u * (1 + u) * (1 + E) ≤ (m + 1) * u * (1 + U) := by
+    calc gam m u * (1 + u) * (1 + E) ≤ (m + 1) * u * (1 + E) :=
+          mul_le_mul_of_nonneg_right hg (by linarith)
+      _ ≤ (m + 1) * u * (1 + U) :=
+          mul_le_mul_of_nonneg_left (by linarith) (mul_nonneg (by positivity) hu)
+  unfold W
+  nlinarith [h1, hU]
+
+/-- **L7c (7), ρ_S from the output.** If `|C − x| ≤ W̄·N_S` (L7c (2)) and `W̄·N_S < |C|`,
+then `N_S/|x| ≤ N_S/(|C| − W̄·N_S)`. -/
+theorem kseg_rho_le {C x Wbar NS : ℝ} (hNS : 0 ≤ NS) (herr : |C - x| ≤ Wbar * NS)
+    (hden : Wbar * NS < |C|) : NS / |x| ≤ NS / (|C| - Wbar * NS) := by
+  have hx : |C| - Wbar * NS ≤ |x| := by
+    have := abs_sub_abs_le_abs_sub C x; linarith
+  exact div_le_div_of_nonneg_left hNS (by linarith) hx
 
 end Immerdink.Segments

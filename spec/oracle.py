@@ -1657,7 +1657,8 @@ def kweights_apply(T: Tensor, labels, qstride, w, sign: int = 1) -> Tensor:
 # contiguous bands and issues one ordinary call per band, the first with its own alpha and
 # beta and every later one with beta = 1, so band s is accumulated into C by §3.7's single
 # fma: C <- fma(1, C, E_s) = RN(C + E_s). Each band is its own call, with its own plan k_s,
-# sigma / tau and RN acceptance. contract_segments() is that sequence of contract() calls,
+# sigma / tau and RN acceptance, dispatched as contract_tensor dispatches it (§4): a band of
+# k_s = 1 is K-empty and runs DIRECT. contract_segments() is that sequence of calls,
 # literally; with alpha = 1 and beta = 0 its result is PROOFS L7's C_S.
 
 def segment_bounds(k: int, S: int) -> list:
@@ -1677,18 +1678,25 @@ def contract_segments(A, B, C, N: int, rounding: str = "RN", bounds=None,
                       alpha: float = 1.0, beta: float = 0.0, g: int | None = None,
                       chunk: int = K_C_ALIGNED, m=None, n=None, k=None,
                       trace: dict | None = None):
-    """The K-segmentation recipe as a literal composition of contract() (NOTES-C1 §4.4).
+    """The K-segmentation recipe as a literal composition of its calls (NOTES-C1 §4.4), an
+    EMULATE recipe (no mode parameter: mode DIRECT has no moduli to save).
 
     bounds = [b_0 = 0 < b_1 < ... < b_S = k] (default segment_bounds(k, 2)): band s holds the
-    canonical K positions b_{s-1} <= h < b_s. Band 1 is contract(A[:, band], B[band, :], C,
-    alpha, beta); band s > 1 is contract(..., C_{s-1}, alpha, 1.0), i.e. C_s = fma(1, C_{s-1},
-    E_s) with E_s = D_s (alpha = 1) or RN(alpha D_s) (§3.7). Each band is a separate call: its
-    own plan at k_s = b_s - b_{s-1} (RN acceptance kappa_s < T per band, so NotSupported only
-    if a band is too long), its own sigma / tau, its own non-finite scan (a flagged row of one
-    band takes the native path in that band only). C is read only if beta != 0 (band 1).
-    InvalidValue for bounds that are not strictly increasing from 0 to k (an empty band; k = 0
-    has no band). `trace`, if a dict, receives bounds, the per-band contract() traces
-    ("segments") and the partial results C_1..C_S ("partial")."""
+    canonical K positions b_{s-1} <= h < b_s. Band 1 is the call (A[:, band], B[band, :], C,
+    alpha, beta); band s > 1 is (..., C_{s-1}, alpha, 1.0), i.e. C_s = fma(1, C_{s-1}, E_s)
+    with E_s = D_s (alpha = 1) or RN(alpha D_s) (§3.7). Each band is a separate call,
+    dispatched as contract_tensor dispatches the band's GEMM view (§4):
+      k_s >= 2: contract(), its own plan at k_s = b_s - b_{s-1} (RN acceptance kappa_s < T per
+        band, so NotSupported only if a band is too long), its own sigma / tau, its own
+        non-finite scan (a flagged row of one band takes the native path in that band only);
+      k_s = 1: K-empty, so DIRECT (§6f.2): D = native_dot (acc = +0, one fma), no plan;
+      alpha = 0: SCALE in either case (C <- beta == 0 ? +0 : RN(beta C)).
+    A and B are not read when alpha == 0 (they may be None; then pass m, n, k, as for
+    contract()); C is read only if beta != 0 (band 1). InvalidValue for bounds that are not
+    integers strictly increasing from 0 to k (an empty band; k = 0 has no band), and for N,
+    rounding or g out of range (as each band's call). `trace`, if a dict, receives bounds, the
+    per-band traces ("segments": contract()'s for a GEMM band, else {}, each with its "kind")
+    and the partial results C_1..C_S ("partial")."""
     if m is None:
         m = len(A)
     if k is None:
@@ -1697,18 +1705,40 @@ def contract_segments(A, B, C, N: int, rounding: str = "RN", bounds=None,
         n = len(B[0]) if k else len(C[0])
     if bounds is None:
         bounds = segment_bounds(k, 2) if k >= 2 else [0, k]
-    bounds = list(bounds)
+    try:
+        bounds = [b.__index__() for b in bounds]      # integers (numpy's too), else invalid
+    except (AttributeError, TypeError):
+        raise InvalidValue(f"contract_segments: bounds {bounds!r} are not integers") from None
     if len(bounds) < 2 or bounds[0] != 0 or bounds[-1] != k or \
             any(b1 <= b0 for b0, b1 in zip(bounds, bounds[1:])):
         raise InvalidValue(f"contract_segments: bounds {bounds!r} do not partition [0, {k})")
+    if not (N_MIN <= N <= N_MAX) or rounding not in ("RN", "TRUNC") or \
+            not (g in (None, 0) or 1 <= g <= N):
+        raise InvalidValue(f"contract_segments: N={N}, rounding={rounding!r}, g={g}")
+    reads_ab = alpha != 0.0
     traces, partial, Cs = [], [], C
     for s, (b0, b1) in enumerate(zip(bounds, bounds[1:])):
-        As = [A[i][b0:b1] for i in range(m)]
-        Bs = [B[h] for h in range(b0, b1)]
+        ks, bs = b1 - b0, (beta if s == 0 else 1.0)
+        kind = "SCALE" if not reads_ab else "DIRECT" if ks == 1 else "GEMM"
+        As = [A[i][b0:b1] for i in range(m)] if reads_ab else None
+        Bs = [B[h] for h in range(b0, b1)] if reads_ab else None
         t = {} if trace is not None else None
-        Cs = contract(As, Bs, Cs, alpha, beta if s == 0 else 1.0, N, rounding, g=g,
-                      chunk=chunk, m=m, n=n, k=b1 - b0, trace=t)
+        if ks > 1:                       # contract(): GEMM, or SCALE after its plan time
+            Cs = contract(As, Bs, Cs, alpha, bs, N, rounding, g=g, chunk=chunk, m=m, n=n,
+                          k=ks, trace=t)
+        else:                            # K-empty, as contract_tensor: no plan
+            Cn = [[None] * n for _ in range(m)]
+            for i in range(m):
+                for j in range(n):
+                    if kind == "SCALE":
+                        Cn[i][j] = 0.0 if bs == 0.0 else mul(bs, Cs[i][j])
+                        continue
+                    D = native_dot(As[i], [Bs[0][j]])          # fma(a, b, +0)
+                    E = D if alpha == 1.0 else mul(alpha, D)
+                    Cn[i][j] = E if bs == 0.0 else fma(bs, Cs[i][j], E)
+            Cs = Cn
         if trace is not None:
+            t["kind"] = kind
             traces.append(t)
             partial.append([row[:] for row in Cs])
     if trace is not None:

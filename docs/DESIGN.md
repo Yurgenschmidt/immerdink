@@ -495,7 +495,10 @@ and it gives up §3.7's single final rounding.
    contiguous). For a tensor, band s is a sub-view along one contracted label that A and B
    share: the same descriptors with that label's extent cut to the band, and both base
    pointers advanced by start × that label's stride in each operand. L7 holds for any
-   partition; the gain needs bands that follow the magnitude profile.
+   partition; the gain needs bands that follow the magnitude profile. Cutting the outermost
+   (slowest-varying) label of the canonical K order gives bands contiguous in that order;
+   cutting another label gives a non-contiguous partition of it (step 3 says what the
+   reference is then).
 2. **Calls.** Band 1 is an ordinary call with the caller's α and β. Bands 2 … S follow in a
    fixed order on the same stream, with the same α and **β = 1**, so
    `C_s = fma(1, C_{s−1}, E_s) = RN(C_{s−1} + E_s)` (§3.7). Bands of equal k_s share one plan
@@ -505,15 +508,23 @@ and it gives up §3.7's single final rounding.
      path only in the band that holds it);
    - its own RN acceptance κ_s < T(N), so a k too long for RN at small N can run in bands;
    - its own N if the caller wants (L7 takes E_s per band);
-   - packs per band: one pack per band sub-view, keyed by its k_s (§6b).
+   - packs per band: one pack per band sub-view, keyed by its k_s (§6b);
+   - its own dispatch (§4): a band of k_s = 1 is K-empty and runs DIRECT, one fma with
+     `|D_s − x_s| ≤ u|x_s|`, so L7 holds for it with E_s = 0.
 3. **Result.** Deterministic for fixed bands, order and N. `oracle.contract_segments(A, B, C,
-   N, rounding, bounds, alpha, beta)` is the literal composition of `contract` and the
-   bit-exact reference (spec/test_oracle.py (13) checks it against an independent
-   composition).
+   N, rounding, bounds, alpha, beta)` is the literal composition of the band calls, each
+   dispatched as the library dispatches it (`contract`, or DIRECT for k_s = 1), and the
+   bit-exact reference. spec/test_oracle.py (13) checks it against the same calls through
+   `contract_tensor` on moved sub-views and against an independent composition. It is an
+   EMULATE recipe, with bands contiguous in canonical K order. For a non-contiguous
+   partition (step 1) the reference is `contract_segments` on the GEMM view with its K
+   positions permuted so that each band is contiguous, in its sub-view's canonical order.
 
-**Error** (PROOFS L7; α = 1, β = 0; finite inputs, no overflow). Per output (i, j), with
+**Error** (PROOFS L7; α = 1, β = 0; finite inputs, no overflow; for NORMWISE and ELEMENTWISE
+also **every band's product D_s normal or zero**). Per output (i, j), with
 `n_s = ‖a_i^s‖‖b_j^s‖`, E_s the §6f.2 E of band s (`imd_err_estimate`'s `unit_bound` at
-(N, k_s, rounding) with **the band's** ℓ1 ratios, or 0 = √k_s) and `γ = (S−1)u/(1 − (S−1)u)`:
+(N, k_s, rounding) with **the band's** ℓ1 ratios, or 0 = √k_s; 0 for a K-empty band) and
+`γ = (S−1)u/(1 − (S−1)u)`:
 ```
 |C_S − x| ≤ Σ_s n_s·W_s,      W_s = u + (1+u)·E_s + γ·(1+u)·(1+E_s)
 ```
@@ -521,6 +532,9 @@ and it gives up §3.7's single final rounding.
   NORMWISE `≤ W̄·‖a_i‖‖b_j‖`; ELEMENTWISE `≤ W̄·ρ_S·|x|` for `ρ_S ≥ N_S/|x|` (ρ_S ≤ ρ);
   ABSOLUTE `≤ W̄·M̄ + (1+γ)·S·2⁻¹⁰⁷⁵` for `M̄ ≥ N_S` (the last term: a band's product that
   underflows gradually; the additions themselves are exact in the subnormal range).
+- **Underflow is a new hazard**: a short band's product can be subnormal while x is not, and
+  the caller does not see D_s. Only the ABSOLUTE form covers it, with its (1+γ)·S·2⁻¹⁰⁷⁵
+  term; NORMWISE and ELEMENTWISE need every D_s normal or zero (PROOFS L7's hypothesis).
 - **Against §6f.2 with ν = √k** (ℓ1 ratios 0) at the same N: `E_s ≤ E(k)`, so the NORMWISE and
   ABSOLUTE bounds exceed the unsegmented ones by `γ(1+u)(1+E)·‖a‖‖b‖` only, about (S−1)u.
 - **A whole-row ℓ1 ratio does not bound a band's**: a row (1, ε, …, ε) has a ratio near 1
@@ -531,18 +545,36 @@ and it gives up §3.7's single final rounding.
   (`cert_kseg_composition`).
 - α ≠ 1 or β ≠ 0: as §6f.2 (one more rounding for α; β's first fma is not expressed).
 
-**Choosing N (rigorous; L7d).** The gain is `N_S < ‖a‖‖b‖`, which the plain statistics do not
-see. With the per-band norms (one pass over A and B, as §6g.11's norms):
-1. `t_eff = t/r` for a NORMWISE target t relative to the plain norms, with
-   `r ≥ max_ij N_S,ij/(‖a_i‖‖b_j‖)` (r = 1 is always valid and gains nothing);
-   `t_eff = t/ρ_S` for ELEMENTWISE, with ρ_S over the outputs that must meet the target (for
-   example from a previous output's N_S/|C|, as §6g.11 does for ρ); `t_eff = t/M̄` for
-   ABSOLUTE (no underflow). One RN division is allowed.
+**Choosing N (rigorous; L7d).** For α = 1 (or α = 2^e with no RN(α·D_s) or C_s underflowing
+or overflowing, which scales the bound exactly) and β = 0: another α adds one rounding per
+band that L7d's margin does not cover. The gain is `N_S < ‖a‖‖b‖`, which the plain statistics
+do not see. With the per-band norms (one pass over A and B, as §6g.11's norms):
+1. Form the exact quotient t̄ and `t_eff = RN(t̄)` (one RN division):
+   - NORMWISE target t relative to the plain norms: `t̄ = t/r` with
+     `r ≥ max_ij N_S,ij/(‖a_i‖‖b_j‖)`, rounded upward. r = 1 is always valid and gains
+     nothing; a cheap valid r is `Σ_s max_i(‖a_i^s‖/‖a_i‖)·max_j(‖b_j^s‖/‖b_j‖)`, evaluated
+     rounding upward.
+   - ELEMENTWISE: `t̄ = t/ρ_S` with `ρ_S ≥ N_S/|x|` over the outputs that must meet the
+     target, rounded upward. A rigorous ρ_S from a previous segmented output C_S (the same
+     bands, α = 1, β = 0, every D_s normal or zero):
+     `|x| ≥ |C_S| − Σ_s n_s W_s ≥ |C_S| − W̄·N_S`, so `ρ_S ≤ N_S/(|C_S| − W̄·N_S)` where the
+     denominator is positive (PROOFS L7c (7)).
+     Evaluate it as §6g.11 does, every step rounded outward, with n ≥ N_S (the band norm
+     products summed rounding upward) and U ≥ W̄ from `params.kseg_wbar_up(Ū, S)`
+     (`Ū + S·u·(1 + Ū)` rounded upward, Ū ≥ every band's NORMWISE `bound`, γ_1 for a
+     K-empty band): ρ̂_S = `params.rho_recipe(C_S, n, 1, U)`, certified only for a finite,
+     normal C_S with a positive denominator (`cert_kseg_composition` (7)). Or take
+     `rho_from_output`'s plain ρ̂ from an unsegmented β = 0 probe: valid since ρ_S ≤ ρ, but it
+     gives up the gain. Either way, as in §6g.11, a ρ_S taken from a previous output predicts
+     the next call's value; it does not bound it.
+   - ABSOLUTE: `t̄ = t/M̄` with `M̄ ≥ N_S`, rounded upward (no underflow).
 2. `t′ = RN(RN(min(t_eff, 1)·(1 − 2⁻⁵⁰)) − 4S·2⁻⁵³)` in FP64 (`params.kseg_request`;
-   S ≤ 2²⁶). If `t′ ≤ 0`, no N meets the target with S bands.
+   S ≤ 2²⁶). If `t′ ≤ 0`, the transform certifies no N: since W ≥ S·u, L7 certifies no
+   t̄ < S·u at any N, and between S·u and about 4S·u the transform is merely conservative.
 3. Request NORMWISE target t′ with ℓ1 ratios 0: `imd_err_min_moduli` / rank on the whole
    contraction (E(k) bounds every E_s) or on each band's sub-view. Its N meets the target:
-   `E(1+u) + u ≤ t′` implies `W ≤ t_eff`.
+   `E(1+u) + u ≤ t′` implies `W ≤ t̄`, the exact quotient (L7d; t_eff = RN(t̄) can lie above
+   t̄).
 
 **When it pays** (M-a, the ≥ 2048³ class; immerdink-eval `findings/c1-evidence.md`).
 - On banded anti-correlated synthetic profiles S = 2 saves 2–4 moduli at equal sampled max
@@ -6140,8 +6172,18 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     N ∈ {3, 4, 5, 8, 14, 20}, RN and TRUNC, per-band ν, every metric, underflowing products;
     the request transform; the whole-row-ν counterexample, the lost single rounding and the
     necessity of γ). **spec/oracle.py** `segment_bounds`, `contract_segments` (a literal
-    composition of `contract`); spec/test_oracle.py (13).
+    composition of the band calls); spec/test_oracle.py (13).
   - **§7:** accurate mode (re-examined with M-a's figures), K-equilibration in the library
     (closed by its gate, with the trigger), K-segmentation as a library mode, larger moduli
     (with arXiv:2603.10634), the N-range plan, multi-N / round-to-odd packs, device-chosen N,
     Ozaki-I slices and the K5 statistics, each with its trigger where deferred.
+  - **Stage-3 review fixes** (independent reviewer, approve-with-fixes; verdicts in NOTES-C1
+    §5.7): a band of k_s = 1 is K-empty and runs DIRECT, as the library dispatches it
+    (`contract_segments` emulated it, so it was not the bit-exact reference there; test (13)
+    now also runs the recipe's calls through `contract_tensor` on moved sub-views); a
+    rigorous ELEMENTWISE ρ_S from a previous segmented output, N_S/(|C_S| − W̄·N_S) rounded
+    outward with `params.kseg_wbar_up` (PROOFS L7c (7), `cert_kseg_composition` (7)), in
+    place of the unsound N_S/|C|; the transform scoped to α = 1 or 2^e and β = 0, with r and
+    ρ_S rounded upward, its guarantee stated as W ≤ t̄ and "t′ ≤ 0" as "no N certified"; the
+    underflow hypothesis of NORMWISE and ELEMENTWISE; the reference of a non-contiguous
+    partition; `contract_segments` without A and B at α = 0.

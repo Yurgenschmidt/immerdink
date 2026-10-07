@@ -40,11 +40,12 @@ What is checked (numbers refer to the oracle task list, sections to DESIGN.md):
       other labels), the guard against materialized weighted rows, exactness of every scaled
       entry, joint-K-permutation invariance, determinism, L5c in exact rationals, the CRT
       precondition and z on the weighted operands, DIRECT results bitwise unchanged.
-  (13) K-segmentation (NOTES-C1 §4.4, stage 3): oracle.contract_segments against an
-      independent composition of per-band contract() calls and exact RN(C + E_s) steps,
-      S = 1 bitwise equal to contract(), per-band sigma / z / CRT precondition, PROOFS L7's
-      proof skeleton in exact rationals, alpha / beta, band-local flags, per-band RN
-      acceptance, the decay_opp gain, validation.
+  (13) K-segmentation (NOTES-C1 §4.4, stage 3): oracle.contract_segments against the
+      recipe's calls through contract_tensor on moved sub-views and against an independent
+      composition of per-band library calls and exact RN(C + E_s) steps, S = 1 bitwise
+      equal to contract(), K-empty bands (k_s = 1) DIRECT, per-band sigma / z / CRT
+      precondition, PROOFS L7's proof skeleton in exact rationals, alpha / beta (alpha = 0
+      without A, B), band-local flags, per-band RN acceptance, the decay_opp gain, validation.
   NB residue-group size g cannot influence the oracle's result by construction (each plane
   is computed independently from the same quantized operands); g-independence of the real
   buffer schedule is the Pipeline spec's job. The g loop in (3) only checks plumbing.
@@ -2042,16 +2043,44 @@ def test_kweights():
                            f"guard seen on fixtures: {s_found['guard0']}")
 
 
+def seg_band_tensor(A, B, Cflat, alpha, beta, N, rnd, b0, b1, trace=None):
+    """One band of the recipe as the library runs it (DESIGN §3.8 step 1): contract_tensor on
+    the sub-view of row-major A (m x k) and B (k x n), K's extent cut to b1 - b0 and both base
+    pointers advanced by b0 x K's stride; C row-major m x n. Returns C's new flat buffer."""
+    m, n, k = len(A), len(B[0]), len(B)
+    i, j, kk = 1, 2, 3
+    Ad = o.Desc([m, b1 - b0], [k, 1], [i, kk])
+    Bd = o.Desc([b1 - b0, n], [n, 1], [kk, j])
+    Cd = o.Desc([m, n], [n, 1], [i, j])
+    return o.contract_tensor(o.Tensor([v for r in A for v in r], b0, Ad),
+                             o.Tensor([v for r in B for v in r], b0 * n, Bd),
+                             o.Tensor(Cflat, 0, Cd), alpha, beta, N, rnd, trace=trace)
+
+
+def seg_library(A, B, C, N, rnd, bounds, alpha=1.0, beta=0.0):
+    """The recipe's calls through the library's front end: seg_band_tensor per band, band 1
+    with (alpha, beta), later bands with (alpha, 1), C's buffer chained. Returns (C_S as an
+    m x n list, the per-band dispatch kinds)."""
+    m, n = len(A), len(B[0])
+    Cf, kinds = [v for r in C for v in r], []
+    for s, (b0, b1) in enumerate(zip(bounds, bounds[1:])):
+        t = {}
+        Cf = seg_band_tensor(A, B, Cf, alpha, beta if s == 0 else 1.0, N, rnd, b0, b1, t)
+        kinds.append(t["kind"])
+    return [Cf[i * n:(i + 1) * n] for i in range(m)], kinds
+
+
 def seg_compose(A, B, C, N, rnd, bounds, alpha=1.0, beta=0.0):
     """Independent composition of the K-segmentation recipe: each band's product D_s from a
-    plain contract() call (alpha = 1, beta = 0), E_s = RN(alpha D_s), and the accumulation
-    by exact rationals and one correct rounding (round_fraction): C_1 = RN(beta C + E_1) (or
-    E_1 for beta = 0), C_s = RN(C_{s-1} + E_s). Returns (C_S, the per-band D lists)."""
+    plain library call on the band's sub-view (seg_band_tensor, alpha = 1, beta = 0: GEMM, or
+    DIRECT for a K-empty band of k_s = 1), E_s = RN(alpha D_s), and the accumulation by exact
+    rationals and one correct rounding (round_fraction): C_1 = RN(beta C + E_1) (or E_1 for
+    beta = 0), C_s = RN(C_{s-1} + E_s). Returns (C_S, the per-band D lists)."""
     m, n = len(A), len(B[0])
     Ds, out = [], None
     for b0, b1 in zip(bounds, bounds[1:]):
-        D = o.contract([r[b0:b1] for r in A], B[b0:b1], [[0.0] * n for _ in range(m)],
-                       1.0, 0.0, N, rnd)
+        Df = seg_band_tensor(A, B, [0.0] * (m * n), 1.0, 0.0, N, rnd, b0, b1)
+        D = [Df[i * n:(i + 1) * n] for i in range(m)]
         Ds.append(D)
         E = [[x if alpha == 1.0 else o.round_fraction(fr(alpha) * fr(x)) for x in r] for r in D]
         if out is None:
@@ -2066,14 +2095,17 @@ def seg_compose(A, B, C, N, rnd, bounds, alpha=1.0, beta=0.0):
 
 def test_segments():
     """(13) K-segmentation (NOTES-C1 §4.4, stage 3; DESIGN §3.8 "Segmented accumulation"):
-    oracle.contract_segments against an independent composition (seg_compose), S = 1 bitwise
-    equal to contract(), segment_bounds against the array_split rule, each band's sigma from
-    the band alone and its z = sum a'b' with the CRT precondition, PROOFS L7's proof skeleton
-    in exact rationals (every band's L3a l1 bound plus u|D_s|, plus gamma_{S-1} sum |D_s|),
-    determinism across chunk lengths and g, alpha / beta and an unread C, band-local flags,
-    the per-band RN acceptance, the decay_opp gain, validation."""
+    oracle.contract_segments against the recipe's calls through contract_tensor on moved
+    sub-views (seg_library) and against an independent composition (seg_compose), S = 1
+    bitwise equal to contract(), segment_bounds against the array_split rule, each band's
+    dispatch (a K-empty band of k_s = 1 runs DIRECT, as the library's), each GEMM band's sigma
+    from the band alone and its z = sum a'b' with the CRT precondition, PROOFS L7's proof
+    skeleton in exact rationals (every band's L3a l1 bound, 0 for a DIRECT band, plus u|D_s|,
+    plus gamma_{S-1} sum |D_s|), determinism across chunk lengths and g, alpha / beta and an
+    unread C, alpha = 0 with unread A and B, band-local flags, the per-band RN acceptance, the
+    decay_opp gain, validation."""
     rng = random.Random(7303)
-    cnt = {"cases": 0, "outputs": 0, "bands": 0, "l7_tight": Fraction(0)}
+    cnt = {"cases": 0, "outputs": 0, "bands": 0, "direct": 0, "l7_tight": Fraction(0)}
     # --- segment_bounds: the array_split rule (the first k mod S bands one longer)
     for k in range(1, 41):
         for S in range(1, k + 1):
@@ -2101,8 +2133,12 @@ def test_segments():
         t = {}
         R = o.contract_segments(A, B, [[0.0] * n for _ in range(m)], N, rnd, bounds, trace=t)
         Rc, Ds = seg_compose(A, B, None, N, rnd, bounds)
+        Rl, kinds = seg_library(A, B, [[0.0] * n for _ in range(m)], N, rnd, bounds)
         assert all(same_bits(x, y) for r1, r2 in zip(R, Rc) for x, y in zip(r1, r2)), trial
+        assert all(same_bits(x, y) for r1, r2 in zip(R, Rl) for x, y in zip(r1, r2)), trial
         assert t["bounds"] == bounds and len(t["segments"]) == S and t["partial"][-1] == R
+        assert [ts["kind"] for ts in t["segments"]] == kinds == \
+            ["DIRECT" if b1 - b0 == 1 else "GEMM" for b0, b1 in zip(bounds, bounds[1:])]
         if S == 1:
             R1 = o.contract(A, B, [[0.0] * n for _ in range(m)], 1.0, 0.0, N, rnd)
             assert all(same_bits(x, y) for r1, r2 in zip(R, R1) for x, y in zip(r1, r2))
@@ -2116,6 +2152,12 @@ def test_segments():
         delta = Fraction(1, 2) if rnd == "RN" else Fraction(1)
         for s, (b0, b1) in enumerate(zip(bounds, bounds[1:])):
             ts, ks = t["segments"][s], b1 - b0
+            cnt["bands"] += 1
+            if ks == 1:                   # K-empty: D_s = fma(a, b, +0) = RN(a b), no plan
+                assert all(same_bits(Ds[s][i][j], o.fma(A[i][b0], B[b0][j], 0.0))
+                           for i in range(m) for j in range(n))
+                cnt["direct"] += 1
+                continue
             plan = ts["plan"]
             assert plan.k == ks
             for i in range(m):
@@ -2127,7 +2169,6 @@ def test_segments():
                     qa, qb = ts["QA"][i], ts["QB"][j]
                     assert sum(abs(o.qvalue(a) * o.qvalue(b)) for a, b in zip(qa, qb)) <= plan.H
                     assert ts["z"][i][j] == sum(o.qvalue(a) * o.qvalue(b) for a, b in zip(qa, qb))
-            cnt["bands"] += 1
         # L7's proof skeleton, exact: |C_S - x| <= sum_s (L3a_s + u|D_s|) + gamma sum_s |D_s|
         for i in range(m):
             for j in range(n):
@@ -2135,11 +2176,14 @@ def test_segments():
                 rhs, sumD = Fraction(0), Fraction(0)
                 for s, (b0, b1) in enumerate(zip(bounds, bounds[1:])):
                     ts = t["segments"][s]
-                    sg, ta = ts["sigma"][i], ts["tau"][j]
-                    l1a = sum(abs(fr(v)) for v in A[i][b0:b1])
-                    l1b = sum(abs(fr(v)) for v in Bt[j][b0:b1])
-                    l3a = delta * (Fraction(2) ** -ta * l1a + Fraction(2) ** -sg * l1b) + \
-                        (b1 - b0) * delta ** 2 * Fraction(2) ** -(sg + ta)
+                    if b1 - b0 == 1:      # DIRECT: y_s = x_s, only the rounding u|D_s|
+                        l3a = Fraction(0)
+                    else:
+                        sg, ta = ts["sigma"][i], ts["tau"][j]
+                        l1a = sum(abs(fr(v)) for v in A[i][b0:b1])
+                        l1b = sum(abs(fr(v)) for v in Bt[j][b0:b1])
+                        l3a = delta * (Fraction(2) ** -ta * l1a + Fraction(2) ** -sg * l1b) + \
+                            (b1 - b0) * delta ** 2 * Fraction(2) ** -(sg + ta)
                     Dij = abs(fr(Ds[s][i][j]))
                     rhs += l3a + u * Dij
                     sumD += Dij
@@ -2152,18 +2196,44 @@ def test_segments():
         cnt["cases"] += 1
 
     # --- alpha / beta: band 1 carries the caller's beta, later bands beta = 1; C unread at
-    # beta = 0
-    for trial in range(12):
+    # beta = 0; K-empty bands (k_s = 1) first, last and adjacent
+    for trial in range(16):
         m, n, k = 2, 3, rng.randrange(6, 30)
         A, B = kw_fixture(rng.choice(fams), m, n, k, rng)
         C0 = [[rng.uniform(-1, 1) for _ in range(n)] for _ in range(m)]
-        bounds = o.segment_bounds(k, rng.randrange(2, 5))
+        bounds = rng.choice([o.segment_bounds(k, rng.randrange(2, 5)), [0, 1, k],
+                             [0, k - 1, k], [0, 1, 2, k], [0, 3, 4, k]])
         alpha, beta = rng.choice([(1.0, 1.0), (0.375, 0.0), (3.0, -0.5), (1.0, 2.0 ** -40)])
         N, rnd = rng.choice([4, 8, 14]), rng.choice(["RN", "TRUNC"])
         Cin = Poison(m) if beta == 0.0 else C0
         R = o.contract_segments(A, B, Cin, N, rnd, bounds, alpha=alpha, beta=beta)
         Rc, _ = seg_compose(A, B, C0, N, rnd, bounds, alpha, beta)
+        Rl, _ = seg_library(A, B, C0, N, rnd, bounds, alpha, beta)
         assert all(same_bits(x, y) for r1, r2 in zip(R, Rc) for x, y in zip(r1, r2)), trial
+        assert all(same_bits(x, y) for r1, r2 in zip(R, Rl) for x, y in zip(r1, r2)), trial
+
+    # --- a K-empty band runs DIRECT as in the library (independent review of stage 3, MF1):
+    # k = 1 at N = 3 is fma(0.1, 0.3, +0), not the emulated 0.029997557401657104
+    t = {}
+    R = o.contract_segments([[0.1]], [[0.3]], Poison(1), 3, "RN", [0, 1], trace=t)
+    Rl, kinds = seg_library([[0.1]], [[0.3]], [[0.0]], 3, "RN", [0, 1])
+    assert same_bits(R[0][0], o.fma(0.1, 0.3, 0.0)) and same_bits(R[0][0], Rl[0][0])
+    assert t["segments"][0]["kind"] == kinds[0] == "DIRECT"
+    assert not same_bits(R[0][0], o.contract([[0.1]], [[0.3]], None, 1.0, 0.0, 3)[0][0])
+    A, B = [[0.1, 0.7, -0.2, 0.5]], [[0.9], [-0.3], [0.6], [0.25]]
+    for bounds in ([0, 1, 4], [0, 3, 4], [0, 1, 2, 3, 4]):
+        R = o.contract_segments(A, B, [[0.0]], 3, "RN", bounds)
+        Rl, kinds = seg_library(A, B, [[0.0]], 3, "RN", bounds)
+        assert same_bits(R[0][0], Rl[0][0]), (bounds, R, Rl)
+    # alpha = 0: A and B are not read (None, shapes given), C <- RN(beta C) or +0
+    C0 = [[0.75, -3.0], [2.0 ** -1074, 5.0]]
+    for beta in (0.0, -2.0, 1.0):
+        for bounds in ([0, 2, 5], [0, 1, 5], [0, 4, 5]):
+            Cin = Poison(2) if beta == 0.0 else C0
+            R = o.contract_segments(None, None, Cin, 8, "RN", bounds, alpha=0.0, beta=beta,
+                                    m=2, n=2, k=5)
+            want = [[(0.0 if beta == 0.0 else o.mul(beta, c)) for c in r] for r in C0]
+            assert all(same_bits(x, y) for r1, r2 in zip(R, want) for x, y in zip(r1, r2))
 
     # --- band-local flags: an Inf in band 2 makes that band native, band 1 stays emulated
     A = [[0.5, -0.25, 0.125, 1.0, math.inf, 2.0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]
@@ -2215,7 +2285,8 @@ def test_segments():
 
     # --- validation
     A, B = [[1.0] * 4], [[1.0] for _ in range(4)]
-    for bad in ([0, 0, 4], [1, 4], [0, 3], [0, 3, 2, 4], [0], [0, 2, 5]):
+    for bad in ([0, 0, 4], [1, 4], [0, 3], [0, 3, 2, 4], [0], [0, 2, 5], [0, 2.0, 4],
+                [0, "2", 4], 4):
         try:
             o.contract_segments(A, B, [[0.0]], 8, "RN", bad)
             raise AssertionError(f"bounds {bad} accepted")
@@ -2226,7 +2297,18 @@ def test_segments():
         raise AssertionError("k = 0 accepted")
     except o.InvalidValue:
         pass
-    RESULTS["segments"] = (f"{cnt['cases']} cases ({cnt['bands']} bands, {cnt['outputs']} outputs; "
+    for kw in ({"N": 1}, {"N": 21}, {"rounding": "RZ"}, {"g": 9}):   # as each band's call,
+        args = {"N": 8, "rounding": "RN", **kw}                      # also with k_s = 1 only
+        for bounds in ([0, 2, 4], [0, 1, 2, 3, 4]):
+            try:
+                o.contract_segments(A, B, [[0.0]], args["N"], args["rounding"], bounds,
+                                    g=kw.get("g"))
+                raise AssertionError(f"{kw} accepted")
+            except o.InvalidValue:
+                pass
+    assert cnt["direct"] > 0, "no K-empty band among the random fixtures"
+    RESULTS["segments"] = (f"{cnt['cases']} cases ({cnt['bands']} bands, {cnt['direct']} "
+                           f"K-empty / DIRECT, {cnt['outputs']} outputs; "
                            f"max err / L7 skeleton bound {float(cnt['l7_tight']):.3f}), "
                            f"decay_opp N = 10 max normwise {e1:.2e} unsegmented vs {e4:.2e} at "
                            f"S = 4")

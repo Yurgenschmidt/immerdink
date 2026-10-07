@@ -85,6 +85,8 @@ open Immerdink
 #print axioms Segments.kseg_normwise
 #print axioms Segments.gam_mul_le
 #print axioms Segments.kseg_request_core
+#print axioms Segments.kseg_wbar_le
+#print axioms Segments.kseg_rho_le
 
 -- Capstone (Exact.lean): L1c + L4 + L2c
 #print axioms Exact.emulated_product_exact

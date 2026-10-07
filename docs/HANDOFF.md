@@ -141,8 +141,8 @@ first.
   Stage 2 (CPU): M-a closed stage 4 (caller-side K-equilibration fails its gate on real psi4
   operands) and deferred stage 6; M-d1 met its criterion. Stage 3: the K-segmentation caller
   recipe (§3.8, PROOFS L7, `cert_kseg_composition`, `oracle.contract_segments`) and L3c + L7
-  in Lean. Open: the stage-3 review (NOTES-C1 §5.7), M-b (CPU), M-c and M-d2 (GPU), and the
-  M-d1 caller guidance into DESIGN §6g.12. Evaluation records and summaries are in
+  in Lean, reviewed (NOTES-C1 §5.7). Open: M-b (CPU), M-c and M-d2 (GPU), and the M-d1
+  caller guidance into DESIGN §6g.12. Evaluation records and summaries are in
   immerdink-eval `results/c1/` and `findings/c1-*.md`.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
