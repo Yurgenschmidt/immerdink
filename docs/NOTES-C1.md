@@ -89,7 +89,10 @@ since the design draft (39972b7), `include/` only in comments.
   §4.7.
 - *Stage 5 (K5 statistics and the device certificate), deferred (IR26):* no consumer issues
   elementwise targets (ehrenfest D8; ccsd.py issues no accuracy request), and the host-side
-  `rho_from_output` gives a rigorous ρ now. Triggers T1–T3 (§4.6).
+  `rho_from_output` gives a rigorous ρ now. Triggers T1–T3 (§4.6). *Trigger check at the
+  close-out* (IR28's "a trigger check only"; read-only, ehrenfest at c7983281): no Python file
+  there imports immerdink, and none issues an accuracy request (its "ELEMENTWISE" matches are
+  elementwise operations, not targets), so T1 and T2 have not fired; T3 has no record.
 - *Also decided:* accurate mode re-rejected (§2.8; its Appendix B trigger is not met, 0 cases);
   the N-range plan and Ozaki-I slices parked with triggers (§3.2, §3.3); K-segmentation and B6
   stay caller recipes (Q15 (a); B6 shows no value at the sizes measured).
