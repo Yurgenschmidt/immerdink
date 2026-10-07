@@ -300,7 +300,9 @@ what has been built since is recorded under "Implementation status".
   the shipped calibration is unchanged and the [M, model-only, outside hold-out] marks stay;
   there is no partial pass and no per-class lifting of the marks. C1's done condition on M-c
   is not met. The reviewer authorized the MC-3 feature as the only path to a pass (§5.9 MC-3),
-  and M-d2 waits until that path closes (§5.9, "M-d2 ordering").
+  amended at the second review as MC-3a: it starts from a per-phase account of the two KL
+  effects, not from a cache-only key. M-d2 waits until that path closes (§5.9, "M-d2
+  ordering").
   - *Sources:* summary immerdink-eval `findings/c1-m-c.md`; scripts `scripts/c1/m_c_*`;
     records `results/c1/m_c/` (untracked, sha256 in the summary).
   - *What ran:* 160 timed calls: 8 shapes × N ∈ {4, 5, 6, 7, 9, 10, 12, 13} plus the
@@ -335,24 +337,51 @@ what has been built since is recorded under "Implementation status".
     (26–29 %). Its median, the mean of the 13th and 14th, is the mean of the two sq1024 N = 4
     calls: (13.5 + 18.2) / 2 = 15.8 % in the first run and (18.1 + 14.1) / 2 = 16.1 % in the
     repeat (`report_shipped.md`, `report_shipped_repeat.md`, "Every call").
-    - *Small N on the KF path:* sq1024 at N = 4 is predicted 16.2 / 20.6 points more
+    - *Small N on the KF path:* sq1024 at N = 4 is predicted 16.1 / 20.6 points more
       optimistically (normal / decay_opp) than the mean of its own anchors' errors (N = 8 and
-      14); 14.9 / 15.7 points in the repeat. With these two calls at that level, the median
-      would be 7.1 % (repeat 9.7 %).
-    - *The REPEAT credit on the Jacobi view (KL path, narrow n):* it is predicted 26–29 % too
-      fast at every N ≤ 10, the anchor N = 8 included, on both data sets. At N = 12–14, the
-      anchor N = 14 included, it is −14.2 to −15.4 %: there the model's K4 time (configuration
-      64×128) steps up more than the measured one (N = 12: predicted 32.9 µs, measured
-      24.6 µs), which offsets part of the error. The REPEAT rule (§6c.1 "Cache state")
-      credits its 21.8 MB of inputs as L2-resident, but the measured times match the COLD
-      prediction (−1.5 to +10 %). With the Jacobi calls at their COLD-prediction error, the
-      median would be 3.5 % (repeat 5.0 %).
-    - The same REPEAT signature holds for three Q24 cases of the class (KL path, narrow n)
-      and for the in-sample `c_skin1280` (−20 %). KF calls do get the saving.
+      14); 14.8 / 15.6 points in the repeat. That baseline inflates the gap, because sq1024's
+      error rises with N (−13.5 % at N = 4 to +10.6 % at N = 14). Against the N = 8 anchor
+      alone the gap is 8.2 / 15.4 points (repeat 12.8 / 6.8). With these two calls at either
+      baseline, the median would be 7.1 % (repeat 9.7 %).
+    - *The Jacobi view (KL path, narrow n):* it is predicted 26–29 % too fast at every
+      N ≤ 10, the anchor N = 8 included, on both data sets. At N = 12–14, the anchor N = 14
+      included, it is −14.2 to −15.4 %: there the model's K4 time (configuration 64×128)
+      steps up more than the measured one (N = 12: predicted 32.9 µs, measured 24.6 µs),
+      which offsets part of the error. The phase marks show two KL effects, not one cache
+      effect (second review, §5.9 MC-3a; immerdink-eval `results/c1/m_c/phases.md`, both runs):
+      - *KL A, the wide operand's pack (a 20 MB read):* the REPEAT rule (§6c.1 "Cache
+        state") credits it 26.8 µs. The measurement keeps 27–50 % of that credit at N ≤ 10
+        (N = 8: measured 45.1 µs, REPEAT 29.6, COLD 56.3) and 55–65 % at N = 12–14. The
+        saving is partial, not absent.
+      - *KL B, the narrow operand's pack (1600 × 100, 1.28 MB; credit ≤ 1.7 µs):* it takes
+        ×1.65–1.89 its REPEAT prediction and ×1.49–1.72 its COLD prediction at N ≤ 10
+        (×1.94–2.02 and ×1.77–1.85 at N = 12–14). That is a KL path error on narrow packs,
+        in every cache state. It is 47–59 % of the call's miss at N ≤ 10 and 92–105 % at
+        N = 12–14.
+      - The call totals match the COLD prediction (−1.5 to +10 %) only because the two
+        cancel: COLD over-predicts KL A and under-predicts KL B. So the call-level
+        counterfactual, the Jacobi calls at their COLD total (median 3.4 %, repeat 5.0 %), is
+        a cancellation. Per phase (first run / repeat): KL A at its measured time gives 5.9 /
+        7.6 %, KL B at its measured time 11.8 / 12.0 %, both 4.7 / 5.1 %.
+    - The Q24 cases of the class (`q_kl1`, `q_kl2`, `q_kl4`) show both effects: KL B takes
+      ×1.50–1.81 its REPEAT and ×1.31–1.65 its COLD prediction (27–95 % of the miss), and KL A
+      keeps 5–52 % of its credit. The in-sample `c_skin1280` and `c_k3hit` share only the KL A
+      part (KL A keeps 14–33 %; KL B ×1.00–1.09).
+    - KF calls keep most of their saving, but not in the modeled shape: sq1024's KF phase
+      keeps about 74 % of its modeled credit at N = 4 (measured 27.2 µs, REPEAT 21.6, COLD
+      43.6) and about 157 % at N = 14 (35.7 / 44.5 / 59.8 µs); `q_kf1` keeps 80 % at N = 4 and
+      163 % at N = 12. So the small-N KF optimism may be the cache rule's shape and not an
+      N effect. MC-3a examines it on `q_kf1` and the cache sweep's `x_s1024`, not on
+      `mc.jsonl`.
+    - These figures are computed from the records at full precision (immerdink-eval
+      `scripts/c1/m_c_phases.py`). The first review round's 16.2 / 20.6 (repeat 14.9 / 15.7),
+      3.5 % and "+1.1" were differences of the report's one-decimal errors.
   - *N itself:*
-    - N = 9–13 track the anchors (median difference −0.3 to +1.1 points).
-    - N = 4–7 are optimistic: 2.0–4.3 points faster than at the anchors (median over the 16
-      shape × data series), at most 20.6 points (sq1024 KF, decay_opp, N = 4).
+    - N = 9–13 track the anchors (median difference from the mean of the anchors' errors
+      −0.3 to +1.2 points).
+    - N = 4–7 are optimistic: 2.0–4.3 points faster than the mean of the anchors' errors
+      (median over the 16 shape × data series), at most 20.6 points (sq1024 KF, decay_opp,
+      N = 4).
     - decay_opp is up to 5.8 % faster than normal data at N = 4 on the large shapes ([KT26]),
       within the targets.
     - Indicative §2.4 ratios from these medians (not M-d2; never used to set or adjust M-d2's
@@ -368,12 +397,13 @@ what has been built since is recorded under "Implementation status".
       hold-out. That 14.7 % is not hold-out evidence: the Q24 cases were chosen from M-c's
       residuals, and `q_kl2` (1296 × 144 × 1296, `abcd,cdij->abij`) is in the Jacobi view's
       own class.
-    - It is not adopted (§5.9 MC-1, upheld). It misses on the repeat run (15.0 %). It absorbs
-      the cache-state error into path parameters (`kl.wave` 2.16 → 4.45 µs, K4's effective
-      L2 0.4 → 0.3 × nominal, and more, MC-1), which moves the PPL view from +2 … +10 % to
-      +11 … +20 % and M-c's ≥ 1 ms p90 from 7.3 to 14.0 %.
-    - The fix is a model feature beyond Q24, now authorized (§5.9 MC-3; NOTES-B2 §12
-      "Remaining").
+    - It is not adopted (§5.9 MC-1, upheld twice). It misses on the repeat run (15.0 %). It
+      moves path parameters (`kl.wave` 2.16 → 4.45 µs, ×2.06, which partly fits KL B's real
+      path error; K4's effective L2 0.4 → 0.3 × nominal; and more, MC-1), which moves the PPL
+      view from +2 … +10 % to +11 … +20 % and M-c's ≥ 1 ms p90 from 7.3 to 14.0 %.
+    - The fix is a model feature beyond Q24, now authorized as amended (§5.9 MC-3 and
+      MC-3a; NOTES-B2 §12 "Remaining"): at most one optional key per physically distinct
+      effect, two in all (the REPEAT credit; the KL narrow-pack time).
   - *Review (approve-with-fixes, 2026-10-07; verdicts §5.9).* The first write-up (a382ef6,
     whose message keeps that framing) put the miss on the Jacobi view alone ("a shape, not
     N"). The records show the missed median is set by the two sq1024 N = 4 calls, so the cause
@@ -383,6 +413,16 @@ what has been built since is recorded under "Implementation status".
     two cache keys can work (MC-3), the decay_opp ratio range, and a CPU self-test of
     `bench/sweep_disjoint.py` (ctest `sweep_disjoint_selftest`: its matching rule, its exit
     codes, and the committed M-c and Q24 sweeps against the fit sweeps and the hold-out).
+  - *Second review (approve-with-fixes, 2026-10-07; verdicts §5.9, "Second review").* The
+    first review's account of the Jacobi view ("the REPEAT credit", "matches the COLD
+    prediction", "loses its whole saving", "one optional REPEAT-credit key") held for call
+    totals only. The phase marks show two KL effects whose errors cancel at the total ("Cause"
+    above), so MC-3 is amended as MC-3a (two optional keys at most, fitted against the phase
+    marks, three more pass conditions and a fresh narrow-KL hold-out). The v1.18 hold-out is
+    judged on two sets in MC-3 step 4 (all cases, and the cases whose GEMM view matches no
+    fit case). Also applied: the exact n1 change list, which overlaps share N with a fit
+    sample (4 of 7), the anchors' baseline next to "16–21 points", and the run-to-run
+    figure of the Jacobi error.
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -1964,12 +2004,17 @@ CC-shaped cases, schedule totals against fixed N, and the re-pack cost per switc
   verdicts §5.9).
   - The < 100 µs median is 15.8 % (target 15 %; repeat 16.1 %). Two effects set it, each
     necessary: the two sq1024 calls at N = 4 (KF path) are 16–21 points (repeat 15–16) more
-    optimistic than the mean of sq1024's anchors, and they are the median; the Jacobi view's
-    REPEAT credit (26–29 % at N ≤ 10, the anchor N = 8 included; −14 to −15 % at N = 12–14)
-    puts 12 calls above them. The other classes are met over all calls.
-  - The marks stay; there is no partial pass. The path to a pass is the MC-3 feature
-    (§5.9 MC-3): DESIGN §6c text first, one optional key, a refit, then the full M-c case
-    list measured again.
+    optimistic than the mean of sq1024's anchors' errors (8.2 / 15.4 points against the
+    N = 8 anchor alone), and they are the median; the Jacobi view (26–29 % fast at N ≤ 10,
+    the anchor N = 8 included; −14 to −15 % at N = 12–14) puts 12 calls above them. The
+    Jacobi error is two KL effects whose errors cancel at the call total: KL A keeps only
+    27–50 % of its modeled REPEAT credit, and KL B, the narrow pack, takes ×1.5–2.0 its
+    prediction in every cache state (Status, "Cause"). The other classes are met over all
+    calls.
+  - The marks stay; there is no partial pass. The path to a pass is the MC-3 feature as
+    amended (§5.9 MC-3, MC-3a): DESIGN §6c text from a per-phase account first, at most two
+    optional keys, a refit against the phase marks, a fresh narrow-KL hold-out, then the
+    full M-c case list measured again.
 
 **M-d: scheduled iterations** (`bench/accuracy/schedule.py`). Convergence and time are measured
 separately. On the drafted small systems a time bar alone cannot discriminate: the ACCURACY §3
@@ -3052,10 +3097,14 @@ dependencies:
 - The stage-0 GPU tests: `packed_repack_n`, `workspace_shared_n`, `graph_phases` with cold
   capture, the first-call measurement (IR10), and `pack_write_extent` with memcheck (IR17).
 - M-c, N ∈ {4, 5, 6, 7, 9, 10, 12, 13} plus the anchors (IR4), **strictly before** M-d2.
-  *It ran and failed (2026-10-07, §5.9).* Its recalibration is now the MC-3 feature (§5.9
-  MC-3: DESIGN §6c text, one optional key, a refit, the hold-outs, a fresh full M-c run, and
-  M-b's [M] figures and M-d2's bars re-derived if the calibration changes), still strictly
-  before M-d2.
+  *It ran and failed (2026-10-07, §5.9).* Its recalibration is now the MC-3 feature as
+  amended (§5.9 MC-3 and MC-3a), in order: the DESIGN §6c text from a per-phase account of
+  the allowed records; at most two optional keys (the REPEAT credit; the KL narrow-pack time),
+  each with `host_perf` tests; a fresh narrow-KL hold-out, committed and checked disjoint
+  before the refit; a refit fitted against the phase marks; the pass checks (the v1.18
+  hold-out on both sets, `mc.jsonl` with and without the repeat, a fresh full M-c run, the
+  narrow-KL hold-out, and the per-phase conditions); then M-b's [M] figures and M-d2's bars
+  re-derived if the calibration changes. Still strictly before M-d2.
 - M-d2 against its pre-registered bands, after the MC-3 path closes (§5.9 "M-d2 ordering").
 - Then the mechanical gate decisions: stage 4 by its pre-registered rule (§4.5); stage 5
   deferred (a trigger check only, §4.6); stage 6 by its rule (§4.7).
@@ -3068,9 +3117,10 @@ never as open.
 - **C1 is done when:**
   - stages 0 and 1 have shipped with their tests and certificates;
   - the round-2 stage-0 GPU tests pass;
-  - M-c has passed after a recalibration per Q24 or with the MC-3 feature (amended by the
-    M-c review, §5.9 MC-3; was "M-c has passed (or the model was recalibrated per Q24 and
-    then passed)". The first run, 2026-10-07, failed);
+  - M-c has passed after a recalibration per Q24 or with the MC-3 feature(s) (amended by the
+    M-c review, §5.9 MC-3, and read as "feature(s)" at the second review, MC-3a; was "M-c has
+    passed (or the model was recalibrated per Q24 and then passed)". The first run,
+    2026-10-07, failed);
   - M-d1 and M-d2 are reported with their success criteria evaluated;
   - the ROADMAP C1 row shows the Q6 decision column and "stage 5 deferred (triggers T1–T3)".
 - **C2 is done when:**
@@ -4333,8 +4383,8 @@ configuration, which in the twelfth case is already below that ideal.
 ### 5.9 M-c: the design questions (independent reviewer, 2026-10-07)
 
 Evidence: Status "M-c"; immerdink-eval `findings/c1-m-c.md`. M-c (§4.3) raised the five
-questions below. Each was decided conservatively and put to an independent reviewer, whose
-verdicts are binding. The review was approve-with-fixes: three must-fix items and six
+questions MC-1 to MC-5 below; MC-6 came up while applying the first review. Each was decided
+conservatively and put to an independent reviewer, whose verdicts are binding. The review was approve-with-fixes: three must-fix items and six
 should-fix items, all applied (Status, "M-c", "Review"). The must-fix items:
 - the cause was misstated. The first write-up blamed the Jacobi view's REPEAT credit alone ("a
   shape, not N"), but the missed median is exactly the mean of the two sq1024 N = 4 calls
@@ -4345,6 +4395,16 @@ should-fix items, all applied (Status, "M-c", "Review"). The must-fix items:
 - the verdicts below are recorded here and in Status, §4.3, DESIGN §6g.9 and §6g.10, the
   ROADMAP and HANDOFF.
 
+A second review of those fixes (approve-with-fixes, 2026-10-07) found that the account of the
+Jacobi view held for call totals only. The reviewer checked the phase marks of `mc.jsonl`,
+`calib_n.jsonl` and the calibration records against the shipped calibration's per-phase
+REPEAT and COLD predictions (CPU, one thread). They show two KL effects whose errors cancel
+at the total (Status, "Cause"; immerdink-eval `results/c1/m_c/phases.md` reproduces them at
+full precision, both runs). Its must-fix items: correct that account everywhere (MF-A), and
+record the verdicts of the second review (MF-B: MC-3a and the ruling on the hold-out's
+overlaps, MC-6). Its verdicts are in each item below and under "Second review" at the end
+of this section; they are binding.
+
 - **MC-1. Is the Q24 refit `n1` adopted?**
   - What `n1` is: the shipped fit's records plus the 43 N-specific calls, with the same
     `perf_fit.py` arguments. The baseline refit reproduces the shipped parameters to rounding.
@@ -4352,14 +4412,20 @@ should-fix items, all applied (Status, "M-c", "Review"). The must-fix items:
     keeps the product hold-out (3.9 / 10.7, 3.1 / 7.4, 2.3 / 7.4 %). That 14.7 % is not
     hold-out evidence: the Q24 cases were chosen from M-c's residuals, and `q_kl2`
     (1296 × 144 × 1296, `abcd,cdij->abij`) is in the Jacobi view's own class.
-  - What it changes (diff of `refit/base.calib` and `refit/n1.calib`):
-    - KL: `kl.wave` 2.16 → 4.45 µs (×2.1), `kl.launch` −11 %, `kl.byte` −24 %, `kl.l2byte`
+  - What it changes (diff of `refit/base.calib` and `refit/n1.calib`; every parameter that
+    moves by 5 % or more, plus the K4 byte rates and the power terms; corrected at the second
+    review, which found two missing and the byte rates misstated):
+    - KL: `kl.wave` 2.16 → 4.45 µs (×2.06), `kl.launch` −11 %, `kl.byte` −24 %, `kl.l2byte`
       −44 %, `kl.op` 0 → 0.15 ps/op.
     - The call term: `call.call` 1.02 → 0.38 µs (−63 %), `call.launch` −28 %.
-    - K4: its effective L2 `l2_bytes` 30.2 → 22.6 MB (0.4 → 0.3 × nominal),
-      `k4_64x128.mac1` −42 %, `k4_64x128.round` +15 %, `k4_64x64.mac_ktail` +56 %,
-      `k4_64x64.mac2` and `mac3` +26 %, the K4 byte rates −5 to −10 %.
-    - K5's `dram` −17 %; the power model's `clock_eff_mhz` 2479 → 2518 and `act_w` +5.7 %.
+    - K4: its effective L2 `l2_bytes` 30.2 → 22.6 MB (0.4 → 0.3 × nominal);
+      `k4_64x128.mac1` −42 %, `mac2` −9.9 %, `round` +15 %; `k4_64x64.mac_ktail` +56 %,
+      `mac2` and `mac3` +26 %; `k4_128x256.mac_ktail` +9.3 %. The byte rates:
+      `k4_64x128.byte` +5.1 %, `k4_128x256.byte` and `k4_128x128.byte` −4.9 %,
+      `k4_64x64.byte` −9.5 %.
+    - K5's `dram` −17 %; the power model's `clock_eff_mhz` 2479 → 2518, `act_w` +5.7 %,
+      `tc_pj` and `alu_pj` +3.9 %.
+    - Every other parameter moves by less than 5 %.
   - Implementer's decision: not adopted. Its pass is not robust (it misses on the repeat run of
     the small calls, 15.0 %); it fits a cache-state error with path parameters, the per-shape
     compensation §6c.5 rules out; it moves the PPL view, an M-d2 gated system, to +11 … +20 %;
@@ -4371,6 +4437,13 @@ should-fix items, all applied (Status, "M-c", "Review"). The must-fix items:
     path parameters, which §6c.5 forbids ("never per-shape factors"). It degrades the ≥ 1 ms
     class: M-c's p90 7.3 → 14.0 % (max 20.3 %), and the PPL view moves to +11 … +20 %. It
     would also change every [M] figure M-b certified.
+  - ***Second review: NO, UPHELD (binding), the rationale corrected.*** n1's `kl.wave` ×2.06
+    (2160 → 4453 ns) partly fits a real KL path error: KL B on narrow packs takes ×1.5–2.0
+    its prediction in every cache state. So "it fits a cache-state error with path
+    parameters" is only half right. NO stands on the other grounds: it misses on the repeat
+    (15.0 %); its case choice comes from M-c's residuals; it moves the PPL view to
+    +11.2 … +20.3 % and M-c's ≥ 1 ms p90 to 14.0 %; and it would change M-b's [M] figures.
+    `n1.calib` stays out of the product repo.
 - **MC-2. Does a miss the anchors share fail M-c? Should the marks be lifted for the
   ≥ 100 µs classes?**
   - Implementer's decision: yes, it fails, as IR4 is written ("judged per size class"). The
@@ -4386,22 +4459,45 @@ should-fix items, all applied (Status, "M-c", "Review"). The must-fix items:
     repeat; the ≥ 1 ms per-N median is 5.4 % at N = 9 (skinny is +6.5 % there through a K4
     step); the Jacobi error persists at the anchor N = 14 (−14 %). Lifting marks on a failed
     gate would be the opposite of conservative.
+    *Reading (second review):* "16–21 points" is against the mean of sq1024's anchors'
+    errors; against the N = 8 anchor alone it is 8.2 / 15.4 points (repeat 12.8 / 6.8),
+    since sq1024's error rises with N (Status, "Cause").
+  - ***Second review: UPHELD (binding).*** Nothing in the phase marks changes the call-level
+    verdict: the class median missed on both runs. M-d2 waits until the MC-3 path closes.
+    The done condition stays as amended, read as "with the MC-3 feature(s)" (§4.11).
 - **MC-3. The fix is a model feature beyond Q24. Build it?**
-  - *What is wrong:* the REPEAT residency rule `res = clamp(L_w − (F − I), 0, I)` (DESIGN
-    §6c.1 "Cache state") is a capacity rule. F = I + workspace + 8bmn already holds the
-    workspace, the KL residue planes included, so the earlier candidate "count the KL pack
-    planes in the REPEAT footprint" (a382ef6) would count them twice. `warm.pack_l2_planes`,
-    the precedent, adds K4's W planes, g·b·m·n̂·(2·k_chunks − 1) per group, to PACK's set S:
-    that is K4's traffic between two re-reads, not a capacity. The mechanism here is [I]:
-    a KL + K4 call moves more bytes through the L2 between one call's read of A and the
-    next call's than its footprint says.
+  - *What is wrong* (corrected at the second review: two KL effects, not one; Status,
+    "Cause"):
+    - *KL A keeps only part of its REPEAT saving.* The REPEAT residency rule
+      `res = clamp(L_w − (F − I), 0, I)` (DESIGN §6c.1 "Cache state") is a capacity rule.
+      On the Jacobi view KL A keeps 27–50 % of its modeled 26.8 µs credit at N ≤ 10 (Q24's
+      KL cases 5–52 %, the in-sample `c_skin1280` and `c_k3hit` 14–33 %). F = I + workspace
+      + 8bmn already holds the workspace, the KL residue planes included, so the earlier
+      candidate "count the KL pack planes in the REPEAT footprint" (a382ef6) would count
+      them twice. `warm.pack_l2_planes`, the precedent, adds K4's W planes,
+      g·b·m·n̂·(2·k_chunks − 1) per group, to PACK's set S: that is K4's traffic between two
+      re-reads, not a capacity. The mechanism is [I]: a KL + K4 call moves more bytes
+      through the L2 between one call's read of A and the next call's than its footprint
+      says.
+    - *KL B, the narrow operand's pack, is slow in every cache state.* On the Jacobi view
+      (1600 × 100, 1.28 MB, credit ≤ 1.7 µs) it takes ×1.65–1.89 its REPEAT and ×1.49–1.72
+      its COLD prediction at N ≤ 10 (×1.94–2.02 / ×1.77–1.85 at N = 12–14); on Q24's KL
+      cases ×1.50–1.81 / ×1.31–1.65. It is 47–59 % of the Jacobi call's miss at N ≤ 10 and
+      92–105 % at N = 12–14. This is a KL path error, not a cache effect; its mechanism is
+      unknown.
+    - At the call total the two cancel against the COLD prediction (−1.5 to +10 %), which is
+      why the first account read the Jacobi view as "no saving at all".
   - *Why no setting of `warm.l2_bytes` or `warm.l2byte` can work* (stronger than the
-    un-refit probe of `probe_cache_keys.txt`): sq1024 (KF) keeps more than its modeled saving
-    at a modeled F − I of 49.3 / 52.5 MB (N = 13 / 14, modeled resident inputs 14.8 /
-    11.7 MB; predicted +4.7 / +10.6 % slow), while the Jacobi view loses its whole saving at
-    13.0–30.5 MB (N = 4–10; 24.7 MB at N = 8; modeled resident 21.8 MB). Any rule that
-    depends on F − I alone credits the Jacobi view at least as much as sq1024 at N = 13–14,
-    so a capacity-only rule cannot separate them.
+    un-refit probe of `probe_cache_keys.txt`; premise corrected at the second review, the
+    conclusion holds): sq1024's KF phase keeps 99–157 % of its modeled credit at a modeled
+    F − I of 49.3 / 52.5 MB (N = 13 / 14; modeled resident inputs 14.8 / 11.7 MB, predicted
+    +4.7 / +10.6 % slow), so it needs about 15–18 MB credited (14.8–18.4 MB over both runs
+    and both data sets). The Jacobi view's KL A keeps 27–50 % of its credit at F − I =
+    13.0–30.5 MB (N = 4–10; 24.7 MB at N = 8; modeled resident 21.8 MB, 20.5 MB of it KL A's
+    read), so it needs about 6–10 MB credited (5.5–10.3 MB). A rule in F − I alone that
+    credits sq1024 15–18 MB at 49–53 MB credits the Jacobi view at least as much at
+    13–31 MB, so a capacity-only rule cannot separate them. (The first version said the
+    Jacobi view "loses its whole saving".)
   - *Candidates* (named, not chosen; the choice belongs to (1) below): (a) traffic: add K4's
     split-K W-plane traffic, Σ over groups of g_i·b·m·n̂·(2·k_chunks − 1), to F − I in
     `res_repeat`, as `warm.pack_l2_planes` adds it to S; (b) path: no REPEAT credit for the
@@ -4428,11 +4524,56 @@ should-fix items, all applied (Status, "M-c", "Review"). The must-fix items:
 
     If MC-3 is not pursued, M-c stays failed and C1 is not done.
     *Rationale:* Q24 excludes features, and the records show that no calibration key can work
-    (the KF calls keep their saving at a larger modeled footprint than the Jacobi view loses
-    it at). DESIGN §6c.5 already prescribes "the smallest physically motivated feature,
-    additive optional key" for a missed target. The REPEAT credit is a real planner-relevant
-    defect, about 26–35 % on narrow-n KL calls including the in-sample `c_skin1280`. Keeping
-    the feature's selection off the M-c records and measuring M-c again keeps the pass honest.
+    (the KF calls keep their saving at a larger modeled footprint than the Jacobi view's
+    KL A loses most of it at). DESIGN §6c.5 already prescribes "the smallest physically motivated feature,
+    additive optional key" for a missed target. The defect is real and planner-relevant:
+    12–35 % on narrow-n KL calls (M-c's Jacobi view, Q24's `q_kl1`, `q_kl2`, `q_kl4`), and
+    6–20 % through KL A alone on the in-sample `c_skin1280` (−20.4 / −10.6 %) and `c_k3hit`
+    (−10.8 / −6.4 %). (Corrected at the second review: the first version said "about
+    26–35 % … including the in-sample `c_skin1280`".) Keeping the feature's selection off the
+    M-c records and measuring M-c again keeps the pass honest.
+  - ***Second review: AMENDED as MC-3a (binding); everything else in MC-3 stands.***
+    1. *The §6c text from a per-phase account.* The DESIGN §6c text is built from a
+       per-phase decomposition (the phase marks against the REPEAT and COLD predictions per
+       phase) of the allowed records only: the calibration, cache, `calib_n.jsonl` and
+       v1.18 hold-out records, never `mc.jsonl`. It names both KL effects: KL A's partial
+       REPEAT saving (5–52 % kept on Q24, 14–33 % on the calibration records), and the
+       narrow-operand pack KL B taking ×1.5–1.8 its prediction in every cache state. It
+       also covers KF's credit against N (`q_kf1` and the cache sweep's `x_s1024`; see the
+       observation below).
+    2. *The cache key is fitted against the phase marks.* It is chosen and fitted against
+       the KL A and KF phase marks, not against call totals alone. A key whose call-level
+       fit relies on KL A cancelling KL B does not meet §6c.5's "physically motivated" rule
+       and does not count. For example, candidate (b) as zero credit puts KL A at its COLD
+       prediction, 2–33 % slow on the allowed records.
+    3. *At most two optional keys.* MC-3 may carry at most one optional key per physically
+       distinct effect, two in all: the REPEAT credit, and the KL narrow-pack time. Each has
+       absent = 0, `host_perf` tests and DESIGN text. If KL B is not modeled, it is recorded
+       as an open model defect, with its size and a trigger, in NOTES-B2 §12 and DESIGN §7.
+    4. *Three more pass conditions.*
+       - KL A's per-phase median |error| on the allowed narrow-KL records must improve.
+       - No phase class's in-sample median or p90 (`perf_fit`'s table) may worsen by more
+         than 1 point. KL A, KL B, KF and K4 are reported before and after, also on M-c's
+         Jacobi calls.
+       - A fresh narrow-KL hold-out must meet every §6c.5 class target. It is committed,
+         with a `sweep_disjoint.py` check against `sweep_calib.txt`, `sweep_calib_n.txt`,
+         `sweep_mc.txt` and `sweep_perf_validate.txt`, before the refit: at least 3 new
+         shapes of the class (KL path, n ≤ 160, inputs inside the REPEAT window) and at least
+         1 KF shape of similar footprint, at N ∈ {4, 8, 13}, on both data sets; about 1 min
+         of GPU in busy-gated chunks.
+    5. *The v1.18 hold-out is judged on both sets* (MC-6 below).
+
+    *Rationale:* the v1.18 hold-out has no case of this class (its narrow-n cases `v_rsm1`,
+    `v_rsm2`, `v_r_mm`, `v_mmg` and `y_k3a` are outside the REPEAT window or not this
+    shape). M-c's Jacobi view is the shape that motivated the feature, and the Q24 cases were
+    chosen from M-c's residuals. Without these conditions an M-c pass could be a phase
+    cancellation measured on its own motivating shape.
+  - *Observation for the MC-3a §6c text (second review):* sq1024's "small-N KF optimism"
+    sits in the KF phase. KF keeps about 74 % of its modeled credit at N = 4 (measured
+    27.2 µs, REPEAT 21.6, COLD 43.6) and about 157 % at N = 14 (35.7 / 44.5 / 59.8 µs);
+    `q_kf1` keeps 80 % at N = 4 and 163 % at N = 12. It may be the same cache-rule shape
+    and not an N effect. MC-3a examines it on `q_kf1` and the cache sweep's `x_s1024`
+    records, not on `mc.jsonl`.
 - **MC-4. The squares' spec.** Implementer's decision: `ik,kj->ij`, the spec of §2.3's [M]
   figures (M-b's `SH`), not the bench's usual `ik,jk->ij` (§2.3 notes a 3 % spec effect).
   ***Verdict: UPHELD (binding).*** *Rationale:* these are the specs of the cited §2.3 / §2.4
@@ -4460,19 +4601,59 @@ should-fix items, all applied (Status, "M-c", "Review"). The must-fix items:
   *Rationale:* IR23 orders "M-c, and its recalibration if any, strictly before M-d2", and
   MC-3 is now that recalibration. Running M-d2 first would put the evidence out of order, or
   give two M-d2 results to choose between.
-- *Observation (outside M-c; for MC-3 step 4):* the v1.18 product hold-out
-  (`bench/sweep_perf_validate.txt`) is disjoint from `sweep_calib.txt` by spec and extents,
-  not by GEMM view. `sweep_disjoint.py` finds 7 of its 76 cases sharing a view with a fit
-  case: `v_s512` and `w_s512` (512³; `c_tcc8` is a tensor with that view, `c_dir1` DIRECT),
-  `v_cc12` (576³; `k_s576` at N = 15–17), `v_pks` (packed 384³; `c_s384` in-line),
-  `v_n15e` (8 × 512² × 2048 at N = 15–17; `c_tikl2` at 8, 14), `v_n18a` (2304³ at N = 18,
-  20; `c_tcc2` at 8, 14, 20) and `v_mmg` (in-line; `c_pkmm` packed). Each pair differs in
-  method (DIRECT, packed), in N, or as a tensor case against a square (`c_tcc8` against
-  `v_s512` at N = 8 and 14, `c_tcc2` against `v_n18a` at N = 20). Decided conservatively:
-  the hold-out is not changed (it is the established product hold-out, and MC-3's pass
-  criterion stays as the verdict states it); MC-3's report also gives the product hold-out's
-  statistics without these 7 cases, reported, not judged. Recorded as a design question for
-  the next review.
+- **MC-6. The v1.18 hold-out's overlaps with the fit** (raised after the first review, for
+  MC-3 step 4). The v1.18 product hold-out (`bench/sweep_perf_validate.txt`) is disjoint
+  from `sweep_calib.txt` by spec and extents, not by GEMM view. `sweep_disjoint.py` finds 7
+  of its 76 cases sharing a view with a fit case:
+  - `v_s512` (in-line 512³ at N = 8, 14): `c_tcc8` is a tensor with that view, in-line at
+    N = 8, 14, 20 (`c_dir1` is DIRECT at N = 8);
+  - `w_s512` (512³ at N = 15–17): `c_tcc8` and `c_dir1` again, at other N;
+  - `v_cc12` (576³ at N = 8, 14): `k_s576` at N = 15–17;
+  - `v_pks` (packed 384³ at N = 8): `c_s384` in-line at N = 8, 14, 20;
+  - `v_n15e` (8 × 512² × 2048 at N = 15–17): `c_tikl2` at N = 8, 14;
+  - `v_n18a` (2304³ at N = 18, 20): `c_tcc2` at N = 8, 14, 20;
+  - `v_mmg` (in-line 1500 × 96 × 40000 at N = 8, 14, 16): `c_pkmm` packed at N = 8, 14.
+
+  4 of the 7 share both view and N with a fit sample, not 2 as the first version implied
+  ("each pair differs in method, in N, or as a tensor against a square"):
+  `perf_fit.samples_from_records` and `perf_validate` take the `plain_` contract of a packed
+  record as an in-line call (COLD state). So `c_pkmm`'s `plain_` (1500 × 96 × 40000,
+  N = 8, 14) is an in-line fit sample with the view and N of `v_mmg`; `v_pks`'s own `plain_`
+  (384³, N = 8) is evaluated with the view and N of `c_s384`; and `v_s512` against `c_tcc8`
+  (N = 8, 14) and `v_n18a` against `c_tcc2` (N = 20) are in-line on both sides.
+  - Implementer's decision: the hold-out unchanged; MC-3's report also gives its statistics
+    without these 7 cases, reported, not judged.
+  - ***Verdict: RULED (binding): the hold-out stays unchanged, but MC-3 step 4 is judged on
+    both sets.*** Both must meet every §6c.5 class target: (i) all 76 cases, and (ii) the
+    69 cases whose GEMM view matches no fit case. *Rationale:* the v1.18 hold-out stays the
+    product's established hold-out, so its history keeps its meaning. Reporting (ii) without
+    judging it is not conservative enough; 4 of the 7 share view and N with a fit sample,
+    and dropping them costs nothing and removes the doubt. The reviewer confirmed with
+    `sweep_disjoint.py`: 7 present against `sweep_calib.txt`; the 4 matches against
+    `sweep_mc.txt` are the 1024³ and 4096³ overlaps accepted in MC-5.
+  - *Counts and the shipped baseline* (immerdink-eval `results/c1/m_c/phases.md`): 3 of the
+    76 cases (`v_x1280`, `v_x2048`, `v_x3072`) are cache pairs, judged by the pair report and
+    not in the class statistics. So set (i) is 73 cases and 199 calls in the class
+    statistics, set (ii) 66 cases and 171 calls. The shipped calibration meets both: (i)
+    3.8 / 10.7, 2.7 / 8.2, 2.5 / 6.4 %; (ii) 3.8 / 10.1, 2.8 / 8.3, 2.2 / 4.5 % (median /
+    p90 for < 100 µs, 100 µs – 1 ms, ≥ 1 ms).
+- **Second review, the remaining verdicts** (approve-with-fixes, 2026-10-07; binding):
+  - The first review's must-fix items: RESOLVED. The cause as two effects at call level
+    (the phase level is MF-A, applied in Status "Cause" and MC-3); the Jacobi view at
+    N ≤ 10 against N = 12–14; the verdicts recorded everywhere. The reviewer re-ran the
+    self-test (29 of 29; the no-swap mutant fails 27 of 29) and found the ctest log and the
+    library sha256s (`466acdb4…`, `c4bdcc4f…`) as claimed.
+  - The implementer's question on the reviewer's figures ("about 5 %" is the repeat's 5.0 %,
+    the first run 3.4 %; "16–21 points" is against the mean of sq1024's anchors' errors):
+    ACCEPTED. Citing both runs is right; the baseline and the N = 8-anchor figure are now
+    given (MC-2 "Reading"). The counterfactual does not depend on the baseline.
+  - Should-fix items applied: the exact n1 change list (MC-1); the overlaps that share N
+    (MC-6); the anchors' baseline wherever "16–21 points" appears; the Jacobi error
+    reproduces run to run within 1.5 points at full precision (`m_jacd` at N = 10: −28.3 %
+    against −26.7 %, 1.6 in the rounded figures), 19 of 20 calls within 1 point (the first
+    version said "within 1 point"); the
+    `sweep_disjoint_selftest` comment in `tests/CMakeLists.txt` now names the Q24 checks;
+    the KF observation (MC-3a above).
 
 ---
 

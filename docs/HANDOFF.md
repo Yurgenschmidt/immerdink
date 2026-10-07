@@ -143,11 +143,16 @@ first.
   recipe (§3.8, PROOFS L7, `cert_kseg_composition`, `oracle.contract_segments`) and L3c + L7
   in Lean, reviewed (NOTES-C1 §5.7). M-b is done. M-c ran on 2026-10-07 and **failed**
   (binding verdict, NOTES-C1 §5.9): the < 100 µs median was missed through a small-N
-  optimism on the KF path (1024³ at N = 4) and the REPEAT credit on narrow-n KL calls, each
-  necessary; the Q24 refit was not adopted and the marks stay. Open: the MC-3 feature,
-  authorized as the only path to an M-c pass (NOTES-C1 §5.9 MC-3: DESIGN §6c text first,
-  one optional REPEAT-credit key, a refit, the hold-outs and a fresh 160-call M-c run);
-  then M-d2 (GPU), which waits for it; and the M-d1 caller guidance into DESIGN §6g.12.
+  optimism on the KF path (1024³ at N = 4) and narrow-n KL calls, each necessary; the
+  narrow-n KL error is two effects that cancel at the call total (KL A keeps only part of
+  its REPEAT credit, the narrow pack KL B is slow in every cache state; per-phase table in
+  immerdink-eval `results/c1/m_c/phases.md`). The Q24 refit was not adopted and the marks
+  stay. Open: the MC-3 feature(s), authorized as the only path to an M-c pass and amended
+  as MC-3a (NOTES-C1 §5.9 MC-3, MC-3a, MC-6: DESIGN §6c text from a per-phase account
+  first, at most two optional keys fitted against the phase marks, a fresh narrow-KL
+  hold-out committed before the refit, the v1.18 hold-out judged with and without its 7
+  view overlaps, and a fresh 160-call M-c run); then M-d2 (GPU), which waits for it; and
+  the M-d1 caller guidance into DESIGN §6g.12.
   Evaluation records and summaries are in
   immerdink-eval `results/c1/` and `findings/c1-*.md`.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,

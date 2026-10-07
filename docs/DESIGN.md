@@ -592,8 +592,9 @@ do not see. With the per-band norms (one pass over A and B, as §6g.11's norms):
   until a GPU measurement of the recipe replaces both (NOTES-C1 §5.8 MB-1).
 - [M] figures at N ∉ {8, 10, 14, 16} are model-only until the small-N hold-out M-c passes
   (NOTES-C1 IR4). M-c ran on 2026-10-07 and failed (one target missed; NOTES-C1 Status,
-  "M-c", and §5.9), so the marks stay; the path to a pass is the MC-3 feature (NOTES-C1 §5.9
-  MC-3). NOTES-C1's M-b re-ran the [M] figures here on this worktree's library:
+  "M-c", and §5.9), so the marks stay; the path to a pass is the MC-3 feature(s) as amended
+  (NOTES-C1 §5.9 MC-3, MC-3a). NOTES-C1's M-b re-ran the [M] figures here on this worktree's
+  library:
   unchanged (immerdink-eval `findings/c1-m-b.md`).
 
 Use it for banded anti-correlated K profiles at normwise or absolute targets well above S·u,
@@ -5090,14 +5091,24 @@ it.
   - M-c ran on 2026-10-07 and **failed**: it missed §6c.5's < 100 µs median (15.8 % against
     15 %; a repeat gives 16.1 %). The binding verdicts are NOTES-C1 §5.9; the details are in
     NOTES-C1 Status ("M-c").
-  - Two effects set the missed median, and each is necessary: a small-N optimism on the KF
-    path (sq1024 at N = 4 is 16–21 points more optimistic than at its anchors in the first
-    run, 15–16 in the repeat, and those two calls are the median), and the REPEAT credit on KL-path calls with a narrow n (the Jacobi
-    view is predicted 26–29 % fast at every N ≤ 10, the anchor N = 8 included; −14 to −15 %
-    at N = 12–14).
+  - Two effects set the missed median, and each is necessary. One is a small-N optimism on
+    the KF path: sq1024 at N = 4 is 16–21 points more optimistic than the mean of its
+    anchors' errors in the first run, 15–16 in the repeat (8.2 / 15.4 points against the
+    N = 8 anchor alone, repeat 12.8 / 6.8, since its error rises with N), and those two
+    calls are the median.
+    The other is the KL path with a narrow n: the Jacobi view is predicted 26–29 % fast at
+    every N ≤ 10, the anchor N = 8 included, and −14 to −15 % at N = 12–14.
+  - The Jacobi error is two KL effects, which cancel at the call total against the COLD
+    prediction (NOTES-C1 Status "Cause", §5.9 MC-3). KL A, the wide operand's pack, keeps
+    only 27–50 % of its modeled REPEAT credit (§6c.1 "Cache state"). KL B, the narrow
+    operand's pack, takes ×1.5–2.0 its prediction in every cache state: a KL path error,
+    not a cache effect.
   - The Q24 refit was not adopted (NOTES-C1 §5.9 MC-1), so the marks stay, with no partial
-    pass (MC-2). The path to a pass is the MC-3 feature (an optional REPEAT-credit key, a
-    refit and a fresh M-c run, NOTES-C1 §5.9 MC-3); M-d2 waits for it.
+    pass (MC-2). The path to a pass is the MC-3 feature(s) as amended (NOTES-C1 §5.9 MC-3,
+    MC-3a): §6c text from a per-phase account, at most two optional keys (the REPEAT credit;
+    the KL narrow-pack time) fitted against the phase marks, a fresh narrow-KL hold-out, the
+    v1.18 hold-out judged with and without its 7 cases that share a GEMM view with a fit
+    case, and a fresh M-c run. M-d2 waits for it.
   - Indicative, not M-d2, and never used to set its bars: the schedule ending at N = 14,
     computed from M-c's single-call medians, is 0.003–0.023 above its [M] ratio on 2000³,
     4096³, DF, QZ and the PPL view, and 0.005–0.028 below on 1024³ and skinny. On the Jacobi
@@ -5281,8 +5292,9 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   switches, off the hot path; ehrenfest's hot-path rank calls are untouched.
 - **Limits.** The choice is the performance model's [M], outside its hold-out at
   N ∉ {8, 10, 14, 16} until NOTES-C1's M-c passes (it failed on 2026-10-07, §6g.9; the path
-  to a pass is NOTES-C1 §5.9 MC-3). Rank's footprint tie order (`TIES_BY_FOOTPRINT`) is not
-  applied to the composed times. A phase names every contraction.
+  to a pass is NOTES-C1 §5.9 MC-3 as amended by MC-3a). Rank's footprint tie order
+  (`TIES_BY_FOOTPRINT`) is not applied to the composed times. A phase names every
+  contraction.
 
 ### 6g.11 The rigorous ρ from a previous output: `rho_from_output` **[cert: cert_rho_recipe]** **[test: host_precision]**
 
@@ -6287,10 +6299,20 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     `bench/sweep_calib_n.txt`.
   - Outcome: **failed**. The < 100 µs median is missed (15.8 % against 15 %) through two
     effects, each necessary: a small-N optimism on the KF path (sq1024 at N = 4) and the
-    REPEAT credit on KL-path calls with a narrow n (the Jacobi view). The Q24 refit was not
+    KL path with a narrow n (the Jacobi view), where KL A keeps only part of its REPEAT
+    credit and the narrow pack KL B is slow in every cache state. The Q24 refit was not
     adopted, so the shipped calibration is unchanged and the [M, model-only, outside
     hold-out] marks stay (§6g.9; NOTES-C1 Status, §5.9).
   - Review (approve-with-fixes; NOTES-C1 §5.9, binding): M-c failed, no partial pass; the
-    MC-3 feature (an optional REPEAT-credit key under §6c.5's feature rule, its §6c text
-    first) is authorized as the only path to a pass; M-d2 waits for it.
-    `bench/sweep_disjoint.py --self-test` is ctest `sweep_disjoint_selftest`.
+    MC-3 feature under §6c.5's feature rule, its §6c text first, is authorized as the only
+    path to a pass; M-d2 waits for it. `bench/sweep_disjoint.py --self-test` is ctest
+    `sweep_disjoint_selftest`.
+  - Second review (approve-with-fixes; NOTES-C1 §5.9 MC-3a, MC-6, binding): the per-phase
+    account above replaces "the REPEAT credit" alone. MC-3 is amended as MC-3a: §6c text
+    from a per-phase decomposition of the allowed records (never M-c's), at most one
+    optional key per physically distinct effect (two in all: the REPEAT credit; the KL
+    narrow-pack time), the cache key fitted against the KL A and KF phase marks, three more
+    pass conditions (KL A's per-phase error improves; no phase class worsens in-sample by
+    more than 1 point; a fresh narrow-KL hold-out, committed before the refit, meets every
+    class target). The v1.18 hold-out is judged on all its cases and on the 69 whose GEMM
+    view matches no fit case.
