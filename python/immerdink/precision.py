@@ -150,10 +150,12 @@ class Phase:
     its Choices. N[name] is the level (an int, or "DIRECT"); g, vec_mode, packed, status
     ("MET", "MISSED", "BUDGET", "DIRECT"), pack_bytes ({role: bytes} of the packed roles; a
     shared pack is repeated under every member that reads it, while footprints() counts it
-    once, keyed by its group), reuse ({role: calls per pack}), assumed_reuse ({role:
-    "iteration"} where 'phase' fell back for want of `iterations`), err_bound / err_typical
-    (in each target's metric) are dicts by name; time_s = the calls-weighted sum of the
-    composed times (one iteration), tflops_eq = sum of calls x 2bmnk / time_s."""
+    once, keyed by its group), reuse ({role: calls per pack}; a shared role's still counts a
+    member at DIRECT in this phase, which reads no pack, so the other members' times are then
+    optimistic [M]: PrecisionPlan's `reuse`), assumed_reuse ({role: "iteration"} where
+    'phase' fell back for want of `iterations`), err_bound / err_typical (in each target's
+    metric) are dicts by name; time_s = the calls-weighted sum of the composed times (one
+    iteration), tflops_eq = sum of calls x 2bmnk / time_s."""
     __slots__ = ("choices", "calls", "assumed", "_flops")
 
     def __init__(self, choices, calls, assumed, flops):
@@ -198,13 +200,13 @@ class Footprints:
     """Exact bytes for sizing once (DESIGN §6g.2 C-ws, C-pack) or per level, from the queries
     (never recomputed): the maximum over what a phase may choose at that level, i.e. the
     allowed pack modes x vec modes x every g that succeeds (no reliance on I2, a certificate
-    and not ABI, for the plan device bytes). levels: the
-    PrecisionPlan's. Per contraction name: workspace and plan_device_bytes {level: bytes,
-    None where no configuration exists}, workspace_max. Per packed operand (key (name, role),
-    or the share group's name for a shared pack): pack_bytes and pack_ws_bytes (imd_pack's
-    workspace) {level: bytes}, pack_max, pack_ws_max. totals {level: bytes}: the sum of every
-    contraction's workspace and plan device bytes and every packed operand's pack and pack
-    workspace bytes (none shared: a joint budget is the caller's policy); total_max."""
+    and not ABI, for the plan device bytes). levels: the PrecisionPlan's. Per contraction
+    name: workspace and plan_device_bytes {level: bytes, None where no configuration exists},
+    workspace_max. Per packed operand (key (name, role), or the share group's name for a
+    shared pack): pack_bytes and pack_ws_bytes (imd_pack's workspace) {level: bytes},
+    pack_max, pack_ws_max. totals {level: bytes}: the sum of every contraction's workspace and
+    plan device bytes and every packed operand's pack and pack workspace bytes (none shared:
+    a joint budget is the caller's policy); total_max."""
     levels: tuple
     workspace: dict
     workspace_max: dict
@@ -260,7 +262,10 @@ class PrecisionPlan:
         "iteration": the pack is remade every iteration): calls per pack = 1, the calls per
         iteration, those x phase()'s `iterations` (without it: as "iteration", recorded in
         Phase.assumed_reuse), or the int. A shared role: the members' summed calls (an int:
-        the total), the members' kinds must agree.
+        the total), the members' kinds must agree; fixed at construction, so it still counts
+        a member at DIRECT in a phase (which reads no pack). The other members' pack term,
+        and Phase.time_s, are then optimistic [M], by at most pack_s x that member's share of
+        the calls, and every phase's choice stays a configs() plan (NOTES-C1 §5.5 S1-10).
     budget: immerdink-owned device bytes per contraction (workspace + plan + packs + pack
         workspace), rank's meaning; an int for all or {name: int}; 0 = none. The caller
         subtracts its own resident tensors, the FP64 source of a packed operand included.
@@ -750,10 +755,13 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
     C: a float64 host array (numpy; copy a device C or the part needed to the host first).
     row_norm_ub, col_norm_ub: upper bounds of the GEMM view's row 2-norms ||a_i|| and column
     2-norms ||b_j|| (§6f.1's obligation: really upper bounds, e.g. rounded up). For C.ndim >= 2
-    a 1-D row_norm_ub is always the vector along axis -2 (length C.shape[-2]) and a 1-D
-    col_norm_ub always the one along axis -1 (length C.shape[-1]), each on its own and for any
-    batch dims (another length: ValueError); other bounds (scalars, explicit (..., m, 1) /
-    (..., 1, n) shapes, or for a 0-D / 1-D C elementwise ones) broadcast to C's shape.
+    each bound lies along its own axis, for any batch dims: a scalar; a 1-D row_norm_ub is
+    the vector along axis -2 (length C.shape[-2]) and a 1-D col_norm_ub the one along axis -1
+    (length C.shape[-1]); a row bound of ndim >= 2 has shape[-1] == 1 ((m, 1) or a per-batch
+    (..., m, 1), keepdims=True) and a column bound shape[-2] == 1 ((1, n) or (..., 1, n)),
+    with none or all of C's batch dims. Anything else is a ValueError, e.g. numpy's (b, m) /
+    (b, n) norms without keepdims, which trailing-axis broadcasting would pair with C's rows
+    and columns. For a 0-D / 1-D C the bounds broadcast elementwise.
     Real norms, not sigma-derived ones (a zero row's sigma bound is vacuous). l1_ratio: None
     (nu = sqrt k), one value for both, or (l1_ratio_a, l1_ratio_b), as host.Accuracy.
     U is the NORMWISE `bound` of imd_err_estimate at (N, rounding, k) for the call's dispatch
@@ -766,8 +774,8 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
     entries are +inf. With true norm bounds rho_hat >= 1.
     ValueError: beta != 0 (for beta = 1 accumulations take rho from a probe call with
     beta = 0 into a scratch buffer, once per phase), alpha not a power of two (D cannot be
-    recovered exactly from RN(alpha D)), a negative or NaN norm bound, a 1-D bound of the
-    wrong length, shapes that do not broadcast to C. TypeError: C not float64."""
+    recovered exactly from RN(alpha D)), a negative or NaN norm bound, a bound off its axis
+    (above), shapes that do not broadcast to C. TypeError: C not float64."""
     import numpy as np
     if beta != 0:
         raise ValueError("rho_from_output needs beta = 0 (take rho from a beta = 0 probe call)")
@@ -791,15 +799,21 @@ def rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, b
         raise TypeError(f"C must be float64, got {C.dtype}")
     row = np.asarray(row_norm_ub, dtype=np.float64)
     col = np.asarray(col_norm_ub, dtype=np.float64)
-    if C.ndim >= 2:     # a 1-D bound is always the rows' (axis -2) or the columns' (axis -1)
+    if C.ndim >= 2:     # a row bound lies along axis -2, a column bound along axis -1
+        for arg, b, own, along, what, form in (
+                ("row_norm_ub", row, -2, -1, "rows", "(..., m, 1)"),
+                ("col_norm_ub", col, -1, -2, "columns", "(..., 1, n)")):
+            if b.ndim == 1 and b.shape[0] != C.shape[own]:
+                raise ValueError(f"a 1-D {arg} has length {b.shape[0]}, C has "
+                                 f"{C.shape[own]} {what} (axis {own})")
+            if b.ndim >= 2 and b.shape[along] != 1:
+                raise ValueError(f"{arg} of shape {b.shape} on C {C.shape}: a bound of the "
+                                 f"{what} has shape[{along}] == 1, {form} (keepdims=True)")
+            if 2 < b.ndim < C.ndim:
+                raise ValueError(f"{arg} of shape {b.shape} on C {C.shape}: it carries some "
+                                 "of C's batch dims (none or all)")
         if row.ndim == 1:
-            if row.shape[0] != C.shape[-2]:
-                raise ValueError(f"a 1-D row_norm_ub has length {row.shape[0]}, C has "
-                                 f"{C.shape[-2]} rows (axis -2)")
             row = row[:, None]
-        if col.ndim == 1 and col.shape[0] != C.shape[-1]:
-            raise ValueError(f"a 1-D col_norm_ub has length {col.shape[0]}, C has "
-                             f"{C.shape[-1]} columns (axis -1)")
     try:
         shape = np.broadcast_shapes(row.shape, col.shape, C.shape)
     except ValueError:

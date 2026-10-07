@@ -47,8 +47,12 @@ what has been built since is recorded under "Implementation status".
   approved with fixes by an independent reviewer; the fixes are applied, and the verdicts on
   the implementation's design questions are §5.5. The binding ones: a share-group member at
   DIRECT leaves the group for the phase, `BUDGET` only on a met target (S1-5, S1-3), and a
-  1-D norm bound of `rho_from_output` is always axis −2 or −1 (S1-7). One question raised by
-  the fix (S1-10) is pending. The provenance of DESIGN §6g.10's cost figures (IR9 style) is
+  1-D norm bound of `rho_from_output` is always axis −2 or −1 (S1-7). A re-review approved
+  with one more fix, applied: a `rho_from_output` bound of ndim ≥ 2 must lie along its own
+  axis and carry none or all of C's batch dims (MF3, S1-7). It made S1-10 binding as
+  implemented (a shared role's reuse stays fixed while a member is at DIRECT) and confirmed
+  that groups joined only through a DIRECT member are ranked separately (S1-5). The
+  provenance of DESIGN §6g.10's cost figures (IR9 style) is
   immerdink-eval `findings/c1-stage1-phase-cost.md`, with the script committed there
   (39d9f9f) and both records untracked, listed with their sha256; a re-run on 51dba1e
   reproduces the first record to within 0.04 ms.
@@ -1324,7 +1328,10 @@ rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, beta=
   cannot be recovered exactly from RN(α·D) (§3.7: E = RN(α·D); DESIGN.md:432).
 - *Inputs.* A call at N with α = 2^e and β = 0, so its output C gives D = ldexp(C, −e). Upper
   bounds n_ij ≥ ‖a_i‖‖b_j‖ from the caller's row and column 2-norms, computed so that they really
-  are upper bounds (§6f.1's existing obligation).
+  are upper bounds (§6f.1's existing obligation). *[Stage-1 reviews, §5.5 S1-7, binding:]* for
+  C.ndim ≥ 2 each bound lies along its own axis: a 1-D row bound is axis −2 and a 1-D column
+  bound axis −1, each of exactly that length; a row bound of ndim ≥ 2 has shape[−1] = 1 and a
+  column bound shape[−2] = 1, with none or all of C's batch dims; anything else raises.
 - *U.* Let U = the NORMWISE `bound` of `imd_err_estimate` at that (N, rounding, k), with
   ν = √k unless the caller's ℓ1 ratios hold. It is evaluated as compose() does,
   E + E·u + u (accuracy.cpp:48-58), times (1 + 2^−40); never as E·(1 + u), since 1 + 2^−53
@@ -3355,7 +3362,11 @@ The stage-1 implementation raised nine questions that §4.2 did not settle. Each
 conservatively, in the spirit of §4.2, implemented and documented (DESIGN §6g.10–§6g.11), and
 put to an independent reviewer, whose verdicts are binding. The review was approve-with-fixes:
 two must-fix items (MF1, MF2) and nine should-fix items (SF1–SF9), all applied (DESIGN v1.19
-change list, "Stage-1 review fixes").
+change list, "Stage-1 review fixes"). A re-review of the fixes was approve-with-fixes again:
+one must-fix item (MF3, under S1-7) and four should-fix items (partial batch dims of a norm
+bound, S1-10 in the API docstrings and here, a docstring reflow), all applied ("Stage-1
+re-review fixes"); its verdicts on the three questions the fixes raised are under S1-5, S1-7
+and S1-10.
 - **S1-1. Parameters beyond §4.2's signature.** `vec_modes` (§4.2 ranks "the given vec modes"
   but names no parameter); `perf` (regime, cache, clock of rank and the pack predictions: the
   `Planner` carries only the calibration and the memo, not the regime or cache §4.2's comment
@@ -3397,6 +3408,12 @@ change list, "Stage-1 review fixes").
   N = 12 and missed by γ_k reported `BUDGET` at native FP64. The brute force of
   `host_precision` encoded the same rule, so the fix changed both, and a scenario pins it
   (both member forms, a coupled third member, and a member that linked two groups).
+  *Re-review (binding):* groups joined only through a DIRECT member (G = {x, y}, H = {x, z},
+  x at DIRECT) are ranked separately. The one-N rule exists only because members read one
+  shared pack, and with x at DIRECT G's pack is read by y alone and H's by z alone; tying y
+  and z would add a constraint with no reason behind it. "The other members are ranked
+  jointly" means the other members of each group, not of the merged component; members
+  listed together in one group stay tied.
 - **S1-6. Footprints.** Per level, the maximum over the allowed pack modes × vec modes at the
   largest g whose query succeeds (F1, ABI); the plan device bytes are included; the totals
   share no workspace; a shared pack counts once, keyed by its group. *Verdict: accepted,
@@ -3412,20 +3429,47 @@ change list, "Stage-1 review fixes").
   certificate line if a consumer needs α = −1. The broadcast rule was unsound: for a batched C,
   or mixed 1-D and 2-D bounds with m = n, numpy paired `row_norm_ub[j]` with column j and
   certified ρ̂ ≈ 1 where ρ ≥ 100. Now, for C.ndim ≥ 2, a 1-D row bound is always axis −2 and
-  a 1-D column bound axis −1, each of exactly that length.
+  a 1-D column bound axis −1, each of exactly that length. *Re-review: the length-1 detail
+  accepted (binding), the rule extended (binding, MF3).* A length-1 1-D bound on a longer axis
+  raises (a caller who wants one value for every row passes a scalar); a 0-D or 1-D C has no
+  row or column axis to confuse, so its bounds broadcast elementwise. The MF2 rule was not
+  complete for bounds of ndim ≥ 2: numpy's per-batch norms without keepdims, (b, m) and
+  (b, n), were paired with C's rows or columns whenever b = m (and b = m = n for the row
+  bound), and certified ρ̂/ρ ≈ 0.006. The rule for C.ndim ≥ 2 is now: a 1-D bound follows
+  the axis rule with its exact length; a row bound of ndim ≥ 2 has shape[−1] = 1 and a column
+  bound shape[−2] = 1; and (should-fix) a bound carries none or all of C's batch dims, since
+  numpy would align a partial set with C's trailing batch dims. Anything else raises
+  ValueError. Scalars, 1-D vectors, (…, m, 1) and (…, 1, n) still pass; a transposed (1, m)
+  row bound, an (m, 1) column bound and an elementwise (m, n) bound now raise.
+  `host_precision` checks per-batch keepdims bounds on unequal batches (one and two batch
+  dims) against each batch's own 2-D call bit for bit, and ρ̂ ≥ row_i·col_j / |C_ij| in
+  exact rationals; every rejected form raises.
 - **S1-8. `fail_budget`** is per phase (§4.2 step 7: P over the phase's calls). A run budget is
   the caller's split; the example calls `phase()` every iteration with `iterations=1` and
   P / T_max. *Verdict: accepted.*
 - **S1-9. A phase names every contraction** (a subset raises ValueError). *Verdict: accepted.*
-- **S1-10 (new, from the MF1 fix; pending the reviewer).** In a phase where a share-group
-  member is at DIRECT, the shared role's reuse still counts that member's calls: it is fixed
-  at construction (the members' summed calls), so every phase's choice stays the `configs()`
-  lookup bit for bit (configuration and composed time) and the plans created before the loop
-  cover it. The other members' pack term is then priced as if those calls read the pack, an
-  optimistic [M] figure in a rare case. Counting only the readers per phase would price it
-  exactly; within a level it changes every candidate's time by one constant, so in exact
-  arithmetic the configuration at a level is unchanged, but the composed times would no
-  longer equal `configs()`'s, and floating-point rounding could reorder near-ties.
+- **S1-10 (from the MF1 fix).** In a phase where a share-group member is at DIRECT, the
+  shared role's reuse still counts that member's calls: it is fixed at construction (the
+  members' summed calls), so every phase's choice stays the `configs()` lookup bit for bit
+  (configuration and composed time) and the plans created before the loop cover it. The
+  other members' pack term is then priced as if those calls read the pack, an optimistic [M]
+  figure in a rare case. Counting only the readers per phase would price it exactly; within
+  a level it changes every candidate's time by one constant, so in exact arithmetic the
+  configuration at a level is unchanged, but the composed times would no longer equal
+  `configs()`'s, and floating-point rounding could reorder near-ties. *Verdict (re-review):
+  accepted as implemented, the reuse stays fixed (binding).* The promise that matters is
+  that every phase's choice is a `configs()` plan, so the plans created and frozen before the
+  loop cover every phase (graph capture, `PlanCache.freeze`); a near-tie reordered in
+  floating point could pick a configuration whose plan was never created, a hard failure in
+  the loop. The cost is a model figure only: the other members' pack term, and
+  `Phase.time_s`, are optimistic by at most pack_s × (the DIRECT member's calls / the summed
+  calls) per iteration, in a phase that already runs a native FP64 (1:64) contraction, which
+  dominates its time. Numerics, budgets and footprints are unaffected. The same covers the
+  shared role staying packed when one member alone reads it in that phase. The `reuse` and
+  `Phase` docstrings say so (`Phase.reuse` reports e.g. {B: 4} where one call reads the
+  pack). Revisit only if a consumer runs share groups with DIRECT members in practice; the
+  fix would then be a hybrid: each level's configuration from `configs()`, the actual
+  readers only for the level comparison and the reported time.
 
 ### 5.6 Stage 2: the implementation's design questions (independent reviewer, 2026-10-07)
 

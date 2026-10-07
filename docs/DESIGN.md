@@ -5081,7 +5081,18 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   role's reuse is fixed at construction and keeps counting the DIRECT member's calls, so every
   phase's choice remains the `configs()` lookup bit for bit. In that phase the other members'
   pack term is then priced as if those calls read the pack: an optimistic [M] figure in a rare
-  case (NOTES-C1 §5.5 S1-10).
+  case (NOTES-C1 §5.5 S1-10). *Binding (re-review):* the reuse stays fixed. Counting only
+  the phase's readers leaves each level's configuration unchanged in exact arithmetic (the
+  shared term is one constant within a level), but in floating point it could reorder
+  near-ties and pick a configuration whose plan was never created, a hard failure in the
+  loop (graph capture, a frozen `PlanCache`). The optimism is at most pack_s × (the DIRECT
+  member's calls / the summed calls) per iteration, in a phase that already runs a native
+  FP64 (1:64) contraction, which dominates its time; numerics, budgets and footprints are
+  unaffected. The same holds for the shared role staying packed when one member alone
+  reads it in that phase. `Phase.reuse` reports the fixed figure (e.g. {B: 4} where one
+  call reads the pack). To revisit only if a consumer runs share groups with DIRECT members
+  in practice: then take each level's configuration from `configs()` and use the actual
+  readers only for the level comparison and the reported time.
 - **`configs(iterations)`** returns the best configuration at every level (status `OK`, or
   `BUDGET` with the least total_bytes; None where no plan exists, e.g. RN with κ ≥ T(N)). A
   fixed N's estimate is the same for every candidate, so it needs no target, and a phase's
@@ -5139,16 +5150,25 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 - **Inputs.** A call at (N, rounding, k, mode) with α = 2^e and β = 0 wrote C = RN(2^e D)
   (§3.7), D its product. `C` is a float64 host array (copy it, or the part needed, to the
   host: the helper moves no data). `row_norm_ub`, `col_norm_ub` are upper bounds of the GEMM
-  view's row and column 2-norms (§6f.1's obligation: really upper bounds). For C.ndim ≥ 2 a
-  1-D `row_norm_ub` is always the vector along axis −2 (length C.shape[−2]) and a 1-D
-  `col_norm_ub` always the one along axis −1 (length C.shape[−1]), each on its own and for
-  any batch dims; another length, 1 included, is a ValueError. Other bounds (scalars,
-  explicit (…, m, 1) and (…, 1, n) shapes, elementwise ones for a 0-D or 1-D C) broadcast to
-  C's shape. numpy's trailing-axis rule alone would pair `row_norm_ub[j]` with column j
-  whenever m = n (a batched C, or a 1-D row bound with a (1, n) column bound) and certify
-  ρ̂ ≈ 1 where ρ ≥ 100 (independent review of stage 1, MF2). Real norms, not σ-derived ones:
-  a zero row has σ := 0, so its bound d·2⁰ is vacuous. `l1_ratio`: as `Accuracy`'s (ν = √k
-  without it).
+  view's row and column 2-norms (§6f.1's obligation: really upper bounds). For C.ndim ≥ 2
+  each bound lies along its own axis, for any batch dims:
+  - a scalar;
+  - a 1-D `row_norm_ub` is the vector along axis −2 (length C.shape[−2]) and a 1-D
+    `col_norm_ub` the one along axis −1 (length C.shape[−1]), each on its own; another
+    length, 1 included, is a ValueError;
+  - a row bound of ndim ≥ 2 has shape[−1] = 1 ((m, 1), or per batch (…, m, 1), numpy's
+    `keepdims=True`) and a column bound shape[−2] = 1 ((1, n) or (…, 1, n)), carrying none or
+    all of C's batch dims;
+  - anything else is a ValueError: numpy's per-batch norms without `keepdims`, (b, m) and
+    (b, n), a transposed (1, m) row or (m, 1) column bound, an elementwise (m, n) one, or a
+    bound with some of C's batch dims (numpy would align them with C's trailing batch dims).
+  For a 0-D or 1-D C the bounds broadcast elementwise. numpy's trailing-axis rule alone pairs
+  a bound with the wrong axis whenever two of C's extents are equal: `row_norm_ub[j]` with
+  column j at m = n (a batched C, or a 1-D row bound with a (1, n) column bound;
+  independent review of stage 1, MF2), and the batch index with a row or column at b = m or
+  b = n (the (b, m) / (b, n) norms; re-review, MF3). Both certified ρ̂ far below ρ: ≈ 1
+  where ρ ≥ 100, and ρ̂/ρ ≈ 0.006. Real norms, not σ-derived ones: a zero row has σ := 0, so
+  its bound d·2⁰ is vacuous. `l1_ratio`: as `Accuracy`'s (ν = √k without it).
 - **Restrictions.** β must be 0 and α = 2^e, else ValueError: D = ldexp(C, −e) is exact,
   while D cannot be recovered from RN(α·D) for another α (§3.7). For β = 1 accumulations (CC
   residual builders) take ρ from a probe call with β = 0 into a scratch buffer, once per
@@ -5211,9 +5231,12 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
   - `rho_from_output` equals `params.rho_recipe` bit for bit (random and boundary values,
     every α = 2^e class, specials, broadcast and batched forms); 1-D bounds on batched C, at
     m = n and mixed with 2-D bounds equal the explicit (m, 1) × (1, n) result, and a 1-D bound
-    of another length raises; U ≥ params' exact bound (its upper enclosure) at N = 2–20,
-    k = 1–40000, both roundings and dispatches; ρ̂ ≥ ρ in exact rationals on emulated
-    outputs (`params.emulate_element`); ValueError / TypeError cases.
+    of another length raises; per-batch (…, m, 1) × (…, 1, n) bounds on unequal batches
+    (one and two batch dims) equal each batch's own 2-D call, with ρ̂ ≥ row_i·col_j / |C_ij|
+    in exact rationals, while the (b, m) / (b, n) forms at b = m and b = m = n, transposed,
+    elementwise and partial-batch bounds raise; U ≥ params' exact bound (its upper
+    enclosure) at N = 2–20, k = 1–40000, both roundings and dispatches; ρ̂ ≥ ρ in exact
+    rationals on emulated outputs (`params.emulate_element`); ValueError / TypeError cases.
 - **[cert] `cert_rho_recipe`** (`params.py --check`), in exact rationals: on emulated elements
   (both roundings, every N = 2–20, random and cancelling rows whose |x| is 0.3–30 × U‖a‖‖b‖,
   α = 2^e, U the tightest double above the exact NORMWISE bound, with ν = √k and with the
@@ -6007,3 +6030,9 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     rest on I2; `cert_rho_recipe` covers every N = 2–20 and the native FMA chain;
     `PrecisionPlan` lowers at the lowest level for flops_eq; §6d's carve-out for
     precision.py.
+  - **Stage-1 re-review fixes** (approve-with-fixes; NOTES-C1 §5.5): a `rho_from_output`
+    bound of ndim ≥ 2 must lie along its own axis (a row bound shape[−1] = 1, a column bound
+    shape[−2] = 1) and carry none or all of C's batch dims, since numpy's per-batch (b, m) /
+    (b, n) norms without keepdims were paired with C's rows or columns at b = m and certified
+    ρ̂ ≈ 0.006 ρ (§6g.11, MF3); S1-10 (a shared role's reuse stays fixed while a member is at
+    DIRECT) is binding and documented in §6g.10 and the `reuse` and `Phase` docstrings.
