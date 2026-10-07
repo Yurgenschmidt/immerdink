@@ -372,8 +372,17 @@ def scale_vector(vec, plan: Plan, rule: str | None = None):
             flag = True
             finite.append(0.0)
     nz = [dyadic(v) for v in finite if v != 0.0]
+    sigma, S, gamma, u = _shift_of_dyadics(nz, plan, rule)
+    return sigma, flag, S, gamma, u
+
+
+def _shift_of_dyadics(nz, plan: Plan, rule: str | None = None):
+    """§3.2 steps 2-5 on the nonzero finite entries of one row, given as exact (m, e) pairs
+    (value m 2^e). Returns (sigma, S, gamma, u); (0, 0, None, None) for no entries (zero row:
+    sigma := 0). scale_vector applies it to a row of floats; kweights (§3.9) to the integers
+    (m, e + w) of a weighted row, which is never materialized."""
     if not nz:
-        return 0, flag, 0, None, None                 # zero row: sigma := 0
+        return 0, 0, None, None                       # zero row: sigma := 0
     gamma = max(abs(m).bit_length() - 1 + e for m, e in nz)   # ilogb(max |a_h|)
     S = 0
     for m, e in nz:
@@ -396,7 +405,7 @@ def scale_vector(vec, plan: Plan, rule: str | None = None):
     u = largest_u(L, R)
     sigma = u - gamma
     assert INT16_MIN <= sigma <= INT16_MAX, "§3.2 step 5: sigma must fit int16"
-    return sigma, flag, S, gamma, u
+    return sigma, S, gamma, u
 
 
 # ---------------------------------------------------------------------------------------
@@ -1370,6 +1379,259 @@ def view_addresses(view: GemmView):
                     c = vec["C_bat"][lam] + vec["C_row"][i] + vec["C_col"][j]
                     out.append((c, bb, a) if view.swapped else (c, a, bb))
     return sorted(out)
+
+
+# ---------------------------------------------------------------------------------------
+# K-weights (NOTES-C1 §4.5; DESIGN v1.19 §3.9 if stage 4 is gated in)
+# ---------------------------------------------------------------------------------------
+#
+# Power-of-two weights on the contracted index (C2, K-equilibration). The caller scales X,
+# the operand pre-scaled by 2^w, along the shared K labels, and each partner Y_p by 2^-w:
+# every product x y, hence x = sum a b, is unchanged (L5a), and the fast rule then runs on
+# the weighted operands (L5b). kweights() is the integer rule of NOTES-C1 §4.5 steps 1-5
+# (exponent extrema, deadband-median balance, the mandatory FP64-exact clamp, the L5c guard
+# and its gain G) for one X and its partners; P = 1 is the single plan's (A, B), the shape
+# of imd_kweights. Stage 2 adds it as the one exact reference of the rule for the C2 study
+# (bench/accuracy/c2_gate.py); its certificates, PROOFS L5 and GuardSound are stage 4's.
+# Exact integers only: a weighted row's shift comes from its integers (m, e + w), so no
+# weighted float is ever built (kweights_apply builds one, for callers and tests, and
+# asserts that every scaled entry is exact).
+
+KW_GUARD, KW_ZERO_ON_FAIL = 1, 2       # imd_kweights_params_t.flags (NOTES-C1 §4.5)
+KW_GUARD_MARGIN = 3                    # L5c: G >= 3 => ||a~_i|| ||b~_j|| < ||a_i|| ||b_j||
+KW_MAX_ABS = 127                       # max_abs in 1..127 (int8 weights)
+KW_DEADBAND = 3                        # the API default (Q11; M-a re-tunes d*)
+INT32_MIN = -2**31                     # report sentinel: not computed / undefined
+
+
+class KwPartner:
+    """One partner Y of X: the plan's caller operands are (A, B) = (X, Y) when x_role is "A",
+    (Y, X) when "B"; C is the plan's output descriptor, N and rounding its options (mode
+    EMULATE). Several partners: one per plan that reads the pre-scaled X (NOTES-C1 IR6)."""
+
+    def __init__(self, Y: Tensor, C: Desc, N: int, rounding: str = "RN", x_role: str = "A"):
+        assert x_role in ("A", "B")
+        self.Y, self.C, self.N, self.rounding, self.x_role = Y, C, N, rounding, x_role
+
+
+def _kw_index(T: Tensor, labels, qstride):
+    """(offset, q) for every coordinate tuple of T's distinct labels (a repeated label takes
+    one index: the diagonal), q = sum_l coord_l qstride_l over the shared labels (Q9 index)."""
+    d = T.desc
+    names = list(dict.fromkeys(d.label))
+    ext = {l: e for e, l in zip(d.extent, d.label)}
+    mst = {l: 0 for l in names}
+    for s, l in zip(d.stride, d.label):
+        mst[l] += s
+    for idx in itertools.product(*[range(ext[l]) for l in names]):
+        yield (T.base + sum(i * mst[l] for i, l in zip(idx, names)),
+               sum(i * qstride[l] for i, l in zip(idx, names) if l in qstride))
+
+
+def kw_layout(X: Desc, Y: Desc, C: Desc):
+    """The Q9 index of a weight vector (NOTES-C1 §4.5 "Index order"): the shared K labels,
+    i.e. the contracted labels both X and Y carry (in neither C), in order of first occurrence
+    in X's descriptor (a repeated label once), first label fastest. Returns (labels, qstride,
+    k_s): w[q] scales X's entries whose shared-label coordinates give q. A K label carried by
+    one operand only is not indexed (w is constant along it); an extent-1 label changes
+    nothing."""
+    shared = set(X.label) & set(Y.label) - set(C.label)
+    ext = {l: e for e, l in zip(X.extent, X.label)}
+    labels = [l for l in dict.fromkeys(X.label) if l in shared]
+    qstride, ks = {}, 1
+    for l in labels:
+        qstride[l] = ks
+        ks *= ext[l]
+    return labels, qstride, ks
+
+
+def _kw_pair_view(X: Tensor, p: KwPartner):
+    """The pair's GEMM view, plan constants and the post-swap role of X ("A" rows / "B"
+    columns), with imd_kweights' plan-time statuses: lower()'s, NOT_SUPPORTED for K-empty or
+    k <= 1 (the §3.2 RN acceptance through Plan)."""
+    A, B = (X, p.Y) if p.x_role == "A" else (p.Y, X)
+    v = lower(A.desc, B.desc, p.C, EMULATE)
+    if v.k <= 1:
+        raise NotSupported("kweights: K-empty or k <= 1")
+    plan = Plan(p.N, v.k, p.rounding)
+    x_post = ("A" if p.x_role == "A" else "B") if not v.swapped else \
+        ("B" if p.x_role == "A" else "A")
+    return v, plan, x_post, A, B
+
+
+def _kw_gain_min(T: Tensor, view: GemmView, role, plan: Plan, wk):
+    """min over the nonzero finite rows (role "A") or columns ("B") of T in the view, every
+    batch, of sigma(weighted) - sigma(plain) at the plan's (N, k, rounding); wk[h] is the
+    exponent added at canonical K position h. None: no nonzero finite row (flagged rows take
+    the native path, zero rows have sigma := 0)."""
+    vec, g = view.vec, None
+    if view.empty_output():
+        return None                                   # no output: nothing to guard
+    if role == "A":
+        offs = [(vec["A_bat"][lam] + vec["A_row"][i], vec["A_k"])
+                for lam in range(view.b) for i in range(view.m)]
+    else:
+        offs = [(vec["B_bat"][lam] + vec["B_col"][j], vec["B_k"])
+                for lam in range(view.b) for j in range(view.n)]
+    for o0, kv in offs:
+        row = [T.buf[T.base + o0 + kv[h]] for h in range(view.k)]
+        if not all(math.isfinite(x) for x in row):
+            continue                                  # flagged: native path, never scaled
+        nz = [(dyadic(x), s) for x, s in zip(row, wk) if x != 0.0]
+        if not nz:
+            continue                                  # zero row
+        s0 = _shift_of_dyadics([md for md, _ in nz], plan)[0]
+        s1 = _shift_of_dyadics([(m, e + s) for (m, e), s in nz], plan)[0]
+        g = s1 - s0 if g is None else min(g, s1 - s0)
+    return g
+
+
+def kweights(X: Tensor, partners, deadband: int = KW_DEADBAND, max_abs: int = KW_MAX_ABS,
+             flags: int = KW_GUARD):
+    """NOTES-C1 §4.5 rule for the operand X pre-scaled by 2^w and its partners (KwPartner
+    list; P = 1 is imd_kweights' single plan). Returns (w, report): w the int weights in the
+    Q9 order (kw_layout of X and the first partner), report the imd_kweights_report_t fields
+    plus the oracle's detail. InvalidValue: deadband < 0, max_abs outside 1..127, unknown
+    flags, ZERO_ON_FAIL without GUARD, no partner, or partners whose shared-K label sets
+    differ (IR6); NotSupported: K-empty, k <= 1 or k_s <= 1, and the plans' own statuses.
+
+      1. extrema   c_X(h), m_X(h): max / min ilogb over X's finite nonzero entries at shared
+                   index h (every batch, free index and one-sided K label); c_Y, m_Y the same
+                   over every partner's entries (the union extrema); undefined if none.
+      2. median    Delta_h = c_Y(h) - c_X(h) where both are defined; med = the lower median
+                   of the defined Delta.
+      3. raw       w0_h = 0 if Delta_h is undefined or |Delta_h - med| <= deadband, else
+                   floor((Delta_h - med) / 2).
+      4. clamp     w_h = w0_h clamped to [-max_abs, max_abs] and, always, to the interval
+                   where both scalings are exact in FP64: w > 0 needs w <= 1023 - c_X(h) and
+                   w <= m_Y(h) + 1022; w < 0 needs w >= -1022 - m_X(h) and w >= c_Y(h) - 1023
+                   (an undefined side imposes no bound). 0 is always feasible, so w_h is the
+                   feasible value nearest to w0_h.
+      5. guard     per pair p, at its plan's (N, k, rounding): G_p = min over X's nonzero
+                   finite rows of (sigma~ - sigma) + the same over Y_p's; G = min_p G_p,
+                   guard = 1 iff G >= 3 (L5c); no nonzero finite row on a side of every pair:
+                   G undefined, guard = 1 vacuously, gain = INT32_MIN. Without KW_GUARD:
+                   guard = -1, gain = INT32_MIN. ZERO_ON_FAIL with guard = 0: w := 0.
+
+    Report: guard, gain, gain_row_min / gain_col_min (the plan's A rows / B columns, for the
+    pair that sets G), median (INT32_MIN if no Delta is defined), num_weighted (w != 0),
+    max_abs_w, clamped (w != w0; ORACLE-CHOICE under ZERO_ON_FAIL: the count of w0 != 0, so
+    that it matches w = 0); oracle detail: k_s, labels, qstride, w0, clamped_max_abs,
+    clamped_fp64 (the FP64 clamp binding after the max_abs one), pairs (gain_x, gain_y, G per
+    partner), extrema (c_X, m_X, c_Y, m_Y lists, None where undefined)."""
+    if not isinstance(deadband, int) or deadband < 0:
+        raise InvalidValue(f"kweights: deadband {deadband!r}")
+    if not isinstance(max_abs, int) or not (1 <= max_abs <= KW_MAX_ABS):
+        raise InvalidValue(f"kweights: max_abs {max_abs!r}")
+    if flags & ~(KW_GUARD | KW_ZERO_ON_FAIL) or (flags & KW_ZERO_ON_FAIL and not flags & KW_GUARD):
+        raise InvalidValue(f"kweights: flags {flags!r}")
+    if not partners:
+        raise InvalidValue("kweights: no partner")
+    pairs = [_kw_pair_view(X, p) for p in partners]
+    lay = [kw_layout(X.desc, p.Y.desc, p.C) for p in partners]
+    if any(set(l[0]) != set(lay[0][0]) for l in lay):
+        raise InvalidValue("kweights: the partners' shared-K label sets differ (IR6)")
+    labels, qstride, ks = lay[0]
+    if ks <= 1:
+        raise NotSupported("kweights: k_s <= 1")
+
+    def extrema(tensors):
+        c, mn = [None] * ks, [None] * ks
+        for T in tensors:
+            for off, q in _kw_index(T, labels, qstride):
+                x = T.buf[off]
+                if math.isfinite(x) and x != 0.0:
+                    t = ilogb(x)
+                    c[q] = t if c[q] is None else max(c[q], t)
+                    mn[q] = t if mn[q] is None else min(mn[q], t)
+        return c, mn
+
+    cX, mX = extrema([X])
+    cY, mY = extrema([p.Y for p in partners])
+    delta = [None if a is None or b is None else b - a for a, b in zip(cX, cY)]
+    defined = sorted(d for d in delta if d is not None)
+    med = defined[(len(defined) - 1) // 2] if defined else None
+    w0 = [0 if d is None or abs(d - med) <= deadband else (d - med) // 2 for d in delta]
+    w, n_abs, n_fp = [], 0, 0
+    for q in range(ks):
+        wa = max(-max_abs, min(max_abs, w0[q]))
+        his = ([1023 - cX[q]] if cX[q] is not None else []) + \
+              ([mY[q] + 1022] if mY[q] is not None else [])     # w > 0: X up, partners down
+        los = ([-1022 - mX[q]] if mX[q] is not None else []) + \
+              ([cY[q] - 1023] if cY[q] is not None else [])     # w < 0: X down, partners up
+        hi, lo = max(min(his, default=max_abs), 0), min(max(los, default=-max_abs), 0)
+        wq = max(lo, min(hi, wa))
+        n_abs += wa != w0[q]
+        n_fp += wq != wa
+        w.append(wq)
+
+    gains, G, at = [], None, None
+    if flags & KW_GUARD:
+        for t, ((v, plan, x_post, A, B), p) in enumerate(zip(pairs, partners)):
+            qv = _radix_vec([((l,), v.ext[l], {"Q": qstride.get(l, 0)}) for l in v.order["K"]],
+                            "Q") if v.k else []
+            wk = [w[q] for q in qv]
+            y_post = "B" if x_post == "A" else "A"
+            gx = _kw_gain_min(X, v, x_post, plan, wk)
+            gy = _kw_gain_min(p.Y, v, y_post, plan, [-s for s in wk])
+            gp = None if gx is None or gy is None else gx + gy
+            ga, gb = (gx, gy) if p.x_role == "A" else (gy, gx)   # the plan's A rows, B cols
+            gains.append(dict(gain_x=gx, gain_y=gy, G=gp, gain_a=ga, gain_b=gb))
+            if gp is not None and (G is None or gp < G):
+                G, at = gp, t
+    guard = -1 if not flags & KW_GUARD else (1 if G is None or G >= KW_GUARD_MARGIN else 0)
+    clamped = sum(a != b for a, b in zip(w, w0))
+    if flags & KW_ZERO_ON_FAIL and guard == 0:
+        w = [0] * ks
+        clamped = sum(x != 0 for x in w0)
+    report = dict(guard=guard, gain=INT32_MIN if G is None else G,
+                  gain_row_min=INT32_MIN if at is None else gains[at]["gain_a"],
+                  gain_col_min=INT32_MIN if at is None else gains[at]["gain_b"],
+                  median=INT32_MIN if med is None else med,
+                  num_weighted=sum(x != 0 for x in w), max_abs_w=max(map(abs, w), default=0),
+                  clamped=clamped, k_s=ks, labels=labels, qstride=qstride, w0=w0,
+                  clamped_max_abs=n_abs, clamped_fp64=n_fp, pairs=gains,
+                  extrema=dict(c_X=cX, m_X=mX, c_Y=cY, m_Y=mY))
+    return w, report
+
+
+def gemm_tensors(A, B):
+    """Dense row-major Tensors of a matrix product's A (m x k, labels i h), B (k x n, labels
+    h j) and C's Desc (m x n, labels i j): the GEMM case of kweights (K = h, k_s = k)."""
+    m, k = len(A), len(B)
+    n = len(B[0]) if k else 0
+    return (Tensor([x for r in A for x in r], 0, Desc([m, k], [k, 1], ["i", "h"])),
+            Tensor([x for r in B for x in r], 0, Desc([k, n], [n, 1], ["h", "j"])),
+            Desc([m, n], [n, 1], ["i", "j"]))
+
+
+def kweights_gemm(A, B, N, rounding="RN", **params):
+    """kweights for the matrix product A (m x k) B (k x n): X = A, one partner B."""
+    TA, TB, C = gemm_tensors(A, B)
+    return kweights(TA, [KwPartner(TB, C, N, rounding)], **params)
+
+
+def kweights_apply(T: Tensor, labels, qstride, w, sign: int = 1) -> Tensor:
+    """The caller's pre-scaling (NOTES-C1 §4.5 recipe step 2): a copy of T with every entry
+    it addresses multiplied by 2^(sign w[q]) (sign +1: X, -1: a partner), q the entry's Q9
+    index (kw_layout). Asserts that every scaled finite entry is exact (the clamp's promise:
+    no rounding, no overflow; non-finite entries stay non-finite) and raises InvalidValue if
+    two coordinates with different scales address one element (a stride-0 or aliasing view
+    along a shared label cannot be pre-scaled)."""
+    buf, seen = list(T.buf), {}
+    for off, q in _kw_index(T, labels, qstride):
+        s = sign * w[q]
+        if seen.setdefault(off, s) != s:
+            raise InvalidValue("kweights_apply: one element at two scales")
+    for off, s in seen.items():
+        x = T.buf[off]
+        y = math.ldexp(x, s)
+        if math.isfinite(x) and x != 0.0:
+            m, e = dyadic(x)
+            assert math.isfinite(y) and dyadic(y) == (m, e + s), \
+                f"kweights_apply: {x!r} * 2^{s} is not exact in FP64 (clamp violated)"
+        buf[off] = y
+    return Tensor(buf, T.base, T.desc)
 
 
 if __name__ == "__main__":
