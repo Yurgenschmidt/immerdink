@@ -66,7 +66,10 @@ what has been built since is recorded under "Implementation status".
 - **Stage 2's CPU evidence (§4.3: M-a and M-d1) is done, 2026-10-07**, approved with fixes by
   an independent reviewer; the fixes are applied, and the verdicts on the implementation's
   design questions are §5.6. A re-review (approve-with-fixes) found the provenance statements
-  wrong; its fixes are applied too, and its verdicts are §5.6 S2-14–S2-18.
+  wrong; its fixes are applied too, and its verdicts are §5.6 S2-14–S2-18. A second re-review
+  (approve-with-fixes) found that the provenance text still claimed more re-running than had
+  been done; it is corrected below, the remaining records are re-run on committed code (all
+  bit for bit), and its verdicts are §5.6 S2-19–S2-20.
   - *Code:* `oracle.kweights` with its multi-partner mode and test_oracle (12) at 5cd8ff3; the
     study (`bench/accuracy/kw_engine.py`, `c2_fixtures.py`, `c2_gate.py`, `c2_summary.py`,
     `md1_converge.py`) at 7260a95; the review fixes at f97696a; the re-review's at 928b49c.
@@ -86,23 +89,50 @@ what has been built since is recorded under "Implementation status".
     - d22a686: M-d1 cg and davidson (with the superseded `cg_v1`, `davidson_v2` and
       `davidson_strongcoupling`) and `rho_local`.
 
-    Two reproduction checks tie them to committed code. The smoke check of the first round
-    covers Tier S only: 128 × 600, phi4 and decay_opp, seeds 0–1, re-run on 7260a95,
-    bit-identical apart from the then-new ρ ≤ 1e8 column (the pilot, a sizing run that no
-    table uses, is not re-run). The re-review's re-run at 928b49c (every study file
-    committed) covers the rest: Tier L decay_opp 2048 × 3600 seed 0 and opp_nonsep
-    2048 × 16384 seeds 0–1 (seed 1 with seed 0's stale weights), the real R2 and R2b of
-    benzene/cc-pVDZ, multi and batch seed 0, the real-operand B6 record of R2b, and every
-    record of M-d1 jacobi (11), davidson (6) and cg (7). All reproduce bit for bit
-    (immerdink-eval `scripts/c1/repro_check.py`); the only differences are columns added
-    after the stored records were written (Tier L's ρ ≤ 1e8 column). M-d1 diis and ppl run
-    the same fixed-point code as jacobi. Records written since the first round carry a dirty
-    flag and the sha256 of every study file: the review round's B6 records (51dba1e,
-    a858225) and IR7 re-run (d89988a), whose files match f97696a's (S2-18).
-  - *CPU budget:* M-a about 39 of its 90 CPU-min, including about 6 min of duplicated work by
-    an orphaned process (§5.6 S2-7), the review's B6 runs at m = 512 (1.6 min) and the
-    re-review's re-runs (1.7 min); M-d1 about 21 of its 30, including the IR7 re-run
-    (1.7 min) and the re-review's re-runs (4.8 min).
+    Three reproduction checks tie them to committed code (corrected in the second re-review:
+    the earlier text claimed more re-running than had been done). Each compares every field
+    of a re-run record with the stored one exactly (immerdink-eval `scripts/c1/repro_check.py`;
+    provenance and resource fields skipped; a field only the re-run has, added after the
+    stored record was written, is listed; a field only the stored record has fails unless
+    explicitly allowed):
+    - *Smoke check, first round:* Tier S only, 128 × 600, phi4 and decay_opp, seeds 0–1, on
+      7260a95, bit-identical apart from the then-new ρ ≤ 1e8 column: 4 of Tier S's 245 runs.
+    - *Spot check, re-review, at 928b49c* (every study file committed;
+      `results/c1/repro_928b49c/`): 3 of the 66 Tier L records (decay_opp 2048 × 3600 seed 0,
+      opp_nonsep 2048 × 16384 seeds 0–1, seed 1 with seed 0's stale weights), 2 of the 11 real
+      ones (R2 and R2b of benzene/cc-pVDZ), 1 of 2 multi, 1 of 2 batch, 1 of the 7 real-operand
+      B6 records (R2b), and all of M-d1 jacobi (11), davidson (6) and cg (7). All bit for bit;
+      beyond Tier L's ρ ≤ 1e8 column, the stored R2b real record's `--b6` block is absent from
+      its re-run (run without `--b6`; the B6 job reproduces it). It did not run M-d1 diis
+      (22 records), ppl (11) or `rho_levels14` (4), and the jacobi re-run does not exercise
+      their code: the DIIS branch of `md1_converge.iterate` (Pulay extrapolation, the history
+      reset at a precision switch) and the PPL class (two calls per iteration, the ring
+      transposition, its own setup). Its records alone make gate (ii) fail: at d*,
+      opp_nonsep 2048 × 16384 has 7 sampled outputs above 2× fast's error at seed 0 and 6 at
+      seed 1 (max ratio 247), guard14 = 1 (G = 14) in both.
+    - *Full re-run, second re-review, at 5925219* (every study file committed;
+      `results/c1/repro_5925219/`, the driver immerdink-eval `scripts/c1/repro.sh`): all 66
+      Tier L, all 11 real (with `--b6`), 2 multi, 2 batch and the 7 real-operand B6 records,
+      and M-d1 diis (22) and ppl (11): **121 records, all bit for bit**, no stored field
+      missing; the only fields added are Tier L's ρ ≤ 1e8 column and the real B6 blocks'
+      later `rho_cap` / `excluded_outputs`. So every 52054e9-era record that is not
+      superseded is reproduced on committed code, and with the spot check every M-d1 record
+      behind the success criterion and the caller guidance (jacobi, diis, ppl, davidson, cg).
+      Gates (i) and (ii) rest on reproduced records only: guard = 0 on every real R1–R6
+      contraction, and all 16 guard-accepted Tier-L records (decay_opp and opp_nonsep at
+      every size, 0–7 sampled outputs above 2× each, 2–19 per fixture, max ratio 247).
+    - *Not re-run:* Tier S beyond the smoke check (241 of 245 runs at 8b58101; d* = 3 and
+      Tier S's share of gate (iii) rest on them) and the pilot (a sizing run no table uses);
+      the superseded files (`real_pre_ew8`, `md1_rho_levels14`, `md1_rho_local`, `cg_v1`,
+      `davidson_v2`, `davidson_strongcoupling`); and the records written since the first
+      round, which carry a dirty flag and the sha256 of every study file instead: the review
+      round's 30 B6 records (51dba1e, a858225) and the IR7 re-run's 4 `md1_rho` records
+      (d89988a), whose files match f97696a's (S2-18).
+  - *CPU budget:* M-a about 51 of its 90 CPU-min, including about 6 min of duplicated work by
+    an orphaned process (§5.6 S2-7), the review's B6 runs at m = 512 (1.6 min), the
+    re-review's spot check (1.7 min) and the full re-run at 5925219 (11.8 min); M-d1 about
+    27 of its 30, including the IR7 re-run (1.7 min), the re-review's spot check (4.8 min)
+    and the diis and ppl re-runs at 5925219 (5.7 min).
   - **Mechanical outcomes** (the pre-registered rules, IR27):
     - d* = 3 (Q11). Every deadband rejected all 30 random-structure runs, and the median gains
       on decay_opp and opp_nonsep are within 0.25 moduli; ties go to 3.
@@ -3762,15 +3792,46 @@ provenance statements named the wrong commit for most records (now Status, stage
   4 `md1_rho.jsonl` records equals the committed file of 51dba1e and f97696a, the other study
   files match f97696a, and the same holds for the 30 review-round B6 records. Records tied by
   content are what `provenance()` is for.
-- **Re-review should-fix items applied.** The 52054e9-era records re-run on committed code
-  (Status, stage 2, *Provenance*); `c2_summary.gate_verdict`'s (iii) sums over every run that
-  scales an operand (Tier S included, stale weights included; B6 scales nothing), and a
-  guard-accepted contraction whose (b)/(c) the script does not compute (R6) makes (i)
-  INCOMPLETE instead of NOT MET; the `oracle.kweights` docstring, §4.5 step 5 and the report
-  struct say that `gain_row_min` / `gain_col_min` are the caller's A rows and B columns,
-  independent of lowering's swap (S2-5 (d)); the B6 findings table shows the reaching and the
-  unreaching seeds separately and says why no split pays at m = n = 512; the M-d1 caller
-  guidance's move into DESIGN is tracked as an open item (Status, stage 2).
+- **Re-review should-fix items applied.** A spot check of the 52054e9- and d22a686-era records
+  re-run on committed code at 928b49c (Status, stage 2, *Provenance*, which names exactly what
+  it covered: 3 of 66 Tier L, 2 of 11 real, 1 of 2 multi, 1 of 2 batch, 1 of 7 real-operand
+  B6, M-d1 jacobi, davidson and cg; the first wording called it the rest);
+  `c2_summary.gate_verdict`'s (iii) sums over every run that scales an operand (Tier S
+  included, stale weights included; B6 scales nothing), and a guard-accepted contraction whose
+  (b)/(c) the script does not compute (R6) makes (i) INCOMPLETE instead of NOT MET; the
+  `oracle.kweights` docstring, §4.5 step 5 and the report struct say that `gain_row_min` /
+  `gain_col_min` are the caller's A rows and B columns, independent of lowering's swap (S2-5
+  (d)); the B6 findings table shows the reaching and the unreaching seeds separately and says
+  why no split pays at m = n = 512; the M-d1 caller guidance's move into DESIGN is tracked as
+  an open item (Status, stage 2).
+
+**Second re-review** (independent reviewer, 2026-10-07; approve-with-fixes). One must-fix:
+the provenance text again claimed more re-running than was done. It called the 928b49c
+re-run "the rest" and said M-d1 diis and ppl "run the same fixed-point code as jacobi",
+while that re-run covered 3 of 66 Tier L, 2 of 11 real, 1 of 2 multi, 1 of 2 batch and 1 of
+7 real-operand B6 records and no diis, ppl or `rho_levels14` record, and jacobi never runs
+the DIIS branch or the PPL class. Fixed: Status, stage 2, *Provenance* calls it a spot
+check, names what it covered and what not, and states what its records alone show (gate
+(ii) fails). Its should-fix items, applied: every 52054e9-era record that is not superseded
+re-run at 5925219 (121 records, all bit for bit: Tier L, real, multi, batch, real B6, M-d1
+diis and ppl; within the CPU budgets, now about 51 of 90 and 27 of 30); `repro_check.py`
+fails on a field only the stored record has, unless allowed by `--allow-missing`; the
+re-run driver committed as immerdink-eval `scripts/c1/repro.sh`; two wording nits in the
+findings and `b6_split_cost.py`. Its verdicts, binding:
+- **S2-19. `self_test_modes`' coverage** (P = 2 standing for P ≥ 2 in the X-role and
+  FP64-clamp checks, guard 0 and 1 required at each P = 1, 2, 3, the clamp not required to
+  bind at exactly P = 3, G undefined left to test_oracle (12)). *Verdict: confirmed, with
+  one binding condition.* The clamp and the X-role attribution depend on P only through the
+  union extrema and the loop over pairs, the same path for P = 2 and 3; the guard's minimum
+  over pairs depends on P and is asserted at each. The reviewer's mutation checks trip the
+  coverage assert, and none of the 1451 weight vectors in M-a has an undefined G. *Binding:*
+  before any record from a fixture that can produce G undefined is used (an all-zero slice in
+  a batched descriptor, a zero operand), `self_test_modes` adds such a case and asserts it.
+- **S2-20. `c2_summary` reports INCOMPLETE** only when (i) is undetermined and (ii) and (iii)
+  both pass; a failing (ii) or (iii) still gives FAILS. *Verdict: confirmed* (checked by
+  perturbing the stored records). The (i) INCOMPLETE line stays in the output even when the
+  verdict is FAILS, so a revival assessment sees the undetermined contraction; it must stay
+  that way.
 
 ### 5.7 Stage 3: the implementation's design questions (independent reviewer, 2026-10-07)
 
