@@ -6,6 +6,9 @@
 # v1.15 (DESIGN §6c.7): 60 s pre-heat (the windows start nearer the settled 74-75 C die of
 # long hot runs; was 15 s) and a 2 s trace (time series per window, temperatures).
 # About 17 min of GPU time on an RTX 4090 (was 7 min).
+# v1.18 (DESIGN §6c.8): 12 more windows for the busy-power / DRAM-energy / boost-clock form: small
+# grids (they run below the cap, at the boost clock), KL / DRAM-heavy r_mm-like calls, two K5-heavy
+# calls and the DIRECT kernel (its variant now says mode=direct). About 33 min of GPU time.
 # name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
 u_s512    | ik,jk->ij | i=512,j=512,k=512          | sustained | 14,16 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
 u_s1024   | ik,jk->ij | i=1024,j=1024,k=1024       | sustained | 8,16 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
@@ -17,3 +20,15 @@ u_rmm     | ik,jk->ij | i=1500,j=96,k=40000        | sustained | 14 | --sustain-
 u_rbigk   | ik,jk->ij | i=2048,j=2048,k=32768      | sustained | 16 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2
 u_tcc     | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | sustained | 16 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2
 u_tdf     | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | sustained | 14 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2
+s_s256    | ik,jk->ij | i=256,j=256,k=256          | sustained | 14 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+s_s384    | ik,jk->ij | i=384,j=384,k=384          | sustained | 14 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+s_s512n8  | ik,jk->ij | i=512,j=512,k=512          | sustained | 8 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+s_s768    | ik,jk->ij | i=768,j=768,k=768          | sustained | 14 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+s_s1536   | ik,jk->ij | i=1536,j=1536,k=1536       | sustained | 8 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+s_rmm1    | ik,jk->ij | i=1000,j=64,k=50000        | sustained | 14 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+s_rmms    | ik,jk->ij | i=384,j=96,k=40000         | sustained | 14 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+s_rmml    | ik,jk->ij | i=4000,j=96,k=40000        | sustained | 14 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2
+s_k5      | ik,jk->ij | i=4096,j=4096,k=256        | sustained | 14 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+s_k5b     | ik,jk->ij | i=8192,j=8192,k=64         | sustained | 14 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+s_kl      | ik,jk->ij | i=8192,j=256,k=8192        | sustained | 14 | --sustain-s 6 --sustain-warm-s 60 --sustain-trace-s 2
+s_dir     | ik,jk->ij | i=1024,j=1024,k=1024       | sustained | 8 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2 --mode direct

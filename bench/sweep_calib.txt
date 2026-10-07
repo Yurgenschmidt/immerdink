@@ -78,6 +78,16 @@ c_l2s1472 | ik,jk->ij | i=1472,j=1472,k=1472       | imd | 8,14,20 | --reps 30 -
 c_l2s1792 | ik,jk->ij | i=1792,j=1792,k=1792       | imd | 14 | --reps 30 --phase-reps 5 --max-seconds 1 --g 4
 c_k3hit   | ik,jk->ij | i=1024,j=96,k=4096         | imd | 8,14 | --reps 30 --phase-reps 5 --max-seconds 1 --g 2
 c_k3miss  | ik,jk->ij | i=4096,j=96,k=4096         | imd | 8,14 | --reps 30 --phase-reps 5 --max-seconds 1 --g 2
+# --- (v1.18, DESIGN §6c.8) the PACK set S with K4's W planes, S = 8(m + n)k + g(m + n_hat)k_hat +
+#     g m n_hat (2 k_chunks - 1), L_hit = 1.1 x L2 = 83 MB: the four non-square / tensor cases that
+#     ruled out the v1.17 proxy (perfminor-time §2), g = 4. 4096^2 x 512: proxy 50 MB, with the
+#     planes 117 MB (miss); 4096 x 128 x 1280: 65 / 67 MB (hit); 1600^3: 61 / 72 MB (hit); DF
+#     a..d = 48, Q = 1024: 57 / 78 MB (hit). Hits of known bytes make the hit price (pack.byte)
+#     identifiable.
+c_w4096k512 | ik,jk->ij | i=4096,j=4096,k=512     | imd | 8,14 | --reps 30 --phase-reps 5 --max-seconds 1 --g 4
+c_skin1280  | ik,jk->ij | i=4096,j=128,k=1280     | imd | 8,14 | --reps 30 --phase-reps 5 --max-seconds 1 --g 4
+c_l2s1600   | ik,jk->ij | i=1600,j=1600,k=1600    | imd | 14 | --reps 30 --phase-reps 5 --max-seconds 1 --g 4
+c_df48      | acQ,bdQ->acbd | a=48,b=48,c=48,d=48,Q=1024 | imd | 8,14 | --reps 30 --phase-reps 5 --max-seconds 1 --g 4
 t_k768    | ik,jk->ij | i=2048,j=2048,k=768        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
 t_k784    | ik,jk->ij | i=2048,j=2048,k=784        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0
 t_k800    | ik,jk->ij | i=2048,j=2048,k=800        | imd | 8,16 | --reps 50 --phase-reps 10 --max-seconds 1 --k4 rule,0

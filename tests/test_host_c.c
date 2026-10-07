@@ -405,9 +405,17 @@ int main(void) {
     CHECK(IMD_HOST_API_VERSION >= 7);
     /* v8 sizes (v7: 3672, 1952, 168, 88, 40; v6: 1232, 96, 1648, 128, 64, 24; the older
      * prefixes are unchanged); v11: imd_perf_calib_t 3680 (energy_byte_f_pj at 3672); v12:
-     * 3688 (pack_l2_hit_bytes at 3680) */
-    CHECK(sizeof(imd_perf_calib_t) == 3688 && offsetof(imd_perf_calib_t, energy_byte_f_pj) == 3672 &&
-          offsetof(imd_perf_calib_t, pack_l2_hit_bytes) == 3680 && IMD_HOST_API_VERSION >= 12);
+     * 3688 (pack_l2_hit_bytes at 3680); v13 (DESIGN v1.18 §6c.8): 3744, seven doubles from
+     * clock_boost_mhz at 3688 to pack_l2_planes at 3736 */
+    CHECK(sizeof(imd_perf_calib_t) == 3744 && offsetof(imd_perf_calib_t, energy_byte_f_pj) == 3672 &&
+          offsetof(imd_perf_calib_t, pack_l2_hit_bytes) == 3680 && IMD_HOST_API_VERSION >= 13);
+    CHECK(offsetof(imd_perf_calib_t, clock_boost_mhz) == 3688 &&
+          offsetof(imd_perf_calib_t, power_act_w) == 3696 &&
+          offsetof(imd_perf_calib_t, power_act_gap_us) == 3704 &&
+          offsetof(imd_perf_calib_t, energy_dram_pj) == 3712 &&
+          offsetof(imd_perf_calib_t, warm_call_ns) == 3720 &&
+          offsetof(imd_perf_calib_t, warm_clean_byte_ns) == 3728 &&
+          offsetof(imd_perf_calib_t, pack_l2_planes) == 3736 && IMD_PERF_CACHE_CLEAN == 3);
     CHECK(strcmp(imd_perf_param_name(IMD_PERF_CLASS_KF, 4), "elem") == 0 &&
           strcmp(imd_perf_param_name(IMD_PERF_CLASS_PACK, 3), "dram") == 0 &&
           imd_perf_param_name(IMD_PERF_CLASS_KL, 4) == NULL);
@@ -801,7 +809,10 @@ int main(void) {
               p7.time_s == p6.time_s && p7.time_lo_s == p7.time_s);
         r7.regime = 7;
         CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r7, NULL, &p7) == IMD_STATUS_INVALID_VALUE);
-        r7.regime = 0, r7.cache = 3;
+        r7.regime = 0, r7.cache = IMD_PERF_CACHE_CLEAN;  /* v13 (DESIGN v1.18 §6c.8) */
+        CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r7, NULL, &p7) == IMD_STATUS_SUCCESS &&
+              p7.cache == IMD_PERF_CACHE_CLEAN && p7.time_s > 0);
+        r7.cache = 4;
         CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r7, NULL, &p7) == IMD_STATUS_INVALID_VALUE);
         r7.cache = 0, r7.clock_mhz = -1.0;
         CHECK(imd_perf_predict(&A, &B, &C, &opt, NULL, &r7, NULL, &p7) == IMD_STATUS_INVALID_VALUE);

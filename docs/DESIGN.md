@@ -1,4 +1,4 @@
-# immerdink — design (v1.17)
+# immerdink — design (v1.18)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -69,6 +69,14 @@ residency size `warm.pack_l2_bytes`), all optional keys (absent = 0 predicts exa
 before; calibration format 2 kept), host API 12 (one appended calibration field), a less
 overfit choice of the effective clock f_ref, and a full recalibration (NOTES-B2 §11). No
 semantic, layout, launch, pack-format or TLA+ change; changed text is marked **[v1.17]**.
+v1.18 (§6c.8) extends the performance model after two offline analyses: a cache term with a
+per-call REPEAT saving and a clean-L2 state (`IMD_PERF_CACHE_CLEAN`), the PACK group working
+set with K4's W planes, and a power model with busy-GPU power, DRAM energy and the boost clock
+(γ = 2.5 as a prior); every key optional (absent = 0 predicts exactly as before; calibration
+format 2 kept), host API 13 (seven appended calibration fields, one cache state, the reported
+clock up to the boost clock), the sustained-DIRECT bench variant fix and a full recalibration
+(NOTES-B2 §12). No semantic, layout, launch, pack-format or TLA+ change; changed text is
+marked **[v1.18]**.
 The change lists are at the end.
 
 Sources:
@@ -2835,12 +2843,17 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
     averaged the two. The 4090 data bound L_hit to [57, 77) MB; `perf_fit.py` sets it to
     0.8 × the nominal L2 (60.4 MB, the cache term's residency fraction, §6c.2). Not clock-bound.
     Terms in W, the grid shape or the occupancy fitted to 0 in the analysis.
+    **[v1.18]** With `warm.pack_l2_planes = 1` S counts one group's W planes,
+    `+ g·b·m·n̂·(2·k_chunks − 1)`, and L_hit = 1.1 × the nominal L2 (§6c.8; the four new
+    non-square cases that ruled the proxy out are in the calibration sweep).
   - Not adopted: the analysis's KF read / write byte split (residue writes cost ~1/3 of an
     input read per byte: they stay in L2 until K4). It needs a seventh KF slot, or a
     retirement of `kf.op` / `kf.row` (both fit 0 on the 4090, but retiring them changes the
     meaning of existing keys, which needs a format bump); offline, on the combined refit's
     records, it moved no hold-out statistic (median, p90, max per size class) by more than
-    1 point over `elem` + `dram` (NOTES-B2 §11).
+    1 point over `elem` + `dram` (NOTES-B2 §11). [v1.18] Re-examined and again not adopted
+    (§6c.8: `kf.row` is non-zero in format-1 files, so it cannot be retired without a format
+    bump; gain ≤ 0.8 points).
 - **K4's DRAM term.** The operands of a group were just written by the packs and stay in L2
   while the group's operands and W planes fit; beyond that K4 streams them from DRAM
   (measured memory-bound: r_mm-like n̂ = 64–128 with long k, skinny m ≫ n). The calibration
@@ -2933,6 +2946,9 @@ split into a time model at a given clock and a clock model per regime.
   modelled DRAM byte, clock-scaled): `P(f) = P_idle + [ (e_tc·O_tc + e_alu·O_alu +
   e_byte^f·D)·(f/f_ref)^γ + e_byte·D ] / t(f)`. e_byte^f = 0 (absent) is the form above, bit
   for bit; P(f) stays monotone in f.
+- **[v1.18]** With `power.clock_boost_mhz` > 0 the clock range ends at the boost clock f_top
+  instead of f_ref, the time is flat above f_ref, and P(f) gains the busy power and the DRAM
+  energy (§6c.8); with the v1.18 keys 0 the rules below are unchanged.
 - **Regimes.** `BURST`: f = f_ref. `SUSTAINED`: f = f_ref if P(f_ref) ≤ P_cap, else the f in
   [f_min, f_ref] with P(f) = P_cap (bisection, deterministic), f_min if even that is above the
   cap. An explicit `clock_mhz` in the request overrides both (e.g. a locked clock, or the
@@ -3018,6 +3034,12 @@ raises them to COLD like every repeat record's phases (it treated them as COLD; 
 calibration or hold-out record used `--l2 flush`, so no shipped fit was affected). **If the measured COLD / WARM difference is below a few
 % of the call on every measured shape, the calibration keeps Δ = 0 (COLD = WARM, the option
 stays as a reported no-op) and NOTES-B2 says so.** A format-1 calibration has Δ = 0.
+**[v1.18]** The flush *reads* its buffer, so a flushed (and method pair's COLD) record starts
+with a clean L2, which a REPEAT call does not have; and the REPEAT saving has a per-call part.
+§6c.8 adds `warm.call_ns` (c, applied when res > 0; supported, **0 in the shipped
+calibration** since perf-minor-noc), `warm.clean_byte` (ω) and the state
+`IMD_PERF_CACHE_CLEAN` (COLD minus ω·min(F − I, L_w) on the call phase); COLD stays the default
+(the model's state of a call inside a sequence, not a measured one, §6c.8).
 
 #### [v1.10] Prediction intervals and ties
 
@@ -3135,7 +3157,9 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
     which API ≤ 10 requires (MISSING_KEY), and it contains `power.byte_f_pj` when non-zero
     (unknown key). Only a file that still carries all three `op_eps` keys and no `byte_f`
     loads in both. "Format 2" names the key grammar this library reads, not a promise that
-    older libraries read every file it writes.
+    older libraries read every file it writes. [v1.18] Likewise a file with any v1.18 key (the
+    shipped one) does not load in API ≤ 12 (unknown key); `host_perf` checks that the shipped
+    file omits the `op_eps` keys and carries `power.byte_f_pj` or a v1.18 key.
   - **[v1.17, host API 12] optional:** `kf.elem`, `pack.dram` (parameters, ≥ 0) and
     `warm.pack_l2_bytes` (L_hit of §6c.1, ≥ 0; the field `pack_l2_hit_bytes`), each absent
     = 0 and written only when non-zero; format-2 keys (rejected in a format-1 file). With
@@ -3147,6 +3171,17 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
     is misread. A bump would be needed if an existing key's meaning changed (e.g. the KF
     read / write split of §6c.1, not adopted). A library older than API 12 rejects a file
     containing any of the three keys.
+  - **[v1.18, host API 13] optional** (§6c.8): `power.clock_boost_mhz`, `power.act_w`,
+    `power.act_gap_us`, `power.dram_pj`, `warm.call_ns`, `warm.clean_byte`,
+    `warm.pack_l2_planes` (0 or 1), each absent = 0 and written only when non-zero; format-2
+    keys. With all seven absent a calibration predicts bit-identically to API 12 (tested),
+    and a library older than API 13 rejects a file containing any of them, so no *library*
+    reads a file with features it was not fitted with and format 2 is kept for the reason
+    above. [v1.18 review] Unlike v1.17's keys, three of them change what existing keys do when
+    present (`warm.pack_l2_planes`: the S that `warm.pack_l2_bytes` thresholds; `power.act_w`
+    > 0: γ is also the busy term's exponent; `warm.l2_bytes` also gates the DRAM energy), so a
+    caller's **v7…v12-sized struct** does read the shipped file with features it was not
+    fitted with: a stated exception, a degraded view (pass NULL; §6c.8 "Host API 13").
   A value of several numbers is separated by blanks. **Reading format 1** migrates: the new
   parameters 0, the built-in occupancy table, no power model, Δ = 0, bands `1 1`; such a
   calibration predicts exactly as host API 6 did (tested). `imd_perf_calib_format` writes the
@@ -3177,10 +3212,13 @@ candidate by appended fields (`struct_size`, `candidate_size`), not by changing 
   The predictors and `imd_perf_calib_format` read it as `warm_l2_bytes` when `pack.dram` > 0
   and as 0 otherwise (the parse / default / load functions write nothing past the caller's
   size, as before). With `pack.dram` = 0 (every file before v1.17) L_hit has no effect, so
-  the view is the full calibration and its text gains no key. For the shipped file the
-  fallback is exact (its `warm.l2_bytes` = `warm.pack_l2_bytes` = 60397977.6 B, 0.8 × L2),
-  so an API-7…11 caller predicts as with NULL;
-  for another file with `pack.dram` > 0 it is a degraded, unvalidated view (pass NULL).
+  the view is the full calibration and its text gains no key. For the v1.17 shipped file the
+  fallback was exact (its `warm.l2_bytes` = `warm.pack_l2_bytes` = 60397977.6 B, 0.8 × L2).
+  **[v1.18 review]** For the v1.18 shipped file it is **not**: L_w = 67.9 MB (64.2 MB since perf-minor-noc), L_hit = 83 MB
+  and S counts K4's planes, and the v1.18 fields read as 0, so an API-7…11 caller gets a
+  degraded, unvalidated view (pass NULL), as for any other file with `pack.dram` > 0. The test
+  checks the exact case on a v1.17-style file (L_hit = L_w, no v1.18 keys) and that the
+  shipped file's v11 view is exactly that degraded calibration.
   (v1.17 as first written read it as 0: every PACK byte at the DRAM rate, a worse prediction
   than the old calibration gave such callers.)
 - **Shipped table.** `src/host/calib/rtx4090_sm89.calib` (the 4090 at stock clocks, as
@@ -3471,6 +3509,13 @@ enum { IMD_PERF_ORDER_TIME = 0, IMD_PERF_ORDER_TIES_BY_FOOTPRINT = 1 };
   returns `"elem"` for KF slot 4 and `"dram"` for PACK slot 3 (were `"op_eps"`) and NULL for
   KL slot 4 (retired). Python: `Calibration.warm` has `"warm.pack_l2_bytes"`,
   `host.FORMAT2_PARAMS` has `kf.elem` and `pack.dram`; `host.API_VERSION` 12.
+- **[v1.18] host API 13:** `imd_perf_calib_t` grows by `clock_boost_mhz`, `power_act_w`,
+  `power_act_gap_us`, `energy_dram_pj`, `warm_call_ns`, `warm_clean_byte_ns`,
+  `pack_l2_planes` (7 doubles, 3688 → 3744); a struct of the v7–v12 size is read with them 0
+  (a degraded view of a v1.18 file: pass NULL). `IMD_PERF_CACHE_CLEAN = 3` (request and rank
+  request; 4 is INVALID_VALUE). `clock_mhz` out is the clock used, up to the boost clock.
+  Python: `host.API_VERSION` 13, `PERF_CACHES["CLEAN"]`, the keys in `Calibration.power` /
+  `.warm`. §6c.8.
 - `imd_perf_predict_pack` uses the request's regime, cache (its input is X: WARM serves X from
   L2 up to L_w) and clock as `imd_perf_predict`.
 - Python (`host.py`): `predict(..., regime=, cache=, clock_mhz=)`, `Prediction.regime`,
@@ -3538,6 +3583,11 @@ rejected in format 1, negative rejected, written only when non-zero and round-tr
 bit-exactly; the retired `op_eps` keys accepted and discarded in both formats (not written);
 the v11-sized struct reads L_hit as 0. `host_c_api`: the v12 size and offset. Monotonicity
 (doubling m, n or k never lowers the predicted time) is re-checked with the new terms.
+
+[v1.18] `host_perf` adds the checks listed in §6c.8 "Tests" (absent = 0 bit-identical, the
+keys' grammar, S with planes transcribed, CLEAN / REPEAT terms, boost clock, busy power and
+DRAM energy monotone, the v12-sized view); `host_c_api` the v13 size, offsets and the CLEAN
+state.
 
 ### 6c.5 Validation (hold-out)
 
@@ -3771,6 +3821,278 @@ fit). So the hold-out is a check of the long-run state, and of shape only at 163
   below it: u_s512 345 / 371 W (−23 / −17 %), u_s1024 N = 8 423 W (−6 %) and u_rmm 258 W
   (−43 %). So power is predicted low on every small window that runs at a high clock, not
   only on r_mm: the power model needs a clock-dependent term for small calls.
+  **[v1.18]** Both gaps are addressed by §6c.8 (busy power, boost clock, DRAM energy).
+
+### 6c.8 Cache-state terms, the PACK set with K4's planes, busy power and the boost clock **[v1.18]**
+
+Status: designed from the two offline analyses of 2026-10-06 (evaluation workspace
+`findings/perfminor-time.md`, `findings/perfminor-power.md`), implemented on branch
+`perf-minor` (host API 13), refit and validated in NOTES-B2 §12 (shipped: every part below
+marked adopted; the v1.18 changelog has the figures). **[perf-minor-noc]** The per-call REPEAT
+saving c (`warm.call_ns`) is **dropped from the shipped fit** by the independent reviewer's
+verdict (NOTES-B2 §12 "Decision: c dropped"): not identifiable from the pair records; the key
+stays supported (optional, 0 = off) for a future calibration, and the question stays open with
+the launch-timing check below. Every new calibration key
+is optional (absent = 0) and calibration format 2 is kept: a file without them predicts
+bit-identically to host API 12 (tested), and API ≤ 12 rejects a file with any of them
+(unknown key), so no library reads a file with features it was not fitted with (§6c.2 "Why
+format 2 is kept"; [v1.18 review] a caller's v7…v12-sized struct is the stated exception,
+"Host API 13" below). Changed text elsewhere in §6c is marked **[v1.18]** and points here.
+
+**What the analyses found (the reasons for each term).**
+- *The COLD / REPEAT pairs are not what the v1.10 cache term assumes.* `imd_bench --l2 flush`
+  and method pair's COLD *read* a 2 × L2 buffer before the timed call, so a COLD record starts
+  with a **clean** L2, while a REPEAT call starts with up to L_w of the previous call's dirty
+  lines (C, the W planes, the residues) and writes them back during the call. On every large
+  pair whose inputs cannot be resident (res = 0) COLD is 7–18 µs *faster* than REPEAT (x_s2048,
+  x_r1, x_r2, 1536³), which the v1.10 form (`Δ·res`) predicts as 0. The REPEAT saving of small
+  calls also has a per-call part (first-touch latency of the resident inputs) that a per-byte
+  Δ cannot carry, so Δ was 1.4× too large on 1024³ at N = 8 and the saving collapsed too early
+  at N = 14 (1024³ N = 14 hold-out call +13.9 %). The KF "overlap" hypothesis (latency and
+  bandwidth terms in a roofline or soft-max) fits worse than the sum in every variant (KF
+  terms do add); the 1024³ error is the cache term's.
+  **[v1.18 review]** The dirty-write-back reading is a hypothesis, not a measured mechanism,
+  and the WARM records argue against it: WARM follows a call that left dirty lines, yet on
+  every res = 0 pair WARM − REPEAT is as large as CLEAN − REPEAT or larger (x_r1 −7.0 vs
+  −5.4 %, x_s2048 −2.8 vs −1.6 %; held out −12.6 vs −6.1 µs and −28.0 vs −20.8 µs). A timing
+  difference fits at least as well: the CLEAN and WARM timed calls start queued behind a GPU
+  operation (the flush kernel, the untimed producer call), while REPEAT, and every plain imd
+  REPEAT record, starts on an idle stream after a host sync. c and ω are therefore effect-size
+  terms fitted to the pairs; which of the two readings is right is open (NOTES-B2 §12
+  "Remaining": a REPEAT variant with a dummy kernel before the timed call and a COLD whose
+  flush *writes*), and the split between c and ω is not checkable from these pairs.
+- *S, the PACK group working set of v1.17, is a proxy that misses K4's W planes.* On four new
+  non-square / tensor cases it makes the wrong hit / miss call on three (4096² × 512 g = 4:
+  S = 50 MB "hit", measured miss; 4096 × 128 × 1280 and 1600³ g = 4: 65 / 61 MB "miss",
+  measured hits). No threshold on the v1.17 S separates them; with one group's W planes counted
+  every case (and the calibration's 1472³ / 1792³) is consistent with L_hit ∈ (77.8, 89.8) MB.
+- *The SUSTAINED power was evaluated at the wrong clock and missed a busy-GPU power.* The
+  solve cannot go above f_ref (2491 MHz, the time model's effective clock), but light calls
+  run at 2625–2790 MHz (NVML); at their measured clock the v1.15 form gets u_s512 right. The
+  energy per operation rises faster than f (locked 2205 MHz vs stock: exponent ≈ 2.2 up to
+  2790 MHz; the shipped γ = 1 over-predicts s512 at 2205 MHz by 33 %), and the DIRECT kernel
+  draws 349 W at 0.26 TFLOPS-eq, which no op- or byte-energy term explains: busy SMs draw power
+  whatever they compute. Fitted on the 14 calibration windows, the v1.15 form misses 11 new
+  windows by a median of 21 % (max 82 %); only forms with a busy-GPU term generalise.
+
+**Time model: the cache state (P1).** Two optional format-2 keys, `warm.call_ns` (c, ns ≥ 0)
+and `warm.clean_byte` (ω, ns per byte ≥ 0), and a fourth cache state:
+
+```c
+enum { ..., IMD_PERF_CACHE_CLEAN = 3 };  /* the inputs evicted and the L2 clean (flushed by
+                                             reads, e.g. imd_bench --l2 flush); host API 13 */
+```
+
+- The parameters θ stay **COLD** costs, and COLD stays the default. COLD is a **modelling
+  convention**, not a measured state: *the inputs are not resident* (res = 0) and the call pays
+  what a REPEAT call with res = 0 pays, i.e. the CLEAN credit is not applied. It is meant as the
+  state of a call that follows other kernels in a sequence (ehrenfest); whether such a call's
+  L2 really holds dirty lines it must write back, or the measured CLEAN / REPEAT gap is launch
+  timing, is open (the reading above). [Design question of the time analysis, decided here:
+  the alternative, "COLD = CLEAN" (what the bench's flushed records measure), would make every
+  default prediction of a large call ω·L_w faster.] **[v1.18 review]** COLD itself is never
+  measured. For a call with res = 0 it equals the measured REPEAT; for res > 0 it is CLEAN +
+  ω·min(F − I, L_w), an extrapolation of the additive form that **no record validates** (with
+  the shipped calibration, no c, COLD is 1.8 / 4.1 / 3.8 % slower than CLEAN on 256³ / 512³ /
+  1024³ at N = 14, at most ω·L_w ≈ 6.7 µs on large calls; with c it was 2.8 / 6.7 / 6.3 % and
+  11.5 µs). If the timing reading above is the right one, a call queued in a sequence is closer
+  to CLEAN and the default is pessimistic by up to ω·L_w. **[perf-minor-noc]** With c fitted,
+  the fitter adds c back onto every REPEAT phase record, so θ (the COLD costs) carried ≈ 1.2 µs
+  per small call that no COLD measurement backs (64³ N = 14 COLD 16.68 µs with c, 15.45 without;
+  REPEAT 15.37 / 15.36): one reason c is 0 in the shipped file.
+- REPEAT / WARM: `cache_ns = −Δ·res − c·[res > 0]`, split over the reading phases by
+  `in_bytes / I` and clamped at 0 per phase as in v1.10 (res = `res_repeat`); c = 0 in the
+  shipped calibration (perf-minor-noc), so there REPEAT = COLD − Δ·res as in v1.10.
+- CLEAN: `res = 0` (as COLD) and the **call** phase gains `−ω·min(F − I, L_w)` (an effect-size
+  credit, read as the write-back of up to L_w dirty bytes that a clean L2 does not pay, a
+  hypothesis; F − I is the call's written footprint). ω ≈ 0.10 ps/B (shipped, no c; 0.17 with
+  c) is far below a DRAM write rate, so the credit is below 20 % of the time to write F − I
+  bytes and a CLEAN time is never negative. Bands as in every state.
+  **[v1.18 review]** The credit saturates at ω·L_w (≈ 6.7 µs shipped; 11.5 µs with c) too
+  early: every res = 0 pair whose measured clean saving is larger is under-predicted (x_r1
+  N = 14 and x_s1536 N = 8 by 10.7 µs in-sample, the held-out v_x3072 by 14.1 µs and v_x1280
+  by 4.7 µs; with c 5.9 / 9.3 / 0.1 µs), so `min(F − I, L_w)` is probably the wrong form for
+  large write-backs (open). WARM stays modelled as REPEAT although the pairs
+  measure WARM − REPEAT of −4.5 / −7.2 / −11.9 % on the held-out pairs and down to −7 % on the
+  calibration pairs (the model: 0; open, with the timing question above).
+- **Fit** (`perf_fit.fit_warm`): L_w scanned over 0.30–1.20 × L2 in steps of 0.05; for each,
+  (Δ, c, ω) ≥ 0 minimise the relative squared error of the pairs' measured `CLEAN − REPEAT`
+  (method pair's COLD is CLEAN) against the C model's `(CLEAN − COLD) + (COLD − REPEAT)` at
+  unit parameters (exact NNLS over the 3 columns; no formula in Python). The REPEAT phases of
+  the calibration records are raised to COLD by the C model's per-phase `COLD − REPEAT` as
+  before (c enters through the split; ω is a call-phase term and never enters the raise). The
+  "Δ = 0 when every measured effect is below 3 %" rule is kept. `--cache-form v110` is the
+  v1.10 fit and `--cache-terms` fits a subset of (Δ, c, ω); **[perf-minor-noc]** the default
+  is `delta,omega` (c = 0; `delta,c,omega` is the perf-minor fit). Shipped (no c): L_w = 0.85 ×
+  L2, Δ = 1.31 ps/B, ω = 0.104 ps/B, pair relative SSE 0.0222 (with c: 0.90 × L2, 1.29, c =
+  1.23 µs, 0.169, 0.0136).
+- **Which records use CLEAN:** method pair's COLD and the totals of `--l2 flush` records (their
+  phases stay REPEAT, v1.17). Method packed's interleaved calls stay COLD (their L2 holds the
+  other calls' dirty lines).
+- **Which records determine the parameters:** Δ and L_w the pairs whose res changes with N
+  (1024³ N = 8–16; L_w is pinned by the N = 14 → 16 drop), c the 256³ / 512³ pairs, ω the
+  res = 0 pairs (2048³, 4096 × 768², 256 × 3000², 1536³). `bench/sweep_cache.txt` gains 1024³
+  at N = 8 / 10 / 12, 1536³ (N = 8 / 14) and 768³ (N = 8 / 16); the hold-out
+  (`bench/sweep_perf_validate.txt`) gains three pairs on shapes the fit does not see (1280³
+  N = 14, 3072 × 1024 × 1024 N = 8 (i = 3072, j = k = 1024), 2048 × 768 × 768 N = 14) and
+  `perf_validate.py` reports
+  every pair's measured and predicted `CLEAN − REPEAT` (an effect size, no target).
+- Offline (the model-fix records + the open-items 1024³ pairs, fit `dirty + c`): L_w = 0.90 ×
+  L2, Δ = 1.34 ps/B, c = 1.41 µs, ω = 0.19 ps/B; 1024³ N = 14 +13.9 → +5.5 %; the two held-out
+  pairs 1536³ (−13.1 µs predicted vs −17.3 / −12.7 measured) and 768³ (+10.4 / +7.7 vs +11.0 /
+  +10.5) are predicted where the v1.10 form gives 0 and +13.4.
+
+**Time model: the PACK set with K4's planes (P3).** One optional format-2 key,
+`warm.pack_l2_planes` ∈ {0, 1} (absent = 0: the v1.17 S). With 1,
+
+`S = Σ_{in-line y} (8·rows_y·k + g·pad_y·k̂) + g·b·m·n̂·(2·k_chunks − 1)`
+
+(one group's W planes, K4's group-bytes rule, with the plan's `k_chunks`), and L_hit stays
+`warm.pack_l2_bytes`; `perf_fit.py --pack-l2-frac` defaults to **1.1** × the nominal L2
+(83 MB on the 4090, the middle of the measured bracket (77.8, 89.8) MB; a fixed fraction, not
+fitted, as 0.8 was) and writes `warm.pack_l2_planes = 1`. A pre-packed operand's per-group
+residues (`g·pad_y·k̂` of a packed y) are **not** added: `imd_bench --methods packed` has no
+`--g`, so no g < N packed case exists to check them (left for when it does). Offline: no case of
+the hold-out, the calibration set or the open-items records changes its hit decision (L_hit
+was not identifiable from them); the four new cases go from 6.9 % (≥ 1 ms) and 5.6 / 21.1 /
+26.4 % (100 µs – 1 ms) to 0.3 % and 4.3 / 16.0 / 20.7 %. `bench/sweep_calib.txt` gains the
+four cases (the hope, **not borne out** [v1.18 review]: that hits of known bytes make the hit
+price `pack.byte` identifiable; it still fits 0, NOTES-B2 §12), and the hold-out gains three
+S-rule shapes not used to choose L_hit (as built: `v_s1920` 1920² × 1152, `v_w3584` 3584² ×
+512 and `v_df64` DF `acQ,bdQ` a…d = 64, Q = 768, all g = 4; the draft named 2048² × 1024 and
+6144 × 256 × 1536). [v1.18 review] Their S (68, 95, 142 MB) all lie outside the bracket
+(75.5, 90.6) MB: they test the planes term, not the threshold L_hit itself, which is
+untested on held-out data.
+
+**Power: busy power, DRAM energy and the boost clock (S6).** Four optional format-2 keys:
+`power.clock_boost_mhz` (f_top, MHz; 0 = `clock_eff_mhz`), `power.act_w` (P_act, W at f_ref),
+`power.act_gap_us` (g, µs per launch) and `power.dram_pj` (e_dram, pJ per DRAM byte,
+unscaled):
+
+```
+P(f) = P_idle + P_act·b·(f/f_ref)^(1+γ)
+     + [ (e_tc·O_tc + e_alu·O_alu + e_byte^f·D)·(f/f_ref)^γ + e_byte·D + e_dram·D_dram ] / t(f)
+t(f)   = the call's time at f in the requested cache state (the cache terms included)
+b      = max(0, 1 − launches·g / t_B)      (the busy share; t_B = the call's COLD time at f_ref)
+D_dram = D if the call's footprint F > warm.l2_bytes, else 0
+```
+
+- **[v1.18 review] t(f) is the predicted time of the request's cache state.** As first built,
+  the power and the clock solve divided by the COLD time in every state, while `fit_power`
+  builds its columns with the windows' measured time, which is REPEAT state (the same call in
+  a loop) and the windows are predicted as REPEAT: on the 8 small windows the model's COLD
+  time is 9–30 % above its REPEAT time (u_s1024 N = 8 30 %, p_s512n8 30 %, u_s512 23 / 17 %),
+  so their predicted power was too low and their clock too high. Now t(f) is the time the
+  prediction reports (each phase's time at f plus its cache term, clamped at 0 per phase as in
+  the time path); a COLD request is unchanged (no cache term). The cache terms do not depend
+  on f, so t(f) stays non-increasing and P(f) monotone. t_B stays the COLD time at f_ref (the
+  fit's busy column is the C model's b of the COLD state too, so fit and prediction agree).
+- **[v1.18 review] Known limits** (open, NOTES-B2 §12): D_dram is a step in the footprint at
+  `warm.l2_bytes`, the cache fit's L_w, so the power term is coupled to the cache fit (a refit
+  with no cache effect has L_w = 0 and charges every call's bytes; BURST power jumps 502 →
+  585 W between 992³ and 1024³ at N = 14); the phases' own DRAM-byte features would be the
+  better measure. The BURST `power_w` is the power at f_top and is **not capped** (585–631 W at
+  1024³–1536³ N = 14: what the call would draw at the boost clock, not a reading).
+
+- P_act is an energy per busy cycle at the voltage of f (∝ f·V², hence the exponent 1 + γ);
+  b uses the fixed BURST time t_B, not t(f), so P(f) stays monotone in f (t(f) is
+  non-increasing, every term non-decreasing) and the bisection argument holds. With the four
+  keys 0 the two new terms are +0 and the clock rule below is the v1.10 one: bit-identical.
+- **Clock regimes** (amends §6c.1 "Clock regimes"). `f_top` = `clock_boost_mhz` if > 0, else
+  `clock_eff_mhz`. BURST: f = f_top (a short call runs at the boost clock; its power is
+  evaluated there). SUSTAINED: f = f_top if P(f_top) ≤ cap, else the f in [f_min, f_top] with
+  P(f) = cap (bisection, as before). An explicit request `clock_mhz` is clamped to f_top
+  (values at or above it mean BURST). **The time** is unchanged above f_ref: every clock-bound
+  term scales by `f_ref / min(f, f_ref)`, so BURST time is the v1.17 BURST time and a solved
+  clock above f_ref costs no time. `imd_perf_t.clock_mhz` (and the candidates') reports the
+  clock used, now on the NVML scale up to f_top: the clock at which `power_w` was evaluated
+  (reviewer question Q1 of the power analysis, decided: report the solved clock; host API 13
+  marks the change; with boost 0 it is the v1.17 value).
+- **γ = 2.5 as a prior** (existing key). With every calibration window at the cap, the
+  in-sample power residual cannot identify γ (it chose 1); the clock-sweep evidence (locked
+  2205 MHz vs stock, exponent ≈ 2.2) and the nested checks favour 2–3, with 2.5 and 3 within
+  0.1 point. `perf_fit.py --power-gammas` still scans by the power residual when several are
+  given.
+- **Fit** (`perf_fit.py --power-form busy`, the new default; `scaled` is the v1.15 form,
+  `unscaled` the v1.10 one): NNLS, relative in P − P_idle, of the five columns e_tc, e_alu,
+  e_byte^f, P_act, e_dram at each window's measured (f, t); `power.byte_pj` held at `--byte-pj`
+  (0), g = `--act-gap-us` (1 µs, a prior: 1.5 µs is equivalent on the windows), P_idle 60 W,
+  f_top = the median NVML clock of the windows that never touched the power cap (clock-event
+  reason 0x4 absent from their trace; `--clock-boost-mhz` overrides; none: 0). The f_ref scan
+  goes down to 2255 MHz (23 candidates; it stopped at 2405 and one fold chose that end).
+  **[v1.18 review]** The leave-one-out and nested checks recompute f_top from each fold's own
+  training windows (as first built it was the median over all windows, so the left-out
+  uncapped window set its own boost clock); a given `--clock-boost-mhz` stays fixed in every
+  fold. A busy fit without any uncapped window warns (f_top 0: the solve stops at f_ref while
+  P_act is still fitted).
+- **Windows.** `bench/sweep_sustained.txt` gains the 12 windows of the power analysis (small:
+  256³ / 384³ N = 14, 512³ N = 8, 768³, 1536³ N = 8; KL / DRAM-heavy r_mm-like 1000 × 64 ×
+  50000, 384 × 96 × 40000, 4000 × 96 × 40000, 8192 × 256 × 8192; K5-heavy 4096² × 256 and
+  8192² × 64; DIRECT 1024³), ≈ +16 min of sweep time.
+- **Bench fix:** `imd_bench --methods sustained --mode direct` wrote the variant "RN g=N
+  sustained" without " mode=direct", so `perf_fit.py` predicted a DIRECT window as EMULATE;
+  the variant now carries the mode as method imd's does.
+- Offline (25 windows, nested leave-one-case-out with f_ref chosen in each fold): call time
+  |err| median 2.26 → 1.57 %, clock |err| median 6.7 → 1.0 %, capped-clock bias of the large
+  calls +4.1 → +1.0 %, SUSTAINED power max |err| 82 → 8.4 %, the locked 2205 MHz check −2.0 …
+  +3.0 % (shipped +2 … +33 %). On the 14 calibration windows alone the nested time median
+  goes 1.21 → 1.38 %: the shipped f_ref cancelled a +1.9 % clock bias against the time
+  model's own error at the capped clock, which is now visible (−1.6 … +1.4 %).
+
+**Not adopted (evidence in the analyses; NOTES-B2 §12).**
+- *KF read / write byte split* (P2 of the time analysis: residue writes cheaper than input
+  reads). KF has no free slot: the analysis proposed retiring `kf.row` (slot 3), but `kf.row`
+  is non-zero in format-1 files (the v6 test vector: 1.52 ns per row), so its retirement
+  changes an existing key's meaning, which needs a format bump (§6c.2). Its offline gain over
+  P1 alone is ≤ 0.8 points per class (hold-out 100 µs – 1 ms p90 6.4 → 5.6 %), with the KF
+  phase median and the open-items records slightly worse; not worth a format change.
+- *A KF / PACK / KL roofline* (refuted: worse than the sum in every variant), *a per-modulus
+  E = 4 KF term* (fits 3.6 ns per step, ≈ 0; the 352³ N = 14–20 series alternates by parity
+  within the 1.024 µs timer step), *a fixed L2-hit price for PACK* (improves the ≥ 1 ms calls,
+  worsens the K2 / K3 phase p90; a chosen number, not an identified one: the hit cases in the
+  calibration sweep let the fit price hits through `pack.byte` instead; [v1.18 review] not
+  borne out: `pack.byte` fits 0 with the four S cases too, the hit cost sits in `pack.wave` /
+  `pack.dram`).
+
+**Host API 13** (§6c.3): `imd_perf_calib_t` grows by seven doubles (3688 → 3744 bytes):
+`clock_boost_mhz`, `power_act_w`, `power_act_gap_us`, `energy_dram_pj`, `warm_call_ns`,
+`warm_clean_byte_ns`, `pack_l2_planes`; `IMD_PERF_CACHE_CLEAN = 3`; `clock_mhz` out may exceed
+`clock_eff_mhz` (above). A struct of a v7…v12 size is read with the seven fields 0 (the
+parse / default / load functions write nothing past its size, as before): for a file with the
+v1.18 keys (the shipped one) that is a **degraded, unvalidated view** (v1.17's S at L_hit
+83 MB, no busy power at γ = 2.5, no boost, no per-call saving); such callers should pass NULL.
+**[v1.18 review] This is an exception to §6c.2's "no file is read with features it was not
+fitted with"**, stated here rather than enforced: three v1.18 keys change what existing keys
+do when present (`warm.pack_l2_planes` changes the S that `warm.pack_l2_bytes` thresholds,
+`power.act_w` > 0 makes γ also the exponent of the busy term, and `warm.l2_bytes` now also
+gates the DRAM energy), so an API-7…12-sized struct reads the shipped file as a model that was
+never fitted. Measured with the shipped file (COLD, N = 14): SUSTAINED no longer reaches the
+cap on large calls (4096³ N = 14: 4396 µs at 340 W against NULL's 4608 µs at the 450 W cap; with c 4397 / 342 / 4614), and BURST is ≈ −7 % on the 4096² × 512 and
+3584² × 512 g = 4 shapes (v1.17's S calls them hits). Refusing such a struct was considered
+(`imd_perf_calib_default` / `_parse` failing for a size below v13 when a v1.18 key is set);
+not done because the degraded-view rule of v6 / v7…v10 / v7…v11 callers is the established
+contract, no known caller passes its own struct (ehrenfest passes NULL), and a refusal would
+turn a degraded prediction into a failure of every query. The v7…v11 L_hit fallback below is
+likewise no longer exact for the shipped file.
+`calib_valid` / the parser: every new value ≥ 0 and finite, `warm.pack_l2_planes` 0 or 1
+(VALUE), `power.clock_boost_mhz` 0 or ≥ `power.clock_eff_mhz` (INCONSISTENT). Python:
+`host.API_VERSION` 13, `PERF_CACHES["CLEAN"]`, the keys in `Calibration.power` / `.warm`.
+
+**Tests** (`host_perf`, C and Python, §6c.4 [v1.18]): with the seven keys absent or explicitly
+0 every prediction (every regime and cache state, a set of shapes) is bit-identical to the
+calibration without them; the keys optional, rejected in format 1, negative / repeated
+rejected, `pack_l2_planes` ∉ {0, 1} and boost < clock_eff rejected, written only when non-zero
+and round-tripping bit-exactly; the Python transcription of S with planes against the C
+features on both sides of L_hit; CLEAN = COLD minus `ω·min(F − I, L_w)` on the call phase
+only, REPEAT = COLD minus `Δ·res + c` exactly when res > 0; BURST with a boost reports f_top
+and the v1.17 BURST time; SUSTAINED ≤ BURST in speed, the capped solve brackets the cap within
+0.05 MHz with P_act > 0 and e_dram > 0, a higher clock never predicts a longer time, P(f)
+monotone in f; a v12-sized struct reads the fields as 0. [v1.18 review] At a fixed clock
+(P − idle)·t is the same in every cache state (the power divides by the state's own time), a
+faster state draws more power, and the SUSTAINED REPEAT / WARM / CLEAN solve brackets the cap;
+the v11 view is exact for a v1.17-style file and is the documented degraded view of the
+shipped one. `host_c_api`: the v13 size and
+offsets, `IMD_PERF_CACHE_CLEAN` accepted, 4 rejected.
 
 ---
 
@@ -4917,3 +5239,69 @@ and host API; every value the same integer (bit-identical, tested on every contr
 - **Docs caveats of the 2026-10-06 review** carried into DESIGN: §6c.7's shipped sustained
   figure (u_sq2048 −1.4 %, f_ref chosen on the same metric, capped clock 2–4 % high) and the
   v1.15 changelog's hold-out claim (the gain is the eps retirement, not the refit).
+
+## v1.18 (§6c.8 performance model: cache-state terms, PACK set with K4's planes, busy power and boost clock; host API 13, calibration format 2 with optional keys; no semantic, layout, launch, pack-format or TLA+ change)
+
+- **§6c.8 time model** (from `findings/perfminor-time.md`): the cache term gains a per-call
+  REPEAT saving `warm.call_ns` (c, when res > 0) and a clean-L2 credit `warm.clean_byte` (ω,
+  `−ω·min(F − I, L_w)` on the call phase) in a new state `IMD_PERF_CACHE_CLEAN` (the bench's
+  flushed records and method pair's COLD); COLD keeps its meaning (inputs evicted by other,
+  dirty work) and stays the default. The PACK group working set S counts one group's W planes
+  when `warm.pack_l2_planes = 1`, with L_hit = 1.1 × the nominal L2. Not adopted: the KF read /
+  write split (`kf.row` is non-zero in format-1 files: a format bump for ≤ 0.8 points), a KF /
+  PACK / KL roofline (refuted), a per-modulus E = 4 KF term (fits ≈ 0), a fixed L2-hit price.
+- **§6c.8 power model** (from `findings/perfminor-power.md`): busy-GPU power `power.act_w` with
+  the busy share b = 1 − launches · `power.act_gap_us` / t_B, DRAM energy `power.dram_pj` for
+  calls whose footprint exceeds `warm.l2_bytes`, the boost clock `power.clock_boost_mhz` (BURST
+  at f_top, SUSTAINED solved on [f_min, f_top], time flat above f_ref, `clock_mhz` out = the
+  clock used), γ = 2.5 as a prior; `perf_fit.py --power-form busy` (default), f_top from the
+  uncapped windows, f_ref scan down to 2255 MHz.
+- **§6c.2 keys:** the seven keys optional (absent = 0, written only when non-zero, format-2
+  keys); `warm.pack_l2_planes` 0 or 1, `power.clock_boost_mhz` 0 or ≥ `power.clock_eff_mhz`.
+- **§6c.3 host API 13:** seven appended `imd_perf_calib_t` fields (3744 bytes),
+  `IMD_PERF_CACHE_CLEAN = 3`; a v7–v12-sized struct reads the fields as 0 (degraded view of a
+  v1.18 file). Python `host.API_VERSION` 13.
+- **Bench:** `imd_bench --methods sustained --mode direct` writes " mode=direct" into the
+  variant. Sweeps: the four PACK-set cases in `sweep_calib.txt`, 1024³ N = 8–16, 1536³ and 768³
+  pairs in `sweep_cache.txt`, 12 sustained windows in `sweep_sustained.txt`, three S-rule shapes,
+  three cache pairs and the 352³ N = 14–20 series in `sweep_perf_validate.txt`;
+  `perf_validate.py` reports the pairs.
+- **§6c.4 tests:** see §6c.8 "Tests".
+- **Shipped calibration** (2026-10-06, branch `perf-minor`, NOTES-B2 §12): one full refit on the
+  v1.18 library (calibration and cache sweeps and hold-out measured; 26 sustained windows, 24 of
+  them reused from the model-fix and perfminor runs on the same kernels): L_w 0.90 × L2, Δ 1.29
+  ps/B, c 1.23 µs, ω 0.169 ps/B; PACK S with planes, L_hit 83 MB; busy power e_tc 0.577 pJ/op,
+  e_alu 92 pJ/op, P_act 154 W, e_dram 96 pJ/B, γ 2.5, boost 2788 MHz, f_ref 2484 MHz (nested
+  leave-one-out 1.62 %, v1.15 form on the same 26 windows 2.34 %; clock 1.3 vs 6.6 %, power max
+  9.9 vs 80.6 %; after the review amendments below: f_ref 2483 MHz, nested 1.40 % vs 2.70 %,
+  clock 0.7 vs 6.6 %, power max 9.8 vs 80.6 %). Hold-out (199 calls) against the v1.17 calibration on the same records:
+  < 100 µs 3.9 / 10.8 / 15.8 → 3.7 / 12.2 / 19.0 %, 100 µs – 1 ms 2.7 / 10.3 / 15.7 → 2.7 / 6.9 /
+  13.4 %, ≥ 1 ms 2.4 / 6.6 / 16.0 → 2.6 / 6.4 / 16.4 % (no class worse beyond run-to-run noise against that calibration; [review] against a v1.17
+  refit on the same records ≥ 1 ms median 1.6 → 2.6 and < 100 µs p90 9.8 → 12.2, a trade-off;
+  KF phase 8.9 / 24.4 → 6.6 / 21.1, K3 5.2 / 16.3 → 4.2 / 14.0; 1024³ N = 14 +14.9 → +6.3 %).
+  Reviewer questions: COLD's meaning, `clock_mhz` on the NVML scale, and whether to keep c
+  (it costs the small REPEAT calls ≈ 1 µs; NOTES-B2 §12 ablations). **Superseded by
+  perf-minor-noc below (c dropped).**
+- **Review amendments** (two independent reviews of `perf-minor`, 2026-10-06; branch
+  `perf-minor-final`, NOTES-B2 §12 "Review"): **the power and the SUSTAINED clock divide by
+  the request's cache-state time** t(f) (they used the COLD time in every state while the fit
+  uses the windows' measured REPEAT time; a COLD request is unchanged); `perf_fit.py`
+  recomputes the boost clock inside every leave-one-out / nested fold and warns on a busy fit
+  without an uncapped window; the power keys refit offline on the same records (time
+  parameters unchanged). Text: the S-rule hold-out shapes and the 3072 × 1024² pair as built,
+  `pack.byte` identifiability not borne out, the dirty-write-back reading of ω marked as a
+  hypothesis (the WARM data argue against it), COLD unvalidated for res > 0, the clean credit's
+  early saturation, the D_dram step and the uncapped BURST power, and the v7…v12-sized struct
+  as a stated exception to §6c.2 (the v11 L_hit fallback is no longer exact for the shipped
+  file).
+- **c dropped** (perf-minor-noc, the independent reviewer's binding verdict, CPU only;
+  NOTES-B2 §12 "Decision: c dropped"): the shipped calibration is the refit of the same records
+  with `perf_fit --cache-terms delta,omega` (now the default): `warm.call_ns` absent (= 0),
+  L_w 0.85 × L2, Δ 1.31 ps/B, ω 0.104 ps/B; f_ref 2479 MHz, nested leave-one-out 1.42 % (with c
+  1.40), clock 0.7 %, power max 9.2 %; hold-out < 100 µs 3.7 / 12.2 / 19.0 → 3.8 / 10.7 / 17.1 %,
+  100 µs – 1 ms 2.7 / 6.9 / 13.4 → 2.7 / 8.2 / 13.3 %, ≥ 1 ms 2.6 / 6.4 / 16.4 → 2.5 / 6.4 /
+  16.4 %; 1024³ N = 14 +6.3 → +10.8 %; small COLD calls ≈ 1.2 µs faster (64³ N = 14 16.68 →
+  15.45 µs). The per-call saving is not identifiable from these records: an open item tied to
+  the launch-timing question (power reviewer item 5). The key stays supported (optional,
+  0 = off); the struct and format are unchanged. Text: COLD described as a modelling convention,
+  the write-back reading of ω as a hypothesis.

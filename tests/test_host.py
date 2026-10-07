@@ -944,12 +944,14 @@ def spec_kf_chain(rows, k_hat, g, sms, r16=2, r4=4, elem=False):
                       r4 if small else r16, sms)
 
 
-def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod=64, l_hit=0.0):
+def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod=64, l_hit=0.0,
+                planes=False):
     """[(name, launches, x)] of one imd_contract (DESIGN §6c.1 table) from the lowering
     summary and the operands' read direction (along rows: KL tiles of 512). occ: kernel name ->
     CTAs per SM (the calibration's occupancy table); the chains assume radix 1 (operands read
     along k-bar) and j-bar-fastest K5: callers compare them only for such cases. l_hit (v1.17):
-    the calibration's warm.pack_l2_bytes (the PACK hit rule; both operands in-line)."""
+    the calibration's warm.pack_l2_bytes (the PACK hit rule; both operands in-line); planes
+    (v1.18, DESIGN §6c.8): S counts one group's W planes, g b m n_hat (2 k_chunks - 1)."""
     m, n, k, b, nh, kh = lw.m, lw.n, lw.k, lw.b, lw.n_hat, lw.k_hat
     N, g = lw.num_moduli, lw.residue_group
     V = lw.vec_entries
@@ -1004,6 +1006,8 @@ def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod
     sizes = [g] * (N // g) + ([N % g] if N % g else [])
     # v1.17: the PACK hit rule: the group working set (both operands, one group's residues)
     S = sum(8 * rows[y] * k + g * pad[y] * kh for y in (0, 1))
+    if planes:
+        S += g * b * m * nh * (2 * lw.k_chunks - 1)
     hit = 0 < l_hit and S <= l_hit
     for x, name in ((0, "K2 pack A"), (1, "K3 pack B")):
         if G > 1:
@@ -1272,7 +1276,8 @@ def suite_perf_v115(cal):
     # v1.17: and without the PACK hit rule (warm.pack_l2_bytes = 0), which the v7..v10 view
     # below cannot hold either (suite_perf_v117 checks that key).
     ship = cal
-    if ship.power["power.byte_f_pj"] != 0.0 or ship.warm["warm.pack_l2_bytes"] != 0.0:
+    if ship.power["power.byte_f_pj"] != 0.0 or ship.warm["warm.pack_l2_bytes"] != 0.0 or \
+            any(ship.extra[kk] != 0.0 for kk in V118_KEYS):
         ts = ship.format()
         if bytes(host.Calibration.parse(ts)._raw) != bytes(ship._raw):
             raise Fail("the shipped calibration does not round trip")
@@ -1281,6 +1286,7 @@ def suite_perf_v115(cal):
         e0 = dict(ship.extra)
         e0["power.byte_f_pj"] = 0.0
         e0["warm.pack_l2_bytes"] = 0.0
+        e0.update({kk: 0.0 for kk in V118_KEYS})  # v1.18: the v7..v10 view has none of them
         cal = host.Calibration.from_values(ship.meta, ship.params, extra=e0)
         count += 1
     # (1) without byte_f the text has no key; an explicit 0 is the same calibration, bit for
@@ -1411,7 +1417,8 @@ def suite_perf_v117(cal):
     optional (absent = 0, written only when non-zero, format-2 keys); the new terms are
     additive (with their parameters 0 the features change but no time does); pack.dram with
     L_hit 0 charges every byte; a v11-sized struct reads L_hit as warm.l2_bytes when
-    pack.dram > 0, else 0 (review 2026-10-06: exact for the shipped calibration)."""
+    pack.dram > 0, else 0 (review 2026-10-06: exact for a v1.17-style file; v1.18 review: for
+    the v1.18 shipped file exactly the documented degraded view)."""
     count = 0
     shapes = [("ik,jk->ij", dict(i=1024, j=1024, k=1024)), ("ik,jk->ij", dict(i=1472, j=1472, k=1472)),
               ("ik,jk->ij", dict(i=1792, j=1792, k=1792)), ("ik,jk->ij", dict(i=1024, j=96, k=4096)),
@@ -1428,6 +1435,7 @@ def suite_perf_v117(cal):
     # (1) the base: the shipped calibration without the three (an API-11 calibration)
     params = dict(cal.params, **{"kf.elem": 0.0, "pack.dram": 0.0})
     extra = dict(cal.extra, **{"warm.pack_l2_bytes": 0.0})
+    extra.update({kk: 0.0 for kk in V118_KEYS})  # v1.18: the v11 view has none of them
     base = host.Calibration.from_values(cal.meta, params, extra=extra)
     tb = base.format()
     if any(f"\n{kk} = " in tb for kk in keys):
@@ -1510,14 +1518,255 @@ def suite_perf_v117(cal):
     if st != 0 or preds(v11bc) != p0 or v11bc.format() != tb:
         raise Fail("a v11-sized struct with pack.dram = 0 is not the calibration without the keys")
     count += 1
-    # the shipped calibration: its v11 default view predicts exactly as NULL (the full one)
+    # v1.18 review: the fallback is exact for a v1.17-style file (L_hit = warm.l2_bytes, no
+    # v1.18 keys): its v11 view predicts as the full calibration
+    if cal.params["pack.dram"] > 0:
+        c117 = host.Calibration.from_values(cal.meta, cal.params, extra=dict(cal.extra, **dict(
+            {kk: 0.0 for kk in V118_KEYS}, **{"warm.pack_l2_bytes": cal.warm["warm.l2_bytes"]})))
+        t117 = c117.format().encode()
+        st, v11e, _ = _sized_calib("imd_perf_calib_parse_ex", V11_CALIB_SIZE, t117, len(t117))
+        if st != 0 or preds(host.Calibration(v11e, host.load())) != preds(c117):
+            raise Fail("a v1.17-style file's v11 view does not predict as the file")
+        count += 1
+    # the shipped calibration's v11 default view: exactly the documented degraded view (the
+    # v1.18 fields 0, L_hit = warm.l2_bytes when pack.dram > 0); since v1.18 not NULL's model
     st, v11d, _ = _sized_calib("imd_perf_calib_default_ex", V11_CALIB_SIZE)
     if st != 0:
         raise Fail("v11 view (default)")
-    if cal.params["pack.dram"] > 0 and cal.warm["warm.l2_bytes"] == cal.warm["warm.pack_l2_bytes"]:
-        if preds(host.Calibration(v11d, host.load())) != preds(None):
-            raise Fail("the shipped calibration's v11 view does not predict as NULL")
+    deg = host.Calibration.from_values(cal.meta, cal.params, extra=dict(cal.extra, **dict(
+        {kk: 0.0 for kk in V118_KEYS},
+        **{"warm.pack_l2_bytes": cal.warm["warm.l2_bytes"] if cal.params["pack.dram"] > 0 else 0.0})))
+    if preds(host.Calibration(v11d, host.load())) != preds(deg):
+        raise Fail("the shipped calibration's v11 view is not the documented degraded view")
+    count += 1
+    return count
+
+
+V118_KEYS = ("power.clock_boost_mhz", "power.act_w", "power.act_gap_us", "power.dram_pj",
+             "warm.call_ns", "warm.clean_byte", "warm.pack_l2_planes")
+V12_CALIB_SIZE = 3688  # sizeof(imd_perf_calib_t) of host API 12
+
+
+def suite_perf_v118(cal):
+    """DESIGN v1.18 §6c.8 (host API 13): the seven optional keys (absent = 0 predicts
+    bit-identically), their grammar, the cache terms (CLEAN credit on the call phase, the
+    per-call REPEAT saving only when res > 0), the S rule with K4's planes, the boost clock
+    (BURST at f_top with the f_ref time), the busy power and DRAM energy (monotone P(f), the
+    capped solve brackets the cap) and the v12-sized view (the fields read as 0)."""
+    count = 0
+    shapes = [("ik,jk->ij", dict(i=256, j=256, k=256)), ("ik,jk->ij", dict(i=1024, j=1024, k=1024)),
+              ("ik,jk->ij", dict(i=2048, j=2048, k=2048)), ("ik,jk->ij", dict(i=4096, j=4096, k=512)),
+              ("ik,jk->ij", dict(i=1500, j=96, k=40000)), ("ik,jk->ij", dict(i=8192, j=8192, k=8192))]
+    caches = ("COLD", "REPEAT", "WARM", "CLEAN")
+    regs = (("BURST", 0.0), ("SUSTAINED", 0.0), ("DEFAULT", 2200.0))
+
+    def preds(c, gs=(0, 4)):
+        return [host.predict(sp, ex, N=N, g=g, regime=rg, clock_mhz=ck, cache=cc, calib=c)
+                for sp, ex in shapes for N in (8, 14) for g in gs for rg, ck in regs
+                for cc in caches]
+
+    # (1) the base: the shipped calibration without the seven keys (an API-12 calibration)
+    extra0 = dict(cal.extra, **{kk: 0.0 for kk in V118_KEYS})
+    base = host.Calibration.from_values(cal.meta, cal.params, extra=extra0)
+    tb = base.format()
+    if any(f"\n{kk} = " in tb for kk in V118_KEYS):
+        raise Fail("v1.18 keys written although 0")
+    stripped = "\n".join(l for l in tb.split("\n") if l.split(" = ")[0] not in V118_KEYS)
+    explicit = tb + "".join(f"{kk} = 0\n" for kk in V118_KEYS)
+    if bytes(host.Calibration.parse(stripped)._raw) != bytes(base._raw) or \
+            bytes(host.Calibration.parse(explicit)._raw) != bytes(base._raw):
+        raise Fail("v1.18 keys: absent / explicit 0 is not the calibration without them")
+    p0 = preds(base)
+    if preds(host.Calibration.parse(explicit)) != p0:
+        raise Fail("v1.18 keys explicitly 0 do not predict bit-identically")
+    for a, b in zip(p0[0::4], p0[3::4]):  # COLD vs CLEAN with omega = 0
+        if repr(a) != repr(b).replace("cache='CLEAN'", "cache='COLD'"):
+            raise Fail("CLEAN without warm.clean_byte differs from COLD")
+    count += len(p0)
+    # (2) grammar: optional format-2 keys, >= 0, planes 0 / 1, boost 0 or >= clock_eff
+    vals = {"power.clock_boost_mhz": 2790.0, "power.act_w": 160.0, "power.act_gap_us": 1.0,
+            "power.dram_pj": 80.0, "warm.call_ns": 1400.0, "warm.clean_byte": 1.9e-4,
+            "warm.pack_l2_planes": 1.0}
+    full = host.Calibration.from_values(cal.meta, cal.params, extra=dict(extra0, **vals))
+    tf = full.format()
+    for kk in V118_KEYS:
+        if f"\n{kk} = " not in tf:
+            raise Fail(f"{kk} not written")
+    back = host.Calibration.parse(tf)
+    if bytes(back._raw) != bytes(full._raw) or back.format() != tf:
+        raise Fail("v1.18 keys round trip")
+    if any(full.extra[kk] != v for kk, v in vals.items()):
+        raise Fail("v1.18 keys: Calibration.power / .warm")
+    v6 = host.Calibration.load(os.path.join(ROOT, "tests/data/perf_calib_v6_format1.calib"))
+    fe = full.power["power.clock_eff_mhz"]
+    for kk in V118_KEYS:
+        bad = {"format-2 key in format 1": (v6.format() + f"{kk} = 1\n", "FORMAT2_KEY", kk),
+               "negative": (tb + f"{kk} = -1\n", "VALUE", kk),
+               "repeated": (tf + f"{kk} = 1\n", "REPEATED_KEY", kk)}
+        if kk == "warm.pack_l2_planes":
+            bad["not 0 or 1"] = (tb + f"{kk} = 0.5\n", "VALUE", kk)
+        if kk == "power.clock_boost_mhz":
+            bad["below clock_eff"] = (tb + f"{kk} = {fe - 1}\n", "INCONSISTENT", kk)
+        for why, (t, reason, key) in bad.items():
+            try:
+                host.Calibration.parse(t)
+                raise Fail(f"accepted {kk}: {why}")
+            except host.CalibrationError as e:
+                if e.reason != reason or e.key != key:
+                    raise Fail(f"{kk} {why}: {e.reason} {e.key}")
+            count += 1
+    # (3) the cache terms: REPEAT = COLD - (Delta res + c [res > 0]) (unclamped: small Delta, c),
+    # CLEAN = COLD - omega min(F - I, L_w) on the call phase only
+    lw, dl, cc, om = 6.0e7, 1e-4, 300.0, 2e-4
+    cw = host.Calibration.from_values(cal.meta, cal.params, extra=dict(
+        extra0, **{"warm.l2_bytes": lw, "warm.l2byte": dl, "warm.call_ns": cc,
+                   "warm.clean_byte": om}))
+    n_res = [0, 0]
+    for sp, ex in shapes:
+        for N in (8, 14):
+            pc, pr, pk = (host.predict(sp, ex, N=N, regime="BURST", cache=st, calib=cw)
+                          for st in ("COLD", "REPEAT", "CLEAN"))
+            if pc.status != "SUCCESS":
+                continue
+            res = pr.warm_bytes
+            n_res[res > 0] += 1
+            want = pc.time_s - 1e-9 * (dl * res + (cc if res > 0 else 0.0))
+            if not close(pr.time_s, want, 1e-9) or (res == 0 and pr.time_s != pc.time_s):
+                raise Fail(f"REPEAT cache term {sp} {ex} N={N}: {pr.time_s} vs {want}")
+            out = 8 * ex["i"] * ex["j"]  # F - I = workspace + the output (no packed buffers)
+            credit = 1e-9 * om * min(pc.workspace_bytes + out, lw)
+            for a, b in zip(pc.phases, pk.phases):
+                if a.name == "call":
+                    if not close(b.time_s, a.time_s - credit, 1e-9):
+                        raise Fail(f"CLEAN credit {sp} {ex} N={N}: {b.time_s} vs {a.time_s - credit}")
+                elif a.time_s != b.time_s:
+                    raise Fail(f"CLEAN changed phase {a.name}")
+            if pk.warm_bytes != 0 or pk.cache != "CLEAN":
+                raise Fail("CLEAN reports resident bytes")
+            count += 1
+    if not (n_res[0] and n_res[1]):
+        raise Fail(f"cache terms not exercised on both sides: {n_res}")
+    # (4) the S rule with planes: 4096^2 x 512 at g = 4 hits by the v1.17 proxy, misses with planes
+    ext = dict(i=4096, j=4096, k=512)
+    for pl, want_hit in ((0.0, True), (1.0, False)):
+        c = host.Calibration.from_values(cal.meta, cal.params, extra=dict(
+            extra0, **{"warm.pack_l2_bytes": 8.3e7, "warm.pack_l2_planes": pl}))
+        p = host.predict("ik,jk->ij", ext, N=14, g=4, calib=c)
+        hit = any(q.cls == "pack" and q.x[3] < q.x[1] for q in p.phases)
+        if hit != want_hit:
+            raise Fail(f"S rule with planes={pl}: hit {hit}")
         count += 1
+    # (5) power: boost clock, busy power, DRAM energy
+    pw = dict(extra0, **{"power.clock_eff_mhz": 2500.0, "power.clock_min_mhz": 1500.0,
+                         "power.cap_w": 450.0, "power.idle_w": 60.0, "power.gamma": 2.5})
+    c_nb = host.Calibration.from_values(cal.meta, cal.params, extra=pw)
+    c_b = host.Calibration.from_values(cal.meta, cal.params, extra=dict(pw, **{
+        "power.clock_boost_mhz": 2790.0, "power.act_w": 160.0, "power.act_gap_us": 1.0,
+        "power.dram_pj": 80.0}))
+    c_b0 = host.Calibration.from_values(cal.meta, cal.params, extra=dict(pw, **{
+        "power.clock_boost_mhz": 2790.0}))
+    n_cap = [0, 0]
+    for sp, ex in shapes:
+        for N in (8, 14):
+            kw = dict(N=N, cache="COLD")
+            bnb = host.predict(sp, ex, regime="BURST", calib=c_nb, **kw)
+            if bnb.status != "SUCCESS":
+                continue
+            bb = host.predict(sp, ex, regime="BURST", calib=c_b, **kw)
+            if bb.clock_mhz != 2790.0 or bb.time_s != bnb.time_s or bnb.clock_mhz != 2500.0:
+                raise Fail(f"BURST with a boost: clock {bb.clock_mhz}, time {bb.time_s} vs {bnb.time_s}")
+            hi = host.predict(sp, ex, clock_mhz=3500.0, calib=c_b, **kw)
+            mid = host.predict(sp, ex, clock_mhz=2600.0, calib=c_b, **kw)
+            if hi.clock_mhz != 2790.0 or hi.time_s != bb.time_s or mid.time_s != bb.time_s or \
+                    mid.clock_mhz != 2600.0 or not mid.power_w <= hi.power_w:
+                raise Fail("clock_mhz above f_ref: time not flat or not clamped to the boost")
+            # P(f) monotone in f; the busy and DRAM terms only add power
+            prev = None
+            for f in (1500.0, 1900.0, 2300.0, 2500.0, 2650.0, 2790.0):
+                q = host.predict(sp, ex, clock_mhz=f, calib=c_b, **kw)
+                q0 = host.predict(sp, ex, clock_mhz=f, calib=c_b0, **kw)
+                if prev is not None and q.power_w < prev * (1 - 1e-12):
+                    raise Fail(f"P(f) not monotone: {sp} {ex} N={N} at {f} MHz")
+                if q.power_w < q0.power_w * (1 - 1e-12) or \
+                        q.power_w - q0.power_w > 160.0 * (f / 2500.0) ** 3.5 + 1e-9 + \
+                        80.0 * 1e-12 * sum(ph.bytes for ph in q.phases) / q.time_s:
+                    raise Fail(f"busy / DRAM power out of range at {f} MHz: {q.power_w} vs {q0.power_w}")
+                prev = q.power_w
+            ps = host.predict(sp, ex, regime="SUSTAINED", calib=c_b, **kw)
+            if ps.time_s < bb.time_s * (1 - 1e-12) or ps.clock_mhz > 2790.0:
+                raise Fail("SUSTAINED faster than BURST with a boost")
+            if bb.power_w <= 450.0:
+                n_cap[0] += 1
+                if ps.clock_mhz != 2790.0 or ps.time_s != bb.time_s:
+                    raise Fail("SUSTAINED below the cap is not BURST with a boost")
+            elif ps.clock_mhz > 1500.0:
+                n_cap[1] += 1
+                lo_, hi_ = (host.predict(sp, ex, clock_mhz=ps.clock_mhz + d, calib=c_b, **kw).power_w
+                            for d in (-0.05, 0.05))
+                if not lo_ <= 450.0 <= hi_:
+                    raise Fail(f"SUSTAINED with busy power: {ps.clock_mhz} MHz ({lo_} .. {hi_} W)")
+            count += 1
+    if not (n_cap[0] and n_cap[1]):
+        raise Fail(f"boost / cap not exercised on both sides: {n_cap}")
+    # a call whose footprint fits warm.l2_bytes pays no DRAM energy
+    small = ("ik,jk->ij", dict(i=256, j=256, k=256))
+    cd = host.Calibration.from_values(cal.meta, cal.params, extra=dict(pw, **{
+        "power.dram_pj": 500.0, "warm.l2_bytes": 6.0e7}))
+    c0 = host.Calibration.from_values(cal.meta, cal.params, extra=dict(pw, **{"warm.l2_bytes": 6.0e7}))
+    if host.predict(*small, N=8, regime="BURST", calib=cd).power_w != \
+            host.predict(*small, N=8, regime="BURST", calib=c0).power_w:
+        raise Fail("DRAM energy charged to a call that fits the L2")
+    big = ("ik,jk->ij", dict(i=8192, j=8192, k=8192))
+    if not host.predict(*big, N=8, regime="BURST", calib=cd).power_w > \
+            host.predict(*big, N=8, regime="BURST", calib=c0).power_w:
+        raise Fail("DRAM energy not charged to a call beyond the L2")
+    count += 2
+    # (5b) v1.18 review: the power divides by the request's cache-state time (energy / t of the
+    # state, so (P - idle) t is the same in every state at a given clock), and the SUSTAINED
+    # solve of a REPEAT / CLEAN request brackets the cap with that state's power
+    c_e = host.Calibration.from_values(cal.meta, cal.params, extra=dict(pw, **{
+        "warm.call_ns": 1200.0, "warm.clean_byte": 1.7e-4}))
+    c_ec = host.Calibration.from_values(cal.meta, cal.params, extra=dict(pw, **{
+        "warm.call_ns": 1200.0, "warm.clean_byte": 1.7e-4, "power.clock_boost_mhz": 2790.0,
+        "power.act_w": 160.0, "power.act_gap_us": 1.0, "power.dram_pj": 80.0}))
+    n_faster = 0
+    for sp, ex in shapes:
+        for N in (8, 14):
+            pc = host.predict(sp, ex, N=N, clock_mhz=2400.0, cache="COLD", calib=c_e)
+            if pc.status != "SUCCESS":
+                continue
+            for cc in ("REPEAT", "WARM", "CLEAN"):
+                pq = host.predict(sp, ex, N=N, clock_mhz=2400.0, cache=cc, calib=c_e)
+                ec, eq = (pc.power_w - 60.0) * pc.time_s, (pq.power_w - 60.0) * pq.time_s
+                if abs(eq - ec) > 1e-9 * ec:
+                    raise Fail(f"{cc} power not energy / its own time: {sp} {ex} N={N}")
+                if pq.time_s < pc.time_s * (1 - 1e-9):
+                    n_faster += 1
+                    if not pq.power_w > pc.power_w:
+                        raise Fail(f"a faster {cc} call does not draw more power")
+                ps = host.predict(sp, ex, N=N, regime="SUSTAINED", cache=cc, calib=c_ec)
+                if 1500.0 < ps.clock_mhz < 2790.0:
+                    lo_, hi_ = (host.predict(sp, ex, N=N, clock_mhz=ps.clock_mhz + d, cache=cc,
+                                             calib=c_ec).power_w for d in (-0.05, 0.05))
+                    if not lo_ <= 450.0 <= hi_:
+                        raise Fail(f"SUSTAINED {cc}: {ps.clock_mhz} MHz ({lo_} .. {hi_} W)")
+                count += 1
+    if not n_faster:
+        raise Fail("no REPEAT / CLEAN call faster than COLD: the state-time check is vacuous")
+    # (6) a v12-sized struct: parse leaves the tail alone; it predicts as the calibration without
+    # the seven keys
+    data = tf.encode()
+    st, v12, _ = _sized_calib("imd_perf_calib_parse_ex", V12_CALIB_SIZE, data, len(data))
+    want = host._PerfCalib.from_buffer_copy(bytes(full._raw))
+    want.struct_size = V12_CALIB_SIZE
+    if st != 0 or bytes(v12)[:V12_CALIB_SIZE] != bytes(want)[:V12_CALIB_SIZE]:
+        raise Fail("v12 view (parse)")
+    no118 = host.Calibration.from_values(cal.meta, cal.params, extra=extra0)
+    if preds(host.Calibration(v12, host.load())) != preds(no118):
+        raise Fail("a v12-sized struct does not predict as the calibration without the v1.18 keys")
+    if host.Calibration(v12, host.load()).format() != no118.format():
+        raise Fail("a v12-sized struct formats with v1.18 keys")
+    count += 1
     return count
 
 
@@ -1690,13 +1939,17 @@ def suite_perf(args):
     occ = {n: v[0] for n, v in cal.kernels.items()}
     # v1.17: the PACK hit rule on both sides (the shipped L_hit, none, and 60.4 MB: the cases'
     # group working sets range from < 1 MB to ~110 MB)
-    hit_cals = [(cal, cal.warm["warm.pack_l2_bytes"] if cal.file_format == 2 else 0.0)]
+    # v1.18: and with S counting K4's W planes (warm.pack_l2_planes), at 83 MB too
+    hit_cals = [(cal, cal.warm["warm.pack_l2_bytes"] if cal.file_format == 2 else 0.0,
+                 cal.file_format == 2 and cal.warm["warm.pack_l2_planes"] == 1.0)]
     if cal.file_format == 2:
-        for lh in (0.0, 6.04e7):
+        for lh, pl in ((0.0, 0.0), (6.04e7, 0.0), (6.04e7, 1.0), (8.3e7, 1.0)):
             hit_cals.append((host.Calibration.from_values(
-                cal.meta, cal.params, extra=dict(cal.extra, **{"warm.pack_l2_bytes": lh})), lh))
+                cal.meta, cal.params, extra=dict(cal.extra, **{"warm.pack_l2_bytes": lh,
+                                                               "warm.pack_l2_planes": pl})),
+                lh, pl == 1.0))
     n_hit = [0, 0]
-    for (hcal, lh), (spec, ext, along) in itertools.product(hit_cals, cases):
+    for (hcal, lh, pl), (spec, ext, along) in itertools.product(hit_cals, cases):
         for N, g in ((8, 0), (14, 4), (20, 7), (3, 1)):
             for vec in ("GENERATE", "RESIDENT"):
                 for mode in ("EMULATE", "DIRECT"):
@@ -1707,7 +1960,8 @@ def suite_perf(args):
                     if p.status != "SUCCESS":
                         continue
                     want = spec_phases(lw, vec, along, cal.meta["l2_bytes"], occ=occ,
-                                       tail_mod=64 if cal.file_format == 1 else 32, l_hit=lh)
+                                       tail_mod=64 if cal.file_format == 1 else 32, l_hit=lh,
+                                       planes=pl)
                     for q in p.phases:
                         if q.cls == "pack":
                             n_hit[q.x[3] < q.x[1]] += 1
@@ -1853,12 +2107,13 @@ def suite_perf(args):
             pass
     n_eps += 1
     # DESIGN v1.15 §6c.2 "Not backward-readable" (review 2026-10-06): the shipped file omits
-    # the op_eps keys (MISSING_KEY in API <= 10) and carries power.byte_f_pj (unknown key in
-    # API <= 10); if either changes, the format note in §6c.2 must be revisited.
+    # the op_eps keys (MISSING_KEY in API <= 10) and carries keys an older library rejects
+    # (v1.15: power.byte_f_pj; v1.18: the busy-power / boost / cache keys, unknown in API <= 12);
+    # if either changes, the format note in §6c.2 must be revisited.
     with open(os.path.join(ROOT, "src/host/calib/rtx4090_sm89.calib")) as f:
         shipped_keys = {l.split(" = ")[0].strip() for l in f if " = " in l and not l.startswith("#")}
-    if shipped_keys & set(opk) or "power.byte_f_pj" not in shipped_keys:
-        raise Fail("shipped calibration: op_eps / byte_f keys differ from DESIGN §6c.2's "
+    if shipped_keys & set(opk) or not shipped_keys & ({"power.byte_f_pj"} | set(V118_KEYS)):
+        raise Fail("shipped calibration: op_eps / optional keys differ from DESIGN §6c.2's "
                    "backward-readability note")
     n_eps += 1
     print(f"  ok  eps retired (v1.15 / v1.17):{n_eps} predictions independent of eps_fraction; "
@@ -1940,6 +2195,10 @@ def suite_perf(args):
     if args.verbose:
         print(f"  ok  v1.17: {n_v117} checks (kf.elem / pack.dram / warm.pack_l2_bytes optional "
               f"and additive, round trip, errors, v11 view)")
+    n_v118 = suite_perf_v118(cal)  # DESIGN v1.18 §6c.8 (host API 13)
+    if args.verbose:
+        print(f"  ok  v1.18: {n_v118} checks (seven optional keys, grammar, CLEAN / REPEAT cache "
+              f"terms, S with planes, boost clock, busy power, DRAM energy, v12 view)")
     if args.verbose:
         print(f"  ok  calibration round trip, {n_feat} feature transcriptions, K4 == A3 "
               f"estimate, {mono} monotonicity pairs, statuses, packed, {n_rank} ranked "

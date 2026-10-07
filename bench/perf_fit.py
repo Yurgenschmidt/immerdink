@@ -44,6 +44,17 @@ effective clock is the vertex of a parabola through the LOO scan near its argmin
 and the nested leave-one-out error of that choice is printed; the phases of --l2 flush records
 (REPEAT state: imd_bench flushes before the timed calls only) are raised to COLD.
 
+v1.18 (DESIGN §6c.8, host API 13): the cache fit adds the per-call REPEAT saving (warm.call_ns;
+since perf-minor-noc not fitted by default, --cache-terms delta,c,omega fits it)
+and the clean-L2 credit (warm.clean_byte): method pair's COLD and the totals of --l2 flush
+records are the CLEAN state (an L2 flushed by reads), L_w is scanned over 0.30-1.20 x L2; the
+PACK set counts one group's W planes (warm.pack_l2_planes = 1, --pack-l2-frac 1.1); the power
+model's default form "busy" adds the busy-GPU power (power.act_w, launch gap --act-gap-us) and
+the DRAM energy (power.dram_pj), solves the clock up to the boost clock (power.clock_boost_mhz:
+the median clock of the windows that never touched the power cap) with gamma 2.5 as a prior;
+the f_ref scan goes down to 2255 MHz on the 4090. The busy share and the DRAM bytes of a window
+come from the C model (a probe calibration), not from a formula here.
+
 Host API 10 (DESIGN §6c.3): the metadata strings are checked against the calibration's field
 sizes before anything is written (check_meta: UTF-8 bytes, NUL included, no line break, no
 leading or trailing blank); a --version or --notes that does not fit is an error, the generated
@@ -229,7 +240,9 @@ def samples_from_records(records, lib=None, seed=None):
             continue
         ext = parse_ext(ext)
         clk = record_clock(r) if USE_RECORD_CLOCK else 0.0
-        cache = "COLD" if "l2=flush" in r.get("variant", "") else "REPEAT"
+        # v1.18 (DESIGN §6c.8): a flushed record's total is the CLEAN state (the flush reads its
+        # buffer, so the L2 holds no dirty lines; its phases are REPEAT state, v1.17)
+        cache = "CLEAN" if "l2=flush" in r.get("variant", "") else "REPEAT"
         if meth == "imd" and "phases" in r:
             o = variant_options(r)
 
@@ -533,11 +546,12 @@ def reference_clock(records):
     return float(statistics.median(clk)) if clk else 0.0
 
 
-def seed_extra(lib, kernels=None, fref=0.0, base=None, pack_l2=0.0):
+def seed_extra(lib, kernels=None, fref=0.0, base=None, pack_l2=0.0, planes=False):
     """The format-2 keys of a seed calibration: the occupancy table (measured, else the
     built-in one), the reference clock without a power model, no cache term, bands 1, and
     (v1.17) L_hit of the PACK hit rule (pack_l2 bytes; it shapes the features, so the seed
-    carries it from the start)."""
+    carries it from the start); v1.18: planes = the PACK set counts K4's W planes
+    (warm.pack_l2_planes)."""
     ref = host.Calibration.default(lib)
     ex = {f"kernel.{n}": v for n, v in ref.kernels.items()}
     if kernels:
@@ -547,7 +561,10 @@ def seed_extra(lib, kernels=None, fref=0.0, base=None, pack_l2=0.0):
                "power.idle_w": 0.0, "power.tc_pj": 0.0, "power.alu_pj": 0.0,
                "power.byte_pj": 0.0, "power.gamma": 2.0,
                "warm.l2_bytes": 0.0, "warm.l2byte": 0.0, "rank.tie_ratio": 1.0,
-               "warm.pack_l2_bytes": float(pack_l2)})
+               "warm.pack_l2_bytes": float(pack_l2),
+               "warm.pack_l2_planes": 1.0 if planes else 0.0, "warm.call_ns": 0.0,
+               "warm.clean_byte": 0.0, "power.act_w": 0.0, "power.act_gap_us": 0.0,
+               "power.dram_pj": 0.0, "power.clock_boost_mhz": 0.0})
     ex.update({k: (1.0, 1.0) for k in ref.bands})
     if base:
         ex.update(base)
@@ -563,36 +580,91 @@ def base_params(lib):
 
 # ---- v1.10: the power model (DESIGN §6c.1 "Clock regimes") ----------------------------------
 
-def sustained_rows(records, cal, lib=None):
+def window_capped(r):
+    """v1.18: whether a sustained window touched the power cap (clock-event reason 0x4) in any
+    trace sample (else in its post-window gpu_after reasons)."""
+    tr = r.get("trace") or []
+    if tr:
+        return any(int(row[5]) & 0x4 for row in tr if len(row) > 5)
+    g = r.get("gpu_after", "").replace(",", " ").split()
+    try:
+        return bool(int(g[-1], 16) & 0x4)
+    except (IndexError, ValueError):
+        return True
+
+
+def power_probe(cal, gap_us, lib=None):
+    """v1.18: a calibration whose power_w is one C-model quantity per call: the busy share b
+    (act_w = 1 W, launch gap gap_us; regime BURST at f = f_ref) or the DRAM bytes x 1e-12 / t
+    (dram_pj = 1). perf_fit reads the window features from it, so no formula lives here."""
+    ex = dict(cal.extra)
+    ex.update({"power.clock_eff_mhz": 2500.0, "power.clock_min_mhz": 2500.0, "power.cap_w": 1e9,
+               "power.idle_w": 0.0, "power.tc_pj": 0.0, "power.alu_pj": 0.0,
+               "power.byte_pj": 0.0, "power.byte_f_pj": 0.0, "power.gamma": 1.0,
+               "power.clock_boost_mhz": 0.0, "power.act_w": 0.0, "power.act_gap_us": 0.0,
+               "power.dram_pj": 0.0})
+    busy = host.Calibration.from_values(cal.meta, cal.params, lib, dict(
+        ex, **{"power.act_w": 1.0, "power.act_gap_us": float(gap_us)}))
+    dram = host.Calibration.from_values(cal.meta, cal.params, lib, dict(ex, **{"power.dram_pj": 1.0}))
+    return busy, dram
+
+
+def sustained_rows(records, cal, lib=None, gap_us=1.0):
     """Per method-sustained record: (case, N, measured s per call, mean power W, mean SM clock,
     tensor-core ops, ALU ops, DRAM bytes, power limit W, label). The op and byte counts come
-    from the C model's phases (perf.cpp call_power uses the same selection)."""
+    from the C model's phases (perf.cpp call_power uses the same selection). v1.18: the mode
+    (DIRECT windows: " mode=direct" in the variant), whether the window touched the cap, and
+    from the C model the busy share b at the launch gap gap_us and the DRAM-energy bytes."""
     out = []
+    busy_cal, dram_cal = power_probe(cal, gap_us, lib)
     for r in records:
         if r.get("method") != "sustained" or r.get("status") != "ok":
             continue
         ext = parse_ext(r["ext"])
         v = r.get("variant", "")
-        p = host.predict(r["spec"], ext, N=int(r["N"]), g=int(r.get("g", 0) or 0),
-                         vec_mode="RESIDENT" if "vec=resident" in v else "GENERATE",
-                         regime="BURST", cache="REPEAT", calib=cal, lib=lib)
+        kw = dict(N=int(r["N"]), g=int(r.get("g", 0) or 0),
+                  vec_mode="RESIDENT" if "vec=resident" in v else "GENERATE",
+                  mode="DIRECT" if "mode=direct" in v else "EMULATE", lib=lib)
+        p = host.predict(r["spec"], ext, regime="BURST", cache="REPEAT", calib=cal, **kw)
         if p.status != "SUCCESS":
             continue
         tc = sum(q.ops for q in p.phases if q.cls.startswith("k4_"))
         alu = sum(q.x[2] for q in p.phases if q.cls in ("kf", "kl", "pack", "k5", "direct"))
         D = sum(q.bytes for q in p.phases)
+        pb = host.predict(r["spec"], ext, regime="BURST", cache="COLD", calib=busy_cal, **kw)
+        pd = host.predict(r["spec"], ext, regime="BURST", cache="COLD", calib=dram_cal, **kw)
         out.append(dict(case=r["case"], N=int(r["N"]), t=float(r["median_s"]),
                         P=float(r["power_w_mean"]), f=float(r["sm_mhz_mean"]), tc=tc, alu=alu,
                         D=D, cap=float(r.get("power_limit_w") or 450.0),
                         label=f"{r['case']} {v} N={r['N']}", spec=r["spec"], ext=ext,
-                        g=int(r.get("g", 0) or 0), vec="RESIDENT" if "vec=resident" in v else "GENERATE"))
+                        g=kw["g"], vec=kw["vec_mode"], mode=kw["mode"],
+                        busy=float(pb.power_w), Ddram=float(pd.power_w) * pd.time_s * 1e12,
+                        capped=window_capped(r)))
     return out
 
 
-POWER_FORMS = ("scaled", "unscaled")
+def boost_clock(rows):
+    """v1.18: the boost clock of the power model's solve: the median NVML clock of the sustained
+    windows that never touched the power cap (0 if there is none)."""
+    f = [r["f"] for r in rows if not r["capped"]]
+    return float(statistics.median(f)) if f else 0.0
 
 
-def fit_power(rows, fref, gammas=None, idle=60.0, form="scaled", byte_pj=0.0):
+def fold_power_kw(power_kw, train):
+    """v1.18 review (DESIGN §6c.8): the fit_power arguments of one fold. With boost_auto (no
+    --clock-boost-mhz) the boost clock is the training windows' own boost_clock, so a left-out
+    uncapped window never sets the clock it is predicted at; a given boost stays fixed."""
+    kw = dict(power_kw)
+    if kw.pop("boost_auto", False):
+        kw["boost"] = boost_clock(train)
+    return kw
+
+
+POWER_FORMS = ("busy", "scaled", "unscaled")
+
+
+def fit_power(rows, fref, gammas=None, idle=60.0, form="busy", byte_pj=0.0, gap_us=1.0,
+              boost=0.0):
     """The power model over the sustained windows at their measured clock f, time t and power
     P (NNLS of P - idle, relative in the dynamic power; the gamma of the smallest power error).
     The awake idle is held fixed (`idle`): with most windows pinned at the cap, a free
@@ -603,20 +675,28 @@ def fit_power(rows, fref, gammas=None, idle=60.0, form="scaled", byte_pj=0.0):
         e_tc, e_alu, e_byte^f; gammas default (1,).
       form "unscaled" (v1.10): P = idle + ((e_tc tc + e_alu alu) (f / fref)^gamma + e_byte D)
         1e-12 / t; fitted e_tc, e_alu, e_byte; gammas default (1, 2, 3).
+      form "busy" (v1.18, DESIGN §6c.8, the default): the scaled form + P_act b (f / fref)^(1 +
+        gamma) + e_dram D_dram 1e-12 / t (b and D_dram from the C model, sustained_rows); fitted
+        e_tc, e_alu, e_byte^f, P_act, e_dram; the launch gap gap_us and the boost clock `boost`
+        (0: none; then the solve stops at fref) are written as given; gammas default (2.5,), a
+        prior.
     Returns the power.* keys (cap = the records' enforced limit, clock_min = 0.8 x the lowest
-    measured; power.byte_f_pj only for the scaled form)."""
+    measured; power.byte_f_pj only for the scaled / busy forms, the v1.18 keys only for busy)."""
     if form not in POWER_FORMS:
         raise ValueError(f"power form {form!r}: one of {POWER_FORMS}")
-    scaled = form == "scaled"
+    scaled = form in ("scaled", "busy")
+    busy = form == "busy"
     if gammas is None:
-        gammas = (1.0,) if scaled else (1.0, 2.0, 3.0)
+        gammas = (2.5,) if busy else (1.0,) if scaled else (1.0, 2.0, 3.0)
     best = None
     P = np.array([r["P"] for r in rows])
     fixed = np.array([byte_pj * r["D"] * 1e-12 / r["t"] for r in rows]) if scaled else 0.0
     for gm in gammas:
         X = np.array([[r["tc"] * (r["f"] / fref) ** gm * 1e-12 / r["t"],
                        r["alu"] * (r["f"] / fref) ** gm * 1e-12 / r["t"],
-                       r["D"] * ((r["f"] / fref) ** gm if scaled else 1.0) * 1e-12 / r["t"]]
+                       r["D"] * ((r["f"] / fref) ** gm if scaled else 1.0) * 1e-12 / r["t"]] +
+                      ([r["busy"] * (r["f"] / fref) ** (1 + gm), r["Ddram"] * 1e-12 / r["t"]]
+                       if busy else [])
                       for r in rows])
         th = nnls_relative(X, np.maximum(P - idle - fixed, 1e-3))  # relative in the dynamic power
         err = float(np.sum(((idle + fixed + X @ th - P) / P) ** 2))
@@ -629,6 +709,10 @@ def fit_power(rows, fref, gammas=None, idle=60.0, form="scaled", byte_pj=0.0):
            "power.byte_pj": float(byte_pj) if scaled else float(th[2]), "power.gamma": gm}
     if scaled:
         out["power.byte_f_pj"] = float(th[2])
+    out.update({"power.act_w": float(th[3]) if busy else 0.0,
+                "power.act_gap_us": float(gap_us) if busy and th[3] > 0 else 0.0,
+                "power.dram_pj": float(th[4]) if busy else 0.0,
+                "power.clock_boost_mhz": float(boost) if busy and boost >= fref else 0.0})
     return out
 
 
@@ -642,13 +726,14 @@ def power_validation(rows, meta, params, extra, fref, lib=None, verbose=True, id
         train = [r for r in rows if r["case"] != case]
         if len(train) < 4:
             continue
-        pw = fit_power(train, fref, idle=idle, **power_kw)
+        pw = fit_power(train, fref, idle=idle, **fold_power_kw(power_kw, train))
         cal = host.Calibration.from_values(meta, params, lib, dict(extra, **pw))
         for r in rows:
             if r["case"] != case:
                 continue
             p = host.predict(r["spec"], r["ext"], N=r["N"], g=r["g"], vec_mode=r["vec"],
-                             regime="SUSTAINED", cache="REPEAT", calib=cal, lib=lib)
+                             mode=r.get("mode", "EMULATE"), regime="SUSTAINED", cache="REPEAT",
+                             calib=cal, lib=lib)
             out.append((r["label"], r["t"], p.time_s, r["f"], p.clock_mhz, r["P"], p.power_w))
     if verbose and out:
         print(f"{'sustained window (leave-one-case-out)':<44} {'TFLOPS-eq':>9} {'t meas':>10} "
@@ -659,8 +744,9 @@ def power_validation(rows, meta, params, extra, fref, lib=None, verbose=True, id
     return out
 
 
-def fref_scan(rows, meta, params, extra, fref, lib, idle, power_kw, step=25.0, count=17):
-    """[(f, LOO median |t err|)] over the candidates fref, fref - step, ... (DESIGN §6c.1)."""
+def fref_scan(rows, meta, params, extra, fref, lib, idle, power_kw, step=25.0, count=23):
+    """[(f, LOO median |t err|)] over the candidates fref, fref - step, ... (DESIGN §6c.1;
+    v1.18: 23 candidates, down to 2255 MHz from the 4090's 2805)."""
     out = []
     for fr in [fref - step * i for i in range(count)]:
         val = power_validation(rows, meta, params, extra, fr, lib, verbose=False, idle=idle,
@@ -703,12 +789,13 @@ def nested_fref_validation(rows, meta, params, extra, fref, lib, idle, power_kw,
         if not scan:
             continue
         fr = fref_select(scan, rule)
-        pw = fit_power(train, fr, idle=idle, **power_kw)
+        pw = fit_power(train, fr, idle=idle, **fold_power_kw(power_kw, train))
         cal = host.Calibration.from_values(meta, params, lib, dict(extra, **pw))
         for r in rows:
             if r["case"] == case:
                 p = host.predict(r["spec"], r["ext"], N=r["N"], g=r["g"], vec_mode=r["vec"],
-                                 regime="SUSTAINED", cache="REPEAT", calib=cal, lib=lib)
+                                 mode=r.get("mode", "EMULATE"), regime="SUSTAINED",
+                                 cache="REPEAT", calib=cal, lib=lib)
                 out.append((r["label"], r["t"], p.time_s, r["f"], p.clock_mhz, r["P"],
                             p.power_w, fr))
     return out
@@ -741,11 +828,18 @@ def pair_cases(records):
     return {k: v for k, v in out.items() if len(v) == 3}
 
 
-def fit_warm(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=True):
+def fit_warm(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=True,
+             form="clean", terms=("delta", "c", "omega")):
     """L_w (a scan over fractions of the nominal L2) and Delta >= 0 (least squares, relative):
     measured t_state - t_repeat against the model's (res_repeat - res_state) bytes, which the C
     model gives as its COLD minus REPEAT time at a unit Delta. Delta = 0 when
-    no measured |COLD - REPEAT| or |WARM - REPEAT| reaches min_effect of the call."""
+    no measured |COLD - REPEAT| or |WARM - REPEAT| reaches min_effect of the call.
+    v1.18 (DESIGN §6c.8), form "clean" (the default): method pair's COLD is the CLEAN state;
+    L_w over 0.30-1.20 x L2 (steps of 0.05) and (Delta, c, omega) >= 0 by exact NNLS of the
+    measured (CLEAN - REPEAT) / REPEAT against the C model's columns (COLD - REPEAT) at unit
+    Delta, at unit c, and (CLEAN - COLD) at unit omega. form "v110": the v1.10 fit."""
+    if form == "clean":
+        return fit_warm_clean(cases, meta, params, extra, l2, lib, min_effect, verbose, terms)
     effects = []
     for (case, spec, ext, N), t in sorted(cases.items()):
         effects.append((case, N, t["cold"] / t["repeat"] - 1, t["warm"] / t["repeat"] - 1, t))
@@ -786,6 +880,89 @@ def fit_warm(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=
     return {"warm.l2_bytes": frac * l2, "warm.l2byte": delta}, effects
 
 
+def pair_effects(cases, verbose=True):
+    effects = []
+    for (case, spec, ext, N), t in sorted(cases.items()):
+        effects.append((case, N, t["cold"] / t["repeat"] - 1, t["warm"] / t["repeat"] - 1, t))
+    if verbose:
+        print(f"{'cache pair case':<20} {'N':>3} {'repeat':>10} {'clean vs repeat':>16} "
+              f"{'warm vs repeat':>15}")
+        for case, N, ec, ew, t in effects:
+            print(f"{case:<20} {N:>3} {1e3 * t['repeat']:>8.4f}ms {100 * ec:>+15.1f}% "
+                  f"{100 * ew:>+14.1f}%")
+    return effects
+
+
+def cache_columns(cases, meta, params, extra, lw, lib=None):
+    """v1.18: per pair case, the C model's (COLD - REPEAT) at unit Delta (ns/B), at unit c (ns)
+    and (CLEAN - COLD) at unit omega (ns/B), relative to the measured REPEAT time, at L_w = lw
+    bytes; and the measured (CLEAN - REPEAT) / REPEAT."""
+    units = (1e-6, 1.0, 1e-6)
+    cals = []
+    for i, key in enumerate(("warm.l2byte", "warm.call_ns", "warm.clean_byte")):
+        ex = dict(extra, **{"warm.l2_bytes": float(lw), "warm.l2byte": 0.0, "warm.call_ns": 0.0,
+                            "warm.clean_byte": 0.0})
+        ex[key] = units[i]
+        cals.append(host.Calibration.from_values(meta, params, lib, ex))
+    A, y, keys = [], [], []
+    for (case, spec, ext, N), t in sorted(cases.items()):
+        e = parse_ext(ext)
+
+        def pr(cal, st):
+            return host.predict(spec, e, N=N, cache=st, regime="BURST", calib=cal, lib=lib).time_s
+        row = [(pr(cals[0], "COLD") - pr(cals[0], "REPEAT")) / units[0],
+               (pr(cals[1], "COLD") - pr(cals[1], "REPEAT")) / units[1],
+               (pr(cals[2], "CLEAN") - pr(cals[2], "COLD")) / units[2]]
+        A.append([v / t["repeat"] for v in row])
+        y.append((t["cold"] - t["repeat"]) / t["repeat"])
+        keys.append((case, N))
+    return np.array(A), np.array(y), keys
+
+
+def nnls_plain(A, y):
+    """argmin_{theta >= 0} ||A theta - y||^2 by enumerating the active sets (few columns)."""
+    best = (float(np.sum(y ** 2)), np.zeros(A.shape[1]))
+    for r in range(1, A.shape[1] + 1):
+        for S in itertools.combinations(range(A.shape[1]), r):
+            sol, *_ = np.linalg.lstsq(A[:, S], y, rcond=None)
+            if np.any(sol < 0):
+                continue
+            th = np.zeros(A.shape[1])
+            th[list(S)] = sol
+            err = float(np.sum((A @ th - y) ** 2))
+            if err < best[0] - 1e-18:
+                best = (err, th)
+    return best
+
+
+def fit_warm_clean(cases, meta, params, extra, l2, lib=None, min_effect=0.03, verbose=True,
+                   terms=("delta", "c", "omega")):
+    """v1.18 (DESIGN §6c.8): see fit_warm. terms: the fitted subset of (delta, c, omega); the
+    others are 0 (an A/B of a term, perf_fit --cache-terms)."""
+    keep = [i for i, n in enumerate(("delta", "c", "omega")) if n in terms]
+    effects = pair_effects(cases, verbose)
+    big = max((max(abs(ec), abs(ew)) for _, _, ec, ew, _ in effects), default=0.0)
+    zero = {"warm.l2_bytes": 0.0, "warm.l2byte": 0.0, "warm.call_ns": 0.0, "warm.clean_byte": 0.0}
+    if big < min_effect:
+        if verbose:
+            print(f"cache effect below {100 * min_effect:.0f} % everywhere: no cache term")
+        return zero, effects
+    best = None
+    for frac in np.round(np.arange(0.30, 1.2001, 0.05), 2):
+        A, y, _ = cache_columns(cases, meta, params, extra, frac * l2, lib)
+        err, th_k = nnls_plain(A[:, keep], y)
+        th = np.zeros(3)
+        th[keep] = th_k
+        if best is None or err < best[0] - 1e-15:
+            best = (err, float(frac), th)
+    err, frac, (delta, c, om) = best
+    if verbose:
+        print(f"cache term: L_w = {frac:.2f} x L2, Delta {delta:.4g} ns per byte, c {c:.4g} ns per "
+              f"call, omega {om:.4g} ns per byte (relative SSE {err:.4f} over {len(cases)} pairs)")
+    return {"warm.l2_bytes": frac * l2, "warm.l2byte": float(delta), "warm.call_ns": float(c),
+            "warm.clean_byte": float(om)}, effects
+
+
 def main(argv=None):
     global USE_RECORD_CLOCK
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -824,16 +1001,32 @@ def main(argv=None):
                          "60 W, evaluation workspace findings/energy-20261004.md)")
     ap.add_argument("--clock-ref", type=float, default=None, help="reference SM clock (MHz)")
     # v1.15 (DESIGN §6c.7)
-    ap.add_argument("--power-form", choices=POWER_FORMS, default="scaled",
-                    help="power model: 'scaled' (v1.15 default: clock-scaled byte energy "
-                         "power.byte_f_pj fitted, power.byte_pj held at --byte-pj) or "
-                         "'unscaled' (the v1.10 fit of power.byte_pj, no byte_f key)")
+    ap.add_argument("--power-form", choices=POWER_FORMS, default="busy",
+                    help="power model: 'busy' (v1.18 default: the scaled form + busy-GPU power "
+                         "power.act_w, DRAM energy power.dram_pj and the boost clock; gamma 2.5), "
+                         "'scaled' (v1.15: clock-scaled byte energy power.byte_f_pj fitted, "
+                         "power.byte_pj held at --byte-pj) or 'unscaled' (the v1.10 fit of "
+                         "power.byte_pj, no byte_f key)")
+    ap.add_argument("--act-gap-us", type=float, default=1.0,
+                    help="busy form: the launch gap of the busy share (us per launch; a prior)")
+    ap.add_argument("--clock-boost-mhz", type=float, default=None,
+                    help="busy form: the boost clock of the solve (default: the median clock of "
+                         "the sustained windows that never touched the power cap; 0: none)")
+    ap.add_argument("--cache-form", choices=("clean", "v110"), default="clean",
+                    help="cache fit: 'clean' (v1.18: Delta, per-call c, clean credit omega; L_w "
+                         "0.30-1.20 x L2) or 'v110' (Delta only, L_w 0.1-1.0 x L2)")
+    ap.add_argument("--cache-terms", default="delta,omega",
+                    help="clean cache fit: the fitted subset of delta,c,omega (the others 0). "
+                         "Default delta,omega: the per-call REPEAT saving c is not identifiable "
+                         "from the pair records (NOTES-B2 §12 \"Decision: c dropped\"); "
+                         "delta,c,omega is the perf-minor fit")
     ap.add_argument("--byte-pj", type=float, default=0.0,
                     help="scaled form: the fixed unscaled byte energy (pJ per DRAM byte; 0, or "
                          "a stated prior), written as power.byte_pj")
     ap.add_argument("--power-gammas", default=None,
-                    help="comma-separated gammas scanned by the power residual (default: 1 for "
-                         "the scaled form, 1,2,3 for the unscaled form)")
+                    help="comma-separated gammas scanned by the power residual (default: 2.5, a "
+                         "prior, for the busy form, 1 for the scaled form, 1,2,3 for the "
+                         "unscaled form)")
     ap.add_argument("--no-chain", action="store_true",
                     help="drop the v1.10 chain features of K0, KL, PACK, K5, DIRECT, BETA")
     ap.add_argument("--drop", action="append", default=[], metavar="CLASS.FEATURE",
@@ -842,10 +1035,12 @@ def main(argv=None):
     ap.add_argument("--kernel", action="append", default=[], metavar="NAME=R",
                     help="override a kernel's CTAs per SM (e.g. kf4=4, the v1.8 built-in)")
     # v1.17 (DESIGN §6c.1, §6c.2)
-    ap.add_argument("--pack-l2-frac", type=float, default=0.8,
+    ap.add_argument("--pack-l2-frac", type=float, default=None,
                     help="L_hit of the PACK hit rule (warm.pack_l2_bytes) as a fraction of the "
-                         "records' nominal L2 (default 0.8: 60.4 MB on the RTX 4090; 0: no hit "
-                         "rule)")
+                         "records' nominal L2 (default 1.1 with the W planes in S, v1.18: 83 MB "
+                         "on the RTX 4090; 0.8 with --no-pack-planes; 0: no hit rule)")
+    ap.add_argument("--no-pack-planes", action="store_true",
+                    help="the v1.17 PACK set S without K4's W planes (warm.pack_l2_planes 0)")
     ap.add_argument("--fref-rule", choices=("vertex", "argmin"), default="vertex",
                     help="effective clock from the sustained LOO scan: the vertex of a parabola "
                          "within +-100 MHz of the argmin (v1.17 default) or the argmin (v1.10)")
@@ -868,11 +1063,15 @@ def main(argv=None):
         a.no_clock = a.no_chain = True
     if a.byte_pj < 0 or not math.isfinite(a.byte_pj):
         ap.error("--byte-pj must be a finite number >= 0")
-    if a.byte_pj != 0 and a.power_form != "scaled":
-        ap.error("--byte-pj is the scaled form's fixed term")
+    if a.byte_pj != 0 and a.power_form == "unscaled":
+        ap.error("--byte-pj is the scaled / busy forms' fixed term")
+    if a.pack_l2_frac is None:
+        a.pack_l2_frac = 0.8 if a.no_pack_planes else 1.1
     power_kw = dict(form=a.power_form, byte_pj=a.byte_pj,
                     gammas=tuple(float(x) for x in a.power_gammas.split(","))
                     if a.power_gammas else None)
+    if a.power_form == "busy":
+        power_kw["gap_us"] = a.act_gap_us
     USE_RECORD_CLOCK = a.clock_normalize and not a.no_clock
     records = []
     for f in a.records:
@@ -914,7 +1113,8 @@ def main(argv=None):
         kernels[n] = (int(r),) + tuple(old[1:])
     if not 0 <= a.pack_l2_frac <= 4:
         ap.error("--pack-l2-frac must be in [0, 4]")
-    extra = None if a.format1 else seed_extra(a.lib, kernels, fref, pack_l2=a.pack_l2_frac * l2)
+    extra = None if a.format1 else seed_extra(a.lib, kernels, fref, pack_l2=a.pack_l2_frac * l2,
+                                              planes=not a.no_pack_planes)
     if extra is not None:
         print(f"reference clock {fref:.0f} MHz; occupancy: " +
               ", ".join(f"{n} {extra['kernel.' + n][0]}" for n in
@@ -949,9 +1149,10 @@ def main(argv=None):
     # the parameters are COLD costs (a REPEAT prediction subtracts the saving again).
     cases = pair_cases(records) if extra is not None else {}
     if cases:
-        wm, _ = fit_warm(cases, meta, params0, extra, l2, a.lib)
+        wm, _ = fit_warm(cases, meta, params0, extra, l2, a.lib, form=a.cache_form,
+                         terms=tuple(a.cache_terms.split(",")))
         extra.update(wm)
-        if wm["warm.l2byte"] > 0:
+        if wm["warm.l2byte"] > 0 or wm.get("warm.call_ns", 0) > 0:
             calw = host.Calibration.from_values(meta, params0, a.lib, extra)
             added = []
             for s in samples:
@@ -970,8 +1171,10 @@ def main(argv=None):
     if extra is not None and extra["warm.pack_l2_bytes"] > 0:
         # v1.17 diagnostic (no selection): the PACK class's fitted error against L_hit
         print(f"PACK L2-hit rule: L_hit = {a.pack_l2_frac:.2f} x {l2 / 2**20:.0f} MiB = "
-              f"{extra['warm.pack_l2_bytes'] / 1e6:.1f} MB; PACK fit error by L_hit (diagnostic):")
-        for frac in (0.0, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 1.0):
+              f"{extra['warm.pack_l2_bytes'] / 1e6:.1f} MB, S "
+              f"{'without' if a.no_pack_planes else 'with'} K4's W planes; PACK fit error by "
+              f"L_hit (diagnostic):")
+        for frac in (0.0, 0.6, 0.7, 0.8, 0.9, 1.0, 1.05, 1.1, 1.15, 1.2, 1.3):
             sd = host.Calibration.from_values(meta, seed.params, a.lib,
                                               dict(extra, **{"warm.pack_l2_bytes": frac * l2}))
             n, med, p90, sse = class_error(samples_from_records(records, a.lib, sd), "pack",
@@ -982,7 +1185,19 @@ def main(argv=None):
                  fref=fnorm, drop=drop)
     if extra is not None:
         rows = sustained_rows(records, host.Calibration.from_values(meta, params, a.lib, extra),
-                              a.lib)
+                              a.lib, gap_us=a.act_gap_us)
+        if a.power_form == "busy":
+            boost = boost_clock(rows) if a.clock_boost_mhz is None else a.clock_boost_mhz
+            power_kw["boost"] = boost
+            # v1.18 review: the LOO / nested folds recompute it from their training windows
+            power_kw["boost_auto"] = a.clock_boost_mhz is None
+            uncapped = sum(1 for r in rows if not r["capped"])
+            print(f"boost clock of the power solve: {boost:.0f} MHz ("
+                  f"{'given' if a.clock_boost_mhz is not None else 'median of the ' + str(uncapped) + ' uncapped windows; recomputed in every fold'})")
+            if a.clock_boost_mhz is None and uncapped == 0:
+                print("WARNING: no sustained window below the power cap: no boost clock (the "
+                      "solve stops at f_ref) while the busy power P_act is still fitted; pass "
+                      "--clock-boost-mhz or add uncapped windows (DESIGN §6c.8)", file=sys.stderr)
         if len(rows) >= 4 and fref > 0:
             # The time model's effective clock (DESIGN §6c.1): the burst calibration's large calls
             # already ran below the boost clock (the limiter acts within a timed loop), so the
@@ -1005,9 +1220,9 @@ def main(argv=None):
                     for lab, tm, tp, fm, fp, pm, pp, ff in nest:
                         print(f"    {lab[:44]:<44} {100 * (tp - tm) / tm:>+6.1f}%  f {fm:.0f} / "
                               f"{fp:.0f} MHz  P {pm:.0f} / {pp:.0f} W  (fold f_ref {ff:.0f})")
-            pw = fit_power(rows, fr, idle=a.idle_w, **power_kw)
+            pw = fit_power(rows, fr, idle=a.idle_w, **fold_power_kw(power_kw, rows))
             print(f"power model ({a.power_form} form" +
-                  (f", power.byte_pj held at {a.byte_pj:g} pJ/B" if a.power_form == "scaled" else "")
+                  (f", power.byte_pj held at {a.byte_pj:g} pJ/B" if a.power_form != "unscaled" else "")
                   + "): " + ", ".join(f"{k} {v:.4g}" for k, v in pw.items()))
             power_validation(rows, meta, params, extra, fr, a.lib, idle=a.idle_w, **power_kw)
             extra.update(pw)

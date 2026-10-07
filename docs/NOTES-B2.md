@@ -1,4 +1,4 @@
-# B2 notes: the performance model (DESIGN v1.8 §6c; v1.10 fidelity follow-up in §6)
+# B2 notes: the performance model (DESIGN v1.8 §6c; v1.10 fidelity follow-up in §6; v1.18 in §12)
 
 ROADMAP B2. A CUDA-free model in libimmerdink_host (host API version 6): `imd_perf_predict`
 (per-phase and total time, TFLOPS-eq, MEMORY_MODEL §4 bounds), `imd_perf_predict_pack`,
@@ -1151,3 +1151,421 @@ to 1.02–1.09; the remaining +4–9 % is in the miss cases.
 keys (DESIGN §6c.2 "Why format 2 is kept", §6c.5 amended), or bump to format 3 as the
 analysis suggested? The additive form needs no misreading rule; a format 3 would only be
 needed for the not-adopted KF read / write split.
+
+## 12. Minor model items: cache state, PACK set with planes, busy power and boost clock (2026-10-06, branch `perf-minor`; DESIGN v1.18 §6c.8, host API 13)
+
+The "Remaining" items of §11 after two offline analyses (evaluation workspace
+`findings/perfminor-time.md`, `findings/perfminor-power.md`). Raw records, logs, scripts and
+every comparison: immerdink-eval `results/perfminor/impl/`.
+
+**What was adopted, and what not (DESIGN §6c.8 has the reasons and the formulas):**
+
+| analysis item | finding | here |
+|---|---|---|
+| KF overlap / roofline (1024³ N = 14 +13.9 %) | refuted: every roofline / soft-max form fits worse than the sum; the error is the cache term's (a flushed COLD is *clean*, a REPEAT call writes back the previous call's dirty lines; the REPEAT saving has a per-call part) | **adopted:** `warm.call_ns` (c; **[noc] dropped from the shipped fit**, "Decision: c dropped"), `warm.clean_byte` (ω), state `IMD_PERF_CACHE_CLEAN`; COLD keeps its meaning (evicted by other, dirty work) and stays the default |
+| KF read / write split | ≤ 0.8 points per class over the cache term alone, KF phase and open-items records slightly worse | **not adopted:** `kf.row` is non-zero in format-1 files (v6 vector 1.52 ns), so retiring it needs a format bump |
+| PACK set S (proxy without K4's planes) | wrong hit / miss on 3 of 4 new non-square cases | **adopted:** `warm.pack_l2_planes = 1`, S += g b m n̂ (2 k_chunks − 1), L_hit = 1.1 × L2 = 83 MB |
+| E = 4 KF at high N | a per-modulus term fits ≈ 0; parity pattern at the 1.024 µs timer step | **not adopted** (no term); 352³ N = 14–20 moved into the hold-out (`v_n18d`, 30 phase reps) |
+| ≥ 1 ms calibration calls (streaming K2 7–9 % slow) | `pack.byte` 0, cost in `pack.wave`; a fixed hit price helps calls, hurts the PACK phase p90 | **not adopted** (no prior); the four S cases in the calibration sweep instead (still open, below) |
+| power: clock evaluated at f_ref, missing busy power | the uncapped calls run at 2625–2790 MHz; DIRECT draws 349 W | **adopted:** `power.act_w`, `power.act_gap_us`, `power.dram_pj`, `power.clock_boost_mhz`, γ = 2.5 as a prior (`perf_fit --power-form busy`, default) |
+| bench: sustained DIRECT variant | `--methods sustained --mode direct` wrote no " mode=direct" | **fixed** in `imd_bench.cu` |
+
+**Design question decided here** (DESIGN §6c.8, "Time model: the cache state"): the default
+COLD is "inputs evicted, L2 dirty with other work" (a call inside an ehrenfest sequence), not the
+bench's "evicted and clean"; the clean credit applies only to `CLEAN` (flushed bench records,
+method pair's COLD). **Reviewer question Q1 of the power analysis, decided:** `clock_mhz` out
+reports the clock used (NVML scale, up to the boost clock), host API 13; with the boost key 0 it
+is the v1.17 value. Both are open for the independent reviewer.
+
+**Offline check first** (CPU only, the model-fix records, `results/perfminor/impl/v/`): with the
+shipped calibration the v1.18 library reproduces the perfminor-time baseline exactly (hold-out
+statistics identical); a refit with the v1.18 cache term reproduces the analysis's `v8p_clean`
+(hold-out 4.2 / 12.7 / 24.2 · 2.5 / 6.4 / 12.7 · 2.2 / 6.7 / 16.7 %), the planes rule its `v11`
+(no hold-out or calibration decision changes); the busy power form on the 25 windows of the
+analyses gives e_tc 0.571 pJ/op, e_alu 74 pJ/op, P_act 158 W, e_dram 90 pJ/B, f_ref 2466 MHz,
+nested LOO 1.62 % (analysis S6: 0.564, 74.5, 161, 83, 2462, 1.57 %).
+
+**Data** (RTX 4090, stock clocks; every GPU step after `ehrenfest_busy.sh` returned FREE in a
+separate step; `tools/calibrate.sh`, BENCH_RETRIES = 1; library ec44099):
+- the two sustained windows no earlier run had on the current kernels, `s_k5b` (8192² × 64,
+  the second K5-heavy window) and `s_dir` (DIRECT, with the fixed variant), 21:07–21:10;
+- one full recalibration `tools/calibrate.sh --validate --sustained FILE` 21:10–22:38: the
+  calibration sweep (449 timed calls; new: `c_w4096k512`, `c_skin1280`, `c_l2s1600`, `c_df48`),
+  the cache sweep (18 pairs; new: 1024³ N = 8 / 10 / 12, 1536³, 768³), the fit, the hold-out
+  (199 calls; new: `v_s1920`, `v_w3584`, `v_df64`, the 352³ N = 14–20 series; 3 hold-out pairs).
+- **The sustained windows were reused, not re-measured** (the documented `--sustained FILE`
+  path; budget): 26 windows = the 14 model-fix windows (7e5ef5d), 3 of the power analysis + 7 of
+  the power-util analysis (684f459; its DIRECT window left out: wrong variant) and the 2 new
+  ones. No kernel or bench timing code changed between 7e5ef5d and ec44099 (`git diff` of `src`
+  outside `src/host` is empty; the bench diff is the two v1.18 lines: the sustained variant string and the predicted state of `--l2 flush` records). Measuring all 26 again would
+  have added ≈ 34 min. `bench/sweep_sustained.txt` lists the 12 new windows (as `s_*`; the
+  reused records carry their analyses' names `d_*` / `p_*`).
+- **GPU time: 18.7 min** (from each case's quiet-gate pass to the next case: warm-up + case,
+  an upper bound that includes waits for the shared GPU lock): 2.4 min for the two windows,
+  16.3 min for the recalibration (≈ 10 calibration, ≈ 1 cache, ≈ 5 hold-out). Sweep wall time
+  90 min, the rest gate waits while other GPU users ran (up to 6 min per case). Budget 60 min.
+
+**Fit** (shipped as `src/host/calib/rtx4090_sm89.calib` by perf-minor / perf-minor-final,
+version ec44099, host API 13; **superseded by the refit without c, "Decision: c dropped"
+below**):
+- Cache: L_w = 0.90 × L2 (68 MB), Δ = 1.29 ps/B, **c = 1.23 µs**, **ω = 0.169 ps/B** (relative
+  SSE 0.0136 over 18 pairs; analysis 0.90 / 1.34 / 1.41 µs / 0.193).
+- PACK (S with planes, L_hit 83 MB): launch 3.39 µs, byte 0, dram 0.841 ps/B, chain 0.85 ns,
+  wave 3.92 µs. The PACK fit error by L_hit (diagnostic, now with the four S cases): 0.8 × L2
+  6.0 relative SSE, 1.0 × 1.64, **1.05–1.15 × 0.94**, 1.2 × 1.33: the data bracket L_hit to
+  (75.5, 90.6) MB with planes, and 83 MB sits in the flat minimum. In-sample PACK 5.6 / 11.1 %.
+  `pack.byte` still fits 0 although the hits now include non-square cases of known bytes.
+- KF: launch 6.00 µs, byte 0.707 ps/B, elem 667 ns; in-sample 5.3 / 24.6 %.
+- Power (busy form, γ 2.5, 26 windows): e_tc 0.577 pJ/op, e_alu 92 pJ/op, e_byte^f 0, P_act
+  154 W, e_dram 95.9 pJ/B, gap 1 µs, boost 2788 MHz (the median of the 6 windows that never hit
+  the cap), **f_ref 2484 MHz** (parabola vertex; scan argmin 2480), **nested leave-one-out
+  median |t err| 1.62 %** (folds' f_ref 2468–2498 MHz). [review] Refit with the fixed solve
+  (below): f_ref **2483 MHz**, e_tc 0.576, e_alu 91.9, P_act 154.1 W, e_dram 95.9 (the power
+  NNLS uses the measured times, so only f_ref moves it), nested **1.40 %** (folds' f_ref
+  2474–2495 MHz, boost recomputed per fold).
+- `rank.tie_ratio` 1.059; bands at the 2.5 / 97.5 quantiles (5 / 95 reached 79.9 %; cross-
+  validated coverage 86 %): call < 100 µs 0.898–1.174, 100 µs – 1 ms 0.894–1.079, ≥ 1 ms
+  0.924–1.094.
+
+**Hold-out, the same 199 calls for both calibrations, the v1.18 library**, BURST, REPEAT
+(median / p90 / max |error| of the call, %; targets 15 / 30, 10 / 20, 5 / 15 %; run-to-run noise
+of §11: 1.3 / 6.5 / 12.0, 0.3 / 1.1 / 4.9, 0.2 / 0.5 / 1.6):
+
+| subset | measured call | calls | shipped (v1.17, model-fix) | **v1.18** |
+|---|---|---|---|---|
+| all | < 100 µs | 65 | 3.9 / 10.8 / 15.8 | **3.7 / 12.2 / 19.0** |
+| all | 100 µs – 1 ms | 65 | 2.7 / 10.3 / 15.7 | **2.7 / 6.9 / 13.4** |
+| all | ≥ 1 ms | 69 | 2.4 / 6.6 / 16.0 | **2.6 / 6.4 / 16.4** |
+| N ≤ 14 | < 100 µs | 39 | 4.3 / 11.0 / 15.8 | 3.3 / 12.1 / 19.0 |
+| N ≤ 14 | 100 µs – 1 ms | 47 | 2.9 / 10.5 / 15.7 | 2.7 / 8.0 / 13.4 |
+| N ≤ 14 | ≥ 1 ms | 43 | 2.0 / 6.7 / 9.1 | 2.2 / 6.5 / 9.2 |
+| N = 15–17 | < 100 µs | 20 | 2.8 / 8.5 / 12.3 | 4.4 / 11.5 / 13.2 |
+| N = 15–17 | 100 µs – 1 ms | 16 | 2.6 / 9.3 / 11.8 | 2.8 / 4.3 / 4.5 |
+| N = 15–17 | ≥ 1 ms | 22 | 2.9 / 6.3 / 16.0 | 2.8 / 6.2 / 16.4 |
+| N = 18–20 | < 100 µs | 6 | 3.0 / 9.8 / 14.1 | 5.5 / 13.1 / 17.3 |
+| N = 18–20 | 100 µs – 1 ms | 2 | 1.2 / 1.4 / 1.5 | 1.3 / 1.5 / 1.6 |
+| N = 18–20 | ≥ 1 ms | 4 | 1.6 / 2.7 / 2.8 | 1.7 / 2.7 / 2.7 |
+
+Per phase, hold-out, all calls (median / p90 %, shipped → v1.18): **KF 8.9 / 24.4 → 6.6 / 21.1**,
+K2 4.9 / 9.2 → 5.3 / 8.3, **K3 5.2 / 16.3 → 4.2 / 14.0**, KL A 3.7 / 13.1 → 4.1 / 13.4, KL B
+3.7 / 14.1 → 3.5 / 14.1, K4 5.1 / 20.9 → 4.9 / 21.6, K5 4.1 / 17.3 → 4.2 / 17.3.
+Calibration set (in-sample for v1.18 only): < 100 µs 7.6 / 17.3 / 38.6 → 8.8 / 19.4 / 36.4,
+100 µs – 1 ms 2.1 / 9.7 / 26.8 → 2.0 / 9.5 / 23.3, ≥ 1 ms 3.9 / 9.2 / 17.6 → 4.0 / 9.3 / 17.6; K3
+7.0 / 15.8 → 5.9 / 12.5, K2 5.4 / 11.6 → 5.2 / 9.5.
+
+Against the shipped calibration, per size class: 100 µs – 1 ms better on every statistic;
+< 100 µs median better, p90 +1.4 and max +3.2 points (within the noise 6.5 / 12.0); ≥ 1 ms p90
+better, median +0.2 (= the noise 0.2) and max +0.4 (noise 1.6). **[review] That comparison
+mixes two record sets** (the v1.17 calibration was fitted on the model-fix records). Against
+the like-for-like refit of the v1.17 model on the same new records (`n_v117`, ablation table
+below) v1.18 **is** worse beyond the noise in two places: ≥ 1 ms median 1.6 → 2.6 (5× the 0.2
+noise; the planes rule, below) and < 100 µs p90 / max 9.8 / 15.2 → 12.2 / 19.0 (the per-call
+saving c); the calibration set's < 100 µs (in-sample) goes 7.3 / 17.6 / 33.6 → 8.8 / 19.4 /
+36.4. Every adopted part is shipped as a trade-off, not as a free gain: the planes rule fixes
+the PACK phases (K3 10.6 / 19.2 → 4.2 / 14.0 %, PACK class SSE 6.0 → 0.94) and the held-out S
+cases at the price of the ≥ 1 ms median, and the cache term fixes the mid class (p90 10.4 →
+6.9) at the price of the small one. The caveats below say where it is worse.
+
+**The named cases** (call error %, shipped → v1.18):
+- **1024³ N = 14** (`v_sq1024`): **+14.9 → +6.3** (vec=resident +15.7 → +7.0); N = 8 −2.2 → +0.3.
+  w_s960 N = 15–17 +8.0 … +11.8 → +3.8 … +4.5, v_bsm N = 14 +9.2 → +1.4. **[review] In-sample
+  for the cache term, not a hold-out gain:** the cache sweep has `x_s1024` pairs at N = 8 / 10 /
+  12 / 14 / 16, the same shape, N and REPEAT call as `v_sq1024`, and the term was designed
+  around this case; part of the 100 µs – 1 ms p90 gain (10.3 → 6.9) comes from such
+  1024³-like shapes too (v_sq1024, w_s960, v_bsm). The genuinely held-out cache evidence is
+  the three `v_x*` pairs below.
+- **`v_n18d`** (352³, 30 phase reps): N = 14 / 16 / 17 / 18 / 19 / 20: −5.5 / −5.2 / −4.8 / −14.1 /
+  −5.4 / −4.0 → −9.1 / −8.6 / −8.2 / −17.3 / −8.9 / −7.6. Worse by ≈ 3.5 points at every N (the
+  per-call saving c on a 25 µs REPEAT call, below). Re-measured quiet, the validation run's
+  15.8 µs KF at N = 20 is not there (27.4 µs call); N = 18 stays the outlier (KF at E = 4).
+- **S rule on shapes not used to choose L_hit:** `v_w3584` (3584² × 512 g = 4: a hit by the v1.17
+  proxy, a miss with planes) N = 8 / 14: −9.9 / −7.5 → −4.9 / +0.7; `v_df64` (DF 64⁴, Q = 768) −3.8
+  / −0.3 → −2.7 / +0.5; `v_s1920` (hit either way) −4.1 / −0.5 → −3.5 / +0.1.
+- **Cache pairs held out** (CLEAN − REPEAT, measured / v1.18 / shipped µs): 1280³ N = 14 −11.4 /
+  −11.5 / 0; 2048 × 768² N = 14 −6.1 / −5.9 / 0; 3072 × 1024² N = 8 −20.8 / −11.5 / 0. Over all 21
+  pair records the absolute CLEAN (flushed COLD) error goes 7.7 → 3.8 % (median), REPEAT
+  2.5 → 2.1 % (`pairs_abs.md`).
+- Open-items targeted records (5 calls ≥ 1 ms, 25 at 100 µs – 1 ms, 17 < 100 µs): 5.1 / 8.8 / 11.2
+  → 2.5 / 6.5 / 7.2, 8.5 / 13.0 / 14.5 → 3.5 / 5.7 / 11.0, 1.0 / 3.4 / 3.8 → 0.7 / 3.3 / 3.5.
+  perfminor-time records: < 100 µs (the noisy 352³ series) 16.0 / 19.6 / 22.3 → 19.0 / 22.6 /
+  25.2, 100 µs – 1 ms 5.6 / 21.1 / 26.4 → 3.7 / 18.0 / 23.3, ≥ 1 ms (4096² × 512) 6.9 → 0.7.
+
+**Ablations on the same new records** (offline refits at f_ref 2484, `results/perfminor/impl/vn/`;
+hold-out median / p90 / max %):
+
+| variant | < 100 µs | 100 µs – 1 ms | ≥ 1 ms | K3 phase | KF phase |
+|---|---|---|---|---|---|
+| shipped (v1.17 fit, old records) | 3.9 / 10.8 / 15.8 | 2.7 / 10.3 / 15.7 | 2.4 / 6.6 / 16.0 | 5.2 / 16.3 | 8.9 / 24.4 |
+| v1.17 model refit on the new records | 3.9 / 9.8 / 15.2 | 2.7 / 10.4 / 15.5 | 1.6 / 6.4 / 16.4 | 10.6 / 19.2 | 6.7 / 20.5 |
+| + planes only | 3.9 / 9.8 / 15.1 | 2.7 / 9.9 / 15.5 | 2.6 / 6.4 / 16.4 | 4.2 / 14.0 | 6.7 / 20.5 |
+| + cache term only | 3.7 / 12.2 / 19.0 | 2.9 / 7.4 / 13.4 | 1.6 / 6.4 / 16.4 | 10.6 / 19.2 | 6.6 / 21.1 |
+| **v1.18 (both; shipped)** | 3.7 / 12.2 / 19.0 | 2.7 / 6.9 / 13.4 | 2.6 / 6.4 / 16.4 | 4.2 / 14.0 | 6.6 / 21.1 |
+| v1.18 without c (Δ + ω) | 3.8 / 10.7 / 17.1 | 2.7 / 8.2 / 13.3 | 2.5 / 6.4 / 16.4 | 4.2 / 14.0 | 7.2 / 22.9 |
+| v1.18 without ω (Δ + c) | 4.4 / 10.2 / 15.7 | 2.6 / 9.8 / 15.0 | 2.6 / 6.7 / 16.4 | 4.2 / 14.0 | 7.1 / 23.6 |
+
+- **The planes rule moves the ≥ 1 ms median 1.6 → 2.6 against a v1.17 refit on the same records**
+  (still 2.4 → 2.6 against the shipped calibration): `v_mmg` / `v_skg` (KL path, g < N,
+  GB-scale K2 misses) go from −1 … +2 % to +2 … +5 %. The v1.17 rule calls the new hit cases
+  (`c_skin1280`, `c_l2s1600`) misses, which pulls `pack.dram` to 0.71 ps/B and fits the
+  streaming misses by accident, at the price of the PACK phases (K3 10.6 / 19.2 %, PACK class
+  relative SSE 6.0 vs 0.94). The planes rule fits the phases and the held-out S cases; the
+  streaming K2 at 0.84 ps/B is the open item of §11 ("launch, wave and byte are not separately
+  identifiable"), now isolated.
+- **The per-call saving c is what costs the small calls.** It makes every small REPEAT call
+  with resident inputs ≈ 1 µs faster: hold-out < 100 µs p90 / max +1.5 / +1.9 over Δ + ω alone,
+  `v_n18d` −3.5 points, v_s512 N = 14 −17.1 → −19.0 %, and the small uncapped sustained windows
+  (BURST time) 1.90 → 2.65 % median (`sus_cmp.md`). It also carries most of the mid-class gain
+  (1024³ N = 14 +10.8 → +6.3 %, 100 µs – 1 ms p90 8.2 → 6.9 %) and the pair fit (CLEAN 4.2 →
+  3.8 %). Both variants pass the noise rule; c is shipped because the analysis's form passes it
+  with the larger gain. **Reviewer question:** ship without c (`perf_fit --cache-terms
+  delta,omega`, a refit of the same records, no GPU) if the small-call / N = 15–20 shift
+  matters more than the mid-size gain.
+
+**SUSTAINED** (26 windows; nested leave-one-case-out with f_ref and, [review] since
+perf-minor-final, the boost clock chosen in each fold; per window in
+`results/perfminor/final/power_nested_final.md`, the perf-minor figures in
+`results/perfminor/impl/power_nested.md`; "large capped" = touched the cap, ≥ 1 ms). The table
+is the **review-fixed** model (power and clock solve with the cache-state time, below);
+in brackets the perf-minor figures before the fix:
+
+| fit, windows | t \|err\| median | f \|err\| median | large capped f bias (median) | P \|err\| max |
+|---|---|---|---|---|
+| v1.15 form (scaled, γ 1), refit on the 26 | 2.70 % (2.34) | 6.6 % (6.6) | +3.4 % (+3.6) | 80.6 % (DIRECT) |
+| **v1.18 busy form (shipped)** on the 26 | **1.40 %** (1.62) | **0.7 %** (1.3) | **+1.5 %** (+1.5) | **9.8 %** (9.9) |
+| … its 14 calibration (u_*) windows | 1.00 % (0.95; v1.15 form 2.05) | 0.7 % (1.3) | +1.4 % (+1.5) | 4.7 % (6.0) |
+| … its 12 "new" windows (see below) | 2.65 % (2.65; v1.15 form 3.00) | 0.7 % (1.0) | +1.5 % (+1.5) | 9.8 % (9.9) |
+| v1.18 form fitted on the 14 calibration windows only, boost **given** 2788 MHz (from the 26) | 1.37 % (1.37; the table said 1.40, a median of rounded rows) | 0.4 % | +0.2 % | 2.2 % |
+| … the same without a boost (none of the 14 is uncapped: perf_fit warns) | 1.37 % | | | |
+| v1.15 form fitted on the 14 only | 0.95 % (1.20) | 2.6 % | +1.5 % | 43.6 % |
+
+Per window (nested, v1.18 → v1.15 form; measured): u_sq12k t +0.8 / −1.7 %, clock 2317 /
+2480 (2258) MHz; u_sq8192 N = 14 +0.2 / −3.2 %, 2319 / 2416 (2274); p_k5 −1.5 / +5.6 %, 2423 / 2247
+(2306); s_k5b +0.4 / +2.7 %, 2547 / 2321 (2432); u_rmm +6.3 / +6.3 %, power 429 / 309 (450) W; s_dir
+−2.4 / −2.4 %, 312 / 67 (346) W; d_s256 +22.1 / +22.1 % (BURST time), 323 / 217 (300) W;
+p_s512n8 −5.1 / −5.1 %, 397 / 405 (406) W (perf-minor: 366 W); u_s1024 N = 8 clock 2634 (2625;
+perf-minor 2752). As calibrated (not left out), the v1.17 calibration's SUSTAINED predictions
+of the 26 windows have median time / clock error 1.41 / 5.4 % and power max 82 %; v1.18 as
+shipped by perf-minor 1.21 / 1.1 % and 9.2 %, review-fixed 1.20 / 0.6 % and 6.4 %.
+- Fitted on the 14 calibration windows alone the busy form is worse in time than the v1.15
+  form (1.37 vs 0.95 %) while clock and power are right; the v1.15 form's f_ref cancels the
+  time model's error at the capped clock against a clock bias. On the 26 windows the busy form
+  is better on every statistic.
+- **[review] The 12 "new" windows are not independent of the form choice**: 11 of them (`d_*`,
+  `p_*`) are the power analysis's windows on which the S6 form and γ = 2.5 were chosen; only
+  `s_k5b` is unseen (and `s_dir` re-measures `d_dir`). The nested figure covers the
+  parameters, f_ref and (now) the boost clock, not the choice of form.
+- The second K5-heavy window (s_k5b) is predicted within +0.4 % (clock +4.7 %); p_k5 −1.5 %
+  (clock +5.1 %, was +12.6 % in the analysis's nested fit).
+
+**Review (two independent reviews, 2026-10-06; branch `perf-minor-final`, CPU only, no GPU).**
+Both: merge after fixes. Verified against the code and the raw data, every must-fix was
+confirmed; the fixes:
+- **Code: the power and the SUSTAINED clock divided by the COLD time in every cache state**
+  (`perf.cpp` `call_seconds` without the cache terms) while `fit_power` uses each window's
+  measured REPEAT time and the windows are predicted as REPEAT. Confirmed: the model's COLD /
+  REPEAT gap on the windows is 23 / 17 % (u_s512), 30 / 9 % (u_s1024 N = 8 / 16), 14 / 19 %
+  (d_s256 / d_s384), 30 % (p_s512n8), 18 % (p_s768), 0 elsewhere. Fixed (DESIGN §6c.8): one
+  phase-time function with the request's cache terms serves the time and the solve; t_B stays
+  the COLD time at f_ref; a COLD request is bit-identical. Test: (P − idle)·t is the same in
+  every state at a fixed clock, a faster state draws more power, and the SUSTAINED REPEAT /
+  WARM / CLEAN solve brackets the cap (fails on the perf-minor library). Effect (nested LOO):
+  1.62 → 1.40 %, clock 1.3 → 0.7 %; u_s1024 N = 8 clock 2752 → 2634 (measured 2625), p_s512n8
+  power 366 → 397 W (406).
+- **perf_fit: the nested LOO leaked the boost clock** (`boost_clock` over all windows, reused
+  in every fold). Confirmed; `fold_power_kw` recomputes it from each fold's training windows
+  (a given `--clock-boost-mhz` stays fixed). Alone (perf-minor library) it leaves the nested
+  median at 1.62 %; folds now use 2785–2790 MHz. A busy fit without an uncapped window warns.
+  The "14 calibration windows only" row was labelled as a 14-window fit but used the boost of
+  the 26 (`--clock-boost-mhz 2788`): relabelled, and its 1.40 % was a median of rounded rows
+  (log: 1.37 %).
+- **Docs:** 1024³ N = 14 is in-sample for the cache term (above); the acceptance sentence
+  compared against a calibration on other records (reworded against `n_v117`); the hold-out is
+  the selection set for c and ω (caveat); DESIGN §6c.8 named the draft's shapes (now the built
+  `v_s1920`, `v_w3584`, the 3072 × 1024² pair) and promised an identifiable `pack.byte` (not
+  borne out); the v7…v11 L_hit fallback is no longer exact for the shipped file (comment,
+  DESIGN, and the test, which had become conditional and silently skipped, now checks the exact
+  case on a v1.17-style file and that the shipped file's v11 view is exactly the documented
+  degraded calibration); §6c.2's "no file is read with features it was not fitted with" is
+  false for a v7…v12-sized caller struct: a stated exception (refusing such structs considered
+  and not done, DESIGN §6c.8 "Host API 13"). Measured with the shipped file (N = 14, COLD):
+  4096³ SUSTAINED 4614 µs at 450 W (NULL) vs 4397 µs at 342 W (v12 view, never capped),
+  4096² × 512 / 3584² × 512 g = 4 BURST −7.1 / −7.5 %. The 12 "new" sustained windows are not
+  independent of the form choice (above). The dirty-write-back reading of ω is marked a
+  hypothesis (DESIGN §6c.8); the calibration header's "p10 p90" for the bands is now "lo hi
+  quantiles".
+- **Not changed:** c is kept (the reviewers differ; the power reviewer wants the timing
+  question tested first; **[noc] dropped since** by the independent reviewer's verdict,
+  "Decision: c dropped" above), BURST power stays uncapped (documented), D_dram stays a step
+  (documented; "Remaining"). Figures for the "Remaining" items with the shipped file: COLD is
+  2.8 / 6.7 / 6.3 % slower than CLEAN on 256³ / 512³ / 1024³ at N = 14 and +11.5 µs on ≥ 2048³;
+  the BURST power is 490 / 502 / 585 / 545 W at 960³ / 992³ / 1024³ / 1056³ N = 14 (the D_dram
+  step at warm.l2_bytes), SUSTAINED clock 2698 / 2674 / 2477 / 2563 MHz; 1536³ BURST 631 W.
+- Unchanged by the fix: every BURST prediction and so the hold-out tables above (BURST,
+  REPEAT; identical to perf-minor), and every COLD prediction (the default); the time
+  parameters are the perf-minor ones bit for bit (the offline refit reproduces them to
+  ~1e-10 relative; only the power keys were taken from it). Records and logs:
+  `results/perfminor/final/` (`r_fixed.*`, `r_oldC_foldboost.*`, `r_14_*`, `r_scaled.*`,
+  `power_nested_final.md`, `figures.txt`, `windows_asfit.txt`).
+
+**Decision: c dropped (independent reviewer, binding; branch `perf-minor-noc`, CPU only, no
+GPU).** The shipped calibration is now the refit of the same records with `perf_fit
+--cache-terms delta,omega` (`warm.call_ns` absent = 0; the key stays supported, optional,
+0 = off, for a future calibration). Reasons: (1) a COLD request gets no c, but the fitter
+adds c back onto every REPEAT phase record before the fit, so the with-c θ carried ≈ +1.2 µs
+per small COLD call that no measurement backs (64³ N = 14 COLD 16.68 → 15.45 µs, below) and
+that sums up over ehrenfest's sequences of small calls; (2) the mid-size gain of c is mostly a
+shift of the L_w threshold (0.85 → 0.90 × L2) tuned on the in-sample 1024³ pairs; (3) the
+< 100 µs hold-out is worse with c (p90 10.7 → 12.2). **The per-call saving is not identifiable
+from these records** (confounded with `call.call` on REPEAT records, and the c / ω split is
+not checkable from the pairs); it stays an open item tied to the launch-timing question
+("Remaining": CLEAN / WARM vs REPEAT may be launch timing, the power reviewer's item 5).
+Records and logs: immerdink-eval `results/perfminor/final/` (`r_noc.*`, `shipped_noc.calib`,
+`noc.*.md`, `power_nested_noc.md`; `refit.sh r_noc --cache-terms delta,omega`, `bands.sh`,
+`noc_extra.sh`, `noc_cold.py`). The time parameters reproduce `vn/n_noc` (the ablation row above) to ~1e-13 relative and so
+its hold-out figures exactly; the power keys and f_ref differ (the review-fixed solve, per-fold
+boost).
+
+- **Cache fit:** L_w **0.85 × L2** (64.2 MB; was 0.90, 67.9 MB), Δ **1.31 ps/B** (1.29), c 0
+  (1.23 µs), ω **0.104 ps/B** (0.169); pair relative SSE **0.0222** (0.0136) over 18 pairs. Over
+  all 21 pair records the absolute CLEAN error (median) **4.2 %** (3.8), REPEAT 2.2 % (2.1).
+  The three held-out pairs (CLEAN − REPEAT, measured / no c / with c, µs): v_x1280 −11.4 / −6.7
+  / −11.5, v_x2048 −6.1 / −6.7 / −5.9, v_x3072 −20.8 / −6.7 / −11.5: **two of three are worse
+  without c** (the clean credit ω·L_w falls 11.5 → 6.7 µs; with c the fit put more of the
+  REPEAT / CLEAN gap into ω). The in-sample res = 0 pairs are under-predicted by up to 10.7 µs
+  (x_r1 N = 14, x_s1536 N = 8; with c 5.9), the early saturation of the credit ("Remaining") is
+  larger.
+- **Power / clock fit** (the REPEAT time enters the solve, L_w moves the D_dram step): f_ref
+  **2479 MHz** (2483; scan argmin 2480), boost 2788 MHz (unchanged; 6 uncapped windows), e_tc
+  0.573 pJ/op, e_alu 91.6 pJ/op, P_act 153.7 W, e_dram 95.2 pJ/B; **nested leave-one-out
+  median |t err| 1.42 %** (1.40; folds' f_ref 2467–2495 MHz), clock |err| median 0.7 % (0.7),
+  large-capped clock bias +1.5 % (+1.5), power max 9.2 % (9.8) over the 26 windows (14
+  calibration windows t 1.05 %, 12 "new" 2.20 %); as calibrated the 26 windows' SUSTAINED
+  median 1.2 %. Per window (nested, no c / with c): u_s512 N = 14 −4.1 / −6.3 %, N = 16 +10.1 /
+  +10.8 %; d_s256 +23.2 / +22.1 %; p_s512n8 −3.2 / −5.1 %; u_s1024 N = 16 +2.1 / −1.3 % (clock
+  2379 / 2354, measured 2525). The D_dram step (`warm.l2_bytes`) moves from 67.9 to 64.2 MB:
+  992³ N = 14 now lies above it (BURST 502 → 573 W, SUSTAINED clock 2674 → 2500 MHz; 960³ /
+  1024³ / 1056³ within 2 W and 3 MHz).
+- `rank.tie_ratio` 1.059 → **1.061**; bands now at the 5 / 95 hold-out quantiles (cross-validated
+  coverage 81 %; with c 5 / 95 reached 79.9 % and 2.5 / 97.5 was stored): call < 100 µs
+  0.911–1.133, 100 µs – 1 ms 0.902–1.053, ≥ 1 ms 0.935–1.032.
+
+Hold-out (the same 199 calls, BURST, REPEAT; median / p90 / max |error| %):
+
+| subset | measured call | calls | with c (perf-minor) | **no c (shipped)** |
+|---|---|---|---|---|
+| all | < 100 µs | 65 | 3.7 / 12.2 / 19.0 | **3.8 / 10.7 / 17.1** |
+| all | 100 µs – 1 ms | 65 | 2.7 / 6.9 / 13.4 | **2.7 / 8.2 / 13.3** |
+| all | ≥ 1 ms | 69 | 2.6 / 6.4 / 16.4 | **2.5 / 6.4 / 16.4** |
+| N ≤ 14 | < 100 µs | 39 | 3.3 / 12.1 / 19.0 | 3.8 / 10.9 / 17.1 |
+| N ≤ 14 | 100 µs – 1 ms | 47 | 2.7 / 8.0 / 13.4 | 2.8 / 9.6 / 13.3 |
+| N ≤ 14 | ≥ 1 ms | 43 | 2.2 / 6.5 / 9.2 | 2.3 / 6.5 / 9.1 |
+| N = 15–17 | < 100 µs | 20 | 4.4 / 11.5 / 13.2 | 4.1 / 10.1 / 12.7 |
+| N = 15–17 | 100 µs – 1 ms | 16 | 2.8 / 4.3 / 4.5 | 2.7 / 5.6 / 7.9 |
+| N = 15–17 | ≥ 1 ms | 22 | 2.8 / 6.2 / 16.4 | 2.8 / 6.2 / 16.4 |
+| N = 18–20 | < 100 µs | 6 | 5.5 / 13.1 / 17.3 | 4.4 / 11.6 / 15.9 |
+| N = 18–20 | 100 µs – 1 ms | 2 | 1.3 / 1.5 / 1.6 | 1.4 / 1.7 / 1.7 |
+| N = 18–20 | ≥ 1 ms | 4 | 1.7 / 2.7 / 2.7 | 1.7 / 2.6 / 2.7 |
+
+Per phase, hold-out (median / p90 %, with c → no c): KF 6.6 / 21.1 → 7.2 / 22.9, KL A 4.1 /
+13.4 → 4.2 / 13.4, KL B 3.5 / 14.1 → 3.5 / 14.2; K2, K3, K4, K5 unchanged (5.3 / 8.3, 4.2 /
+14.0, 4.9 / 21.6, 4.2 / 17.3). Calibration set (in-sample for both): < 100 µs 8.8 / 19.4 / 36.4
+→ 7.7 / 18.2 / 34.8, 100 µs – 1 ms 2.0 / 9.5 / 23.3 → 2.0 / 9.7 / 21.1, ≥ 1 ms unchanged. The
+open-items targeted records are worse without c (100 µs – 1 ms 3.5 / 5.7 / 11.0 → 4.6 / 8.6 /
+11.0, < 100 µs 2.5 / 6.5 / 7.2 → 3.2 / 6.3 / 9.9; mostly 1024³-like shapes), the perfminor-time
+records better (< 100 µs 19.0 / 22.6 / 25.2 → 17.8 / 21.3 / 23.9, 100 µs – 1 ms 3.7 / 18.0 / 23.3
+→ 4.0 / 15.7 / 20.5).
+
+Named cases (call error %, with c → no c): **`v_sq1024` N = 14 +6.3 → +10.8** (vec=resident
++7.0 → +11.6; N = 8 +0.3 → −0.2), w_s960 N = 15 / 16 / 17 +4.5 / +3.8 / +4.0 → +4.7 / +6.5 /
++7.9, v_bsm N = 14 +1.4 → +5.3; **`v_n18d`** N = 14 / 16 / 17 / 18 / 19 / 20 −9.1 / −8.6 / −8.2 /
+−17.3 / −8.9 / −7.6 → −7.7 / −7.2 / −6.8 / −15.9 / −7.4 / −6.0; **`v_w3584`** N = 8 / 14 −4.9 /
++0.7 → −5.5 / +0.3; v_df64 −2.7 / +0.5 → −3.4 / 0.0; v_s1920 −3.5 / +0.1 → −3.7 / 0.0; v_s512
+N = 14 −19.0 → −17.1.
+
+Small-call predictions (BURST, N = 14, µs; COLD / REPEAT / CLEAN):
+
+| shape | with c | **no c** | COLD |
+|---|---|---|---|
+| 64³ | 16.68 / 15.37 / 16.64 | 15.45 / 15.36 / 15.43 | −1.23 µs (−7.4 %) |
+| 128³ | 17.50 / 15.93 / 17.36 | 16.30 / 15.96 / 16.22 | −1.19 µs (−6.8 %) |
+| 256³ | 20.69 / 18.11 / 20.13 | 19.64 / 18.27 / 19.30 | −1.05 µs (−5.1 %) |
+| 512³ | 35.23 / 28.61 / 33.01 | 34.76 / 29.28 / 33.39 | −0.47 µs (−1.3 %) |
+| 1024³ | 150.16 / 129.05 / 141.30 | 149.77 / 134.50 / 144.31 | −0.39 µs (−0.3 %) |
+| 2048³ | 730.59 / 730.59 / 719.12 | 730.11 / 730.11 / 723.42 | −0.49 µs (−0.1 %) |
+
+COLD is now 1.8 / 4.1 / 3.8 % slower than CLEAN on 256³ / 512³ / 1024³ (with c 2.8 / 6.7 / 6.3 %)
+and ω·L_w = 6.7 µs on ≥ 2048³ (11.5). The small REPEAT calls are ≈ 0.1–0.7 µs slower than with
+c, the small COLD calls ≈ 1.0–1.2 µs faster. The v12-sized struct view (figures of "Review"):
+4096³ SUSTAINED 4608 µs at 450 W (NULL) vs 4396 µs at 340 W (v12 view); 4096² × 512 /
+3584² × 512 g = 4 BURST −7.1 / −7.5 % (unchanged). (`figures_noc.txt`.)
+
+**Caveats:**
+- The small class: p90 / max +1.4 / +3.2 points, N = 15–17 below 100 µs 2.8 / 8.5 / 12.3 →
+  4.4 / 11.5 / 13.2 % and N = 18–20 3.0 / 9.8 / 14.1 → 5.5 / 13.1 / 17.3 % (6 calls). A v1.17 refit
+  on the same records already moves N = 15–17 to 3.9 / 8.4 / 12.8: about half is the records,
+  half the per-call saving c (above). **[noc]** Without c (shipped now): < 100 µs 3.8 / 10.7 /
+  17.1, N = 15–17 4.1 / 10.1 / 12.7, N = 18–20 4.4 / 11.6 / 15.9; the cost moves to the mid class
+  (p90 6.9 → 8.2, 1024³ N = 14 +10.8 %) and the held-out cache pairs (two of three worse).
+- The hold-out is not fully independent of the design: the analyses chose the forms on the
+  model-fix hold-out; the new hold-out shapes (S rule, pairs, the 352³ series) are the
+  independent part. **[review]** It is also the selection set for c and ω: the `vn/*`
+  variants (`n_noc`, `n_noomega`, `n_all`) were ranked by these hold-out statistics, so the
+  reported hold-out figures of the shipped variant are optimistic by that choice. Of the S-rule
+  shapes only `v_w3584` discriminates the rule (a hit by the v1.17 proxy, a miss with planes),
+  and all three (S 68 / 95 / 142 MB) lie outside the L_hit bracket (75.5, 90.6) MB: the
+  threshold itself is untested on held-out data.
+- The shipped `notes` line records the window reuse; 24 of the 26 windows are 0.5–3.5 h older
+  than the calibration sweep (1–3 h; same kernels, 68–77 °C at the window ends).
+- A v7–v12-sized calibration struct reads the seven fields as 0: for the shipped file a degraded
+  view (pass NULL; DESIGN §6c.8 "Host API 13").
+
+**Remaining:**
+- The streaming K2 of g < N KL-path calls (`v_mmg`, `v_skg`, `c_rskin2g`: +2 … +5 %, `pack.dram`
+  0.84 ps/B with `pack.byte` 0): needs a separable feature (e.g. the K2 launch's own DRAM
+  bandwidth at > 1 GB) or a K2-only rate.
+- A pre-packed operand at g < N in the S rule (`imd_bench --methods packed` has no `--g`).
+- K4 and KF on tiny shapes (`z_s200`, `v_s320`, v_s512 N = 14 −19 %, `v_n18d` N = 18).
+- The BURST time of tiny windows (d_s256 +22 %) and of the r_mm-like windows (+6 … +8 %).
+- Mid-size capped calls' clock (p_s1536 −5.7 %, u_s1024 N = 16 −4.7 %).
+- The reviewer questions: COLD's meaning, `clock_mhz` on the NVML scale, c shipped or not
+  (**[noc] decided: c dropped**, "Decision: c dropped" above; the per-call saving is not
+  identifiable from these records, an open item tied to the launch-timing question below, the
+  power reviewer's item 5).
+- [review] **COLD (the default) is unmeasured for res > 0**: COLD = CLEAN + ω·min(F − I, L_w)
+  rests on the additive form only (for res = 0 it equals the measured REPEAT). A ≈ 1 min
+  pair variant whose flush *writes* a 2 × L2 buffer would validate it.
+- [review] **CLEAN / WARM vs REPEAT may be launch timing, not write-back**: on every res = 0
+  pair WARM − REPEAT ≥ CLEAN − REPEAT although WARM follows a dirty-leaving call; the CLEAN /
+  WARM timed calls start queued behind a GPU op, REPEAT after a host sync. Check: a REPEAT
+  variant with a dummy kernel before the timed call. If timing, COLD is pessimistic by up to
+  ω·L_w ≈ 6.7 µs (no c; with c 11.5 µs; ≤ 1 % of large calls) and the c / ω split (not
+  checkable from the pairs) should be revisited: **[noc]** this test also decides whether a
+  per-call REPEAT saving (`warm.call_ns`, supported, 0 in the shipped file) comes back. WARM is still predicted = REPEAT although the held-out pairs measure
+  −4.5 / −7.2 / −11.9 %.
+- [review] **The clean credit saturates too early**: res = 0 pairs whose clean saving exceeds
+  ω·L_w are under-predicted (x_r1 N = 14 and x_s1536 N = 8 by 5.9 µs in-sample, v_x3072 by
+  9.3 µs held out; **[noc]** without c 10.7 / 10.7 / 14.1 µs, and v_x1280 4.7 µs); `min(F − I,
+  L_w)` is probably the wrong form for large write-backs.
+- [review] **c is confounded with `call.call` on REPEAT records** (call.call 1738 → 1124 ns):
+  net, small REPEAT calls ≈ 1 µs faster (v_n18d −3.5 points, small-window BURST median 1.90 →
+  2.65 %). The time reviewer would ship Δ + ω (`--cache-terms delta,omega`), the power
+  reviewer keep c until the timing question is tested: kept, for the user. **[noc] Decided:
+  c dropped** (independent reviewer, binding): call.call 1124 → 1023 ns, the small COLD calls
+  ≈ 1.2 µs faster ("Decision: c dropped").
+- [review] **D_dram is a step at `warm.l2_bytes`**, the cache fit's L_w: power and cache fit
+  are coupled (L_w = 0 charges every call), the predicted BURST power and SUSTAINED clock jump
+  between neighbouring sizes (figures in "Review"). Use the phases' own DRAM-byte features
+  (K4 dram, k5.dram, pack.dram) or a separate threshold.
+- [review] **BURST `power_w` is uncapped** (the power at the boost clock; documented in DESIGN
+  §6c.8, not a reading).
+- [review] **The power coefficients are not stable**: fitted on 14 windows P_act 210 W, e_alu
+  0, e_dram 55; on 26 154 W, 92 pJ/op, 96 pJ/B (byte_f went 289 → 0 since v1.17). P_act and
+  e_alu are collinear (exponents differ by 1 over f / f_ref ≈ 0.9–1.12; 92 pJ per ALU op is not
+  physical): do not interpret the individual coefficients. 5 NNLS parameters + 2 priors + boost
+  + f_ref on ≈ 20 distinct cases; 20 of 26 windows at the cap, so the power level comes from 6
+  uncapped windows. Re-check after a fresh sustained run (24 of 26 windows were reused).
+- [review] **The L_hit threshold is untested on held-out data** (all three S-rule hold-out
+  shapes lie outside (75.5, 90.6) MB): a held-out shape with S ≈ 78–88 MB would test it.
+- [review] A v7…v12-sized caller struct reads the shipped file as a never-fitted model (a
+  stated exception, DESIGN §6c.2 / §6c.8 "Host API 13"); an adapter like `fold_byte_f` is
+  possible if a caller ever needs it (none known: ehrenfest passes NULL).
