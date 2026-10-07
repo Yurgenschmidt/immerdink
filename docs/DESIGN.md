@@ -591,8 +591,9 @@ do not see. With the per-band norms (one pass over A and B, as §6g.11's norms):
   M-b). That [M] composition is the reference for decisions; the [E] stays as a cross-check
   until a GPU measurement of the recipe replaces both (NOTES-C1 §5.8 MB-1).
 - [M] figures at N ∉ {8, 10, 14, 16} are model-only until the small-N hold-out M-c passes
-  (NOTES-C1 IR4). M-c ran on 2026-10-07 and missed one target (NOTES-C1 Status, "M-c"), so
-  the marks stay. NOTES-C1's M-b re-ran the [M] figures here on this worktree's library:
+  (NOTES-C1 IR4). M-c ran on 2026-10-07 and failed (one target missed; NOTES-C1 Status,
+  "M-c", and §5.9), so the marks stay; the path to a pass is the MC-3 feature (NOTES-C1 §5.9
+  MC-3). NOTES-C1's M-b re-ran the [M] figures here on this worktree's library:
   unchanged (immerdink-eval `findings/c1-m-b.md`).
 
 Use it for banded anti-correlated K profiles at normwise or absolute targets well above S·u,
@@ -5086,15 +5087,21 @@ it.
 - The gain depends on the final N the consumer needs and on the shape (NOTES-C1 §2.3–§2.4,
   §4.10). Gains at N ∉ {8, 10, 14, 16} rest on the performance model outside its hold-out
   until NOTES-C1's M-c passes.
-  - M-c ran on 2026-10-07 and missed §6c.5's < 100 µs median (15.8 % against 15 %). The
-    details are in NOTES-C1 Status ("M-c") and NOTES-C1 §5.9.
-  - The miss is the REPEAT credit on KL-path calls with a narrow n: the Jacobi view is
-    predicted 26–29 % fast at every N ≤ 10, the anchors included. It is not an N effect.
-  - The Q24 refit was not adopted (NOTES-C1 §5.9 MC-1), so the marks stay.
-  - Indicative, not M-d2: the schedule ending at N = 14, computed from M-c's single-call
-    medians, is 0.003–0.023 above its [M] ratio on 2000³, 4096³, DF, QZ and the PPL view,
-    and 0.005–0.028 below on 1024³ and skinny. On the Jacobi view it is 0.044–0.047 above
-    (0.830 against 0.786).
+  - M-c ran on 2026-10-07 and **failed**: it missed §6c.5's < 100 µs median (15.8 % against
+    15 %; a repeat gives 16.1 %). The binding verdicts are NOTES-C1 §5.9; the details are in
+    NOTES-C1 Status ("M-c").
+  - Two effects set the missed median, and each is necessary: a small-N optimism on the KF
+    path (sq1024 at N = 4 is 16–21 points more optimistic than at its anchors in the first
+    run, 15–16 in the repeat, and those two calls are the median), and the REPEAT credit on KL-path calls with a narrow n (the Jacobi
+    view is predicted 26–29 % fast at every N ≤ 10, the anchor N = 8 included; −14 to −15 %
+    at N = 12–14).
+  - The Q24 refit was not adopted (NOTES-C1 §5.9 MC-1), so the marks stay, with no partial
+    pass (MC-2). The path to a pass is the MC-3 feature (an optional REPEAT-credit key, a
+    refit and a fresh M-c run, NOTES-C1 §5.9 MC-3); M-d2 waits for it.
+  - Indicative, not M-d2, and never used to set its bars: the schedule ending at N = 14,
+    computed from M-c's single-call medians, is 0.003–0.023 above its [M] ratio on 2000³,
+    4096³, DF, QZ and the PPL view, and 0.005–0.028 below on 1024³ and skinny. On the Jacobi
+    view it is 0.044–0.047 above (0.830 against 0.786).
   - NOTES-C1's M-b re-ran these [M] figures on this worktree's library (host API 13): every
     design-phase record reproduces byte for byte, and `PrecisionPlan`'s own choices give the
     same schedule ratios (immerdink-eval `findings/c1-m-b.md`).
@@ -5273,9 +5280,9 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   with their sha256, the product commits and the library's sha256). It runs at phase
   switches, off the hot path; ehrenfest's hot-path rank calls are untouched.
 - **Limits.** The choice is the performance model's [M], outside its hold-out at
-  N ∉ {8, 10, 14, 16} until NOTES-C1's M-c passes (it missed on 2026-10-07; §6g.9). Rank's
-  footprint tie order (`TIES_BY_FOOTPRINT`) is not applied to the composed times. A phase
-  names every contraction.
+  N ∉ {8, 10, 14, 16} until NOTES-C1's M-c passes (it failed on 2026-10-07, §6g.9; the path
+  to a pass is NOTES-C1 §5.9 MC-3). Rank's footprint tie order (`TIES_BY_FOOTPRINT`) is not
+  applied to the composed times. A phase names every contraction.
 
 ### 6g.11 The rigorous ρ from a previous output: `rho_from_output` **[cert: cert_rho_recipe]** **[test: host_precision]**
 
@@ -6278,7 +6285,12 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
   - Tooling: `bench/sweep_mc.txt` (160 calls), `bench/sweep_disjoint.py` (absence from the
     calibration set by GEMM-view extents), `imd_bench --data decay_opp`, and the Q24 cases
     `bench/sweep_calib_n.txt`.
-  - Outcome: the < 100 µs median is missed (15.8 % against 15 %) through the REPEAT credit on
-    KL-path calls with a narrow n. The Q24 refit was not adopted, so the shipped calibration
-    is unchanged and the [M, model-only, outside hold-out] marks stay (§6g.9; NOTES-C1
-    Status, §5.9).
+  - Outcome: **failed**. The < 100 µs median is missed (15.8 % against 15 %) through two
+    effects, each necessary: a small-N optimism on the KF path (sq1024 at N = 4) and the
+    REPEAT credit on KL-path calls with a narrow n (the Jacobi view). The Q24 refit was not
+    adopted, so the shipped calibration is unchanged and the [M, model-only, outside
+    hold-out] marks stay (§6g.9; NOTES-C1 Status, §5.9).
+  - Review (approve-with-fixes; NOTES-C1 §5.9, binding): M-c failed, no partial pass; the
+    MC-3 feature (an optional REPEAT-credit key under §6c.5's feature rule, its §6c text
+    first) is authorized as the only path to a pass; M-d2 waits for it.
+    `bench/sweep_disjoint.py --self-test` is ctest `sweep_disjoint_selftest`.

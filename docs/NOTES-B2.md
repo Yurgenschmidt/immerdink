@@ -1570,18 +1570,35 @@ c, the small COLD calls ≈ 1.0–1.2 µs faster. The v12-sized struct view (fig
   stated exception, DESIGN §6c.2 / §6c.8 "Host API 13"); an adapter like `fold_byte_f` is
   possible if a caller ever needs it (none known: ehrenfest passes NULL).
 - [C1 M-c, 2026-10-07] **The REPEAT saving is wrong for KL-path calls with a narrow n whose
-  inputs fit the REPEAT window.** Source: NOTES-C1 Status "M-c"; immerdink-eval
+  inputs fit the REPEAT window.** Source: NOTES-C1 Status "M-c" and §5.9 (MC-3); immerdink-eval
   `findings/c1-m-c.md`, `results/c1/m_c/cold_check.md`.
   - The Jacobi view (`abcd,cdij->abij`, 1600 × 100 × 1600) is predicted 26–29 % too fast at
-    every N ≤ 10, the anchors included.
+    every N ≤ 10, the anchor N = 8 included; at N = 12–14 (the anchor N = 14 included) it is
+    −14 to −15 %, where the model's K4 time (64×128) steps up more than the measured one
+    (N = 12: predicted 32.9 µs, measured 24.6 µs) and offsets part of it.
   - So are 1408 × 96 × 1408, a 1296 × 144 × 1296 tensor and 1792 × 128 × 1280 (−12 to −35 %).
   - The in-sample `c_skin1280` (−20.4 / −10.6 %) and `c_k3hit` (−10.8 / −6.4 %) have the same
     signature.
   - The rule credits all 15–22 MB of inputs as resident. The measured REPEAT time matches the
     COLD prediction (−10 to +12 %), while KF calls (1024³, 1280² × 960) do get the saving.
-  - No setting of `warm.l2_bytes` / `warm.l2byte` fixes it without losing the KF saving. A
-    refit with N-specific cases of this class (`bench/sweep_calib_n.txt`) absorbs it into
-    `kl.wave` (2.16 → 4.45 µs), which raises the 100 × 9216 × 9216 view by about 10 points.
-    It was not adopted.
-  - Candidate fix (a feature, not a refit): count the KL pack planes written between two calls
-    in the REPEAT footprint, as `warm.pack_l2_planes` does for PACK, under an optional key.
+  - It is one of the two effects behind M-c's failed < 100 µs median; the other is a small-N
+    optimism on the KF path (1024³ at N = 4, 16–21 points below its anchors). Each is
+    necessary (NOTES-C1 Status, "Cause").
+  - **No setting of `warm.l2_bytes` / `warm.l2byte` can fix it**, since the rule depends on
+    capacity only: res = clamp(L_w − (F − I), 0, I). 1024³ (KF) keeps more than its modeled
+    saving at a modeled F − I of 49.3 / 52.5 MB (N = 13 / 14), while the Jacobi view loses
+    all of it at 13.0–30.5 MB (N = 4–10). Any rule in F − I alone credits the Jacobi view at
+    least as much. A refit with N-specific cases of this class (`bench/sweep_calib_n.txt`)
+    absorbs it into path parameters instead (`kl.wave` 2.16 → 4.45 µs, K4's effective L2
+    0.4 → 0.3 × nominal), which raises the 100 × 9216 × 9216 view by about 10 points. It was
+    not adopted (NOTES-C1 §5.9 MC-1).
+  - **The fix is a feature (NOTES-C1 §5.9 MC-3, authorized under DESIGN §6c.5's feature
+    rule).** F already holds the workspace, the KL residue planes included, so counting
+    those planes again would double them. `warm.pack_l2_planes`, the precedent, adds K4's W
+    planes, g·b·m·n̂·(2·k_chunks − 1) per group, to PACK's set S: traffic between two
+    re-reads, not capacity. Candidates, to be chosen from the calibration, cache, Q24 and
+    v1.18 hold-out records only (never M-c's): (a) add K4's split-K W-plane traffic,
+    Σ_groups g_i·b·m·n̂·(2·k_chunks − 1), to F − I in res_repeat; (b) no REPEAT credit for
+    the input bytes a KL pack reads, the KF credit kept. Either under one optional key in
+    format 2, absent = 0; DESIGN §6c text first, then `host_perf` tests, a refit and a fresh
+    M-c run.

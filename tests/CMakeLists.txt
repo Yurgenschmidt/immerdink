@@ -86,6 +86,13 @@ if(Python3_FOUND)
   # cannot silently invalidate the M-a / M-d1 engine. CPU only (numpy), about 10 s.
   add_test(NAME c2_engine_selftest
            COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/c2_gate.py" selftest)
+  # NOTES-C1 §4.3 M-c (§5.9): bench/sweep_disjoint.py, the check that a hold-out shares no
+  # GEMM view with the fit sweeps. Its matching rule (another spec, A and B swapped, a tensor
+  # equal to a square, near sizes, the batch), its exit codes (--against fails, --report only
+  # lists), and the committed sweeps: M-c against sweep_calib.txt and sweep_calib_n.txt.
+  # CPU only, standard library, under a second.
+  add_test(NAME sweep_disjoint_selftest
+           COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/sweep_disjoint.py" --self-test)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
