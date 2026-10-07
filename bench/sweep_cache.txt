@@ -2,10 +2,16 @@
 # times, interleaved, the same call COLD (L2 evicted by reading 2 x L2), WARM (the previous call
 # wrote its A) and REPEAT (the same call just ran: the state of every other record). C = A B^T
 # with n = k, so C of one call is the next call's A. About 1 min of GPU time.
+# v1.18 (DESIGN §6c.8): the COLD of a pair is the CLEAN state (the flush reads its buffer, so the
+# L2 holds no dirty lines). 1024^3 at N = 8-16 pins L_w and Delta (its resident bytes change with
+# N), 256^3 / 512^3 the per-call saving c, the res = 0 pairs (2048^3, 4096 x 768^2, 256 x 3000^2,
+# 1536^3) the clean credit omega; 768^3 adds a mid-size res ramp. About 2 min of GPU time.
 # name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
 x_s256    | ik,jk->ij | i=256,j=256,k=256          | pair | 14,16 | --reps 300 --max-seconds 2
 x_s512    | ik,jk->ij | i=512,j=512,k=512          | pair | 14,16 | --reps 300 --max-seconds 2
-x_s1024   | ik,jk->ij | i=1024,j=1024,k=1024       | pair | 14,16 | --reps 100 --max-seconds 2
+x_s1024   | ik,jk->ij | i=1024,j=1024,k=1024       | pair | 8,10,12,14,16 | --reps 100 --max-seconds 2
 x_s2048   | ik,jk->ij | i=2048,j=2048,k=2048       | pair | 14,16 | --reps 30 --max-seconds 2
 x_r1      | ik,jk->ij | i=4096,j=768,k=768         | pair | 14,16 | --reps 50 --max-seconds 2
 x_r2      | ik,jk->ij | i=256,j=3000,k=3000        | pair | 14 | --reps 50 --max-seconds 2
+x_s1536   | ik,jk->ij | i=1536,j=1536,k=1536       | pair | 8,14 | --reps 50 --max-seconds 2
+x_s768    | ik,jk->ij | i=768,j=768,k=768          | pair | 8,16 | --reps 200 --max-seconds 2

@@ -834,7 +834,7 @@ struct Bench {
     // v1.10: the bench's state (the same call repeated) at the reference clock; the default
     // eps fraction (the v6 bench passed 0 here by value-initialization).
     imd_perf_request_t preq{sizeof(imd_perf_request_t), 0, k4_plan, 0, -1.0,
-                            IMD_PERF_REGIME_BURST, o.l2_flush ? IMD_PERF_CACHE_COLD : IMD_PERF_CACHE_REPEAT, 0.0};
+                            IMD_PERF_REGIME_BURST, o.l2_flush ? IMD_PERF_CACHE_CLEAN : IMD_PERF_CACHE_REPEAT, 0.0};
     imd_perf_t pred{};
     pred.struct_size = sizeof pred;
     imd_perf_predict(&A, &B, &C, &opt, nullptr, &preq, nullptr, &pred);
@@ -1442,6 +1442,8 @@ struct Bench {
     e.integer("g", (long long)((g == 0 || g >= N) ? N : g));
     std::string vs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
     if (vec_mode == IMD_VEC_RESIDENT) vs += " vec=resident";
+    // v1.18: the mode as method imd writes it (bench/perf_fit.py read a DIRECT window as EMULATE)
+    if (o.mode == IMD_DIRECT) vs += " mode=direct";
     record("sustained", vs + " sustained", N, T, nullptr, flops(), P->wsb, e);
   }
 
