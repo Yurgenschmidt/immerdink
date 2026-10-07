@@ -12,6 +12,10 @@
 #
 # Already inside the slice (nested call): runs the command directly.
 # No systemd user manager: warns and runs uncapped.
+#
+# A time limit goes INSIDE: `tools/memcap.sh timeout 600 cmd ...`. The command runs in a
+# systemd scope, and `timeout 600 tools/memcap.sh cmd ...` did not stop it (2026-10-07: a
+# timed-out study chunk kept running and writing records after the timeout fired).
 set -u
 [ $# -ge 1 ] || { echo "usage: $0 command [args...]" >&2; exit 2; }
 

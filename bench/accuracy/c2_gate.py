@@ -4,14 +4,16 @@ rule, guarded), K-segmentation and the envelope rule against fast mode, at reali
 in exact integer emulation (bench/accuracy/kw_engine.py, bit-identical to spec/oracle.py).
 CPU only, single-threaded; no GPU.
 
-    OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 timeout 600 \\
-      tools/memcap.sh python3 bench/accuracy/c2_gate.py TIER [options] --out DIR
+    OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \\
+      tools/memcap.sh timeout 600 python3 bench/accuracy/c2_gate.py TIER [options] --out DIR
 
 TIER: selftest | pilot | S | L | real | multi | batch | b6 (options: --families, --seeds,
 --sizes, --dstar, --real-dir, --b6). Records: one JSON line per run in DIR/<tier>.jsonl (raw
 records belong in immerdink-eval results/c1/m_a/, untracked); c2_summary.py turns them into
-tables. Wrap the timeout INSIDE memcap (tools/memcap.sh timeout 600 python3 ...): memcap runs
-the command in a systemd scope that a timeout around memcap.sh does not stop.
+tables. The timeout goes INSIDE memcap, as above: memcap runs the command in a systemd scope
+that a timeout around memcap.sh does not stop. Each record carries the commit, a dirty flag
+and the sha256 of every study script (provenance()), since the scripts may be uncommitted
+when a record is written.
 
 Per run (§4.3 "Engine"):
   1. full operands, exact, over every row and column: the exponent extrema per shared K
@@ -86,12 +88,26 @@ def load_host():
     return host, h
 
 
+STUDY_FILES = ("bench/accuracy/c2_gate.py", "bench/accuracy/kw_engine.py",
+               "bench/accuracy/c2_fixtures.py", "bench/accuracy/md1_converge.py",
+               "spec/oracle.py", "python/immerdink/precision.py")
+
+
+def _sha256(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def provenance(h):
-    commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
-                            text=True, cwd=ROOT).stdout.strip()
-    with open(h.path, "rb") as f:
-        sha = hashlib.sha256(f.read()).hexdigest()
-    return dict(commit=commit, lib=os.path.relpath(h.path, ROOT), lib_sha256=sha,
+    """The commit, whether any study file differs from it (dirty), each study file's sha256
+    (so a record written from uncommitted code still names its code), and the library."""
+    def git(*a):
+        return subprocess.run(["git", *a], capture_output=True, text=True, cwd=ROOT).stdout
+    commit = git("rev-parse", "--short", "HEAD").strip()
+    dirty = sorted(p for p in STUDY_FILES if git("status", "--porcelain", "--", p).strip())
+    return dict(commit=commit, dirty=dirty,
+                code_sha256={p: _sha256(os.path.join(ROOT, p)) for p in STUDY_FILES},
+                lib=os.path.relpath(h.path, ROOT), lib_sha256=_sha256(h.path),
                 host_api=int(h.version))
 
 
@@ -489,10 +505,11 @@ def perf_block(perf, meta, m, n, k):
 # Several partners (IR6) and batches (IR16)
 # ---------------------------------------------------------------------------------------
 
-def run_multi(X, Ys, meta, cfg, perf, x_role="A"):
+def run_multi(X, Ys, meta, cfg, perf, x_role="A", keep_w=False):
     """X pre-scaled by 2^w once, partners Y_p by 2^-w; w from the union extrema; G = min_p
     G_p (each pair at N_ref). x_role: X's role in every pair ("A": rows, "B": columns).
-    Compared with each pair's own single-partner w. Sampled outputs per pair."""
+    Compared with each pair's own single-partner w. Sampled outputs per pair. keep_w: the
+    weight vectors go into the record too (self_test_modes)."""
     t0 = time.process_time()
     k = X.shape[1]
     rec = dict(meta, k=k, x_rows=X.shape[0], partners=[Y.shape[0] for Y in Ys])
@@ -532,6 +549,8 @@ def run_multi(X, Ys, meta, cfg, perf, x_role="A"):
                                      guard=1 if not dG or min(dG) >= 3 else 0,
                                      fp64_violations=viol, num_weighted=int((w != 0).sum())))
     rec["weights"] = {nm: v[3] for nm, v in W.items()}
+    if keep_w:
+        rec["w"] = {nm: v[0].tolist() for nm, v in W.items()}
     rng = np.random.default_rng([meta.get("seed", 0), 4343])
     pairs = []
     for p, Y in enumerate(Ys):
@@ -576,10 +595,11 @@ def run_multi(X, Ys, meta, cfg, perf, x_role="A"):
     return rec
 
 
-def run_batched(As, Bs, meta, cfg, perf, per_batch=16):
+def run_batched(As, Bs, meta, cfg, perf, per_batch=16, keep_w=False):
     """IR16: batches share one w (Q12 a: extrema over every lambda; the guard over every
     (lambda, row)) against per-lambda w (Q12 b). Sampled outputs: per_batch rows x columns of
-    every batch, max errors over all batches."""
+    every batch, max errors over all batches. keep_w: the weight vectors and the per-lambda
+    G go into the record too (self_test_modes)."""
     t0 = time.process_time()
     b, k = len(As), As[0].shape[1]
     d = cfg["dstar"]
@@ -638,6 +658,10 @@ def run_batched(As, Bs, meta, cfg, perf, per_batch=16):
     rec["guard"] = {"shared": guard_of(gains["shared"], True),
                     "per_batch": guard_of(gains["per_batch"], False)}
     rec["fp64_violations"] = viol
+    if keep_w:
+        rec["w"] = dict(shared=shared.tolist(), per_batch=[w.tolist() for w in own])
+        rec["G_per_batch"] = [None if g[0] is None or g[1] is None else g[0] + g[1]
+                              for g in gains["per_batch"]]
     rec["nmin"] = {nm: dict(ew={str(t): nmin({N: v[1] for N, v in c.items() if isinstance(N, int)}, t)
                                 for t in EW_TARGETS},
                             nw={str(t): nmin({N: v[0] for N, v in c.items() if isinstance(N, int)}, t)
@@ -647,6 +671,84 @@ def run_batched(As, Bs, meta, cfg, perf, per_batch=16):
     rec["curves"] = {nm: {str(N): v for N, v in c.items()} for nm, c in curves.items()}
     rec["cpu_s"] = round(time.process_time() - t0, 2)
     return rec
+
+
+def _kw_case(rng, rows, cen, spread=5):
+    """rows x k row fibers around 2^cen[h] (one zero entry)."""
+    X = rng.standard_normal((rows, cen.size)) * \
+        np.ldexp(1.0, cen[None, :] + rng.integers(-spread, spread + 1, (rows, cen.size)))
+    X[rng.integers(rows), rng.integers(cen.size)] = 0.0
+    return X
+
+
+def self_test_modes(rng_seed=20261008, verbose=True):
+    """run_multi (IR6: union extrema, G = min_p G_p; each pair's own w) and run_batched (IR16:
+    one w over every lambda; per-lambda w) on small cases against oracle.kweights: its
+    multi-partner mode (X in role A and in role B, P = 2..3) and its batched descriptors (a
+    batch label in A, B and C), and oracle.kweights_gemm per slice. Checks w, G per pair, G,
+    the guard and num_weighted. Raises AssertionError on any mismatch; returns counts."""
+    rng = np.random.default_rng(rng_seed)
+    g_of = lambda G: o.INT32_MIN if G is None else G  # noqa: E731
+    cnt = dict(multi=0, pairs=0, batched=0, slices=0)
+    for t in range(12):
+        k, P = int(rng.integers(3, 24)), int(rng.integers(2, 4))
+        x_role = "A" if t % 2 == 0 else "B"
+        cen = rng.integers(-40, 40, k)
+        X = _kw_case(rng, int(rng.integers(2, 4)), cen)
+        Ys = [_kw_case(rng, int(rng.integers(2, 4)), (-cen if p == 0 else cen) +
+                       rng.integers(-20, 21, k)) for p in range(P)]
+        if t % 3 == 0:                  # a partner row near the bottom of the range (the
+            Ys[-1][0] = np.ldexp(rng.uniform(1, 2, k),        # FP64 clamp's m_Y side)
+                                 rng.integers(-1074, -1040, k))
+        d = int(rng.choice([0, 2, 3]))
+        rec = run_multi(X, Ys, dict(seed=t), dict(dstar=d), None, x_role=x_role, keep_w=True)
+        parts = []
+        for Y in Ys:                                            # the caller's A, B and C
+            TA, TB, C = o.gemm_tensors(*((X.tolist(), Y.T.tolist()) if x_role == "A" else
+                                         (Y.tolist(), X.T.tolist())))
+            TX, TY = (TA, TB) if x_role == "A" else (TB, TA)
+            parts.append(o.KwPartner(TY, C, 14, "RN", x_role))
+        w, rep = o.kweights(TX, parts, deadband=d)
+        sh = rec["weights"]["shared"]
+        assert rec["w"]["shared"] == w, (t, "w")
+        assert [g_of(g) for g in sh["G_pairs"]] == [g_of(q["G"]) for q in rep["pairs"]], t
+        assert g_of(sh["G"]) == rep["gain"] and sh["guard"] == rep["guard"], t
+        assert sh["num_weighted"] == rep["num_weighted"] and sh["fp64_violations"] == 0, t
+        for p, part in enumerate(parts):
+            wp, rp = o.kweights(TX, [part], deadband=d)
+            assert rec["w"][f"own{p}"] == wp, (t, p)
+            assert g_of(rec["weights"][f"own{p}"]["G_pairs"][p]) == rp["gain"], (t, p)
+            cnt["pairs"] += 1
+        cnt["multi"] += 1
+    for t in range(6):
+        b, m, n = int(rng.integers(2, 5)), int(rng.integers(2, 4)), int(rng.integers(2, 4))
+        k = int(rng.integers(3, 20))
+        cen, shift = rng.integers(-30, 30, k), rng.integers(-15, 16, k)
+        As = [_kw_case(rng, m, cen + (shift if lam % 2 else 0)) for lam in range(b)]
+        Bs = [_kw_case(rng, n, -cen + rng.integers(-10, 11, k)) for _ in range(b)]
+        d = int(rng.choice([0, 2, 3]))
+        rec = run_batched(As, Bs, dict(seed=t), dict(dstar=d), None, keep_w=True)
+        TA = o.Tensor([x for A in As for x in A.ravel().tolist()], 0,
+                      o.Desc([b, m, k], [m * k, k, 1], ["l", "i", "h"]))
+        TB = o.Tensor([x for B in Bs for x in B.T.ravel().tolist()], 0,
+                      o.Desc([b, k, n], [k * n, n, 1], ["l", "h", "j"]))
+        C = o.Desc([b, m, n], [m * n, n, 1], ["l", "i", "j"])
+        w, rep = o.kweights(TA, [o.KwPartner(TB, C, 14, "RN", "A")], deadband=d)
+        sh = rec["guard"]["shared"]
+        assert rep["labels"] == ["h"] and rec["w"]["shared"] == w, (t, "batched w")
+        assert g_of(sh["G"]) == rep["gain"] and sh["guard"] == rep["guard"], t
+        for lam in range(b):
+            wl, rl = o.kweights_gemm(As[lam].tolist(), Bs[lam].T.tolist(), 14, "RN", deadband=d)
+            assert rec["w"]["per_batch"][lam] == wl, (t, lam)
+            assert g_of(rec["G_per_batch"][lam]) == rl["gain"], (t, lam)
+            cnt["slices"] += 1
+        cnt["batched"] += 1
+    if verbose:
+        print(f"c2_gate self-test: run_multi == oracle.kweights on {cnt['multi']} cases "
+              f"(P = 2..3, X in role A and B; {cnt['pairs']} own-w pairs), run_batched == "
+              f"oracle.kweights on {cnt['batched']} batched descriptors ({cnt['slices']} "
+              f"per-lambda slices == kweights_gemm)", flush=True)
+    return cnt
 
 
 # ---------------------------------------------------------------------------------------
@@ -823,6 +925,7 @@ def main():
     args = ap.parse_args()
     t0 = time.process_time()
     ke.self_test(verbose=True)
+    self_test_modes(verbose=True)
     if args.tier == "selftest":
         return 0
     host, h = load_host()
@@ -863,8 +966,25 @@ def main():
     elif args.tier == "b6":
         # IR11 on the real operands: full FP64 outputs (an estimate), every output and only the
         # outputs with rho <= RHO_MUST (structural near-zeros of the point group excluded)
+        # A job without ":" is a synthetic family at --sizes (m = n) and --seeds with EXACT x
+        # over every output (§4.3: full outputs wherever m n <= 512^2), outside run_case.
         cache = {}
         for job in args.families:
+            if ":" not in job:
+                for (m, k) in [tuple(int(v) for v in s.split("x")) for s in args.sizes]:
+                    assert m * m <= 512 ** 2, "B6 with exact x: m n <= 512^2"
+                    for seed in (args.seeds or [0]):
+                        t1 = time.process_time()
+                        A, Bt = fx.synthetic(job, m, m, k, seed)
+                        rec = dict(prov, tier="b6", family=job, size=[m, k], seed=seed, m=m,
+                                   n=m, k=k)
+                        rec["b6"] = b6_estimate(perf, A, Bt, exact_full(A, Bt), label="exact")
+                        rec["cpu_s"] = round(time.process_time() - t1, 2)
+                        rec["peak_rss_mb"] = round(
+                            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+                        log(rec)
+                        del A, Bt
+                continue
             which, mol = job.split(":")
             if mol not in cache:
                 cache.clear()

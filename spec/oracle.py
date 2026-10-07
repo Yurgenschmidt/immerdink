@@ -1515,10 +1515,23 @@ def kweights(X: Tensor, partners, deadband: int = KW_DEADBAND, max_abs: int = KW
 
     Report: guard, gain, gain_row_min / gain_col_min (the plan's A rows / B columns, for the
     pair that sets G), median (INT32_MIN if no Delta is defined), num_weighted (w != 0),
-    max_abs_w, clamped (w != w0; ORACLE-CHOICE under ZERO_ON_FAIL: the count of w0 != 0, so
-    that it matches w = 0); oracle detail: k_s, labels, qstride, w0, clamped_max_abs,
+    max_abs_w, clamped (w != w0); oracle detail: k_s, labels, qstride, w0, clamped_max_abs,
     clamped_fp64 (the FP64 clamp binding after the max_abs one), pairs (gain_x, gain_y, G per
-    partner), extrema (c_X, m_X, c_Y, m_Y lists, None where undefined)."""
+    partner), extrema (c_X, m_X, c_Y, m_Y lists, None where undefined).
+    Report choices (confirmed by the independent reviewer, NOTES-C1 §5.6; binding for the C
+    API):
+    - G undefined (no pair has a nonzero finite row on both sides): gain_row_min and
+      gain_col_min are INT32_MIN too, even where one side of some pair is defined (the pair
+      that sets G names them, and there is none); the per-side values are in `pairs`.
+    - ZERO_ON_FAIL with guard = 0: the C fields describe the WRITTEN w = 0, i.e. clamped =
+      #{w != w0} on it (the count of w0 != 0), num_weighted = 0, max_abs_w = 0; guard, gain,
+      gain_row_min, gain_col_min and median keep their computed values (guard = 0, the
+      failing G). The detail fields clamped_max_abs and clamped_fp64 (not in the C struct)
+      describe the clamps of the pre-zeroing w.
+    - w = 0 everywhere (num_weighted = 0, e.g. aligned profiles): G = 0, so guard = 0 (L5c
+      needs G >= 3); no special case. The weighted call IS then the plain call: the caller
+      skips the pre-scaling and uses the plain request with its own l1 ratios, not
+      imd_err_request_kweighted with gain 0 (which would tighten cond 4x for nothing)."""
     if not isinstance(deadband, int) or deadband < 0:
         raise InvalidValue(f"kweights: deadband {deadband!r}")
     if not isinstance(max_abs, int) or not (1 <= max_abs <= KW_MAX_ABS):

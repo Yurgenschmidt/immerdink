@@ -3,8 +3,11 @@
 contraction computed by the bit-exact emulator (bench/accuracy/kw_engine.py, checked against
 spec/oracle.py by its self-test). No GPU; time is M-d2's job.
 
-    OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 timeout 600 \\
-      tools/memcap.sh python3 bench/accuracy/md1_converge.py SYSTEM [--out DIR]
+    OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \\
+      tools/memcap.sh timeout 600 python3 bench/accuracy/md1_converge.py SYSTEM [--out DIR]
+
+(timeout INSIDE memcap: memcap.sh runs the command in a systemd scope, which a timeout
+around memcap.sh does not stop.)
 
 SYSTEM: jacobi | diis | ppl | rho (the rho-miss rate) | davidson | cg.
 
@@ -47,11 +50,14 @@ needs at most one more iteration to each tolerance fixed N_final reaches, on jac
 
 rho-miss rate (IR7): each call's ELEMENTWISE target e (1e-6, 1e-10) is met at the N that
 imd_err_min_moduli (BOUND, levels up to 20) picks for cond = max rho_hat of the PREVIOUS
-call's output over its certified outputs: the §4.2 rigorous recipe, implemented here as
-specified because precision.rho_from_output (stage 1) has not shipped yet. A miss: the
-call's realized max elementwise error (exact reference) over those outputs exceeds e; the
-rate counts calls whose lagged request was MET (a MISSED request, no level meeting it, is
-reported apart as capped).
+call's output over its certified outputs, rho_hat from the shipped helper
+immerdink.precision.rho_from_output (stage 1, DESIGN §6g.11; bit-identical to spec/params.py
+rho_recipe), with the caller's norm upper bounds (FP64 row norms raised by
+(1 + (k + 4) 2^-52), then one ulp up). A miss: the call's realized max elementwise error
+(exact reference) over those outputs exceeds e; the rate counts calls whose lagged request
+was MET (a MISSED request, no level meeting it, is reported apart as capped). The records
+before the helper shipped (7260a95) used a local version, rho_hat_local, which also raised U
+by (1 + 2^-40); `rho --rho-impl local` reproduces them.
 """
 
 import argparse
@@ -67,6 +73,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kw_engine as ke  # noqa: E402
 import c2_gate as c2g  # noqa: E402
+sys.path.insert(0, os.path.join(ke.ROOT, "python"))
+from immerdink import precision  # noqa: E402  (loads no library on import)
 
 o = ke.o
 LEVELS = [5, 6, 8, 10, 12, 14]
@@ -163,8 +171,22 @@ class Schedule:
         return want
 
 
+def norm_ub(na, k):
+    """Upper bounds of the true row 2-norms from ke.norms' FP64 values (the caller's §6f.1
+    obligation): raised by (1 + (k + 4) 2^-52), then one ulp up."""
+    return np.nextafter(na * (1 + (k + 4) * 2.0 ** -52), np.inf)
+
+
 def rho_hat(perf, D, na, nb, N, k, rnd="RN"):
-    """NOTES-C1 §4.2 rigorous rho from a call's output D (alpha = 1, beta = 0): U = the
+    """The shipped rigorous rho (precision.rho_from_output, alpha = 1, beta = 0, nu = sqrt k)
+    of a call's output D, from norm upper bounds of the operands' FP64 row norms na, nb.
+    Returns (rho_hat, certified mask)."""
+    return precision.rho_from_output(D, norm_ub(na, k), norm_ub(nb, k), N=N, rounding=rnd,
+                                     k=k, lib=perf.h.path)
+
+
+def rho_hat_local(perf, D, na, nb, N, k, rnd="RN"):
+    """The local recipe of the first M-d1 runs (7260a95, before the helper shipped): U = the
     NORMWISE bound of imd_err_estimate at (N, rounding, k) (nu = sqrt k) times (1 + 2^-40);
     n_ij >= ||a_i|| ||b_j|| (FP64 norms raised by (1 + (k + 4) 2^-52)); t = nextafter(U n, inf),
     den = nextafter(|D| - t, 0), certified iff D is finite and normal and den > 0,
@@ -404,8 +426,10 @@ def fixed_point_study(sysm, perf, iters, log, prov, diis=0):
         del ref_tr, n20_tr, refs
 
 
-def rho_miss(sysm, perf, eps, iters, log, prov):
-    """IR7: the lagged-rho ELEMENTWISE schedule; miss rate per contraction call."""
+def rho_miss(sysm, perf, eps, iters, log, prov, impl="shipped"):
+    """IR7: the lagged-rho ELEMENTWISE schedule; miss rate per contraction call. impl:
+    "shipped" (precision.rho_from_output) or "local" (rho_hat_local, the first runs)."""
+    rho_fn = rho_hat if impl == "shipped" else rho_hat_local
     t0 = time.process_time()
     sc = Schedule(perf, "rho", eps=eps, monotone=False, levels=RHO_LEVELS)
     x = np.zeros_like(sysm.r)
@@ -423,7 +447,7 @@ def rho_miss(sysm, perf, eps, iters, log, prov):
                 ew = np.where(hi != 0, np.abs((D - hi) - lo) / np.abs(hi), np.inf)
             prev = certs.get(c)
             realized = float(ew[prev].max()) if prev is not None and prev.any() else None
-            rho, cert = rho_hat(perf, D, A.norm, B.norm, N, A.X.shape[1])
+            rho, cert = rho_fn(perf, D, A.norm, B.norm, N, A.X.shape[1])
             conds[c] = float(rho[cert].max()) if cert.any() else None
             certs[c] = cert
             row.append(dict(c=c, N=N, met=met, cond_next=conds[c], certified=int(cert.sum()),
@@ -437,7 +461,7 @@ def rho_miss(sysm, perf, eps, iters, log, prov):
     ms = [r["miss"] for row in rows for r in row if r["miss"] is not None and r["met"]]
     capped = [r["miss"] for row in rows for r in row if r["miss"] is not None and r["met"] is False]
     log(dict(prov, system=sysm.name, schedule=f"rho_eps{eps}", eps=eps, iterations=len(rows),
-             levels=RHO_LEVELS, checked=len(ms), misses=int(sum(ms)),
+             rho_impl=impl, levels=RHO_LEVELS, checked=len(ms), misses=int(sum(ms)),
              miss_rate=sum(ms) / len(ms) if ms else None, capped_calls=len(capped),
              capped_misses=int(sum(capped)), per_iteration=rows,
              cpu_s=round(time.process_time() - t0, 1)))
@@ -521,7 +545,9 @@ def cg_setup(n=2048, naux=128, nrhs=16, cond=1e6, seed=17):
 def run_cg(sched, A, Aop, b, iters=400, tol=1e-10, mode="relaxed", eta=0.1):
     """CG per right-hand side, one emulated block matvec A P per iteration. Ramp: ABSOLUTE
     eta ||r||_inf (monotone; the fixed-point forcing rule); relaxed: NORMWISE matvec tolerance
-    min(1e-2, tol / ||r_k||) (decreasing precision, monotone=False); mode "tighten": NORMWISE
+    min(1e-2, tol / ||r_k||) (decreasing precision, monotone=False; no iteration-count factor,
+    so the attainable residual keeps the inexact-Krylov gap: the theory's form scales it,
+    e.g. tol / (m_max ||r_k||)); mode "tighten": NORMWISE
     eta ||r_k|| / ||b|| (monotone tightening of the relative matvec accuracy); kind "fp64":
     the FP64 BLAS matvec (the attainable-accuracy baseline). True residual max_rhs ||b - A x|| / ||b|| in FP64
     every iteration, 80-bit long double at the end."""
@@ -567,6 +593,9 @@ def main():
     ap.add_argument("system", choices=["jacobi", "diis", "ppl", "rho", "davidson", "cg"])
     ap.add_argument("--out", default=None)
     ap.add_argument("--iters", type=int, default=None)
+    ap.add_argument("--rho-impl", choices=["shipped", "local"], default="shipped",
+                    help="rho: precision.rho_from_output (default) or the first runs' local recipe")
+    ap.add_argument("--tag", default="", help="suffix of the output file name")
     args = ap.parse_args()
     t0 = time.process_time()
     ke.self_test(verbose=True)
@@ -576,7 +605,7 @@ def main():
     fout = None
     if args.out:
         os.makedirs(args.out, exist_ok=True)
-        fout = open(os.path.join(args.out, f"md1_{args.system}.jsonl"), "a")
+        fout = open(os.path.join(args.out, f"md1_{args.system}{args.tag}.jsonl"), "a")
 
     def log(rec):
         if fout:
@@ -596,8 +625,8 @@ def main():
         fixed_point_study(PPL(), perf, args.iters or 100, log, prov)
     elif s == "rho":
         for eps in (1e-6, 1e-10):
-            rho_miss(Jacobi(), perf, eps, args.iters or 40, log, prov)
-            rho_miss(PPL(), perf, eps, args.iters or 40, log, prov)
+            rho_miss(Jacobi(), perf, eps, args.iters or 40, log, prov, args.rho_impl)
+            rho_miss(PPL(), perf, eps, args.iters or 40, log, prov, args.rho_impl)
     elif s == "davidson":
         H, d = davidson_setup()
         Hop = Operand(H)

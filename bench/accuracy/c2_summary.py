@@ -8,7 +8,15 @@ records of c2_gate.py. Light: reads records, calls the GPU-free host library for
 Conventions: moduli saved = N_min(fast) - N_min(scheme) at equal sampled max error; an
 unreachable target (no N <= 20) counts as 21 in medians and is shown as ">20"; times are
 [M] (imd_perf_predict of this worktree's library: DEFAULT regime, COLD, GENERATE, g = N,
-in-line operands) plus [E] caller-side costs (c2_gate.kw_costs); TFLOPS-eq first.
+in-line operands) plus [E] caller-side costs (c2_gate.kw_costs); TFLOPS-eq first. The memory
+of scaled copies (gate (b)) is 8 (mk + nk) bytes: both operands pre-scaled, held next to the
+plain ones (an upper estimate; a caller that scales in place, or fuses the scaling into its
+producer, holds none).
+
+The stage-4 gate verdict is computed as pre-registered (IR27): (i) on the real R1-R6 of the
+>= 2048^3 class (2mnk >= 1.7e10), (ii) by the per-output count (1) on every Tier-L / real
+fixture's guard-accepted runs (the noise-robust (2) and (3) are printed as diagnostics), and
+(iii) from the FP64-clamp round trips.
 """
 
 import argparse
@@ -25,6 +33,11 @@ import c2_gate as cg  # noqa: E402
 EW, NW = [str(t) for t in cg.EW_TARGETS], [str(t) for t in cg.NW_TARGETS]
 RANDOM_FAMS = ("outliers", "phi2", "phi4", "mixed")
 STRUCT_FAMS = ("decay_opp", "opp_nonsep")
+# Appendix B's trigger asks for NON-separable magnitudes; these families are separable
+# (row factor x K profile x column factor, or constant scale), every other one counts
+SEPARABLE_FAMS = ("decay_opp", "decay_same", "uniform", "same_sign")
+GATE_CLASS = 1.7e10            # 2mnk of the >= 2048^3 class (§4.3: gate admissibility)
+GAIN_BAR = 0.05                # gate (b): net TFLOPS-eq gain >= 5 %
 # NOTES-C1 §1.3 / ccsd.py: which operands are rebuilt every iteration (t1-dressed integrals,
 # t2 and its intermediates) and which are invariant (bare Bov and what is built from it)
 CPU_ALL = {}
@@ -144,32 +157,20 @@ def nmin_table(recs, schemes, metric="ew", targets=EW):
     return "\n".join(lines)
 
 
-def gate_rows(perf, r, dstar, status):
-    """Stage-4 gate (b) and (c) for one admissible run: per gate target, N measured, [M] time
-    and TFLOPS-eq of fast at its N against K-eq d* at its N plus [E] costs, net gain."""
-    m, n, k = r["m"], r["n"], r["k"]
-    p = r["perf"]
-    out = []
-    kq = f"keq_d{dstar}"
-    for metric, targets in (("ew", cg.GATE_EW), ("nw", cg.GATE_NW)):
-        for t in targets:
-            Nf, Nk = r["nmin"]["fast"][metric][str(t)], r["nmin"][kq][metric][str(t)]
-            row = dict(metric=metric, target=t, N_fast=Nf, N_keq=Nk)
-            if Nf is not None and Nk is not None:
-                tf, fl = p[str(Nf)]["time_s"], p[str(Nf)]["flops_eq"]
-                tk = p[str(Nk)]["time_s"]
-                cost = cg.kw_costs(perf, m * k, n * k, status)
-                row.update(t_fast=tf, t_keq=tk + cost, cost=cost, tf_fast=fl / tf * 1e-12,
-                           tf_keq=fl / (tk + cost) * 1e-12, gain=tf / (tk + cost) - 1)
-            row["c"] = (metric == "ew" and t <= 1e-8 and Nf is None and Nk is not None)
-            out.append(row)
-    return out
-
-
 def label(r):
     if r.get("molecule"):
         return f"{r['molecule']} {r['family']}"
     return f"{r['family']} {r['size'][0]}x{r['size'][1]}"
+
+
+def admissible(r):
+    """The >= 2048^3 class of the stage-4 gate (2mnk >= 1.7e10, §4.3)."""
+    return 2.0 * r["m"] * r["n"] * r["k"] >= GATE_CLASS
+
+
+def scaled_mb(r):
+    """Gate (b)'s memory of scaled copies: both operands pre-scaled next to the plain ones."""
+    return 8.0 * (r["m"] + r["n"]) * r["k"] / 1e6
 
 
 def nm_of(r, scheme, metric, t):
@@ -187,14 +188,15 @@ def gate_table(perf, recs, dstar, statuses, metrics):
     [M] TFLOPS-eq (time) of fast and of K-eq with its [E] caller costs per scenario."""
     kq = f"keq_d{dstar}"
     lines = ["| case | guard (G) | target | N fast / K-eq / K-seg2 | fast TFLOPS-eq (ms) | " +
-             " | ".join(f"K-eq {s} TFLOPS-eq (ms), gain" for s in statuses) + " |",
-             "|---" * (5 + len(statuses)) + "|"]
+             " | ".join(f"K-eq {s} TFLOPS-eq (ms), gain" for s in statuses) +
+             " | scaled copies (MB) |", "|---" * (6 + len(statuses)) + "|"]
     for r in recs:
         m, n, k = r["m"], r["n"], r["k"]
         g = r["keq"][f"d{dstar}"]
+        name = label(r) + ("" if admissible(r) else " (not gate-admissible: 2mnk < 1.7e10)")
         for metric, t in metrics:
             Nf, Nk, Ns = (nm_of(r, s, metric, t) for s in ("fast", kq, "kseg2"))
-            cells = [label(r), f"{g['guard14']} ({g['G14']})", f"{metric} {t:g}",
+            cells = [name, f"{g['guard14']} ({g['G14']})", f"{metric} {t:g}",
                      f"{fmt_n(Nf)} / {fmt_n(Nk)} / {fmt_n(Ns)}"]
             if Nf is None:
                 cells.append("-")
@@ -210,6 +212,7 @@ def gate_table(perf, recs, dstar, statuses, metrics):
                 c = cg.kw_costs(perf, m * k, n * k, stx)
                 cells.append(f"{fl / (tk + c) * 1e-12:.1f} ({(tk + c) * 1e3:.3f}), "
                              f"{(tf / (tk + c) - 1) * 100:+.0f} %")
+            cells.append(f"{scaled_mb(r):.0f}")
             lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
@@ -222,8 +225,8 @@ def gate_table_agg(perf, recs, dstar, statuses, metrics):
     for r in recs:
         groups[(r["family"], tuple(r["size"]))].append(r)
     lines = ["| fixture | runs | target | N fast / K-eq (median) | fast TFLOPS-eq (ms) | " +
-             " | ".join(f"K-eq {s}: TFLOPS-eq (ms), gain" for s in statuses) + " |",
-             "|---" * (5 + len(statuses)) + "|"]
+             " | ".join(f"K-eq {s}: TFLOPS-eq (ms), gain" for s in statuses) +
+             " | scaled copies (MB) |", "|---" * (6 + len(statuses)) + "|"]
     for (fam, size), rs in sorted(groups.items()):
         m, n, k = rs[0]["m"], rs[0]["n"], rs[0]["k"]
         for metric, t in metrics:
@@ -237,7 +240,8 @@ def gate_table_agg(perf, recs, dstar, statuses, metrics):
                 rows.append((Nf, Nk, tf, fl, tk))
             if not rows:
                 lines.append(f"| {fam} {size[0]}x{size[1]} | {len(rs)} | {metric} {t:g} | "
-                             "unreachable | - |" + " - |" * len(statuses))
+                             "unreachable | - |" + " - |" * len(statuses) +
+                             f" {scaled_mb(rs[0]):.0f} |")
                 continue
             Nf = med([x[0] for x in rows])
             Nk = med([x[1] for x in rows])
@@ -251,12 +255,87 @@ def gate_table_agg(perf, recs, dstar, statuses, metrics):
                 gains = [x[2] / (x[4] + c) - 1 for x in rows]
                 tkm = med(tks)
                 cells.append(f"{fl / tkm * 1e-12:.1f} ({tkm * 1e3:.2f}), {med(gains) * 100:+.0f} %")
+            cells.append(f"{scaled_mb(rs[0]):.0f}")
             lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
 def statuses_real(r):
     return REAL_STATUS.get(r["family"], "both")
+
+
+def gate_verdict(perf, Lr, real, multi, batch, dstar):
+    """The stage-4 gate (NOTES-C1 §4.5, IR27) applied mechanically. (i): some real R1-R6
+    contraction of the >= 2048^3 class has guard = 1 at d* and either (b) a net [M] + [E]
+    TFLOPS-eq gain >= 5 % at a gate target (ew 1e-8 / 1e-10, nw 1e-10 / 1e-12 relative to the
+    plain norms; caller costs from the operand status, REAL_STATUS) or (c) an elementwise
+    target <= 1e-8 fast mode cannot reach at N <= 20 that K-eq reaches. (ii): no Tier-L or real
+    fixture has a sampled output of a guard-accepted K-eq d* run above 2x fast's error at the
+    same N (the per-output count (1)). (iii): no FP64-clamp violation in any run."""
+    kq = f"keq_d{dstar}"
+    out, ok_i = [], False
+    for r in real:
+        if r["family"] not in ("R1", "R2", "R2b", "R3", "R4", "R5", "R6"):
+            continue
+        if r["family"] == "R6":                         # several partners: the union w
+            g = r["weights"]["shared"]
+            out.append(f"  - {label(r)}: guard {g['guard']} (G {g['G']}) -> (i) not met"
+                       if g["guard"] != 1 else f"  - {label(r)}: guard 1, (b)/(c) not computed")
+            continue
+        if not admissible(r):
+            out.append(f"  - {label(r)}: not gate-admissible (2mnk < 1.7e10)")
+            continue
+        g = r["keq"][f"d{dstar}"]
+        gains, c_ok = [], False
+        for metric, ts in (("ew", cg.GATE_EW), ("nw", cg.GATE_NW)):
+            for t in ts:
+                Nf, Nk = nm_of(r, "fast", metric, t), nm_of(r, kq, metric, t)
+                if Nf is not None and Nk is not None:
+                    tf, _ = time_of(r, Nf)
+                    tk, _ = time_of(r, Nk)
+                    c = cg.kw_costs(perf, r["m"] * r["k"], r["n"] * r["k"], statuses_real(r))
+                    gains.append(tf / (tk + c) - 1)
+        for t in cg.EW_TARGETS:
+            if t <= 1e-8 and nm_of(r, "fast", "ew", t) is None and nm_of(r, kq, "ew", t) is not None:
+                c_ok = True
+        b_ok = bool(gains) and max(gains) >= GAIN_BAR
+        met = g["guard14"] == 1 and (b_ok or c_ok)
+        ok_i |= met
+        out.append(f"  - {label(r)}: guard {g['guard14']} (G {g['G14']}); (b) best net gain "
+                   + (f"{max(gains) * 100:+.0f} %" if gains else "-") +
+                   f"; (c) {'yes' if c_ok else 'no'} -> (i) {'met' if met else 'not met'}")
+    lines = [f"- (i) {'MET' if ok_i else 'NOT MET'}: no real R1-R6 contraction of the "
+             f">= 2048^3 class has guard = 1 with (b) or (c)" if not ok_i else
+             "- (i) MET"] + out
+    bad, diag = [], []
+    for r in Lr + real:
+        v = r.get("regress", {}).get(f"d{dstar}")
+        if v is None:
+            continue
+        if v["count"]:
+            bad.append((label(r), r.get("seed"), v["count"], v["max_ratio"]))
+        if v.get("systematic") or v.get("metric_N"):
+            diag.append((label(r), r.get("seed")))
+    fx_ = defaultdict(lambda: [0, 0.0])
+    for nm, _, c, mx in bad:
+        fx_[nm][0] += c
+        fx_[nm][1] = max(fx_[nm][1], mx)
+    lines.append(f"- (ii) {'NOT MET' if bad else 'MET'} as pre-registered (per-output count (1) "
+                 f"of guard-accepted K-eq d* runs): " +
+                 ("; ".join(f"{nm} {c} outputs, max ratio {mx:.3g}" for nm, (c, mx) in
+                            sorted(fx_.items())) if bad else "no output above 2x"))
+    lines.append(f"  - diagnostic, the noise-robust (2) and (3) (the re-registered (ii) of a "
+                 f"revival, §4.5): {len(diag)} runs flagged")
+    viol = sum(v.get("fp64_violations", 0) for x in Lr + real for v in x.get("keq", {}).values())
+    viol += sum(v.get("fp64_violations", 0) for x in multi + real
+                for v in x.get("weights", {}).values())
+    viol += sum(x.get("fp64_violations", 0) for x in batch + real if "guard" in x)
+    lines.append(f"- (iii) {'MET' if viol == 0 else 'NOT MET'}: {viol} FP64-clamp violations")
+    passed = ok_i and not bad and viol == 0
+    lines.append(f"- **Stage 4: {'PASSES' if passed else 'FAILS'}**" +
+                 ("" if passed else " -> closed with the revival trigger \"a real-operand family "
+                  "meeting (i)\"; stage 6 deferred (its gate needs a shipped stage 4)"))
+    return "\n".join(lines)
 
 
 def kseg_table(recs, dstar, metrics):
@@ -309,20 +388,28 @@ def md1_tables(d):
               f" | {ph if len(ph) < 120 else ph[:117] + '...'} | " +
               ("-" if sc is None else f"{'PASS' if sc['pass_'] else 'FAIL'} "
                f"(ratio {sc['residual_ratio']:.2f}, +{sc['extra_iterations']['it_1e10']} it)") + " |")
-    p = os.path.join(md, "md1_rho.jsonl")
-    if os.path.exists(p):
-        P("\n### M-d1 rho-miss rate (lagged rho_hat, ELEMENTWISE BOUND, levels up to 20)\n")
-        P("| system | target | MET calls checked | misses | rate | capped (MISSED) calls | N used |")
-        P("|---|---|---|---|---|---|---|")
-        for x in open(p):
-            r = json.loads(x)
+    for f in ("md1_rho.jsonl", "md1_rho_local.jsonl"):
+        p = os.path.join(md, f)
+        if not os.path.exists(p):
+            continue
+        rs = [json.loads(x) for x in open(p)]
+        P(f"\n### M-d1 rho-miss rate (lagged rho_hat, ELEMENTWISE BOUND, levels up to 20; {f})\n")
+        P("| system | target | rho_hat | MET calls checked | misses | rate | capped (MISSED) "
+          "calls | N used |")
+        P("|---|---|---|---|---|---|---|---|")
+        for r in rs:
             Ns = defaultdict(int)
             for row in r["per_iteration"]:
                 for c in row:
                     Ns[c["N"]] += 1
-            P(f"| {r['system']} | {r['eps']:g} | {r['checked']} | {r['misses']} | "
+            impl = r.get("rho_impl", "local")
+            P(f"| {r['system']} | {r['eps']:g} | "
+              f"{'precision.rho_from_output' if impl == 'shipped' else 'local recipe'} | "
+              f"{r['checked']} | {r['misses']} | "
               f"{(r['miss_rate'] or 0) * 100:.1f} % | {r.get('capped_calls')} | " +
               ", ".join(f"{k}: {v}" for k, v in sorted(Ns.items())) + " |")
+        P(f"\nTotal: {sum(r['misses'] for r in rs)} misses in {sum(r['checked'] for r in rs)} "
+          f"MET calls.")
     for f, title in (("md1_davidson.jsonl", "block Davidson (report-only)"),
                      ("md1_cg.jsonl", "CG, 16 right-hand sides (report-only)")):
         p = os.path.join(md, f)
@@ -354,8 +441,12 @@ def main():
     allr = S + Lr + real + multi + batch
     if allr:
         r0 = allr[0]
-        P(f"Provenance: commit {r0['commit']}, {r0['lib']} sha256 {r0['lib_sha256'][:16]}..., "
-          f"host API {r0['host_api']}.")
+        commits = sorted({(x["commit"], ", ".join(x["dirty"]) if "dirty" in x else "not recorded")
+                          for x in allr + b6r})
+        P(f"Provenance: {r0['lib']} sha256 {r0['lib_sha256'][:16]}..., host API "
+          f"{r0['host_api']}; commits (uncommitted study files): " +
+          "; ".join(f"{c} ({d or 'none'})" for c, d in commits) + ". Records written before "
+          "provenance() recorded the study files' sha256 carry 'not recorded'.")
         P("CPU-seconds in runs per file (duplicates included): " +
           ", ".join(f"{t} {v:.0f}" for t, v in CPU_ALL.items()) +
           f"; peak RSS max {max(x.get('peak_rss_mb', 0) for x in allr):.0f} MB.")
@@ -374,6 +465,9 @@ def main():
         P(f"\nRule result: d* = {d_auto}.")
         dstar = d_auto if dstar is None else dstar
     dstar = 3 if dstar is None else dstar
+    if real or Lr:
+        P("\n### Stage-4 gate (NOTES-C1 §4.5, IR27), applied mechanically\n")
+        P(gate_verdict(perf, Lr, [x for x in real], multi, batch, dstar))
     for name, recs, schemes in (("Tier S", S, ["keq_d0", "keq_d2", "keq_d3", "keq_d5", "kseg2",
                                                  "kseg4", f"keq_d{dstar}+kseg2", "env", "sc25"]),
                                 ("Tier L", Lr, ["keq_d0", f"keq_d{dstar}", "kseg2",
@@ -386,19 +480,30 @@ def main():
     gl = [r for r in Lr + real if "keq" in r]
     if gl:
         P("\n### Realized regressions among guard-accepted K-eq runs (Tier L, real)\n")
-        P("(1) the pre-registered per-output count at one N (floor u|x|); (2) systematic: outputs "
-          "whose median ratio over the informative N exceeds 2; (3) N at which the sampled max "
-          "error exceeds fast's by > 2x where fast is not saturated.\n")
-        P("| case | runs (guard-accepted) | scheme | (1) outputs > 2x | max ratio | (2) systematic | (3) N |")
-        P("|---|---|---|---|---|---|---|")
+        P("(1) the pre-registered measure (IR27, gate (ii)): sampled outputs whose error exceeds "
+          "fast's at the same N by > 2x (floor u|x|), summed over the N = 4..20 (RN) and 8, 14 "
+          "(TRUNC; 'T'), with the N where they occur; it decides gate (ii). Diagnostics only: "
+          "(2) systematic, outputs whose median ratio over the informative N exceeds 2; (3) the N "
+          "at which the sampled max error exceeds fast's by > 2x where fast's own error in that "
+          "metric is below 1.\n")
+        P("| case | runs (guard-accepted) | scheme | (1) outputs > 2x | max ratio | (1) at N "
+          "(count) | (2) systematic | (3) N |")
+        P("|---|---|---|---|---|---|---|---|")
         groups = defaultdict(list)
         for r in gl:
             for sname, v in r.get("regress", {}).items():
                 groups[(label(r), sname)].append(v)
         for (nm, sname), vs in sorted(groups.items()):
+            byN = defaultdict(int)
+            for v in vs:
+                for N, c in v.get("by_N", {}).items():
+                    byN[N] += c
             P(f"| {nm} | {len(vs)} | {sname} | {sum(v['count'] for v in vs)} / "
-              f"{sum(v['outputs'] for v in vs)} | {max(v['max_ratio'] for v in vs):.3g} | "
-              f"{sum(v.get('systematic') or 0 for v in vs)} | "
+              f"{sum(v['outputs'] for v in vs)} | {max(v['max_ratio'] for v in vs):.3g} | " +
+              (", ".join(f"{N}: {c}" for N, c in sorted(byN.items(),
+                                                       key=lambda x: (int(x[0][:-1]), x[0])))
+               or "-") +
+              f" | {sum(v.get('systematic') or 0 for v in vs)} | "
               f"{sorted({N for v in vs for N in v.get('metric_N', [])}) or '-'} |")
     if Lr:
         acc = [r for r in Lr if r["keq"][f"d{dstar}"]["guard14"] == 1]
@@ -418,12 +523,13 @@ def main():
         P(nmin_table(rr, sch, "ew8", EW))
         P("\nNormwise (" + "/".join(NW) + "):\n")
         P(nmin_table(rr, sch, "nw", NW))
-        P("\n| case | m x n x k | 2mnk | guard d0 (G) | guard d* (G) | worst pair bits d* | "
-          "median pair bits d* | weighted indices d* | max abs w |")
-        P("|---|---|---|---|---|---|---|---|---|")
+        P("\n| case | m x n x k | 2mnk | gate-admissible | guard d0 (G) | guard d* (G) | "
+          "worst pair bits d* | median pair bits d* | weighted indices d* | max abs w |")
+        P("|---|---|---|---|---|---|---|---|---|---|")
         for r in rr:
             g0, g3 = r["keq"]["d0"], r["keq"][f"d{dstar}"]
             P(f"| {label(r)} | {r['m']} x {r['n']} x {r['k']} | {2 * r['m'] * r['n'] * r['k']:.1e} | "
+              f"{'yes' if admissible(r) else 'no'} | "
               f"{g0['guard14']} ({g0['G14']}) | {g3['guard14']} ({g3['G14']}) | "
               f"{g3['worst_pair_bits']:+.2f} | {g3['median_pair_bits']:+.2f} | "
               f"{g3['num_weighted']} / {r['k']} | {g3['max_abs_w']} |")
@@ -435,16 +541,25 @@ def main():
         P("\n### Q15: K-segmentation against K-equilibration (Tier L guard-accepted and real)\n")
         P(kseg_table([r for r in Lr if r["keq"][f"d{dstar}"]["guard14"] == 1 and r["seed"] == 0]
                      + rr, dstar, [("ew", 1e-10), ("nw", 1e-12), ("nw", 1e-15)]))
-    envc = []
-    for r in Lr + [x for x in real if "nmin" in x]:
+    envc, best = [], None
+    for r in Lr + [x for x in real if "nmin" in x and "keq" in x]:
+        if r["family"] in SEPARABLE_FAMS or not admissible(r):
+            continue
+        acc = r["keq"][f"d{dstar}"]["guard14"] == 1
         for metric, ts in (("ew", EW), ("nw", NW)):
             for t in ts:
                 e = nm_of(r, "env", metric, t)
-                others = [nm_of(r, s_, metric, t) for s_ in (f"keq_d{dstar}", "kseg2")]
-                if e is not None and all(n_of(o_) - e >= 2 for o_ in others):
+                # what a caller gets: K-eq d* where its guard holds, otherwise fast mode
+                keq = nm_of(r, f"keq_d{dstar}" if acc else "fast", metric, t)
+                sv = None if e is None else min(n_of(keq) - e, n_of(nm_of(r, "kseg2", metric, t)) - e)
+                if sv is not None:
+                    best = sv if best is None else max(best, sv)
+                if sv is not None and sv >= 2:
                     envc.append((label(r), r.get("seed"), metric, t))
-    P(f"\n### Appendix B revival trigger: Tier L / real cases where the envelope rule saves >= 2 "
-      f"moduli beyond both K-eq d* and K-seg 2: {len(envc)}" + (f" {envc[:10]}" if envc else ""))
+    P(f"\n### Appendix B revival trigger: non-separable Tier L / real cases of the >= 2048^3 "
+      f"class where the envelope rule saves >= 2 moduli beyond both K-seg 2 and what a caller "
+      f"gets from K-eq (K-eq d* where its guard holds, otherwise fast mode): {len(envc)}"
+      + (f" {envc[:10]}" if envc else "") + f" (largest saving beyond both: {best} moduli)")
     for r in multi + [x for x in real if x["family"] == "R6"]:
         P(f"\n### Several partners: {label(r) if r.get('molecule') else r['family'] + ' ' + str(r['size']) + ' s' + str(r['seed'])}\n")
         P("weights: " + json.dumps(r["weights"]))

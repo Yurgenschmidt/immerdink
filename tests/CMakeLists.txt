@@ -80,6 +80,12 @@ if(Python3_FOUND)
   add_test(NAME host_precision
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_precision.py"
                    --host-lib "$<TARGET_FILE:immerdink_host>" -v)
+  # NOTES-C1 §4.3 (stage 2): the C2 study's exact engine (bench/accuracy/kw_engine.py: sigma,
+  # K-weights, emulation, exact references) and its several-partner / batched paths
+  # (c2_gate.py run_multi / run_batched) == spec/oracle.py, so a later change to the oracle
+  # cannot silently invalidate the M-a / M-d1 engine. CPU only (numpy), about 10 s.
+  add_test(NAME c2_engine_selftest
+           COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/c2_gate.py" selftest)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files

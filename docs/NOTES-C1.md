@@ -52,6 +52,49 @@ what has been built since is recorded under "Implementation status".
   immerdink-eval `findings/c1-stage1-phase-cost.md`, with the script committed there
   (39d9f9f) and both records untracked, listed with their sha256; a re-run on 51dba1e
   reproduces the first record to within 0.04 ms.
+- **Stage 2's CPU evidence (§4.3: M-a and M-d1) is done, 2026-10-07**, approved with fixes by
+  an independent reviewer; the fixes are applied, and the verdicts on the implementation's
+  design questions are §5.6.
+  - *Code:* `oracle.kweights` with its multi-partner mode and test_oracle (12) at 5cd8ff3; the
+    study (`bench/accuracy/kw_engine.py`, `c2_fixtures.py`, `c2_gate.py`, `c2_summary.py`,
+    `md1_converge.py`) at 7260a95; the review fixes after it. The CPU ctest
+    `c2_engine_selftest` runs the engine's self-test and checks the several-partner and
+    batched paths against `oracle.kweights`.
+  - *Summary:* immerdink-eval `findings/c1-evidence.md`. It replaces the `findings/c1-m-a.md`
+    named in §4.3 and covers M-d1 too. The raw records are in `results/c1/m_a/` and
+    `results/c1/m_d1/`, the psi4 operands in `results/c1/real/`, all untracked. The study code
+    was uncommitted when the first records were written: they name the commit at run time
+    (8b58101, d22a686), and a bit-identical reproduction smoke check links them to 7260a95.
+    Records written since carry a dirty flag and the sha256 of every study file.
+  - *CPU budget:* M-a about 37 of its 90 CPU-min, including about 6 min of duplicated work by
+    an orphaned process (§5.6 S2-7) and the review's B6 runs at m = 512 (1.6 min); M-d1 about
+    16 of its 30, including the IR7 re-run (1.7 min).
+  - **Mechanical outcomes** (the pre-registered rules, IR27):
+    - d* = 3 (Q11). Every deadband rejected all 30 random-structure runs, and the median gains
+      on decay_opp and opp_nonsep are within 0.25 moduli; ties go to 3.
+    - **Stage 4 fails its gate (§4.5) and is closed**, with the revival trigger "a real-operand
+      family meeting (i)". (i): no real R1–R6 contraction of the ≥ 2048³ class has guard = 1
+      (G ≤ 0 on all of them). (ii) is not met as pre-registered either: each guard-accepted
+      Tier-L fixture has 2–19 sampled outputs above 2× fast's error, max ratio 247. (iii)
+      holds: no FP64-clamp violation. `oracle.kweights` and M-a remain C2's deliverable (Q8).
+    - **The gate was applied at the end of round 1**, although IR28 places the gate decisions
+      in round 2. That is admissible because the failing part of (i), guard = 1 on a real
+      R1–R6 contraction, is a CPU-only quantity that no round-2 measurement can change. M-e
+      needs a stage-4 build and is not run.
+    - **Stage 6 is deferred** (§4.7): its gate requires a shipped stage 4.
+    - Q12 (a) stands for this cycle, but vacuously on real data (§5.6 S2-12). Q15 (a) stands
+      (§5.6 S2-13). The Appendix B revival trigger is not met: 0 cases, and the largest saving
+      beyond both alternatives is 1 modulus.
+    - B6 (IR11) shows no value. No split beats running every row at N_hi, on the real
+      operands (FP64 x) or on synthetic outliers, opp_nonsep and φ = 4 at m = n = 128 and 512
+      (exact x).
+    - M-d1: every forcing-rule ramp meets §4.3's success criterion on Jacobi, DIIS(8) with and
+      without a reset, and PPL + ring. **IR7 is closed:** with the shipped `rho_from_output`
+      (51dba1e's), the lagged ρ̂ missed in 1 of 228 MET calls (PPL at 1e−6, realized 1.013e−6,
+      after an output passed near zero). The report-only cases became caller guidance (§1.3).
+  - **Not yet run:** M-b (the [M] re-runs of IR9 and the share-group raise cost of IR15; CPU,
+    round 1), and M-c and M-d2 (GPU, round 2). Stage 3 may start: the M-a summary is published
+    (§4.11).
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -329,6 +372,27 @@ order of work and a definition of done. They override the earlier text wherever 
   use. `monotone=True` stays the default.
 - M-d1 (§4.3) reports a block Davidson case (tightening ramp) and a block CG case (tightening and
   relaxed). Both are report-only and document caller guidance; they are not C1 gates.
+- **Caller guidance from M-d1** (2026-10-07; CPU evidence on one fixture each, report-only, not
+  a C1 gate; accepted with corrections by the independent reviewer, §5.6 S2-9; immerdink-eval
+  `findings/c1-evidence.md`):
+  - *Fixed-point iterations and DIIS.* The forcing-rule ramps match fixed N = 14: the same
+    iterations, and the final residual within 2×. With DIIS, reset the history at each
+    precision switch. That costs no iteration and improves the final residual, 1.5e−16
+    against 2.1e−15.
+  - *Subspace methods (block Davidson).* At each N switch, collapse the subspace to the Ritz
+    block and recompute its σ = HV. Otherwise the old low-N products stay in the subspace and
+    the ramp stalls. Even with the recompute, the ramp took 16 iterations against 11 at fixed
+    N = 14 (+5), and that on an easy, diagonally dominant case (coupling ‖2BBᵀ‖ = 1 Ha
+    against a diagonal of 0.35–61 Ha). So §4.3's expectation (at most one more iteration) is
+    not met, and a ramp is not recommended for Davidson unless the per-iteration saving
+    outweighs that overhead.
+  - *Krylov methods (CG): start tight and relax.* Rules that start at low N and tighten (the
+    fixed-point forcing rule, or a relative η‖r_k‖ rule) stall CG at N = 5–6. A relaxed rule,
+    matvec tolerance min(1e−2, tol/‖r_k‖), converges (1e−7 in 274 iterations against 251 at
+    fixed 14, with N falling from 12 to 6), but it leaves a residual gap: it attains 7.1e−8,
+    against 3.3e−10 at fixed 14 and 2.0e−10 with the FP64 matvec (cond 1e6). The relaxation
+    must therefore be scaled by the expected iteration count, e.g. tol/(m_max·‖r_k‖), as
+    inexact-Krylov theory has it; the M-d1 rule had no such factor.
 - ACCURACY §3 shows a contracting iteration does not accumulate emulation error: drift is set in
   the first few iterations, and the steady state is about one contraction's error/(1 − ρ). So for
   a fixed-point iteration, the last phase's N sets the converged accuracy.
@@ -1324,7 +1388,8 @@ protocol is the independent reviewer's (IR1), and it replaces the previous "size
 random-structure gains vanish as m grows, while every guard quantity costs only O(mk).
 - **Harness:** `bench/accuracy/c2_gate.py`, oracle arithmetic only. It compares immerdink's own
   scalings, so it belongs in the product repo. Raw records go to immerdink-eval
-  `results/c1/m_a/` as JSONL (untracked); the summary goes to `findings/c1-m-a.md`.
+  `results/c1/m_a/` as JSONL (untracked); the summary goes to `findings/c1-evidence.md` (it
+  covers M-d1 too; the name `c1-m-a.md` planned here was not used).
 - **`oracle.kweights`** (spec/oracle.py) is added here, not in stage 4, with its multi-partner
   mode (§4.5, IR6). M-a needs one exact reference for the §4.5 rule, the clamp, the L5c guard
   and the gain G, and until the Q13 gate passes that reference is C2's deliverable (Q8). Only its
@@ -1449,14 +1514,20 @@ random-structure gains vanish as m grows, while every guard quantity costs only 
   IR27). Tier S tunes d* and shows the trend.
 - **CPU budget (hard):**
   - every run single-threaded (OMP/OPENBLAS/MKL = 1), under `tools/memcap.sh`, after a FREE busy
-    check in its own call, wrapped in `timeout 600`;
+    check in its own call, with `timeout 600` inside memcap (`tools/memcap.sh timeout 600 cmd`).
+    memcap runs the command in a systemd scope, and a timeout around memcap.sh does not stop
+    it (§5.6 S2-7);
   - the whole of M-a ≤ 90 CPU-min: self-tests + pilot ≤ 10, Tier S ≤ 25, Tier L ≤ 25, real
     operands (generation included) ≤ 30;
   - pilot first: outliers, 4096², k = 3600, seed 0. The total is projected from it;
   - if the projection exceeds 90, cut in this pre-declared order: (1) Tier L 4096 seeds 2 → 1;
     (2) Tier S m = 512, k = 16384 kept only for decay_opp, opp_nonsep, outliers and φ = 4;
     (3) Tier L 2048, k = 16384 kept only for decay_opp, opp_nonsep and synthetic CC;
-  - never cut the real operands, the guard, or m = 4096.
+  - never cut the real operands, the guard, or m = 4096;
+  - the per-tier allotments trigger cuts too (§5.6 S2-6): a tier whose projection exceeds its
+    allotment applies the earliest pre-declared cut that reduces that tier, under the same
+    "never cut" rule, and the projection that triggered it is recorded. In the 2026-10-07 run
+    Tier S projected about 26 min against its 25, so cut (2) was applied.
 
   The machine was BUSY during the review, so these costs are estimates. The pilot plus the
   pre-declared cut order keeps the 90-minute bound enforceable without post-hoc choices.
@@ -1507,7 +1578,8 @@ under 100 µs (10–13 %).
     against a double-double reference iteration (CPU Dot2 contractions) and against the N = 20
     trajectory; for DIIS, iteration counts with and without the reset at each switch.
   - **Success:** the ramp reaches the fixed-N_final residual within 2× and with at most one more
-    iteration, on every system, DIIS included.
+    iteration, on every system, DIIS included. *Outcome (2026-10-07): met on every system and
+    ramp* (Status, stage 2).
   - **Report-only cases** (IR3). They are not C1 gates; they document caller guidance. Block
     forms give the emulated contraction a GEMM shape, which is what immerdink is for; a plain
     GEMV gains nothing from INT8 emulation. A's σ is computed once per N.
@@ -1516,7 +1588,8 @@ under 100 µs (10–13 %).
       emulated 2048×2048×8 GEMM. Schedules: fixed N ∈ {8, 14}, and a tightening ramp over the
       levels {6, 8, 10, 12, 14} with **absolute** targets η·‖r‖. Reported: iterations to
       residual 1e−7 and 1e−10, and the eigenvalue error against FP64 `eigh`. Expected: the ramp
-      needs ≤ fixed-N_final + 1 iterations.
+      needs ≤ fixed-N_final + 1 iterations. *Outcome (2026-10-07): not met;* +5 even with a
+      recompute at each switch (§1.3).
     - *Block CG:* SPD A = BBᵀ/k + μI from DF-like factors, n = 2048, cond ≈ 1e6, 16 right-hand
       sides, with an emulated GEMM matvec. Schedules: fixed N ∈ {8, 10, 14}; monotone
       tightening; relaxed decreasing (matvec tolerance ∝ tol/‖r_k‖). Reported: iterations to a
@@ -1524,7 +1597,10 @@ under 100 µs (10–13 %).
   - **ρ-miss rate** (IR7). A schedule variant with ELEMENTWISE targets, whose cond comes from
     the previous iteration's ρ̂ (`rho_from_output`), records per iteration whether the current
     call's realized max elementwise error missed the target. The miss rate is reported per
-    system: it is the number a caller needs to trust the lagged ρ.
+    system: it is the number a caller needs to trust the lagged ρ. *Reading (§5.6 S2-8):* the
+    rate is over the calls whose lagged request was MET at some level ≤ 20, against the
+    previous call's certified outputs; MISSED (capped) requests are reported apart, and the
+    levels go up to 20 for this variant only.
   - **Budget:** M-d1 ≤ 30 CPU-min in total, each run ≤ 10 min, single-threaded, under memcap,
     after a busy check.
 - **M-d2 (GPU, round 2): time, on realistic shapes.** It runs only after M-c (IR23). If M-c
@@ -1789,6 +1865,46 @@ before M-a's results are known). Stage 4 passes iff all of the following hold:
 If the gate fails, stage 4 is closed with the revival trigger "a real-operand family meeting
 (i)", and `oracle.kweights` and M-a remain as the C2 deliverable.
 
+**Applied, 2026-10-07: the gate FAILS, and stage 4 is closed** with the revival trigger "a
+real-operand family meeting (i)" (computed by `bench/accuracy/c2_summary.py`; immerdink-eval
+`findings/c1-evidence.md`; §5.6 S2-3).
+- **(i) not met.** No real R1–R6 contraction of the ≥ 2048³ class has guard = 1; G ≤ 0 on
+  every one. R1, R2, R6 and R7 contract one DF factor with itself or its transpose, so Δ ≡ 0
+  and w ≡ 0 by construction. R2b, R3, R4 and R5 have nearly aligned K profiles (|w| ≤ 4,
+  G ∈ [−4, 0]). With the caller's costs, K-eq is 2–47 % slower than fast mode at the gate
+  targets, and (c) cannot apply: point-group zeros (ρ up to 1e20) leave max-elementwise
+  1e−8 unreachable for every scheme at N ≤ 20. Water R1 and R5 (2mnk = 7.2e8) are below the
+  class and not gate-admissible.
+- **(ii) not met as pre-registered.** Every guard-accepted Tier-L fixture has sampled outputs
+  above 2× fast's error at the same N: 2–19 per fixture at d*, max ratio 247 (opp_nonsep
+  2048 × 16384). At d* they all occur at N = 4–5, on outputs whose fast-mode error is itself
+  of order 1 (high-ρ outputs; fast mode as a whole already meets normwise 1e−8 at N = 4 on
+  decay_opp). At d = 0 they also occur at N = 6, 12 and 14 (TRUNC). The noise-robust
+  measures (2) and (3) below flag nothing; they are diagnostics this round, and the outcome
+  does not depend on (ii), since (i) fails.
+- **(iii) met:** no FP64-clamp violation in any run.
+- **When:** at the end of round 1, although IR28 places the gate decisions in round 2. That
+  is admissible because the failing part of (i), guard = 1 on a real R1–R6 contraction, is a
+  CPU-only quantity that no round-2 measurement can change. M-e needs a stage-4 build and is
+  not run.
+
+**Re-registered for any revival** (decided by the independent reviewer before any new
+evidence, §5.6 S2-1, S2-2, S2-12; binding on a revival):
+- **(ii)** passes iff, on every guard-accepted Tier-L or real fixture, both hold:
+  - (2): no sampled output whose median ratio (K-eq error / fast error at the same N, over
+    the N where fast's error exceeds 4u|x|, at least three of them) exceeds 2;
+  - (3): no N at which fast's sampled max error is below 1 and the scheme's exceeds 2× fast's,
+    in either metric.
+
+  The per-output count (1) above is still reported, as a diagnostic: at equal accuracy it
+  fires on independent rounding noise (for two half-normal errors whose scales differ 2×,
+  about 16 % of outputs exceed 2×).
+- **Elementwise criteria (b) and (c)** are judged on the outputs with ρ_ij ≤ 1e8 (exact x,
+  plain norms): DESIGN §6f.1's "outputs that must meet the target". The all-outputs reading is
+  reported alongside. On this round's data the outcome is the same under both readings.
+- **Q12** is re-tested on a real batched contraction that is not a self-contraction, before
+  the C API is fixed (R7 cannot discriminate: Δ ≡ 0 in every batch).
+
 **Cost figures at the gate** (IR23). The gate uses bandwidth-based [E] figures for the
 pre-scaling (16 B per element) and the helper (1–2 operand reads), at the DRAM bandwidth implied
 by the shipped calibration, and states them next to the gate. M-e measures them after any
@@ -1864,6 +1980,12 @@ defining w on X keeps role swaps across plans well defined.
      at pair p's plan (N, k, rounding). The reported G = min_p G_p, and guard = 1 iff G ≥ 3. L5c
      is pairwise, so it then holds for every partner. `imd_err_request_kweighted` with the min G
      is valid for every partner, because the transform is monotone in G.
+   - *w ≡ 0* (`num_weighted` = 0, e.g. aligned profiles, or Δ ≡ 0 in a self-contraction): then
+     G = 0, so guard = 0, with no special case (decided, §5.6 S2-4): guard = 1 stays the one
+     claim of L5c. The weighted call IS the plain call, so the caller skips the pre-scaling and
+     uses the plain request with its own ℓ1 ratios. It does not call
+     `imd_err_request_kweighted` with gain 0, which would tighten cond 4× for nothing. The
+     same goes into the stage-4 header.
 
 **Exactness for the caller.** With the clamp, every scaled entry is representable, so the
 caller's pre-scaling is exact. Non-finite entries stay non-finite (Inf·2^w = Inf), and no finite
@@ -1889,9 +2011,14 @@ typedef struct {                 /* 32 B, written by the call into caller device
                                     0: not; -1: not computed                                  */
   int32_t gain;                  /* G = gain_row_min + gain_col_min (L5c/d); INT32_MIN if not
                                     computed (never 0: G = 0 is a real value)                  */
-  int32_t gain_row_min, gain_col_min;  /* min (sigma~ - sigma) over nonzero finite rows of A / columns of B */
+  int32_t gain_row_min, gain_col_min;  /* min (sigma~ - sigma) over nonzero finite rows of A / columns of B,
+                                    for the pair that sets G; INT32_MIN whenever gain is, even
+                                    if one side is defined (§5.6 S2-5)                         */
   int32_t median;                /* med, INT32_MIN if no index has both exponents            */
-  int32_t num_weighted, max_abs_w, clamped;
+  int32_t num_weighted, max_abs_w, clamped;  /* of the WRITTEN w: #{w != 0}, max |w|,
+                                    #{w != w0}; ZERO_ON_FAIL with guard = 0: 0, 0, #{w0 != 0},
+                                    while guard, gain, gain_*_min and median keep their
+                                    computed values (§5.6 S2-5)                                */
 } imd_kweights_report_t;
 /* libimmerdink_host: exact workspace bytes, and k_s (GPU-free) */
 imd_status_t imd_kweights_ws_bytes(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
@@ -1937,7 +2064,12 @@ imd_status_t imd_err_request_kweighted(const imd_err_request_t* plain, int32_t g
   the weighted request (`imd_err_request_kweighted`) and the choice of N happen once per
   magnitude profile, outside capture, by the caller.
   - `IMD_KW_ZERO_ON_FAIL` (valid only with `IMD_KW_GUARD`): on guard failure the helper writes
-    w ≡ 0, and sets the report's `clamped` and `num_weighted` to match.
+    w ≡ 0, and sets the report's `clamped` and `num_weighted` to match. The report then
+    describes the written w (`clamped` = #{w0 ≠ 0}, `num_weighted` = 0, `max_abs_w` = 0), while
+    `guard`, `gain`, `gain_row_min`, `gain_col_min` and `median` keep their computed values: the
+    caller sees guard = 0 and uses the plain request (confirmed, §5.6 S2-5). `oracle.kweights`'
+    detail fields `clamped_max_abs` and `clamped_fp64`, which are not in the C struct, describe
+    the clamps of the pre-zeroing w.
   - **The fully captured pattern:** the helper with ZERO_ON_FAIL → the caller's scaling kernel
     applies w → a contract at an N chosen beforehand from the **plain** request with
     `l1_ratio` = 0 (ν = √k). That request is rigorous in both outcomes: by L5c when the guard
@@ -1971,7 +2103,8 @@ imd_status_t imd_err_request_kweighted(const imd_err_request_t* plain, int32_t g
    fused into the caller's own producer kernel where possible (otherwise 16 B per element per
    changed operand, §2.6). Use the Q9 index order: w depends only on the shared K labels.
 3. Build the weighted request with `imd_err_request_kweighted(plain, report.gain)` and choose N
-   with `min_moduli` / `PrecisionPlan` as usual.
+   with `min_moduli` / `PrecisionPlan` as usual. If `num_weighted` = 0, skip steps 2–3: the
+   plain operands and request apply unchanged.
 4. Contract and pack the scaled tensors as usual.
 
 The caller owns consistency: every partner of a pre-scaled packed operand must carry the same w,
@@ -2255,6 +2388,11 @@ zero_exempt=False) -> float`, whose result goes into an ordinary
   ≥ 5 % from pre-scaling or scaled copies on a recurring contraction.
 
 Otherwise stage 6 is deferred with that trigger. The layout follows the decision below.
+
+**Applied, 2026-10-07: deferred.** Stage 4 has not shipped: its gate failed and it is closed
+(§4.5). Trigger: a revived stage 4 that ships and passes M-e on its gate case, plus a real
+fixture on which library-internal weights remove ≥ 5 % of pre-scaling or scaled-copy cost on a
+recurring contraction (the three conditions above).
 
 **Decided: from caller-order weights to the kernels' k̄** (R-api should-fix 7; IR21, decided by
 the independent reviewer: candidate (i), in its map form). Stage 6 stays gated; this only
@@ -3289,6 +3427,125 @@ change list, "Stage-1 review fixes").
   arithmetic the configuration at a level is unchanged, but the composed times would no
   longer equal `configs()`'s, and floating-point rounding could reorder near-ties.
 
+### 5.6 Stage 2: the implementation's design questions (independent reviewer, 2026-10-07)
+
+The stage-2 CPU evidence (M-a, M-d1) raised the questions below. Each was decided
+conservatively during the study and put to an independent reviewer, whose verdicts are binding.
+The review was approve-with-fixes: three must-fix items (the gate-(ii) report, these notes, the
+`timeout` order) and the should-fix items, all applied (Status, stage 2).
+- **S2-1. Gate (ii): what is a "realized regression"?** The pre-registered measure counts the
+  sampled outputs whose error exceeds fast's at the same N by > 2× (1). At equal accuracy that
+  fires on independent rounding noise, so the study also recorded two noise-robust measures:
+  (2) outputs whose median ratio over the informative N exceeds 2, and (3) the N at which the
+  sampled max error exceeds fast's by > 2× while fast's is below 1. *Verdict: this round, the
+  literal measure applies, so (ii) is NOT met* (2–19 outputs per guard-accepted Tier-L
+  fixture at d*, max ratio 247), and that is reported; the outcome is unchanged because (i)
+  fails. *For any revival, (ii) is re-registered before new evidence:* it passes iff (2) and
+  (3) both hold on every guard-accepted Tier-L or real fixture, and (1) is reported as a
+  diagnostic (§4.5). IR27 exists to prevent post-hoc gate choices, so a pre-registered rule is
+  not relabelled after the data; (2) + (3) is the sound, stricter replacement for the future.
+  *Correction to the first report:* the events are at N = 4–5 only for d* = 3; at d = 0 they
+  also occur at N = 6, 12 and 14 (TRUNC). "Fast mode is saturated" there was misleading: fast
+  mode already meets normwise 1e−8 at N = 4 on decay_opp; the saturation is per output
+  (high-ρ outputs whose fast-mode D carries no correct digit).
+- **S2-2. Elementwise targets on real operands.** Point-group zeros (ρ up to 1e20) make max
+  elementwise ≤ 1e−8 unreachable for every scheme at N ≤ 20, so (b)-elementwise and (c) are
+  vacuous on real data. The study added a labelled diagnostic, max elementwise over the
+  outputs with ρ ≤ 1e8. *Verdict: not retroactively.* This round's gate stands as applied (all
+  sampled outputs with x ≠ 0), and the ρ ≤ 1e8 column stays a diagnostic. For any revival,
+  (b)-elementwise and (c) are judged on the outputs with ρ_ij ≤ 1e8 (exact x, plain norms),
+  DESIGN §6f.1's "outputs that must meet the target", with the all-outputs reading alongside
+  (§4.5). On this round's data the outcome is the same either way: guard = 0 on every real
+  contraction, and on the ρ ≤ 1e8 outputs K-eq never gains with its costs (R2b saves 1
+  modulus at 1e−8 but is 36 % slower).
+- **S2-3. Q13: stage 4 closed by the pre-registered rule; acceptable as final for this cycle?**
+  The real operands are stand-ins: MP2 amplitudes and bare integrals [I]. *Verdict:
+  confirmed.* Stage 4 is closed with the trigger "a real-operand family meeting (i)", stage 6
+  is deferred because its gate requires a shipped stage 4, and `oracle.kweights` plus M-a are
+  C2's deliverable. The stand-ins are accepted as recorded under IR19; a future consumer dump
+  of converged, t1-dressed operands falls under the existing trigger. The result is
+  structural, not marginal: R1, R2, R6 and R7 have Δ ≡ 0 by construction, whatever the
+  dressing, and R2b, R3, R4 and R5 have aligned profiles with G ∈ [−4, 0]. The reviewer
+  checked guard8 = guard14 in every record, 0 fallbacks and 0 FP64 violations, and re-ran the
+  engine self-test and test_oracle.
+- **S2-4. The guard when w ≡ 0.** The rule gives G = 0 and so guard = 0, although the weighted
+  call is then the plain call. *Verdict: keep guard = 0.* guard = 1 is a soundness claim tied
+  to one lemma (L5c, G ≥ 3); a special case would add a second meaning and a branch to
+  `GuardSound`, the oracle and the GPU tests for no gain, and `num_weighted` already tells the
+  caller. Documented in §4.5 (step 5 and the caller recipe), the `oracle.kweights` docstring
+  and, later, the stage-4 header: with `num_weighted` = 0, skip the pre-scaling and use the
+  plain request.
+- **S2-5. The report's ORACLE-CHOICEs.** (a) Under ZERO_ON_FAIL the report describes the
+  written w: `clamped` = #{w ≠ w0} = #{w0 ≠ 0}, `num_weighted` = 0, `max_abs_w` = 0, while
+  `guard` and `gain` keep their computed (failing) values. (b) When G is undefined,
+  `gain_row_min` and `gain_col_min` are INT32_MIN too, even where one side is defined. (c) The
+  oracle's detail fields `clamped_max_abs` and `clamped_fp64` describe the pre-zeroing w.
+  *Verdict: confirmed, keep all three,* and document them before the C API is fixed: done in
+  the `oracle.kweights` docstring and §4.5's report struct and ZERO_ON_FAIL text. (a) is the
+  field's own definition applied to the w the helper writes, as §4.5 says ("sets clamped and
+  num_weighted to match"); reporting the failing G keeps the capture-safe pattern rigorous.
+- **S2-6. Cuts triggered by a tier's allotment.** Tier S projected about 26 min against its
+  25, while M-a as a whole projected about 55 against 90; the pre-declared trigger names the
+  total, and cut (1) touches Tier L only. The study applied cut (2). *Verdict: yes, and the
+  cut as applied is accepted.* The per-tier allotments are part of the hard budget: a tier
+  whose projection exceeds its allotment applies the earliest pre-declared cut that reduces
+  that tier, never cutting the real operands, the guard or m = 4096, and the projection that
+  triggered it is recorded (§4.3). d* is unaffected: every deadband ties at 30/30 rejections.
+- **S2-7. `timeout` around memcap.** `timeout 600 tools/memcap.sh …` did not stop the command,
+  which memcap runs in a systemd scope: a timed-out chunk kept running and wrote 14 duplicate
+  records (bit-identical; the summary keeps the first, and all CPU time is counted). *Verdict:
+  the correct form is `tools/memcap.sh timeout 600 cmd`.* It is now in tools/memcap.sh's usage
+  comment, §4.3's budget text, and the usage lines of `c2_gate.py`, `md1_converge.py` and
+  immerdink-eval `scripts/c1/psi4_operands.py`, which had taught the wrong order. Keeping the
+  first record, deduplicating and counting all CPU time are accepted.
+- **S2-8. The reading of IR7's ρ-miss rate.** The study counted only calls whose lagged request
+  was MET, with levels up to 20; with the forcing rule's levels (≤ 14), MISSED requests run at
+  the top level would have counted as misses of the lag. *Verdict: accepted* (§4.3): a request
+  no level can meet is a capacity limit, not a failure of the lagged ρ. The count is 1 miss in
+  228 MET calls (the first report said 266). IR7 closes only with the shipped helper: the
+  first runs used a local recipe that also raised U by (1 + 2⁻⁴⁰). *Re-run 2026-10-07* with
+  `precision.rho_from_output` as of 51dba1e: the same N on every call, ρ̂ within 6.2e−16
+  relative of the local recipe's, and the same single miss (PPL at 1e−6, realized 1.013e−6,
+  after the ring term's ρ jumped from 2.5e6 to 2.0e9). IR7 is closed.
+- **S2-9. Caller guidance from M-d1** ("Krylov: start tight, relax"; "subspace methods:
+  recompute at switches"; DIIS reset). *Verdict: accepted as report-only caller guidance
+  (IR3), labelled as CPU evidence on one fixture each, not a C1 gate, with two corrections:*
+  Davidson's ramp still costs +5 iterations with the recompute, so §4.3's expectation is not
+  met; and the relaxed CG rule leaves a residual gap (7.1e−8 against 3.3e−10), so the
+  relaxation must be scaled by the expected iteration count. As corrected, it is in §1.3.
+- **S2-10. The Davidson fixture was changed after the first runs.** The first H had
+  ‖2BBᵀ‖ ≈ 950 Ha and did not converge even with FP64 matvecs and diagonal preconditioning;
+  the coupling is now normalized to 1 Ha, and the earlier records are kept. *Verdict:
+  accepted.* The case is report-only, the change and its reason are disclosed, and the
+  findings note that the normalized case is diagonally dominant and easy.
+- **S2-11. The synthetic CC family at natural shapes** (m ≠ n), matched to each tier's class
+  by (o, v, naux); cc_ppl and cc_ring have no k = 16384 tier (the (ac|bd) operand would exceed
+  the 3-GB RSS cap). *Verdict: accepted.* The class is defined by 2mnk ≥ 1.7e10, not by m = n
+  (Tier L-2048: cc_df 2025² × 3600 = 2.95e10, cc_ppl 1024 × 3136² = 2.0e10, cc_ring 2048³ =
+  1.7e10), natural shapes are what the consumer runs, cc_df covers k = 16384, and the family
+  has w ≈ 0 at every size anyway.
+- **S2-12. Q12's escape clause** (decided in the report, not raised as a question). *Verdict:
+  Q12 (a) stands for this cycle, but the closure is vacuous on real data and recorded as
+  such.* R7 (iaQ,ibQ->iab) is a self-contraction in every batch, so Δ ≡ 0 for shared and
+  per-λ weights alike, and the real-fixture trigger could never fire. The synthetic batch
+  shows per-λ weights saving 3–4 moduli on all-output max elementwise (0 on the ρ ≤ 1e8
+  outputs and normwise). At any stage-4 revival, Q12 is re-tested on a real batched
+  contraction that is not a self-contraction, before the C API is fixed (§4.5).
+- **S2-13. Q15: K-segmentation beyond K-equilibration?** The one positive case, R2b at normwise
+  1e−15, is 2 % faster. *Verdict: Q15 (a) stands,* a documented recipe with no API flag. 2 % is
+  inside the model's p90 error (10–13 %) and below the 5 % bar of every other gate here;
+  elsewhere K-seg 2 needs 1–4 more moduli than K-eq and loses elementwise accuracy on the
+  ρ ≤ 1e8 outputs.
+- **Review should-fix items applied besides the above.** B6 synthetic at m = n = 512 with exact
+  x (outliers, opp_nonsep and φ = 4; k = 3600 and 16384; 5 seeds; no split pays); the Appendix
+  B trigger compared with what a caller gets and restricted to non-separable families of the
+  class (still 0 cases); gate verdict lines computed by `c2_summary.py`, with the memory of
+  scaled copies in the gate tables; water R1 and R5 labelled not gate-admissible; the engine
+  self-test extended to the several-partner and batched paths against `oracle.kweights`, and
+  registered as the CPU ctest `c2_engine_selftest`; test_oracle (12) given a swapped view with
+  X = A and an unswapped one with X = B; the provenance of each record extended by a dirty
+  flag and every study file's sha256.
+
 ---
 
 ## Appendix A. Claims corrected in review (not carried into this design)
@@ -3489,4 +3746,6 @@ revival.
 
 **Revival trigger.** Stage 2 finds a realistic family with structured but **non-separable**
 magnitudes where this rule saves ≥ 2 moduli beyond K-equilibration and K-segmentation on calls
-of the 2048³ class or larger.
+of the 2048³ class or larger. *Checked 2026-10-07 (M-a): not met.* No non-separable Tier-L
+or real case of the class qualifies. Against K-seg 2 and what a caller gets from K-eq (K-eq d*
+where its guard holds, otherwise fast mode), the largest saving is 1 modulus.

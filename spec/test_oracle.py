@@ -1758,13 +1758,14 @@ def kw_fixture(fam, m, n, k, rng):
 
 def test_kweights():
     """(12) NOTES-C1 §4.5 K-weights (stage 2): oracle.kweights against independent brute
-    forces (rule, clamp, Q9 order, multi-partner union extrema and min-G guard), FP64
+    forces (rule, clamp, Q9 order, multi-partner union extrema and min-G guard, swapped and
+    X = B views), FP64
     exactness of every scaled entry (incl. subnormals and the top of the range), invariance
     under a joint K permutation, determinism, L5c in exact rationals, the CRT precondition
     and z = sum a'b' on the weighted operands, bitwise-equal DIRECT results, validation."""
     rng = random.Random(4519)
     cnt = {"rule": 0, "clamped_fp64": 0, "clamped_max_abs": 0, "guard_pairs": 0,
-           "l5c_pairs": 0, "crt_outputs": 0, "multi": 0}
+           "l5c_pairs": 0, "crt_outputs": 0, "multi": 0, "views": 0}
 
     # --- rule + clamp vs brute force, single partner (GEMM) and guard vs the float path
     for trial in range(220):
@@ -1895,6 +1896,46 @@ def test_kweights():
         assert rep["gain"] == (min(dG) if dG else o.INT32_MIN)
         assert rep["guard"] == (1 if not dG or min(dG) >= 3 else 0)
         cnt["multi"] += 1
+    # --- the remaining views: a swapped single-partner GEMM (column-major C, X = A, so the
+    # post-swap X is the plan's B) and an unswapped partner with X = B (row-major C). The
+    # report names the caller's A rows / B columns and does not depend on C's layout.
+    rep_fields = ("guard", "gain", "gain_row_min", "gain_col_min", "median", "num_weighted",
+                  "max_abs_w", "clamped")
+    for trial in range(40):
+        m, n, k = rng.randrange(2, 4), rng.randrange(2, 4), rng.randrange(2, 10)
+        cen = [rng.randrange(-40, 40) for _ in range(k)]
+        A = [[kw_rand_entry(rng, cen[h]) for h in range(k)] for _ in range(m)]
+        B = [[kw_rand_entry(rng, cen[h] + rng.randrange(-30, 31)) for _ in range(n)]
+             for h in range(k)]
+        db, N, rnd = rng.choice([0, 2, 3]), rng.choice([6, 8, 14]), rng.choice(["RN", "TRUNC"])
+        TA, TB, Crow = o.gemm_tensors(A, B)
+        Ccol = o.Desc([m, n], [1, m], ["i", "j"])
+        assert o.lower(TA.desc, TB.desc, Ccol).swapped
+        assert not o.lower(TA.desc, TB.desc, Crow).swapped
+        fin = lambda x: math.isfinite(x) and x != 0.0  # noqa: E731
+        a_at = [[A[i][h] for i in range(m) if fin(A[i][h])] for h in range(k)]
+        b_at = [[B[h][j] for j in range(n) if fin(B[h][j])] for h in range(k)]
+        # (a) X = A, swapped
+        wa, ra = o.kweights(TA, [o.KwPartner(TB, Ccol, N, rnd, "A")], deadband=db)
+        wr, rr = o.kweights(TA, [o.KwPartner(TB, Crow, N, rnd, "A")], deadband=db)
+        assert wa == wr and all(ra[f] == rr[f] for f in rep_fields), trial
+        assert wa == kw_brute(a_at, b_at, db, 127)[0]
+        gx, gy = kw_gain_brute(TA, TB, Ccol, N, rnd, "A", ra["labels"], ra["qstride"], wa)
+        gp = None if gx is None or gy is None else gx + gy
+        assert ra["gain"] == (o.INT32_MIN if gp is None else gp)
+        if gp is not None:
+            assert (ra["gain_row_min"], ra["gain_col_min"]) == (gx, gy)    # X = caller's A
+        # (b) X = B, unswapped
+        wb, rb = o.kweights(TB, [o.KwPartner(TA, Crow, N, rnd, "B")], deadband=db)
+        assert rb["labels"] == ["h"] and wb == kw_brute(b_at, a_at, db, 127)[0]
+        gx, gy = kw_gain_brute(TB, TA, Crow, N, rnd, "B", rb["labels"], rb["qstride"], wb)
+        gp = None if gx is None or gy is None else gx + gy
+        assert rb["gain"] == (o.INT32_MIN if gp is None else gp)
+        assert rb["guard"] == (1 if gp is None or gp >= 3 else 0)
+        if gp is not None:
+            assert (rb["gain_row_min"], rb["gain_col_min"]) == (gy, gx)    # X = caller's B
+        cnt["views"] += 1
+
     Y3 = o.Tensor([1.0] * (v_ * v_ * q_), 0, o.Desc([v_, v_, q_], [1, v_, v_ * v_], ["a", "c", "Q"]))
     C3 = o.Desc([v_, o_], [1, v_], ["a", "k"])
     try:
@@ -1990,7 +2031,8 @@ def test_kweights():
             pass
     RESULTS["kweights"] = (f"rule cases {cnt['rule']} (FP64 clamp binding {cnt['clamped_fp64']}"
                            f"x, max_abs {cnt['clamped_max_abs']}x), guard pairs "
-                           f"{cnt['guard_pairs']}, multi-partner {cnt['multi']}, L5c pairs "
+                           f"{cnt['guard_pairs']}, multi-partner {cnt['multi']}, swapped / "
+                           f"X = B views {cnt['views']}, L5c pairs "
                            f"{cnt['l5c_pairs']}, CRT outputs {cnt['crt_outputs']}, failing "
                            f"guard seen on fixtures: {s_found['guard0']}")
 
