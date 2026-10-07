@@ -1,4 +1,4 @@
-# immerdink — design (v1.18)
+# immerdink — design (v1.19)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -77,6 +77,14 @@ format 2 kept), host API 13 (seven appended calibration fields, one cache state,
 clock up to the boost clock), the sustained-DIRECT bench variant fix and a full recalibration
 (NOTES-B2 §12). No semantic, layout, launch, pack-format or TLA+ change; changed text is
 marked **[v1.18]**.
+v1.19 (§6g, stage 0 of docs/NOTES-C1.md, ROADMAP C1(a)) adds adaptive precision as
+**precision phases** on host API 13: a plan and a pack per N, switched between calls. It
+publishes the footprint guarantees a caller needs to size one workspace and one packed buffer
+for every phase (§6a F1–F3: workspace and pack bytes nondecreasing in N and g, `imd_pack`'s
+write extent), the rule for re-packing one buffer at another N (§6b.7), certificates of the
+internal layout facts (I1–I3, not ABI), and a host-side Python guard (`PackedBuffer`). No
+semantic, layout, launch, pack-format, API, calibration-format or TLA+ change; changed text is
+marked **[v1.19]**.
 The change lists are at the end.
 
 Sources:
@@ -1585,6 +1593,8 @@ const char*  imd_status_string(imd_status_t);
   - complex values via the 2M method (2 GEMMs per modulus, moduli with √−1);
   - accurate-mode scaling, which is incompatible with independent packing.
   - adaptive precision, possibly via an Ozaki-I slice mode sharing this pipeline (PLAN, Later).
+    **[v1.19]** Per-call N ships as precision phases (§6g): a plan and a pack per N, no new
+    API. An Ozaki-I slice mode stays parked with triggers (NOTES-C1 §3.3).
 
 ---
 
@@ -1768,6 +1778,33 @@ there is no budget option (BENCHMARKS "Residue-group size g" gives the speed sid
   `imd_pack_layout_t.format` and `.pack_bytes` with them and re-pack whenever a fresh
   `imd_pack_layout` of the same descriptor reports a different format or size (k > 96
   moves from format 1 to 2 in API 9; the library cannot detect stale bytes; §4b.5, §6b.5).
+- **[v1.19] Footprints across N and g (guaranteed from host API 13 on; §6g).** Fix the
+  descriptors, `mode`, `vec_mode` and the packed roles. That also fixes k̂ (a function of k
+  alone, §4b.3) and the KF / KL choice (a function of k̂ alone). Then:
+  - **F1.** `imd_workspace_size` and `imd_workspace_size_packed` are nondecreasing in N at
+    every fixed g ≥ 1, and nondecreasing in g ∈ [1, N]. With g = 0 (normalized to N) they are
+    nondecreasing in N. With packed roles and RN, the packs' κ ≥ T(N) makes the smallest N
+    NOT_SUPPORTED (§6b.3); F1 holds over the N where the query succeeds, which is an up-set
+    in N (T grows with N).
+  - **F2.** `pack_bytes` (`imd_pack_layout`, `imd_pack_bytes`) is nondecreasing in N.
+  - **F3.** `imd_pack` writes every byte of [0, `pack_bytes`) (§6b.4). A packed contract
+    reads only [0, `pack_bytes`) of a packed buffer: that is the buffer's ALIASING extent
+    (§6b.5), and CompatSpec's `NoOOBRead` (spec/PackedOperand.tla) models it. **`imd_pack`
+    writes no byte beyond `pack_bytes`**: published in v1.19, only after the GPU tests
+    `pack_write_extent` and `pack_write_extent_memcheck` passed on every `imd_pack` launch
+    shape (NOTES-C1 IR17; §6g.8).
+  - **Consequences** (proof in §6g.2). **C-ws:** one workspace of
+    `imd_workspace_size(N_max, g_max)` serves every plan with the same descriptors, options
+    and packed roles, N ≤ N_max and g ≤ g_max (g = 0 counts as N), with at most one call in
+    flight per workspace (§6 rule 1). **C-pack:** one buffer of `pack_bytes(N_max)` holds the
+    pack of the same descriptor at any N′ ≤ N_max. A caller may instead size per phase and
+    re-allocate at a switch; both are exact through these queries.
+  - These describe the current formulas and change no meaning, so they need no new API
+    version; they are promises from API 13 on, which a later layout or pack format must keep
+    (one that could not would be a new function or format, as above). Only the totals and the
+    extents are promised: where the regions lie inside the workspace or the pack (I1), the
+    plan device bytes (I2) and whether packing shrinks the workspace (I3) are certificates
+    (`params.py cert_footprint_monotone`), not ABI, so a later format may change them.
 - Internal C++ entry points of the host library (lowering, layout, plan data) are exported
   for libimmerdink and the tests only; they are not in `include/` and carry no ABI promise
   (both libraries are built together).
@@ -1784,7 +1821,9 @@ status, layout, plan device bytes, lowering); `host_python` (wrapper == direct C
 `host_vs_plan` (real plans: GEMM view, layout, device bytes, K4 parameter sets and
 launches, host payload counted from the live containers == the host queries);
 `host_cuda_free` (no CUDA in readelf/ldd/nm; the repository builds and passes its host
-tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH).
+tests with `IMMERDINK_HOST_ONLY=ON`, the system compiler and no nvcc on PATH);
+**[v1.19]** `host_footprint_monotone` (F1, F2, C-ws, C-pack and I1–I3 on the library ==
+`params.py`, §6g.8).
 
 ---
 
@@ -1943,6 +1982,7 @@ pack_bytes = Σ align₂₅₆(region) in this order;  0 if b·r·k = 0
 ```
 - Every byte of `[0, pack_bytes)` is written by `imd_pack`, alignment gaps with 0: the
   bytes are a pure function of (key, X's values), so packs can be compared or hashed.
+  **[v1.19]** No byte outside it is written (§6a F3, checked on every `imd_pack` launch shape).
 - **Role A** (post-swap): K4 reads m = r rows per batch at batch stride r·k̂ — exactly the
   v1 RA layout `[slot][λ][ī][k̂]`.
 - **Role B**: the GEMM's N extent is n̂ = ⌈r⌉₁₆; block (l, λ) is read from its start at
@@ -2152,6 +2192,20 @@ descriptor (format 2), and the library cannot tell; the caller compares `format`
   until every contract using that pack has completed: K5's native path reads it for flagged
   outputs, and a result mixing two versions is neither contraction
   (`neg_stream_writex_early`). If X changes, re-pack.
+- **[v1.19] Re-packing in place** (precision phases, §6g; e.g. the same X at another N):
+  - A packed buffer holds the pack of its **last** `imd_pack` only. Every contract that reads
+    it must pass a handle whose key is that pack's key.
+  - The library compares the handle with the plan, never the bytes with the handle
+    (§6b.10 #12). So a contract that passes the previous pack's handle, with its plan, after a
+    re-pack at another N reads the bytes as the old N and returns a wrong C with SUCCESS
+    (§6b.10 #3's documented limit; shown by `packed_repack_n`).
+  - A CUDA graph that captured a contract on the buffer must not be replayed after the buffer
+    is re-packed with another key.
+  - Ordering is the WAR rule above: re-pack only after every contract that read the old
+    contents.
+  - A buffer of `pack_bytes(N_max)` holds the pack at any N′ ≤ N_max (§6a C-pack). The bytes
+    above `pack_bytes(N′)` keep stale planes that nothing reads.
+  - Python's `PackedBuffer` checks the plain stream-ordered pattern on the host (§6g.5).
 - Two `imd_pack` calls into one buffer must not overlap (like a workspace, §6 rule 1);
   into distinct buffers, any concurrency.
 - **Capture**: `imd_pack` and `imd_contract_packed` only launch kernels on the caller's
@@ -2239,6 +2293,8 @@ operands, non-finite inputs]**
 15. **Interaction with C1 (adaptive precision)**: N is in the key, so a pack serves one N.
     An Ozaki-I slice format (C1(c)) would be a new `IMD_PACK_FORMAT` where one pack serves
     every N′ ≤ N; out of scope here (recommended: keep N in the key for format 1).
+    **[v1.19]** C1(a) keeps it: one pack per N, re-packed in place into one buffer sized for
+    the largest N (§6a C-pack, §6b.7, §6g). The slice format stays parked (NOTES-C1 §3.3).
 
 ### 6b.11 Implementation notes (v1.7)
 
@@ -2374,6 +2430,11 @@ pa.pack_bytes, pa.workspace_bytes, pa.layout
 pa.pack(A, out=bufA, workspace=pws, stream=s)                 # imd_pack
 plan = imd.Plan("ik,kj->ij", A, B, C, N=14, packs=(pa, None)) # imd_plan_create_packed
 plan.contract(A, B, C, workspace=ws, stream=s, packed=(bufA, None))   # imd_contract_packed
+# [v1.19] precision phases (§6g): one buffer re-packed at several N, guarded on the host
+p8 = imd.Pack(spec.with_moduli(8))                            # the same descriptor at N = 8
+buf = imd.PackedBuffer(bufA)                                  # records the last Pack.pack
+p8.pack(A, out=buf, workspace=pws, stream=s); buf.last_pack   # PackRecord(N=8, ...)
+plan.contract(A, B, C, workspace=ws, packed=(buf, None))      # N = 14 plan: PackMismatchError
 
 cache = imd.PlanCache()                  # imd.default_plan_cache is the default one
 cache.get("ik,kj->ij", A, B, C, N=14)    # warm before a capture, then
@@ -2396,7 +2457,8 @@ imd.set_cai_stream_policy("ignore")      # CAI v3 stream opt-out (default "check
   "RESIDENT", `k4_tune` bool.
 - **Buffers** (workspace, packed buffers, `imd_pack`'s workspace): any CUDA array of any
   dtype, contiguous (its bytes = size × itemsize), a `DeviceArray`, or a `(ptr, nbytes)`
-  tuple; None only when the C function accepts NULL (0 bytes needed).
+  tuple; None only when the C function accepts NULL (0 bytes needed). **[v1.19]** A packed
+  buffer may also be a `PackedBuffer` (§6g.5).
 - `contract_ptr` / `Pack.pack_ptr` are the raw entry points for hot loops and other
   bindings: integers only, no Python-side layout check (the caller vouches that the
   pointers match the plan's descriptors); the C checks (null, aliasing, alignment, sizes)
@@ -4603,6 +4665,241 @@ These are for the reviewer: NOTES-B2 §7.4.
 
 ---
 
+## 6g. Adaptive precision: precision phases (ROADMAP C1) [v1.19]
+
+Design: docs/NOTES-C1.md, stage 0 (§4.1), with its resolved questions Q1–Q3 and the
+independent reviewer's binding decisions IR8–IR10, IR14, IR17 and IR20. Iterative methods
+need full precision only near convergence. So a caller runs each contraction at the smallest
+N its current target needs, and switches N between calls, at iteration boundaries where it
+returns to the host anyway.
+
+**Decision.**
+- **C1(a), per-call N: a plan and a pack per N, on host API 13.** There is no new function,
+  struct or option. A **phase** is the set of plans (and packs) at one N.
+- **Parked:** one plan serving a range of N. The kernels already select by N on every call:
+  K5's instantiation comes from the plan's N, the pack emitter's word count W from N, KF and
+  KL's group size from min(g, N), and the group loop runs over N. So a range call is
+  launch-identical to the plan at that N and gains nothing per call. It would save only plan
+  creation (11–12 µs for a GENERATE plan, NOTES-M4) and some host bytes, at the price of new
+  entry points, a new lowering and four TLA+ modules. NOTES-C1 §3.2 keeps it with its trigger.
+- **Parked with triggers:** an Ozaki-I slice mode (C1(c)), in which one pack serves every
+  N′ ≤ N. No consumer needs one operand at two precisions at once, which is the only case a
+  prefix format pays for (NOTES-C1 §1.3, §3.3).
+- **C1(b), choosing N from a target, stays on the host** with the §6f queries
+  (`imd_err_min_moduli`, rank with an accuracy). NOTES-C1 stage 1 adds a thin Python
+  `PrecisionPlan` on top of them. Choosing N on the device is rejected, and device statistics
+  (NOTES-C1 stage 5) are deferred with triggers.
+- **The policy stays with the caller:** immerdink never changes N on its own (ehrenfest D8:
+  precision is user-directed).
+
+### 6g.1 What a phase is
+
+- Each phase is a plain plan at its N. Every §3 rule, certificate and proof applies
+  unchanged, and results are bit-exact against `oracle.contract(..., N)` at that phase's N.
+  There is no numerics change.
+- σ depends on N only through the plan constant R·2^F (§3.2: R = (2T(N) − κ)² for RN and
+  T(N)² for TRUNC). So a pack serves exactly one N: N is word 1 of its key (§6b.10 #15), and
+  a plan at another N gets PACK_MISMATCH `_MODULI`.
+- Plans are created before the iteration loop. RESIDENT plan creation synchronizes and is
+  not capturable (§6), and with `k4_tune` on, each plan autotunes. `PlanCache.freeze()`
+  asserts that every plan exists before a capture.
+- A packed operand that changes every iteration is re-packed every iteration anyway. An
+  invariant one is re-packed once per phase change, in place (§6b.7, §6g.4).
+
+### 6g.2 Sizing once: F1–F3, C-ws, C-pack **[cert: cert_footprint_monotone]** **[test: host_footprint_monotone]**
+
+The guarantees and their consequences are stated in §6a ("Footprints across N and g"). The
+proof:
+- **F1.** Every §4a region is either independent of (N, g) or has N or g as a factor:
+  RA = g·b·m·k̂, RB = g·b·n̂·k̂ and W = N·b·m·n̂ (W is last); sA, sB, fA, fB and vec depend on
+  neither. align₂₅₆ is monotone, and the total is a sum of aligned regions in a fixed order.
+  A packed role only drops sX, fX and RX (§6b.6).
+- **F2.** In the pack (§6b.4), res = N·b·r·k̂ + (⌈r⌉₁₆ − r)·k̂ is affine in N, and sig and
+  flag do not contain N.
+- **F3.** The first half is §6b.4. The read extent is §6b.5's ALIASING interval: K4 reads at
+  most the last byte of res (in the B role, the end of the tail; `cert_pack_layout`), and K5
+  reads σ and the flags. The second half, no byte beyond `pack_bytes`, holds if each pack
+  kernel writes only regions of the layout: `kp_prep` the alignment gaps, the tail and the last
+  gap, KL the σ, flag and plane rows (§6b.11). That was an inference [I] until
+  `pack_write_extent` (sentinels around an exactly sized window) and
+  `pack_write_extent_memcheck` (exactly sized allocations under memcheck) checked it on every
+  `imd_pack` launch shape; only then did it become ABI (NOTES-C1 IR17).
+- **C-ws.** ws(N, g) ≤ ws(N_max, g) ≤ ws(N_max, g_max) by F1, which applies because
+  g ≤ N ≤ N_max (`options_ok`), and the contract checks accept a larger workspace (§6). The
+  bytes a call at another N left behind are never read: every byte a call reads, that call
+  wrote (Pipeline's junk-initialized workspace invariants `NoStaleRead` and
+  `EveryRowByteWritten`). Each call uses its own plan's region offsets. (HostAPI's
+  `neg_ws_shared` is about concurrent calls, not about reuse across plans.)
+- **C-pack.** It follows from F2, F3's first half and the read extent: `imd_pack` at N′
+  writes all of [0, `pack_bytes(N′)`), and a contract at N′ reads only that range. It needs
+  neither the offsets (I1) nor F3's second half.
+
+### 6g.3 Internal facts: certificates, not ABI
+
+These hold for today's formulas, but no caller needs them, and a future format may break
+them: a K-weight region after res (NOTES-C1 stage 6), a slice format, a range plan. Under
+§6a a published promise cannot be withdrawn, so they stay certificates that a format change
+must revisit (`params.py cert_footprint_monotone`, checked on the library by
+`host_footprint_monotone`):
+- **I1.** In `imd_pack_layout`, the sig and flag offsets and bytes, the res offset and
+  `pack_ws_bytes` do not depend on N, and res(N′) is a prefix of res(N_max).
+- **I2.** The plan device bytes (`imd_plan_bytes`, `imd_lowering_packed`) do not depend on N
+  or g. The host bytes do, through the K4 shape keys.
+- **I3.** Packing more roles never increases ws(N, g). A memory budget that allows several
+  pack modes takes the maximum over them from the queries, so no caller relies on I3.
+
+### 6g.4 Re-packing one buffer
+
+The rule is §6b.7's [v1.19] item. Its hazard, a stale handle with its plan reading a
+re-packed buffer and returning a wrong C with SUCCESS, already existed for any re-pack with
+another key; precision phases make re-packing routine. A device-side digest header in the
+buffer is rejected (NOTES-C1 Q3). It would reverse §6b.10 #12 and §6b.4's "the bytes are a
+pure function of (key, values)". Checking it needs a synchronization that kernel scope
+forbids, and it could not protect graph replays anyway.
+
+### 6g.5 Python
+
+- `PackSpec.with_moduli(N)` is the same pack descriptor at another N (`dataclasses.replace`;
+  the orders are kept).
+- `PackedBuffer(buf, nbytes=None)` wraps a caller-owned packed buffer: a contiguous CUDA
+  array, an (int pointer, nbytes) tuple, or an int pointer with `nbytes`.
+  - `Pack.pack(X, PackedBuffer)` records the pack's `PackRecord` (N, rounding, `pack_bytes`,
+    key digest) on the host at enqueue, under a lock. A call the library rejects keeps the
+    previous record; a CUDA_ERROR clears it.
+  - `Plan.contract` and `immerdink.contract` refuse a `PackedBuffer` whose record differs
+    from the plan slot's pack, or that has none, with `PackMismatchError` ("buffer last
+    packed at N=8, plan expects N=14"), before any C call.
+  - It allocates nothing, and raw buffers behave as before.
+- It is a safety net, not a soundness argument. The digest is the library's FNV-1a
+  `key_digest`, for diagnostics only. The record follows host enqueue order, not GPU order:
+  under graph replay, or across streams ordered by events, it can differ from what the GPU
+  sees, so it guards the plain stream-ordered pattern only. `Pack.pack_ptr` and any other
+  write bypass it.
+- Its lock-and-compare costs 0.14 µs per `Plan.contract` (`bench/python_overhead.py`,
+  "ik,kj->ij" 16³, N = 8, median host time: 6.26 µs with a `PackedBuffer` against 6.12 µs
+  with the raw buffer of the same packed plan; the bare ctypes call takes 3.98 µs; immerdink-eval
+  `results/c1/stage0_python_overhead.json`).
+
+### 6g.6 First call at a new N; capture (NOTES-C1 IR10)
+
+**Measured** (`bench/first_call.py --sweep`, 2026-10-07, RTX 4090, quiet machine, under the
+GPU lock). The case is "ik,kj->ij" with m = n = k = 1024 and 4096, RN, g = N, GENERATE
+vectors, under `CUDA_MODULE_LOADING=LAZY` (the CUDA default). Each (size, N, mode) runs in a
+fresh process that first plans and calls at another N, so the numbers are a switch, not process
+start-up. Call times run from just before the enqueue to completion, the same measure for the
+steady call (median of 20) and the first one. Records: immerdink-eval
+`results/c1/stage0_first_call.jsonl`, summary `findings/c1-stage0-first-call.md`.
+
+| m = n = k | N | steady call | first call at the new N | first plan creation | re-pack of A (GPU) | cold capture: first / steady replay |
+|---:|---:|---|---|---:|---:|---:|
+| 1024 | 6 | 27.1 TFLOPS-eq, 0.079 ms | 25.1 TFLOPS-eq, 0.086 ms | 0.141 ms | 0.018 ms | 1.10 |
+| 1024 | 8 | 23.5 TFLOPS-eq, 0.091 ms | 22.3 TFLOPS-eq, 0.096 ms | 0.013 ms | 0.019 ms | 1.09 |
+| 1024 | 10 | 20.6 TFLOPS-eq, 0.104 ms | 19.3 TFLOPS-eq, 0.112 ms | 0.150 ms | 0.020 ms | 1.08 |
+| 1024 | 14 | 15.4 TFLOPS-eq, 0.139 ms | 14.9 TFLOPS-eq, 0.144 ms | 0.013 ms | 0.023 ms | 1.06 |
+| 4096 | 6 | 61.2 TFLOPS-eq, 2.244 ms | 61.2 TFLOPS-eq, 2.244 ms | 0.012 ms | 0.275 ms | 1.00 |
+| 4096 | 8 | 49.4 TFLOPS-eq, 2.781 ms | 49.4 TFLOPS-eq, 2.782 ms | 0.012 ms | 0.305 ms | 1.00 |
+| 4096 | 10 | 41.2 TFLOPS-eq, 3.333 ms | 41.4 TFLOPS-eq, 3.320 ms | 0.011 ms | 0.344 ms | 0.98 |
+| 4096 | 14 | 31.3 TFLOPS-eq, 4.395 ms | 31.2 TFLOPS-eq, 4.403 ms | 0.012 ms | 0.423 ms | 0.99 |
+
+- **The switch is cheap.** The first call at a never-launched N spends 12–35 µs more host time
+  enqueueing than a steady call (consistent with the lazy load of that N's kernels [I]); most
+  of it overlaps the GPU, and from enqueue to completion the first call takes at most 8 µs
+  more (5–8 µs at 1024³, within noise at 4096³). The first `imd_plan_create` at the new N
+  takes 0.011–0.150 ms, against 0.004–0.005 ms afterwards. The 0.14–0.15 ms cases (1024³,
+  N = 6 and 10) probably load a K4 configuration the earlier N did not use, since plan
+  creation reads the K4 kernels' attributes [I].
+- **Re-packing costs more.** Re-packing one operand at the new N takes 0.018–0.023 ms of GPU
+  time at 1024² and 0.28–0.42 ms at 4096², and it recurs at every phase switch (every
+  iteration for an operand that changes), while the switch is paid once per N per process.
+- **Cold capture works.** `graph_phases` captures phases whose N never ran in its process
+  (bit-exact), and here the first replay of a cold capture is 0.98–1.10× the steady replay.
+  NOTES-C1 IR10's bar (a capture failure, or a first replay above 2× the steady one) is not
+  met, so **no plan-time preload is added**: `imd_plan_create` is unchanged.
+- The process's own first call, at any N, is start-up rather than a switch: its enqueue takes
+  0.8–1.9 ms, once per process.
+
+### 6g.7 Spec
+
+**No TLA+ change** (NOTES-C1 R1, IR20; the §6f.5 argument):
+- The re-pack ordering is modelled. A re-pack is StreamSpec's post = "repack" with the WAR
+  edge (`neg_stream_no_war`), and a contract after it is the pack → contract RAW case
+  (`neg_stream_no_raw`).
+- The stale handle is §6b.10 #3's documented limit. The library never compares bytes with
+  handles, so a witness would only restate the caller rule.
+- The layout prefix is a static formula (`pack_layout`): certificate I1, not a protocol
+  property. F3's write extent is likewise checked by a GPU test with memcheck, not by a TLA+
+  write-footprint invariant, which would only restate that formula.
+- Pipeline, IndexMap and HostAPI do not change: per-N plans and handles are existing objects,
+  and C-ws rests on Pipeline's existing invariants.
+- The optional StreamSpec model with ⟨version, key⟩ cells (NOTES-C1 §4.1) is built only if
+  the N-range plan is revived or Eric asks for it.
+
+**[cert] `cert_footprint_monotone`:** F1, F2, C-ws, C-pack and I1–I3 on the §4a and §6b.4
+formulas: every (N, g), every packed-role set, both vec modes, A = 16 and 64, a grid and
+random shapes, and the per-region structure of the F1 proof. Mutations (a workspace that
+falls at one N, a packed set that grows the workspace, a res offset that moves with N) fail
+it.
+
+### 6g.8 Tests
+
+- **CPU.**
+  - `host_footprint_monotone` (`tests/test_footprint.py`): F1, F2, C-ws, C-pack and I1–I3 on
+    libimmerdink_host, every value equal to params. The grid is m, n ∈ {1, 15, 16, 17, 255,
+    256, 257}, k ∈ {2, 96, 97, 1024, 1025, 131008, 131009}, b ∈ {1, 3}, N = 2..20, g = 0..N,
+    both vec modes, the caller's packed roles none / A / B / AB, and the K alignment AUTO and
+    A16. Then 10⁴ random legal contractions (role swaps, diagonals, permuted and negative
+    strides; A = 16, 64 or AUTO). RN acceptance is NOT_SUPPORTED exactly where κ ≥ T(N).
+  - `python_device`, CPU part: `PackedBuffer` through a fake libimmerdink (each refusal
+    happens before any C call; the record on success, rejection and CUDA_ERROR; `nbytes`),
+    and `PackSpec.with_moduli`.
+- **GPU** (`tests/test_phases.py`, one fresh process per suite, under the GPU lock, with the
+  allocation shim):
+  - `packed_repack_n`: X is packed at N = 14 into a buffer of `pack_bytes(14)` and
+    contracted, then re-packed at N = 8 in place and contracted with the N = 8 plan; both
+    bit-exact, every packed byte equal to `oracle.pack`. Bytes above `pack_bytes(8)` keep a
+    sentinel. The stale N = 14 plan with the `PackedBuffer` raises `PackMismatchError` with
+    no launch; with the raw buffer it returns SUCCESS and a wrong C (the documented limit).
+    Then back to N = 14. Both post-swap roles (B with tail rows).
+  - `workspace_shared_n`: one workspace of `imd_workspace_size(N = 14, g = 0)` serves plans
+    at (N, g) ∈ {5, 8, 14} × several g, both vec modes, called alternately on one stream
+    (KF; KL with the role swap). Then the same with A re-packed before each call into one
+    buffer of `pack_bytes(14)`. All bit-exact; no allocation; the guard zones untouched.
+  - `graph_phases`: one graph per phase, N = 6 (warm) and N = 10 (**cold**: captured before
+    any launch at N = 10 in the process, under `CUDA_MODULE_LOADING=LAZY`), sharing one
+    workspace and replayed alternately on new data, bit-exact. A cold packed phase too:
+    `imd_pack` and `imd_contract_packed` at N = 12, never launched, in one graph.
+  - `pack_write_extent` (F3's evidence): 88 packs covering every `imd_pack` launch shape.
+    KL reads along rows (tiles of 64, 32, 16 and 8 rows; rows on chip and re-read chunks)
+    and along k̄ (tiles of 64 down to 1 row; 8 and 4 values per thread), each with W = 2 and
+    3, RN and TRUNC, A = 16 and 64 (where k > 96 allows it), r ∈ {1, 15, 16, 17, 33},
+    b ∈ {1, 3}, N ∈ {2, 3, 8, 14, 20}. Each pack is written twice into an exactly sized
+    window of a buffer filled with a sentinel (0xA5, then 0x5A). Every byte outside the
+    window keeps the sentinel, every byte inside is the same both times (all written), and
+    small packs equal `oracle.pack`; the same holds for `imd_pack`'s workspace. Each pack, in
+    an exactly sized allocation, is then read by `imd_contract_packed` with the in-line
+    partner on every producer path (KF or KL by rule, K1 + K2/K3, KL, KL with 64-row tiles),
+    each bit-identical to the plain `imd_contract`.
+  - `pack_write_extent_memcheck` (`tests/memcheck_pack_extent.sh`): the same packs and
+    contracts with every allocation exactly sized, under `compute-sanitizer --tool memcheck
+    --padding 4096`: clean. A pack allocation 16 bytes short (`imd_pack` told `pack_bytes`)
+    must be reported as an invalid global write, which shows the check fires.
+
+### 6g.9 Risks and limits
+
+- The re-pack rule, and not replaying a graph after a re-pack with another key, are caller
+  obligations the library cannot check (§6b.7). `PackedBuffer` covers only stream-ordered
+  host code.
+- Plans per N multiply the RESIDENT vector bytes, 8(2m + 2n + 2k + 3b) per plan, by the
+  number of levels (GENERATE plans hold none), and with `k4_tune` on, the plan-time
+  autotuning.
+- A future pack format with offsets that depend on N would break I1, and the certificate
+  would catch it. C-pack does not depend on I1.
+- The gain depends on the final N the consumer needs and on the shape (NOTES-C1 §2.3–§2.4,
+  §4.10). Gains at N ∉ {8, 10, 14, 16} rest on the performance model outside its hold-out
+  until NOTES-C1's M-c passes.
+
+---
+
 ## 7. What was considered and rejected
 
 | Option | Why not |
@@ -5305,3 +5602,41 @@ and host API; every value the same integer (bit-identical, tested on every contr
   the launch-timing question (power reviewer item 5). The key stays supported (optional,
   0 = off); the struct and format are unchanged. Text: COLD described as a modelling convention,
   the write-back reading of ω as a hypothesis.
+
+## v1.19 (§6g adaptive precision, stage 0: precision phases on host API 13; no semantic, layout, launch, pack-format, API, calibration-format or TLA+ change)
+
+Design: docs/NOTES-C1.md §4.1 (stage 0), as amended by the independent reviewer's binding
+decisions (IR1–IR29, NOTES-C1 §5.3).
+- **§6g (new):** C1(a), per-call N, as precision phases: a plan and a pack per N; the N-range
+  plan and the Ozaki-I slice mode parked with their triggers; C1(b) on the host (§6f, and
+  NOTES-C1 stage 1's `PrecisionPlan`).
+- **§6a contract text (from API 13 on):** F1 (`imd_workspace_size[_packed]` nondecreasing in
+  N and g), F2 (`pack_bytes` nondecreasing in N), F3 (`imd_pack`'s write extent, a packed
+  contract's read extent) and their consequences C-ws (one workspace for every phase) and
+  C-pack (one packed buffer for every N′ ≤ N_max). They describe the current formulas: no
+  API version change. F3's second half ("`imd_pack` writes no byte beyond `pack_bytes`")
+  became ABI only after `pack_write_extent` and `pack_write_extent_memcheck` passed on every
+  `imd_pack` launch shape (NOTES-C1 IR17).
+- **§6g.6 measured** (NOTES-C1 IR10): a switch to a never-launched N costs at most 8 µs end
+  to end on its first call and 0.011–0.150 ms of first plan creation, less than re-packing
+  one operand (0.018–0.42 ms); cold capture works and its first replay is 0.98–1.10× the
+  steady one, so no plan-time preload is added.
+- **Certificates, not ABI:** I1 (pack offsets independent of N, res(N′) a prefix of
+  res(N_max)), I2 (plan device bytes independent of N and g), I3 (packing never grows the
+  workspace): `params.py cert_footprint_monotone` (also F1, F2, C-ws, C-pack).
+- **§6b.7:** the re-pack-in-place rule (the last pack's key only; no graph replay after a
+  re-pack with another key; WAR ordering). §6b.10 #15 notes that C1(a) keeps N in the key.
+- **Python:** `PackSpec.with_moduli`, `device.PackedBuffer` and `PackRecord` (host-side
+  record of the last pack, refusal of a stale plan with `PackMismatchError`), exported from
+  `immerdink`; `bench/python_overhead.py` measures the guard (methods `packed`,
+  `packed_guard`); `bench/first_call.py` measures the first call at a new N (§6g.6).
+- **Tests:** `host_footprint_monotone` (CPU), the `python_device` CPU part (a fake
+  libimmerdink), and on the GPU `packed_repack_n`, `workspace_shared_n`, `graph_phases` (cold
+  capture), `pack_write_extent` and `pack_write_extent_memcheck` (`tests/test_phases.py`,
+  `tests/memcheck_pack_extent.sh`).
+- **Provenance** (NOTES-C1 IR9, IR14): this worktree's libraries rebuilt first; host API 13,
+  `imd_perf_rank`, `imd_perf_predict_pack` and `imd_err_min_moduli` present;
+  `libimmerdink_host.so` byte-identical to the library that produced NOTES-C1's [M] figures.
+  The design-phase scripts and records are in immerdink-eval (`scripts/c1/design-phase/`,
+  `results/c1/design-phase/`), listed with their sha256 in
+  `findings/c1-design-phase-manifest.md`.

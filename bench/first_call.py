@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""The first call at a new N: what a precision-phase switch costs the first time (DESIGN v1.19
+§6g.6; NOTES-C1 IR10), next to re-packing an operand at that N.
+
+    QUIET_GATE=1 tools/run_quiet.sh python3 bench/first_call.py --sweep --out first_call.jsonl
+    python3 bench/first_call.py --N 10 --size 1024 --mode plain      # one fresh-process run
+
+--sweep runs one FRESH process per (shape, N, mode) and prints a table (TFLOPS-eq first, time
+alongside); a single run prints one JSON line. In each process:
+  1. warm-up at a base N (14, or 8 when N = 14): the CUDA context and every kernel a call at
+     the base N launches are loaded, so what follows is a switch to an N never launched in
+     the process, not process start-up (the plain mode also reports the process's very first
+     plan and contract at the base N, "cold_process");
+  2. plain mode: the first imd_plan_create at N and a second one (host time), the first
+     imd_contract at N (host enqueue time, GPU time between CUDA events, and enqueue to
+     completion), then the steady state (median of --reps event-timed calls); the first and
+     steady imd_pack of the operand A at N (the re-pack a phase switch needs for a packed
+     operand);
+  3. graph mode: the contract at N captured (cudaStreamCaptureModeGlobal) before any launch
+     at N (a cold capture), instantiated, then the first replay and the steady replay
+     (median of --reps), each GPU time between events and host time to completion. NOTES-C1
+     IR10's bar: a plan-time preload is needed if the cold capture fails or the first replay
+     costs > 2x the steady replay.
+"ik,kj->ij" m = n = k = --size, GENERATE vectors, g = N, RN; data (u - 1/2) exp(4 g).
+TFLOPS-eq = 2 m n k / time (FP64 work the call replaces). Under CUDA_MODULE_LOADING=LAZY
+(the default; set explicitly). Run on a quiet machine under the GPU lock (tools/run_quiet.sh).
+"""
+
+import argparse
+import ctypes as C
+import json
+import os
+import statistics
+import subprocess
+import sys
+import time
+
+os.environ["CUDA_MODULE_LOADING"] = os.environ.get("IMD_BENCH_MODULE_LOADING", "LAZY")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path[:0] = [os.path.join(ROOT, "tests")]
+import harness as hz  # noqa: E402
+
+
+class Rt:
+    """The CUDA runtime calls this benchmark needs (libcudart of libimmerdink)."""
+
+    def __init__(self):
+        rt = self.rt = C.CDLL("libcudart.so.13")
+        for name, args in {
+            "cudaMalloc": [C.POINTER(C.c_void_p), C.c_size_t], "cudaFree": [C.c_void_p],
+            "cudaMemcpy": [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int],
+            "cudaDeviceSynchronize": [], "cudaStreamCreate": [C.POINTER(C.c_void_p)],
+            "cudaStreamSynchronize": [C.c_void_p],
+            "cudaEventCreate": [C.POINTER(C.c_void_p)], "cudaEventRecord": [C.c_void_p, C.c_void_p],
+            "cudaEventSynchronize": [C.c_void_p],
+            "cudaEventElapsedTime": [C.POINTER(C.c_float), C.c_void_p, C.c_void_p],
+            "cudaStreamBeginCapture": [C.c_void_p, C.c_int],
+            "cudaStreamEndCapture": [C.c_void_p, C.POINTER(C.c_void_p)],
+            "cudaGraphInstantiate": [C.POINTER(C.c_void_p), C.c_void_p, C.c_ulonglong],
+            "cudaGraphLaunch": [C.c_void_p, C.c_void_p],
+        }.items():
+            getattr(rt, name).argtypes = args
+            getattr(rt, name).restype = C.c_int
+
+    def ok(self, err, what):
+        if err:
+            raise RuntimeError(f"{what}: CUDA error {err}")
+
+    def malloc(self, n):
+        p = C.c_void_p()
+        self.ok(self.rt.cudaMalloc(C.byref(p), max(int(n), 1)), "cudaMalloc")
+        return p.value
+
+    def event(self):
+        e = C.c_void_p()
+        self.ok(self.rt.cudaEventCreate(C.byref(e)), "cudaEventCreate")
+        return e.value
+
+    def elapsed_ms(self, a, b):
+        self.ok(self.rt.cudaEventSynchronize(b), "cudaEventSynchronize")
+        ms = C.c_float()
+        self.ok(self.rt.cudaEventElapsedTime(C.byref(ms), a, b), "cudaEventElapsedTime")
+        return ms.value
+
+
+def run_one(lib_path, N, size, mode, reps):
+    import numpy as np
+    L = hz.Library(lib_path)
+    lib = L.lib
+    rt = Rt()
+    m = n = k = size
+    i, j, kk = 1, 2, 3
+    tA, tB, tC = (hz.make_tensor(e, hz.dense(e), lab) for e, lab in
+                  (([m, k], [i, kk]), ([k, n], [kk, j]), ([m, n], [i, j])))
+    rng = np.random.default_rng(7)
+    out = {"N": N, "size": size, "mode": mode, "flop": 2 * m * n * k,
+           "module_loading": os.environ.get("CUDA_MODULE_LOADING")}
+    s = C.c_void_p()
+    rt.ok(rt.rt.cudaStreamCreate(C.byref(s)), "stream")
+    s = s.value
+    ev = [rt.event() for _ in range(2)]
+    dev = {}
+    for name, e in (("A", m * k), ("B", k * n), ("C", m * n)):
+        dev[name] = rt.malloc(8 * e)
+        x = ((rng.random(e) - 0.5) * np.exp(4.0 * rng.standard_normal(e))).astype(np.float64)
+        rt.ok(rt.rt.cudaMemcpy(dev[name], x.ctypes.data, 8 * e, 1), "H2D")
+    h = L.handle()
+
+    def plan_at(Nx):
+        p = C.c_void_p()
+        t0 = time.perf_counter()
+        st = lib.imd_plan_create(h, C.byref(tA), C.byref(tB), C.byref(tC),
+                                 C.byref(hz.Options(Nx, 0, hz.RN, hz.EMULATE, 0, 0)), C.byref(p))
+        dt = time.perf_counter() - t0
+        if st:
+            raise RuntimeError(f"imd_plan_create N={Nx}: {hz.STATUS[st]}")
+        return p, dt
+
+    def ws_at(Nx):
+        return L.workspace_size(tA, tB, tC, Nx)[1]
+
+    base = 8 if N == 14 else 14
+    nws = max(ws_at(N), ws_at(base))
+    ws = rt.malloc(nws)
+
+    def contract(p, timed=True):
+        """(host enqueue s, GPU ms, host enqueue-to-completion s)."""
+        rt.ok(rt.rt.cudaEventRecord(ev[0], s), "record")
+        t0 = time.perf_counter()
+        st = lib.imd_contract(p, 1.0, dev["A"], dev["B"], 0.0, dev["C"], ws, nws, s)
+        t1 = time.perf_counter()
+        if st:
+            raise RuntimeError(f"imd_contract: {hz.STATUS[st]}")
+        rt.ok(rt.rt.cudaEventRecord(ev[1], s), "record")
+        gpu = rt.elapsed_ms(ev[0], ev[1])
+        return t1 - t0, gpu, time.perf_counter() - t0
+
+    # 1. the process's first plan and contract (at the base N), then warm the base N
+    pb_, t_plan0 = plan_at(base)
+    first0 = contract(pb_)
+    if mode == "plain":
+        out["cold_process"] = {"N": base, "plan_create_s": t_plan0, "enqueue_s": first0[0],
+                               "gpu_ms": first0[1], "total_s": first0[2]}
+    for _ in range(3):
+        contract(pb_)
+    rt.ok(rt.rt.cudaDeviceSynchronize(), "sync")
+
+    # 2. the switch to N (never launched in this process)
+    p, t_plan = plan_at(N)
+    p2, t_plan2 = plan_at(N)
+    out["plan_create_first_s"], out["plan_create_again_s"] = t_plan, t_plan2
+    if mode == "plain":
+        first = contract(p)
+        steady = [contract(p) for _ in range(reps)]
+        out["contract_first"] = {"enqueue_s": first[0], "gpu_ms": first[1], "total_s": first[2]}
+        out["contract_steady"] = {"enqueue_s": statistics.median(x[0] for x in steady),
+                                  "gpu_ms": statistics.median(x[1] for x in steady),
+                                  "total_s": statistics.median(x[2] for x in steady)}
+        # re-pack cost: imd_pack of A at N (its pack kernels: first launch, then steady)
+        klist = (C.c_int32 * 1)(kk)
+        od = hz.PackDesc(C.sizeof(hz.PackDesc), N, hz.RN, hz.ORDER_AUTO, C.pointer(tA), 1,
+                         klist, 0, None, 0, None)
+        st, hp = L.pack_create(od)
+        if st != "SUCCESS":
+            raise RuntimeError(f"imd_pack_create: {st}")
+        pbytes, pws = L.pack_bytes(hp)
+        dp, dpw = rt.malloc(pbytes), rt.malloc(pws)
+
+        def pack():
+            rt.ok(rt.rt.cudaEventRecord(ev[0], s), "record")
+            t0 = time.perf_counter()
+            st = lib.imd_pack(hp, dev["A"], dp, pbytes, dpw, pws, s)
+            t1 = time.perf_counter()
+            if st:
+                raise RuntimeError(f"imd_pack: {hz.STATUS[st]}")
+            rt.ok(rt.rt.cudaEventRecord(ev[1], s), "record")
+            return t1 - t0, rt.elapsed_ms(ev[0], ev[1]), time.perf_counter() - t0
+        pf = pack()
+        ps = [pack() for _ in range(reps)]
+        out["pack_bytes"] = pbytes
+        out["pack_first"] = {"enqueue_s": pf[0], "gpu_ms": pf[1], "total_s": pf[2]}
+        out["pack_steady"] = {"enqueue_s": statistics.median(x[0] for x in ps),
+                              "gpu_ms": statistics.median(x[1] for x in ps),
+                              "total_s": statistics.median(x[2] for x in ps)}
+        L.pack_destroy(hp)
+    else:
+        g, ge = C.c_void_p(), C.c_void_p()
+        rt.ok(rt.rt.cudaStreamBeginCapture(s, 0), "begin capture")
+        t0 = time.perf_counter()
+        st = lib.imd_contract(p, 1.0, dev["A"], dev["B"], 0.0, dev["C"], ws, nws, s)
+        t_cap = time.perf_counter() - t0
+        end = rt.rt.cudaStreamEndCapture(s, C.byref(g))
+        out["capture_status"] = hz.STATUS[st]
+        out["end_capture_error"] = end
+        if st or end:
+            out["capture_ok"] = False
+            return out
+        t0 = time.perf_counter()
+        rt.ok(rt.rt.cudaGraphInstantiate(C.byref(ge), g, 0), "instantiate")
+        out["capture_ok"] = True
+        out["capture_s"], out["instantiate_s"] = t_cap, time.perf_counter() - t0
+
+        def replay():
+            rt.ok(rt.rt.cudaEventRecord(ev[0], s), "record")
+            t0 = time.perf_counter()
+            rt.ok(rt.rt.cudaGraphLaunch(ge, s), "graph launch")
+            rt.ok(rt.rt.cudaEventRecord(ev[1], s), "record")
+            gpu = rt.elapsed_ms(ev[0], ev[1])
+            return gpu, time.perf_counter() - t0
+        first = replay()
+        steady = [replay() for _ in range(reps)]
+        out["replay_first"] = {"gpu_ms": first[0], "total_s": first[1]}
+        out["replay_steady"] = {"gpu_ms": statistics.median(x[0] for x in steady),
+                                "total_s": statistics.median(x[1] for x in steady)}
+        out["first_over_steady_gpu"] = first[0] / out["replay_steady"]["gpu_ms"]
+        out["first_over_steady_total"] = first[1] / out["replay_steady"]["total_s"]
+    return out
+
+
+def tflops(flop, seconds):
+    return flop / seconds / 1e12 if seconds > 0 else float("nan")
+
+
+def table(rows):
+    print("plain: switch to a never-launched N (TFLOPS-eq first, time alongside; ms)")
+    print(f"{'size':>5} {'N':>3} | {'plan 1st':>8} {'plan 2nd':>8} | {'1st call TF':>11} "
+          f"{'ms':>8} | {'steady TF':>9} {'ms':>7} | {'extra ms':>8} | {'pack 1st':>8} "
+          f"{'pack ms':>7}")
+    for r in rows:
+        if r["mode"] != "plain":
+            continue
+        f, st = r["contract_first"], r["contract_steady"]
+        extra = 1e3 * f["total_s"] - st["gpu_ms"]
+        print(f"{r['size']:>5} {r['N']:>3} | {1e3 * r['plan_create_first_s']:>8.3f} "
+              f"{1e3 * r['plan_create_again_s']:>8.3f} | "
+              f"{tflops(r['flop'], f['total_s']):>11.2f} {1e3 * f['total_s']:>8.3f} | "
+              f"{tflops(r['flop'], st['gpu_ms'] / 1e3):>9.2f} {st['gpu_ms']:>7.3f} | "
+              f"{extra:>8.3f} | {1e3 * r['pack_first']['total_s']:>8.3f} "
+              f"{r['pack_steady']['gpu_ms']:>7.3f}")
+    print("\ngraph: cold capture at a never-launched N, first vs steady replay")
+    print(f"{'size':>5} {'N':>3} | {'capture':>7} | {'1st TF':>7} {'1st ms':>8} | "
+          f"{'steady TF':>9} {'ms':>7} | {'1st/steady':>10}")
+    for r in rows:
+        if r["mode"] != "graph":
+            continue
+        if not r.get("capture_ok"):
+            print(f"{r['size']:>5} {r['N']:>3} | FAILED ({r.get('capture_status')}, "
+                  f"end {r.get('end_capture_error')})")
+            continue
+        f, st = r["replay_first"], r["replay_steady"]
+        print(f"{r['size']:>5} {r['N']:>3} | {'ok':>7} | {tflops(r['flop'], f['total_s']):>7.2f} "
+              f"{1e3 * f['total_s']:>8.3f} | {tflops(r['flop'], st['gpu_ms'] / 1e3):>9.2f} "
+              f"{st['gpu_ms']:>7.3f} | {r['first_over_steady_total']:>10.2f}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--lib", default=hz.default_lib())
+    ap.add_argument("--N", type=int, default=10)
+    ap.add_argument("--size", type=int, default=1024)
+    ap.add_argument("--mode", choices=("plain", "graph"), default="plain")
+    ap.add_argument("--reps", type=int, default=20)
+    ap.add_argument("--sweep", action="store_true",
+                    help="one fresh process per (size, N, mode): sizes 1024 4096, N 6 8 10 14")
+    ap.add_argument("--sizes", default="1024,4096")
+    ap.add_argument("--Ns", default="6,8,10,14")
+    ap.add_argument("--out", help="append the JSON lines here (--sweep)")
+    a = ap.parse_args()
+    if not a.sweep:
+        print(json.dumps(run_one(a.lib, a.N, a.size, a.mode, a.reps)))
+        return 0
+    rows = []
+    for size in map(int, a.sizes.split(",")):
+        for N in map(int, a.Ns.split(",")):
+            for mode in ("plain", "graph"):
+                r = subprocess.run([sys.executable, os.path.abspath(__file__), "--lib", a.lib,
+                                    "--N", str(N), "--size", str(size), "--mode", mode,
+                                    "--reps", str(a.reps)], capture_output=True, text=True)
+                if r.returncode:
+                    print(r.stdout, r.stderr, file=sys.stderr)
+                    return 1
+                rec = json.loads(r.stdout.strip().splitlines()[-1])
+                rec["date"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                rows.append(rec)
+                if a.out:
+                    with open(a.out, "a") as f:
+                        f.write(json.dumps(rec) + "\n")
+    table(rows)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
