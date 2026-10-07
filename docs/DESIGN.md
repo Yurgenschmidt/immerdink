@@ -1785,14 +1785,19 @@ there is no budget option (BENCHMARKS "Residue-group size g" gives the speed sid
     every fixed g ≥ 1, and nondecreasing in g ∈ [1, N]. With g = 0 (normalized to N) they are
     nondecreasing in N. With packed roles and RN, the packs' κ ≥ T(N) makes the smallest N
     NOT_SUPPORTED (§6b.3); F1 holds over the N where the query succeeds, which is an up-set
-    in N (T grows with N).
+    in N (T grows with N). The up-set is part of the promise (NOTES-C1 §5.4 S0-2): if the
+    query succeeds at some N, it succeeds at every larger N, so C-ws is well defined.
   - **F2.** `pack_bytes` (`imd_pack_layout`, `imd_pack_bytes`) is nondecreasing in N.
   - **F3.** `imd_pack` writes every byte of [0, `pack_bytes`) (§6b.4). A packed contract
     reads only [0, `pack_bytes`) of a packed buffer: that is the buffer's ALIASING extent
     (§6b.5), and CompatSpec's `NoOOBRead` (spec/PackedOperand.tla) models it. **`imd_pack`
     writes no byte beyond `pack_bytes`**: published in v1.19, only after the GPU tests
     `pack_write_extent` and `pack_write_extent_memcheck` passed on every `imd_pack` launch
-    shape (NOTES-C1 IR17; §6g.8).
+    shape, including KL's radix > 1 row mapping, with the coverage asserted by the test
+    itself (NOTES-C1 IR17; §6g.8).
+  - **Not covered: `imd_pack`'s own workspace** (`pack_ws_bytes` of `imd_pack_layout` /
+    `imd_pack_bytes`). That it does not depend on N is I1 (§6g.3), a certificate, not a promise.
+    A caller who sizes it once for several phases takes the maximum of the per-phase queries.
   - **Consequences** (proof in §6g.2). **C-ws:** one workspace of
     `imd_workspace_size(N_max, g_max)` serves every plan with the same descriptors, options
     and packed roles, N ≤ N_max and g ≤ g_max (g = 0 counts as N), with at most one call in
@@ -4723,7 +4728,9 @@ proof:
   gap, KL the σ, flag and plane rows (§6b.11). That was an inference [I] until
   `pack_write_extent` (sentinels around an exactly sized window) and
   `pack_write_extent_memcheck` (exactly sized allocations under memcheck) checked it on every
-  `imd_pack` launch shape; only then did it become ABI (NOTES-C1 IR17).
+  `imd_pack` launch shape: the 42 KL shapes, among them the radix > 1 row mapping a
+  batch-fastest X takes, plus `kp_prep`'s two instances and a gathered K (§6g.8). Only then did
+  it become ABI (NOTES-C1 IR17).
 - **C-ws.** ws(N, g) ≤ ws(N_max, g) ≤ ws(N_max, g_max) by F1, which applies because
   g ≤ N ≤ N_max (`options_ok`), and the contract checks accept a larger workspace (§6). The
   bytes a call at another N left behind are never read: every byte a call reads, that call
@@ -4733,6 +4740,9 @@ proof:
 - **C-pack.** It follows from F2, F3's first half and the read extent: `imd_pack` at N′
   writes all of [0, `pack_bytes(N′)`), and a contract at N′ reads only that range. It needs
   neither the offsets (I1) nor F3's second half.
+- **Outside F1–F3:** `imd_pack`'s own workspace. Its independence of N is I1 (§6g.3), so a
+  caller who sizes it once for every phase takes the maximum of the per-phase `pack_ws_bytes`
+  (the tests `packed_repack_n` and `workspace_shared_n` do).
 
 ### 6g.3 Internal facts: certificates, not ABI
 
@@ -4768,7 +4778,13 @@ forbids, and it could not protect graph replays anyway.
     previous record; a CUDA_ERROR clears it.
   - `Plan.contract` and `immerdink.contract` refuse a `PackedBuffer` whose record differs
     from the plan slot's pack, or that has none, with `PackMismatchError` ("buffer last
-    packed at N=8, plan expects N=14"), before any C call.
+    packed at N=8, plan expects N=14"), before any C call. The error's `reason` stays None:
+    it means the library's plan-time `IMD_PACK_MISMATCH_*` reason, and this refusal is a
+    host-side comparison, so the message alone names the N, rounding or key difference.
+  - `Pack.record` is the `PackRecord` of a pack's key: what a `PackedBuffer` records when
+    that pack writes it, and what a plan made with that pack expects. `PackedBuffer.last_pack`
+    is the record of the last successful pack into the buffer (None before the first one, or
+    after a CUDA_ERROR).
   - It allocates nothing, and raw buffers behave as before.
 - It is a safety net, not a soundness argument. The digest is the library's FNV-1a
   `key_digest`, for diagnostics only. The record follows host enqueue order, not GPU order:
@@ -4788,7 +4804,8 @@ vectors, under `CUDA_MODULE_LOADING=LAZY` (the CUDA default). Each (size, N, mod
 fresh process that first plans and calls at another N, so the numbers are a switch, not process
 start-up. Call times run from just before the enqueue to completion, the same measure for the
 steady call (median of 20) and the first one. Records: immerdink-eval
-`results/c1/stage0_first_call.jsonl`, summary `findings/c1-stage0-first-call.md`.
+`results/c1/stage0_first_call.jsonl` (`bench/first_call.py --table` prints this table from
+them, with the GPU-event times alongside), summary `findings/c1-stage0-first-call.md`.
 
 | m = n = k | N | steady call | first call at the new N | first plan creation | re-pack of A (GPU) | cold capture: first / steady replay |
 |---:|---:|---|---|---:|---:|---:|
@@ -4803,14 +4820,17 @@ steady call (median of 20) and the first one. Records: immerdink-eval
 
 - **The switch is cheap.** The first call at a never-launched N spends 12–35 µs more host time
   enqueueing than a steady call (consistent with the lazy load of that N's kernels [I]); most
-  of it overlaps the GPU, and from enqueue to completion the first call takes at most 8 µs
-  more (5–8 µs at 1024³, within noise at 4096³). The first `imd_plan_create` at the new N
-  takes 0.011–0.150 ms, against 0.004–0.005 ms afterwards. The 0.14–0.15 ms cases (1024³,
-  N = 6 and 10) probably load a K4 configuration the earlier N did not use, since plan
-  creation reads the K4 kernels' attributes [I].
+  of it overlaps the GPU, and from enqueue to completion the first call takes at most 9 µs
+  more (5–7 µs at 1024³; at 4096³ between −13 and +9 µs, under 0.3 % of the call).
+- **Plan creation is not part of the switch.** The first `imd_plan_create` at the new N takes
+  0.011–0.150 ms of host time, against 0.004–0.005 ms afterwards: a one-time cost per N per
+  process, paid when the plans are made before the iteration loop (§6g.1). The 0.14–0.15 ms
+  cases (1024³, N = 6 and 10) probably load a K4 configuration the earlier N did not use,
+  since plan creation reads the K4 kernels' attributes [I].
 - **Re-packing costs more.** Re-packing one operand at the new N takes 0.018–0.023 ms of GPU
-  time at 1024² and 0.28–0.42 ms at 4096², and it recurs at every phase switch (every
-  iteration for an operand that changes), while the switch is paid once per N per process.
+  time at 1024² and 0.28–0.42 ms at 4096², more than the first call's extra time (3–5× at
+  1024³). It recurs at every phase switch (every iteration for an operand that changes),
+  while the first call's extra time is paid once per N per process.
 - **Cold capture works.** `graph_phases` captures phases whose N never ran in its process
   (bit-exact), and here the first replay of a cold capture is 0.98–1.10× the steady replay.
   NOTES-C1 IR10's bar (a capture failure, or a first replay above 2× the steady one) is not
@@ -4859,30 +4879,40 @@ it.
     bit-exact, every packed byte equal to `oracle.pack`. Bytes above `pack_bytes(8)` keep a
     sentinel. The stale N = 14 plan with the `PackedBuffer` raises `PackMismatchError` with
     no launch; with the raw buffer it returns SUCCESS and a wrong C (the documented limit).
-    Then back to N = 14. Both post-swap roles (B with tail rows).
+    Then back to N = 14. Both post-swap roles (B with tail rows), each case's role asserted.
   - `workspace_shared_n`: one workspace of `imd_workspace_size(N = 14, g = 0)` serves plans
     at (N, g) ∈ {5, 8, 14} × several g, both vec modes, called alternately on one stream
     (KF; KL with the role swap). Then the same with A re-packed before each call into one
-    buffer of `pack_bytes(14)`. All bit-exact; no allocation; the guard zones untouched.
+    buffer of `pack_bytes(14)`, and one `imd_pack` workspace of the maximum per-N
+    `pack_ws_bytes`. All bit-exact; no allocation; the guard zones untouched.
   - `graph_phases`: one graph per phase, N = 6 (warm) and N = 10 (**cold**: captured before
     any launch at N = 10 in the process, under `CUDA_MODULE_LOADING=LAZY`), sharing one
     workspace and replayed alternately on new data, bit-exact. A cold packed phase too:
-    `imd_pack` and `imd_contract_packed` at N = 12, never launched, in one graph.
-  - `pack_write_extent` (F3's evidence): 88 packs covering every `imd_pack` launch shape.
-    KL reads along rows (tiles of 64, 32, 16 and 8 rows; rows on chip and re-read chunks)
-    and along k̄ (tiles of 64 down to 1 row; 8 and 4 values per thread), each with W = 2 and
-    3, RN and TRUNC, A = 16 and 64 (where k > 96 allows it), r ∈ {1, 15, 16, 17, 33},
-    b ∈ {1, 3}, N ∈ {2, 3, 8, 14, 20}. Each pack is written twice into an exactly sized
-    window of a buffer filled with a sentinel (0xA5, then 0x5A). Every byte outside the
-    window keeps the sentinel, every byte inside is the same both times (all written), and
-    small packs equal `oracle.pack`; the same holds for `imd_pack`'s workspace. Each pack, in
-    an exactly sized allocation, is then read by `imd_contract_packed` with the in-line
-    partner on every producer path (KF or KL by rule, K1 + K2/K3, KL, KL with 64-row tiles),
-    each bit-identical to the plain `imd_contract`.
-  - `pack_write_extent_memcheck` (`tests/memcheck_pack_extent.sh`): the same packs and
-    contracts with every allocation exactly sized, under `compute-sanitizer --tool memcheck
-    --padding 4096`: clean. A pack allocation 16 bytes short (`imd_pack` told `pack_bytes`)
-    must be reported as an invalid global write, which shows the check fires.
+    `imd_pack` and `imd_contract_packed` at N = 12, never launched, in one graph. The script
+    refuses to run it after another suite in the same process.
+  - `pack_write_extent` (F3's evidence): 113 packs. The suite computes each pack's KL launch
+    from the rule (`pack_pivot`, `pack_kl_lg_rows_for`, `kl_launch`; its transcription of
+    `pack_pivot` is checked against the library's on every case's plan view) and fails unless
+    the cases cover all 42 shapes: along rows, tiles of 64, 32 and 16 rows, and of 8 rows with
+    one or two chunks on chip or with re-read chunks, each with radix 1 and radix > 1
+    (a batch-fastest X; two row modes); along k̄, tiles of 64 down to 1 row, the 1-row tile
+    with one, two or more chunks; each with W = 2 and 3. They also cover `kp_prep`'s
+    nine-mode instance (an X with nine fused modes), a gathered K (two K modes X cannot fuse),
+    and both post-swap roles. RN and TRUNC, A = 16 and 64 (where k > 96 allows it),
+    r ∈ {1, 15, 16, 17, 33} (12, 35 and 36 in the multi-mode cases), b ∈ {1, 3, 5, 12},
+    N ∈ {2, 3, 8, 14, 17, 20}. Each pack is written twice into an exactly sized window of a
+    buffer filled with a sentinel (0xA5, then 0x5A). Every byte outside the window keeps the
+    sentinel, every byte inside is the same both times (all written), and small packs (72)
+    equal `oracle.pack`; the same holds for `imd_pack`'s workspace. Each pack, in an exactly
+    sized allocation, is then read by `imd_contract_packed` with the in-line partner on every
+    producer path (KF or KL by rule, K1 + K2/K3, KL, KL with 64-row tiles; every 12th case
+    also under each of the four K4 configurations): 612 packed contracts, each bit-identical
+    to the plain `imd_contract`, which must change C and (77 small cases) equal the oracle.
+  - `pack_write_extent_memcheck` (`tests/memcheck_pack_extent.sh`): the same 113 packs and
+    612 contracts, with the same coverage assertion, every allocation exactly sized, under
+    `compute-sanitizer --tool memcheck --padding 4096`: clean. A pack allocation 16 bytes
+    short (`imd_pack` told `pack_bytes`) must be reported as an invalid global write, which
+    shows the check fires.
 
 ### 6g.9 Risks and limits
 
@@ -5616,11 +5646,17 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
   C-pack (one packed buffer for every N′ ≤ N_max). They describe the current formulas: no
   API version change. F3's second half ("`imd_pack` writes no byte beyond `pack_bytes`")
   became ABI only after `pack_write_extent` and `pack_write_extent_memcheck` passed on every
-  `imd_pack` launch shape (NOTES-C1 IR17).
-- **§6g.6 measured** (NOTES-C1 IR10): a switch to a never-launched N costs at most 8 µs end
-  to end on its first call and 0.011–0.150 ms of first plan creation, less than re-packing
-  one operand (0.018–0.42 ms); cold capture works and its first replay is 0.98–1.10× the
-  steady one, so no plan-time preload is added.
+  `imd_pack` launch shape (NOTES-C1 IR17), the radix > 1 row mapping included, with the
+  coverage asserted by the test (independent review of stage 0, must-fix 1). `imd_pack`'s
+  own workspace is outside F1–F3 (its independence of N is I1). The header comments of
+  `imd_pack`, `imd_workspace_size[_packed]` and `imd_pack_layout` say so.
+- **§6g.6 measured** (NOTES-C1 IR10): the first call at a never-launched N takes at most 9 µs
+  more than a steady call, end to end (5–7 µs at 1024³, under 0.3 % at 4096³), less than one
+  re-pack of an operand (0.018–0.42 ms of GPU time). The first plan creation at that N
+  (0.011–0.150 ms) is a one-time host cost per N per process, paid before the iteration loop.
+  Cold capture works and its first replay is 0.98–1.10× the steady one, so no plan-time
+  preload is added. (This corrects the summary in commit 8b58101's message, which said "at
+  most 8 µs" and compared plan creation with a re-pack.)
 - **Certificates, not ABI:** I1 (pack offsets independent of N, res(N′) a prefix of
   res(N_max)), I2 (plan device bytes independent of N and g), I3 (packing never grows the
   workspace): `params.py cert_footprint_monotone` (also F1, F2, C-ws, C-pack).
@@ -5630,10 +5666,10 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
   record of the last pack, refusal of a stale plan with `PackMismatchError`), exported from
   `immerdink`; `bench/python_overhead.py` measures the guard (methods `packed`,
   `packed_guard`); `bench/first_call.py` measures the first call at a new N (§6g.6).
-- **Tests:** `host_footprint_monotone` (CPU), the `python_device` CPU part (a fake
-  libimmerdink), and on the GPU `packed_repack_n`, `workspace_shared_n`, `graph_phases` (cold
-  capture), `pack_write_extent` and `pack_write_extent_memcheck` (`tests/test_phases.py`,
-  `tests/memcheck_pack_extent.sh`).
+- **Tests:** `host_footprint_monotone` (CPU, in `tools/test.sh`'s CPU-only pass, outside the
+  GPU lock), the `python_device` CPU part (a fake libimmerdink), and on the GPU
+  `packed_repack_n`, `workspace_shared_n`, `graph_phases` (cold capture), `pack_write_extent`
+  and `pack_write_extent_memcheck` (`tests/test_phases.py`, `tests/memcheck_pack_extent.sh`).
 - **Provenance** (NOTES-C1 IR9, IR14): this worktree's libraries rebuilt first; host API 13,
   `imd_perf_rank`, `imd_perf_predict_pack` and `imd_err_min_moduli` present;
   `libimmerdink_host.so` byte-identical to the library that produced NOTES-C1's [M] figures.

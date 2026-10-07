@@ -3,9 +3,34 @@
 ## Status
 
 **Revised after two independent reviews, 2026-10-07, then amended by the binding decisions of the
-independent design reviewer, 2026-10-07** (branch `claude/ozaki-kernels-immerdink-1089fd`). This
-is a design phase: nothing has been built, no test or TLA+ model has been run, and no GPU work
-has been done.
+independent design reviewer, 2026-10-07** (branch `claude/ozaki-kernels-immerdink-1089fd`). The
+text below was written in the design phase, before anything was built, tested or run on the GPU;
+what has been built since is recorded under "Implementation status".
+
+**Implementation status.**
+- **Stage 0 (§4.1) is done, 2026-10-07: DESIGN v1.19 §6g**, approved with fixes by an independent
+  reviewer; the fixes are applied, and the reviewer's verdicts on the implementation's design
+  questions are §5.4.
+  - **IR14:** this worktree's libraries were rebuilt first (`tools/test.sh`, host API 13; `nm`
+    shows `imd_perf_rank`, `imd_perf_predict_pack`, `imd_err_min_moduli`).
+    `build/libimmerdink_host.so` has sha256 `466acdb469b06e404a202c0d3f2ce5ab4f27d3c0f881984ecd4b9122648810fc`,
+    byte-identical to the agent-ac829dae library of the [M] figures, so every design-phase [M]
+    figure is a figure of this worktree's library; `build/libimmerdink.so` has sha256
+    `b8baa75d2d2869341431c9a7667b7a61ab03392d9ced21b16ef2b473abfbec85`.
+  - **IR9:** the 61 design-phase files are in immerdink-eval (Provenance below), listed with
+    their sha256 in `findings/c1-design-phase-manifest.md`; the scripts and the manifest are
+    committed there (7bdac3d), the records stay untracked.
+  - **IR10, closed by measurement: no plan-time preload.** Cold capture works at every N
+    measured (`graph_phases`; `bench/first_call.py`), and the first replay of a cold capture is
+    0.98–1.10× the steady one, against the 2× bar. The first call at a never-launched N takes at
+    most 9 µs more than a steady one, end to end (DESIGN §6g.6; immerdink-eval
+    `findings/c1-stage0-first-call.md`).
+  - **IR17, evidence passed: F3's second half is published** (DESIGN §6a). `pack_write_extent`
+    and `pack_write_extent_memcheck` cover 113 packs and assert that the cases reach all 42
+    launch shapes of `imd_pack`'s KL, the radix > 1 row mapping included (added after the
+    review found every earlier case at radix 1), plus `kp_prep`'s two instances and a gathered
+    K; sentinels and memcheck are clean, and the 16-byte-short mutation is reported.
+  - **IR18:** ROADMAP C1's decision column and C2's title are updated (Q6, Q7).
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -121,7 +146,10 @@ order of work and a definition of done. They override the earlier text wherever 
 - [I]: inference, not checked.
 
 **Provenance.**
-- Design-phase scratch directory: `/home/ef/.claude/jobs/ca28e7d2/tmp/c1/`.
+- Design-phase scratch directory: `/home/ef/.claude/jobs/ca28e7d2/tmp/c1/` (ephemeral). **Copied
+  to immerdink-eval in stage 0** (IR9): the scripts to `scripts/c1/design-phase/`, the records to
+  `results/c1/design-phase/`, each with its sha256 in `findings/c1-design-phase-manifest.md`. The
+  file names below are relative to those directories.
   - Scripts: emulator `emu.py`; scaling variants `exp_acc.py`, `exp_hyb.py`, `exp_lowN.py`;
     K-weight study `c2gate.py`, `c2gate2.py`; K-segments `c2cmp.py`; envelope rule `c2bcs/`;
     slices `slice_eval/`; the review's size check `judge/keq_m.py`.
@@ -129,8 +157,8 @@ order of work and a definition of done. They override the earlier text wherever 
     `perf_summary.md`, `c2cost.md`, `predict_cc.out`.
   - Second-round review scripts: R-api's host-model spot checks `review_api/spot*.py`; R-num's
     exact L5c/L6 checks `review/chk_lemmas.py` (and `review/chk_perf.py`).
-- **Copy to immerdink-eval** (IR9; stage 0 step (b)). Scratch is ephemeral, and the provenance
-  rule is paper-grade:
+- **Copy to immerdink-eval** (IR9; stage 0 step (b); **done 2026-10-07**, every copy compared
+  with `cmp`). Scratch is ephemeral, and the provenance rule is paper-grade:
   - the scripts (emu.py, exp_*.py, c2gate*.py, c2cmp*.py, c2bcs/, slice_eval/, judge/,
     review*/, perf*.py, nsweep.py, phases.py, predict_cc*.py) go to
     `scripts/c1/design-phase/` (tracked);
@@ -151,10 +179,11 @@ order of work and a definition of done. They override the earlier text wherever 
   `results/c1/`.
 - [M] numbers come from `.claude/worktrees/agent-ac829dae3600d2888/build/libimmerdink_host.so`
   (cbdf230, host API 13). Its `src/host`, `include` and `python` match this worktree's
-  (`diff -rq`). This worktree's own `build/libimmerdink_host.so` is stale: host API 5, with no
-  `imd_perf_*` or `imd_err_*` symbols (R-num confirmed this with `nm`). **Rebuilding it is the
-  first step of stage 0** (IR14). Stages 0 and 1 already need the API-13 symbols, and every
-  later record names this worktree's library.
+  (`diff -rq`). This worktree's own `build/libimmerdink_host.so` was stale in the design phase:
+  host API 5, with no `imd_perf_*` or `imd_err_*` symbols (R-num confirmed this with `nm`).
+  **Rebuilding it was the first step of stage 0** (IR14), and the rebuilt library is
+  byte-identical to the agent-ac829dae one (sha256 under "Implementation status"). Stages 0 and
+  1 already need the API-13 symbols, and every later record names this worktree's library.
 - Tag suffixes: "[C, review]", "[M, review]" and "[E, review]" mark numbers a second-round
   reviewer computed or estimated, under the same rules. A tag without a suffix is this draft's
   own. "[V, independent reviewer]" marks a fact the independent design reviewer verified for its
@@ -3100,6 +3129,46 @@ its cost figures are estimates.
 - **IR28. Order of work** (§4.11): round 1 (CPU) and round 2 (GPU), following the dependencies.
 - **IR29. Definition of done** for C1 and C2 (§4.11). Completion is a finite checklist in
   which every gated item ends as built, closed or deferred with a trigger.
+
+### 5.4 Stage 0: the implementation's design questions (independent reviewer, 2026-10-07)
+
+The stage-0 implementation raised seven questions that the text above did not settle. Each was
+decided conservatively and then put to an independent reviewer, whose verdicts are binding.
+- **S0-1. What "every pack path" means for F3** (IR17 named "KF, KL, K2/K3"). *Verdict:
+  confirmed, on condition that the radix > 1 cases pass.* `imd_pack` launches only `kp_prep`
+  and one KL (contract.cu `enqueue_pack`); KF and K1 + K2/K3 write only the contract
+  workspace, so IR17's list was a misnomer. Every pack path means every `imd_pack` launch shape
+  for the write extent, plus packed contracts on every producer path, under memcheck, for the
+  read extent. The reviewer recomputed the launch rule for the 88 original cases: they covered
+  all 26 (along rows, tile height, values per thread, W) shapes, but not the radix > 1 row
+  mapping a batch-fastest X takes. The fix added those cases (113 packs in all), and the suite
+  now asserts its own coverage (DESIGN §6g.8). It passed under both the sentinels and memcheck,
+  so the publication stands. Had it failed, the library would have been fixed to meet the
+  promise; an ABI promise is not withdrawn.
+- **S0-2. F1 for `imd_workspace_size_packed` with RN.** The packs' κ ≥ T(N) makes the smallest N
+  NOT_SUPPORTED, so DESIGN §6a states F1 over the N where the query succeeds. *Verdict:
+  accepted, and the up-set is part of the promise.* T(N) is strictly increasing on 2..20, and
+  RN accepts k ≤ (T − 1)², so the N where the query succeeds form an up-set. C-ws needs that: if
+  any phase's query succeeds, the query at N_max succeeds too. `host_footprint_monotone`
+  asserts the up-set and the exact NOT_SUPPORTED boundary.
+- **S0-3. `PackedBuffer` refuses a buffer with no record** (never written by `Pack.pack`).
+  *Verdict: accepted.* A buffer filled by `pack_ptr`, a copy or persisted bytes has no
+  host-side provenance, so it goes through the raw path (DESIGN §6g.5).
+- **S0-4. `PackMismatchError.reason` for that refusal.** *Verdict: keep None.* The attribute
+  means the library's plan-time `IMD_PACK_MISMATCH_*` reason; the digest comparison is a
+  host-side diagnostic of a different reliability, and the message names the difference
+  (DESIGN §6g.5).
+- **S0-5. `packed_repack_n` asserts that the stale plan with a raw buffer returns SUCCESS and a
+  wrong C.** *Verdict: accepted.* DESIGN §6b.7 states that hazard as fact. If the library ever
+  detected stale buffers, it would reverse §6b.10 #12, and the DESIGN text and the assertion
+  would change together.
+- **S0-6. `CUDA_MODULE_LOADING=LAZY` forced** in `test_phases.py` and (overridable with
+  `IMD_BENCH_MODULE_LOADING`) in `bench/first_call.py`. *Verdict: accepted.* LAZY is the CUDA
+  default and the worst case for capture: a function first loaded inside the capture is what
+  IR10 asked to test.
+- **S0-7. `host_footprint_monotone` covers N = 2..20** where §4.1's grid said 2..19. *Verdict:
+  accepted.* N_MAX is 20; the superset covers the W = 3 boundary (N ≥ 17) and the whole
+  published F1/F2 range.
 
 ---
 

@@ -53,8 +53,8 @@ milestone like M2/M3, L ≈ multi-milestone or research.
 
 | # | Item | Addresses | Size | Your decision |
 |---|---|---|---|---|
-| C1 | **Adaptive precision** — options: (a) per-call N (re-pack; simplest), (b) auto-N from the M5 elementwise rule (N grows with log‖a‖‖b‖/‖x‖), (c) **Ozaki-I slice mode** (prefix slices: one packed operand serves every precision) | iterative methods that need full precision only near convergence; N = 8 is ~1.6× faster than N = 14 | L | which variant(s); TLA+ for slices |
-| C2 | Accurate-mode scaling | more bits per modulus ⇒ smaller N at equal accuracy | M | after C1 |
+| C1 | **Adaptive precision** — options: (a) per-call N (re-pack; simplest), (b) auto-N from the M5 elementwise rule (N grows with log‖a‖‖b‖/‖x‖), (c) **Ozaki-I slice mode** (prefix slices: one packed operand serves every precision). Design: docs/NOTES-C1.md. **Stage 0 done (2026-10-07, DESIGN v1.19 §6g):** precision phases on host API 13 (a plan and a pack per N), footprints published from API 13 on (§6a F1–F3: workspace and pack bytes nondecreasing in N and g, `imd_pack` writes nothing beyond `pack_bytes`), the re-pack-in-place rule, `PackSpec.with_moduli` and the host-side `PackedBuffer` guard; cold capture at a new N works, so no plan-time preload | iterative methods that need full precision only near convergence; N = 8 is ~1.6× faster than N = 14 | L | C1 = (a) per-call N (plan + pack per N) + host-side (b) (PrecisionPlan, min_moduli/rank, rigorous ρ-from-output helper); (c) Ozaki-I slices parked with triggers (NOTES-C1 §3.3); TLA+ for slices deferred to the slice trigger — approved on Eric's behalf by the independent reviewer (NOTES-C1 IR18); Eric may overrule |
+| C2 | **K-equilibration (power-of-two K-weights, guarded, staged and gated) + K-segmentation recipe; accurate mode re-rejected (NOTES-C1 §2.8)** (was: accurate-mode scaling) | more bits per modulus ⇒ smaller N at equal accuracy | M | retitled as above, approved on Eric's behalf by the independent reviewer (NOTES-C1 Q7, IR18); Eric may overrule; after C1 |
 
 ## Phase D — New capabilities
 
