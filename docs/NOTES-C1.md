@@ -10,13 +10,21 @@ what has been built since is recorded under "Implementation status".
 **Implementation status.**
 - **Stage 0 (§4.1) is done, 2026-10-07: DESIGN v1.19 §6g**, approved with fixes by an independent
   reviewer; the fixes are applied, and the reviewer's verdicts on the implementation's design
-  questions are §5.4.
+  questions are §5.4. A re-review (approve-with-fixes) amended one verdict: F1 no longer
+  promises an up-set of succeeding N (§5.4 S0-2). Its fixes are applied too.
   - **IR14:** this worktree's libraries were rebuilt first (`tools/test.sh`, host API 13; `nm`
     shows `imd_perf_rank`, `imd_perf_predict_pack`, `imd_err_min_moduli`).
     `build/libimmerdink_host.so` has sha256 `466acdb469b06e404a202c0d3f2ce5ab4f27d3c0f881984ecd4b9122648810fc`,
     byte-identical to the agent-ac829dae library of the [M] figures, so every design-phase [M]
-    figure is a figure of this worktree's library; `build/libimmerdink.so` has sha256
-    `b8baa75d2d2869341431c9a7667b7a61ab03392d9ced21b16ef2b473abfbec85`.
+    figure is a figure of this worktree's library. The review rounds' rebuilds left it
+    unchanged. The 1e6e709 build of `build/libimmerdink.so`, which produced the stage-0 GPU
+    records, had sha256 `b8baa75d2d2869341431c9a7667b7a61ab03392d9ced21b16ef2b473abfbec85`.
+    Later rebuilds after header-comment-only changes (0197351 and the re-review's) changed its
+    bytes but no source: no file under `src/` has changed since 1e6e709. The 0197351 build had
+    sha256 `9a9ad2ea12689905c1bd8e1b83d95fa2406b529f765ecbe6750d1ee0014424de`, and the
+    re-review's build has `c4bdcc4f696a6c87ec8049ed7c6ebf1ce4eae44a775ce5cde6c7783d298c4740`.
+    `bench/first_call.py` now writes the library's path, its sha256 and the git commit into
+    each record.
   - **IR9:** the 61 design-phase files are in immerdink-eval (Provenance below), listed with
     their sha256 in `findings/c1-design-phase-manifest.md`; the scripts and the manifest are
     committed there (7bdac3d), the records stay untracked.
@@ -3151,6 +3159,23 @@ decided conservatively and then put to an independent reviewer, whose verdicts a
   RN accepts k ≤ (T − 1)², so the N where the query succeeds form an up-set. C-ws needs that: if
   any phase's query succeeds, the query at N_max succeeds too. `host_footprint_monotone`
   asserts the up-set and the exact NOT_SUPPORTED boundary.
+  - *Amended by the re-review (independent reviewer, 2026-10-07; binding): the up-set is
+    withdrawn from the promise before merge, and the downward statement is promised instead.*
+    The first verdict overlooked INVALID_VALUE for a size past uint64 (§5 row 5), which also
+    grows with N and g: RA = g·b·m·k̂ and W = N·b·m·n̂ in the workspace, and res = N·b·r·k̂ in
+    a pack. Measured on this build for "ik,kj->ij", m = 2^30, k = 2^31, n = 16: the plain query
+    (TRUNC, g = 0) succeeds at N = 2..7 and returns INVALID_VALUE at 8..20. With A packed and
+    RN it returns NOT_SUPPORTED at 2..4, SUCCESS at 5..7 and INVALID_VALUE at 8..20. So the N
+    where the query succeeds form an interval, not an up-set. The κ-feasible N are still an
+    up-set. What C-ws uses, and what DESIGN §6a F1 now promises, is the downward direction: if
+    the query succeeds at (N_max, g_max), every (N, g) with 1 ≤ g ≤ N ≤ N_max and g ≤ g_max
+    (g = 0 counting as N) either succeeds with at most that many bytes or is NOT_SUPPORTED by
+    the packs' κ ≥ T(N) under RN. The same text is in the headers of `imd_workspace_size` and
+    `imd_workspace_size_packed`. `host_footprint_monotone` now models every status from params
+    (overflow, then κ). It asserts the pattern at each g (a NOT_SUPPORTED prefix, a SUCCESS
+    interval, an INVALID_VALUE suffix) and the downward statement, step by step on every case
+    and pair by pair on two shapes that pass uint64. The measurement above is one of those
+    shapes.
 - **S0-3. `PackedBuffer` refuses a buffer with no record** (never written by `Pack.pack`).
   *Verdict: accepted.* A buffer filled by `pack_ptr`, a copy or persisted bytes has no
   host-side provenance, so it goes through the raw path (DESIGN §6g.5).

@@ -126,8 +126,12 @@ IMD_API uint32_t imd_host_api_version(void);
 /* Exact workspace bytes of DESIGN §4a (the bytes imd_contract needs). SUCCESS,
  * INVALID_VALUE or NOT_SUPPORTED (§5 rows 1-5); never applies the §3.2 RN acceptance rule.
  * Guaranteed from host API 13 on (§6a F1): with the descriptors, mode and vec_mode fixed, the
- * bytes are nondecreasing in N at every fixed g >= 1, in g in [1, N], and in N with g = 0, so
- * one workspace of the largest (N, g) serves the plans at every smaller one (§6a C-ws). */
+ * bytes are nondecreasing in N at every fixed g >= 1, in g in [1, N], and in N with g = 0,
+ * where the query succeeds. The one status that depends on (N, g), INVALID_VALUE for a size
+ * past uint64, occurs only at the largest N and g, so the N where it succeeds at a fixed g
+ * form an interval. If it succeeds at (N_max, g_max), it succeeds at every (N, g) with
+ * g <= N <= N_max and g <= g_max (g = 0 counts as N) with at most those bytes, so that one
+ * workspace serves the plans at all of them (§6a C-ws). */
 IMD_API imd_status_t imd_workspace_size(const imd_tensor_t* A, const imd_tensor_t* B,
                                         const imd_tensor_t* C, const imd_options_t* options,
                                         size_t* bytes);
@@ -346,8 +350,9 @@ typedef struct {
  * and kappa >= T). With INVALID_VALUE only struct_size and status are written; with
  * NOT_SUPPORTED also the sizes and the layout (key_digest 0). A pack with b r k = 0 is valid
  * and has 0 bytes. Guaranteed from host API 13 on (§6a F2): with the rest of the descriptor
- * fixed, pack_bytes is nondecreasing in N, so a buffer of the largest N's pack_bytes holds the
- * pack at any smaller N (§6a C-pack). pack_ws_bytes and the region offsets carry no such
+ * fixed, pack_bytes is nondecreasing in N where it is reported (a size past uint64 occurs
+ * only at the largest N), so a buffer of the largest N's pack_bytes holds the pack at any
+ * smaller N (§6a C-pack). pack_ws_bytes and the region offsets carry no such
  * promise (a caller sizing imd_pack's workspace once takes the maximum over its N). */
 IMD_API imd_status_t imd_pack_layout(const imd_pack_desc_t* desc, imd_pack_layout_t* out);
 
@@ -371,8 +376,12 @@ IMD_API imd_status_t imd_pack_desc_for(const imd_tensor_t* A, const imd_tensor_t
  * each pack descriptor's (imd_pack_layout: INVALID_VALUE / NOT_SUPPORTED), then
  * PACK_MISMATCH (the plan-time compatibility check, no GPU needed). Never the §3.2 kappa
  * rule of the plan. From host API 13 on, F1 holds as for imd_workspace_size with the packed
- * roles fixed too, over the N where the query succeeds: an up-set in N (an RN pack is
- * NOT_SUPPORTED below the N whose T(N) exceeds its kappa). */
+ * roles fixed too (each pack descriptor at the query's N and rounding). One more status
+ * depends on N: an RN pack is NOT_SUPPORTED at the smallest N, those where kappa >= T(N).
+ * INVALID_VALUE also covers a pack's size past uint64, at the largest N. So if the query
+ * succeeds at (N_max, g_max), every (N, g) below it (as for imd_workspace_size) either
+ * succeeds with at most those bytes or is that NOT_SUPPORTED. The N where it succeeds at a
+ * fixed g form an interval, not an up-set. */
 IMD_API imd_status_t imd_workspace_size_packed(const imd_tensor_t* A, const imd_tensor_t* B,
                                                const imd_tensor_t* C,
                                                const imd_options_t* options,

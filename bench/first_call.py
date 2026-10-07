@@ -7,7 +7,9 @@
     python3 bench/first_call.py --table first_call.jsonl               # the tables, no GPU
 
 --sweep runs one FRESH process per (shape, N, mode) and prints a table (TFLOPS-eq first, time
-alongside); a single run prints one JSON line. In each process:
+alongside); a single run prints one JSON line. Each line records its provenance: the
+library's path and sha256, libimmerdink_host's sha256, the git commit and whether tracked
+files differ from it. In each process:
   1. warm-up at a base N (14, or 8 when N = 14): the CUDA context and every kernel a call at
      the base N launches are loaded, so what follows is a switch to an N never launched in
      the process, not process start-up (the plain mode also reports the process's very first
@@ -29,6 +31,7 @@ TFLOPS-eq = 2 m n k / time (FP64 work the call replaces). Under CUDA_MODULE_LOAD
 
 import argparse
 import ctypes as C
+import hashlib
 import json
 import os
 import statistics
@@ -261,6 +264,25 @@ def table(rows):
               f"{r['first_over_steady_total']:>10.2f} ({r['first_over_steady_gpu']:>4.2f})")
 
 
+def provenance(lib_path):
+    """What produced a record: the library (path, sha256), libimmerdink_host next to it, and
+    the source commit (git HEAD; "dirty" if tracked files differ from it)."""
+    def sha(p):
+        with open(p, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    def git(*args):
+        r = subprocess.run(["git", "-C", ROOT, *args], capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else None
+    lib = os.path.realpath(lib_path)
+    host_lib = os.path.join(os.path.dirname(lib), "libimmerdink_host.so")
+    status = git("status", "--porcelain", "--untracked-files=no")
+    return {"lib": lib, "lib_sha256": sha(lib),
+            "host_lib_sha256": sha(host_lib) if os.path.exists(host_lib) else None,
+            "commit": git("rev-parse", "HEAD"),
+            "dirty": None if status is None else bool(status)}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--lib", default=hz.default_lib())
@@ -281,9 +303,9 @@ def main():
             table([json.loads(line) for line in f if line.strip()])
         return 0
     if not a.sweep:
-        print(json.dumps(run_one(a.lib, a.N, a.size, a.mode, a.reps)))
+        print(json.dumps(run_one(a.lib, a.N, a.size, a.mode, a.reps) | provenance(a.lib)))
         return 0
-    rows = []
+    rows, prov = [], provenance(a.lib)
     for size in map(int, a.sizes.split(",")):
         for N in map(int, a.Ns.split(",")):
             for mode in ("plain", "graph"):
@@ -293,7 +315,7 @@ def main():
                 if r.returncode:
                     print(r.stdout, r.stderr, file=sys.stderr)
                     return 1
-                rec = json.loads(r.stdout.strip().splitlines()[-1])
+                rec = json.loads(r.stdout.strip().splitlines()[-1]) | prov
                 rec["date"] = time.strftime("%Y-%m-%dT%H:%M:%S")
                 rows.append(rec)
                 if a.out:

@@ -42,7 +42,9 @@ main refuses graph_phases after another suite).
                       instance (nine fused modes); a gathered K (k_affine = 0); r in {1, 15,
                       16, 17, 33}, b in {1, 3, 5}; the K alignment 16 and AUTO (64 for k > 96);
                       N in {2, 3, 8, 14, 17, 20}; RN and TRUNC; pack_pivot's transcription ==
-                      the library's on every case's plan view. Each pack, in an EXACTLY sized
+                      the library's on every case's plan view, and the pack key's digest
+                      (X's fused lists, the shape's input) == the oracle's (imd_pack_layout)
+                      on every case. Each pack, in an EXACTLY sized
                       allocation, is then read by imd_contract_packed with the in-line partner
                       on every producer path (fused -1: KF or KL by rule; 0: K1 + K2 / K3; 2:
                       KL; 3: KL with 64-row tiles; every 12th case under each of the four K4
@@ -721,6 +723,14 @@ def suite_write_extent(lib, cuda, shim, verbose):
                 if (pb, pw) != (pv.pack_bytes, pv.pack_ws):
                     raise Fail(f"{name}: pack sizes {pb}, {pw}; oracle {pv.pack_bytes}, "
                                f"{pv.pack_ws}")
+                # the library's pack key == the oracle's: the key holds X's fused (extent,
+                # stride) lists, the input of write_extent_shape and of the library's pivot
+                lay = imd.host._PackLayout()
+                lay.struct_size = C.sizeof(lay)
+                st = lib.lib.imd_pack_layout(C.byref(desc), C.byref(lay))
+                if st != 0 or lay.key_digest != pv.digest:
+                    raise Fail(f"{name}: imd_pack_layout status {st}, key digest "
+                               f"{lay.key_digest:#x}; oracle {pv.digest:#x}")
                 shapes.add(write_extent_shape(pv, N))
                 if len(pv.fused["K"]) > 1:
                     extra.add("gathered K")

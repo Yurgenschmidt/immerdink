@@ -1781,13 +1781,21 @@ there is no budget option (BENCHMARKS "Residue-group size g" gives the speed sid
 - **[v1.19] Footprints across N and g (guaranteed from host API 13 on; §6g).** Fix the
   descriptors, `mode`, `vec_mode` and the packed roles. That also fixes k̂ (a function of k
   alone, §4b.3) and the KF / KL choice (a function of k̂ alone). Then:
-  - **F1.** `imd_workspace_size` and `imd_workspace_size_packed` are nondecreasing in N at
-    every fixed g ≥ 1, and nondecreasing in g ∈ [1, N]. With g = 0 (normalized to N) they are
-    nondecreasing in N. With packed roles and RN, the packs' κ ≥ T(N) makes the smallest N
-    NOT_SUPPORTED (§6b.3); F1 holds over the N where the query succeeds, which is an up-set
-    in N (T grows with N). The up-set is part of the promise (NOTES-C1 §5.4 S0-2): if the
-    query succeeds at some N, it succeeds at every larger N, so C-ws is well defined.
-  - **F2.** `pack_bytes` (`imd_pack_layout`, `imd_pack_bytes`) is nondecreasing in N.
+  - **F1.** `imd_workspace_size` and `imd_workspace_size_packed` (each pack descriptor at the
+    query's N and rounding) are nondecreasing in N at every fixed g ≥ 1, and nondecreasing in
+    g ∈ [1, N]. With g = 0 (normalized to N) they are nondecreasing in N. This holds over the
+    (N, g) where the query succeeds. Two statuses depend on (N, g). With packed roles and RN,
+    the packs' κ ≥ T(N) makes the smallest N NOT_SUPPORTED (§6b.3; T grows with N). A size
+    past uint64 (INVALID_VALUE, §5 row 5: RA, RB, W or the total, also of a packed role, and
+    a pack's res or `pack_bytes`) can occur only at the largest N and g, because every size
+    is nondecreasing in both. So at a fixed g the N where the query succeeds form an
+    interval, not an up-set. **What is promised** (NOTES-C1 §5.4 S0-2, as amended): if the
+    query succeeds at (N_max, g_max), then every (N, g) with 1 ≤ g ≤ N ≤ N_max and g ≤ g_max
+    (g = 0 counts as N) either succeeds with at most that many bytes or, with packed roles
+    and RN, is NOT_SUPPORTED by the packs' κ ≥ T(N). C-ws rests on this downward statement.
+  - **F2.** `pack_bytes` (`imd_pack_layout`, `imd_pack_bytes`) is nondecreasing in N, over
+    the N where `imd_pack_layout` reports it (SUCCESS or NOT_SUPPORTED). A size past uint64
+    (INVALID_VALUE) can occur only at the largest N, since res grows with N.
   - **F3.** `imd_pack` writes every byte of [0, `pack_bytes`) (§6b.4). A packed contract
     reads only [0, `pack_bytes`) of a packed buffer: that is the buffer's ALIASING extent
     (§6b.5), and CompatSpec's `NoOOBRead` (spec/PackedOperand.tla) models it. **`imd_pack`
@@ -1801,9 +1809,10 @@ there is no budget option (BENCHMARKS "Residue-group size g" gives the speed sid
   - **Consequences** (proof in §6g.2). **C-ws:** one workspace of
     `imd_workspace_size(N_max, g_max)` serves every plan with the same descriptors, options
     and packed roles, N ≤ N_max and g ≤ g_max (g = 0 counts as N), with at most one call in
-    flight per workspace (§6 rule 1). **C-pack:** one buffer of `pack_bytes(N_max)` holds the
-    pack of the same descriptor at any N′ ≤ N_max. A caller may instead size per phase and
-    re-allocate at a switch; both are exact through these queries.
+    flight per workspace (§6 rule 1). By F1, such a plan's query succeeds with no more bytes;
+    an N that the packs' κ rejects has no plan. **C-pack:** one buffer of `pack_bytes(N_max)`
+    holds the pack of the same descriptor at any N′ ≤ N_max. A caller may instead size per
+    phase and re-allocate at a switch; both are exact through these queries.
   - These describe the current formulas and change no meaning, so they need no new API
     version; they are promises from API 13 on, which a later layout or pack format must keep
     (one that could not would be a new function or format, as above). Only the totals and the
@@ -4718,9 +4727,17 @@ proof:
 - **F1.** Every §4a region is either independent of (N, g) or has N or g as a factor:
   RA = g·b·m·k̂, RB = g·b·n̂·k̂ and W = N·b·m·n̂ (W is last); sA, sB, fA, fB and vec depend on
   neither. align₂₅₆ is monotone, and the total is a sum of aligned regions in a fixed order.
-  A packed role only drops sX, fX and RX (§6b.6).
+  A packed role only drops sX, fX and RX (§6b.6). The statuses: the query checks §5 row 5 on
+  the in-line layout (each region and the total, a packed role's regions included,
+  `workspace_layout`), then each pack descriptor (its sizes, then κ ≥ T(N) under RN), then
+  PACK_MISMATCH. Every size checked is nondecreasing in N and g (no factor is 0 on this path:
+  b, m, n ≥ 1, k̂ ≥ 16, g ≥ 1), so the (N, g) past uint64 are closed upward. κ ≥ T(N) holds
+  on a down-set of N, and nothing else depends on (N, g). If (N_max, g_max) succeeds, no
+  smaller (N, g) passes uint64, so each either succeeds or is rejected by κ: the downward
+  statement.
 - **F2.** In the pack (§6b.4), res = N·b·r·k̂ + (⌈r⌉₁₆ − r)·k̂ is affine in N, and sig and
-  flag do not contain N.
+  flag do not contain N. The sizes are checked before κ, so INVALID_VALUE occurs on an up-set
+  of N.
 - **F3.** The first half is §6b.4. The read extent is §6b.5's ALIASING interval: K4 reads at
   most the last byte of res (in the B role, the end of the tail; `cert_pack_layout`), and K5
   reads σ and the flags. The second half, no byte beyond `pack_bytes`, holds if each pack
@@ -4731,8 +4748,10 @@ proof:
   `imd_pack` launch shape: the 42 KL shapes, among them the radix > 1 row mapping a
   batch-fastest X takes, plus `kp_prep`'s two instances and a gathered K (§6g.8). Only then did
   it become ABI (NOTES-C1 IR17).
-- **C-ws.** ws(N, g) ≤ ws(N_max, g) ≤ ws(N_max, g_max) by F1, which applies because
-  g ≤ N ≤ N_max (`options_ok`), and the contract checks accept a larger workspace (§6). The
+- **C-ws.** The query succeeds at (N_max, g_max), so by F1's downward statement it succeeds
+  at (N_max, g) and at every (N, g) that has a plan. There ws(N, g) ≤ ws(N_max, g) ≤
+  ws(N_max, g_max) by F1, which applies because g ≤ N ≤ N_max (`options_ok`), and the
+  contract checks accept a larger workspace (§6). The
   bytes a call at another N left behind are never read: every byte a call reads, that call
   wrote (Pipeline's junk-initialized workspace invariants `NoStaleRead` and
   `EveryRowByteWritten`). Each call uses its own plan's region offsets. (HostAPI's
@@ -4869,6 +4888,14 @@ it.
     both vec modes, the caller's packed roles none / A / B / AB, and the K alignment AUTO and
     A16. Then 10⁴ random legal contractions (role swaps, diagonals, permuted and negative
     strides; A = 16, 64 or AUTO). RN acceptance is NOT_SUPPORTED exactly where κ ≥ T(N).
+    Then two "ik,kj->ij" shapes whose sizes pass uint64: m = 2^30, k = 2^31, n = 16 (RA from
+    g = 8 on, and A's pack from N = 8 on) and m = n = 2^30, k = 2 (W from N = 16 on). They run
+    at every (N, g), RN and TRUNC, both vec modes, every packed set. Every status equals
+    params: INVALID_VALUE where a size passes uint64, then the packs' κ rule. At each g, the
+    statuses over N are a NOT_SUPPORTED prefix, a SUCCESS interval and an INVALID_VALUE
+    suffix; with A packed and RN at g = 0 that is NOT_SUPPORTED at N = 2..4, SUCCESS at 5..7
+    and INVALID_VALUE at 8..20. C-ws's downward statement is checked on every pair of (N, g)
+    points. On the grid and the random cases, it is checked step by step.
   - `python_device`, CPU part: `PackedBuffer` through a fake libimmerdink (each refusal
     happens before any C call; the record on success, rejection and CUDA_ERROR; `nbytes`),
     and `PackSpec.with_moduli`.
@@ -4892,7 +4919,9 @@ it.
     refuses to run it after another suite in the same process.
   - `pack_write_extent` (F3's evidence): 113 packs. The suite computes each pack's KL launch
     from the rule (`pack_pivot`, `pack_kl_lg_rows_for`, `kl_launch`; its transcription of
-    `pack_pivot` is checked against the library's on every case's plan view) and fails unless
+    `pack_pivot` is checked against the library's on every case's plan view, and its input,
+    X's fused lists, against the library's through the pack key's digest, which
+    `imd_pack_layout` reports equal to the oracle's on every case) and fails unless
     the cases cover all 42 shapes: along rows, tiles of 64, 32 and 16 rows, and of 8 rows with
     one or two chunks on chip or with re-read chunks, each with radix 1 and radix > 1
     (a batch-fastest X; two row modes); along k̄, tiles of 64 down to 1 row, the 1-row tile
@@ -5641,10 +5670,16 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
   plan and the Ozaki-I slice mode parked with their triggers; C1(b) on the host (§6f, and
   NOTES-C1 stage 1's `PrecisionPlan`).
 - **§6a contract text (from API 13 on):** F1 (`imd_workspace_size[_packed]` nondecreasing in
-  N and g), F2 (`pack_bytes` nondecreasing in N), F3 (`imd_pack`'s write extent, a packed
+  N and g over the (N, g) where the query succeeds, and the downward statement: success at
+  (N_max, g_max) implies success with no more bytes at every smaller (N, g), or the packs' κ
+  rejection), F2 (`pack_bytes` nondecreasing in N), F3 (`imd_pack`'s write extent, a packed
   contract's read extent) and their consequences C-ws (one workspace for every phase) and
   C-pack (one packed buffer for every N′ ≤ N_max). They describe the current formulas: no
-  API version change. F3's second half ("`imd_pack` writes no byte beyond `pack_bytes`")
+  API version change. An earlier text of this version also promised that the N where the
+  query succeeds form an up-set. That is false: a size past uint64 (INVALID_VALUE) grows with
+  N and g, so the succeeding N form an interval. The up-set was withdrawn before merge
+  (independent re-review of stage 0; NOTES-C1 §5.4 S0-2), and `host_footprint_monotone`
+  now covers two shapes that pass uint64. F3's second half ("`imd_pack` writes no byte beyond `pack_bytes`")
   became ABI only after `pack_write_extent` and `pack_write_extent_memcheck` passed on every
   `imd_pack` launch shape (NOTES-C1 IR17), the radix > 1 row mapping included, with the
   coverage asserted by the test (independent review of stage 0, must-fix 1). `imd_pack`'s
