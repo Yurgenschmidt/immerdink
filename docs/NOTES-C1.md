@@ -2,9 +2,10 @@
 
 ## Status
 
-**Revised after two independent reviews, 2026-10-07** (branch
-`claude/ozaki-kernels-immerdink-1089fd`). This is a design phase: nothing has been built, no
-test or TLA+ model has been run, and no GPU work has been done.
+**Revised after two independent reviews, 2026-10-07, then amended by the binding decisions of the
+independent design reviewer, 2026-10-07** (branch `claude/ozaki-kernels-immerdink-1089fd`). This
+is a design phase: nothing has been built, no test or TLA+ model has been run, and no GPU work
+has been done.
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -23,22 +24,92 @@ rationale) is in §5, and so are the review decisions outside the questions (§5
 the reviewers disagreed, §5 decides on the merits and says so. Claims found wrong in any review
 are listed in Appendix A, and nothing below relies on them.
 
-**To report to Eric** (neither item blocks stages 0–3):
-- **Q6** changes the "Your decision" column of ROADMAP C1 to: C1 = (a) per-call N + host-side
-  (b); (c) slices parked; "TLA+ for slices" deferred to the slice trigger (§3.3).
-- **Q7** reframes C2: accurate mode is re-rejected for the corrected reason (§2.8), and C2 is
-  delivered as K-equilibration. ROADMAP's C2 row is retitled accordingly.
+**Binding decisions of the independent design reviewer** (decided by the independent reviewer,
+2026-10-07). A completeness critic then found 17 gaps, and the previous version left 8 items
+open. The reviewer decided all of them, plus the stage-5 gate, pre-registered gate rules, the
+order of work and a definition of done. They override the earlier text wherever the two differ.
+§5.3 records each as IR1–IR29 with its rationale, and the stage texts of §4 carry them:
+- **IR1** (gap 1): M-a runs on full operands up to m = n = 4096. It computes the guard
+  quantities exactly, at O(mk), with a σ engine bit-identical to the oracle, and samples 64 × 64
+  outputs. Tier S tunes d*; Tier L and the real operands are the gate evidence. The budget is a
+  hard 90 CPU-min, with a pre-declared cut order; m = 16 is dropped (§4.3).
+- **IR2** (gap 2): `PrecisionPlan` composes the per-role pack cost in Python. It makes one rank
+  call with reuse = 1 and re-keys the candidates by contract_s + Σ pack_s(role, N)/reuse(role).
+  Reuse is per role ('call' / 'iteration' / 'phase' / int). No ABI change (§4.2).
+- **IR3** (gap 3): §1.3 is rewritten, since relaxed Krylov methods loosen precision
+  (`monotone=False`). M-d1 adds report-only block Davidson and block CG cases (§1.3, §4.3).
+- **IR4** (gap 4): §1.2 item 8 is corrected; no case anywhere is at N = 5, 6, 7, 9 or 13. M-c
+  covers N ∈ {4, 5, 6, 7, 9, 10, 12, 13} plus anchors at 8 and 14 on 8 shapes. Until it passes,
+  figures at N ∉ {8, 10, 14, 16} are [M, model-only, outside hold-out] (§1.2, §4.3).
+- **IR5** (gap 5): stage 3 first gets L3c and an FP summation lemma γ_k in Lean, before L7; it is
+  re-sized S → M. The code does not wait for the Lean; "C2 done" does (§4.4).
+- **IR6** (gap 6): K-weights for an operand X with several partners. The clamp uses union
+  extrema, and the guard is pairwise, G = min_p G_p. In `oracle.kweights` from stage 2 (§4.5).
+- **IR7** (gap 7): the ρ recipe ships as the tested helper `rho_from_output`, for β = 0 and
+  α = 2^e only. M-d1 measures its next-iteration miss rate (§4.2, §4.3).
+- **IR8** (gap 8): pack-mode masks per contraction. `budget` keeps rank's meaning, and a new
+  phase status BUDGET is added. "Packing never increases ws" becomes certificate I3, not ABI
+  (§4.1, §4.2).
+- **IR9** (gap 9): the design-phase scripts and records move to immerdink-eval, with a sha256
+  manifest (stage 0). M-b re-runs every cited [M] figure on this worktree's library (Provenance,
+  §4.1, §4.3).
+- **IR10** (gap 10): the stage-0 GPU round measures the first plan and contract per N, and tests
+  cold capture. A plan-time preload is added only if needed (§4.1).
+- **IR11** (gap 11): output-selective refinement is recorded as §3.1 B6, a caller recipe with no
+  API. M-a estimates its value (§3.1, §4.3).
+- **IR12** (gap 12): §2.7's cost wording is corrected. Stage 3 follows the M-a summary, and its
+  §7 rows cite M-a, or are worded "provisional until M-a" (§2.7, §4.4).
+- **IR13** (gap 13): a capture-safe guard path through `IMD_KW_ZERO_ON_FAIL`. The guard read and
+  the choice of N happen outside capture (§4.5).
+- **IR14** (gap 14): rebuilding this worktree's libraries, with an API-13 check, is the first
+  step of stage 0. Nothing else in stages 0–2 runs before it (§4.1).
+- **IR15** (gap 15): `levels` may end with a DIRECT sentinel. The prefix-plane option is recorded
+  as the comparator a slice revival must beat. M-b measures the share-group raise cost. One §7
+  line covers larger moduli (§3.3, §4.2, §4.3, §4.4).
+- **IR16** (gap 16): batched fixtures (real R7 with core orbitals, and a synthetic one), with a
+  pre-registered Q12 trigger (§4.3, Q12).
+- **IR17** (gap 17): F3's second half ("no byte beyond `pack_bytes`") becomes ABI only after the
+  GPU test `pack_write_extent` passes (§4.1).
+- **IR18** (open item 1): the ROADMAP edits of Q6 and Q7 are approved on Eric's behalf (below).
+- **IR19** (open item 2): no ehrenfest dump in this cycle. Real operands come from our own psi4
+  script in immerdink-eval, and the contractions R1–R7 are taken from the consumer's ccsd.py
+  (§4.3, Q14).
+- **IR20** (open item 3): the optional StreamSpec model is not adopted; R1 stands (§4.1).
+- **IR21** (open item 4): stage 6 delivers the weights to the kernels through a Q9-index map q(k̄)
+  in the vec region of plans created weighted. No new region (§4.7).
+- **IR22** (open item 5): superseded by IR14.
+- **IR23** (open item 6): every inferred item gets a named closing measurement, ordered before
+  the claim (§4.1, §4.3, §4.5).
+- **IR24** (open item 7): share groups are ranked jointly over every level ≥ the group floor
+  (§4.2).
+- **IR25** (open item 8): binding run limits for the stage-4/5 TLA+ models (§4.5).
+- **IR26**: stage 5's gate is not met. Stage 5 is formally deferred with triggers T1–T3, and its
+  cost bar is restated without `ncu` (§4.6). C1 is complete without it.
+- **IR27**: pre-registered gate rules for stages 4 and 6 (§4.5, §4.7).
+- **IR28**: the order of work, as round 1 (CPU) and round 2 (GPU) (§4.11).
+- **IR29**: a definition of done for C1 and C2 (§4.11).
 
-Both ROADMAP edits land with the DESIGN v1.19 merge, unless Eric overrides them.
+**To report to Eric** (none of these blocks stages 0–3):
+- **Q6 and Q7: approved on Eric's behalf by the independent reviewer (IR18).** Eric may overrule.
+  - ROADMAP C1's decision column becomes "C1 = (a) per-call N (plan + pack per N) + host-side
+    (b) (PrecisionPlan, min_moduli/rank, rigorous ρ-from-output helper); (c) Ozaki-I slices
+    parked with triggers (§3.3); TLA+ for slices deferred to the slice trigger".
+  - ROADMAP C2 is retitled "K-equilibration (power-of-two K-weights, guarded, staged and
+    gated) + K-segmentation recipe; accurate mode re-rejected (§2.8)".
+  - Both land with the DESIGN v1.19 merge.
+- **Q14: no ehrenfest dump is requested in this cycle (IR19).** The real operands come from our
+  own psi4 script. If psi4 cannot run, the Eric-approved dump is the named fallback.
+- **Stage 5 is formally deferred (IR26).** It has triggers T1–T3, and T3 is Eric asking for the
+  device certificate.
 
 **Decision summary.** §3 gives the reasons, §4 the stages.
 
 | item | decision |
 |---|---|
-| C1(a) per-call N | **Plan per N + pack per N** on host API 13, with published footprint monotonicity (totals and write extent only), an internal layout certificate, and a re-pack-in-place protocol (stage 0). A single plan serving a range of N is **parked**: it gains nothing per call. |
-| C1(b) auto-N | **Host-side**, using the existing `imd_err_min_moduli` / rank, plus a thin `PrecisionPlan` in its own Python module and a rigorous ρ-from-output recipe (stage 1). Device statistics and an a-posteriori certificate (lemma L6) come **later, gated** on a consumer with elementwise targets (stage 5). Choosing N on the device is rejected. |
-| C1(c) Ozaki-I slices | **Parked with triggers**; the numerics ideas are recorded (§3.3). |
-| C2 | **K-equilibration**: power-of-two weights on the contracted index (lemma L5). First as caller-side pre-scaling with an `imd_kweights` helper (stage 4). The helper has a mandatory FP64-exact clamp and an exact integer guard that is never worse in the §3.8 bound (L5c). It reports the gain G, which converts the plain operands' statistics into a rigorous request for the weighted call (L5d). Library-internal weights and weighted packs come later (stage 6). Both stages are gated on a CPU study at realistic sizes and on real operands (stage 2). **K-segmentation** becomes a documented caller recipe with lemma L7 (stage 3). **Accurate mode stays rejected**, for the corrected reason in §2.8; the never-worse partner-envelope rule is recorded in Appendix B. |
+| C1(a) per-call N | **Plan per N + pack per N** on host API 13, with published footprint monotonicity (totals, plus the write extent once `pack_write_extent` passes, IR17), internal layout certificates, and a re-pack-in-place protocol (stage 0, which starts with the library rebuild, IR14). A single plan serving a range of N is **parked**: it gains nothing per call. |
+| C1(b) auto-N | **Host-side**, using the existing `imd_err_min_moduli` / rank, plus a thin `PrecisionPlan` in its own Python module and a tested rigorous ρ-from-output helper (stage 1; IR2, IR7, IR8, IR24). Device statistics and an a-posteriori certificate (lemma L6) are **formally deferred**: the gate, a consumer with elementwise targets, is not met, and triggers T1–T3 are recorded (stage 5, IR26). Choosing N on the device is rejected. |
+| C1(c) Ozaki-I slices | **Parked with triggers**; the numerics ideas and the prefix-plane comparator are recorded (§3.3). |
+| C2 | **K-equilibration**: power-of-two weights on the contracted index (lemma L5), with a multi-partner rule (IR6). First as caller-side pre-scaling with an `imd_kweights` helper (stage 4). The helper has a mandatory FP64-exact clamp and an exact integer guard that is never worse in the §3.8 bound (L5c). It reports the gain G, which converts the plain operands' statistics into a rigorous request for the weighted call (L5d). Library-internal weights and weighted packs come later (stage 6). Both stages are gated, by pre-registered rules (IR27), on a CPU study at realistic sizes and on real psi4 operands (stage 2; IR1, IR19). **K-segmentation** becomes a documented caller recipe with lemma L7 (stage 3). **Accurate mode stays rejected**, for the corrected reason in §2.8; the never-worse partner-envelope rule is recorded in Appendix B. |
 
 **Tags.**
 - [V]: verified in code (file:line) or in the docs.
@@ -58,19 +129,36 @@ Both ROADMAP edits land with the DESIGN v1.19 merge, unless Eric overrides them.
     `perf_summary.md`, `c2cost.md`, `predict_cc.out`.
   - Second-round review scripts: R-api's host-model spot checks `review_api/spot*.py`; R-num's
     exact L5c/L6 checks `review/chk_lemmas.py` (and `review/chk_perf.py`).
+- **Copy to immerdink-eval** (IR9; stage 0 step (b)). Scratch is ephemeral, and the provenance
+  rule is paper-grade:
+  - the scripts (emu.py, exp_*.py, c2gate*.py, c2cmp*.py, c2bcs/, slice_eval/, judge/,
+    review*/, perf*.py, nsweep.py, phases.py, predict_cc*.py) go to
+    `scripts/c1/design-phase/` (tracked);
+  - the records (*.jsonl, *.out, *.md summaries) go to `results/c1/design-phase/` (untracked,
+    never `git add`);
+  - a manifest goes to `findings/c1-design-phase-manifest.md` (tracked). It lists each file's
+    sha256, the source worktree commit (cbdf230), the sha256 of the agent-ac829dae library, and
+    host API 13.
+
+  DESIGN and these notes then cite the eval paths, not scratch. The copy happens before any
+  DESIGN v1.19 text cites a [C] or [M] figure.
 - Every run checked first that ehrenfest was FREE, then used one thread under
   `tools/memcap.sh` and took at most a minute. R-num's [M] re-runs were not completed, because
-  ehrenfest became BUSY; R-num checked their arithmetic for internal consistency instead.
+  ehrenfest became BUSY; R-num checked their arithmetic for internal consistency instead. M-b
+  re-runs every [M] figure DESIGN will cite on this worktree's rebuilt library. A figure that
+  differs by > 0.5 % is replaced, and the change is noted (IR9).
 - Stage 2 (§4.3) moves the study into `bench/accuracy/` and the raw records into immerdink-eval
   `results/c1/`.
 - [M] numbers come from `.claude/worktrees/agent-ac829dae3600d2888/build/libimmerdink_host.so`
   (cbdf230, host API 13). Its `src/host`, `include` and `python` match this worktree's
   (`diff -rq`). This worktree's own `build/libimmerdink_host.so` is stale: host API 5, with no
-  `imd_perf_*` or `imd_err_*` symbols (R-num confirmed this with `nm`). **Rebuild it before
-  stage 2**, so that every stage-2 record names this worktree's library.
+  `imd_perf_*` or `imd_err_*` symbols (R-num confirmed this with `nm`). **Rebuilding it is the
+  first step of stage 0** (IR14). Stages 0 and 1 already need the API-13 symbols, and every
+  later record names this worktree's library.
 - Tag suffixes: "[C, review]", "[M, review]" and "[E, review]" mark numbers a second-round
   reviewer computed or estimated, under the same rules. A tag without a suffix is this draft's
-  own.
+  own. "[V, independent reviewer]" marks a fact the independent design reviewer verified for its
+  decisions (§5.3).
 - Performance numbers for external libraries stay in immerdink-eval. Algorithms and accuracy
   facts from papers are cited by tag: [OZ2], [SC25] and [ERR] as in DESIGN, and [KT26] =
   Kawakami–Takahashi, arXiv:2606.29129 (the scale-invariant fast mode).
@@ -163,7 +251,15 @@ Both ROADMAP edits land with the DESIGN v1.19 merge, unless Eric overrides them.
    - Rank enumerates N × g × vec mode × packing. It copies `*base` and overrides only N, g and
      vec_mode (src/host/perf.cpp:1724), so `mode` and `rounding` pass through.
    - Capacity used: 13 of 16 phases, 12 of 16 classes, 90 of 128 kernel rows.
-   - The hold-out covers N = 8 / 14 plus 10 / 16 only (DESIGN §6c.5), so **no N ≤ 7**.
+   - **N coverage** (the N column of each bench file; rows per N in parentheses where few)
+     [V, independent reviewer, re-counted]:
+     - calibration (`bench/sweep_calib.txt`): N = 4 (2), 8, 11 (2), 14–17 and 20;
+     - hold-out (`bench/sweep_perf_validate.txt`): N = 8, 10 (2), 14 and 15–20;
+     - cache sweep (`bench/sweep_cache.txt`): N = 8, 10, 12 (1), 14 and 16.
+
+     **No case anywhere is at N = 5, 6, 7, 9 or 13.** Several things therefore rest on
+     unvalidated predictions until M-c (§4.3, IR4) passes: the default levels (6, 8, 10, 12, 14),
+     the §2.4 schedules (N = 6 and 9), and the 1024³ fit's K4 wave steps at N = 9 and 13 (§2.3).
 9. **RN acceptance.** κ ≥ T(N) gives NOT_SUPPORTED at plan time (analysis.cpp:322) and at pack
    time (pack.cpp:213). N = 2 needs k ≤ 32041; N = 3 needs k ≤ 8.2e6 (params `rn_feasible_kmax`).
 10. **K5's per-output code** holds |z| as L32(N) limbs plus its sign after `crt_finish`
@@ -172,12 +268,20 @@ Both ROADMAP edits land with the DESIGN v1.19 merge, unless Eric overrides them.
 
 ### 1.3 Consumer profile
 
-**Generic iterative methods** (Jacobi/DIIS fixed points, Krylov, Davidson, iterative refinement)
-tighten precision as the residual falls. That means a few monotone phases, switched at iteration
-boundaries where the caller already crosses to the host. ACCURACY §3 shows a contracting
-iteration does not accumulate emulation error: drift is set in the first few iterations, and the
-steady state is about one contraction's error/(1 − ρ). So the last phase's N sets the converged
-accuracy.
+**Generic iterative methods** (rewritten by IR3).
+- **Fixed-point (Jacobi/DIIS), Newton-type and residual-driven iterations**, iterative
+  refinement included, tighten precision as the residual falls. That means a few monotone phases,
+  switched at iteration boundaries where the caller already crosses to the host. This is
+  `monotone=True`, the `PrecisionPlan` default (§4.2).
+- **Relaxed (inexact) Krylov methods may loosen the matvec precision** as the residual shrinks
+  [literature, not checked here: Bouras–Frayssé; Simoncini–Szyld; van den Eshof–Sleijpen]. They
+  use `PrecisionPlan` with `monotone=False` and a decreasing schedule, and the docs state that
+  use. `monotone=True` stays the default.
+- M-d1 (§4.3) reports a block Davidson case (tightening ramp) and a block CG case (tightening and
+  relaxed). Both are report-only and document caller guidance; they are not C1 gates.
+- ACCURACY §3 shows a contracting iteration does not accumulate emulation error: drift is set in
+  the first few iterations, and the steady state is about one contraction's error/(1 − ρ). So for
+  a fixed-point iteration, the last phase's N sets the converged accuracy.
 
 **ehrenfest (DF-CCSD) is context, not a requirement** [consumer reader]:
 - It has no immerdink integration yet; its Ozaki work has been frozen since 2026-09-06.
@@ -221,7 +325,8 @@ format would pay for.
   the fast-RN curve.
 - **The sizes are small:** m = n ≤ 256 for the scaling variants, 12–24 for the K-weight and
   K-segment studies, 128–144 for the envelope rule. §2.6 shows the size matters for data with
-  random structure.
+  random structure. M-a (§4.3) re-runs the C2 study on full operands up to m = n = 4096, with
+  sampled outputs (IR1).
 - **The K-weight studies used one seed and norm ratios only.** No study ran the L5c guard
   (§4.4) on its data: `c2gate*.py` and `judge/keq_m.py` report error or
   log₂(‖a‖‖b‖/‖ã‖‖b̃‖), not guard acceptance. M-a (§4.3) measures it.
@@ -282,7 +387,8 @@ TFLOPS-eq (time):
 - **Predicted time is monotone in N at the best g** on sq1024, sq4096, DF, 256²×65536 and
   s256, and the workspace is monotone in N at g = 0 and g = 1 on all of them [M, review,
   `review_api/spot.py`].
-- **Linear fits in µs:** 41 + 7.7·N (1024³, with K4 wave steps at N = 9, 13 and 17),
+- **Linear fits in µs:** 41 + 7.7·N (1024³, with K4 wave steps at N = 9, 13 and 17; no case
+  covers 9 or 13, §1.2 item 8),
   363 + 310·N (4096³), 1441 + 2176·N (8192³), 120 + 177·N (DF).
   - The fixed part (FP64 reads in KF/KL, K0, K5's base cost) caps the gain at low N: N = 4 is
     only 1.35× faster than N = 6 at 4096³.
@@ -292,9 +398,11 @@ TFLOPS-eq (time):
 - **Re-pack cost:** `imd_pack` of a 4096² operand is 313 / 414 µs at N = 8 / 14 [M] (measured
   0.437 ms at N = 14, NOTES-D1:107), against a call of 2.86 / 4.70 ms. That is about 11 % of one
   call, paid once per switch for each invariant operand.
-- **The N ≤ 7 predictions fall outside the hold-out** (§1.2 item 8). [KT26] also reports INT8
-  throughput that depends on the data at small N, through the fraction of zeros after scaling.
-  M-c in stage 2 checks these predictions.
+- **No calibration or hold-out case covers N = 5, 6, 7, 9 or 13.** N = 4, 11 and 12 have one or
+  two rows each (§1.2 item 8). [KT26] also reports INT8 throughput that depends on the data at
+  small N, through the fraction of zeros after scaling. M-c in stage 2 checks these predictions
+  (IR4). Until it passes, DESIGN tags every figure at N ∉ {8, 10, 14, 16} as [M, model-only,
+  outside hold-out].
 
 ### 2.4 Precision schedules [M]
 
@@ -323,8 +431,11 @@ gives 1.09× (1024³), 1.12× (4096³) and 1.13× (8192³ and DF).
   o = 10, v = 96 PPL view (100 × 9216 × 9216) at 0.75× (1.33×) [M, review]. Many-small-plans
   workloads gain about 10–25 % (§2.3).
 - **All of it comes from running at a lower N**, which per-N plans already allow (§3, A1 vs A2).
-- **These are predictions at N = 6 and 8, outside the hold-out** (§1.2 item 8). M-c (§4.3) must
-  validate them before any schedule gain using N ≤ 7 enters DESIGN as a claim.
+- **These rest on predictions at N = 6 and 9**, and the default levels rest on N = 6 and 12. No
+  calibration or hold-out case covers 6 or 9, and 12 has a single cache-sweep row (§1.2 item 8).
+  M-c (§4.3) must validate them. Until it passes, DESIGN marks the default levels and every §2.4
+  or §4.10 schedule gain that uses N ∉ {8, 10, 14, 16} as [M, model-only, outside hold-out]
+  (IR4).
 
 ### 2.5 Partner-aware row/column shifts (the accurate-mode family) [C]
 
@@ -470,7 +581,10 @@ median / worst pair.
     than fast mode; at k = 3600 they equal fast mode. φ = 4 at k = 3600 reaches 12/14/16/18
     against fast mode's 11/12/14/16, 1–2 moduli worse.
 - **Time at equal elementwise accuracy on decay_opp** [M]. These are **upper bounds**: they
-  count neither the helper nor the pre-scaling (§4.5). Dense data gain nothing.
+  count neither the helper nor the pre-scaling (§4.5). Dense data gain nothing. K-eq's N = 9 and
+  12 lie outside {8, 10, 14, 16}, so DESIGN tags these rows [M, model-only, outside hold-out]
+  as well until M-c passes (IR4, applied conservatively). M-a recomputes them with every cost
+  term (§4.3).
 
   | target | N, fast → K-eq | shape | TFLOPS-eq (time) | speedup, upper bound |
   |---|---|---|---|---|
@@ -527,8 +641,10 @@ max normwise error:
   (DF) to 1.28× (8192³) faster, and S = 4 is a net loss on DF.
 - **Numerics.** Segmentation adds S − 1 FP64 roundings, so the result is no longer correctly
   rounded once, and its ELEMENTWISE bound is provably worse at high N (L7).
-- **Against K-equilibration on decay_opp:** K-eq gives about 6 moduli at about 0 per-call cost;
-  K-segmentation gives 3–5 at +10–93 %. K-segmentation needs only contiguous magnitude bands, not
+- **Against K-equilibration on decay_opp:** K-eq gives about 6 moduli at about 0 per-call cost
+  for invariant operands or pre-scaling fused into the producer; about 6–13 % per call per
+  changed operand otherwise (§2.6 [E]; corrected by IR12). K-segmentation gives 3–5 at
+  +10–93 %. K-segmentation needs only contiguous magnitude bands, not
   separable profiles, so it stays as a recipe.
 
 ### 2.8 Why K-weights beat σ/τ shifts per bit (from L3a)
@@ -631,10 +747,11 @@ measured smallest N reaching max elementwise 1e−6 / 1e−8 / 1e−10 / 1e−12
 | A6 | Lower-N planes from a higher-N pack | impossible | 2 has no inverse mod 256, rounding is not modular, and σ(N+1) − σ(N) depends on the data. CRT over a prefix gives z mod P(N′) (PackedOperand `neg_n`). |
 | | **C1(b)** | | |
 | B1 | Host-side target → N (`imd_err_min_moduli`, then one rank over the allowed levels ≥ that N, with the accuracy set; §6f.3's `rank([n, n+1])` is the two-level case), plus a thin `PrecisionPlan` | **adopt (stage 1)** | Already exists in C; the helper only composes it per phase. The policy stays with the caller (D8). |
-| B2 | Rigorous ρ from the previous output (§4.2) | **adopt (documentation, stage 1)** | No new library code: one pass over C plus the caller's row and column norms (a pass over A and B, unless the caller has them), and the existing NORMWISE bound. |
-| B3 | K5 statistics plus an a-posteriori certificate (L6), with one pure host function `imd_stats_cond` that turns the statistics into `cond` (P1 S2, reduced) | **adopt later, gated (stage 5)** | Fuses B2 into K5. It needs no norms at all (L6 uses ‖a·2^σ‖ ≤ d), which saves the pass over A and B as well as the pass over C, and it adds a rigorous per-call elementwise certificate. Worth an ABI change once a consumer runs elementwise targets. |
+| B2 | Rigorous ρ from the previous output (§4.2) | **adopt (stage 1), as the tested helper `precision.rho_from_output`** (IR7) | No new C library code: one pass over C plus the caller's row and column norms (a pass over A and B, unless the caller has them), and the existing NORMWISE bound. β = 0 and α = 2^e only. Checked against `cert_rho_recipe`, so the capability is rigorous, not documentation alone. |
+| B3 | K5 statistics plus an a-posteriori certificate (L6), with one pure host function `imd_stats_cond` that turns the statistics into `cond` (P1 S2, reduced) | **formally deferred, triggers T1–T3** (stage 5, IR26) | Fuses B2 into K5. It needs no norms at all (L6 uses ‖a·2^σ‖ ≤ d), which saves the pass over A and B as well as the pass over C, and it adds a rigorous per-call elementwise certificate. Gate not met: no consumer issues elementwise targets (§4.6). |
 | B4 | Choosing N on the device within a call | reject | N fixes the launch sequence, the K5 instantiation, W, the workspace and σ itself. Kernel scope forbids the sync. |
 | B5 | Device-side selection feeding a caller-owned conditional (SWITCH) graph node (P1 S5) | park | No consumer runs captured adaptive iterations. |
+| B6 | Output-selective refinement: run at N_lo, then recompute only the rows (or columns) whose ρ̂ exceeds the target's threshold, with a higher-N plan over a row sub-view or over rows the caller gathers (IR11) | **caller recipe, no API** | With ELEMENTWISE targets a few max-ρ outputs set N for the whole call, so the gain can be large on outlier data. It needs nothing new from the library: views exist, and stage 1's `rho_from_output` locates the rows. M-a estimates its value (§4.3). A device version would need a per-row max-r output (b·m bytes) in stage 5. |
 | | **C1(c)** | | |
 | C1 | Ozaki-I slice mode with prefix packs and an exact Horner combine (P2) | **park with triggers** (§3.3) | Faster only on benign data below about 1e−8 (§2.9). Break-even near 1e−10, 1.25–1.75× slower at FP64 level, and no win beyond S = 2 on heavy-tailed rows. Its capability (one pack for every precision) is not used by the workload (§1.3). L-size. |
 | C2 | One scheme per phase: a slice pack in low phases, then one Ozaki-II re-pack at the end (P2 H4) | park with C1 | The gain covers only low-phase calls, about 1–3 % of a schedule's emulated time [I, first-round review]. |
@@ -646,7 +763,7 @@ measured smallest N reaching max elementwise 1e−6 / 1e−8 / 1e−10 / 1e−12
 | D4 | One-sided coupling; headroom packs (P3 stage 4) | reject | One-sided: only 1.3–1.4× smaller error with 25 bits of slack [C]. Headroom packs as drafted are unsound under RN (Appendix A, item 16). |
 | D5 | Hölder or asymmetric budgets that ignore the partner | reject | Always worse than Cauchy–Schwarz (§2.5). |
 | D6 | Non-power-of-two fine scales | reject | ≤ 0.44 bits per side, about 0.11 modulus, and it needs exact division by odd integers in K5. |
-| D7 | **K-equilibration** (P1) | **adopt, staged and gated** (oracle rule in stage 2; stages 4, 6) | About 6 moduli on separable anti-correlated data. The library adds no per-call cost; the caller's pre-scaling and the helper do, for operands rebuilt every iteration (§2.6). Once w is fixed it does not depend on the partner. Exact (L5). It avoids regressions in the bound only with the guard (§2.6). |
+| D7 | **K-equilibration** (P1) | **adopt, staged and gated** (oracle rule with multi-partner mode in stage 2; stages 4, 6 by pre-registered rules, IR27) | About 6 moduli on separable anti-correlated data. The library adds no per-call cost; the caller's pre-scaling and the helper do, for operands rebuilt every iteration (§2.6). Once w is fixed it does not depend on the partner; an operand with several partners gets one w from the union extrema (IR6). Exact (L5). It avoids regressions in the bound only with the guard (§2.6). |
 | D8 | K-segmentation (P4) | **adopt as a documented recipe, with L7** (stage 3) | 3–5 moduli on banded anti-correlated data, with no API change, and packs still work. It costs +10–93 % per call and the single final rounding. An accuracy-API flag only if the gate shows value beyond D7 (Q15). |
 
 ### 3.2 The parked range plan (kept for revival)
@@ -704,6 +821,13 @@ If revived, the design is as P1 drafted it, with these corrections:
   pressure (e.g. mixed-precision iterative refinement), or M-d measures phase-switch re-packs at
   ≥ 5 % of a phase. If triggered, "TLA+ for slices" means a new OzakiSlices.tla (toy β = 4) and
   PackedOperand and Pipeline extensions, as P2 drafted them.
+- **The cheaper alternatives a revival must beat** (IR15):
+  - *The prefix-plane option* [I, analytic]. It uses the first N planes of an N_max pack, with an
+    asymmetric partner budget T_B ≈ H(N)/T(N_max). Its accuracy is about that of a symmetric
+    N_eq ≈ 2N − N_max. It needs an asymmetric scaling rule in KF/KL, not a new pack format.
+    Unlike A6 it re-scales the partner, so the CRT over the prefix stays exact [I].
+  - *The share-group raise cost*: a group run at its max N against each member at its own floor
+    with separate packs. M-b measures it on the DF-CCSD contraction set (§4.3).
 
 ---
 
@@ -711,24 +835,41 @@ If revived, the design is as P1 drafted it, with these corrections:
 
 | stage | size | gate | ABI | delivers |
 |---|---|---|---|---|
-| 0. Precision phases on host API 13 | S | — | none | C1(a): published monotone footprints, layout certificate, re-pack rule, Python guard (no TLA+ change, R1) |
-| 1. `PrecisionPlan` and recipes | S | — | none | C1(b) on the host; ρ from the output (`cert_rho_recipe`); schedule example |
-| 2. Evidence | S (CPU) + M (GPU) | — | none | combined C2 study at realistic sizes with `oracle.kweights`; small-N hold-out; scheduled iterations (convergence on the CPU, time on the GPU) |
-| 3. L7 and the K-segmentation recipe | S | — | none | L7 in PROOFS (+ Lean), `cert_kseg_composition`, `oracle.contract_segments`; DESIGN §7 re-rejection |
-| 4. `imd_kweights` + caller-side equilibration | S–M | stage 2 passes (Q13) | host API +1 | C2, step 1, with L5 in PROOFS (+ Lean), its certificates and `GuardSound` |
-| 5. K5 statistics + certificate | S–M | a consumer with elementwise targets (Q16) | host API +1 | C1(b) on the device, with L6 in PROOFS (+ Lean) and its certificates |
-| 6. Library-internal weights + weighted packs | M | stage 4 measured (M-e) + real operands; the open layout item of §4.7 | host API +1 | C2, step 2 |
+| 0. Precision phases on host API 13 | S | — | none | first the library rebuild with the API-13 check (IR14), then the provenance manifest (IR9); C1(a): published monotone footprints (F3's second half only after `pack_write_extent`, IR17), layout certificates I1–I3, re-pack rule, Python guard (no TLA+ change, R1, IR20) |
+| 1. `PrecisionPlan` and recipes | S | — | none | C1(b) on the host: per-role pack-cost composition, pack-mode masks and BUDGET, joint share groups, the DIRECT sentinel (IR2, IR8, IR24, IR15); the tested `rho_from_output` (`cert_rho_recipe`, IR7); schedule example |
+| 2. Evidence | S (CPU) + M (GPU) | — | none | M-a at full size with sampled outputs, real psi4 operands, and multi-partner and batched fixtures, with `oracle.kweights` (IR1, IR6, IR16, IR19); M-b re-runs of the [M] figures; M-c small-N hold-out (IR4); scheduled iterations (convergence on the CPU, time on the GPU) |
+| 3. L7 and the K-segmentation recipe | M (was S; IR5) | after the M-a summary (IR12, IR28) | none | L3c and γ_k in Lean, then L7 in PROOFS + Lean; `cert_kseg_composition`, `oracle.contract_segments`; DESIGN §7 rows citing M-a |
+| 4. `imd_kweights` + caller-side equilibration | S–M | pre-registered rule (IR27, §4.5) | host API +1 | C2, step 1, with L5 in PROOFS (+ Lean), its certificates and `GuardSound` |
+| 5. K5 statistics + certificate | S–M | **not met: formally deferred**, triggers T1–T3 (IR26, §4.6) | host API +1, if built | C1(b) on the device, with L6 in PROOFS (+ Lean) and its certificates |
+| 6. Library-internal weights + weighted packs | M | pre-registered rule (IR27, §4.7); layout decided (IR21) | host API +1 | C2, step 2 |
 
 Each lemma is proved in the stage that first relies on it (R2, §5.2). Its hand proof is
-recorded in §4.4 now.
+recorded in §4.4 now. Stage 3 adds the Lean prerequisite L3c (IR5). §4.11 gives the order of
+work and the definition of done (IR28, IR29).
 
 DESIGN v1.19 gets the following:
-- §6g "Adaptive precision", with the stage 0–1 text and later the stage-5 API;
+- §6g "Adaptive precision", with the stage 0–1 text, and the stage-5 API only if a trigger fires;
 - a §3.8 addendum (L7, stage 3; L6 when stage 5 ships) and §3.9 "K-weights" (stages 4 and 6);
 - updated §6a and §6b.7 contract text;
 - rewritten §7 rows.
 
 ### 4.1 Stage 0 — precision phases on host API 13
+
+**Order** (IR28). Nothing else in stages 0–2 runs before step (a) passes (IR14).
+- **(a) Rebuild** this worktree's `libimmerdink_host.so` and `libimmerdink`. Run
+  `tools/test.sh` with `IMMERDINK_BUILD_JOBS=4`, under memcap, after a FREE busy check. Assert
+  that the library reports host API 13 through its version query, and that `nm` shows
+  `imd_perf_rank`, `imd_perf_predict_pack` and `imd_err_min_moduli`. Record the library's sha256
+  in the provenance manifest. The current build is host API 5 (Provenance).
+- **(b) Provenance copy and manifest** (IR9; Provenance in Status), before any DESIGN v1.19 text
+  cites a [C] or [M] figure.
+- **(c) DESIGN §6g stage-0 text:** F1, F2, and F3's first half with the contract read extent
+  (IR17); C-ws, C-pack and the re-pack rule.
+- **(d)** `cert_footprint_monotone` (I1–I3) and `host_footprint_monotone`.
+- **(e)** `PackSpec.with_moduli`, `PackedBuffer` with the `python_device` CPU part, and
+  `python_overhead`.
+
+The stage-0 GPU tests run in round 2 (§4.11).
 
 **Numerics:** none. Each phase is a plain plan at its N, so every §3 rule, certificate and proof
 applies unchanged.
@@ -742,10 +883,13 @@ alone). Then:
   nondecreasing in N.
 - **F2.** `pack_bytes` of `imd_pack_layout` / `imd_pack_bytes` is nondecreasing in N.
 - **F3.** `imd_pack` writes every byte of [0, `pack_bytes`) (already in
-  include/immerdink/immerdink.h:74-75) and **no byte beyond it** (new text, checked by guard
-  zones in `packed_repack_n`). A packed contract reads only [0, `pack_bytes`) of a packed buffer:
-  that is the buffer's ALIASING extent (immerdink.h:107), and CompatSpec's `NoOOBRead`
-  (spec/PackedOperand.tla:353) models it.
+  include/immerdink/immerdink.h:74-75). A packed contract reads only [0, `pack_bytes`) of a
+  packed buffer: that is the buffer's ALIASING extent (immerdink.h:107), and CompatSpec's
+  `NoOOBRead` (spec/PackedOperand.tla:353) models it.
+  - **F3's second half, "`imd_pack` writes no byte beyond `pack_bytes`", becomes published ABI
+    only after the GPU test `pack_write_extent` passes** (IR17). Until then the stage-0 DESIGN
+    text publishes only the first half and the read extent. Under §6a an ABI promise cannot be
+    withdrawn, so it needs evidence on every pack path, not one shape's guard zones.
 
 **Internal facts, not ABI** **[cert: cert_footprint_monotone]**. They are true of today's
 formulas, but no caller needs them, and a future format (§4.7's kw region after res, a slice
@@ -756,12 +900,17 @@ so they stay certificates that a format change must revisit:
   `LayoutPrefix`, moved here because `pack_layout` is static, pack.cpp:35-57).
 - **I2.** `imd_plan_bytes` device bytes do not depend on N or g. Host bytes do depend on them,
   through the K4 shape keys.
+- **I3.** Packing more roles never increases ws(N, g) (IR8). A packed role drops sA/fA/RA or
+  sB/fB/RB and adds no region (src/host/workspace.cpp:65-68). Per R6 it stays a certificate,
+  because a later format could break it. `PrecisionPlan.footprints()` reports the maximum over the
+  allowed pack modes × levels from the queries, so no caller relies on I3.
 
 *Proof.* Every §4a region is either independent of (N, g) or has N or g as a factor
 (workspace.cpp:49-56). align₂₅₆ is monotone, and the total is a sum of aligned regions in a fixed
 order. In the pack, res is affine in N (pack.cpp:44-47) and the earlier regions do not contain N.
-F3's first half is §6b.4. Its second half holds if each pack kernel writes only regions of the
-layout, which is how they are built [I]; the guard zones of `packed_repack_n` check it. ∎
+I3: packing only removes regions from the sum. F3's first half is §6b.4. Its second half holds if
+each pack kernel writes only regions of the layout, which is how they are built [I]; the GPU test
+`pack_write_extent` checks it on every pack path before it becomes ABI (IR17). ∎
 
 A random check [C] found 0 violations: 3000 shapes × N = 2..19 × g ∈ {1, ⌊N/2⌋, N}, using
 params `workspace_size` and `pack_layout`, with pack offsets equal across N. R-api's host-model
@@ -780,9 +929,10 @@ spot check agrees on 5 shapes [M, review].
     `neg_ws_shared` is about concurrency, not about reuse across plans.)
   - Region *offsets* differ between plans; each call uses its own plan's layout.
 - **C-pack.** One buffer of `pack_bytes(N_max)` holds the pack of the same descriptor at any
-  N′ ≤ N_max. This follows from F2 and F3 alone: `imd_pack` at N′ writes exactly
-  [0, `pack_bytes(N′)`), and a contract at N′ reads only that range. The bytes above it keep
-  stale planes that nothing reads. The offsets of I1 are not needed.
+  N′ ≤ N_max. This follows from F2, F3's first half and the read extent, so it can be published
+  before `pack_write_extent` passes: `imd_pack` at N′ writes all of [0, `pack_bytes(N′)`), and a
+  contract at N′ reads only that range. The bytes above it keep stale planes that nothing reads.
+  The offsets of I1 are not needed.
 - A caller may instead size per phase and re-allocate at a switch. Both are exact through the
   host queries.
 
@@ -814,12 +964,16 @@ not fit the module, and what it was meant to show is either modelled already or 
   certificate I1, not a protocol property.
 - Pipeline, IndexMap and HostAPI do not change. Per-N plans and handles are existing objects,
   and C-ws rests on Pipeline's existing invariants.
-- **Optional model, if Eric wants one.** In StreamSpec, make each cell a pair ⟨version, key⟩,
-  with N in the key (R-num). Add an op c3 after post with a RAW edge post → c3, and bind each
-  contract to its plan's key (R-api). The invariant is then "every contract reads cells whose
-  last writer's key equals its plan's key, given the caller rule". `neg_repack_stale` (c3 keeps
-  the old plan) violates it, and so does dropping the post → c3 edge. Optionally, add a
-  CompatSpec model at N′ with the buffer sized for N + 1.
+- **Optional model: not adopted** (IR20; decided by the independent reviewer). R1 stands, and
+  stage 0 has no TLA+ change. The model is built only if the N-range plan is revived, as §3.2
+  already requires, or if Eric asks for it. As recorded: in StreamSpec, make each cell a pair
+  ⟨version, key⟩, with N in the key (R-num). Add an op c3 after post with a RAW edge post → c3,
+  and bind each contract to its plan's key (R-api). The invariant is then "every contract reads
+  cells whose last writer's key equals its plan's key, given the caller rule".
+  `neg_repack_stale` (c3 keeps the old plan) violates it, and so does dropping the post → c3
+  edge. Optionally, add a CompatSpec model at N′ with the buffer sized for N + 1. Building it
+  would spend TLC time with no new assurance: the ordering half is modelled already, and the
+  stale-handle half is §6b.10 #3's documented limit.
 
 **Python.**
 - `PackSpec.with_moduli(N)` (= `dataclasses.replace`; `PackSpec` is a frozen dataclass,
@@ -837,23 +991,47 @@ not fit the module, and what it was meant to show is either modelled already or 
 
 **Tests.**
 - CPU:
-  - `host_footprint_monotone`: F1, F2 and the internal facts I1–I2 for `imd_workspace_size`,
+  - `host_footprint_monotone`: F1, F2 and the internal facts I1–I3 for `imd_workspace_size`,
     `_packed`, `imd_pack_layout` and `imd_plan_bytes` against params. The grid is
     m, n ∈ {1, 15, 16, 17, 255, 256, 257}, k ∈ {2, 96, 97, 1024, 1025, 131008, 131009},
     b ∈ {1, 3}, N = 2..19, g = 1..N, both vec modes, packed roles ∅/A/B/AB, both k_align
     policies, plus 10⁴ random shapes.
   - The `python_device` CPU part: `PackedBuffer` refusal through a fake library.
-- GPU (queued for a quiet machine, under `_wip/gpu.lock`):
+- GPU (round 2, §4.11; queued for a quiet machine, under `_wip/gpu.lock`):
   - `packed_repack_n`:
     1. Pack X at N = 14 into a buffer sized for N = 14 and contract.
     2. Re-pack at N = 8 into the same buffer and contract with the N = 8 plan.
     3. Both results must be bit-exact against the oracle.
     4. The stale N = 14 plan with a `PackedBuffer` must raise `PackMismatchError`.
-    5. Guard zones must show that `imd_pack` at N = 8 writes exactly [0, `pack_bytes(8)`) (F3).
+    5. Guard zones show that `imd_pack` at N = 8 writes exactly [0, `pack_bytes(8)`), a smoke
+       check only; the F3 evidence is `pack_write_extent`.
+  - **`pack_write_extent`** (IR17), the evidence for F3's second half. It covers:
+    - every pack emitter path (KF, KL, K2/K3);
+    - r ∈ {1, 15, 16, 17, 33};
+    - both k_align policies;
+    - N ∈ {2, 3, 8, 14, 20};
+    - RN and TRUNC.
+
+    Each pack is written into an exactly sized window inside a sentinel-filled buffer, and every
+    byte outside [0, `pack_bytes`) must keep the sentinel. One compute-sanitizer memcheck run
+    with exact-size allocations and `--padding` is the second check. There is no TLA+
+    write-footprint invariant: it would only restate the layout of a static formula, which is
+    params territory (I1).
   - `workspace_shared_n`: one workspace sized for (14, g = 0); plans N ∈ {5, 8, 14} called
     alternately on one stream; all bit-exact; the LD_PRELOAD shim counts no allocation.
   - `graph_phases`: one graph per phase (N = 6 and 10), **sharing one workspace**, replayed
-    alternately, bit-exact.
+    alternately, bit-exact. It captures a **cold** phase, whose N was never launched in the
+    process, as well as a warm one (IR10).
+  - **First call at a new N** (IR10): in a fresh process per N ∈ {6, 8, 10, 14}, the first
+    `imd_plan_create`, the first contract and the steady state. This switch cost is reported
+    next to the re-pack cost, TFLOPS-eq first, time alongside.
+  - **Plan-time preload, only if needed** (IR10). If cold capture fails, or the first replay
+    costs > 2× the steady replay, `imd_plan_create` gets a preload: `cudaFuncGetAttributes` on
+    every kernel the plan will launch (its K5<N>, its K4 configurations, its KF/KL/K1 variants).
+    It is host-side, runs before capture, changes no ABI, and is documented in §6g. The test is
+    then re-run. *Why:* NOTES-M4:220-222 records module loading on the first plan, and K5<N>
+    instantiations get no attribute call (src/k4/k4_cfg.cuh:80 covers K4 only), so lazy loading
+    could land inside a capture, which kernel scope and capture safety forbid [I].
 
 **Risks.**
 - Graph replays after a re-pack cannot be guarded; the rule is documentation only.
@@ -867,14 +1045,17 @@ not fit the module, and what it was meant to show is either modelled already or 
   for capture. A phase switch that creates a RESIDENT plan on demand synchronizes.
 - **With `k4_tune` ON, a plan per N multiplies the plan-time GPU autotuning** by the number of
   levels.
+- **Lazy module loading** at an N never launched in the process could land inside a capture.
+  `graph_phases` tests cold capture, and the preload above is the fix if it fails (IR10).
 
 ### 4.2 Stage 1 — `PrecisionPlan` and recipes
 
 **Placement.** `PrecisionPlan` lives in its own module, `python/immerdink/precision.py`, not in
 `planner.py`. §6e.4 promises that planner.py computes nothing in Python (DESIGN.md:4204), and
-`PrecisionPlan` does compute: levels, the monotone floor and share groups. It calls only
-`Planner.min_moduli`, `Planner.rank`, and the workspace and pack-layout queries; no GPU, no
-policy.
+`PrecisionPlan` does compute: levels, the monotone floor, share groups and the per-role pack-cost
+composition (IR2). It calls only `Planner.min_moduli`, `Planner.rank`, `Planner.predict_pack`,
+and the workspace and pack-layout queries; no GPU, no policy. §6e.4's "computes nothing" rule
+covers planner.py only.
 
 ```python
 # python/immerdink/precision.py
@@ -883,20 +1064,26 @@ class PrecisionPlan:
                  mode="EMULATE", share=(), packs=None, reuse=None, budget=0, monotone=True)
         # planner: a planner.Planner (calibration, regime and cache come from it, not duplicated)
         # contractions: {name: (spec, extents[, strides][, calls_per_iteration])}
-        # levels: sorted allowed N (3-5 levels recommended)
+        # levels: sorted allowed N (3-5 levels recommended); may end with the sentinel "DIRECT"
         # share: [(group, [names])] - contractions that read one packed operand use one N
-        # packs: {name: "NONE" | "A" | "B" | "AB"} - packed roles for rank
-        # reuse: {name: contractions per imd_pack} for packed roles; default calls_per_iteration
-        #        (the pack is remade every iteration); an invariant operand is remade at each
-        #        phase switch, so its reuse is the calls of a phase
+        # packs: {name: mode or set of modes}, mode "NONE" | "A" | "B" | "AB": the allowed
+        #        pack modes, ranked at every level, so the packing may differ by N (IR8)
+        # reuse: {name: {"A" | "B": "call" | "iteration" | "phase" | int}} per packed role;
+        #        default "iteration" (the pack is remade every iteration) (IR2)
+        # budget: immerdink-owned bytes per contraction, as in rank; 0 = none (IR8)
+        # monotone: True for tightening iterations; False for relaxed Krylov (§1.3)
     def configs(self) -> dict      # {name: {N: Candidate}} at every level, up front
     def phase(self, targets, *, iterations=None, fail_budget=None) -> Phase
-        # targets: {name: planner.Accuracy}
-    def footprints(self) -> Footprints  # per name: max workspace over configs() and the value
-                                        # per level; per packed operand: pack_bytes per level and max
+        # targets: {name: planner.Accuracy}; iterations: the phase length
+    def footprints(self) -> Footprints  # per name: max workspace over the allowed pack modes x
+                                        # levels, the value per level, and per-level totals;
+                                        # per packed operand: pack_bytes per level and max
     def reset(self)                     # forget the monotone floor: a new solve, geometry or restart
 class Phase:   # lazy view
-    N: dict; g: dict; vec_mode: dict; status: dict
+    N: dict; g: dict; vec_mode: dict; status: dict   # status: also MISSED, BUDGET or DIRECT
+    packed: dict                        # name -> "NONE" | "A" | "B" | "AB" (IR2)
+    pack_bytes: dict                    # name -> {role: pack_bytes} of the packed roles
+    reuse: dict; assumed_reuse: dict    # the effective per-role reuse; where 'phase' fell back
     time_s: float; tflops_eq: float     # calls-weighted; TFLOPS-eq = sum 2bmnk / time
     err_bound: dict; err_typical: dict
 ```
@@ -904,34 +1091,94 @@ class Phase:   # lazy view
 There is no `noise_floor`: a sum of errors across contractions in possibly different metrics
 means nothing.
 
-**`configs()`** ranks each contraction once per level (all g, the given vec modes, packs, reuse
-and budget) and returns the best candidate at each level. The caller creates every one of these
-plans before the iteration loop, and uses `PlanCache.freeze()` for capture (§4.1 Risks). With
-`k4_tune` ON, that multiplies the plan-time GPU autotuning by the number of levels. A
-fixed-N rank needs no accuracy: the error estimate depends only on (N, rounding, k), so
-accuracy makes every candidate at one N feasible or every one infeasible.
+**Reuse, per role** (IR2):
+- 'call' = 1;
+- 'iteration' = calls_per_iteration;
+- 'phase' = calls_per_iteration × the phase's iterations, i.e. the `iterations` argument of
+  `phase()`. If it is None, 'phase' falls back to 'iteration' (conservative), and
+  `Phase.assumed_reuse` records the fallback. An invariant operand is re-packed at each phase
+  switch, so 'phase' is its value.
+- A role shared by a share group divides its pack cost by the total calls of all members that
+  read that pack.
+
+**Pack-cost composition** (IR2; decided by the independent reviewer). Rank takes one int32 reuse
+for every packed operand, but a contraction's two roles can have different reuse. So
+`precision.py` composes the ranking itself:
+- One `Planner.rank` call per contraction per phase, over the levels ≥ the floor and the allowed
+  pack-mode mask, with reuse = 1, requesting all candidates.
+- Each candidate is re-keyed as
+  time = contract_s + Σ_{role ∈ candidate.packed} pack_s(role, N) / reuse(role),
+  with pack_s(role, N) = `Planner.predict_pack` of `imd_pack_desc_for(role)` at N, memoized per
+  (contraction, role, N). The interval bounds time_lo/time_hi are composed the same way.
+- Feasibility (status, budget, accuracy) is taken from the candidate unchanged; none of it depends
+  on reuse.
+- Order: feasible by the composed time, then rank's tie order (total_bytes, N, g, vec_mode,
+  packed).
+
+The re-keying is exact. time_s = contract_s + pack_s/reuse is the only reuse-dependent field of a
+candidate, and contract_s, pack_s and the packed bits are exposed
+(include/immerdink/immerdink_host.h:763-770). This keeps "stages 0–3: no ABI change" (§4.9).
+`PrecisionPlan` runs once per phase switch, off the hot path, and ehrenfest's hot-path rank calls
+are untouched. A per-role reuse in `imd_perf_rank_request_t` is **not** adopted. It is revisited
+only if a hot-path consumer needs per-role reuse inside one C rank call.
+
+**Budget and pack-mode masks** (IR8; no ABI change):
+- `budget` keeps rank's meaning: immerdink-owned bytes per contraction (workspace + plan +
+  packs + pack workspace). The docs state that the caller subtracts its own resident tensors,
+  including the FP64 source of every packed operand, which must stay resident (§6b.10 #4,
+  DESIGN.md:2211-2213). FP64 sources are needed whether an operand is packed or in-line, so they
+  shift feasibility, not the ranking among modes. There is no extra parameter, so one budget
+  meaning holds across the API.
+- With a mask, the benzene-5Z case (an N = 14 pack of 17.7 GB plus the 9.97 GB FP64 source,
+  over 24 GB) falls back to in-line at N = 14 and packs at lower N.
+- A share group's shared role is fixed packed; masks apply to the other roles only.
+- Joint multi-contraction budgets are caller policy. `footprints()` reports per-level totals so
+  the caller can check them.
+
+**`configs()`** ranks each contraction once per level (all g, the given vec modes, the allowed
+pack modes, the composed reuse and budget) and returns the best candidate at each level. The
+caller creates every one of these plans before the iteration loop, and uses
+`PlanCache.freeze()` for capture (§4.1 Risks). With `k4_tune` ON, that multiplies the plan-time
+GPU autotuning by the number of levels. A fixed-N rank needs no accuracy: the error estimate
+depends only on (N, rounding, k), so accuracy makes every candidate at one N feasible or every
+one infeasible.
 
 **`phase()` rule,** for each contraction c:
-1. n_c = `min_moduli(acc_c, n_lo = levels[0], n_hi = levels[-1])`. A lowering error raises.
-   MISSED sets the status MISSED with N = levels[−1]. The RN κ ≥ T levels are +∞ in the
-   estimate, so they are skipped automatically.
+1. n_c = `min_moduli(acc_c, n_lo = levels[0], n_hi = the top emulated level)`. A lowering error
+   raises. The RN κ ≥ T levels are +∞ in the estimate, so they are skipped automatically. If no
+   emulated level meets the target:
+   - with `levels` ending in "DIRECT" (IR15), DIRECT is evaluated through
+     `min_moduli` / `imd_err_estimate` with mode DIRECT: status DIRECT if it meets the target,
+     MISSED otherwise. DIRECT is not in the default levels, so there is no silent switch to
+     native FP64, which runs at 1:64 on the 4090;
+   - otherwise the status is MISSED, with N = the top emulated level.
 2. f_c = the smallest level ≥ n_c.
 3. With `monotone`, f_c = max(f_c, the previous phase's **final** N_c), i.e. its N after the
-   share-group raise and the rank choice. `reset()` clears it.
-4. Each share group's floor is raised to the maximum f over its members.
-5. **One rank call** per contraction over the levels ≥ f_c (a share group: over its one N only),
-   with the accuracy set, the given vec modes, packs, reuse and budget. Its best feasible
-   candidate is the phase's choice. This equals the fastest of `configs()[c][N]` over N ≥ f_c,
-   which an implementation may use as its memo. It holds even where time is not linear in N
-   (§2.3), and it replaces both the draft's `rank([N_c])` and §6f.3's `rank([n, n+1])`, which is
-   the two-level case.
-6. **TYPICAL targets.** p in §6f.2 is the failure probability *per call* (DESIGN §6f.2,
+   share-group choice and the rank choice. DIRECT is the top of the monotone order. `reset()`
+   clears it.
+4. **A contraction outside any share group** uses the composed ranking above over the levels ≥ f_c
+   and its allowed pack modes, with the accuracy set, the given vec modes and the budget. Its best
+   feasible candidate is the phase's choice. This equals the fastest composed `configs()[c][N]`
+   over N ≥ f_c, which an implementation may use as its memo. It holds even where time is not
+   linear in N (§2.3), and it replaces both the draft's `rank([N_c])` and §6f.3's
+   `rank([n, n+1])`, which is the two-level case.
+5. **Share groups are ranked jointly** (IR24; changed by the independent reviewer). The group
+   floor is the max of its members' f_c. For each level N ≥ the group floor, group time =
+   Σ_members calls × (the member's best composed time at N), with the shared pack's cost counted
+   once per pack through the members' summed reuse. The N with the least group time is chosen
+   for every member. Time is usually monotone in N, so this normally returns the group floor, but
+   not when the packing and reuse terms differ by level.
+6. **BUDGET** (IR8). If no candidate at any level ≥ the floor fits the budget, N is the floor
+   level, the status is BUDGET, and the reported candidate is the plan-time SUCCESS candidate with
+   the least total_bytes at that level. MISSED takes precedence over BUDGET.
+7. **TYPICAL targets.** p in §6f.2 is the failure probability *per call* (DESIGN §6f.2,
    [review] p). With `iterations` and `fail_budget` P given, `phase()` passes
    p = P / (iterations · Σ_c calls_per_iteration_c) to every TYPICAL target of the phase: a
    union bound over the phase's calls. Without them it uses each Accuracy's own `fail_prob`.
 
-The cost is one `min_moduli` (about 1.7 µs) and one rank over at most |levels| N values per
-contraction per phase switch. That is off the hot path, and memoizable through `Memo`.
+The cost is one `min_moduli` (about 1.7 µs), one rank over at most |levels| N values, and the
+memoized `predict_pack` calls, per contraction per phase switch. A share group adds
+|levels| × members re-keyed candidates. That is off the hot path, and memoizable through `Memo`.
 
 **Not in the library:** the forcing rule, i.e. residual → target. It ships as an example in
 `bench/accuracy/schedule.py` and the docs:
@@ -939,13 +1186,28 @@ contraction per phase switch. That is off the hot path, and memoizable through `
   `norm_product_c` refreshed per phase;
 - raise N only at an iteration boundary;
 - use BOUND for the final phase and TYPICAL for intermediate phases, as the user chooses, with
-  p = P/C as in step 6.
+  p = P/C as in step 7;
+- for relaxed Krylov methods, use `monotone=False` with a decreasing schedule (matvec tolerance
+  ∝ tol/‖r_k‖), §1.3.
 
-**Rigorous ρ from the previous output** (documented recipe, ELEMENTWISE targets)
-**[cert: cert_rho_recipe]**.
-- *Inputs.* A call at N with α = 1 and β = 0, so its output C is D. Upper bounds
-  n_ij ≥ ‖a_i‖‖b_j‖ from the caller's row and column 2-norms, computed so that they really are
-  upper bounds (§6f.1's existing obligation).
+**Rigorous ρ from the previous output** (ELEMENTWISE targets) **[cert: cert_rho_recipe]**. It
+ships as a tested helper in `python/immerdink/precision.py` (IR7), not as documentation alone:
+
+```python
+rho_from_output(C, row_norm_ub, col_norm_ub, *, N, rounding, k, alpha=1.0, beta=0.0,
+                l1_ratio=None) -> (rho_hat, certified_mask)
+```
+
+- It implements the recipe below exactly: U evaluated as compose() does, times (1 + 2^−40), then
+  the nextafter chain.
+- **Restrictions.** β must be 0, and α a power of two 2^e, since D = ldexp(C, −e) is exact for
+  normal C. Anything else raises ValueError. An output whose C is not normal is uncertified.
+- For β = 1 accumulations, as in CC residual builders, the docs say: take ρ from a probe call
+  with β = 0 into a scratch buffer, once per phase. No α ≠ 2^e composition ships, because D
+  cannot be recovered exactly from RN(α·D) (§3.7: E = RN(α·D); DESIGN.md:432).
+- *Inputs.* A call at N with α = 2^e and β = 0, so its output C gives D = ldexp(C, −e). Upper
+  bounds n_ij ≥ ‖a_i‖‖b_j‖ from the caller's row and column 2-norms, computed so that they really
+  are upper bounds (§6f.1's existing obligation).
 - *U.* Let U = the NORMWISE `bound` of `imd_err_estimate` at that (N, rounding, k), with
   ν = √k unless the caller's ℓ1 ratios hold. It is evaluated as compose() does,
   E + E·u + u (accuracy.cpp:48-58), times (1 + 2^−40); never as E·(1 + u), since 1 + 2^−53
@@ -969,79 +1231,209 @@ contraction per phase switch. That is off the hot path, and memoizable through `
 - *Cost* [E]. One pass over C, plus the caller's norms: a pass over A and B, about 2× a pass
   over C at square shapes. At 4096³, N = 14, that is about 3 % for C and 6 % for the norms, so
   about 9 % of a call when every norm is recomputed. Norms of an invariant operand are computed
-  once per phase.
+  once per phase. The ρ that sets N is needed once per phase decision, so this cost amortizes
+  over the phase.
 - σ-derived norms, ‖a_i‖ ≤ d·2^{−σ_i} (L1b), are valid for nonzero rows only. A zero row has
   σ := 0, so its bound d·2^0 is vacuous and can inflate the maximum by up to about T. So the
   recipe uses real norms unless the caller knows its zero rows.
-- Stage 5 fuses this recipe into K5, and **needs no norms at all**: L6 uses ‖a·2^σ‖ ≤ d, which
-  the scaling rule guarantees. That is the hook's real advantage over the recipe.
+- The per-output ρ̂ also gives an a-posteriori elementwise bound for that call, and it locates
+  the rows for output-selective refinement (§3.1 B6).
+- A stage 5, if a trigger fires (§4.6), would fuse this recipe into K5 and **need no norms at
+  all**: L6 uses ‖a·2^σ‖ ≤ d, which the scaling rule guarantees. That is the hook's real
+  advantage over the recipe.
 
 **Tests.** A new CPU test `host_precision` of the module, next to `host_planner`:
-- `PrecisionPlan.phase` equals a brute-force `min_moduli` + one rank over the levels ≥ the
-  floor per contraction, and equals the `configs()` lookup;
-- N is monotone over phases until `reset()`, share groups get equal N, and the levels are
-  respected;
+- `PrecisionPlan.phase` equals a brute-force composition from `predict`, `predict_pack` and the
+  footprint queries, at every level, g, vec mode and pack mode (IR2), and equals the
+  `configs()` lookup;
+- per-role reuse, including the 'phase' → 'iteration' fallback and `assumed_reuse`, and a shared
+  role's cost divided by the members' summed calls;
+- share groups: the joint choice equals a brute force over the levels ≥ the group floor (IR24),
+  and members get equal N;
+- N is monotone over phases until `reset()`, and the levels are respected; DIRECT only when
+  no emulated level meets the target, and only if listed (IR15);
+- BUDGET: the floor level and the least-total_bytes SUCCESS candidate; MISSED takes precedence
+  (IR8);
 - TYPICAL targets get p = P/C when `iterations` and `fail_budget` are passed;
-- footprints equal the maximum of the C queries;
-- MISSED and κ ≥ T levels are handled.
+- footprints equal the maximum of the C queries over the allowed pack modes × levels;
+- MISSED and κ ≥ T levels are handled;
+- `rho_from_output` against params' `cert_rho_recipe` in exact rationals, on random rows and on
+  rows with |D| just above U·n; ValueError for β ≠ 0 or α ≠ 2^e (IR7).
 
 ### 4.3 Stage 2 — evidence
 
-**Prerequisite.** Rebuild this worktree's `build/libimmerdink_host.so` (stale, host API 5; see
-Provenance), so every stage-2 record names this worktree's library.
+**Prerequisite.** Stage 0 step (a) (§4.1): the rebuilt library with the API-13 check (IR14).
+Every stage-2 record names this worktree's library (commit, sha256, host API).
 
-**M-a (CPU, now): the combined C2 study.** It merges P1 S0, P3 stage 0 and P4 stage 3a.
+**M-a (CPU, round 1): the combined C2 study.** It merges P1 S0, P3 stage 0 and P4 stage 3a. The
+protocol is the independent reviewer's (IR1), and it replaces the previous "sizes and seeds"
+(m = n ∈ {16, 128, 512}). The Q13 gate needs evidence at the ≥ 2048³ class, and §2.6 shows that
+random-structure gains vanish as m grows, while every guard quantity costs only O(mk).
 - **Harness:** `bench/accuracy/c2_gate.py`, oracle arithmetic only. It compares immerdink's own
-  scalings, so it belongs in the product repo. Raw records go to immerdink-eval `results/c1/`.
-- **`oracle.kweights`** (spec/oracle.py) is added here, not in stage 4. M-a needs one exact
-  reference for the §4.5 rule, the clamp, the L5c guard and the gain G, and until the Q13 gate
-  passes that reference is C2's deliverable (Q8). Only its self-tests come with it; its
-  certificates, PROOFS L5 and `GuardSound` wait for stage 4 (R2, §5.2).
+  scalings, so it belongs in the product repo. Raw records go to immerdink-eval
+  `results/c1/m_a/` as JSONL (untracked); the summary goes to `findings/c1-m-a.md`.
+- **`oracle.kweights`** (spec/oracle.py) is added here, not in stage 4, with its multi-partner
+  mode (§4.5, IR6). M-a needs one exact reference for the §4.5 rule, the clamp, the L5c guard
+  and the gain G, and until the Q13 gate passes that reference is C2's deliverable (Q8). Only its
+  self-tests come with it; its certificates, PROOFS L5 and `GuardSound` wait for stage 4 (R2,
+  §5.2).
+- **Engine:**
+  1. *Full-operand quantities*, exact, over **all** rows and columns:
+     - c_A/m_A/c_B/m_B per shared K index, Δ, the median, and w and the clamp counts per scheme;
+     - σ_i, σ̃_i, τ_j and τ̃_j at N_ref ∈ {8, 14}, and from these gain_row_min, gain_col_min, G
+       and the guard. Both N_ref are reported, and a run whose guard differs between them is
+       flagged;
+     - the worst pair W = min_i log₂(‖a_i‖/‖ã_i‖) + min_j log₂(‖b_j‖/‖b̃_j‖). It is separable,
+       so it costs O(mk) with no products. FP64 norms are allowed for W, which is labelled a
+       diagnostic;
+     - percentiles of σ̃ − σ.
+  2. *σ engine.* (S, γ) do not depend on N; only u does. A vectorized engine is allowed only if
+     it is bit-identical to `oracle.scale_vector`. The recommended form is an FP interval
+     pre-pass on S with a rigorous error bound, plus an exact Python fallback for any row whose u
+     is ambiguous. The existing per-element Python S loop (bench/accuracy/common.py:139-154)
+     would take minutes per operand at k = 16384 [E]. **Self-test before any record is written:**
+     ≥ 2000 rows (random, near the u boundary, subnormal, single-entry, zero) at
+     N ∈ {3, 6, 8, 14, 20}, RN and TRUNC, 0 mismatches.
+  3. *Row-blocked processing*: ≤ 256 rows or columns per block, peak RSS ≤ 3 GB per run.
+  4. *Sampled outputs*: 64 rows × 64 columns per run.
+     - Rows: up to 4 argmin_i(σ̃_i − σ_i) at N_ref = 14, ∪ up to 4
+       argmin_i log₂(‖a_i‖/‖ã_i‖), ∪ seeded random rows up to 64. Columns are chosen the same
+       way. So the sample is adversarial exactly where min G is set.
+     - On the sample: exact x, and the emulated D of every scheme at every N = 4..20 under RN,
+       and under TRUNC at N ∈ {8, 14}. Limb BLAS with K chunked by 4096, so every partial sum is
+       < 2^53.
+     - The CRT precondition is asserted on every sampled output of every scheme. For fast and
+       K-eq it holds on the full operands by L1c.
 - **Schemes:**
-  - fast;
-  - K-eq: plain, deadband ∈ {0, 2, 3, 5}, and guarded (L5c);
-  - K-seg, S ∈ {2, 4};
-  - K-eq + K-seg;
-  - the envelope rule (Appendix B), as the reference for the best partner-aware σ/τ without a
-    GEMM;
-  - exact-integer SC25, as the reference for "accurate mode as published".
-- **Fixtures:** the M5 families; φ ∈ {0.5, 2, 4}; same-sign; `opp_nonsep`; `local_df`; `mixed`;
-  and a documented synthetic integral × amplitude family. The synthetic family has
-  energy-ordered virtual orbitals, amplitudes g/(ε_c + ε_d − ε_i − ε_j), and DF-like integrals
-  with decaying factors.
-- **Real operands:** real DF-CCSD operand pairs (Bov, dressed Bvv, t2) if Eric approves a one-off
-  FP64 dump (Q14). They run CPU-only, single-threaded, under memcap, outside ehrenfest's test
-  windows (busy check, silent mode). Raw dumps and records stay in immerdink-eval `results/c1/`
-  or scratch, never in the product repo.
-- **Sizes and seeds:** m = n ∈ {16, 128, 512}, k ∈ {600, 3600, 16384}, at least 5 seeds.
+  - *Tier S:* fast; K-eq with deadband d ∈ {0, 2, 3, 5}, each with its guard report; K-seg
+    S ∈ {2, 4}; K-eq(d*) + K-seg S = 2; the envelope rule (Appendix B), the reference for the
+    best partner-aware σ/τ without a GEMM. Exact-integer SC25, the reference for "accurate mode
+    as published", runs at m = n = 128 only: it needs a full m×k×n GEMM. It and `acc_exact` are
+    reference schemes already rejected (§2.5).
+  - *Tier L and the real operands:* fast, K-eq d = 0, K-eq d* (guarded), K-seg S = 2,
+    K-eq(d*) + K-seg S = 2, and the envelope rule.
+- **Deadband d*** (settles Q11). It is chosen at Tier S, m = n = 512, over 5 seeds: the d with
+  the fewest guard rejections on the random-structure fixtures (outliers, φ = 2 and 4, mixed),
+  subject to the median gain on decay_opp and opp_nonsep staying within 0.25 moduli of the best
+  d. Ties go to 3.
+- **Fixtures and sizes** (m = 16 is dropped):
+  - *Tier S* (deadband tuning, continuity with §2.6), 5 seeds: m = n = 128 with
+    k ∈ {600, 3600} and full outputs; m = n = 512 with k ∈ {3600, 16384} and sampled outputs.
+    Fixtures: uniform, φ ∈ {0.5, 2, 4}, decay_same, decay_opp, opp_nonsep, outliers, cancel,
+    same-sign, local_df, mixed, and the synthetic CC family.
+  - *Tier L* (gate evidence): m = n = 2048 with k ∈ {3600, 16384} and 3 seeds; m = n = 4096
+    with k = 3600 and 2 seeds. Fixtures: outliers, φ = 2, φ = 4, decay_opp, opp_nonsep, uniform
+    (control), and the synthetic CC contractions F_DF, F_PPL and F_ring.
+  - *Synthetic CC family*, documented in the fixture docstring, with its modelling assumptions
+    tagged [I]:
+    - occupied ε: o/7 core orbitals at −11 ± 0.5 Ha, valence uniform in [−1.5, −0.3] Ha;
+    - virtual ε: log-spaced over [0.05, 50] Ha;
+    - DF factors B_{Q,pq} = s_Q·g(ε_p)g(ε_q)·N(0,1), with s_Q decaying over 8 decades along Q
+      and g(ε) = (1 + |ε|)^{−1/2};
+    - MP2 amplitudes t = (ia|jb)/(ε_i + ε_j − ε_a − ε_b);
+    - contractions F_DF (K = Q), F_PPL (t2 × W over K = cd) and F_ring (K = ld).
+  - *Real operands*: R1–R7, below (IR19).
+  - *Multi-partner* (IR6): the real Bov with its Q-partners {Bov, Bvo}, plus a synthetic X with
+    3 partners (decay_opp-like, φ = 4, uniform).
+  - *Batched* (IR16): the real R7, iaQ,ibQ->iab with batch i over **all** occupied orbitals,
+    core included; and a synthetic batch whose λ < b/4 slices decay along K at a different rate
+    from the rest. Each reports the gain of a shared w (Q12 a) against per-λ w (Q12 b, from
+    `oracle.kweights` per slice), with the guard for both. Pre-registered trigger: Q12 (b) is
+    reconsidered only if per-λ weights save ≥ 1 modulus beyond shared weights on a real fixture
+    at the same guard status. Otherwise Q12 (a) stands, and the escape clause is closed.
+- **Real operands** (IR19; decided by the independent reviewer). No ehrenfest dump is requested
+  or performed in this cycle. ehrenfest saves no tensors (checked read-only), and its integrals
+  come from a psi4 sidecar at runtime, which would mean running ehrenfest code.
+  - *Generator:* a new script, immerdink-eval `scripts/c1/psi4_operands.py`. It is our code: it
+    must not import or run anything from `/home/ef/repos/ehrenfest-ipdps`. It uses the psi4
+    already installed in the `main` conda env, read-only; nothing is installed into that env.
+  - *Run conditions:* CPU-only, `psi4.set_num_threads(1)` and OMP/MKL/OPENBLAS = 1,
+    `set_memory` ≤ 4 GB, under `tools/memcap.sh`, after a FREE busy check, `timeout 600` per
+    molecule, ≤ 15 CPU-min in total, inside the M-a budget.
+  - *Molecules:* benzene/cc-pVDZ (for PPL), benzene/cc-pVTZ, and water/cc-pV5Z (the 5Z virtual
+    spectrum of the consumer's target basis). Each run: DF-SCF; MO-basis RIFIT factors
+    B^Q_{oo, ov, vv}; orbital energies; MP2 amplitudes t = (ia|jb)/D. No frozen core.
+  - *Storage:* `.npz` files in immerdink-eval `results/c1/real/` (untracked). `c2_gate.py`
+    loads them by path argument and never depends on psi4.
+  - *Contractions*, taken read-only from the consumer's own ehrenfest
+    examples/chemistry/coupledCluster/ccsd/ccsd.py:
+    - R1 aiQ,bjQ->abij (K = Q, TZ);
+    - R2 acQ,bdQ->acbd and R2b ijcd,acbd->abij (K = cd, DZ);
+    - R3 ilad,ldkc->aikc (K = ld, TZ);
+    - R4 kjbc,kiac->abij (K = kc, TZ);
+    - R5 kiQ,acQ->kiac (K = Q, TZ);
+    - R6 the multi-partner Bov over Q;
+    - R7 the batched iaQ,ibQ->iab.
+
+    Each is of the ≥ 2048³ class (2mnk ≥ 1.7e10) except R7, which is a fixture for Q12 only.
+  - *Status for Q13:* these count as real, consumer-confirmed operands: real molecules, on the
+    consumer's own contraction list. Recorded assumptions [I]: MP2 amplitudes stand in for
+    converged t2, and bare integrals for t1-dressed ones (the t1 dressing is small).
+  - *Fallback:* if psi4 cannot run in that env, the stage-4/6 gates are formally deferred with
+    the trigger "real operands available". The Eric-approved ehrenfest dump is then the named
+    fallback route.
 - **Reported:**
-  - moduli saved at equal max-elementwise and max-normwise error;
-  - the change in the **worst** output;
-  - stale-weight rates;
-  - **the guard**, on every family and in particular on `opp_nonsep`, the synthetic CC family
-    and the real operands: its acceptance rate, the gain G, the worst pair's
-    log₂(‖a‖‖b‖/‖ã‖‖b̃‖), and the **realized** regressions among guard-accepted cases (the guard
-    bounds the error bound, not the error);
-  - the moduli saved through the L5d transform, i.e. what `min_moduli` picks for the weighted
-    call from the plain statistics, against the measured minimum;
-  - predicted TFLOPS-eq and time from `imd_perf_predict` with every cost term: for K-seg, the
-    S-fold K0/K5/W writes and the β = 1 read of C; for K-eq, the helper (one or two operand
-    reads) and the pre-scaling (16 B per element per changed operand per call unless fused),
-    as in §2.6.
-- **The CRT precondition is asserted for every output.** The study also settles the deadband
-  value and Q11: the deadband is re-tuned at m = n ≥ 128 with at least 5 seeds.
+  - per run, as JSONL in immerdink-eval `results/c1/m_a/`: commit, library sha256, host API,
+    CPU-seconds, peak RSS;
+  - per fixture, as a function of m ∈ {128, 512, 2048, 4096}: the guard acceptance rate, G
+    (median and min), the worst-pair bits, and the moduli saved at equal sampled
+    max-elementwise (1e−6 / 1e−8 / 1e−10 / 1e−12) and max-normwise (1e−8 / 1e−12 / 1e−15) error;
+  - **realized regressions among guard-accepted runs** (the guard bounds the error bound, not the
+    error): sampled outputs whose weighted error exceeds fast's at the same N by > 2×, as a count
+    and the max ratio;
+  - stale-weight rates (weights from seed s applied to seed s + 1);
+  - the L5d moduli, i.e. what `min_moduli` picks for the weighted call from the plain
+    statistics, against the measured minimum;
+  - the **B6 estimate** (IR11), on outliers, opp_nonsep, φ = 4 and the real operands: the fraction
+    of rows with max_j ρ_ij above the threshold, and the [M] time t(N_lo, full) + t(N_hi, rows)
+    against t(N_hi, full). It uses full outputs where m·n ≤ 512², and FP64 x on the real
+    operands (an estimate, labelled);
+  - [M] TFLOPS-eq first, time alongside, from `imd_perf_predict` of this worktree's rebuilt
+    library, with every cost term: for K-seg, the S-fold K0/K5/W writes and the β = 1 read of C;
+    for K-eq, the helper (one or two operand reads) and the pre-scaling (16 B per element per
+    changed operand per call unless fused), as in §2.6.
+- **Gate admissibility.** Only Tier L and real-operand runs feed Q13 (the stage-4 rule, §4.5,
+  IR27). Tier S tunes d* and shows the trend.
+- **CPU budget (hard):**
+  - every run single-threaded (OMP/OPENBLAS/MKL = 1), under `tools/memcap.sh`, after a FREE busy
+    check in its own call, wrapped in `timeout 600`;
+  - the whole of M-a ≤ 90 CPU-min: self-tests + pilot ≤ 10, Tier S ≤ 25, Tier L ≤ 25, real
+    operands (generation included) ≤ 30;
+  - pilot first: outliers, 4096², k = 3600, seed 0. The total is projected from it;
+  - if the projection exceeds 90, cut in this pre-declared order: (1) Tier L 4096 seeds 2 → 1;
+    (2) Tier S m = 512, k = 16384 kept only for decay_opp, opp_nonsep, outliers and φ = 4;
+    (3) Tier L 2048, k = 16384 kept only for decay_opp, opp_nonsep and synthetic CC;
+  - never cut the real operands, the guard, or m = 4096.
 
-**M-b (CPU, now): model trajectories.** Per-phase TFLOPS-eq and time for square and CC-shaped
-cases, schedule totals against fixed N, and the re-pack cost per switch (`predict_pack`).
-§2.3–§2.4 already hold most of this.
+  The machine was BUSY during the review, so these costs are estimates. The pilot plus the
+  pre-declared cut order keeps the 90-minute bound enforceable without post-hoc choices.
 
-**M-c (GPU, later): small-N hold-out.**
-- About 20 calls on shapes disjoint from the calibration set: sq1024, sq2048, sq4096, a DF shape,
-  a CC shape, a skinny shape.
-- N = 4–7, with dense and decay data.
-- Judged against the §6c.5 targets. If a target is missed: per-class residuals first, then N = 4–7
-  calibration cases. No new features (Q24).
-- **M-c runs before any schedule gain that uses N ≤ 7 (§2.4) enters DESIGN as a claim.**
+**M-b (CPU, round 1): model trajectories.** Per-phase TFLOPS-eq and time for square and
+CC-shaped cases, schedule totals against fixed N, and the re-pack cost per switch
+(`predict_pack`). §2.3–§2.4 already hold most of this. In addition:
+- **Re-run every [M] figure that DESIGN will cite** with this worktree's rebuilt library (IR9).
+  A figure that differs by > 0.5 % is replaced, and the change is noted. This also completes
+  R-num's unfinished [M] re-runs (Provenance).
+- **The share-group raise cost** (IR15) on the DF-CCSD contraction set (ehrenfest ccsd.py,
+  read-only): the group at its max N against each member at its own floor with separate packs,
+  [M], TFLOPS-eq and time.
+
+**M-c (GPU, round 2): small-N hold-out** (IR4; decided by the independent reviewer). It runs
+**strictly before M-d2**.
+- N ∈ {4, 5, 6, 7, 9, 10, 12, 13}, plus N ∈ {8, 14} as anchors on the same shapes, so that a
+  shape error separates from an N error.
+- Shapes: sq1024, sq2048, sq4096, DF acQ,bdQ 64⁴ with Q = 2032, QZ kiQ,acQ (o 21, v 489,
+  Q 1122), skinny 256²×65536, the PPL view 100×9216×9216 and the Jacobi view 1600×100×1600.
+  A script checks by extents that every shape is absent from `bench/sweep_calib.txt`; if one is
+  not, the nearest unlisted size is used (e.g. 2000, 4000). sq2048 is in the calibration set
+  today [V], so it becomes such a size.
+- Data: dense normal, and decay_opp-like, to cover [KT26]'s data-dependent INT8 throughput.
+- About 160 cases, ≤ 15 min of GPU time, under `_wip/gpu.lock`.
+- Judged per size class against §6c.5 (median and p90 of the total), and reported per N.
+- If a target is missed: per-class residuals first, then N-specific calibration cases under the
+  existing format, with optional keys only (Q24; no new features).
+- **Until M-c passes**, DESIGN marks the default levels (6, 8, 10, 12, 14) and every §2.4 or
+  §4.10 schedule gain that uses N ∉ {8, 10, 14, 16} as [M, model-only, outside hold-out].
 
 **M-d: scheduled iterations** (`bench/accuracy/schedule.py`). Convergence and time are measured
 separately. On the drafted small systems a time bar alone cannot discriminate: the ACCURACY §3
@@ -1055,7 +1447,7 @@ under 100 µs (10–13 %).
     ring-like term.
 - **Schedules:** fixed N ∈ {6, 8, 10, 12, 14}, and forcing-rule ramps (η ∈ {0.1, 0.01}, levels
   {5, 6, 8, 10, 12, 14}, BOUND and TYPICAL with p = P/C).
-- **M-d1 (CPU, possible now): convergence.** The bit-exact emulator (checked against
+- **M-d1 (CPU, round 1): convergence.** The bit-exact emulator (checked against
   `oracle.contract`) runs the iterations, so no GPU is needed. Systems at reduced size where
   needed (the PPL-like system at v ≈ 40), single-threaded, under memcap, when ehrenfest is FREE.
   - Metrics: iterations to reach tol ∈ {1e−7, 1e−10}; the final residual in long double; drift
@@ -1063,7 +1455,28 @@ under 100 µs (10–13 %).
     trajectory; for DIIS, iteration counts with and without the reset at each switch.
   - **Success:** the ramp reaches the fixed-N_final residual within 2× and with at most one more
     iteration, on every system, DIIS included.
-- **M-d2 (GPU, later): time, on realistic shapes.** The o = 10, v = 96 PPL view
+  - **Report-only cases** (IR3). They are not C1 gates; they document caller guidance. Block
+    forms give the emulated contraction a GEMM shape, which is what immerdink is for; a plain
+    GEMV gains nothing from INT8 emulation. A's σ is computed once per N.
+    - *Block Davidson:* the lowest 4 roots of a symmetric n = 2048 matrix,
+      diag(Δε_ia-like) + DF-like coupling, block 8, subspace ≤ 48 with restart. σ = H·V is an
+      emulated 2048×2048×8 GEMM. Schedules: fixed N ∈ {8, 14}, and a tightening ramp over the
+      levels {6, 8, 10, 12, 14} with **absolute** targets η·‖r‖. Reported: iterations to
+      residual 1e−7 and 1e−10, and the eigenvalue error against FP64 `eigh`. Expected: the ramp
+      needs ≤ fixed-N_final + 1 iterations.
+    - *Block CG:* SPD A = BBᵀ/k + μI from DF-like factors, n = 2048, cond ≈ 1e6, 16 right-hand
+      sides, with an emulated GEMM matvec. Schedules: fixed N ∈ {8, 10, 14}; monotone
+      tightening; relaxed decreasing (matvec tolerance ∝ tol/‖r_k‖). Reported: iterations to a
+      true residual of 1e−7 and 1e−10, recomputed exactly, and the attainable accuracy.
+  - **ρ-miss rate** (IR7). A schedule variant with ELEMENTWISE targets, whose cond comes from
+    the previous iteration's ρ̂ (`rho_from_output`), records per iteration whether the current
+    call's realized max elementwise error missed the target. The miss rate is reported per
+    system: it is the number a caller needs to trust the lagged ρ.
+  - **Budget:** M-d1 ≤ 30 CPU-min in total, each run ≤ 10 min, single-threaded, under memcap,
+    after a busy check.
+- **M-d2 (GPU, round 2): time, on realistic shapes.** It runs only after M-c (IR23). If M-c
+  triggers a recalibration, the predicted ratios and bands below are re-derived and
+  pre-registered before M-d2 runs. Systems: the o = 10, v = 96 PPL view
   (100 × 9216 × 9216; predicted schedule/fixed-14 = 0.75 [M, review]), DF (0.66) and 4096³
   (0.67). The Jacobi view (predicted 0.79) is reported but not gated.
   - Metrics: measured TFLOPS-eq and time per phase against the predictions; re-pack time at the
@@ -1083,9 +1496,29 @@ TFLOPS-eq first, with time alongside.
 `oracle.contract_segments`, the K-segmentation caller recipe (§2.7, with L7's caveats), and the
 DESIGN §7 rows below.
 
+**Order and size** (IR12, IR28, IR5). Stage 3 starts after the M-a summary exists, and its §7
+rows cite M-a. It is re-sized from S to M for the Lean prerequisite below.
+
+**Lean prerequisite: L3c** (IR5; decided by the independent reviewer). proofs/NOTES.md maps only
+L3a and L3b. There is no IEEE model; rounding enters as a hypothesis. L7 needs both L3c and
+γ_{S−1}. So before L7's `kseg_compose`, Lean gets:
+- L3c's ν form;
+- the ELEMENTWISE and ABSOLUTE compositions;
+- the final-rounding step in the normal range, under the same style of hypothesis as L3b's
+  existing |D − z·2^{−σ−τ}| ≤ u|D|;
+- an FP recursive-summation lemma γ_k: the per-step hypothesis |fl(a + b) − (a + b)| ≤ u|a + b|,
+  and induction to γ_{S−1}.
+
+All of it lives in proofs/Proofs/Error.lean or a new Summation.lean, with no new axioms, and is
+audited by `tools/check_proofs.sh`. proofs/NOTES.md maps L3c and L7 when they land.
+- The stage-3 code deliverables do not wait on the Lean: `oracle.contract_segments`,
+  `cert_kseg_composition` and the recipe text.
+- The Lean must be complete before C2 is declared done (§4.11).
+- L5d and L6 Lean (stages 4 and 5, if built) build on this L3c.
+
 **The other lemmas are proved where they are first relied on** (R2, §5.2):
 - L5, its certificates, `GuardSound` and Lean in stage 4;
-- L6, its certificates and Lean in stage 5.
+- L6, its certificates and Lean in stage 5, which is deferred (§4.6, IR26).
 
 Their statements and hand proofs are recorded here now. R-num re-derived L5a/b/c, L6 and L7 by
 hand.
@@ -1126,6 +1559,10 @@ b̃_hj = b_hj·2^{−w_h}.
     rows' ratios.
   - The guard bounds the error *bound*, not the realized error ("never worse in the §3.8
     bound").
+  - **Several partners** (§4.5, IR6). With X pre-scaled once and partners Y_1..Y_P, the guard
+    is per pair: G_p = gain_min(X) + gain_min(Y_p), and the reported G = min_p G_p. L5c is
+    pairwise, so G ≥ 3 makes it hold for every partner. L5d's transform with the min G is valid
+    for every partner, because the transform is monotone in G.
   - Evidence [C, review]: in exact arithmetic, margin 3 had 0 violations (65 accepted cases),
     and at margin 2 none was observed (13 cases).
 - **(d) Transfer to the request** (R-num should-fix 1). From (c), with any reported G, the plain
@@ -1146,7 +1583,7 @@ b̃_hj = b_hj·2^{−w_h}.
     reached through auto-N. Stage 4 ships the transform as `imd_err_request_kweighted`
     (§4.5).
 
-**L6 (a-posteriori certificate)** **[stage 5; cert: cert_apost, cert_stats_constants,
+**L6 (a-posteriori certificate)** **[stage 5, deferred (IR26); cert: cert_apost, cert_stats_constants,
 cert_stats_bin; TLA+: OzakiScaling `CertSound`; Lean `apost_cert`]**
 
 *Setting.* As L3, possibly with weighted operands (L5b). Take δ = ½ (RN) or 1 (TRUNC),
@@ -1214,17 +1651,19 @@ Assume finite inputs and no overflow or underflow.
 
 **Certificates** (spec/params.py, real widths, every N = 2..20, RN and TRUNC), by stage:
 - Stage 0: `cert_footprint_monotone`. It covers F1, F2 and the internal facts I1 (including
-  the drafted `LayoutPrefix`: equal sig/flag offsets across N, res(N′) inside res(N_max)) and
-  I2.
+  the drafted `LayoutPrefix`: equal sig/flag offsets across N, res(N′) inside res(N_max)), I2,
+  and I3 (packing more roles never increases ws(N, g); IR8).
 - Stage 1: `cert_rho_recipe`. The §4.2 FP evaluation gives ρ̂ ≥ ρ in exact rationals, on random
-  rows and on rows with |D| just above U·n.
+  rows and on rows with |D| just above U·n. `host_precision` checks the shipped
+  `rho_from_output` helper against it (IR7).
 - Stage 3: `cert_kseg_composition`. L7 against exact rationals, with rows from every M5 family
   plus constant rows; S ∈ {1, 2, 3, 4}; N ∈ {3, 4, 5, 8, 14, 20}; RN and TRUNC; per-segment ν;
   every metric; plus the ν counterexample (a = (1, ε, …)).
 - Stage 4:
   - `cert_kw_rule`: the §4.5 integer rule against an independent brute force on random Δ
     vectors (ties, even and odd counts, deadband edges, floor of negative values, both clamps,
-    the Q9 index order with repeated and one-sided labels).
+    the Q9 index order with repeated and one-sided labels), including the multi-partner union
+    extrema and clamps, and the rejection of partners whose shared-K label set differs (IR6).
   - `cert_kw_fp64_exact`: clamped weights make every scaled entry exact in FP64, on edge
     exponents including subnormals. R-num re-derived the four clamp bounds.
   - `cert_kw_guard`: L5c on random and adversarial rows in exact rationals:
@@ -1232,7 +1671,7 @@ Assume finite inputs and no overflow or underflow.
     inequality whenever G ≥ 3. It also checks L5d's FP evaluation: cond′ and norm_product′ at
     least, and t′ at most, the exact values. It does not search for a margin-2 witness; L5c
     states analytically why margin 2 is not enough for the proof.
-- Stage 5:
+- Stage 5 (deferred, IR26; built only on a trigger):
   - `cert_stats_constants`: X and B̄ are exact ceilings; their widths fit L32(N) for RN; the
     TRUNC "uncertified" flag; r ≤ 155; k ≤ 2^40.
   - `cert_stats_bin`: the K5 bin rule (bitlen(X) − bitlen(Y), clamped at 0, then one exact
@@ -1241,29 +1680,67 @@ Assume finite inputs and no overflow or underflow.
   - `cert_apost`: L6 against `emulate_element` on random, constant, adversarial and weighted
     rows (ρ ≤ 2^r, error ≤ certificate for in-range outputs, out-of-range ones flagged), with
     counterexamples for dropping kδ² or using ⌊√k⌋.
-- Stage 6: `cert_kw_shift_range` and reruns (§4.7).
+- Stage 6: `cert_kw_shift_range` and reruns; `cert_workspace` and `cert_plan_bytes` for the
+  weighted vec sizes of the q map (§4.7, IR21).
 
 **Oracle** (spec/oracle.py), by stage:
 - Stage 2: `kweights(A, B, plan, params)`, returning (w, report) in exact integers, with the
-  report's G (§4.3 M-a).
+  report's G (§4.3 M-a); and its multi-partner mode (one X, partners Y_1..Y_P, G = min_p G_p;
+  P = 1 is the single-partner case), which rejects partners whose shared-K label set differs
+  (§4.5, IR6).
 - Stage 3: `contract_segments(A, B, C, N, rounding, bounds)`, a literal composition of
   `contract` with β = 1.
-- Stage 5: `apost_bin(z, sigma, tau, plan)`, and `stats(view, ...)`, the integer fields of
-  `imd_stats_t`.
+- Stage 5 (deferred): `apost_bin(z, sigma, tau, plan)`, and `stats(view, ...)`, the integer
+  fields of `imd_stats_t`.
 - Self-tests cover the CRT assertion on every fixture, invariance of w under joint K
   permutation, and determinism.
 
-**DESIGN §7 rows** (immerdink data only):
+**DESIGN §7 rows** (immerdink data only). They are written after the M-a summary and cite it
+(IR12): DESIGN §7 must not assert dominance on synthetic small-m data before the realistic-size
+study.
 - "Accurate mode": still rejected. By an estimate from the §3.8 bound, confirmed by the data of
   §2.5–§2.6 (not a theorem), partner-aware σ/τ shifts realize about G/7.8 moduli out of a G-bit
   headroom. They saved ≤ 0.3 moduli on dense data and about 3 on separable anti-correlated data,
   need one more operand pass (losing KF/KL group-1 fusion) and break D1. K-equilibration turns
-  the same headroom into about G/3.9 moduli, with no pass inside the library (§2.8). The
-  envelope rule (Appendix B) is recorded as the proven partner-aware option.
+  the same headroom into about G/3.9 moduli, with no pass inside the library (§2.8). The row
+  adds M-a's Tier L and real-operand figures. The envelope rule (Appendix B) is recorded as the
+  proven partner-aware option.
+  - **If any stage-3 text is written before M-a reports**, this row is worded "provisional until
+    M-a". It then keeps only the reasons that hold regardless of M-a: it breaks D1 for σ, needs
+    the extra operand pass, loses KF/KL group-1 fusion, and gets about G/7.8 against G/3.9
+    moduli per bit, tagged as an estimate.
+- "More bits per modulus via larger moduli (e.g. Karatsuba-split residues)": rejected, more
+  INT8 GEMMs per bit on sm_89 [I] (IR15). arXiv:2603.10634 is cited only if the builder can
+  verify its title and claim; otherwise the row carries no citation.
 - New rows: N-range plan (A2), multi-N and RO packs (A3, A4), device-chosen N (B4), slices (C1,
-  parked).
+  parked, with §3.3's triggers), K5 statistics and the device certificate (B3, deferred with
+  triggers T1–T3, §4.6). Every deferral names its trigger, here or in the ROADMAP (IR29).
 
 ### 4.5 Stage 4 — `imd_kweights` and caller-side equilibration (C2, step 1)
+
+**Gate** (pre-registered by the independent reviewer, IR27; applied mechanically in round 2,
+before M-a's results are known). Stage 4 passes iff all of the following hold:
+- **(i)** On at least one real-operand contraction R1–R6 (≥ 2048³ class, §4.3):
+  - the guard = 1;
+  - **and** either **(b)**: the predicted net TFLOPS-eq gain is ≥ 5 % at equal target, in either
+    metric. The elementwise targets are {1e−8, 1e−10}. The normwise targets, {1e−10, 1e−12},
+    are relative to the **plain** norms through L5d's t′. Every cost is included: the helper,
+    amortized over a 16-iteration run for invariant operands and per call for operands rebuilt
+    every iteration; unfused pre-scaling at 16 B per element per changed operand per call; and
+    the memory of scaled copies;
+  - **or (c)**: a target ≤ 1e−8 elementwise that fast mode cannot reach at N ≤ 20 becomes
+    reachable at N ≤ 20.
+- **(ii)** No Tier-L or real fixture shows realized regressions > 2× among guard-accepted runs.
+- **(iii)** The FP64-exact clamp is never violated.
+
+If the gate fails, stage 4 is closed with the revival trigger "a real-operand family meeting
+(i)", and `oracle.kweights` and M-a remain as the C2 deliverable.
+
+**Cost figures at the gate** (IR23). The gate uses bandwidth-based [E] figures for the
+pre-scaling (16 B per element) and the helper (1–2 operand reads), at the DRAM bandwidth implied
+by the shipped calibration, and states them next to the gate. M-e measures them after any
+stage-4 build. If M-e's net gain on the gate's own case falls below the 5 % bar, stage 4 is not
+merged to dev unless criterion (c) holds there, and stage 6 is not started.
 
 **The idea.** The caller stores pre-scaled operands, ã = a·2^w along K and b̃ = b·2^{−w}, and
 contracts them with ordinary plans and packs. The library's numerics do not change; C is
@@ -1273,22 +1750,38 @@ that turns plain statistics into the weighted call's request (L5d).
 
 **Index order** (Q9, both reviewers' rules merged). w is indexed over the **shared K labels**:
 the plan's contracted labels that both A and B carry.
-- Labels are ordered by their first occurrence in A's descriptor mode order, first label
-  fastest (column-major). A repeated (diagonal) label counts once, at its first occurrence.
+- Labels are ordered by their first occurrence in X's descriptor mode order, first label
+  fastest (column-major). X is the operand scaled by 2^w: A in a single plan, and the
+  pre-scaled operand of the multi-partner rule below (IR6). A repeated (diagonal) label counts
+  once, at its first occurrence.
 - The length k_s is the product of the shared labels' extents. k_s = k when every K label is
   shared. An extent-1 label contributes a factor 1 and changes nothing.
 - A K label carried by only one operand (DESIGN §5 step 6: stride 0 in the other) is not
   indexed: w is constant along it, i.e. it gets w ≡ 0. Scaling it on one side would need the
   other operand materialized along a label it does not carry.
 - The order does not depend on the partner or on C's strides, unlike the plan's canonical k̄
-  (§5 step 8). Stage 6 must convert it (§4.7, open item).
+  (§5 step 8). Stage 6 maps it to k̄ through the q map (§4.7, IR21).
+
+**Several partners** (IR6; decided by the independent reviewer). In DF-CCSD the invariant Bov is
+contracted over Q with both Bov and Bvo (ehrenfest ccsd.py, read-only: ldQ,kcQ->ldkc and
+aiQ,kcQ->aikc). The rule below therefore defines w on one operand X, pre-scaled once by 2^w along
+the shared K labels. Its partners Y_1..Y_P each receive 2^{−w}, whatever their role in each plan;
+defining w on X keeps role swaps across plans well defined.
+- Every partner must carry exactly the same shared-K label set, in X's descriptor mode order (the
+  Q9 order taken from X). `oracle.kweights` rejects partners whose shared-K set differs.
+- Partners over different K labels (e.g. t2 over cd in PPL and over ld in ring) need separate
+  weight vectors and separate scaled copies: the memory risk below.
+- The single-partner case is P = 1, with X = A and Y_1 = B.
+- Share groups are the partners of a shared packed X: one N (a pack per N) and one w. There is
+  no further interaction.
 
 **Rule** (integers only; one vector shared by every batch λ, Q12):
-1. **Exponent extrema.** For each shared index h: c_A(h) and m_A(h) are the max and min of
-   ilogb|a| over the finite nonzero entries of A at h (all λ, rows and one-sided K labels);
-   c_B(h) and m_B(h) the same for B (all λ, columns and one-sided K labels). An index with no
-   such entry on one side is undefined.
-2. **Δ and median.** Δ_h = c_B(h) − c_A(h) where both are defined; Δ ∈ [−2097, 2097]. med = the
+1. **Exponent extrema.** For each shared index h: c_X(h) and m_X(h) are the max and min of
+   ilogb|x| over the finite nonzero entries of X at h (all λ, its free indices and one-sided K
+   labels). c_Y(h) and m_Y(h) are the max and min over the finite nonzero entries of **every**
+   partner at h (all λ, free indices and one-sided K labels): the union extrema. An index with
+   no such entry on one side is undefined. With P = 1 these are c_A, m_A, c_B, m_B.
+2. **Δ and median.** Δ_h = c_Y(h) − c_X(h) where both are defined; Δ ∈ [−2097, 2097]. med = the
    lower median of the defined Δ, from a one-CTA histogram.
 3. **Raw weight.** w0_h = 0 if Δ_h is undefined or |Δ_h − med| ≤ deadband; otherwise
    ⌊(Δ_h − med)/2⌋.
@@ -1296,9 +1789,10 @@ the plan's contracted labels that both A and B carry.
    interval where scaling both operands is exact in FP64. The FP64-exact clamp is
    unconditional (R-num must-fix 1); there is no flag to turn it off. A side with no finite
    nonzero entry at h imposes no bound.
-   - w > 0 (A scaled up, B down): w ≤ 1023 − c_A(h) (no overflow) and w ≤ m_B(h) + 1022
-     (no B entry drops below the normal range).
-   - w < 0 (A down, B up): w ≥ −1022 − m_A(h) and w ≥ c_B(h) − 1023.
+   - w > 0 (X scaled up, partners down): w ≤ 1023 − c_X(h) (no overflow) and
+     w ≤ m_Y(h) + 1022 (no partner entry drops below the normal range).
+   - w < 0 (X down, partners up): w ≥ −1022 − m_X(h) and w ≥ c_Y(h) − 1023.
+   - The union extrema keep the clamp exact for every partner.
 
    0 is always feasible, so the clamp is the nearest feasible value to w0_h. A constant offset in
    w has no effect (σ is scale-equivariant), which is why the rule centres on the median.
@@ -1313,6 +1807,10 @@ the plan's contracted labels that both A and B carry.
    guard = 1 iff G ≥ 3 (L5c). If A has no nonzero finite row or B no nonzero finite column, G is
    undefined. Then guard = 1 vacuously, since every product is zero or flagged, and
    gain = INT32_MIN; the plain request applies unchanged.
+   - *Several partners:* the guard is per pair, G_p = gain_min(X) + gain_min(Y_p), each computed
+     at pair p's plan (N, k, rounding). The reported G = min_p G_p, and guard = 1 iff G ≥ 3. L5c
+     is pairwise, so it then holds for every partner. `imd_err_request_kweighted` with the min G
+     is valid for every partner, because the transform is monotone in G.
 
 **Exactness for the caller.** With the clamp, every scaled entry is representable, so the
 caller's pre-scaling is exact. Non-finite entries stay non-finite (Inf·2^w = Inf), and no finite
@@ -1327,8 +1825,10 @@ typedef struct {                 /* 24 B; zero-tail rule (§4.9)                
   uint32_t struct_size;
   int32_t  deadband;             /* >= 0 (default 3)                                          */
   int32_t  max_abs;              /* 1..127 (default 127)                                      */
-  int32_t  flags;                /* IMD_KW_GUARD = 1; other bits: INVALID_VALUE. The FP64-exact
-                                    clamp is always applied (no flag).                       */
+  int32_t  flags;                /* IMD_KW_GUARD = 1; IMD_KW_ZERO_ON_FAIL = 2 (only with
+                                    IMD_KW_GUARD, else INVALID_VALUE: on guard failure w := 0);
+                                    other bits: INVALID_VALUE. The FP64-exact clamp is always
+                                    applied (no flag).                                        */
   int64_t  reserved;             /* 0 */
 } imd_kweights_params_t;
 typedef struct {                 /* 32 B, written by the call into caller device memory      */
@@ -1361,6 +1861,9 @@ imd_status_t imd_err_request_kweighted(const imd_err_request_t* plain, int32_t g
                                        imd_err_request_t* weighted);
 ```
 
+- **Single-partner shape.** The signature above is the P = 1 case. The multi-partner C API shape
+  (partners as an array of plans and B pointers, one report with the min G) is finalized at the
+  stage-4 gate (IR6); the rule and `oracle.kweights` already define it.
 - **Plan.** Any EMULATE plan of the contraction works; it supplies the lowering, the scatter
   vectors and (N, k, rounding) for the guard. It reads the FP64 pointers passed, and its packs are
   ignored. DIRECT, K-empty, k ≤ 1 and k_s ≤ 1 plans return NOT_SUPPORTED.
@@ -1377,9 +1880,20 @@ imd_status_t imd_err_request_kweighted(const imd_err_request_t* plain, int32_t g
 
   The output is bitwise deterministic. The helper is capture-safe: kernels only, on the caller's
   stream, with no allocation or sync.
+- **Capture, end to end** (IR13). The helper may run inside a capture. The guard read (a D2H),
+  the weighted request (`imd_err_request_kweighted`) and the choice of N happen once per
+  magnitude profile, outside capture, by the caller.
+  - `IMD_KW_ZERO_ON_FAIL` (valid only with `IMD_KW_GUARD`): on guard failure the helper writes
+    w ≡ 0, and sets the report's `clamped` and `num_weighted` to match.
+  - **The fully captured pattern:** the helper with ZERO_ON_FAIL → the caller's scaling kernel
+    applies w → a contract at an N chosen beforehand from the **plain** request with
+    `l1_ratio` = 0 (ν = √k). That request is rigorous in both outcomes: by L5c when the guard
+    holds, and on plain operands when w ≡ 0. It gives up only the L5d tightening inside captured
+    iterations.
 - **Cost** [E]: one read of A and B without the guard, two with it. At 4096³ that is about 0.3 /
   0.6 ms, about 6 / 13 % of an N = 14 call. It is paid once per magnitude profile, or per call
-  if it is re-run on operands that change every iteration (§2.6).
+  if it is re-run on operands that change every iteration (§2.6). The gate states
+  bandwidth-based figures, and M-e measures them (IR23).
 - **Perf model:** no phase. The helper is measured in M-e and counted in the Q13 gate.
 - **Python:** `Plan.kweights(A, B, deadband=3, max_abs=127, guard=True, workspace=, stream=)`,
   returning device views of w and the report; `host.kweights_ws_bytes`;
@@ -1407,9 +1921,10 @@ imd_status_t imd_err_request_kweighted(const imd_err_request_t* plain, int32_t g
    with `min_moduli` / `PrecisionPlan` as usual.
 4. Contract and pack the scaled tensors as usual.
 
-The caller owns consistency: every partner of a pre-scaled packed operand must carry the same w.
-A mismatch is a silently wrong product, documented as a caller rule. The reported G is valid for
-the pair the helper ran on. For new data it is a prediction, unless the helper is re-run.
+The caller owns consistency: every partner of a pre-scaled packed operand must carry the same w,
+the one the multi-partner rule chooses over all of them (IR6). A mismatch is a silently wrong
+product, documented as a caller rule. The reported G is valid for the pairs the helper ran on.
+For new data it is a prediction, unless the helper is re-run.
 
 **Spec.**
 - New small `DeviceReduce.tla`, run under memcap with bounded parallelism. It models one call's
@@ -1426,18 +1941,34 @@ the pair the helper ran on. For new data it is a prediction, unless the helper i
   library reports, so this lemma follows the project pattern for lemmas: TLA+ toy + params +
   oracle + Lean.
 - PROOFS L5 with its Lean proofs `kweight_cancel` and `kweight_guard`, and the stage-4
-  certificates of §4.4. `oracle.kweights` already exists from stage 2.
+  certificates of §4.4. `oracle.kweights` already exists from stage 2. L5d's Lean builds on
+  stage 3's L3c (IR5).
+- **TLA+ run limits** (IR25; binding when stages 4 and 5 are built). A previous TLC run
+  OOM-crashed the machine, so:
+  - every run under `tools/memcap.sh`, ≤ 2 workers, -Xmx ≤ 8 GB, ≤ 30 min per configuration;
+  - first a 1-worker smoke configuration at the smallest constants, with TLC's state count and
+    memory recorded;
+  - toy constants then sized to fit: CTAs ≤ 2, threads per CTA ≤ 2, calls ≤ 2, toy k ≤ 3, toy
+    widths as in OzakiScaling;
+  - the chosen constants, the distinct-state count, the run time and the peak RSS recorded in
+    each .cfg header.
+
+  `GuardSound`'s toy-exhaustive enumeration is bounded the same way, and the bounds are stated in
+  PROOFS next to L5c.
 
 **Tests.**
 - `host_kweights`: workspace bytes and k_s against params, the Q9 order (repeated labels,
-  one-sided K labels, extent-1 labels), and validation (struct_size, unknown flags, deadband < 0,
-  max_abs ∉ 1..127, reserved ≠ 0, a nonzero tail beyond the known size).
+  one-sided K labels, extent-1 labels), and validation (struct_size, unknown flags,
+  ZERO_ON_FAIL without GUARD, deadband < 0, max_abs ∉ 1..127, reserved ≠ 0, a nonzero tail
+  beyond the known size).
 - `host_accuracy`: `imd_err_request_kweighted` against params' exact transform for every metric,
   with ℓ1 ratios reset, and its INVALID_VALUE cases.
 - GPU `kweights_helper`: w and the report bit-equal to the oracle on the M5 families, random Δ,
   ties, all-zero K indices, non-finite entries, all-equal Δ, subnormals at the clamp edges, k = 2,
-  batches. Also determinism (repeats, two streams), capture/replay, and compute-sanitizer
-  memcheck, racecheck and initcheck.
+  batches; with ZERO_ON_FAIL, w ≡ 0 on a failing guard. Also determinism (repeats, two
+  streams), capture/replay, and compute-sanitizer memcheck, racecheck and initcheck. Once the
+  multi-partner C API is fixed at the gate, the same against `oracle.kweights`' multi-partner
+  mode.
 - `contract_kw_prescaled`: scaled contractions bit-exact against `oracle.contract(ã, b̃)`,
   including flagged rows.
 - `bench/accuracy`: when guard = 1, the measured error stays within the unweighted bound, and
@@ -1450,18 +1981,53 @@ the pair the helper ran on. For new data it is a prediction, unless the helper i
   every recurring cost included**: the helper amortized over the profile's lifetime (or per call
   if it is re-run), the unfused pre-scaling of operands that change per iteration, and the
   memory of scaled copies.
+- It confirms the stage-4 gate case (IR23, IR27). Below the 5 % bar on that case, stage 4 is not
+  merged to dev unless criterion (c) holds there, and stage 6 is not started.
 
 **Risks.**
 - The value depends on the data: none on dense data.
 - Weights that go stale on random-structure data cost up to 2 moduli. The guard detects this only
   when it is re-run on the current pair.
-- Pre-scaling a tensor that is also contracted over other indices (e.g. t2 in PPL and ring) needs
-  a scaled copy per weight vector, which costs memory. Stage 6 removes the copies.
+- Pre-scaling a tensor that is also contracted over other indices (e.g. t2 in PPL over cd and in
+  ring over ld) needs a separate weight vector and a scaled copy per K-label set, which costs
+  memory (IR6). Stage 6 removes the copies.
 
 ### 4.6 Stage 5 — K5 statistics and the a-posteriori certificate (C1(b) on the device)
 
-**Gate:** a consumer with elementwise targets (Q16). Until then the stage-1 recipe covers the
-need.
+**Gate: a consumer with elementwise targets (Q16). Not met; stage 5 is formally deferred**
+(IR26; decided by the independent reviewer on read-only evidence):
+- ehrenfest FOUNDATIONS.md D8 (lines 756-788): precision is user-directed; accuracy and stability
+  analysis is out of scope; auto-choosing precision is a non-goal; the built-in policy is
+  fp32 → fp64 on a residual threshold.
+- ehrenfest docs/design/hardwareAcceleration.md:22: the Ozaki choice uses a 2× speed threshold,
+  not an accuracy target.
+- BENZENE_5Z_READINESS.md: the Ozaki work has been frozen since 2026-09-06.
+- ccsd.py issues no accuracy requests.
+
+So no consumer has elementwise targets. The stage-1 helper is rigorous and is needed only once
+per phase decision, so its ~9 % cost amortizes away. Stage 5 would put a hook into K5, which runs
+at 82–96 % of its bound (ROADMAP A4), for no current user, and would add an ABI, a TLA+ module,
+Lean L6 and three certificates. Deferring with explicit triggers decides the gate on evidence,
+and nothing that regresses ships.
+
+**Triggers:**
+- **T1:** a consumer issues ELEMENTWISE accuracy requests per phase, and the `rho_from_output`
+  recipe's measured cost (the norm pass plus the pass over C) is ≥ 3 % of that consumer's run;
+- **T2:** a consumer needs a rigorous per-call elementwise certificate on every call (verified or
+  validated numerics);
+- **T3:** Eric asks for the device certificate, e.g. for the paper track.
+
+On a trigger, stage 5 is built as designed below (R3, R7, Q17–Q21), with one correction recorded
+now: **the cost bar cannot use `ncu`.** GPU performance counters are admin-only on this machine,
+and that must not change. The bar is restated as compiler resource usage (`-Xptxas -v` /
+`cuobjdump --dump-resource-usage`), occupancy from
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor`, and A/B timing.
+
+**C1 is complete without stage 5.** C1(b), auto-N from the M5 elementwise rule, is delivered
+host-side by stage 1: `min_moduli`/rank, `PrecisionPlan`, and the rigorous `rho_from_output`
+helper, whose per-output ρ̂ also yields an a-posteriori bound for that call.
+
+The design below is kept for a trigger.
 
 **Per-call struct and entry point** (host API +1):
 
@@ -1533,7 +2099,9 @@ typedef struct {                       /* 1328 B */
   `stats != NULL` branch costs no time when it is not taken, but it can still raise register
   allocation, and K5 runs at 82–96 % of its bound (ROADMAP A4). With stats on: at most 1 % of a
   4096³ call and 2 % of a DF call (K5 is 5–16 % of a call, §2.3). If the bar fails, use a K5
-  template variant and the optional calibration key `k5.stats_op` (Q20).
+  template variant and the optional calibration key `k5.stats_op` (Q20). Registers come from
+  the compiler (`-Xptxas -v` / `cuobjdump --dump-resource-usage`) and occupancy from
+  `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, never from `ncu` (IR26).
 
 **Accuracy API: one pure host function; `imd_err_request_t` is unchanged** (R3, §5.2,
 R-api should-fix 3).
@@ -1610,8 +2178,9 @@ zero_exempt=False) -> float`, whose result goes into an ordinary
   - Accumulation across calls and N; two streams on one buffer; capture/replay with re-zeroing;
     DIRECT, SCALE and α = 0 calls (`other_calls`); `k_max` / `k_min_c` across calls of two k;
     ALIASING, MISALIGNED and a nonzero `imd_call_t` tail.
-  - The cost bar (A/B), with register count and occupancy from the compiler and `ncu` for
-    `stats` NULL in every variant and at every N.
+  - The cost bar (A/B timing), with the register count from the compiler and the occupancy from
+    `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, for `stats` NULL in every variant and at
+    every N. No `ncu`: GPU performance counters are admin-only on this machine (IR26).
 - `host_accuracy`:
   - `imd_stats_cond` equals a brute force, with and without ZERO_EXEMPT; NOT_SUPPORTED when
     nothing is certified;
@@ -1626,26 +2195,46 @@ zero_exempt=False) -> float`, whose result goes into an ordinary
 
 ### 4.7 Stage 6 — library-internal weights and weighted packs (C2, step 2)
 
-**Gate:** M-e (stage 4) measured, plus real-operand evidence (Q13, Q14). The open layout item
-below must also be designed before the stage-6 build starts.
+**Gate** (pre-registered by the independent reviewer, IR27). Stage 6 starts iff:
+- stage 4 has shipped;
+- M-e confirms the stage-4 gate case (net ≥ 5 %, or (c));
+- and a real fixture shows that library-internal weights remove a cost stage 4 cannot avoid:
+  ≥ 5 % from pre-scaling or scaled copies on a recurring contraction.
 
-**Open design item: from caller-order weights to the kernels' k̄** (R-api should-fix 7). It
-blocks the stage-6 build.
-- w arrives in the Q9 order (shared K labels, A's mode order). The scaling and pack kernels
+Otherwise stage 6 is deferred with that trigger. The layout follows the decision below.
+
+**Decided: from caller-order weights to the kernels' k̄** (R-api should-fix 7; IR21, decided by
+the independent reviewer: candidate (i), in its map form). Stage 6 stays gated; this only
+unblocks its design.
+- w arrives in the Q9 order (shared K labels, X's mode order). The scaling and pack kernels
   index K in the plan's canonical k̄, which depends on the partner and on C's strides (§5
   step 8), and they need w per k̄ position, constant along one-sided labels.
-- "Stage 6 converts internally" therefore needs either a new workspace region for the
-  k̄-ordered weights (k̂ bytes), or extra vec entries mapping k̄ → Q9 index.
-- The region count is fixed by the header contract: `imd_workspace_layout` returns
-  `IMD_REGION_COUNT` regions (include/immerdink/immerdink_host.h:149-151), and
-  tests/test_host_c.c:59 checks it. This is the same problem Appendix A #18 raises for P3's
-  regions.
-- Candidates, to be decided with a TLA+/params plan of their own:
-  - (i) extend the vec region with a k̄-ordered weight table of k̂ bytes, written per call by
-    the vec kernel (K0) under GENERATE. There is no new region, but vec grows.
-  - (ii) a new region. That changes `IMD_REGION_COUNT` and needs a new layout entry point.
-  - (iii) the caller supplies w in k̄ order through a host query exposing the plan's K order.
-    This is Q9 (b), rejected for stage 4 because that order depends on the partner and on C.
+- **The q map.** A plan created as weighted gets one more K scatter vector in the vec region:
+  q(k̄) = Σ_{shared K labels l} coord_l(k̄)·qstride_l, the Q9 index of each k̄ position.
+  - It is mixed-radix over the shared labels in X's mode order, with qstride = 0 for one-sided
+    labels, so w ≡ 0 along them.
+  - It uses 8-byte entries like the other vectors, 8k bytes in all.
+  - K0 generates it under GENERATE, and it is resident under RESIDENT, exactly like the existing
+    A/B K offsets.
+- **Use.** The scaling and pack kernels gather w[q(k̄)] from the caller's Q9-ordered vector
+  (in-line), or read the pack's kw region (packed). `imd_pack_ex` writes kw in the pack's
+  adopted K order through the same map. There is no per-call conversion kernel, and
+  `IMD_REGION_COUNT` does not change.
+- **Unweighted plans keep byte-identical layouts**, because the map exists only for plans
+  created weighted. `imd_options_t` is frozen at 24 B, so that needs a new `imd_plan_create_ex`
+  with a `struct_size`-versioned descriptor (flag `IMD_PLAN_KWEIGHTED`, zero-tail rule, §4.9).
+- **Rejected:**
+  - (ii) a new region. It changes `IMD_REGION_COUNT`: `imd_workspace_layout` returns that many
+    regions (include/immerdink/immerdink_host.h:149-151), and tests/test_host_c.c:59 checks it.
+    This is the same problem Appendix A #18 raises for P3's regions.
+  - (iii) a caller-supplied k̄ order. That is Q9 (b), rejected because the order depends on the
+    partner and on C.
+- *Why the map.* The Q9 index of a k̄ position is a linear function of the K-label coordinates.
+  That is the same kind of object as the existing per-k operand offsets, so it reuses K0's
+  generator and the RESIDENT/GENERATE machinery, and changes no region count.
+- **Spec and params plan:** `cert_workspace` and `cert_plan_bytes` for the weighted vec sizes;
+  IndexMap "the q map equals the Q9 index", with negatives `neg_kw_map_onesided` and
+  `neg_kw_map_order`; Pipeline "kw read through the map is read-only".
 
 **Kernels.**
 - K1, k1_tiled, KF, KL, K2/K3 and `imd_pack` add w (A side) or −w (B side) to the element
@@ -1668,7 +2257,9 @@ blocks the stage-6 build.
 
 **Where w comes from.**
 - Both operands in-line: `imd_call_t` gains `const int8_t* kweights` (it replaces `reserved1`;
-  same size), in the Q9 order and converted to k̄ as the open item above decides.
+  same size), in the Q9 order and gathered through the q map above. If stage 5 has not shipped
+  by then, stage 6 introduces `imd_call_t` and `imd_contract_ex` with §4.6's layout, and a
+  non-NULL `stats` returns NOT_SUPPORTED until stage 5 ships.
 - One packed operand: w comes from that pack's `kw` region, and the in-line partner applies −w.
   The pack is the single source of truth.
 - **Both packed with weights → NOT_SUPPORTED** (Q22). A caller-chosen id cannot prove that two kw
@@ -1682,8 +2273,11 @@ blocks the stage-6 build.
   v1 meaning (Q23).
 - The format word gains a weighted bit, so older libraries report FORMAT for weighted keys.
 - There is a new reason `IMD_PACK_MISMATCH_KWEIGHTS`.
-- The `kw` region holds k̂ bytes, 256-aligned, after res, in the pack's adopted K order.
+- The `kw` region holds k̂ bytes, 256-aligned, after res, in the pack's adopted K order, written
+  through the q map (IR21).
 - Unweighted packs keep their bytes, formats 1/2 and keys.
+- Plans: `imd_plan_create_ex` with the `IMD_PLAN_KWEIGHTED` descriptor flag (IR21); unweighted
+  plans keep byte-identical layouts.
 
 **Accuracy meaning.** No change to `imd_err_request_t`. The §6f statistics refer to the weighted
 operands (L5b).
@@ -1700,10 +2294,14 @@ operands (L5b).
   only), `neg_kw_same_sign`, `neg_kw_range` (σ overflows at toy width).
 - PackedOperand: `pos_kw_from_pack`, `neg_kw_partner_own` (the in-line partner uses its own w
   instead of the pack's), `neg_kw_both_packed` (the witness for NOT_SUPPORTED).
-- Pipeline: kw is a read-only input of the scaling and pack kernels; `neg_kw_helper_race` (the
-  helper's output is read on another stream without an event).
+- Pipeline: kw is a read-only input of the scaling and pack kernels, read through the q map;
+  `neg_kw_helper_race` (the helper's output is read on another stream without an event).
+- IndexMap (IR21): the q map equals the Q9 index; negatives `neg_kw_map_onesided` (a one-sided
+  label with qstride ≠ 0) and `neg_kw_map_order` (the map follows k̄'s label order instead of
+  X's).
 - Certificates `cert_kw_shift_range`, `cert_pack_words` (weighted), `cert_error_estimate`
-  (weighted rows), and `cert_workspace`/`cert_pack_layout` for weighted packs.
+  (weighted rows), `cert_workspace`/`cert_pack_layout` for weighted packs, and
+  `cert_workspace`/`cert_plan_bytes` for the weighted vec sizes (IR21).
 - Oracle: `scale_vector` and `quantize` with a dyadic weight (no FP `ldexp`, which would
   overflow), `contract(..., kweights=)`, `pack(..., kweights=)`, and `lower_packed` with the
   weighted key.
@@ -1721,35 +2319,41 @@ No new phase.
 
 | artifact | stage | change |
 |---|---|---|
-| PackedOperand.tla | 0 | **none** (R1): ordering is already modelled, the stale handle is §6b.10 #3's documented limit, and the layout prefix is a params certificate. Optional, if Eric asks: ⟨version, key⟩ cells, a c3 after post with RAW post → c3, `neg_repack_stale` (§4.1) |
-| DeviceReduce.tla (new) | 4, 5 | helper reductions (`neg_kw_no_zero`, `neg_kw_rmw`, `neg_kw_median_early`); statistics (`pos_stats_two_calls`, `neg_stats_flush_before_barrier`, `neg_stats_global_rmw`, `neg_stats_lib_zeroes`) |
-| HostAPI.tla | 5 | `pos_stats_shared` |
-| IndexMap.tla | 5 | stats argument checks (`neg_stats_alias`) |
-| OzakiScaling.tla | 4, 5, 6 | `GuardSound`, toy-exhaustive (4); `CertSound` (+ `neg_cert_no_kdelta2`, `neg_cert_floor_kappa`) (5); weighted JointSpec (+ `neg_kw_one_side`, `neg_kw_same_sign`, `neg_kw_range`) (6) |
+| PackedOperand.tla | 0 | **none** (R1, IR20): ordering is already modelled, the stale handle is §6b.10 #3's documented limit, and the layout prefix is a params certificate. The optional ⟨version, key⟩ cells, a c3 after post with RAW post → c3, and `neg_repack_stale` (§4.1) are **not adopted**: built only on a range-plan revival (§3.2) or if Eric asks |
+| DeviceReduce.tla (new) | 4, 5 (if built) | helper reductions (`neg_kw_no_zero`, `neg_kw_rmw`, `neg_kw_median_early`); statistics (`pos_stats_two_calls`, `neg_stats_flush_before_barrier`, `neg_stats_global_rmw`, `neg_stats_lib_zeroes`). Under the IR25 run limits (§4.5) |
+| HostAPI.tla | 5 (deferred) | `pos_stats_shared` |
+| IndexMap.tla | 5 (deferred), 6 | stats argument checks (`neg_stats_alias`) (5); the q map equals the Q9 index (+ `neg_kw_map_onesided`, `neg_kw_map_order`) (6, IR21) |
+| OzakiScaling.tla | 4, 5, 6 | `GuardSound`, toy-exhaustive, bounded per IR25 (4); `CertSound` (+ `neg_cert_no_kdelta2`, `neg_cert_floor_kappa`) (5, deferred); weighted JointSpec (+ `neg_kw_one_side`, `neg_kw_same_sign`, `neg_kw_range`) (6) |
 | PackedOperand.tla | 6 | `pos_kw_from_pack`, `neg_kw_partner_own`, `neg_kw_both_packed` |
-| Pipeline.tla | 6 | kw read-only input, `neg_kw_helper_race`; the layout of the k̄-ordered weights (open item, §4.7) |
+| Pipeline.tla | 6 | kw read-only input, read through the q map; `neg_kw_helper_race` |
 | OzakiCRT, CRTRealization, K4Align | — | no change: integer back end independent of how the scaling is chosen (OzakiCRT `CRTExact`) |
-| PROOFS / Lean | 3, 4, 5 | L7 `kseg_compose` (3); L5 `kweight_cancel`, `kweight_guard` (4); L6 `apost_cert` (5) |
-| params.py | 0, 1, 3, 4, 5, 6 | `cert_footprint_monotone` (0); `cert_rho_recipe` (1); `cert_kseg_composition` (3); `cert_kw_rule`, `cert_kw_fp64_exact`, `cert_kw_guard` (4); `cert_stats_constants`, `cert_stats_bin`, `cert_apost` (5); `cert_kw_shift_range` and reruns (6) |
-| oracle.py | 2, 3, 5, 6 | `kweights` (2); `contract_segments` (3); `apost_bin`, `stats` (5); the weighted quantizer (6) |
+| PROOFS / Lean | 3, 4, 5 | L3c and the FP summation lemma γ_k, then L7 `kseg_compose` (3, IR5); L5 `kweight_cancel`, `kweight_guard` (4); L6 `apost_cert` (5, deferred) |
+| params.py | 0, 1, 3, 4, 5, 6 | `cert_footprint_monotone` with I3 (0); `cert_rho_recipe` (1); `cert_kseg_composition` (3); `cert_kw_rule` (multi-partner), `cert_kw_fp64_exact`, `cert_kw_guard` (4); `cert_stats_constants`, `cert_stats_bin`, `cert_apost` (5, deferred); `cert_kw_shift_range`, `cert_workspace`/`cert_plan_bytes` for weighted vec sizes, and reruns (6) |
+| oracle.py | 2, 3, 5, 6 | `kweights` with multi-partner mode (2); `contract_segments` (3); `apost_bin`, `stats` (5, deferred); the weighted quantizer (6) |
 
-Every TLC/Apalache run goes through `tools/memcap.sh` with bounded parallelism.
+Every TLC/Apalache run goes through `tools/memcap.sh` with bounded parallelism, and stage 4/5
+models follow IR25's limits (§4.5).
 
 ### 4.9 Versioning
 
 - **Stages 0–3: no ABI change.** `IMD_HOST_API_VERSION` stays 13. The F1–F3 guarantees are
   documented "from API 13 on"; they describe the current formulas and change no meaning. They
-  cover only the totals and the write extent (§4.1). The offset and device-byte facts I1–I2 are
-  certificates, not ABI, so a later format may change them.
+  cover only the totals and the write extent (§4.1). F3's second half ("no byte beyond
+  `pack_bytes`") is published only after `pack_write_extent` passes (IR17). The offset,
+  device-byte and packing facts I1–I3 are certificates, not ABI, so a later format may change
+  them. Stage 1's `PrecisionPlan` composition and `rho_from_output` are Python only (IR2, IR7).
 - **Stages 4, 5 and 6** each take the next host API number in the order they ship (14 for the
   first). No number is reserved in advance, so the drafts' competing "API 14" claims are void.
+  Stage 5 is deferred (IR26), so it takes a number only if a trigger fires.
 - **New meanings only through new function names or validated words.** New functions
-  (`imd_stats_cond`, `imd_err_request_kweighted`, `imd_pack_*_ex`), or validated flag and
-  reserved words that older libraries reject when nonzero (`imd_call_t` reserved fields). Never
-  through an appended tail field that an older library ignores silently. `imd_err_request_t`
-  does not change in any stage. Its `reserved` word stays free (R3).
+  (`imd_stats_cond`, `imd_err_request_kweighted`, `imd_pack_*_ex`, `imd_plan_create_ex`), or
+  validated flag and reserved words that older libraries reject when nonzero (`imd_call_t`
+  reserved fields, `IMD_KW_ZERO_ON_FAIL` in `imd_kweights_params_t.flags`). Never through an
+  appended tail field that an older library ignores silently. `imd_err_request_t` does not
+  change in any stage. Its `reserved` word stays free (R3).
 - **Zero-tail rule for every new `struct_size`-versioned input** (`imd_call_t`,
-  `imd_kweights_params_t`, `imd_pack_desc_t` v2; R-api should-fix 4). The library reads
+  `imd_kweights_params_t`, `imd_pack_desc_t` v2, stage 6's plan descriptor for
+  `imd_plan_create_ex`; R-api should-fix 4). The library reads
   `struct_size` bytes. Every byte beyond the size it knows must be 0, else INVALID_VALUE. So an
   older library rejects a newer caller's appended field instead of ignoring it. That closes the
   bug class of accuracy.cpp:99 and pack.cpp:133 for every new struct, not only through reserved
@@ -1768,18 +2372,85 @@ Every TLC/Apalache run goes through `tools/memcap.sh` with bounded parallelism.
   ending at N = 14. The Jacobi view gains about 1.27× and the o10/v96 PPL view about 1.33×.
   Many-small-plans workloads (256³–512³) gain only about 10–25 % from a lower N (§2.3–§2.4)
   [M, review].
-- **It rests on unvalidated N ≤ 7 predictions** (M-c) and on unmeasured iteration counts under
-  ramps, DIIS included (M-d1).
+- **It rests on unvalidated predictions at N = 5, 6, 7, 9 and 13**, which no calibration or
+  hold-out case covers (§1.2 item 8; M-c, IR4), and on unmeasured iteration counts under ramps,
+  DIIS included (M-d1). Until M-c passes, DESIGN tags the schedule gains above, and every other
+  gain at N ∉ {8, 10, 14, 16}, [M, model-only, outside hold-out].
 - **The C2 evidence is synthetic and small,** one seed, and without the guard. Random-structure
-  gains already vanished at m = n = 512; the structured gains must be confirmed on real operands
-  (stage 2) before stages 4 and 6.
+  gains already vanished at m = n = 512; the structured gains must be confirmed at Tier L and on
+  the real psi4 operands (stage 2; IR1, IR19) before stages 4 and 6.
 - **C2's speedups are upper bounds.** The helper and the pre-scaling recur for operands rebuilt
   every iteration, and they cut 1.55× to about 1.2–1.44× at 4096³ unless the pre-scaling is fused
   (§2.6).
-- **Weights can go stale,** and caller-side pre-scaling may need copies (stage 4).
+- **Weights can go stale,** and caller-side pre-scaling may need copies, one per K-label set of
+  a multi-partner operand (stage 4, IR6).
 - **The re-pack and pre-scaling consistency rules are caller obligations** that the library
   cannot check (stage 0, stage 4).
-- **The statistics overhead** in K5 is unmeasured (stage 5).
+- **The statistics overhead** in K5 is unmeasured; stage 5 is deferred (IR26).
+- **The real operands are stand-ins** [I]: MP2 amplitudes for converged t2, and bare integrals
+  for t1-dressed ones (IR19).
+
+### 4.11 Order of work and definition of done
+
+Decided by the independent reviewer, 2026-10-07 (IR28, IR29). The order follows the
+dependencies:
+- the rebuild gates everything that calls the library;
+- `oracle.kweights` gates `c2_gate.py`;
+- M-a gates stage 3's §7 text and the C2 gates;
+- M-c gates M-d2 and every claim at N ∉ {8, 10, 14, 16} (§1.2 item 8).
+
+**Round 1 (CPU; the GPU only for the tools' existing CPU tests).**
+- **Stage 0, in order** (§4.1): (a) the rebuild and the API-13 check; (b) the provenance copy and
+  manifest; (c) the DESIGN §6g stage-0 text (F1, F2 and F3's first half, C-ws, C-pack, the
+  re-pack rule); (d) `cert_footprint_monotone` (I1–I3) and `host_footprint_monotone`; (e)
+  `PackSpec.with_moduli`, `PackedBuffer` with the `python_device` CPU part, and
+  `python_overhead`.
+- **Then two tracks in parallel.** They touch disjoint files (`python/immerdink/precision.py`
+  against `spec/oracle.py`, `bench/accuracy` and immerdink-eval), so they can run concurrently,
+  each single-threaded and busy-gated.
+  - **Track A, stage 1** (§4.2): `precision.py` with the IR2 composition, pack-mode masks and
+    BUDGET (IR8), joint share groups (IR24), the DIRECT sentinel (IR15), `rho_from_output` with
+    `cert_rho_recipe` (IR7), and `host_precision`; `bench/accuracy/schedule.py`; the §1.3 text
+    in the docs (IR3).
+  - **Track B, stage-2 CPU evidence** (§4.3):
+    1. `oracle.kweights` with the multi-partner mode and self-tests (IR6);
+    2. the psi4 operand generator (IR19);
+    3. `c2_gate.py`: engine self-test → pilot → Tier S (d*) → Tier L → real operands (IR1),
+       plus the B6 estimate (IR11);
+    4. M-b: the re-runs of the [M] figures and the share-group raise cost (IR9, IR15);
+    5. M-d1: Jacobi, DIIS with and without reset, PPL-like, Davidson and block CG (IR3), and the
+       ρ-miss rate (IR7).
+- **Then stage 3, after the M-a summary** (§4.4): L3c in Lean → L7 + `kseg_compose` (IR5),
+  `cert_kseg_composition`, `oracle.contract_segments`, the K-seg recipe, and the §7 rows citing
+  M-a (IR12).
+
+**Round 2 (GPU, under `_wip/gpu.lock`, behind the quiet gate, under memcap, FREE only).**
+- The stage-0 GPU tests: `packed_repack_n`, `workspace_shared_n`, `graph_phases` with cold
+  capture, the first-call measurement (IR10), and `pack_write_extent` with memcheck (IR17).
+- M-c, N ∈ {4, 5, 6, 7, 9, 10, 12, 13} plus the anchors (IR4), **strictly before** M-d2.
+- M-d2 against its pre-registered bands.
+- Then the mechanical gate decisions: stage 4 by its pre-registered rule (§4.5); stage 5
+  deferred (a trigger check only, §4.6); stage 6 by its rule (§4.7).
+
+If stage 4 passes, its build (L5 + Lean, `GuardSound`, `DeviceReduce`, the helper, M-e) is
+round 3.
+
+**Definition of done** (IR29). Every gated item ends as built, closed or deferred with a trigger,
+never as open.
+- **C1 is done when:**
+  - stages 0 and 1 have shipped with their tests and certificates;
+  - the round-2 stage-0 GPU tests pass;
+  - M-c has passed (or the model was recalibrated per Q24 and then passed);
+  - M-d1 and M-d2 are reported with their success criteria evaluated;
+  - the ROADMAP C1 row shows the Q6 decision column and "stage 5 deferred (triggers T1–T3)".
+- **C2 is done when:**
+  - the M-a summary is published;
+  - stage 3 has shipped, including L3c and L7 in Lean;
+  - the stage-4 gate has been decided by the pre-registered rule: built and M-e measured if it
+    passed, closed with its trigger if not;
+  - the stage-6 gate has been decided: built if it passed, deferred with its trigger otherwise;
+  - the ROADMAP C2 row is retitled per Q7.
+- Every deferral names its trigger in DESIGN §7 or the ROADMAP.
 
 ---
 
@@ -1792,7 +2463,9 @@ Both reviewers answered every question.
 Each entry gives the options, the resolution, who decided it, and the rationale. "Both" means
 the two reviewers chose the same option; amendments from either are adopted unless the entry
 says otherwise. Where they disagreed, the entry says so and decides on the merits. §5.2 records
-the review decisions that fall outside the questions.
+the review decisions that fall outside the questions. §5.3 records the independent design
+reviewer's binding decisions (IR1–IR29, 2026-10-07). Where one amends a question's resolution,
+the entry carries an **Amended (IRn)** line, and the amendment is binding.
 
 ### 5.1 The questions
 
@@ -1821,6 +2494,8 @@ g ≤ N ≤ N_max (`options_ok`), and the contract checks accept larger buffers
 (immerdink.h:112-113). RA/RB scale with g and W with N (workspace.cpp:49-56), and the pack's
 res is affine in N (pack.cpp:44-47). Per-phase sizing matters under memory pressure (ehrenfest's
 17.7 GB DF packs), and it lets low-N phases use coarser caller tiles.
+**Amended (IR8).** With pack-mode masks, `footprints()` reports the maximum over the allowed
+modes × levels, and per-level totals for the caller's joint budget.
 
 **Q3. How is the stale-handle hazard of re-packing in place guarded?**
 (a) Documentation, a `neg_repack_stale` witness and the Python `PackedBuffer`;
@@ -1838,6 +2513,8 @@ library cannot catch "a wrong buffer of the right kind". A header would reverse 
 break §6b.4's rule that the bytes are a pure function of (key, values), and it still could not
 protect graph replays. Checking bytes against the handle needs a sync, which kernel scope
 forbids. `PackedBuffer` is cheap and opt-in, and raw buffers behave as today.
+**Amended (IR20).** The optional combined model is not adopted. It is built only on a range-plan
+revival (§3.2) or if Eric asks.
 
 **Q4. How much does `PrecisionPlan` do?**
 (a) A thin target → N per phase helper, with the forcing rule as example code;
@@ -1854,6 +2531,16 @@ forbids. `PackedBuffer` is cheap and opt-in, and raw buffers behave as today.
 
 R-num's amendments are adopted as well: p = P/C for TYPICAL; the monotone floor is the previous
 phase's final N, after the share-group raise.
+**Amended (IR2, IR8, IR15, IR24, IR7, IR3).**
+- The per-role pack cost is composed in Python: one rank with reuse = 1, re-keyed by
+  contract_s + Σ pack_s(role, N)/reuse(role). Reuse is per role.
+- `packs` takes allowed pack-mode masks, with a BUDGET status.
+- `levels` may end with "DIRECT".
+- Share groups are ranked jointly over every level ≥ the group floor.
+- The ρ recipe ships as the tested `rho_from_output`.
+- The docs state `monotone=False` for relaxed Krylov.
+
+Still no ABI change (§4.2).
 *Rationale.* It only composes `min_moduli` and rank, which already exist, and it keeps policy
 with the caller (ehrenfest D8: precision is user-directed). planner.py's contract is "nothing
 computed in Python" (DESIGN.md:4204). A single rank call over the levels matches §6f.3's
@@ -1864,7 +2551,7 @@ guidance, and it holds even where time is not linear in N.
 (b) TYPICAL;
 (c) BOUND for the final phase and TYPICAL for intermediate phases, as passed by the caller.
 **Resolved: (a) as the default, both; (c) documented** as an explicit per-phase opt-in, with
-fail_prob = P/C over the phase's calls (§4.2 step 6). M-d measures both.
+fail_prob = P/C over the phase's calls (§4.2 step 7). M-d measures both.
 *Rationale.* BOUND is the library's rigorous contract (§6f.2), and TYPICAL is opt-in by design.
 TYPICAL saves about ⅔ of a modulus, but it fails on rows of many equal entries (ROADMAP B2), and
 its p is per call, so a schedule must divide P across the run. In intermediate phases a miss only
@@ -1879,6 +2566,11 @@ without kernels;
 decision column becomes: C1 = (a) + host-side (b); (c) parked. **Reported to Eric for
 confirmation (Status); he may override it, but it does not block stages 0–3.** (R-num: "does
 not block C1". R-api: "for confirmation". The two are compatible.)
+**Amended (IR18): approved on Eric's behalf by the independent reviewer**; it is reported to
+him, and he may overrule. The column text is "C1 = (a) per-call N (plan + pack per N) +
+host-side (b) (PrecisionPlan, min_moduli/rank, rigorous ρ-from-output helper); (c) Ozaki-I
+slices parked with triggers (§3.3); TLA+ for slices deferred to the slice trigger". It lands with
+the DESIGN v1.19 merge.
 *Rationale.* No consumer needs one operand at two precisions at once (§1.3), and that is the only
 case a prefix format pays for. Slices win only on benign data at about 1e−8 or looser, the cheap
 part of any schedule. They are 1.25–1.75× slower at FP64 level (S = 7), even before the
@@ -1894,6 +2586,9 @@ re-rejected and the envelope rule recorded;
 (d) drop C2.
 **Resolved: (a), both.** ROADMAP C2's row is retitled from accurate-mode scaling to
 K-equilibration, with accurate mode re-rejected. **Reported to Eric** with Q6 (Status).
+**Amended (IR18): approved on Eric's behalf by the independent reviewer**; he may overrule. The
+title is "K-equilibration (power-of-two K-weights, guarded, staged and gated) + K-segmentation
+recipe; accurate mode re-rejected (§2.8)". It lands with the DESIGN v1.19 merge.
 *Rationale.* Both use the same headroom, but K-weights get about twice the moduli per bit. In the
 §3.8 bound, K-weights scale both error terms with ‖ã‖‖b̃‖ (about G/3.9 moduli), while σ/τ
 shifts cut each term only by the partner's increment (about G/7.8). These are estimates from the
@@ -1932,7 +2627,10 @@ by 2^{−w} along that label. That is impossible without materializing B, becaus
 shared across the label (stride 0, DESIGN §5 step 6).
 *Rationale.* The caller applies w to its own tensors in stage 4, so the caller's order is the
 usable one. The canonical k̄ depends on the partner and on C's strides, so (b) would expose
-unstable orders. Stage 6's conversion to k̄ needs its own layout design first (§4.7, open item).
+unstable orders. Stage 6's conversion to k̄ needs its own layout design first (§4.7).
+**Amended (IR6, IR21).** The order is taken from X, the operand pre-scaled by 2^w (A in a single
+plan). Every partner must carry the same shared-K label set. Stage 6 reaches k̄ through the q map
+of plans created weighted (§4.7).
 
 **Q10. Never-worse guard?**
 (a) The exact σ-based guard of L5c (margin 3) reported by the helper, with the caller accepting
@@ -1952,6 +2650,10 @@ N-free, so one guard serves every phase, and it keeps the plain-norm §6f bounds
 ν = √k. Floating-point norm ratios (c) would be neither exact nor reproducible, the only
 non-exact rule in the design. (b) is ruled out by §2.6's size check: worst outputs lose
 3.7–13.6 bits at m = n = 512.
+**Amended (IR6, IR13).**
+- With several partners, the guard is per pair and G = min_p G_p.
+- `IMD_KW_ZERO_ON_FAIL` makes a failing guard write w ≡ 0, for a capture-safe path. In that
+  path the N comes from the plain request with ν = √k.
 
 **Q11. Which weight rule?**
 (a) Deadband-median balanced, with the deadband a parameter re-tuned in stage 2 at
@@ -1960,6 +2662,10 @@ m = n ≥ 128;
 (c) one-sided, from the reused operand only.
 **Resolved: (a), both.** The deadband is re-tuned in M-a at m = n ≥ 128 with at least 5 seeds.
 The guard is the actual barrier against regressions.
+**Amended (IR1).** The selection rule for d* is fixed in advance. It is chosen at Tier S,
+m = n = 512, over 5 seeds: the d ∈ {0, 2, 3, 5} with the fewest guard rejections on the
+random-structure fixtures, subject to the median gain on decay_opp and opp_nonsep staying within
+0.25 moduli of the best d. Ties go to 3.
 *Rationale.* The plain rule lost up to 1 modulus on φ = 0.5 and decay_same at small sizes, and
 the deadband did not prevent regressions at m = n = 512, so it is a tuning knob, not a guarantee.
 Centring on the median is harmless (σ is scale-equivariant) and keeps |w| small inside the
@@ -1973,7 +2679,12 @@ comes from.
 *Rationale.* One k_s-vector keeps caller-side scaling and a stage-6 kw region simple. Per-λ
 weights cost b·k bytes and a batch index in every scaling and pack kernel, with no evidence of
 benefit. The guard already ranges over every (λ, row). The magnitude structure of the motivating
-cases (orbital energies, DF factors) comes from the contracted labels, not the batch.
+cases (orbital energies, DF factors) comes from the contracted labels, not the batch [I].
+**Amended (IR16).** The escape clause could not fire without a batched fixture, so M-a adds two:
+the real R7 (iaQ,ibQ->iab over all occupied orbitals, core included) and a synthetic batch.
+The trigger is pre-registered. (b) is reconsidered only if per-λ weights save ≥ 1 modulus beyond
+shared weights on a real fixture at the same guard status. Otherwise (a) stands, and the escape
+clause is closed.
 
 **Q13. What gates stages 4 and 6?**
 (a) ≥ 2 moduli saved at equal target on calls of the 2048³ class or larger;
@@ -1990,6 +2701,10 @@ consumer confirms is realistic;
 (§2.3), and an unfused pre-scaling pass alone takes 1.55× down to about 1.35–1.44× at 4096³.
 Random-structure gains vanished at m = n = 512, so real data must decide. Option (c) has a value
 that no time ratio captures.
+**Amended (IR27, IR1, IR23).** The rule is pre-registered and applied mechanically (§4.5 for
+stage 4, §4.7 for stage 6). It covers the targets, the cost terms, the regression bar (ii) and
+the clamp bar (iii). Only Tier L and real-operand runs of M-a are admissible. M-e must confirm
+the gate case before stage 4 merges to dev, unless (c) holds there.
 
 **Q14. Where does real-operand evidence come from?**
 (a) The synthetic integral × amplitude family now, plus a one-off ehrenfest FP64 dump of a few
@@ -2000,6 +2715,21 @@ under memcap, outside ehrenfest's test windows (busy check, silent mode). Raw du
 stay in immerdink-eval `results/c1/` or scratch, never in the product repo.
 *Rationale.* The whole C2 value case rests on the claim that real anti-correlated profiles are
 separable along K. Only real operands can confirm it, and the dump is cheap and read-only.
+**Amended (IR19): no ehrenfest dump is requested or performed in this cycle.**
+- The real operands come from our own script, immerdink-eval `scripts/c1/psi4_operands.py`. It
+  uses the psi4 of the `main` conda env read-only, CPU-only and single-threaded, and imports
+  nothing from ehrenfest.
+- Molecules: benzene/cc-pVDZ and cc-pVTZ, and water/cc-pV5Z. The contractions R1–R7 are taken
+  read-only from the consumer's ccsd.py (§4.3).
+- They count as real, consumer-confirmed operands for Q13. MP2 amplitudes stand in for t2, and
+  bare integrals for t1-dressed ones [I].
+- If psi4 cannot run, the stage-4/6 gates are formally deferred with the trigger "real operands
+  available", and the Eric-approved dump is the named fallback.
+
+*Why:* ehrenfest has no saved tensors (checked read-only), and its integrals come from a psi4
+sidecar at runtime, so a dump would mean running ehrenfest code. Our own generator yields the
+same bare DF blocks, with real anti-correlation and separability structure. It touches no
+ehrenfest code, GPU or session, and it removes the only Eric-blocking dependency of the C2 gates.
 
 **Q15. How is K-segmentation exposed?**
 (a) A documented recipe plus L7, with no API;
@@ -2024,6 +2754,10 @@ about 9 % at 4096³ when everything is recomputed [E] (§4.2).
 entry point, a device struct, a hook in the hottest per-output code and an unmeasured cost bar.
 Their real advantage is that they need no norms at all (L6: ‖a·2^σ‖ ≤ d), and that justifies an
 ABI change only once a consumer needs elementwise targets.
+**Amended (IR7, IR26).** "The recipe covers the need" rested on documentation alone. It now ships
+as the tested `rho_from_output` (β = 0, α = 2^e), checked against `cert_rho_recipe`. Its
+next-iteration miss rate is measured in M-d1. The gate was decided on evidence: **not met**, and
+stage 5 is formally deferred with triggers T1–T3 (§4.6).
 
 **Q17. How are the statistics binned?**
 (a) ρ̂ bins plus separate uncertified and zero-z counters;
@@ -2067,6 +2801,10 @@ and occupancy with `stats` NULL, in every variant and at every N (R-api).
 library-size cost (cf. the +10–13 % measured for v1.14's W templates). A branch that is not taken
 costs no time, but it can still raise register allocation, and K5 runs at 82–96 % of its bound
 (ROADMAP A4). So the bar measures registers and occupancy explicitly.
+**Amended (IR26).** Not with `ncu`, since GPU counters are admin-only on this machine. Registers
+come from `-Xptxas -v` / `cuobjdump --dump-resource-usage`, occupancy from
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor`, and time from A/B runs. This applies only if a
+trigger revives stage 5.
 
 **Q21. Do zero-z outputs count as misses in cond-from-stats?**
 (a) Yes, by default, with an exemption flag;
@@ -2101,12 +2839,21 @@ meanings. Under §6a a change of meaning gets a new function name.
 **Q24. How is the performance model covered at small N?**
 (a) Hold-out first (M-c), recalibrating only if the §6c.5 targets are missed;
 (b) add N = 4–7 cases to the calibration now.
-**Resolved: (a), both.** M-c (about 20 calls on shapes outside the calibration set, N = 4–7) is
-a prerequisite for publishing any schedule gain that uses N ≤ 7 (§2.4).
-*Rationale.* The hold-out covers only N = 8, 10, 14 and 16, while the schedules lean on N = 6
-predictions, and [KT26] reports INT8 throughput at small N that depends on the data. Validate
-before refitting: adding calibration cases first would spend GPU time, and possibly add model
-features, without knowing whether they are needed.
+**Resolved: (a), both.** M-c, run on shapes outside the calibration set, is a prerequisite for
+publishing any schedule gain that uses an N no case covers (§2.4).
+*Rationale.* No calibration, hold-out or cache case covers N = 5, 6, 7, 9 or 13 (§1.2 item 8),
+while the schedules lean on N = 6 and 9 predictions, and [KT26] reports INT8 throughput at small N
+that depends on the data. Validate before refitting: adding calibration cases first would spend
+GPU time, and possibly add model features, without knowing whether they are needed.
+**Amended (IR4).**
+- The previous text ("about 20 calls, N = 4–7"; "the hold-out covers only N = 8, 10, 14 and 16")
+  was inaccurate.
+- M-c now covers N ∈ {4, 5, 6, 7, 9, 10, 12, 13}, plus the anchors 8 and 14 on the same shapes,
+  on 8 shapes checked absent from the calibration set. That is about 160 cases, ≤ 15 min of GPU
+  time, judged per size class and reported per N.
+- A miss leads to per-class residuals, then N-specific calibration cases with optional keys
+  only.
+- Until M-c passes, figures at N ∉ {8, 10, 14, 16} are [M, model-only, outside hold-out].
 
 **Q25. What about DIIS at precision switches?**
 (a) Measure in M-d (with and without a history reset) and document the result for callers;
@@ -2117,6 +2864,13 @@ features, without knowing whether they are needed.
 emulation error. A DIIS history that mixes vectors computed at two precisions is untested, and
 it decides whether ramps keep the iteration count, which is M-d's success criterion. Iteration
 counts do not depend on GPU timing.
+**Amended (IR3, IR7, IR23).**
+- M-d1 adds report-only block Davidson and block CG cases. CG includes a relaxed (decreasing)
+  schedule.
+- M-d1 also adds the ρ-miss rate of lagged ELEMENTWISE targets.
+- M-d1 has a budget of ≤ 30 CPU-min.
+- M-d2 runs strictly after M-c. If M-c recalibrates, its bands are re-derived and pre-registered
+  first.
 
 ### 5.2 Review decisions outside the questions
 
@@ -2131,7 +2885,8 @@ counts do not depend on GPU timing.
     cannot check (§6b.10 #3, #12), so its witness would be tautological.
   - Both agreed that `LayoutPrefix` belongs in `cert_footprint_monotone` (I1).
   - The combined model (R-num's ⟨version, key⟩ cells plus R-api's c3 with RAW post → c3) is
-    recorded as optional, should Eric want one.
+    recorded as optional, should Eric want one. **Not adopted (IR20):** it is built only on a
+    range-plan revival or if Eric asks.
 - **R2. What stage 3 front-loads.** **The reviewers disagreed.** R-num wanted L5 and L7 proved
   in stage 3, with L6's hand proof and `cert_apost` there too and only L6's Lean deferred. R-api
   wanted stage 3 to keep only L7, `oracle.contract_segments`, the K-seg recipe and the §7
@@ -2175,6 +2930,176 @@ counts do not depend on GPU timing.
   predicted ratio stated next to the bar.
 - **R9. Zero-tail rule** (R-api should-fix 4). **Adopted** for every new `struct_size`-versioned
   input (§4.9).
+
+### 5.3 Binding decisions of the independent design reviewer (2026-10-07)
+
+A completeness critic reviewed the previous version and found 17 gaps; that version also left
+8 items unresolved. All of them, plus four further items, were decided by the independent
+reviewer, 2026-10-07. The decisions are binding. Each entry gives the decision in brief, where
+the full text lives, and the reviewer's rationale. The machine was BUSY during the review, so
+its cost figures are estimates.
+
+**On the critic's gaps.**
+- **IR1. M-a at realistic sizes** (gap 1: M-a could not answer the Q13 gate at m ≤ 512).
+  - *Decision:* adopt the full-size, sampled-output protocol of §4.3, which replaces "sizes and
+    seeds"; m = 16 is dropped.
+  - *Rationale:* Q13 needs ≥ 2048³-class evidence, and §2.6 shows that random-structure gains
+    vanish (and worst-pair losses grow to −13.6 bits) as m rises. Every guard quantity is O(mk),
+    and the worst pair is separable, so full operands are affordable at m = 4096 if only the
+    errors are sampled. A sample that includes the rows and columns setting min G is
+    adversarial where it matters. The existing Python S loop would take minutes per operand at
+    k = 16384 [E], hence the bit-identical vectorized engine with an exact fallback. SC25 and
+    `acc_exact` need full GEMMs, so they stay at small m; they are already rejected (§2.5). The
+    pilot and the pre-declared cut order keep the 90-minute bound enforceable without post-hoc
+    choices.
+- **IR2. Per-role pack cost** (gap 2: `PrecisionPlan`'s per-role packing cost against rank's
+  single int32 reuse).
+  - *Decision:* option (a). Compose in `precision.py` (§4.2): one rank call with reuse = 1,
+    candidates re-keyed by contract_s + Σ pack_s(role, N)/reuse(role), feasibility unchanged,
+    and per-role reuse with `Phase.packed`, `pack_bytes`, `reuse` and `assumed_reuse`.
+    `host_precision` checks it against a brute force. Option (b), a per-role reuse in
+    `imd_perf_rank_request_t`, is not adopted; it is revisited only if a hot-path consumer needs
+    per-role reuse inside one C rank call.
+  - *Rationale:* candidates already expose contract_s, pack_s and the packed bits, and time_s is
+    the only reuse-dependent field (include/immerdink/immerdink_host.h:763-770; DESIGN.md
+    3410-3425), so re-keying is exact. It keeps "stages 0–3: no ABI change". §6e.4's "computes
+    nothing" covers planner.py only. The helper runs once per phase switch, and ehrenfest's
+    hot-path rank calls are untouched.
+- **IR3. Relaxed Krylov** (gap 3: the consumer profile was wrong for relaxed Krylov, and M-d
+  had no Krylov or Davidson case).
+  - *Decision:* rewrite §1.3, with `monotone=False` documented for relaxed Krylov. M-d1 adds
+    report-only block Davidson and block CG cases (§4.3), ≤ 30 CPU-min in total.
+  - *Rationale:* §1.3 contradicted established inexact-Krylov theory, and the fix is cheap. Block
+    forms give the emulated contraction a GEMM shape. Davidson is the consumer-adjacent
+    eigensolver. Report-only keeps C1 from being gated on methods outside the narrowed profile.
+- **IR4. Performance-model N coverage** (gap 4).
+  - *Decision:* correct §1.2 item 8 from the counts in the bench files. M-c covers N ∈ {4, 5, 6,
+    7, 9, 10, 12, 13} plus the anchors 8 and 14 on 8 shapes (§4.3). Until M-c passes, the
+    default levels and every §2.4 or §4.10 schedule gain at N ∉ {8, 10, 14, 16} are
+    [M, model-only, outside hold-out].
+  - *Rationale:* the counts were reproduced from the N columns of `bench/sweep_calib.txt`,
+    `sweep_perf_validate.txt` and `sweep_cache.txt`. The schedules use N = 6 and 9, the
+    defaults 6 and 12, and the 1024³ fit has K4 wave steps at 9 and 13; all are unvalidated.
+    Anchors cost little GPU time and make a miss attributable.
+- **IR5. L3c in Lean** (gap 5: the Lean plan rested on an unformalized L3c).
+  - *Decision:* stage 3 gets L3c, its compositions, the normal-range final rounding and an FP
+    summation lemma γ_k in Lean before L7 (§4.4), and is re-sized S → M. The code deliverables do
+    not wait on the Lean; "C2 done" does.
+  - *Rationale:* proofs/NOTES.md maps only L3a and L3b, with rounding as a hypothesis; L7 needs
+    L3c and γ_{S−1}. R2's "prove where first relied on" puts it in stage 3. Implementation does
+    not block on Lean (the paper-track preference).
+- **IR6. Several partners** (gap 6: K-weights for an operand with several partners).
+  - *Decision:* the multi-partner rule of §4.5. w is defined on X; the partners must share X's
+    K-label set; the clamp uses union extrema; the guard is per pair, with G = min_p G_p. It is
+    in `oracle.kweights` from stage 2. The C API shape is finalized at the stage-4 gate.
+  - *Rationale:* in DF-CCSD, Bov is contracted over Q with Bov and Bvo. "Every partner carries
+    the same w" was unusable without a rule for choosing w. Union extrema keep the clamp exact
+    for every partner, and the min over pairs keeps never-worse pairwise, as proved.
+- **IR7. The ρ recipe as a helper** (gap 7: the rigorous-ρ recipe covered less than claimed).
+  - *Decision:* ship `rho_from_output` in `precision.py`, for β = 0 and α = 2^e only, checked
+    against `cert_rho_recipe` (§4.2). M-d1 measures the next-iteration miss rate.
+  - *Rationale:* no shipped code implemented the certified FP evaluation. α ≠ 1 adds a rounding
+    (DESIGN.md:432), so the restriction keeps the claim exact. The miss rate is the number a
+    caller needs to trust the lagged ρ.
+- **IR8. Memory pressure and budgets** (gap 8).
+  - *Decision:* pack-mode masks; `budget` keeps rank's meaning, and the caller subtracts its own
+    resident tensors; a phase status BUDGET; the shared role of a share group is fixed packed;
+    "packing never increases ws" becomes certificate I3; joint budgets are caller policy (§4.1,
+    §4.2). No ABI change.
+  - *Rationale:* packed roles drop regions today (src/host/workspace.cpp:65-68), but per R6
+    facts that later formats could break stay certificates. FP64 sources are needed in either
+    mode, so subtracting them is exact. The mask lets the benzene-5Z case fall back to in-line at
+    N = 14 and pack at lower N.
+- **IR9. Provenance** (gap 9: design-phase evidence lived in ephemeral scratch).
+  - *Decision:* stage 0 copies the scripts and records to immerdink-eval with a sha256
+    manifest (Provenance, §4.1). M-b re-runs every cited [M] figure on this worktree's library
+    and replaces any that differ by > 0.5 %.
+  - *Rationale:* the project's provenance rule is paper-grade, and scratch is ephemeral. The
+    layout follows the eval repo's conventions: scripts and findings tracked, results untracked.
+    The re-runs close R-num's unfinished [M] re-runs.
+- **IR10. First call at a new N** (gap 10: untested cold capture).
+  - *Decision:* round 2 measures the first plan and contract per N, and `graph_phases` captures
+    a cold phase. If either fails its bar, a plan-time preload is added, with no ABI change
+    (§4.1).
+  - *Rationale:* NOTES-M4:220-222 records module loading on the first plan, and K5<N> gets no
+    attribute call. A preload is the minimal fix, made only if the test shows a problem.
+- **IR11. Output-selective refinement** (gap 11).
+  - *Decision:* record it as §3.1 B6, a caller recipe with no API. M-a estimates its value.
+  - *Rationale:* with ELEMENTWISE targets, a few max-ρ outputs set N for the whole call. Views
+    and the stage-1 helper suffice, so it is a recipe, not an ABI item.
+- **IR12. §7 timing and §2.7's wording** (gap 12).
+  - *Decision:* stage 3 is ordered after the M-a summary, and its §7 rows cite M-a, or are
+    worded "provisional until M-a" (§4.4). §2.7's cost wording is corrected.
+  - *Rationale:* §2.6 lists recurring costs of 6–13 % per call that §2.7 contradicted. DESIGN §7
+    must not assert dominance on synthetic small-m data before the realistic-size study.
+- **IR13. A capture-safe guard path** (gap 13), scoped to stage 4 if it is built.
+  - *Decision:* `IMD_KW_ZERO_ON_FAIL` and the documented fully captured pattern (§4.5).
+  - *Rationale:* feeding the reported gain into a host function needs a sync. The flag gives a
+    rigorous capture-safe path at the cost of one validated bit, and gives up only L5d's
+    tightening inside captured iterations.
+- **IR14. Rebuild first** (gap 14: the library rebuild was ordered too late).
+  - *Decision:* the rebuild, with the API-13 and `nm` checks and the sha256 recorded, is stage 0
+    step (a). Nothing else in stages 0–2 runs before it (§4.1).
+  - *Rationale:* `host_footprint_monotone`, `host_precision` and every [M] record need the
+    API-13 symbols, and the current build is API 5.
+- **IR15. DIRECT, prefix planes, raise cost, larger moduli** (gap 15).
+  - *Decision:* (1) `levels` may end with the sentinel "DIRECT" (§4.2). (2) The prefix-plane
+    option is recorded as the slice comparator (§3.3). (3) M-b measures the share-group raise
+    cost (§4.3). (4) One §7 line rejects larger moduli [I], citing arXiv:2603.10634 only if
+    verified (§4.4).
+  - *Rationale:* the sentinel makes `min_moduli`'s existing DIRECT support usable without
+    changing default behaviour. The prefix-plane option and the raise cost are exactly the
+    cheaper alternatives a slice revival must beat. An unverified claim must not enter DESIGN as
+    fact.
+- **IR16. Batched fixtures** (gap 16: Q12's escape clause could not fire).
+  - *Decision:* real R7 with core orbitals and a synthetic batch, with a pre-registered trigger
+    (§4.3, Q12).
+  - *Rationale:* core against valence occupied orbitals is the physically natural
+    batch-dependent profile in CC. Without the fixture the clause could never fire.
+- **IR17. F3 as ABI** (gap 17: F3 rested on thin evidence).
+  - *Decision:* F3's second half becomes ABI only after `pack_write_extent` passes, on every
+    pack path, with memcheck padding (§4.1). No TLA+ write-footprint invariant.
+  - *Rationale:* an ABI promise cannot be withdrawn under §6a. A sentinel window plus memcheck
+    padding is cheap and decisive. A TLA+ invariant would only restate a static formula.
+
+**On the previously unresolved items.**
+- **IR18** (open item 1). The ROADMAP edits of Q6 and Q7 are approved on Eric's behalf and
+  reported to him; he may overrule (Status, Q6, Q7). Both reviewers and all three judges agree,
+  and neither edit blocks stages 0–3.
+- **IR19** (open item 2). No ehrenfest dump in this cycle. Real operands come from our own psi4
+  generator (§4.3, Q14), with the dump as the named fallback.
+- **IR20** (open item 3). The optional StreamSpec model is not adopted, and R1 stands (§4.1).
+  The ordering half is modelled; the stale-handle half is §6b.10 #3's documented limit.
+- **IR21** (open item 4). Stage 6's weights reach the kernels through the q map, candidate (i)
+  in its map form, with `imd_plan_create_ex` for weighted plans; (ii) and (iii) are rejected
+  (§4.7). The map is the same kind of object as the existing per-k offsets, and unweighted
+  layouts stay byte-identical.
+- **IR22** (open item 5). Superseded by IR14: stages 0 and 1 already need the API-13 symbols.
+- **IR23** (open item 6). Every inferred item is closed by a named measurement, in an order
+  where the check precedes the claim:
+  - F3's second half by `pack_write_extent` (IR17);
+  - the [M] figures by M-b's re-runs (IR9);
+  - the §2.6/§4.2 [E] costs by bandwidth-based figures stated at the stage-4 gate, then by M-e
+    (§4.5);
+  - the M-d2 bars by running M-c strictly first, with the bands re-derived and pre-registered
+    if M-c recalibrates (§4.3).
+- **IR24** (open item 7). Share groups are ranked jointly over every level ≥ the group floor
+  (§4.2). With IR2's composition this is exact and cheap, and it subsumes the max-floor
+  simplification.
+- **IR25** (open item 8). The binding TLA+ run limits for `GuardSound` and `DeviceReduce`
+  (§4.5). A previous TLC run OOM-crashed the machine, so every new model is gated on a measured
+  smoke run.
+
+**Gates, order and completion.**
+- **IR26. The stage-5 gate is not met.** Stage 5 is formally deferred with triggers T1–T3, and
+  its cost bar is restated without `ncu` (§4.6). C1 is complete without stage 5. The evidence is
+  read-only: ehrenfest makes precision user-directed and issues no accuracy requests, and its
+  Ozaki work is frozen.
+- **IR27. Pre-registered gate rules for stages 4 and 6** (§4.5, §4.7), applied mechanically in
+  the next round. Writing them down before M-a reports prevents post-hoc gate choices.
+- **IR28. Order of work** (§4.11): round 1 (CPU) and round 2 (GPU), following the dependencies.
+- **IR29. Definition of done** for C1 and C2 (§4.11). Completion is a finite checklist in
+  which every gated item ends as built, closed or deferred with a trigger.
 
 ---
 
@@ -2291,6 +3216,36 @@ P1–P4 are the four drafts (§Status).
     and flags are now stated (§2.3).
 41. **L6 looseness** omitted the factor ⌈d²⌉/d² (§4.4). **§2.8** used d for both the σ/τ
     increment and T − κ/2.
+
+**Completeness critic, accepted by the independent reviewer (IR1–IR29) — claims of the previous
+version of these notes:**
+
+42. **Hold-out coverage.** "The hold-out covers N = 8 / 14 plus 10 / 16 only, so no N ≤ 7" was
+    wrong both ways. The calibration set has N = 4 (2 rows), and the hold-out has N = 15–20. No
+    case anywhere is at N = 5, 6, 7, 9 or 13 (§1.2 item 8, IR4).
+43. **§2.4's "predictions at N = 6 and 8, outside the hold-out".** N = 8 is the best-covered N.
+    The uncovered ones are 6 and 9 for the schedules, and 6 and 12 for the default levels (IR4).
+44. **§2.7's "K-eq at about 0 per-call cost"** contradicted §2.6's recurring 6–13 % per call
+    per changed operand. That holds only for invariant operands or pre-scaling fused into the
+    producer (IR12).
+45. **§1.3's "Krylov … tighten precision as the residual falls."** Relaxed (inexact) Krylov
+    methods may loosen the matvec precision as the residual shrinks (IR3).
+46. **"Rebuild before stage 2."** Stages 0 and 1 already need the API-13 symbols, so the
+    rebuild is stage 0's first step (IR14).
+47. **M-a at m = n ≤ 512 as the Q13 evidence.** The gate needs the ≥ 2048³ class, and
+    random-structure gains change sign with m (IR1).
+48. **Q12's escape clause** ("unless M-a finds batch-dependent profiles") could not fire: M-a had
+    no batched fixture (IR16).
+49. **Q16's "the recipe covers the need"** rested on documentation alone; no shipped code
+    implemented the certified FP evaluation, and α ≠ 1 or β ≠ 0 were not addressed (IR7).
+50. **F3's "no byte beyond `pack_bytes`" as ABI** rested on one shape's guard zones (IR17).
+51. **§4.5's "every partner of a pre-scaled packed operand must carry the same w"** gave no rule
+    for choosing that w across several partners (IR6).
+52. **The stage-5 cost bar named `ncu`**, but GPU performance counters are admin-only on this
+    machine (IR26).
+53. **The stage-0 GPU tests** assumed a phase's first launch could happen inside a capture
+    without any check. K5<N> gets no plan-time attribute call, so lazy module loading may land
+    there (IR10).
 
 ## Appendix B. The partner-envelope accurate rule (recorded, not adopted)
 
