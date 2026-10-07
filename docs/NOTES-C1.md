@@ -58,21 +58,44 @@ what has been built since is recorded under "Implementation status".
   reproduces the first record to within 0.04 ms.
 - **Stage 2's CPU evidence (§4.3: M-a and M-d1) is done, 2026-10-07**, approved with fixes by
   an independent reviewer; the fixes are applied, and the verdicts on the implementation's
-  design questions are §5.6.
+  design questions are §5.6. A re-review (approve-with-fixes) found the provenance statements
+  wrong; its fixes are applied too, and its verdicts are §5.6 S2-14–S2-18.
   - *Code:* `oracle.kweights` with its multi-partner mode and test_oracle (12) at 5cd8ff3; the
     study (`bench/accuracy/kw_engine.py`, `c2_fixtures.py`, `c2_gate.py`, `c2_summary.py`,
-    `md1_converge.py`) at 7260a95; the review fixes after it. The CPU ctest
-    `c2_engine_selftest` runs the engine's self-test and checks the several-partner and
-    batched paths against `oracle.kweights`.
+    `md1_converge.py`) at 7260a95; the review fixes at f97696a; the re-review's at 928b49c.
+    The CPU ctest `c2_engine_selftest` (one of `tools/test.sh`'s CPU-only tests) runs the
+    engine's self-test and checks the several-partner and batched paths against
+    `oracle.kweights`, asserting its own coverage.
   - *Summary:* immerdink-eval `findings/c1-evidence.md`. It replaces the `findings/c1-m-a.md`
     named in §4.3 and covers M-d1 too. The raw records are in `results/c1/m_a/` and
-    `results/c1/m_d1/`, the psi4 operands in `results/c1/real/`, all untracked. The study code
-    was uncommitted when the first records were written: they name the commit at run time
-    (8b58101, d22a686), and a bit-identical reproduction smoke check links them to 7260a95.
-    Records written since carry a dirty flag and the sha256 of every study file.
-  - *CPU budget:* M-a about 37 of its 90 CPU-min, including about 6 min of duplicated work by
-    an orphaned process (§5.6 S2-7) and the review's B6 runs at m = 512 (1.6 min); M-d1 about
-    16 of its 30, including the IR7 re-run (1.7 min).
+    `results/c1/m_d1/`, the psi4 operands in `results/c1/real/`, all untracked.
+  - *Provenance* (corrected in the re-review, from the `commit` field of every file). The study
+    code was uncommitted when the first records were written, so they name the commit at run
+    time, not their code:
+    - 8b58101: Tier S (`S.jsonl`) and the pilot;
+    - 52054e9: Tier L (`L.jsonl`), the real operands (`real.jsonl`), `multi`, `batch`,
+      `real_pre_ew8`, the 7 real-operand B6 records, and M-d1 jacobi, diis, ppl and
+      `rho_levels14`;
+    - d22a686: M-d1 cg and davidson (with the superseded `cg_v1`, `davidson_v2` and
+      `davidson_strongcoupling`) and `rho_local`.
+
+    Two reproduction checks tie them to committed code. The smoke check of the first round
+    covers Tier S only: 128 × 600, phi4 and decay_opp, seeds 0–1, re-run on 7260a95,
+    bit-identical apart from the then-new ρ ≤ 1e8 column (the pilot, a sizing run that no
+    table uses, is not re-run). The re-review's re-run at 928b49c (every study file
+    committed) covers the rest: Tier L decay_opp 2048 × 3600 seed 0 and opp_nonsep
+    2048 × 16384 seeds 0–1 (seed 1 with seed 0's stale weights), the real R2 and R2b of
+    benzene/cc-pVDZ, multi and batch seed 0, the real-operand B6 record of R2b, and every
+    record of M-d1 jacobi (11), davidson (6) and cg (7). All reproduce bit for bit
+    (immerdink-eval `scripts/c1/repro_check.py`); the only differences are columns added
+    after the stored records were written (Tier L's ρ ≤ 1e8 column). M-d1 diis and ppl run
+    the same fixed-point code as jacobi. Records written since the first round carry a dirty
+    flag and the sha256 of every study file: the review round's B6 records (51dba1e,
+    a858225) and IR7 re-run (d89988a), whose files match f97696a's (S2-18).
+  - *CPU budget:* M-a about 39 of its 90 CPU-min, including about 6 min of duplicated work by
+    an orphaned process (§5.6 S2-7), the review's B6 runs at m = 512 (1.6 min) and the
+    re-review's re-runs (1.7 min); M-d1 about 21 of its 30, including the IR7 re-run
+    (1.7 min) and the re-review's re-runs (4.8 min).
   - **Mechanical outcomes** (the pre-registered rules, IR27):
     - d* = 3 (Q11). Every deadband rejected all 30 random-structure runs, and the median gains
       on decay_opp and opp_nonsep are within 0.25 moduli; ties go to 3.
@@ -89,9 +112,13 @@ what has been built since is recorded under "Implementation status".
     - Q12 (a) stands for this cycle, but vacuously on real data (§5.6 S2-12). Q15 (a) stands
       (§5.6 S2-13). The Appendix B revival trigger is not met: 0 cases, and the largest saving
       beyond both alternatives is 1 modulus.
-    - B6 (IR11) shows no value. No split beats running every row at N_hi, on the real
-      operands (FP64 x) or on synthetic outliers, opp_nonsep and φ = 4 at m = n = 128 and 512
-      (exact x).
+    - B6 (IR11) shows no value at the sizes measured. No split beats running every row at
+      N_hi, on the real operands (FP64 x) or on synthetic outliers, opp_nonsep and φ = 4 at
+      m = n = 128 and 512 (exact x). At m = n = 512 the reason is the refinement call's fixed
+      part: in [M], t(N_hi, m' rows) costs 53–57 % of t(N_hi, full) even for m' = 1–46 rows
+      (59–65 % of it packs the whole partner at N_hi), while one modulus less on the bulk
+      saves 1.7–3.8 % (immerdink-eval `scripts/c1/b6_split_cost.py`). B6 stays a caller
+      recipe; a much larger m with few high-ρ rows is untested.
     - M-d1: every forcing-rule ramp meets §4.3's success criterion on Jacobi, DIIS(8) with and
       without a reset, and PPL + ring. **IR7 is closed:** with the shipped `rho_from_output`
       (51dba1e's), the lagged ρ̂ missed in 1 of 228 MET calls (PPL at 1e−6, realized 1.013e−6,
@@ -99,6 +126,10 @@ what has been built since is recorded under "Implementation status".
   - **Not yet run:** M-b (the [M] re-runs of IR9 and the share-group raise cost of IR15; CPU,
     round 1), and M-c and M-d2 (GPU, round 2). Stage 3 may start: the M-a summary is published
     (§4.11).
+  - **Open:** the M-d1 caller guidance (§1.3: the DIIS reset, Davidson's recompute and its +5
+    iterations, CG's relaxation scaled by the iteration count) lives only here. It is to be
+    carried into DESIGN §6g.12, `bench/accuracy/schedule.py` and the `precision.py`
+    docstrings, which the stage-1 work owns (also a ROADMAP C1 open item).
 
 The draft merges four design proposals and three earlier reviews:
 - **P1**: Ozaki-II N-range plans, K5 statistics, K-equilibration.
@@ -1896,7 +1927,7 @@ real-operand family meeting (i)" (computed by `bench/accuracy/c2_summary.py`; im
   not run.
 
 **Re-registered for any revival** (decided by the independent reviewer before any new
-evidence, §5.6 S2-1, S2-2, S2-12; binding on a revival):
+evidence, §5.6 S2-1, S2-2, S2-12, S2-14, S2-16; binding on a revival):
 - **(ii)** passes iff, on every guard-accepted Tier-L or real fixture, both hold:
   - (2): no sampled output whose median ratio (K-eq error / fast error at the same N, over
     the N where fast's error exceeds 4u|x|, at least three of them) exceeds 2;
@@ -1906,6 +1937,14 @@ evidence, §5.6 S2-1, S2-2, S2-12; binding on a revival):
   The per-output count (1) above is still reported, as a diagnostic: at equal accuracy it
   fires on independent rounding noise (for two half-normal errors whose scales differ 2×,
   about 16 % of outputs exceed 2×).
+  - (ii) is judged on the scheme the revival would ship (K-eq at d*). If the revived caller
+    recipe allows reusing a w on changed data (stale weights) instead of re-running the
+    helper per changed operand, as the recipe below prescribes, the stale-weight runs count
+    as gate-(ii) runs too (S2-14).
+- **Gate (b)'s memory of scaled copies** is reported for the recipe actually proposed (which
+  operands are held pre-scaled, per caller-cost scenario), with the upper estimate
+  8(mk + nk) bytes (both operands pre-scaled and kept beside the plain ones) alongside
+  (S2-16).
 - **Elementwise criteria (b) and (c)** are judged on the outputs with ρ_ij ≤ 1e8 (exact x,
   plain norms): DESIGN §6f.1's "outputs that must meet the target". The all-outputs reading is
   reported alongside. On this round's data the outcome is the same under both readings.
@@ -1980,9 +2019,10 @@ defining w on X keeps role swaps across plans well defined.
    every nonzero finite row of A and of ã (and of the columns of B and of b̃) at the plan's
    (N, k, rounding). It works from the integers (m, e + w), so ã is never materialized. It
    reports gain_row_min = min_i(σ̃_i − σ_i), gain_col_min, their sum G (`gain`), and
-   guard = 1 iff G ≥ 3 (L5c). If A has no nonzero finite row or B no nonzero finite column, G is
-   undefined. Then guard = 1 vacuously, since every product is zero or flagged, and
-   gain = INT32_MIN; the plain request applies unchanged.
+   guard = 1 iff G ≥ 3 (L5c). Rows and columns are those of the caller's A and B, independent
+   of lowering's operand swap (§5.6 S2-5). If A has no nonzero finite row or B no nonzero finite
+   column, G is undefined. Then guard = 1 vacuously, since every product is zero or flagged,
+   and gain = INT32_MIN; the plain request applies unchanged.
    - *Several partners:* the guard is per pair, G_p = gain_min(X) + gain_min(Y_p), each computed
      at pair p's plan (N, k, rounding). The reported G = min_p G_p, and guard = 1 iff G ≥ 3. L5c
      is pairwise, so it then holds for every partner. `imd_err_request_kweighted` with the min G
@@ -2019,8 +2059,11 @@ typedef struct {                 /* 32 B, written by the call into caller device
   int32_t gain;                  /* G = gain_row_min + gain_col_min (L5c/d); INT32_MIN if not
                                     computed (never 0: G = 0 is a real value)                  */
   int32_t gain_row_min, gain_col_min;  /* min (sigma~ - sigma) over nonzero finite rows of A / columns of B,
-                                    for the pair that sets G; INT32_MIN whenever gain is, even
-                                    if one side is defined (§5.6 S2-5)                         */
+                                    for the pair that sets G; A and B are the caller's operands
+                                    as passed to that pair's plan, independent of lowering's
+                                    operand swap (the same for row- and column-major C);
+                                    INT32_MIN whenever gain is, even if one side is defined
+                                    (§5.6 S2-5)                                                */
   int32_t median;                /* med, INT32_MIN if no index has both exponents            */
   int32_t num_weighted, max_abs_w, clamped;  /* of the WRITTEN w: #{w != 0}, max |w|,
                                     #{w != w0}; ZERO_ON_FAIL with guard = 0: 0, 0, #{w0 != 0},
@@ -3528,6 +3571,11 @@ The review was approve-with-fixes: three must-fix items (the gate-(ii) report, t
   the `oracle.kweights` docstring and §4.5's report struct and ZERO_ON_FAIL text. (a) is the
   field's own definition applied to the w the helper writes, as §4.5 says ("sets clamped and
   num_weighted to match"); reporting the failing G keeps the capture-safe pattern rigorous.
+  (d) The re-review added one more, binding in the same way: `gain_row_min` and
+  `gain_col_min` name the rows of the caller's A and the columns of the caller's B as passed
+  to the plan, not the operands after lowering's swap, so a swapped plan (column-major C)
+  reports the same values as the unswapped one. test_oracle (12) pins this; it is stated in
+  the docstring, §4.5 step 5 and the report struct.
 - **S2-6. Cuts triggered by a tier's allotment.** Tier S projected about 26 min against its
   25, while M-a as a whole projected about 55 against 90; the pre-declared trigger names the
   total, and cut (1) touches Tier L only. The study applied cut (2). *Verdict: yes, and the
@@ -3589,6 +3637,51 @@ The review was approve-with-fixes: three must-fix items (the gate-(ii) report, t
   registered as the CPU ctest `c2_engine_selftest`; test_oracle (12) given a swapped view with
   X = A and an unswapped one with X = B; the provenance of each record extended by a dirty
   flag and every study file's sha256.
+
+**Re-review** (independent reviewer, 2026-10-07; approve-with-fixes). One must-fix: the
+provenance statements named the wrong commit for most records (now Status, stage 2,
+*Provenance*). Its verdicts on the review round's design questions, binding:
+- **S2-14. Gate (ii) is evaluated on K-eq d*,** the scheme stage 4 would ship; d = 0 and stale
+  weights are diagnostics in the regression table. *Verdict: confirmed* (Q11 fixes d* = 3 as
+  the shipped deadband). (ii) is not met whichever scheme is counted (d = 0: 1–14 outputs per
+  fixture, d*: 2–19, stale: 2–10). *Binding for any revival:* if the revived recipe allows
+  reusing a w on changed data instead of re-running the helper per changed operand, the
+  stale-weight runs count as gate-(ii) runs too (§4.5).
+- **S2-15. Appendix B's non-separable set.** Separable = {decay_opp, decay_same, uniform,
+  same_sign}; every other family is non-separable (outliers, φ, mixed, opp_nonsep, the CC
+  families, the real operands). *Verdict: confirmed:* for a revival trigger the wider set is
+  the conservative (more sensitive) reading. The trigger is 0 cases under either reading,
+  compared with what a caller gets (guard-accepted K-eq d*, otherwise fast mode) and with
+  K-seg 2.
+- **S2-16. The memory of scaled copies (gate (b))** is reported as 8(mk + nk) bytes, both
+  operands pre-scaled and kept beside the plain ones. *Verdict: confirmed as an upper
+  estimate, labelled as such;* it cannot flatter K-eq, and every real R1–R6 has guard = 0
+  this round. For a revival the gate table also gives the figure for the recipe actually
+  proposed, with the bound alongside (§4.5).
+- **S2-17. The several-partner and batched self-test** lives in `c2_gate.py`
+  (`self_test_modes`, next to `run_multi` / `run_batched`), runs in every `c2_gate` process
+  before any record and in the ctest `c2_engine_selftest`; `keep_w` defaults off, so record
+  formats are unchanged. *Verdict: confirmed, subject to two fixes, both applied:* the ctest
+  is among `tools/test.sh`'s CPU-only tests, so it no longer waits for or holds the shared GPU
+  lock; and the self-test asserts its coverage (guard 0 and 1 at P = 1, 2 and 3, X in role A
+  and B at P ≥ 2, the FP64 clamp binding at P = 1 and at P ≥ 2, and w = 0 in a
+  several-partner case, a batched descriptor and a slice, added for S2-4), so a fixture or RNG
+  change cannot remove it silently. G undefined stays covered by test_oracle (12) only.
+- **S2-18. The IR7 re-run's provenance:** its records name d89988a with
+  `python/immerdink/precision.py` dirty (another agent's uncommitted edit), with that file's
+  sha256 equal to 51dba1e's. *Verdict: confirmed, checked by the reviewer:* the sha256 in all
+  4 `md1_rho.jsonl` records equals the committed file of 51dba1e and f97696a, the other study
+  files match f97696a, and the same holds for the 30 review-round B6 records. Records tied by
+  content are what `provenance()` is for.
+- **Re-review should-fix items applied.** The 52054e9-era records re-run on committed code
+  (Status, stage 2, *Provenance*); `c2_summary.gate_verdict`'s (iii) sums over every run that
+  scales an operand (Tier S included, stale weights included; B6 scales nothing), and a
+  guard-accepted contraction whose (b)/(c) the script does not compute (R6) makes (i)
+  INCOMPLETE instead of NOT MET; the `oracle.kweights` docstring, §4.5 step 5 and the report
+  struct say that `gain_row_min` / `gain_col_min` are the caller's A rows and B columns,
+  independent of lowering's swap (S2-5 (d)); the B6 findings table shows the reaching and the
+  unreaching seeds separately and says why no split pays at m = n = 512; the M-d1 caller
+  guidance's move into DESIGN is tracked as an open item (Status, stage 2).
 
 ---
 
