@@ -541,6 +541,11 @@ also **every band's product D_s normal or zero**). Per output (i, j), with
 - **Underflow is a new hazard**: a short band's product can be subnormal while x is not, and
   the caller does not see D_s. Only the ABSOLUTE form covers it, with its (1+γ)·S·2⁻¹⁰⁷⁵
   term; NORMWISE and ELEMENTWISE need every D_s normal or zero (PROOFS L7's hypothesis).
+  A caller cannot check that hypothesis: D_s for s ≥ 2 is never materialized, and a normal
+  C_S does not imply it. Without it every form holds with the same absolute term added,
+  `(1+γ)·S·2⁻¹⁰⁷⁵ ≤ S·2⁻¹⁰⁷⁴` (`params.kseg_eta(S)`, a double; PROOFS L7c (3)), which
+  matters only for outputs within a few ulps of the subnormal range. The rigorous ρ_S below
+  carries it, so it needs no hypothesis.
 - **Against §6f.2 with ν = √k** (ℓ1 ratios 0) at the same N: `E_s ≤ E(k)`, so the NORMWISE and
   ABSOLUTE bounds exceed the unsegmented ones by `γ(1+u)(1+E)·‖a‖‖b‖` only, about (S−1)u.
 - **A whole-row ℓ1 ratio does not bound a band's**: a row (1, ε, …, ε) has a ratio near 1
@@ -557,30 +562,47 @@ band that L7d's margin does not cover. The gain is `N_S < ‖a‖‖b‖`, which
 do not see. With the per-band norms (one pass over A and B, as §6g.11's norms):
 1. Form the exact quotient t̄ and `t_eff = RN(t̄)` (one RN division):
    - NORMWISE target t relative to the plain norms: `t̄ = t/r` with
-     `r ≥ max_ij N_S,ij/(‖a_i‖‖b_j‖)`, rounded upward. r = 1 is always valid and gains
-     nothing; a cheap valid r is `Σ_s max_i(‖a_i^s‖/‖a_i‖)·max_j(‖b_j^s‖/‖b_j‖)`, evaluated
-     rounding upward.
+     `r ≥ max_ij N_S,ij/(‖a_i‖‖b_j‖)`, rounded upward. r = 1 is always valid (N_S ≤ ‖a‖‖b‖)
+     and gains nothing; a cheap valid r is
+     `min(1, Σ_s max_i(‖a_i^s‖/‖a_i‖)·max_j(‖b_j^s‖/‖b_j‖))` (the sum can exceed 1), the
+     maxima over the rows and columns with ‖a_i‖ > 0 and ‖b_j‖ > 0 (an output with a zero
+     row or column has N_S = 0 and x = 0, so it needs no ratio). It is an upper bound only
+     if every band norm ‖a_i^s‖, ‖b_j^s‖ in it is an upper bound, every whole-row norm
+     ‖a_i‖, ‖b_j‖ a LOWER bound, and each quotient, product and sum is rounded upward.
+     Norms computed in RN carry relative errors of about k·u, which L7d's margin (about
+     5u·t̄) does not cover: enclose them (square sums with directed rounding, or the RN
+     result widened by an explicit relative bound, outward in each direction: γ_{k+1} for
+     the square root of an RN sum of k squares, absent underflow and overflow).
    - ELEMENTWISE: `t̄ = t/ρ_S` with `ρ_S ≥ N_S/|x|` over the outputs that must meet the
      target, rounded upward. A rigorous ρ_S from a previous segmented output C_S (the same
-     bands, α = 1, β = 0, every D_s normal or zero):
-     `|x| ≥ |C_S| − Σ_s n_s W_s ≥ |C_S| − W̄·N_S`, so `ρ_S ≤ N_S/(|C_S| − W̄·N_S)` where the
-     denominator is positive (PROOFS L7c (7)).
+     bands, α = 1, β = 0; no hypothesis on the D_s):
+     `|x| ≥ |C_S| − Σ_s n_s W_s − (1+γ)·S·2⁻¹⁰⁷⁵ ≥ |C_S| − W̄·N_S − (1+γ)·S·2⁻¹⁰⁷⁵`, so
+     `ρ_S ≤ N_S/(|C_S| − W̄·N_S − (1+γ)·S·2⁻¹⁰⁷⁵)` where the denominator is positive
+     (PROOFS L7c (3), (7)).
      Evaluate it as §6g.11 does, every step rounded outward, with n ≥ N_S (the band norm
      products summed rounding upward) and U ≥ W̄ from `params.kseg_wbar_up(Ū, S)`
      (`Ū + S·u·(1 + Ū)` rounded upward, Ū ≥ every band's NORMWISE `bound`, γ_1 for a
-     K-empty band): ρ̂_S = `params.rho_recipe(C_S, n, 1, U)`, certified only for a finite,
-     normal C_S with a positive denominator (`cert_kseg_composition` (7)). Or take
+     K-empty band): ρ̂_S = `params.rho_recipe(C_S, n, 1, U, eta=params.kseg_eta(S))`, the
+     absolute term added to U·n rounding upward, certified only for a finite, normal C_S
+     with a positive denominator (`cert_kseg_composition` (7), also on outputs whose last
+     band's products underflow). Or take
      `rho_from_output`'s plain ρ̂ from an unsegmented β = 0 probe: valid since ρ_S ≤ ρ, but it
      gives up the gain. Either way, as in §6g.11, a ρ_S taken from a previous output predicts
      the next call's value; it does not bound it.
-   - ABSOLUTE: `t̄ = t/M̄` with `M̄ ≥ N_S`, rounded upward (no underflow).
+   - ABSOLUTE: `t̄ = t/M̄` with `M̄ ≥ N_S`, rounded upward.
+   Each guarantee below holds up to the absolute term above, which only an underflowing
+   D_s brings.
 2. `t′ = RN(RN(min(t_eff, 1)·(1 − 2⁻⁵⁰)) − 4S·2⁻⁵³)` in FP64 (`params.kseg_request`;
-   S ≤ 2²⁶). If `t′ ≤ 0`, the transform certifies no N: since W ≥ S·u, L7 certifies no
-   t̄ < S·u at any N, and between S·u and about 4S·u the transform is merely conservative.
-3. Request NORMWISE target t′ with ℓ1 ratios 0: `imd_err_min_moduli` / rank on the whole
-   contraction (E(k) bounds every E_s) or on each band's sub-view. Its N meets the target:
-   `E(1+u) + u ≤ t′` implies `W ≤ t̄`, the exact quotient (L7d; t_eff = RN(t̄) can lie above
-   t̄).
+   S ≤ 2²⁶). If `t′ ≤ 0`, the transform certifies no N and `params.kseg_request` returns
+   None, never 0.0: a target of 0 means "no target, report only" to rank (§6f.1), which
+   would return the cheapest configuration with no accuracy filter. Since W ≥ S·u, L7
+   certifies no t̄ < S·u at any N, and between S·u and about 4S·u the transform is merely
+   conservative: normwise targets near 1e−15 are out of reach (t_eff = 5e−16 or 8e−16 at
+   S = 2, 1e−15 at S = 4).
+3. Request NORMWISE target t′ > 0, basis BOUND (TYPICAL voids the certification), with ℓ1
+   ratios 0: `imd_err_min_moduli` / rank on the whole contraction (E(k) bounds every E_s) or
+   on each band's sub-view. Its N meets the target: `E(1+u) + u ≤ t′` implies `W ≤ t̄`, the
+   exact quotient (L7d; t_eff = RN(t̄) can lie above t̄).
 
 **When it pays** (M-a, the ≥ 2048³ class; immerdink-eval `findings/c1-evidence.md`).
 - On banded anti-correlated synthetic profiles S = 2 saves 2–4 moduli at equal sampled max
@@ -4946,7 +4968,10 @@ forbids, and it could not protect graph replays anyway.
   `key_digest`, for diagnostics only. The record follows host enqueue order, not GPU order:
   under graph replay, or across streams ordered by events, it can differ from what the GPU
   sees, so it guards the plain stream-ordered pattern only. `Pack.pack_ptr` and any other
-  write bypass it.
+  write bypass it. It also assumes one host thread per buffer: the lock covers the record,
+  not the call, so a `Pack.pack` into the buffer from another thread between a contract's
+  check and its enqueue is not seen (the call then reads the new bytes). A caller that packs
+  and contracts on one buffer from several threads serializes them itself.
 - Its lock-and-compare costs 0.14 µs per `Plan.contract` (`bench/python_overhead.py`,
   "ik,kj->ij" 16³, N = 8, median host time: 6.26 µs with a `PackedBuffer` against 6.12 µs
   with the raw buffer of the same packed plan; the bare ctypes call takes 3.98 µs; immerdink-eval
@@ -4962,7 +4987,14 @@ start-up. Call times run from just before the enqueue to completion, the same me
 steady call (median of 20) and the first one. Records: immerdink-eval
 `results/c1/stage0_first_call.jsonl` (`bench/first_call.py --table` prints this table from
 them, with the GPU-event times alongside), summary `findings/c1-stage0-first-call.md`. The
-library was built at 1e6e709 (host API 13); the summary gives its sha256.
+library was built at 1e6e709 (host API 13); the summary gives its sha256. **Provenance limit:**
+the 16 records carry only a date, no commit, library sha256 or host API. They were written
+(05:04) by `bench/first_call.py` before its first commit (8b58101, 05:13), and that run is the
+only one; the script's later changes (0197351, d22a686, and the final review's host-API
+field) touch its table and provenance code only. So the build named above is the summary's
+account of the library in place at the time, not a field of the records. A re-run on the
+current build, whose records name all three, is due in the remaining C1 GPU round (NOTES-C1
+Status, "What remains for C1").
 
 | m = n = k | N | steady call | first call at the new N | first plan creation | re-pack of A (GPU) | cold capture: first / steady replay |
 |---:|---:|---|---|---:|---:|---:|
@@ -4976,9 +5008,10 @@ library was built at 1e6e709 (host API 13); the summary gives its sha256.
 | 4096 | 14 | 31.3 TFLOPS-eq, 4.395 ms | 31.2 TFLOPS-eq, 4.403 ms | 0.012 ms | 0.423 ms | 0.99 |
 
 - **The switch is cheap.** The first call at a never-launched N spends 12–35 µs more host time
-  enqueueing than a steady call (consistent with the lazy load of that N's kernels [I]); most
-  of it overlaps the GPU, and from enqueue to completion the first call takes at most 9 µs
-  more (5–7 µs at 1024³; at 4096³ between −13 and +9 µs, under 0.3 % of the call).
+  enqueueing than a steady call (consistent with the lazy load of that N's kernels [I]); much
+  of it overlaps the GPU (46–68 % of the extra enqueue time at 1024³, 75 % or more at
+  4096³), and from enqueue to completion the first call takes at most 9 µs more (5–7 µs at
+  1024³; at 4096³ between −13 and +9 µs, under 0.3 % of the call).
 - **Plan creation is not part of the switch.** The first `imd_plan_create` at the new N takes
   0.011–0.150 ms of host time, against 0.004–0.005 ms afterwards: a one-time cost per N per
   process, paid when the plans are made before the iteration loop (§6g.1). The 0.14–0.15 ms
@@ -5258,8 +5291,13 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   N ≥ that floor, the group time is Σ_members calls × the member's best composed time at N;
   the least wins (ties: the smaller N) for every member. Time is usually monotone in N, so
   this normally returns the floor, but not when the packing and reuse terms differ by level.
-  Groups that share a contraction are merged for N. Whether the members can really read one
-  pack (one key) is checked where it matters, by plan creation (PACK_MISMATCH).
+  Groups that share a contraction are merged for N. The shared roles must read one pack:
+  `PrecisionPlan` checks at construction that their pack keys (`imd_pack_layout`'s N,
+  rounding, pack_bytes and key digest, as `PackRecord` compares them) are equal at every
+  level where the members have a plan, and that some level can pack them, and raises
+  ValueError otherwise. (The final review of C1/C2 found a group whose members read different
+  operands accepted and priced as one pack; `footprints()` then sized one buffer where two
+  were needed.) Plan creation's PACK_MISMATCH stays the backstop for a caller's own `Pack`.
   *What the raise costs* [M, model-only, outside hold-out at levels ∉ {8, 10, 14, 16}]
   (NOTES-C1 §3.3, M-b: ehrenfest ccsd.py's pairwise DF contractions at psi4 sizes): nothing
   in 11 of 12 forcing-rule cases on the real operands, whose group members share a floor, and
@@ -5332,6 +5370,16 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   (immerdink-eval `findings/c1-stage1-phase-cost.md`: the committed script, both records
   with their sha256, the product commits and the library's sha256). It runs at phase
   switches, off the hot path; ehrenfest's hot-path rank calls are untouched.
+  It is not free per call, and a loop whose targets change every iteration should not call it
+  every iteration (`bench/accuracy/schedule.py` does, as an example: 0.2–0.8 ms of host time
+  per call on its two contractions, a new target each time, against its 5.8 ms [M]
+  iteration; immerdink-eval `results/c1/final_review/phase_call_cost.txt`). A switch is due
+  only when a floor moves: `phase()` starts from one `min_moduli` per contraction (steps 1–2;
+  a few µs each through a `planner.Query`), and its configurations stay the same while those
+  return the same status and `num_moduli` (with `"DIRECT"` listed, also the mode-DIRECT
+  check at the top level), for the same `iterations` and `fail_budget` (TYPICAL targets
+  carrying step 7's p); only the err fields follow the targets. So the caller can run those
+  queries every iteration and `phase()` only when one of them changes.
 - **Limits.** The choice is the performance model's [M], outside its hold-out at
   N ∉ {8, 10, 14, 16} until NOTES-C1's M-c passes (it failed on 2026-10-07, §6g.9; the path
   to a pass is NOTES-C1 §5.9 MC-3 as amended by MC-3a). Rank's footprint tie order
@@ -5446,9 +5494,19 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
     shared reuse and the `configs()` lookup kept); BUDGET (the floor and the least
     total_bytes) and MISSED's precedence, and `BUDGET` never on a missed target; TYPICAL
     p = P / (iterations × calls); RN κ ≥ T levels; argument errors. The brute force applies
-    the same DIRECT rule from first principles.
+    the same DIRECT rule from first principles. **[final review]** Share groups whose roles
+    read different packs, or that no level can pack, are refused at construction (in the
+    random suite too, from pack keys the test computes itself, after which the members run
+    by name only), while one operand read by two contractions shares one PackSpec; equal
+    step-1 `min_moduli` results give equal configurations (the "Cost" pattern).
   - `footprints()` equals the maximum of the C queries over the allowed pack modes × vec
     modes × every g, per level, with its totals.
+  - **[final review]** The plans a phase names: every `configs()` and `phase()` choice lowers
+    (`host.lowering` with its `options()` and `pack_specs`) with no PACK_MISMATCH and its
+    `workspace_bytes`, and a share group's member lowers with another member's PackSpec of the
+    shared role. `python_device`'s CPU part creates those Plans and Packs through its fake
+    library (in-line, packed, DIRECT) and runs a share group's two plans on one
+    `PackedBuffer`.
   - `rho_from_output` equals `params.rho_recipe` bit for bit (random and boundary values,
     every α = 2^e class, specials, broadcast and batched forms). On a 2-D C, 1-D bounds at
     m = n and mixed with 2-D bounds equal the explicit (m, 1) × (1, n) result, and a 1-D
@@ -5466,7 +5524,7 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
     (exact rationals): the mutation that drops the ndim rule, and the pre-MF4 code, fail
     first on a (b,) row bound at b = m = n = 3, 9 of 27 certified outputs below ρ. U ≥
     params' exact bound (its upper enclosure) at N = 2–20, k = 1–40000, both roundings and
-    dispatches; ρ̂ ≥ ρ in exact rationals on emulated outputs (`params.emulate_element`);
+    dispatches, and with ℓ1 ratios from 1 to √k and 1e9 (k up to 2²⁰); ρ̂ ≥ ρ in exact rationals on emulated outputs (`params.emulate_element`);
     ValueError / TypeError cases. Norm bounds convert to float64 exactly (float16, float32
     and integers ≤ 2⁵³ equal the float64 call) or are refused (2⁵³ + 1 as an array and as a
     list, a uint64 above 2⁵³, Fractions, Decimals, 2⁷⁰, a long double wider than 64 bits,
@@ -5544,8 +5602,8 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 | Register-fused CRT (V3) | Exceeds 255 registers/thread at useful tiles (MEMORY_MODEL §6). |
 | FP CRT ([OZ2] double-double) | Exact integer arithmetic is simpler, checkable, and division-free. |
 | Accurate mode ([SC25]'s partner-aware σ/τ shifts) — **[v1.19]** re-examined for wide dynamic range (NOTES-C1 §2.5, §2.8, M-a) | Still rejected. It needs one more operand pass (KF/KL lose their group-1 fusion), and σ depends on the partner, which breaks operand packing (D1). It also converts headroom poorly: by an estimate from the §3.8 bound, confirmed by NOTES-C1 §2.5–§2.6's data (not a theorem), partner-aware shifts realize about G/7.8 moduli of a G-bit headroom where K-weights realize about G/3.9. Measured [C]: ≤ 0.3 moduli on dense data, ≤ 0.34 for the faithful 6-bit form even on decay_opp, about 3 with exact or envelope bounds on separable anti-correlated data. M-a at the ≥ 2048³ class (immerdink-eval `findings/c1-evidence.md`): the never-worse envelope rule (NOTES-C1 Appendix B, recorded as the proven partner-aware option) saves 1.5–3.5 moduli at equal elementwise error on decay_opp and opp_nonsep (K-equilibration 4–7), −0.5 to +1 on random-structure data, and none on the real psi4 operands. Its revival trigger (≥ 2 moduli beyond both K-equilibration and K-segmentation on a non-separable family of that class) is not met: 0 cases. |
-| K-equilibration in the library: power-of-two K-weights with `imd_kweights` and caller pre-scaling, then library-internal weighted packs (NOTES-C1 stages 4, 6) | Closed by its pre-registered gate (NOTES-C1 §4.5). No real-operand contraction of the ≥ 2048³ class (psi4 DF and MP2 operands of benzene and water on the consumer's contraction list) passes the L5c guard: their K profiles are aligned (G ≤ 0), and with the caller's costs K-equilibration is 2–47 % slower there [M]. It saves about 6 moduli only on synthetic anti-correlated profiles. The exact rule stays as `oracle.kweights`, and `oracle.kweights` with M-a is C2's deliverable. **Stage 4** (caller-side, `imd_kweights`) **closed**, 2026-10-07; **revival trigger:** a real-operand family meeting gate (i) (guard = 1 on a real contraction of the ≥ 2048³ class, and a net TFLOPS-eq gain ≥ 5 % at equal target with every caller cost counted, or an elementwise target ≤ 1e−8 that fast mode cannot reach at N ≤ 20 becoming reachable), judged with the re-registered (ii) of NOTES-C1 §4.5, after the d*-deciding part of Tier S is re-run on committed code (NOTES-C1 §5.6 S2-21). **Stage 6** (library-internal weights and weighted packs) **deferred**, since its gate needs a shipped stage 4; **trigger:** a revived stage 4 that ships and passes M-e on its gate case, plus a real fixture on which library-internal weights remove ≥ 5 % of pre-scaling or scaled-copy cost on a recurring contraction (NOTES-C1 §4.7). |
-| K-segmentation as a library mode (a SEGMENTS flag or a segment loop; NOTES-C1 Q15) | A documented caller recipe instead (§3.8 "Segmented accumulation", PROOFS L7): it works today with β = 1 and moved base pointers. M-a: on every guard-accepted Tier-L case it needs 1–4 more moduli than K-equilibration; on the real operands it saves at most one modulus (normwise 1e−15) at +4 % to +62 % of fast mode's time [M], and it gives up the single rounding. An API only if a real workload shows value beyond the recipe. |
+| K-equilibration in the library: power-of-two K-weights with `imd_kweights` and caller pre-scaling, then library-internal weighted packs (NOTES-C1 stages 4, 6) | Closed by its pre-registered gate (NOTES-C1 §4.5). No real-operand contraction of the ≥ 2048³ class (psi4 DF and MP2 operands of benzene and water on the consumer's contraction list) passes the L5c guard: their K profiles are aligned (G ≤ 0), and with the caller's costs K-equilibration reaches 2–47 % lower TFLOPS-eq than fast mode there at the normwise targets (+2 % to +89 % time; N = 9–12) [M, model-only, outside hold-out] and 1–36 % lower at the ew8 targets (+1 % to +57 % time; N = 13–16) [M, model-only, outside hold-out at N = 13 and 15]. It saves about 6 moduli only on synthetic anti-correlated profiles. The exact rule stays as `oracle.kweights`, and `oracle.kweights` with M-a is C2's deliverable. **Stage 4** (caller-side, `imd_kweights`) **closed**, 2026-10-07; **revival trigger:** a real-operand family meeting gate (i) (guard = 1 on a real contraction of the ≥ 2048³ class, and a net TFLOPS-eq gain ≥ 5 % at equal target with every caller cost counted, or an elementwise target ≤ 1e−8 that fast mode cannot reach at N ≤ 20 becoming reachable), judged with the re-registered (ii) of NOTES-C1 §4.5, after the d*-deciding part of Tier S is re-run on committed code (NOTES-C1 §5.6 S2-21). **Stage 6** (library-internal weights and weighted packs) **deferred**, since its gate needs a shipped stage 4; **trigger:** a revived stage 4 that ships and passes M-e on its gate case, plus a real fixture on which library-internal weights remove ≥ 5 % of pre-scaling or scaled-copy cost on a recurring contraction (NOTES-C1 §4.7). |
+| K-segmentation as a library mode (a SEGMENTS flag or a segment loop; NOTES-C1 Q15) | A documented caller recipe instead (§3.8 "Segmented accumulation", PROOFS L7): it works today with β = 1 and moved base pointers. M-a: on every guard-accepted Tier-L case it needs 1–4 more moduli than K-equilibration; on the real operands it saves at most one modulus (normwise 1e−15) at +4 % to +62 % of fast mode's time (R2b: 2 % faster, inside the model's error) [M, model-only, outside hold-out at N = 13], and it gives up the single rounding. An API only if a real workload shows value beyond the recipe. |
 | More bits per modulus via larger moduli (e.g. Karatsuba-split residues) | More INT8 GEMMs per bit on sm_89 [I]: a residue of a modulus above 256 needs two int8 parts and three GEMMs per modulus, against one per 8-bit modulus. The FP8 analogue, Ozaki-II with Karatsuba-split FP8 residues (arXiv:2603.10634), needs 3 FP8 GEMMs per modulus and about 2.5× the multiplications of the INT8 scheme for 53 bits. |
 | N-range plan: one plan serving every N′ ∈ [N_lo, N_hi] (NOTES-C1 §3.2) | Parked. A call at N′ is launch-identical to the single-N′ plan, so it gains nothing per call; precision phases use a plan per N (§6g). It would save only plan count, host bytes and creation time (0.011–0.15 ms per N, once). **Trigger:** a consumer that cannot re-plan per phase, or a measurement showing that plan count, plan creation or RESIDENT memory matters. |
 | Multi-N packs; round-to-odd reference-integer packs; lower-N planes from a higher-N pack (NOTES-C1 §3.1 A3, A4, A6) | A multi-N pack has the same bytes as separate packs and saves one FP64 read per pack creation, for N-set key semantics. A round-to-odd pack takes 5 / 8 / 9 / 11 B per element at N_max = 8 / 14 / 16 / 20 (≥ FP64 from N_max = 14), each call still reads ≥ 8 B per element, and it saves only the S pass that KL already fuses. Lower-N planes cannot come from a higher-N pack: σ depends on N, rounding is not modular, and the CRT over a prefix gives z mod P(N′) (PackedOperand `neg_n`). |
@@ -6366,11 +6424,12 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     fixed N = 14), the lagged ρ̂ of §6g.11 missed in 1 of 228 MET calls (IR7 closed), and
     the report-only Davidson and CG cases give the caller guidance of §6g.12.
   - Reviewed four times (approve-with-fixes; NOTES-C1 §5.6). Provenance (NOTES-C1 Status):
-    every record the gates and M-d1's criterion rest on is reproduced bit for bit on
-    committed code (121 records at 5925219, M-d1 jacobi, davidson and cg at 928b49c; the
-    ρ-miss records are tied to it by sha256, NOTES-C1 §5.6 S2-18); Tier S, which sets
-    the deadband d* = 3, is not (8b58101-era, 4 of 245 runs smoke-checked), and the gate
-    verdict holds at d = 0 as well.
+    the records gates (i) and (ii) are evaluated on, and those behind M-d1's criterion, are
+    reproduced bit for bit on committed code (121 records at 5925219, M-d1 jacobi, davidson
+    and cg at 928b49c; the ρ-miss records are tied to it by sha256, NOTES-C1 §5.6 S2-18).
+    Tier S, which sets the deadband d* = 3, is not (8b58101-era, 4 of 245 runs
+    smoke-checked), nor is Tier S's share of gate (iii); the gate verdict holds at d = 0 as
+    well.
 - **Stage 3** (NOTES-C1 §4.4 with IR5, IR12, IR15; C2; no ABI change, host API 13):
   - **§3.8 "Segmented accumulation":** the K-segmentation caller recipe (S calls, β = 1
     after the first, moved base pointers; per-band σ, flags, RN acceptance and packs), its
@@ -6482,3 +6541,29 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     M-d1 are done and stage 5 is deferred (T1–T3), but M-c failed and M-d2 has not run.
     What remains is the MC-3a path (§6g.9; NOTES-C1 §5.9), then M-d2 (NOTES-C1 §4.3,
     §5.10).
+- **Final review of C1/C2** (three independent reviewers, approve-with-fixes, 2026-10-07;
+  NOTES-C1 Status, "Final review"). No library, calibration, ABI or TLA+ change: host API 13.
+  - §3.8: `params.kseg_request` returns None, not 0.0, when no N is certified (rank reads a
+    target of 0 as "no target"; normwise targets near 1e−15 are out of reach at S = 2–4),
+    and step 3 requests t′ > 0 with basis BOUND; the cheap r states which norms must be upper
+    and which lower bounds, skips zero rows, takes min(1, ·) and encloses RN-computed norms;
+    the rigorous ρ_S carries the absolute underflow term `params.kseg_eta(S)` =
+    S·2⁻¹⁰⁷⁴ ≥ (1+γ)·S·2⁻¹⁰⁷⁵, so it no longer assumes every D_s normal (a caller cannot
+    check that); `params.rho_recipe` takes it as `eta` (PROOFS L7c (7)).
+    `cert_kseg_composition` adds `kseg_wbar_up` exactly on a grid of U and S up to 2²⁶, a
+    two-band K-empty witness of γ's size (L7 met to 0.996), ρ_S with the term on outputs
+    whose last band underflows, and the None case; spec/test_oracle.py (13) adds a K-empty
+    first band with β not a power of two.
+  - §6g.10: `PrecisionPlan` refuses a share group whose shared roles read different packs, or
+    that no level can pack (ValueError at construction; it had priced and sized two operands
+    as one pack); the per-call cost of `phase()` and the cheaper pattern (re-run it only when
+    a `min_moduli` result changes). §6g.5: `PackedBuffer` assumes one host thread per buffer.
+    `host_precision` adds the refusals, the equal-`min_moduli` claim, ℓ1 ratios in its U
+    check and the plans a phase names (`host.lowering` with each choice's `options()` and
+    `pack_specs`, a share group's members with one PackSpec); `python_device`'s CPU part
+    creates those Plans and Packs through its fake library.
+  - §6g.6: the first call's extra enqueue time "much of it" overlaps the GPU (it said
+    "most"), and the first-call records' provenance limit is stated. §7: K-equilibration's
+    cost on the real operands is TFLOPS-eq first with time alongside, tagged [M, model-only,
+    outside hold-out]; the K-segmentation row names R2b. `bench/first_call.py` records the
+    host API.

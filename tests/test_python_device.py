@@ -853,6 +853,17 @@ class _FakeC:
     def imd_plan_create_packed(self, h, A, B, C, o, pa, pb, out):
         return self._new(out)
 
+    def imd_plan_create(self, h, A, B, C, o, out):
+        return self._new(out)
+
+    def imd_workspace_size(self, A, B, C, o, out):
+        out._obj.value = 4096
+        return 0
+
+    def imd_contract(self, plan, alpha, A, B, beta, C, ws, wsb, stream):
+        self.calls.append(("contract", None, 0))
+        return 0
+
     def imd_workspace_size_packed(self, A, B, C, o, packing, out):
         out._obj.value = 4096
         return 0
@@ -978,6 +989,99 @@ def test_packed_buffer_guard_cpu():
     assert "N=8" in repr(capped) and "never packed" in repr(imd.PackedBuffer((1, 2)))
     for x in (p14, p8):
         x.close()
+
+
+def test_precision_plans_cpu():
+    """The plans and packs a PrecisionPlan names (DESIGN v1.19 §6g.10: "creating these plans
+    before the loop covers every phase"), through a fake library: every configs() choice and
+    two phases' choices make a Plan from Choice.options() and Packs from pack_specs (in-line,
+    packed and the DIRECT level), and a packed call takes a PackedBuffer that the choice's
+    own Pack wrote; in a share group one buffer, packed by one member's Pack, serves the
+    other member's plan (one key), and a buffer packed at another level is refused."""
+    from immerdink import planner, precision
+    lib = _FakeLib()
+    pl = planner.Planner(lib=lib.host)
+    shapes = {"x": ("ik,kj->ij", dict(i=48, k=300, j=40), ((48, 300), (300, 40), (48, 40))),
+              "y": ("ik,kl->il", dict(i=48, k=300, l=24), ((48, 300), (300, 24), (48, 24))),
+              "z": ("ik,kj->ij", dict(i=40, k=64, j=40), ((40, 64), (64, 40), (40, 40)))}
+    pp = precision.PrecisionPlan(
+        pl, {n: (spec, ext) for n, (spec, ext, _) in shapes.items()},
+        levels=(6, 8, precision.DIRECT), share=[("G", [("x", "A"), ("y", "A")])],
+        packs={"x": {"NONE", "A", "AB"}, "y": {"A", "AB"}})
+    ops = {n: tuple(Cai(0x100000 * (8 * i + t + 1), sh) for t, sh in enumerate(shp))
+           for i, (n, (_, _, shp)) in enumerate(shapes.items())}
+    W, PW = (0x900000, 4096), (0xA00000, 256)
+    calls = lib.lib.calls
+    made = {"inline": 0, "packed": 0, "direct": 0}
+
+    def plan_of(n, ch, packs=None):
+        spec, _, shp = shapes[n]
+        if packs is None:
+            packs = tuple(imd.Pack(ch.pack_specs[r], lib=lib) if r in ch.pack_specs else None
+                          for r in "AB")
+        plan = imd.Plan(spec, *(imd.Layout(x) for x in shp), lib=lib,
+                        packs=None if packs == (None, None) else packs, **ch.options())
+        assert {k: plan.options[k] for k in ch.options()} == ch.options()
+        return plan, packs
+
+    def run(n, ch, plan, packs, bufs=None):
+        A, B, Cc = ops[n]
+        if packs == (None, None):
+            plan.contract(A, B, Cc, workspace=W)
+            made["direct" if ch.mode == "DIRECT" else "inline"] += 1
+            return
+        if bufs is None:
+            bufs = tuple(None if pk is None else imd.PackedBuffer((0xB00000 + 0x100000 * r,
+                                                                    pk.pack_bytes))
+                         for r, pk in enumerate(packs))
+            for pk, X, buf in zip(packs, (A, B), bufs):
+                if pk is not None:
+                    pk.pack(X, buf, workspace=PW)
+        n0 = len(calls)
+        plan.contract(A, B, Cc, workspace=W, packed=bufs)
+        assert len(calls) == n0 + 1 and calls[-1][0] == "contract"
+        made["packed"] += 1
+
+    for n, by in pp.configs().items():
+        for lv, ch in by.items():
+            assert ch is not None, (n, lv)
+            assert (ch.mode == "DIRECT") == (lv == precision.DIRECT)
+            plan, packs = plan_of(n, ch)
+            run(n, ch, plan, packs)
+            plan.close()
+    acc = host.Accuracy("NORMWISE", 1e-4)     # N = 6, then x at 1e-6 raises the group to 8
+    levels = []
+    for targets in ({"x": acc, "y": acc, "z": acc},
+                    {"x": host.Accuracy("NORMWISE", 1e-6), "y": acc, "z": acc}):
+        ph = pp.phase(targets)
+        assert ph.N["x"] == ph.N["y"] != precision.DIRECT and ph.packed["x"] in ("A", "AB")
+        levels.append(ph.N["x"])
+        cx, cy = ph.choices["x"], ph.choices["y"]
+        px, kx = plan_of("x", cx)
+        py, ky = plan_of("y", cy)
+        run("x", cx, px, kx)
+        pz, kz = plan_of("z", ph.choices["z"])         # outside the group, in-line
+        run("z", ph.choices["z"], pz, kz)
+        pz.close()
+        # one buffer for the group: x's Pack writes it, y's plan (made with its own Pack of
+        # the same key) reads it
+        shared = imd.PackedBuffer((0xC00000, kx[0].pack_bytes))
+        kx[0].pack(ops["x"][0], shared, workspace=PW)
+        assert shared.last_pack == ky[0].record
+        bufs = (shared, None if ky[1] is None else imd.PackedBuffer((0xD00000, ky[1].pack_bytes)))
+        if ky[1] is not None:
+            ky[1].pack(ops["y"][1], bufs[1], workspace=PW)
+        run("y", cy, py, ky, bufs)
+        # the shared buffer re-packed at the other level: refused
+        other = 6 if ph.N["x"] == 8 else 8
+        imd.Pack(cx.pack_specs["A"].with_moduli(other), lib=lib).pack(ops["x"][0], shared,
+                                                                      workspace=PW)
+        with pytest.raises(imd.PackMismatchError, match=f"plan expects N={ph.N['y']}"):
+            py.contract(*ops["y"], workspace=W, packed=bufs)
+        for p_ in (px, py):
+            p_.close()
+    assert levels == [6, 8] and made["inline"] and made["packed"] and made["direct"], \
+        (levels, made)
 
 
 # ------------------------------------------------------------------------------------------

@@ -7,8 +7,10 @@ host queries per phase: `imd_err_min_moduli` (the cheapest N for a target), `imd
 (the configurations at the allowed levels), `imd_perf_predict_pack` (one packed role) and the
 footprint queries, through a `planner.Planner`. It computes in Python (levels, the monotone
 floor, share groups, per-role pack costs), so it lives here and not in planner.py, whose
-queries compute nothing (§6e.4). It runs once per phase switch, off the hot path. No GPU, no
-data, no policy: the residual -> target rule is the caller's (bench/accuracy/schedule.py is an
+queries compute nothing (§6e.4). phase() is not free: 0.2-0.8 ms of host time per call on
+schedule.py's two contractions (a new target misses the memo), so call it when a floor may
+have moved, not every iteration (PrecisionPlan.phase; DESIGN §6g.10). No GPU, no data, no
+policy: the residual -> target rule is the caller's (bench/accuracy/schedule.py is an
 example), and immerdink never changes N on its own (ehrenfest D8).
 
     from immerdink import planner, precision
@@ -255,8 +257,12 @@ class PrecisionPlan:
         role that reads the group's one packed operand. Members get one N, ranked jointly over
         every level >= the group floor (IR24); a shared role is always packed (the other roles
         follow `packs`), and its pack cost is divided by the calls of every member reading it.
-        Groups that share a contraction are merged for N. A member at DIRECT in a phase reads
-        no pack and leaves the group for that phase (the others keep one N).
+        The shared roles must read one pack: at every level, their imd_pack_desc_for keys
+        (imd_pack_layout's N, rounding, pack_bytes, key_digest) are equal, and some level can
+        pack them; checked here, ValueError otherwise (the same operand in the same layout
+        and class order; plan creation's PACK_MISMATCH is the backstop for a caller's own
+        Pack). Groups that share a contraction are merged for N. A member at DIRECT in a
+        phase reads no pack and leaves the group for that phase (the others keep one N).
     packs: {name: mode or set of modes} ("NONE", "A", "B", "AB"; default {"NONE"}): the
         allowed pack modes, ranked at every level, so the packing may differ by N (IR8).
     reuse: {name: {"A" | "B": "call" | "iteration" | "phase" | int}} per packed role (default
@@ -331,6 +337,7 @@ class PrecisionPlan:
             ks = {repr(self._c[n].kinds[r]) for n, r in members if r is not None}
             if len(ks) > 1:
                 raise ValueError(f"share group {g!r}: its members' reuse kinds differ ({ks})")
+            self._check_one_pack(g, members)
         self._lock = threading.Lock()
         self._packs = {}       # (name, role, N) -> (PackSpec, planner.Prediction)
         self._floor = {}       # name -> the previous phase's final level (monotone)
@@ -420,6 +427,41 @@ class PrecisionPlan:
                                  "int >= 1")
             out[r] = k if isinstance(k, str) else int(k)
         return out
+
+    def _check_one_pack(self, g, members):
+        """The shared roles of group g read one pack (DESIGN §6g.10): at every emulated level
+        where they have a pack descriptor (imd_pack_desc_for does not depend on g or the vec
+        mode), the keys PackRecord compares (N, rounding, pack_bytes, key_digest of
+        imd_pack_layout) are equal; and at some level the pack is supported. ValueError
+        otherwise: footprints() would size one pack where the members need two, and a caller
+        packing both into one buffer would get a wrong C with SUCCESS."""
+        roles = [(n, r) for n, r in members if r is not None]
+        if not roles:
+            return
+        packable = False
+        for N in self.emulated:
+            recs = {}
+            for n, r in roles:
+                try:
+                    spec = self._c[n].query.pack_desc_for(_OPERAND[r], N, 0, self.vec_modes[0],
+                                                          rounding=self.rounding, mode=self.mode)
+                    lay = host.pack_layout(spec, lib=self.planner.lib)
+                except ImmerdinkError:
+                    continue                      # no plan of n at N: nothing to share there
+                recs[(n, r)] = (lay.num_moduli, lay.rounding, lay.pack_bytes, lay.key_digest)
+                packable = packable or lay.status == "SUCCESS"
+            if len(set(recs.values())) > 1:
+                first = next(iter(recs))
+                other = next(m for m in recs if recs[m] != recs[first])
+                x, y = recs[first], recs[other]
+                raise ValueError(
+                    f"share group {g!r}: {first[0]!r} role {first[1]} and {other[0]!r} role "
+                    f"{other[1]} read different packs at N={N} ({x[2]} vs {y[2]} bytes, key "
+                    f"digest {x[3]:#x} vs {y[3]:#x}): a shared role reads one pack, the same "
+                    "operand in the same layout and class order")
+        if not packable:
+            raise ValueError(f"share group {g!r}: no level in {self.emulated} can pack its "
+                             f"shared role ({', '.join(f'{n} {r}' for n, r in roles)})")
 
     def _flops(self, name, q):
         """2 b m n k of the GEMM view, as the C library's flops_eq (the lowering's sizes). b,
@@ -603,7 +645,15 @@ class PrecisionPlan:
           7. with `iterations` (the phase length) and `fail_budget` P, every TYPICAL target
              gets fail_prob P / (iterations x the calls per iteration of every contraction).
         targets: {name: host.Accuracy with a target > 0} for every contraction. Raises
-        ImmerdinkError for a lowering error, ValueError for bad arguments."""
+        ImmerdinkError for a lowering error, ValueError for bad arguments.
+        Cost: 0.2-0.8 ms of host time per call on bench/accuracy/schedule.py's two
+        contractions (a new target each call misses the planner memo), so call it at a phase
+        switch, not every iteration. A switch is due only when a floor moves: the
+        configurations stay the same while every contraction's step-1 query,
+        planner.Query.min_moduli(target, n_lo=levels[0], n_hi=the top emulated level) (with
+        "DIRECT" listed, also its mode-DIRECT check at the top level), returns the same status
+        and num_moduli, for the same `iterations` and `fail_budget` (TYPICAL targets carrying
+        step 7's p); only the err fields follow the targets (DESIGN §6g.10 "Cost")."""
         if set(targets) != set(self._c):
             raise ValueError(f"targets must name every contraction: {sorted(self._c)}")
         if iterations is not None and (not isinstance(iterations, numbers.Integral) or

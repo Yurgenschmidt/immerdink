@@ -8,7 +8,8 @@
 
 --sweep runs one FRESH process per (shape, N, mode) and prints a table (TFLOPS-eq first, time
 alongside); a single run prints one JSON line. Each line records its provenance: the
-library's path and sha256, libimmerdink_host's sha256, the git commit and whether tracked
+library's path and sha256, libimmerdink_host's sha256 and host API version
+(imd_host_api_version of the library actually loaded), the git commit and whether tracked
 files differ from it. In each process:
   1. warm-up at a base N (14, or 8 when N = 14): the CUDA context and every kernel a call at
      the base N launches are loaded, so what follows is a switch to an N never launched in
@@ -265,8 +266,9 @@ def table(rows):
 
 
 def provenance(lib_path):
-    """What produced a record: the library (path, sha256), libimmerdink_host next to it, and
-    the source commit (git HEAD; "dirty" if tracked files differ from it)."""
+    """What produced a record: the library (path, sha256), libimmerdink_host next to it (its
+    sha256 and host API, imd_host_api_version), and the source commit (git HEAD; "dirty" if
+    tracked files differ from it)."""
     def sha(p):
         with open(p, "rb") as f:
             return hashlib.sha256(f.read()).hexdigest()
@@ -277,9 +279,14 @@ def provenance(lib_path):
     lib = os.path.realpath(lib_path)
     host_lib = os.path.join(os.path.dirname(lib), "libimmerdink_host.so")
     status = git("status", "--porcelain", "--untracked-files=no")
+    host_api = None
+    if os.path.exists(host_lib):
+        f = C.CDLL(host_lib).imd_host_api_version
+        f.restype, f.argtypes = C.c_uint32, []
+        host_api = int(f())
     return {"lib": lib, "lib_sha256": sha(lib),
             "host_lib_sha256": sha(host_lib) if os.path.exists(host_lib) else None,
-            "commit": git("rev-parse", "HEAD"),
+            "host_api": host_api, "commit": git("rev-parse", "HEAD"),
             "dirty": None if status is None else bool(status)}
 
 

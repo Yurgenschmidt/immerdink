@@ -434,7 +434,10 @@ class PackedBuffer:
     order, not GPU order. Under CUDA graph replay, or across streams ordered by events, the
     record can differ from what the GPU sees (a graph that captured a contract on the buffer
     must not be replayed after a re-pack with another key; DESIGN §6b.7). It guards the plain
-    stream-ordered pattern only. Pack.pack_ptr and other writes bypass the record."""
+    stream-ordered pattern only. Pack.pack_ptr and other writes bypass the record. One host
+    thread per buffer: the lock covers the record, not the contract's enqueue, so a Pack.pack
+    into the buffer from another thread between the check and the enqueue is not seen;
+    callers that pack and contract on one buffer from several threads serialize them."""
 
     __slots__ = ("buf", "nbytes", "_last", "_lock")
 
@@ -466,7 +469,8 @@ class PackedBuffer:
         return p, n
 
     def _expect(self, rec, what):
-        """PackMismatchError unless the recorded pack is `rec` (lock-and-compare)."""
+        """PackMismatchError unless the recorded pack is `rec` (lock-and-compare: the lock
+        guards the read of the record only; the caller's enqueue follows it unlocked)."""
         with self._lock:
             got = self._last
         if got == rec:

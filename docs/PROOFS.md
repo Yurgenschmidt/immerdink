@@ -278,7 +278,11 @@ L7a with `d_s = D_s` gives `|C_S − Σ D_s| ≤ γ Σ|D_s|`. The triangle inequ
    S ≤ 2²⁶) and `E_s ≤ U_s`. If `|C_S| > W̄·N_S` then
    `|x| ≥ |C_S| − |C_S − x| ≥ |C_S| − W̄·N_S > 0`, so `N_S/|x| ≤ N_S/(|C_S| − W̄·N_S)`, which
    increases with N_S and W̄: upper bounds of both, rounded outward as in DESIGN §6g.11, give
-   a valid ρ_S. ∎
+   a valid ρ_S. Without the normal-range hypothesis on the D_s (which a caller cannot check:
+   D_s for s ≥ 2 is never materialized), (3) gives `|C_S − x| ≤ W̄·N_S + (1 + γ)·S·η`, and
+   the same argument holds with the denominator `|C_S| − W̄·N_S − (1 + γ)·S·η`. Since γ ≤ 1
+   for S ≤ 2²⁶, `(1 + γ)·S·η ≤ S·2⁻¹⁰⁷⁴`, a double (`params.kseg_eta`), which DESIGN §3.8's
+   evaluation adds to U·n rounding upward. ∎
 
 **Claim L7d (the recipe's request).** Let `t_eff > 0` be RN of a positive rational t̄, let
 `S ≤ 2²⁶`, and let `t′ = RN(RN(min(t_eff, 1)·(1 − 2⁻⁵⁰)) − 4S·2⁻⁵³)` (`params.kseg_request`).
@@ -307,8 +311,10 @@ is the recipe's bit-exact reference.
 `sorry`, `admit` or new axioms. The capstone `emulated_product_exact` chains L1c + L4 + L2c.
 **[v1.19]** L3c (the ν form, its NORMWISE / ELEMENTWISE / ABSOLUTE compositions with the
 final rounding, and the native chain's γ_k) and L7 (the recursive-summation lemma L7a,
-`kseg_compose`, `kseg_rows` from the band rows, the metric forms and the exact half of L7d)
-were added for NOTES-C1 stage 3 (IR5). Run `tools/check_proofs.sh`. The lemma-to-theorem map
+`kseg_compose`, `kseg_rows` from the band rows; of the metric forms L7c, N_S ≤ ‖a‖‖b‖, the
+NORMWISE form, the underflow term of (3), E's monotonicity (4) and the exact statements of
+(7); and the exact half of L7d) were added for NOTES-C1 stage 3 (IR5). L7c (2)'s ELEMENTWISE
+and ABSOLUTE forms are one-line corollaries of `kseg_compose` and are not restated. Run `tools/check_proofs.sh`. The lemma-to-theorem map
 and modelling choices are in `proofs/NOTES.md`. Still taken as hypotheses:
 - the IEEE rounding properties (of the final conversion, `|fl(y) − y| ≤ u|fl(y)|` or
   `≤ u|y|`, and of an addition, `|fl(a + b) − (a + b)| ≤ u|a + b|`);

@@ -175,10 +175,10 @@ first.
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
 - **D3 gate (Eric, 2026-10-04):** D3 begins with a design/theory discussion with Eric to narrow
   the questions. Do not start D3 agents or specs before that.
-- **Roadmap done:** A1, A2, A3, A4, A5 (2026-10-04, docs/NOTES-A5.md), D1, D4 part 1; C2
-  (2026-10-07, on the C1/C2 branch above, not merged). Next by Eric's priority: D3 (packed
+- **Roadmap done:** A1, A2, A3, A4, A5 (2026-10-04, docs/NOTES-A5.md), D1, D4 part 1, B1, B2;
+  C2 (2026-10-07, on the C1/C2 branch above, not merged). Next by Eric's priority: D3 (packed
   symmetric contractions; design preference: one generic kernel, else split; TLA+ first),
-  then B2 (performance model that ehrenfest can call), B1, then C1 after Ozaki-II is polished.
+  and C1's remaining GPU work (MC-3a, then M-d2; the C1/C2 bullet above).
   SE items are parked. For tiny-call timings use `imd_bench --methods duel` (two immerdink
   configurations interleaved; docs/BENCHMARKING.md, NOTES-A5 §1.2). The bench is
   immerdink-only; comparisons with other libraries live in the evaluation workspace.
@@ -198,6 +198,16 @@ first.
    `bench/sweep_d1.txt`) once the 4090 has no desktop on it, ideally with persistence mode on
    (`sudo nvidia-smi -pm 1`). Records now carry `attempts` and `contaminated`.
 4. **Decided 2026-10-04: not now** (revisit for a paper or sub-percent tiny-shape numbers) — GPU clock locking for paper-grade small-shape numbers (`sudo nvidia-smi -lgc`): optional.
+5. **C1/C2 (2026-10-07; docs/NOTES-C1.md "To report to Eric")**, none blocking:
+   - Q6 and Q7 (ROADMAP C1's decision column, C2's new title) were approved on Eric's behalf
+     by the independent reviewer (IR18); Eric may overrule.
+   - MC-3 can close without a calibration change only as MC-3a's recorded outcome or by
+     Eric's explicit decision (NOTES-C1 §5.10 MD2-0); otherwise M-d2 waits for MC-3a.
+   - Stage 5 (device statistics, the a-posteriori certificate) is deferred with triggers
+     T1–T3; T3 is Eric asking for the device certificate (NOTES-C1 §4.6).
+   - IR26's premise was wrong: GPU counters are open to all users here. Stage 5's cost bar
+     keeps its content; `ncu` is a diagnostic only, with `--clock-control none` (NOTES-C1
+     §4.6, "Correction").
 
 ## Machine notes
 

@@ -13,7 +13,10 @@ a brute force from host.py's queries and against spec/params.py. CPU only.
     the DIRECT sentinel, TYPICAL p = P / C); the chosen configuration, its status and its
     composed time bit for bit, on random plans (levels, masks, reuse, budgets, vec modes,
     groups, 3-phase target sequences); each choice == the configs() lookup; the C rank's
-    pack_s == the per-role predict_pack sum (the re-keying is exact); the composed band;
+    pack_s == the per-role predict_pack sum (the re-keying is exact); the composed band; a
+    share group whose roles read different packs (pack keys from host.pack_desc_for /
+    pack_layout) is refused (ValueError) and then run with its members by name only, while
+    one operand read by two contractions (kf's A is kf2's) shares one pack;
   - scenarios: per-role reuse ('call', 'iteration', 'phase' with and without iterations ->
     assumed_reuse, int), a shared role divided by the members' summed calls; a level above
     the floor chosen where the model predicts it faster (a shape found at run time), alone and
@@ -22,12 +25,18 @@ a brute force from host.py's queries and against spec/params.py. CPU only.
     DIRECT leaves the group for the phase (both member forms; the others keep one N; it links
     no groups); BUDGET (the floor and the least total_bytes) and MISSED's precedence, BUDGET
     never on a missed target; TYPICAL p = P / (iterations x calls); RN kappa >= T levels;
-    argument errors;
+    argument errors; share groups refused at construction when their roles read different
+    packs or no level can pack them; the configuration unchanged while every min_moduli
+    result is (DESIGN §6g.10 "Cost");
+  - the plans a phase needs: every configs() and phase() choice lowers (host.lowering with
+    its options() and pack_specs) with no PACK_MISMATCH and its workspace_bytes, and a share
+    group's members lower with one member's PackSpec of the shared role;
   - footprints() == the maximum of the C queries over the allowed pack modes x vec modes x
     every g, per level, and their totals;
   - rho_from_output == spec/params.py rho_recipe bit for bit (random and boundary values,
     every alpha = 2^e class), U == imd_err_estimate's NORMWISE bound for the call's dispatch
-    and >= params' exact bound (the upper end of its enclosure) at N = 2..20, both dispatches;
+    and >= params' exact bound (the upper end of its enclosure) at N = 2..20, both dispatches,
+    with l1 ratios 0 and with ratios from 1 to sqrt k and 1e9 (both roundings);
     on a 2-D C a 1-D row bound is axis -2 and a 1-D column bound axis -1 (m == n, mixed with
     2-D bounds: == the explicit (m, 1) x (1, n) result), a row bound of ndim 2 has
     shape[-1] == 1 and a column bound shape[-2] == 1; on a batched C (ndim 3 and 4) a bound
@@ -72,7 +81,8 @@ ROLES = {"NONE": (), "A": ("A",), "B": ("B",), "AB": ("A", "B")}
 OP = {"A": 0, "B": 1}
 VEC = {"GENERATE": 0, "RESIDENT": 1}
 LIB = None
-STATS = {"phases": 0, "choices": 0, "candidates": 0, "configs": 0, "footprints": 0, "rho": 0}
+STATS = {"phases": 0, "choices": 0, "candidates": 0, "configs": 0, "footprints": 0, "rho": 0,
+         "plans": 0, "plans_shared": 0}
 STATUSES = {}   # how often each status / feature occurred in the random suite
 
 
@@ -106,6 +116,7 @@ def case(spec, calls=1, beta=False, **ext):
 
 CASES = {
     "kf": case("ik,kj->ij", i=64, k=300, j=48),
+    "kf2": case("ik,kl->il", i=64, k=300, l=20, calls=2),   # reads kf's A: one pack key
     "kl": case("lik,lkj->lij", l=3, i=33, k=1100, j=17, calls=2, beta=True),
     "ring": case("kjbc,kiac->abij", a=12, b=12, c=12, i=6, j=6, k=6, calls=3),
     "big": case("ik,kj->ij", i=4096, k=4096, j=4096),
@@ -334,6 +345,10 @@ def random_target(rng):
 
 def random_cfg(rng):
     names = rng.sample(sorted(CASES), rng.randint(1, 3))
+    group = len(names) >= 2 and rng.random() < 0.5
+    twin = group and rng.random() < 0.5
+    if twin:        # one operand read by two contractions: kf's A is kf2's A (one pack key)
+        names = ["kf", "kf2"] + [n for n in names if n not in ("kf", "kf2")][:len(names) - 2]
     levels = sorted(rng.sample(range(3, 18), rng.randint(2, 5)))
     if rng.random() < 0.25:
         levels.append(DIRECT)
@@ -350,10 +365,13 @@ def random_cfg(rng):
             tot = [c["total"] for c in level_cands(CASES[n], mid, cfg, MODES)]
             if tot:
                 cfg["budget"][n] = int(rng.uniform(min(tot) * 0.9, max(tot) * 1.1))
-    if len(names) >= 2 and rng.random() < 0.5:
-        members = [(n, rng.choice((None, "A", "B"))) for n in rng.sample(names, 2)]
-        if all(r is None for _, r in members):
-            members[0] = (members[0][0], "A")
+    if group:
+        if twin:
+            members = [("kf", "A"), ("kf2", rng.choice(("A", None)))]
+        else:       # random roles: these read different packs, so the plan refuses them
+            members = [(n, rng.choice((None, "A", "B"))) for n in rng.sample(names, 2)]
+            if all(r is None for _, r in members):
+                members[0] = (members[0][0], "A")
         cfg["share"]["grp"] = tuple(members)
         kind = rng.choice(("call", "iteration", "phase", 7))
         for n, r in members:
@@ -361,6 +379,48 @@ def random_cfg(rng):
                 cfg["shared"].setdefault(n, {})[r] = "grp"
                 cfg["reuse"].setdefault(n, {})[r] = kind
     return cfg
+
+
+def share_mismatch(cfg):
+    """Why cfg's share groups cannot read one pack, from host.pack_desc_for / pack_layout
+    (None if they can): at some emulated level two members with a plan there have different
+    (N, rounding, pack_bytes, key_digest), or no level packs the shared role."""
+    emu = [x for x in cfg["levels"] if x != DIRECT]
+    for g, ms in cfg["share"].items():
+        roles = [(n, r) for n, r in ms if r is not None]
+        if not roles:
+            continue
+        packable = False
+        for N in emu:
+            recs = set()
+            for n, r in roles:
+                try:
+                    lay = host.pack_layout(host.pack_desc_for(
+                        CASES[n].spec, CASES[n].extents, operand=OP[r], N=N, lib=LIB), lib=LIB)
+                except host.ImmerdinkError:
+                    continue
+                recs.add((lay.num_moduli, lay.rounding, lay.pack_bytes, lay.key_digest))
+                packable = packable or lay.status == "SUCCESS"
+            if len(recs) > 1:
+                return f"group {g}: {roles} read different packs at N={N}"
+        if not packable:
+            return f"group {g}: no level packs {roles}"
+    return None
+
+
+def settle_share(pl, cfg):
+    """cfg itself if its share groups read one pack each; else check that the plan refuses
+    them (ValueError at construction) and return cfg with every member by name only (equal N,
+    no shared pack)."""
+    why = share_mismatch(cfg)
+    if why is None:
+        if any(r is not None for ms in cfg["share"].values() for _, r in ms):
+            STATUSES["shared role"] = STATUSES.get("shared role", 0) + 1
+        return cfg
+    raises(ValueError, lambda: make_plan(pl, cfg), f"share groups {cfg['share']} ({why})")
+    STATUSES["share refused"] = STATUSES.get("share refused", 0) + 1
+    return dict(cfg, share={g: tuple((n, None) for n, _ in ms)
+                            for g, ms in cfg["share"].items()}, shared={})
 
 
 def make_plan(pl, cfg):
@@ -399,7 +459,7 @@ def check_choice(ch, want, reuse_r, what):
 def suite_random(pl, rng, count, verbose):
     t0 = time.time()
     for i in range(count):
-        cfg = random_cfg(rng)
+        cfg = settle_share(pl, random_cfg(rng))
         pp = make_plan(pl, cfg)
         prev = {}
         for ph_i in range(3):
@@ -460,7 +520,8 @@ def suite_random(pl, rng, count, verbose):
               f"choices == the brute force ({STATS['candidates']} host.py configurations), "
               f"== configs() ({time.time() - t0:.1f}s); {dict(sorted(STATUSES.items()))}",
               flush=True)
-    for st in ("MET", "MISSED", "BUDGET", "DIRECT", "packed", "shared"):
+    for st in ("MET", "MISSED", "BUDGET", "DIRECT", "packed", "shared", "shared role",
+               "share refused"):
         need(count < 20 or STATUSES.get(st, 0) > 0, f"random suite never produced {st}")
 
 
@@ -660,6 +721,45 @@ def suite_scenarios(pl, verbose):
     need(pp.configs()["m"][2] is None and pp.configs()["m"][3] is not None, "kappa >= T configs")
     need(pp.phase({"m": acc(0.5)}).N["m"] == 3, "kappa >= T level skipped")
     need(pp.footprints().workspace["m"][2] is None, "kappa >= T footprint")
+    # share groups whose roles cannot read one pack are refused at construction (final review
+    # of C1/C2): two operands of different shapes, priced and sized as one pack before
+    raises(ValueError, lambda: precision.PrecisionPlan(
+        pl, {"x": ("ik,kj->ij", dict(i=2048, k=512, j=64)),
+             "y": ("ik,kj->ij", dict(i=64, k=512, j=4096))}, levels=(8, 14),
+        share=[("G", [("x", "A"), ("y", "B")])]), "share group of different operands")
+    ext = dict(i=8, k=40000, j=8)       # RN kappa >= T at N = 2: no level packs it
+    raises(ValueError, lambda: precision.PrecisionPlan(
+        pl, {"x": ("ik,kj->ij", ext)}, levels=(2,), share=[("G", [("x", "A")])]),
+        "share group no level can pack")
+    precision.PrecisionPlan(pl, {"x": ("ik,kj->ij", ext)}, levels=(2, 3),
+                            share=[("G", [("x", "A")])])
+    pp = precision.PrecisionPlan(pl, {"x": ("ik,kj->ij", kf.extents),
+                                      "y": (CASES["kf2"].spec, CASES["kf2"].extents)},
+                                 levels=(6, 8), share=[("G", [("x", "A"), ("y", "A")])])
+    ph = pp.phase({"x": acc(1e-6), "y": acc(1e-6)})
+    need(ph.choices["x"].pack_specs["A"] == ph.choices["y"].pack_specs["A"],
+         "one operand read by two contractions: one PackSpec")
+    # the configuration depends on the targets only through the step-1 min_moduli results
+    # (DESIGN §6g.10 "Cost"): equal results, equal configurations, other err fields
+    two = {"x": ("ik,kj->ij", big.extents, 2), "y": ("acQ,bdQ->acbd", CASES["df"].extents)}
+    for monotone in (True, False):
+        pp = precision.PrecisionPlan(pl, two, levels=(6, 8, 10, 12, 14), monotone=monotone,
+                                     packs={"y": {"NONE", "B"}})
+        seen = 0
+        for t in (1e-5, 1e-7, 1e-9, 1e-11):
+            ta, tb = {n: acc(t) for n in two}, {n: acc(t * 0.97) for n in two}
+            mm = [{n: pl.query(*two[n][:2]).min_moduli(a[n], n_lo=6, n_hi=14) for n in two}
+                  for a in (ta, tb)]
+            p1, p2 = pp.phase(ta), pp.phase(tb)
+            if all((mm[0][n].status, mm[0][n].num_moduli) ==
+                   (mm[1][n].status, mm[1][n].num_moduli) for n in two):
+                seen += 1
+                for n in two:
+                    c1, c2 = p1.choices[n], p2.choices[n]
+                    need((c1.level, c1.residue_group, c1.vec_mode, c1.packed, c1.time_s) ==
+                         (c2.level, c2.residue_group, c2.vec_mode, c2.packed, c2.time_s),
+                         f"equal min_moduli at {t}, monotone {monotone}: {n} {c1} != {c2}")
+        need(seen >= 2, f"min_moduli scenario vacuous ({seen})")
     # argument errors
     one = {"m": ("ik,kj->ij", kf.extents)}
     for kw in (dict(levels=(8, 6)), dict(levels=(1, 8)), dict(levels=(8, DIRECT, 10)),
@@ -685,7 +785,52 @@ def suite_scenarios(pl, verbose):
         print(f"  ok  scenarios: per-role reuse and its band, shared role, a faster higher "
               f"level (N = {N_up} -> {N_up + 1}, alone and in a share group), monotone / reset / "
               f"relaxed, DIRECT sentinel, a DIRECT member leaves its share group, BUDGET and "
-              f"MISSED, TYPICAL p = P/C, kappa >= T, argument errors", flush=True)
+              f"MISSED, TYPICAL p = P/C, kappa >= T, share groups refused (different packs, no "
+              f"packable level), equal min_moduli -> equal configuration, argument errors",
+              flush=True)
+
+
+# ------------------------------------------------------------------------------------------
+# The plans a phase needs (DESIGN §6g.10: "creating these plans before the loop covers every
+# phase"): host.lowering of each choice's options() and pack_specs, as Plan creation lowers it
+
+def lowers(cs, ch, specs, what):
+    packing = (specs.get("A"), specs.get("B"))
+    packing = None if packing == (None, None) else packing
+    lw = host.lowering(cs.spec, cs.extents, packing=packing, lib=LIB, **ch.options())
+    need(lw.status == "SUCCESS" and lw.pack_mismatch == "NONE" and lw.lowered,
+         f"{what}: {lw.status} {lw.pack_mismatch}")
+    ws = host.workspace_size(cs.spec, cs.extents, packing=packing, lib=LIB, **ch.options())
+    need(ws == ch.workspace_bytes, f"{what}: workspace {ws} != {ch.workspace_bytes}")
+    STATS["plans"] += 1
+
+
+def suite_plans(pl, rng, count, verbose):
+    for i in range(count):
+        cfg = settle_share(pl, random_cfg(rng))
+        pp = make_plan(pl, cfg)
+        chs = [(n, lv, ch) for n, by in pp.configs().items() for lv, ch in by.items()
+               if ch is not None]
+        for _ in range(2):
+            ph = pp.phase({n: random_target(rng) for n in cfg["names"]})
+            chs += [(n, ph.N[n], ph.choices[n]) for n in cfg["names"]]
+            for g, ms in cfg["share"].items():   # a member lowers with another's PackSpec
+                rs = [(n, r) for n, r in ms if r is not None and ph.N[n] != DIRECT]
+                for (n, r), (n2, r2) in zip(rs, rs[1:]):
+                    specs = dict(ph.choices[n2].pack_specs)
+                    specs[r2] = ph.choices[n].pack_specs[r]
+                    lowers(CASES[n2], ph.choices[n2], specs, f"plans {i}: {n2} with {n}'s pack")
+                    STATS["plans_shared"] += 1
+        for n, lv, ch in chs:
+            lowers(CASES[n], ch, ch.pack_specs, f"plans {i}: {n} level {lv} {ch.packed}")
+            if lv == DIRECT:
+                need(ch.mode == "DIRECT" and ch.packed == "NONE", f"plans {i}: DIRECT choice")
+    need(STATS["plans_shared"] > 0, "plans: no share group member lowered with another's pack")
+    if verbose:
+        print(f"  ok  plans: {STATS['plans']} configs()/phase() choices lower with their "
+              f"options() and pack_specs (no PACK_MISMATCH, == workspace_bytes), "
+              f"{STATS['plans_shared']} share-group members with another member's PackSpec",
+              flush=True)
 
 
 # ------------------------------------------------------------------------------------------
@@ -693,7 +838,7 @@ def suite_scenarios(pl, verbose):
 
 def suite_footprints(pl, rng, count, verbose):
     for i in range(count):
-        cfg = random_cfg(rng)
+        cfg = settle_share(pl, random_cfg(rng))
         pp = make_plan(pl, cfg)
         fp = pp.footprints()
         emu = [x for x in cfg["levels"] if x != DIRECT]
@@ -1005,6 +1150,19 @@ def suite_rho(rng, verbose):
                     need(U == math.inf if ref is None else Fraction(U) >= ref[1],
                          f"U below the exact bound (N={N} k={k} {rnd} {dispatch})")
                     nU += 1
+    # and with l1 ratios (rho_from_output's l1_ratio): 1, between 1 and sqrt k, sqrt k, 1e9
+    for N in range(2, 21):
+        for k in (2, 7, 300, 5000, 40000, 2**20):
+            for rnd in ("RN", "TRUNC"):
+                for _ in range(3):
+                    la = rng.choice((1.0, 1 + rng.random() * (math.sqrt(k) - 1), math.sqrt(k),
+                                     1e9))
+                    lb = rng.choice((1.0, 1 + rng.random() * (math.sqrt(k) - 1), math.sqrt(k)))
+                    U = U_of(N, k, rnd, "EMULATE", la, lb)
+                    ref = P.error_estimate(N, k, rnd, l1_ratio_a=la, l1_ratio_b=lb)["bound"]
+                    need(U == math.inf if ref is None else Fraction(U) >= ref[1],
+                         f"U below the exact bound (N={N} k={k} {rnd} l1 {la}, {lb})")
+                    nU += 1
     # argument errors
     C = np.ones((2, 2))
     kw = dict(N=8, rounding="RN", k=10, lib=LIB)
@@ -1068,13 +1226,14 @@ def main():
         suite_scenarios(pl, a.verbose)
         suite_random(pl, rng, a.configs, a.verbose)
         suite_footprints(pl, rng, max(a.configs // 2, 10), a.verbose)
+        suite_plans(pl, rng, max(a.configs // 5, 10), a.verbose)
         suite_rho(rng, a.verbose)
     except Fail as e:
         print(f"FAIL  {e}")
         return 1
     print(f"PASS  {STATS['phases']} phases ({STATS['choices']} choices) == the brute force and "
-          f"configs(), {STATS['footprints']} footprints, {STATS['rho']} rho outputs == params, "
-          f"in {time.time() - t0:.1f}s")
+          f"configs(), {STATS['footprints']} footprints, {STATS['plans']} choices lowered, "
+          f"{STATS['rho']} rho outputs == params, in {time.time() - t0:.1f}s")
     return 0
 
 

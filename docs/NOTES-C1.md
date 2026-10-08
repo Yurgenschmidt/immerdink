@@ -17,7 +17,10 @@ the `libimmerdink.so` builds named per item.
   - Stage 3 has shipped, with L3c and L7 in Lean: DESIGN §3.8 "Segmented accumulation", PROOFS
     L7, `proofs/Proofs/{Error,Summation,Segments}.lean` (71 headline theorems in
     `proofs/AxiomCheck.lean`, standard axioms only, `tools/check_proofs.sh` passing after the
-    review fixes at 4176732).
+    review fixes at 4176732). Stored log: immerdink-eval
+    `results/c1/final_review/check_proofs.log`, re-run at the final review on 57d7f97 (the
+    Lean sources unchanged since 4176732; Lean 4.34.1, Mathlib `d13f23b`): 8932 jobs, 71
+    theorems, only propext / Classical.choice / Quot.sound.
   - The stage-4 gate is decided by its pre-registered rule: **failed, stage 4 closed**, with the
     revival trigger "a real-operand family meeting (i)" (§4.5, DESIGN §7, ROADMAP C2).
   - The stage-6 gate is decided: **deferred**, with its trigger (§4.7, DESIGN §7, ROADMAP C2).
@@ -30,7 +33,11 @@ the `libimmerdink.so` builds named per item.
     (IR10), one of §4.11's round-2 stage-0 GPU items, was not repeated there: it was measured
     at stage 0 (1e6e709, `libimmerdink.so` `b8baa75d…`; `findings/c1-stage0-first-call.md`)
     and still stands, because no file under `src/` has changed since 1e6e709 (`include/` in
-    comments only).
+    comments only). Its provenance is weaker than the rest of the branch (final review): the
+    16 records carry only a date (no commit, library sha256 or host API), were written by
+    `bench/first_call.py` before its first commit (8b58101) and were never re-run on
+    committed code; the build is the summary's account, not a record field (DESIGN §6g.6).
+    A re-run on the current build is in "What remains" below.
   - **Not met: M-c has not passed.** It ran on 2026-10-07 and failed one §6c.5 target: the
     < 100 µs median error is 15.8 % against 15 % (16.1 % in a repeat). The Q24 refit was not
     adopted (§5.9 MC-1). The only authorized path to a pass, the MC-3 feature(s) as amended
@@ -76,6 +83,54 @@ the `libimmerdink.so` builds named per item.
   `tools/test.sh`'s `cpu_only` list read verbatim, 18 of 18 pass (172.2 s); `schedule.py` runs
   (default and `--relaxed`); library sha256s unchanged. Logs: immerdink-eval
   `results/c1/closeout/review2/` (untracked).
+- *Final review* (three independent reviewers, approve-with-fixes, 2026-10-07, of 57d7f97:
+  the numerics, the host and Python code, and the documents and provenance). Applied:
+  - *Must-fix:* `params.kseg_request` returns None when no N is certified, never 0.0, which
+    rank reads as "no target" (§5.7 S3-1, DESIGN §3.8 steps 2–3: t′ > 0, basis BOUND);
+    DESIGN §6g.6's first-call overlap reads "much of it" (46–68 % at 1024³); K-equilibration's
+    cost on the real operands is TFLOPS-eq first with time alongside and the outside-hold-out
+    tag ("2–47 % lower TFLOPS-eq ... (+2 % to +89 % time)", Status above, §4.5, DESIGN §7,
+    ROADMAP C2).
+  - *Numerics:* DESIGN §3.8's cheap r (upper band norms, LOWER whole-row norms, zero rows
+    skipped, min(1, ·), RN norms enclosed); the rigorous ρ_S carries the absolute underflow
+    term `params.kseg_eta(S)` (`rho_recipe`'s new `eta`), so it no longer assumes every D_s
+    normal, which no caller can check (PROOFS L7c (7)); `cert_kseg_composition` checks
+    `kseg_wbar_up` exactly up to S = 2²⁶ (an S − 1 mutant fails), γ's size with a two-band
+    K-empty witness (L7 met to 0.996; a halved-γ mutant fails), ρ_S on outputs whose last
+    band underflows, and the None case; spec/test_oracle.py (13) adds a K-empty first band
+    with β = 0.3, 3.0, −0.7 (a two-rounding β step fails it); `host_precision` checks U with
+    ℓ1 ratios; PROOFS and proofs/NOTES.md name exactly which L7c forms Lean states, and why a
+    zero band row enters only through `kseg_compose`.
+  - *Host and Python:* `PrecisionPlan` refuses, at construction, a share group whose shared
+    roles read different packs or that no level can pack (DESIGN §6g.10; it had accepted
+    two operands of different shapes and sized one pack for them); `phase()`'s per-call
+    cost (0.2–0.8 ms on `schedule.py`'s contractions) and the cheaper pattern (re-run it
+    only when a step-1 `min_moduli` result changes, a claim `host_precision` checks) are in
+    DESIGN §6g.10 and the docstrings; `PackedBuffer` assumes one host thread per buffer
+    (DESIGN §6g.5); `host_precision` lowers every `configs()` and `phase()` choice with its
+    `options()` and `pack_specs` (no PACK_MISMATCH, its workspace) and a share group's
+    members with one PackSpec, and `python_device`'s CPU part makes those Plans and Packs
+    through its fake library; `bench/first_call.py` records the host API.
+  - *Records and documents:* the first-call records' provenance limit is stated (above,
+    DESIGN §6g.6); MC-3a's runs record library sha256s, host API and the dirty flag at run
+    time (§5.9 MC-3a item 6); `run`'s bit-exact check is to fill C before each call at the
+    next re-registration, required before any M-d2 run (§4.3; not applied now, since that
+    re-registers the driver); the synthetic judge-check records are moved out of
+    `results/c1/m_d2/` (§4.3 "M-d2" records); the M-b tally names its 9 information-only
+    figures; DESIGN's change log no longer says every record the gates rest on is
+    reproduced; DESIGN §7's K-segmentation row names R2b; HANDOFF lists the items for Eric;
+    PLAN and SCOPE carry the outcomes; the Lean check has a stored log (above).
+  - *Verdicts on the review questions:* L7 (L7a–L7d, the request transform, ρ_S) is sound;
+    the Lean proofs build with standard axioms only and state what PROOFS claims;
+    `rho_from_output` and `rho_recipe` are sound with strong tests; `oracle.contract_segments`
+    is a faithful reference and `oracle.kweights` correct; `cert_footprint_monotone`
+    supports F1/F2 and I1–I3; the ABI and version claims are consistent (host API 13, no
+    bump); planner.py computes nothing; the GPU-lock usage is correct; C2's definition of
+    done is met and C1's open state is reported consistently; no external-library
+    comparison is in the product repo; no claimed re-run was missing.
+  *Re-checked* after FREE busy checks, CPU only, one thread, under memcap, on 57d7f97 plus
+  these edits: listed in immerdink-eval `findings/c1-final-review.md` (logs in
+  `results/c1/final_review/`, untracked).
 
 **What shipped.** No ABI, calibration-format or TLA+ change: host API 13. `src/` has not changed
 since the design draft (39972b7), `include/` only in comments.
@@ -102,8 +157,11 @@ since the design draft (39972b7), `include/` only in comments.
 **What was closed or deferred, and why.**
 - *Stage 4 (caller-side K-equilibration), closed by its gate.* No real R1–R6 contraction of the
   ≥ 2048³ class (psi4 DF and MP2 operands of benzene and water on ccsd.py's contraction list)
-  passes the guard: G ≤ 0 on all of them, and with the caller's costs K-equilibration is
-  2–47 % slower than fast mode there [M]. (ii) is not met as pre-registered either: 2–19
+  passes the guard: G ≤ 0 on all of them, and with the caller's costs K-equilibration reaches
+  2–47 % lower TFLOPS-eq than fast mode there at the normwise targets (+2 % to +89 % time;
+  N = 9–12) [M, model-only, outside hold-out] and 1–36 % lower at the ew8 targets (+1 % to
+  +57 % time; N = 13–16) [M, model-only, outside hold-out at N = 13 and 15]. (ii) is not met
+  as pre-registered either: 2–19
   sampled outputs per guard-accepted Tier-L fixture above 2× fast's error, max ratio 247.
   Source: `bench/accuracy/c2_summary.py` over records reproduced bit for bit at 5925219
   (`results/c1/repro_5925219/`), M-a's [M] blocks reproduced by M-b on `466acdb4…`; the
@@ -133,8 +191,11 @@ since the design draft (39972b7), `include/` only in comments.
 
 **What remains for C1** (round 2, GPU): the MC-3a path (§5.9: the DESIGN §6c text from a
 per-phase account first, at most two optional keys, a fresh narrow-KL hold-out committed
-before the refit, the pass checks, a fresh M-c run), then M-d2 (§4.3; eight `run` processes
-into one records file and one `judge`). Until M-c passes, figures at N ∉ {8, 10, 14, 16} keep
+before the refit, the pass checks, a fresh M-c run, each chunk with its run-time provenance),
+then M-d2 (§4.3; the driver re-registered with the NaN-filled bit-exact check first, then
+eight `run` processes into one records file and one `judge`). In the same GPU round, a
+re-run of `bench/first_call.py --sweep` on the current build (about a minute of GPU), whose
+records name the commit, the library sha256s and the host API (final review; DESIGN §6g.6). Until M-c passes, figures at N ∉ {8, 10, 14, 16} keep
 the mark [M, model-only, outside hold-out]. Open outside C1: a `PrecisionPlan` member role
 "A=B" for a self-contraction reading one shared pack through both roles (M-b below; named
 "AB" before the close-out review, which renamed it because `"AB"` is the pack-mode value for
@@ -400,7 +461,9 @@ what has been built since is recorded under "Implementation status".
     identically. So do stage 2's [M] records: M-a's `perf` blocks (66 Tier L, 9 real),
     `c2_summary.md` and `b6_split_cost.txt`. No prediction changed.
   - *The cited figures:* 191 [M] and [E] figures of §2.3–§2.7, §4.2, §4.3 and DESIGN §3.8,
-    recomputed from fresh queries: 169 print as cited; 7 differ in the last digit only
+    recomputed from fresh queries: 9 are information only (§2.7's [M] composition of the S
+    calls, which M-b added, so there is no citation to compare); of the other 182, 169 print
+    as cited; 7 differ in the last digit only
     (≤ 0.42 %: mis-roundings of unchanged predictions just below a tie, corrected in place after
     the M-b review, §2.3 and §2.6); 6 differ by more. One is a text error, corrected in
     §2.3: the 4096² re-pack is 9–11 % of one call, not "about 11 %" (8.8 % at N = 14). Five
@@ -642,7 +705,11 @@ what has been built since is recorded under "Implementation status".
       positive control that meets every check got past the gate and stopped at the first
       CUDA call ("no CUDA-capable device"), writing nothing.
     - Records: immerdink-eval `results/c1/m_d2/` (untracked; `rereg2/` for 35eeb46,
-      `reregister/` for daf3583); summary `findings/c1-m-d2.md`.
+      `reregister/` for daf3583); summary `findings/c1-m-d2.md`. The relabelled synthetic
+      records of the judge checks (real smoke records relabelled as M-d2 systems) were moved
+      out of `m_d2/` at the final review, to `results/c1/m_d2_judge_checks/{rereg2,
+      reregister}/` (files and sha256 unchanged), so that no glob over `m_d2/` counts them
+      as M-d2 attempts (MD2-8).
   - *Caller note [M, model-only, outside hold-out]* (§5.10 MD2-4, §2.4). The PPL view's bar
     is an in-line ratio. With the invariant B (680 MB) packed per phase, the schedule gain
     is 1.14× (P14/PF14 = 0.876, above the 0.8 cap), against 1.33× in-line: the four packs
@@ -2340,6 +2407,15 @@ under 100 µs (10–13 %).
       then exits 1). Update the bars, the band classes and `REGISTERED_CALIB` in the
       driver, and commit before any M-d2 run. That re-registers the driver: a new commit
       and sha256 here (allowed before the first M-d2 record; below).
+    - *Required at the next re-registration, before any M-d2 run, whether or not the
+      calibration changes* (final review of C1/C2, binding): `run`'s bit-exact check (rule
+      (a)) fills C with a NaN bit pattern before the in-line reference call and before the
+      packed call, and counts a level as bit-exact only if the in-line call wrote every
+      element (no pattern left) and the packed result equals it. At 35eeb46 C is not reset
+      between the two calls, so a packed call that writes nothing would compare equal
+      (`tests/test_phases.py` guards the same case: "the reference is not vacuous"). Not
+      applied now: changing the driver re-registers it, and the review placed the fix in the
+      next re-registration; M-d2 cannot run before one (the ordering above).
     - *Records, freeze and continuation* (binding; the re-review's must-fix, §5.10 MD2-8 as
       amended; mirrored in the driver's docstring):
       - *One normative records file:* immerdink-eval `results/c1/m_d2/md2.jsonl`. Every
@@ -2700,8 +2776,10 @@ real-operand family meeting (i)" (computed by `bench/accuracy/c2_summary.py`; im
 - **(i) not met.** No real R1–R6 contraction of the ≥ 2048³ class has guard = 1; G ≤ 0 on
   every one. R1, R2, R6 and R7 contract one DF factor with itself or its transpose, so Δ ≡ 0
   and w ≡ 0 by construction. R2b, R3, R4 and R5 have nearly aligned K profiles (|w| ≤ 4,
-  G ∈ [−4, 0]). With the caller's costs, K-eq is 2–47 % slower than fast mode at the gate
-  targets, and (c) cannot apply: point-group zeros (ρ up to 1e20) leave max-elementwise
+  G ∈ [−4, 0]). With the caller's costs, K-eq reaches 2–47 % lower TFLOPS-eq than fast mode
+  at the normwise gate targets (+2 % to +89 % time; N = 9–12) [M, model-only, outside
+  hold-out] and 1–36 % lower at the ew8 ones (+1 % to +57 % time; N = 13–16) [M,
+  model-only, outside hold-out at N = 13 and 15], and (c) cannot apply: point-group zeros (ρ up to 1e20) leave max-elementwise
   1e−8 unreachable for every scheme at N ≤ 20. Water R1 and R5 (2mnk = 7.2e8) are below the
   class and not gate-admissible.
 - **(ii) not met as pre-registered.** Every guard-accepted Tier-L fixture has sampled outputs
@@ -4694,7 +4772,11 @@ should-fix items, all applied (Status, stage 3).
   gain; either predicts the next call, it does not bound it); (b) the guarantee is W ≤ t̄,
   the exact quotient, not ≤ t_eff; (c) the transform holds for α = 1 or 2^e and β = 0, with r
   and ρ_S rounded upward; (d) t′ ≤ 0 means no N is certified. The 4S·2⁻⁵³ margin, about twice
-  what the proof needs, stays.
+  what the proof needs, stays. *Final review of C1/C2 (must-fix, applied):* in case (d)
+  `params.kseg_request` returns None, not 0.0, since rank reads a target of 0 as "no target,
+  report only" and would return its cheapest configuration unfiltered; this happens at the
+  normwise ~1e−15 targets §3.8 discusses (t_eff = 5e−16 or 8e−16 at S = 2, 1e−15 at S = 4).
+  Step 3 requests t′ > 0 with basis BOUND (TYPICAL voids the certification).
 - **S3-2. `contract_segments`' signature.** §4.4 names (A, B, C, N, rounding, bounds). Decided:
   `bounds` is the boundary list [0, k_1, …, k], default two near-equal bands
   (`segment_bounds(k, 2)`, numpy's array_split as `c2_gate.segmented`); and `alpha`, `beta`,
@@ -4967,6 +5049,15 @@ of this section; they are binding.
          1 KF shape of similar footprint, at N ∈ {4, 8, 13}, on both data sets; about 1 min
          of GPU in busy-gated chunks.
     5. *The v1.18 hold-out is judged on both sets* (MC-6 below).
+    6. *Run-time provenance of every fresh GPU chunk* (final review of C1/C2, should-fix,
+       applied before any MC-3a run). `imd_bench`'s records carry `commit` but no library
+       sha256, host API or dirty flag (`m_c/mc.jsonl` was made by a profiling build linked
+       34 s before 530ff81 was committed; its hashes were supplied afterwards, and they still
+       match the files on disk). immerdink-eval `scripts/c1/m_c_chunk.sh` now appends to each
+       chunk's `logs/<chunk>/provenance.txt`, after the chunk: the commit, the dirty flag,
+       the sha256 of `imd_bench` and of the `libimmerdink` libraries it loads, and the host
+       API. MC-3a's hold-out and refit runs, and the fresh M-c run, go through it (or
+       record the same fields at run time).
 
     *Rationale:* the v1.18 hold-out has no case of this class (its narrow-n cases `v_rsm1`,
     `v_rsm2`, `v_r_mm`, `v_mmg` and `y_k3a` are outside the REPEAT window or not this

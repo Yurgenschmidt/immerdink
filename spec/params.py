@@ -38,7 +38,8 @@ Map to docs/DESIGN.md (v1). Each certificate in CHECKS names its section.
   §6f   accuracy-aware planning: the bounds of imd_err_estimate ..... error_estimate()
   §6g.11 rigorous rho from a previous output (stage 1 of C1) ....... rho_recipe()
   §3.8  segmented accumulation, the K-segmentation recipe (L7) ...... kseg_gamma(), kseg_unit(),
-                                                                     kseg_request()
+                                                                     kseg_request(),
+                                                                     kseg_wbar_up(), kseg_eta()
 TLA+ models are scaled-down copies of the same rules; scaled_moduli() and
 scaled_constants() produce their parameters with the same greedy rule.
 """
@@ -531,22 +532,28 @@ def error_estimate(N, k, rounding, dispatch="EMULATE", outputs=1, metric=ERR_NOR
 DBL_MIN = 2.0**-1022                 # the smallest normal double
 
 
-def rho_recipe(C, row_ub, col_ub, U, e=0):
+def rho_recipe(C, row_ub, col_ub, U, e=0, eta=0.0):
     """rho_hat >= rho_ij = ||a_i|| ||b_j|| / |x_ij| for one output, evaluated in FP64 exactly as
     precision.rho_from_output does; None if the output is uncertified.
 
     The call ran at (N, rounding, k) with alpha = 2^e and beta = 0, so it wrote C = RN(2^e D)
     (§3.7), D its product; row_ub >= ||a_i||_2 and col_ub >= ||b_j||_2 are the caller's
     doubles; U >= the NORMWISE bound coefficient (imd_err_estimate's 'bound'), so that
-    |D - x| <= U ||a_i|| ||b_j|| for D finite and normal (PROOFS L3c).
+    |D - x| <= U ||a_i|| ||b_j|| + eta for D finite and normal (PROOFS L3c; eta = 0 there).
       D = ldexp(C, -e): exact for C finite and normal; for e < 0 also |C| > 2^-1022 (a C of
         exactly 2^-1022 can be a subnormal 2^e D rounded up). Uncertified unless D is normal.
       n = nextafter(row_ub col_ub, +inf) >= ||a|| ||b||;
-      t = nextafter(U n, +inf) >= U n;  den = nextafter(|D| - t, 0) <= |D| - U n;
+      t = nextafter(U n, +inf) >= U n, then, for eta > 0 only, t = nextafter(t + eta, +inf);
+      den = nextafter(|D| - t, 0) <= |D| - U n - eta;
       certified iff den > 0 and rho_hat = nextafter(n / den, +inf) is finite.
-    Then |x| >= |D| - |D - x| >= |D| - U n >= den > 0 and rho <= n / (|D| - U n) <= rho_hat:
+    Then |x| >= |D| - |D - x| >= |D| - U n - eta >= den > 0 and rho <= n / den <= rho_hat:
     each RN result is within half an ulp (also in the subnormal range), so one ulp outward
-    bounds it."""
+    bounds it. eta: an absolute error term the bound carries, a double >= 0; the segmented
+    recipe's rho_S passes kseg_eta(S), which covers band products that underflow (DESIGN §3.8
+    "Choosing N", PROOFS L7c (3), (7)); rho_from_output has none (eta = 0, bit-identical to
+    it)."""
+    if not (math.isfinite(eta) and eta >= 0):
+        raise ValueError("eta must be finite and >= 0")
     if not math.isfinite(C) or (e < 0 and abs(C) <= DBL_MIN):
         return None
     try:
@@ -557,6 +564,8 @@ def rho_recipe(C, row_ub, col_ub, U, e=0):
         return None
     n = math.nextafter(row_ub * col_ub, math.inf)
     t = math.nextafter(U * n, math.inf)
+    if eta > 0:
+        t = math.nextafter(t + eta, math.inf)
     den = math.nextafter(abs(D) - t, 0.0)
     if not den > 0:
         return None
@@ -592,19 +601,21 @@ def kseg_unit(E, S):
 
 
 def kseg_request(t_eff, S):
-    """The NORMWISE target t' to request (imd_err_min_moduli / rank, nu = sqrt k) for a
-    segmented call whose L7 coefficient must stay <= t_bar, the exact quotient that t_eff
+    """The NORMWISE target t' to request (imd_err_min_moduli / rank, nu = sqrt k, basis BOUND)
+    for a segmented call whose L7 coefficient must stay <= t_bar, the exact quotient that t_eff
     rounds (DESIGN §3.8 "Choosing N", step 2; alpha = 1 or 2^e, beta = 0):
         t' = RN(RN(min(t_eff, 1) (1 - 2^-50)) - 4 S 2^-53)    in FP64, as a caller evaluates it;
-    0.0 if t' <= 0: the transform certifies no N with S bands (W >= S u, so no N is certified
-    for t_bar < S u; between S u and about 4 S u the transform is merely conservative).
+    None if t' <= 0: the transform certifies no N with S bands (W >= S u, so no N is certified
+    for t_bar < S u; between S u and about 4 S u the transform is merely conservative). Never
+    0.0: a target of 0 means "no target, report only" to rank (§6f.1), which would choose the
+    cheapest configuration with no accuracy filter.
     Soundness (PROOFS L7d, cert_kseg_composition): E (1+u) + u <= t' implies
     kseg_unit(E, S) <= t_bar exactly, for t_eff = RN(t_bar), t_bar = t / r, t / rho_S or
     t / M_bar."""
     if not (math.isfinite(t_eff) and t_eff > 0) or not 1 <= S <= KSEG_S_MAX:
         raise ValueError("t_eff must be finite and > 0, S in 1..2^26")
     t = min(t_eff, 1.0) * KSEG_REQ_SCALE - 4 * S * 2.0**-53
-    return t if t > 0 else 0.0
+    return t if t > 0 else None
 
 
 def kseg_wbar_up(U, S):
@@ -617,6 +628,16 @@ def kseg_wbar_up(U, S):
         raise ValueError("U must be finite and >= 0, S in 1..2^26")
     one_u = math.nextafter(1.0 + U, math.inf)
     return math.nextafter(U + math.nextafter(S * 2.0**-53 * one_u, math.inf), math.inf)
+
+
+def kseg_eta(S):
+    """The double S 2^-1074 >= (1 + gamma_{S-1}) S 2^-1075, exact: L7's absolute term for band
+    products that underflow (PROOFS L7c (3); gamma_{S-1} <= 1 for S <= 2^26). The segmented
+    recipe's rho_S passes it to rho_recipe (eta), so rho_hat_S needs no hypothesis on the band
+    products D_s, which a caller never sees for s >= 2 (DESIGN §3.8 "Choosing N")."""
+    if not 1 <= S <= KSEG_S_MAX:
+        raise ValueError("S outside 1..2^26")
+    return math.ldexp(float(S), -1074)
 
 
 # ---------------------------------------------------------------------------
@@ -2264,20 +2285,27 @@ def cert_kseg_composition():
         ABSOLUTE <= W_bar M + (1 + gamma) S 2^-1075, also on rows whose products underflow;
         at S = 1, W_1 is error_estimate's own NORMWISE bound (gamma_0 = 0);
     (3) the recipe's request: E (1+u) + u <= kseg_request(t_eff, S) implies W(E) <= t_eff,
-        on random t_eff = RN(t / r) and S, at the largest admissible E;
+        on random t_eff = RN(t / r) and S, at the largest admissible E; out of reach it is
+        None, never 0.0 (rank's "no target"), e.g. at normwise 5e-16 with S = 2;
     (4) the nu counterexample a = (1, eps, ..., eps): a band's nu exceeds the whole row's,
         and the band bound with the whole row's nu is violated;
     (5) the lost single rounding: at N = 20 some S = 2 output's error exceeds the
         unsegmented ELEMENTWISE bound (u + E rho (1+u)) |x| that the plain call meets;
     (6) gamma is necessary: sum_s n_s (u + (1+u) E_s) fails on rows aligned band by band;
+        and its size: a two-band K-empty witness errs by 3.98 u against L7's 4.00 u, above the
+        bound with gamma halved (3.00 u);
     (7) the rigorous rho_S of a previous segmented output (DESIGN §3.8 "Choosing N"):
         kseg_wbar_up(U, S) >= W_bar for U >= every band's NORMWISE 'bound' (the upper
-        enclosure, rounded up), and rho_recipe(C_S, n, 1, kseg_wbar_up(U, S)) with
-        n >= N_S, where certified, is >= N_S / |x| (upper enclosures)."""
+        enclosure, rounded up), and rho_recipe(C_S, n, 1, kseg_wbar_up(U, S), eta=kseg_eta(S))
+        with n >= N_S, where certified, is >= N_S / |x| (upper enclosures), also on rows whose
+        last band's products underflow while x is normal (no hypothesis on the D_s);
+        kseg_wbar_up(U, S) >= W(E) at the largest E with E (1+u) + u <= U, exactly, on a grid
+        of U and S up to 2^26; kseg_eta(S) >= (1 + gamma) S 2^-1075 exactly."""
     rng = random.Random(7307)
     u = UNIT_ROUNDOFF
     cnt = {"elements": 0, "bands": 0, "direct": 0, "underflow": 0, "requests": 0,
-           "rho_s": 0, "rho_s_gain": 0, "max_ratio": Fraction(0)}
+           "out_of_reach": 0, "rho_s": 0, "rho_s_gain": 0, "rho_s_underflow": 0,
+           "wbar": 0, "max_ratio": Fraction(0)}
 
     def ub(r):                                    # the smallest double >= a rational >= 1
         return max(_up(r), 1.0)
@@ -2285,7 +2313,7 @@ def cert_kseg_composition():
     def unit_lo(N, ks, rnd, nu_a=0.0, nu_b=0.0):
         return error_estimate(N, ks, rnd, l1_ratio_a=nu_a, l1_ratio_b=nu_b)["unit_bound"][0]
 
-    def check(a, b, N, rnd, S, underflow=False):
+    def check(a, b, N, rnd, S, underflow=False, mixed=False):
         k = len(a)
         bounds = [0]
         for s in range(S):
@@ -2336,8 +2364,22 @@ def cert_kseg_composition():
         # ABSOLUTE: always (the underflow term covers gradual underflow of a band's D_s)
         need(err <= Wbar * nab_hi + (1 + g) * S * ERR_UNDERFLOW, f"{what}: ABSOLUTE")
         cnt["elements"] += 1
+        # (7) the rigorous rho_S from this output (alpha = 1, beta = 0): with eta =
+        # kseg_eta(S), no hypothesis on the D_s (some may underflow)
+        Wup = kseg_wbar_up(_up(U_hi), S)
+        need(W_hi <= Wup, f"{what}: kseg_wbar_up below W_bar")
+        rho_s = rho_recipe(C, _up(NS_hi), 1.0, Wup, eta=kseg_eta(S))
+        if rho_s is not None:
+            need(NS_hi <= Fraction(rho_s) * abs(x), f"{what}: rho_S from the output")
+            cnt["rho_s"] += 1
+            if underflow:
+                cnt["rho_s_underflow"] += 1
+            elif Fraction(rho_s) * abs(x) < sqrt_enclosure(na2 * nb2)[0]:
+                cnt["rho_s_gain"] += 1            # rho_hat_S below the plain rho
         if underflow:
             cnt["underflow"] += 1
+            need(not mixed or any(0 < abs(D) < DBL_MIN for D in Ds),
+                 f"{what}: no band product underflows")
             return
         need(err <= bound_nu, f"{what}: L7 with per-band nu")
         need(err <= bound_rk, f"{what}: L7 with nu = sqrt k_s")
@@ -2350,15 +2392,6 @@ def cert_kseg_composition():
             rho = Fraction(_up(nab_hi / abs(x))) if nab_hi / abs(x) < 2**1000 else None
             if rho is not None:
                 need(err <= Wbar * rho * abs(x), f"{what}: ELEMENTWISE")
-        # (7) the rigorous rho_S from this output (alpha = 1, beta = 0, every D_s normal)
-        Wup = kseg_wbar_up(_up(U_hi), S)
-        need(W_hi <= Wup, f"{what}: kseg_wbar_up below W_bar")
-        rho_s = rho_recipe(C, _up(NS_hi), 1.0, Wup)
-        if rho_s is not None:
-            need(NS_hi <= Fraction(rho_s) * abs(x), f"{what}: rho_S from the output")
-            cnt["rho_s"] += 1
-            if Fraction(rho_s) * abs(x) < sqrt_enclosure(na2 * nb2)[0]:
-                cnt["rho_s_gain"] += 1            # rho_hat_S below the plain rho
         if bound_rk:
             cnt["max_ratio"] = max(cnt["max_ratio"], err / bound_rk)
 
@@ -2394,10 +2427,40 @@ def cert_kseg_composition():
                 b = [math.ldexp(1 + rng.random(), -540 - rng.randrange(8)) * rng.choice((1, -1))
                      for _ in range(10)]
                 check(a, b, N, rnd, S, underflow=True)
+    # x normal, the last band's products subnormal (D_S underflows, the caller never sees it):
+    # ABSOLUTE and (7)'s rho_S with kseg_eta (their own generator: the draws below unchanged)
+    rng2 = random.Random(7313)
+    for N in (4, 8, 20):
+        for rnd in (RN, TRUNC):
+            for S in (2, 3):
+                for lead in (-500, -505, 0):
+                    a = [math.ldexp(1 + rng2.random(), lead) * rng2.choice((1, -1))
+                         for _ in range(5)] + \
+                        [math.ldexp(1 + rng2.random(), -530 - rng2.randrange(8)) *
+                         rng2.choice((1, -1)) for _ in range(5)]
+                    b = [math.ldexp(1 + rng2.random(), lead) for _ in range(5)] + \
+                        [math.ldexp(1 + rng2.random(), -530 - rng2.randrange(8)) *
+                         rng2.choice((1, -1)) for _ in range(5)]
+                    check(a, b, N, rnd, S, underflow=True, mixed=True)
     need(cnt["max_ratio"] > 0, "vacuous: no error")
-    need(cnt["direct"] > 0 and cnt["rho_s"] > 100 and cnt["rho_s_gain"] > 0,
+    need(cnt["direct"] > 0 and cnt["rho_s"] > 100 and cnt["rho_s_gain"] > 0 and
+         cnt["rho_s_underflow"] > 10,
          f"vacuous: {cnt['direct']} K-empty bands, {cnt['rho_s']} rho_S certified "
-         f"({cnt['rho_s_gain']} below rho)")
+         f"({cnt['rho_s_gain']} below rho, {cnt['rho_s_underflow']} with a band underflowing)")
+    # (7) kseg_wbar_up on its own, exactly: W(E) <= kseg_wbar_up(U, S) at the largest E with
+    # E (1+u) + u <= U (S - 1 for S would fail here at large S), and kseg_eta's term
+    for S in (1, 2, 3, 4, 64, 4096, 2**20, KSEG_S_MAX):
+        need(Fraction(kseg_eta(S)) >= (1 + kseg_gamma(S)) * S * ERR_UNDERFLOW,
+             f"kseg_eta({S}) below (1 + gamma) S 2^-1075")
+        for _ in range(300):
+            U = math.ldexp(1 + rng2.random(), rng2.randint(-53, 2))
+            E = (Fraction(U) - u) / (1 + u)
+            if E < 0:
+                continue
+            need(kseg_unit(E, S) <= Fraction(kseg_wbar_up(U, S)),
+                 f"kseg_wbar_up({U!r}, {S}) below W")
+            cnt["wbar"] += 1
+    need(cnt["wbar"] > 2000, "kseg_wbar_up check vacuous")
 
     # (3) the request transform, exact, at the largest admissible E = (t' - u) / (1 + u)
     for _ in range(3000):
@@ -2409,15 +2472,19 @@ def cert_kseg_composition():
         if not (math.isfinite(t_eff) and t_eff > 0):
             continue
         tp = kseg_request(t_eff, S)
-        if tp == 0.0:                             # out of reach of S bands: nothing to check
+        if tp is None:                            # out of reach of S bands: nothing to check
+            cnt["out_of_reach"] += 1
             continue
+        need(tp > 0, f"kseg_request({t_eff!r}, {S}) = {tp!r}: not a positive target")
         Emax = (Fraction(tp) - u) / (1 + u)
         if Emax < 0:
             continue
         need(kseg_unit(Emax, S) <= Fraction(t) / Fraction(r),
              f"kseg_request({t_eff!r}, {S}) = {tp!r} unsound")
         cnt["requests"] += 1
-    need(cnt["requests"] > 1000, "request check vacuous")
+    need(cnt["requests"] > 1000 and cnt["out_of_reach"] > 0, "request check vacuous")
+    for t_eff, S in ((5e-16, 2), (8e-16, 2), (1e-15, 4)):   # normwise ~1e-15: out of reach
+        need(kseg_request(t_eff, S) is None, f"kseg_request({t_eff}, {S}) is not None")
 
     # (4) the nu counterexample: a = (1, eps, ..., eps), b likewise, S = 2 bands of 300
     viol = None
@@ -2477,13 +2544,43 @@ def cert_kseg_composition():
             no_gamma = trial
             break
     need(no_gamma is not None, "the bound without gamma never failed")
+    # (6) and its size: two K-empty bands (DIRECT, E_s = 0, n_s = |x_s|), a_1 b_1 just below
+    # 1 + u and a_2 b_2 just below 1 + 3u, so D = (1, 1 + 2u) and C = RN(2 + 2u) = 2 (the tie
+    # goes to even): err just below 4u, L7's sum_s n_s (u + gamma_1 (1+u)) just above it, the
+    # bound with gamma halved 3u
+    rng3 = random.Random(7319)
+
+    def below(target):                            # doubles a, b: target - u/64 < a b < target
+        for _ in range(20000):
+            a = 1 + rng3.random() * 2**-20
+            b = float(target / Fraction(a))
+            for _ in range(4):
+                p = Fraction(a) * Fraction(b)
+                if target - u / 64 < p < target:
+                    return a, b
+                b = math.nextafter(b, 0.0) if p >= target else math.nextafter(b, 2.0)
+        need(False, f"no doubles with a product just below {float(target)!r}")
+    (a1, b1), (a2, b2) = below(1 + u), below(1 + 3 * u)
+    C, Ds = _kseg_element([a1, a2], [b1, b2], 20, RN, [0, 1, 2])
+    need(Ds == [1.0, 1 + 2 * float(u)] and C == 2.0, f"gamma witness: D {Ds}, C {C!r}")
+    xs = [Fraction(a1) * Fraction(b1), Fraction(a2) * Fraction(b2)]
+    err, g2 = abs(Fraction(C) - sum(xs)), kseg_gamma(2)
+    full = sum(kseg_unit(0, 2) * x for x in xs)
+    half = sum((u + g2 * (1 + u) / 2) * x for x in xs)
+    need(half < err <= full and err > Fraction(99, 100) * full,
+         f"gamma witness: err {float(err / u):.4f} u, L7 {float(full / u):.4f} u, "
+         f"halved {float(half / u):.4f} u")
+    tight = float(err / full)
     return (f"{cnt['elements']} segmented elements ({cnt['bands']} bands, {cnt['direct']} "
-            f"K-empty; {cnt['underflow']} underflowing, ABSOLUTE only), max err / L7 bound "
-            f"{float(cnt['max_ratio']):.3f}; rho_S from the output certified on {cnt['rho_s']} "
-            f"({cnt['rho_s_gain']} below rho); "
+            f"K-empty; {cnt['underflow']} with underflowing products: ABSOLUTE and rho_S "
+            f"only), max err / L7 bound {float(cnt['max_ratio']):.3f}; rho_S from the output "
+            f"certified on {cnt['rho_s']} ({cnt['rho_s_gain']} below rho); "
             f"{cnt['requests']} request transforms sound; whole-row nu fails a band at "
             f"N={viol[0]} {viol[1]} ({viol[2]:.1f}x); S = 2 at N = 20 loses the single rounding "
-            f"(err {lost[1]:.2f} u|x|); without gamma L7 fails (aligned bands, N = 20)")
+            f"(err {lost[1]:.2f} u|x|); without gamma L7 fails (aligned bands, N = 20), and "
+            f"a K-empty witness meets it to {tight:.4f} (above gamma / 2); rho_S with kseg_eta "
+            f"certified on {cnt['rho_s_underflow']} outputs with a band underflowing; "
+            f"kseg_wbar_up >= W exactly at {cnt['wbar']} (U, S)")
 
 
 @check("§2-§3.6 scaled TLA+ parameters")

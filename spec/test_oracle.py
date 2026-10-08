@@ -2102,8 +2102,9 @@ def test_segments():
     from the band alone and its z = sum a'b' with the CRT precondition, PROOFS L7's proof
     skeleton in exact rationals (every band's L3a l1 bound, 0 for a DIRECT band, plus u|D_s|,
     plus gamma_{S-1} sum |D_s|), determinism across chunk lengths and g, alpha / beta and an
-    unread C, alpha = 0 with unread A and B, band-local flags, the per-band RN acceptance, the
-    decay_opp gain, validation."""
+    unread C (also a K-empty first band with beta not a power of two: one fma), alpha = 0 with
+    unread A and B, band-local flags, the per-band RN acceptance, the decay_opp gain,
+    validation."""
     rng = random.Random(7303)
     cnt = {"cases": 0, "outputs": 0, "bands": 0, "direct": 0, "l7_tight": Fraction(0)}
     # --- segment_bounds: the array_split rule (the first k mod S bands one longer)
@@ -2211,6 +2212,30 @@ def test_segments():
         Rl, _ = seg_library(A, B, C0, N, rnd, bounds, alpha, beta)
         assert all(same_bits(x, y) for r1, r2 in zip(R, Rc) for x, y in zip(r1, r2)), trial
         assert all(same_bits(x, y) for r1, r2 in zip(R, Rl) for x, y in zip(r1, r2)), trial
+    # a K-empty first band with a beta that is not a power of two: C_1 = fma(beta, C, E_1),
+    # one rounding; RN(RN(beta C) + E_1) differs on some outputs here, so the check can fail
+    # (final review of C1/C2: every beta above is 0, 1 or a power of two)
+    rb, twice = random.Random(7311), 0
+    for beta in (0.3, 3.0, -0.7):
+        for alpha in (1.0, 0.375):
+            for first in ([0, 1], [0, 1, 2]):
+                m, n, k = 3, 4, rb.randrange(6, 20)
+                A, B = kw_fixture(rb.choice(fams), m, n, k, rb)
+                C0 = [[rb.uniform(-1, 1) for _ in range(n)] for _ in range(m)]
+                bounds = first + [k]
+                N, rnd = rb.choice([4, 8, 14]), rb.choice(["RN", "TRUNC"])
+                R = o.contract_segments(A, B, C0, N, rnd, bounds, alpha=alpha, beta=beta)
+                Rc, _ = seg_compose(A, B, C0, N, rnd, bounds, alpha, beta)
+                Rl, _ = seg_library(A, B, C0, N, rnd, bounds, alpha, beta)
+                assert all(same_bits(x, y) for r1, r2 in zip(R, Rc) for x, y in zip(r1, r2))
+                assert all(same_bits(x, y) for r1, r2 in zip(R, Rl) for x, y in zip(r1, r2))
+                for i in range(m):
+                    for j in range(n):
+                        D = o.fma(A[i][0], B[0][j], 0.0)
+                        E = D if alpha == 1.0 else o.mul(alpha, D)
+                        twice += not same_bits(o.fma(beta, C0[i][j], E),
+                                               o.fma(1.0, o.mul(beta, C0[i][j]), E))
+    assert twice > 0, "a two-rounding beta step would pass"
 
     # --- a K-empty band runs DIRECT as in the library (independent review of stage 3, MF1):
     # k = 1 at N = 3 is fma(0.1, 0.3, +0), not the emulated 0.029997557401657104

@@ -35,7 +35,7 @@ downloaded, never built from source.
 | L3c (3), the native FMA chain | `Summation.fma_chain` (γ_k) | `Proofs/Summation.lean` |
 | L7a (recursive summation, γ_k) | `Summation.recsum` (power form `recsum_pow`; `pow_sub_one_le_gam`, `gam_nonneg`) | `Proofs/Summation.lean` |
 | L7b (segmented bound) | `Segments.kseg_compose` (`kseg_compose_sub` with gradual underflow; per band `band_bound`); from the band rows through L3c (1): `kseg_rows` | `Proofs/Segments.lean` |
-| L7c (metric forms) | `Segments.bands_norm_le` (N_S ≤ ‖a‖‖b‖), `kseg_normwise`; E monotone (`E_s ≤ E(k)`): `Error.unitE_mono`; (7) ρ_S from the output: `kseg_wbar_le`, `kseg_rho_le` | `Proofs/Segments.lean`, `Proofs/Error.lean` |
+| L7c (metric forms) | `Segments.bands_norm_le` (N_S ≤ ‖a‖‖b‖), `kseg_normwise` (NORMWISE); (3) the underflow term: `kseg_compose_sub`; E monotone (`E_s ≤ E(k)`): `Error.unitE_mono`; (7) ρ_S from the output: `kseg_wbar_le`, `kseg_rho_le`. The ELEMENTWISE and ABSOLUTE forms of (2) are one-line corollaries of `kseg_compose` (with N_S ≤ ρ_S·|x|, N_S ≤ M̄) and are not restated | `Proofs/Segments.lean`, `Proofs/Error.lean` |
 | L7d (the recipe's request) | `Segments.gam_mul_le`, `kseg_request_core` (the exact half) | `Proofs/Segments.lean` |
 
 ## Modelling choices
@@ -81,12 +81,17 @@ These choices are faithful to PROOFS.md, but they are not literal transcriptions
     `|y_s − x_s| ≤ E_s n_s`); `kseg_rows` instantiates them from band rows of lengths
     `ks s` (a dependent family `(s : ℕ) → Fin (ks s) → ℝ`) through `l3c_unit`. That the
     contraction's sum is the sum of the band sums is the partition itself and is not
-    restated.
+    restated. `kseg_rows`' hypothesis `hσb` (`2^-σ ≤ 2‖a^s‖·sf/d`) cannot hold for a band
+    whose row is zero (its right side is 0), so such a band enters only through
+    `kseg_compose`, with `x_s = y_s = 0` and `n_s = 0` given directly.
   - L7d's FP evaluation of `t′` (two roundings, `params.kseg_request`) is not modelled;
     `kseg_request_core` proves the exact half, and `cert_kseg_composition` checks the
     rounding. Likewise L7c (7): `kseg_wbar_le` and `kseg_rho_le` are the exact statements;
     their outward-rounded evaluation (`params.kseg_wbar_up`, `params.rho_recipe`) is checked
-    by `cert_kseg_composition` (7).
+    by `cert_kseg_composition` (7). The ρ_S without the normal-range hypothesis (DESIGN
+    §3.8: the absolute term `(1 + γ)·S·η ≤ S·2⁻¹⁰⁷⁴`, `params.kseg_eta`) is the same
+    argument as `kseg_rho_le` with `W̄·N_S + (1 + γ)·S·η` from `kseg_compose_sub`; it is a
+    hand corollary (PROOFS L7c (7)), not restated in Lean.
 
 ## Discrepancies with PROOFS.md and proposed text
 

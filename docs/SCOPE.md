@@ -113,8 +113,10 @@ K5 crt   : exact multi-word CRT → one rounding → unscale → α/β → strid
 Memory and traffic for each step are given in [MEMORY_MODEL.md](MEMORY_MODEL.md).
 
 ### Later
-FP32 emulation, complex, accurate mode, auto-N, fused variants (V2/V3), packed micro-kernel
-experiments, other GPUs (sm_90/100/120), AMX/SME CPU back ends, Python bindings.
+FP32 emulation, complex, accurate mode (re-rejected, DESIGN v1.19 §7), auto-N (host-side since
+v1.19: per-call N as precision phases and `PrecisionPlan`, DESIGN §6g), fused variants
+(V2/V3), packed micro-kernel experiments, other GPUs (sm_90/100/120), AMX/SME CPU back ends,
+Python bindings.
 
 ### Non-goals
 Multi-operand path optimization (opt_einsum/cotengra), sparse/block-sparse, distributed,
