@@ -7,7 +7,7 @@ host queries per phase: `imd_err_min_moduli` (the cheapest N for a target), `imd
 (the configurations at the allowed levels), `imd_perf_predict_pack` (one packed role) and the
 footprint queries, through a `planner.Planner`. It computes in Python (levels, the monotone
 floor, share groups, per-role pack costs), so it lives here and not in planner.py, whose
-queries compute nothing (§6e.4). phase() is not free: 0.2-0.8 ms of host time per call on
+queries compute nothing (§6e.4). phase() is not free: 0.2-0.7 ms of host time per call on
 schedule.py's two contractions (a new target misses the memo), so call it when a floor may
 have moved, not every iteration (PrecisionPlan.phase; DESIGN §6g.10). No GPU, no data, no
 policy: the residual -> target rule is the caller's (bench/accuracy/schedule.py is an
@@ -646,7 +646,7 @@ class PrecisionPlan:
              gets fail_prob P / (iterations x the calls per iteration of every contraction).
         targets: {name: host.Accuracy with a target > 0} for every contraction. Raises
         ImmerdinkError for a lowering error, ValueError for bad arguments.
-        Cost: 0.2-0.8 ms of host time per call on bench/accuracy/schedule.py's two
+        Cost: 0.2-0.7 ms of host time per call on bench/accuracy/schedule.py's two
         contractions (a new target each call misses the planner memo), so call it at a phase
         switch, not every iteration. A switch is due only when a floor moves: the
         configurations stay the same while every contraction's step-1 query,

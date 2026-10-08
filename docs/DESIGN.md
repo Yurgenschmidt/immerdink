@@ -5371,11 +5371,13 @@ pp.reset()                    # forget the monotone floor (a new solve, geometry
   with their sha256, the product commits and the library's sha256). It runs at phase
   switches, off the hot path; ehrenfest's hot-path rank calls are untouched.
   It is not free per call, and a loop whose targets change every iteration should not call it
-  every iteration (`bench/accuracy/schedule.py` does, as an example: 0.2–0.8 ms of host time
-  per call on its two contractions, a new target each time, against its 5.8 ms [M]
-  iteration; immerdink-eval `results/c1/final_review/phase_call_cost.txt`). A switch is due
-  only when a floor moves: `phase()` starts from one `min_moduli` per contraction (steps 1–2;
-  a few µs each through a `planner.Query`), and its configurations stay the same while those
+  every iteration (`bench/accuracy/schedule.py` does, as an example: 0.2–0.7 ms of host time
+  per call on its two contractions, a new target each time, median 0.6 ms while the targets
+  move the floors and 0.2 ms once they sit at the top level, one call in 144 at 1.4 ms;
+  against its 5.8 ms [M] iteration; one core, c22ebcb, immerdink-eval
+  `results/c1/final_review/phase_call_cost.txt`). A switch is due only when a floor moves:
+  `phase()` starts from one `min_moduli` per contraction (steps 1–2; about 2.5 µs each
+  through a `planner.Query`), and its configurations stay the same while those
   return the same status and `num_moduli` (with `"DIRECT"` listed, also the mode-DIRECT
   check at the top level), for the same `iterations` and `fail_budget` (TYPICAL targets
   carrying step 7's p); only the err fields follow the targets. So the caller can run those

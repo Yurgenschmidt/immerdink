@@ -104,7 +104,7 @@ the `libimmerdink.so` builds named per item.
   - *Host and Python:* `PrecisionPlan` refuses, at construction, a share group whose shared
     roles read different packs or that no level can pack (DESIGN §6g.10; it had accepted
     two operands of different shapes and sized one pack for them); `phase()`'s per-call
-    cost (0.2–0.8 ms on `schedule.py`'s contractions) and the cheaper pattern (re-run it
+    cost (0.2–0.7 ms on `schedule.py`'s contractions) and the cheaper pattern (re-run it
     only when a step-1 `min_moduli` result changes, a claim `host_precision` checks) are in
     DESIGN §6g.10 and the docstrings; `PackedBuffer` assumes one host thread per buffer
     (DESIGN §6g.5); `host_precision` lowers every `configs()` and `phase()` choice with its
