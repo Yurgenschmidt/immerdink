@@ -195,8 +195,9 @@ comparisons are kept outside this repository (docs/BENCHMARKING.md). Note that c
   shipped as precision phases (a plan and a pack per N, published footprint guarantees,
   §6g.1–§6g.9); auto-N is host-side (`precision.PrecisionPlan` over `imd_err_min_moduli` /
   rank, and the rigorous `rho_from_output`, §6g.10–§6g.11); the Ozaki-I slice mode is parked
-  with its triggers (DESIGN §7). C1 is still open: the performance model's small-N hold-out
-  (MC-3a), then the GPU timing of the schedules (M-d2).
+  with its triggers (DESIGN §7). C1 is still open: MC-3a ran once (2026-10-09, NOTES-C1 §5.11)
+  and declared no pass, so the performance model's small-N hold-out stays failed; the GPU
+  timing of the schedules (M-d2) remains.
 - **Packed symmetric tensor contractions** (generic permutational symmetry). Wanted by
   Eric (2026-10-03), long-term; motivating case: the particle–particle ladder (PPL) in
   DF-CCSD. Operands and/or output are stored packed over permutational symmetry groups

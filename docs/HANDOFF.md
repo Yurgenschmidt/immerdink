@@ -153,13 +153,19 @@ first.
     (1024³ at N = 4) and narrow-n KL calls (KL A keeps only part of its REPEAT credit, the
     narrow pack KL B is slow in every cache state; per-phase table in immerdink-eval
     `results/c1/m_c/phases.md`); the Q24 refit was not adopted and the [M, model-only, outside
-    hold-out] marks stay. Next: the MC-3a path (NOTES-C1 §5.9 MC-3, MC-3a, MC-6: DESIGN §6c
-    text from a per-phase account first, at most two optional keys fitted against the phase
-    marks, a fresh narrow-KL hold-out committed before the refit, the v1.18 hold-out judged with
-    and without its 7 view overlaps, a fresh 160-call M-c run); then M-d2, whose protocol and
-    driver `bench/accuracy/md2_time.py` are pre-registered at 35eeb46 (NOTES-C1 §4.3, §5.10;
-    one normative records file, the driver frozen from the first M-d2 record on). MC-3 closes
-    without a calibration change only as MC-3a's recorded outcome or by Eric's decision.
+    hold-out] marks stay. **MC-3a was executed once on 2026-10-09 (NOTES-C1 §5.11, DESIGN
+    §6c.9):** one key (`warm.kl_drop`, fitted 0.70), a fresh narrow-KL hold-out, one refit
+    with Q24, a fresh 160-call M-c run. Every §6c.5 class target is met on every set, but one
+    pre-registered in-sample condition fails under its literal reading (two K4 entries, from
+    Q24's records), so no pass is declared: M-c stays FAILED, the marks stay, the shipped
+    calibration is unchanged, KL B is an open model defect (DESIGN §7), and MC-3 is closed
+    without a calibration change as MC-3a's recorded outcome. For the reviewer: if the
+    in-sample condition is read against the same records, the candidate calibration
+    (immerdink-eval `results/c1/mc3a/refit/mc3a.calib`) passes every check and must be shipped
+    and the bars re-derived before M-d2 (NOTES-C1 §5.11 "Verdict"). Next: M-d2, whose
+    protocol and driver `bench/accuracy/md2_time.py` are pre-registered at 35eeb46 (NOTES-C1
+    §4.3, §5.10; one normative records file, the driver frozen from the first M-d2 record on),
+    with `--md2-cleared` citing the closure commit and NOTES-C1 §5.11.
   - Open outside C1: a `PrecisionPlan` member role "A=B" (one shared pack read through both
     roles; named "AB" before the close-out review), trigger the ehrenfest-side integration of
     the B2 performance model declaring DF-factor sharing (ROADMAP C1).

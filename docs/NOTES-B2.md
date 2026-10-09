@@ -1632,3 +1632,25 @@ c, the small COLD calls ≈ 1.0–1.2 µs faster. The v12-sized struct view (fig
       run each meet every §6c.5 class target.
     - **Open if not modeled:** if MC-3 does not model KL B, it stays here as an open model
       defect with its size and a trigger, and in DESIGN §7.
+    - **MC-3a outcome (2026-10-09; NOTES-C1 §5.11, DESIGN §6c.9, §7).** One key was built and
+      fitted once, `warm.kl_drop` (the share of the REPEAT saving that KL reads do not get;
+      0.70 with Q24 in the fit): KL A's per-phase median |error| on the allowed narrow-KL
+      records 35.4 → 4.8 %, and every §6c.5 class target is met on a fresh narrow-KL hold-out,
+      the v1.18 hold-out (all cases and the 69 whose view matches no fit case), `mc.jsonl`
+      with and without the repeat, and a fresh full M-c run; one pre-registered in-sample
+      condition (no phase class worsens by more than 1 point) fails on two K4 entries (+1.6
+      and +1.0 points) that come from Q24's records, so no pass was declared and the
+      candidate calibration is not shipped.
+    - **KL B stays an open model defect, with its size and trigger.** Size: ×1.50–1.81 its
+      REPEAT prediction on Q24's narrow multi-pass packs under the shipped calibration;
+      −18 % median signed on M-c's Jacobi KL B marks, 12 % median |error| on the allowed
+      narrow-KL records, under the candidate. The v1.8 compute chain was re-tested offline
+      (57 ns per step from Q24's slopes against 6–13 ns fitted over the calibration's wide
+      launches; 13.7 → 12.7 % on a held-out shape's KL B) and not adopted. **Trigger:** see
+      DESIGN §7 (a consumer's planner decision on a narrow-n KL call below about 150 µs;
+      narrow multi-pass KL packs in a calibration sweep; or adoption of the candidate).
+    - **KF's saving against N** (the second half of the REPEAT-credit effect) has no key: the
+      cache sweep's `x_s1024` pairs follow the modeled window collapse (CLEAN − REPEAT 16.4 /
+      13.3 / 12.3 / 8.3 / 4.0 µs against 18.4 / 17.8 / 17.1 / 9.8 / 0.9), the KF phase marks
+      of `v_sq1024` and `q_kf1` do not (KF's modeled slope in N is 1.6–1.9 µs per modulus
+      against 1.0 measured). sq1024 at N = 4 is still −13.6 / −14.1 % under the candidate.
