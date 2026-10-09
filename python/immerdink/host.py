@@ -63,6 +63,7 @@ PERF_CLASSES = ["k0", "kf", "kl", "pack", "k4_128x256", "k4_128x128", "k4_64x128
 PERF_PHASES = ["K0 vec", "KF fused", "KL A", "KL B", "K2 pack A", "K3 pack B", "K4 gemm",
                "K5 crt", "DIRECT", "K5 beta-only", "call", "pack prep", "pack KL"]
 _PERF_MAX_PARAMS, _PERF_PARAM_CAPACITY, _PERF_MAX_PHASES = 6, 96, 16
+_PERF_PARAM_KL_DROP_SLOT = _PERF_PARAM_CAPACITY - 1  # IMD_PERF_PARAM_KL_DROP_SLOT (v1.19, 95)
 _PERF_BETA_NONZERO, _PERF_ALPHA_ZERO = 1, 2
 _PERF_VEC = {"GENERATE": 1, "RESIDENT": 2}
 _PERF_PACK = {"NONE": 1, "A": 2, "B": 4, "AB": 8}
@@ -857,8 +858,8 @@ class Calibration:
                 # v13 (DESIGN v1.18 §6c.8; 0: absent)
                 "warm.pack_l2_planes": r.pack_l2_planes, "warm.call_ns": r.warm_call_ns,
                 "warm.clean_byte": r.warm_clean_byte_ns,
-                # v1.19 (§6c.9; 0: absent): stored in the first param slot past the classes
-                "warm.kl_drop": r.param[len(PERF_CLASSES) * _PERF_MAX_PARAMS]}
+                # v1.19 (§6c.9; 0: absent): stored in param[IMD_PERF_PARAM_KL_DROP_SLOT]
+                "warm.kl_drop": r.param[_PERF_PARAM_KL_DROP_SLOT]}
 
     @property
     def bands(self):

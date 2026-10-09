@@ -457,14 +457,16 @@ int main(void) {
     CHECK(back.sm_count == cal.sm_count &&
           memcmp(&back.peak_dram_bytes_per_s, &cal.peak_dram_bytes_per_s, 4 * sizeof(double)) == 0);
     /* v1.19 (DESIGN §6c.9, host API 13, no struct growth): the optional warm.kl_drop lives in
-     * param[IMD_PERF_CLASS_COUNT * IMD_PERF_MAX_PARAMS], in [0, 1], written only when non-zero */
+     * param[IMD_PERF_PARAM_KL_DROP_SLOT], in [0, 1], written only when non-zero */
     {
       static char t0[16700], t1[16700], bad[16800];
       static imd_perf_calib_t kd, kb;
-      const int kslot = IMD_PERF_CLASS_COUNT * IMD_PERF_MAX_PARAMS;
+      const int kslot = IMD_PERF_PARAM_KL_DROP_SLOT;
       size_t n0 = 0, n1 = 0;
       int32_t el = -1;
-      CHECK(kslot < IMD_PERF_PARAM_CAPACITY && cal.format == IMD_PERF_CALIB_FORMAT);
+      CHECK(kslot == IMD_PERF_PARAM_CAPACITY - 1 && kslot == 95 &&
+            kslot >= IMD_PERF_CLASS_COUNT * IMD_PERF_MAX_PARAMS &&
+            cal.format == IMD_PERF_CALIB_FORMAT);
       kd = cal;
       kd.param[kslot] = 0;
       CHECK(imd_perf_calib_format(&kd, t0, sizeof t0, &n0) == IMD_STATUS_SUCCESS &&

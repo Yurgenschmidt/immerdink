@@ -621,8 +621,8 @@ do not see. With the per-band norms (one pass over A and B, as §6g.11's norms):
 - [M] figures at N ∉ {8, 10, 14, 16} are model-only until the small-N hold-out M-c passes
   (NOTES-C1 IR4). M-c ran on 2026-10-07 and failed (one target missed; NOTES-C1 Status,
   "M-c", and §5.9), so the marks stay; the MC-3 feature path (NOTES-C1 §5.9 MC-3, MC-3a) was
-  run once on 2026-10-09 and did not produce a declared pass (§6c.9, NOTES-C1 §5.11): the marks
-  stay. NOTES-C1's M-b re-ran the [M] figures here on this worktree's
+  run once on 2026-10-09 and did not pass (§6c.9, NOTES-C1 §5.11, independent review, ruling A,
+  binding): the marks stay. NOTES-C1's M-b re-ran the [M] figures here on this worktree's
   library:
   unchanged (immerdink-eval `findings/c1-m-b.md`).
 
@@ -4341,7 +4341,11 @@ hold-out (both sets), `mc.jsonl` (with and without the repeat) and a fresh full 
 pre-registered in-sample condition is not met under its literal reading (two K4 entries, from
 Q24's records and not from the key), so no pass was declared and the candidate calibration is
 not shipped: the key is supported (optional, absent = 0, tested) and absent from the shipped
-file, and the figures in this section are those of the shipped v1.18 calibration.**
+file, and the figures in this section are those of the shipped v1.18 calibration.
+Independent review (2026-10-09, binding, ruling A): that condition is read against the shipped
+fit's `perf_fit` table, as written, so MC-3a does not pass; M-c stays FAILED, the shipped
+calibration stays, `mc3a.calib` stays in the evaluation workspace, no second key is tried, and
+M-d2 runs on the shipped calibration and its pre-registered bars.**
 
 **What the phase marks show.** For a phase with mark m and model times R (REPEAT) and C (COLD),
 the saving the model credits is C − R and the share the mark keeps is (C − m) / (C − R).
@@ -4394,8 +4398,10 @@ the saving the model credits is C − R and the share the mark keeps is (C − m
   relative squared error; the smallest sum wins. It is chosen on the KL A / KL B phase marks, not
   on call totals, and the scan is printed. `--kl-drop D` fixes it (0: the v1.18 rule).
 - **Where it is stored.** `imd_perf_calib_t` keeps its size (host API 13, calibration format 2):
-  the key lives in the first parameter slot past the classes, `param[IMD_PERF_CLASS_COUNT ·
-  IMD_PERF_MAX_PARAMS]` (the capacity of 96 slots holds four classes more than there are),
+  the key lives in the last parameter slot, `param[IMD_PERF_PARAM_KL_DROP_SLOT]` (the macro,
+  `IMD_PERF_PARAM_CAPACITY - 1` = 95; the capacity of 96 slots holds four classes more than there
+  are, and a `static_assert` keeps the classes' slots before it; the text file names the key, so
+  it does not depend on the slot, and a hand-built `imd_perf_calib_t` must zero `param`),
   zeroed in a format-1 view and checked to lie in [0, 1]. A library without it rejects a file
   that has the key (unknown key), so no file is read with a feature it was not fitted with.
   Python: `Calibration.warm["warm.kl_drop"]`.
@@ -4424,7 +4430,7 @@ number in [0, 1], not repeated; negative, above 1 and `nan` rejected), written o
 non-zero, round trip; the rule on a KL narrow-n case, the Jacobi view and a KF case: a KL
 phase's REPEAT time is COLD − (1 − d)(COLD − REPEAT at d = 0), WARM = REPEAT, d = 1 puts a KL
 read at its COLD time, COLD / CLEAN and every non-KL phase are unchanged (a mutant that applies
-the share to every phase, and one that ignores the key, are caught); `host_c_api`: the slot, the
+the share to every phase, and one that ignores the key, are caught); `host_c_api`: the slot (95), the
 round trip, the three rejections.
 
 ---
@@ -5255,7 +5261,11 @@ it.
     pre-registered in-sample condition fails under its literal reading (two K4 entries,
     +1.6 and +1.0 points, from Q24's records), so no pass is declared: M-c stays failed, the
     marks stay, the shipped calibration is unchanged, and MC-3 is closed without a
-    calibration change.
+    calibration change. Independent review (2026-10-09, binding, ruling A, NOTES-C1 §5.11): the
+    in-sample condition is read against the shipped fit's table, so MC-3a does not pass; the
+    shipped calibration stays, `mc3a.calib` stays in immerdink-eval, `warm.kl_drop` stays in
+    the library and the fitter, and no second key is tried. Whether C1's done condition
+    ("M-c has passed") is amended is Eric's decision after M-d2 (not amended).
   - Indicative, not M-d2, and never used to set its bars: the schedule ending at N = 14,
     computed from M-c's single-call medians, is 0.003–0.023 above its [M] ratio on 2000³,
     4096³, DF, QZ and the PPL view, and 0.005–0.028 below on 1024³ and skinny. On the Jacobi
@@ -5720,7 +5730,7 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 | Multi-N packs; round-to-odd reference-integer packs; lower-N planes from a higher-N pack (NOTES-C1 §3.1 A3, A4, A6) | A multi-N pack has the same bytes as separate packs and saves one FP64 read per pack creation, for N-set key semantics. A round-to-odd pack takes 5 / 8 / 9 / 11 B per element at N_max = 8 / 14 / 16 / 20 (≥ FP64 from N_max = 14), each call still reads ≥ 8 B per element, and it saves only the S pass that KL already fuses. Lower-N planes cannot come from a higher-N pack: σ depends on N, rounding is not modular, and the CRT over a prefix gives z mod P(N′) (PackedOperand `neg_n`). |
 | Choosing N on the device within a call | N fixes the launch sequence, the K5 instantiation, W, the workspace and σ itself, and kernel scope forbids the sync. N is chosen on the host per phase (§6g.10). |
 | Ozaki-I slice mode: prefix slices, one pack for every precision (C1(c), NOTES-C1 §2.9, §3.3) | Parked. Faster than Ozaki-II only on benign data below about 1e−8, break-even near 1e−10, 1.25–1.75× slower at FP64 level [E], no win beyond S = 2 slices on heavy-tailed rows; and no operand is needed at two N at once. **Triggers:** a consumer needs one operand at two or more precisions at once under memory pressure, or M-d measures phase-switch re-packs at ≥ 5 % of a phase. A revival must beat the prefix-plane option and the best configuration without slices (a shared pack, separate packs or in-line). On the DF-CCSD contraction set a pack serving every N could save nothing in the 12 forcing-rule cases with real operands (the best of those configurations is already at or below the ideal: each member at its own floor reading one pack) and up to 9.1 % per iteration with one member's floor a level apart (16.0 % at 8 against 14) in synthetic floor patterns [M, model-only, outside hold-out; the slice pack priced as an ordinary pack at the group's top floor, no slice per-call penalty; B roles of one-factor contractions in-line, bare-factor norms; NOTES-C1 §3.3, M-b]. The share-group raise cost (shared against separate packs) is not that bar. A revival builds its TLA+ then. |
-| **[v1.19]** KL B, the narrow operand's pack on the multi-pass launch (rows of three or more chunks, a grid of fewer CTAs than SMs): its time model (NOTES-C1 §5.9 MC-3a, §5.11; §6c.9) | **Open model defect.** Shipped model: ×1.50–1.81 its REPEAT and ×1.31–1.65 its COLD prediction on Q24's three narrow-KL shapes, ×1.65–2.02 on M-c's Jacobi view; after the MC-3a candidate refit (Q24 in the fit) −18 % median signed on the Jacobi view's KL B marks (12 % median \|error\| on the allowed narrow-KL records), partly hidden at the call total by a KL A / K4 over-prediction of +9 %. The compute chain `nc · values · g` fits Q24 at 57 ns per step but not the calibration's wide launches (6–13 ns), and an underfilled-only feature breaks monotonicity (§6c.9). **Trigger:** a consumer whose planner decision depends on a narrow-n KL call below about 150 µs (the shipped model is 25–45 % low on its KL B phase and 26–29 % low on its total), or a calibration sweep that adds narrow multi-pass KL packs (which would identify the feature), or the reviewer's ruling that adopts the candidate calibration. |
+| **[v1.19]** KL B, the narrow operand's pack on the multi-pass launch (rows of three or more chunks, a grid of fewer CTAs than SMs): its time model (NOTES-C1 §5.9 MC-3a, §5.11; §6c.9) | **Open model defect.** Shipped model: ×1.50–1.81 its REPEAT and ×1.31–1.65 its COLD prediction on Q24's three narrow-KL shapes, ×1.65–2.02 on M-c's Jacobi view; after the MC-3a candidate refit (Q24 in the fit) −18 % median signed on the Jacobi view's KL B marks (12 % median \|error\| on the allowed narrow-KL records), partly hidden at the call total by a KL A / K4 over-prediction of +9 %. The compute chain `nc · values · g` fits Q24 at 57 ns per step but not the calibration's wide launches (6–13 ns), and an underfilled-only feature breaks monotonicity (§6c.9). **Trigger:** a consumer whose planner decision depends on a narrow-n KL call below about 150 µs (the shipped model is 25–45 % low on its KL B phase and 26–29 % low on its total), or a calibration sweep that adds narrow multi-pass KL packs (which would identify the feature), or an explicit decision to adopt the candidate calibration (the independent review of 2026-10-09, ruling A, declined: MC-3a did not pass). |
 | K5 statistics and a device a-posteriori certificate (lemma L6; NOTES-C1 stage 5) | Deferred: no consumer issues elementwise targets, and the host-side `rho_from_output` (§6g.11) gives a rigorous ρ now. **Triggers** (NOTES-C1 §4.6): T1, a consumer issues ELEMENTWISE requests per phase and the recipe's measured cost is ≥ 3 % of its run; T2, a consumer needs a rigorous per-call elementwise certificate on every call; T3, Eric asks for it. On a trigger it is built as NOTES-C1 §4.6 designs it, with its cost bar restated without `ncu` (compiler resource usage, the occupancy query and A/B timing; IR26). C1's definition of done does not need it (IR26, IR29). |
 | FP8 / INT4 paths | FP8 can't hold residues exactly at speed on Ada. INT4 forces p ≤ 16. |
 
@@ -6652,7 +6662,7 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     ROADMAP C2 retitled). **C1 is not:** stages 0 and 1, the round-2 stage-0 GPU tests and
     M-d1 are done and stage 5 is deferred (T1–T3), but M-c failed and M-d2 has not run.
     What remains is M-d2 (NOTES-C1 §4.3, §5.10); MC-3a was executed on 2026-10-09 and recorded
-    (NOTES-C1 §5.11), with no pass declared.
+    (NOTES-C1 §5.11), with no pass (independent review, ruling A, binding, 2026-10-09).
 - **Final review of C1/C2** (three independent reviewers, approve-with-fixes, 2026-10-07;
   NOTES-C1 Status, "Final review"). No library, calibration, ABI or TLA+ change: host API 13.
   - §3.8: `params.kseg_request` returns None, not 0.0, when no N is certified (rank reads a

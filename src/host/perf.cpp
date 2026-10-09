@@ -81,11 +81,14 @@ constexpr bool optional_param(int cl, int j) {
   return (cl == IMD_PERF_CLASS_KF && j == 4) || (cl == IMD_PERF_CLASS_PACK && j == 3);
 }
 // v1.19 (§6c.9, host API 13, no struct growth): the optional key warm.kl_drop, the share of the
-// REPEAT / WARM saving that KL reads do not get, lives in the first parameter slot past the
-// classes (IMD_PERF_PARAM_CAPACITY holds four classes more than IMD_PERF_CLASS_COUNT). 0 =
-// absent = the saving of every reading phase as before; format 2 only, in [0, 1].
-constexpr int kKlDropIdx = IMD_PERF_CLASS_COUNT * kP;
-static_assert(kKlDropIdx < IMD_PERF_PARAM_CAPACITY, "warm.kl_drop slot");
+// REPEAT / WARM saving that KL reads do not get, lives in param[IMD_PERF_PARAM_KL_DROP_SLOT],
+// the last slot (IMD_PERF_PARAM_CAPACITY holds four classes more than IMD_PERF_CLASS_COUNT; the
+// slots between are unused and 0). 0 = absent = the saving of every reading phase as before;
+// format 2 only, in [0, 1]. The file names the key: the text format does not depend on the slot.
+constexpr int kKlDropIdx = IMD_PERF_PARAM_KL_DROP_SLOT;
+static_assert(IMD_PERF_CLASS_COUNT * kP <= IMD_PERF_PARAM_KL_DROP_SLOT,
+              "warm.kl_drop slot is past every class's slots");
+static_assert(kKlDropIdx == IMD_PERF_PARAM_CAPACITY - 1, "warm.kl_drop slot");
 constexpr const char* kKlDropKey = "warm.kl_drop";
 // v1.15 / v1.17: the retired op_eps keys (formats 1 and 2): accepted (a number >= 0, at most
 // once) and discarded, never written.

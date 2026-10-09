@@ -8,7 +8,11 @@ summary; C1's record continues with MC-3a. **Update, 2026-10-09: MC-3a has been 
 (§5.11): every §6c.5 class target is met on every set, one pre-registered in-sample
 condition is not met under its literal reading, so no pass is declared; M-c stays FAILED,
 the marks stay, the shipped calibration is unchanged, MC-3 is closed without a calibration
-change, and M-d2 may run on its pre-registered bands.** The bullets below that say MC-3a "has
+change, and M-d2 may run on its pre-registered bands. Independent review of MC-3a
+(2026-10-09, binding, ruling A, §5.11): the in-sample condition is read against the shipped
+fit's table, so MC-3a does not pass; M-c stays FAILED, the shipped calibration stays, and
+whether C1's done condition "M-c has passed" is amended is Eric's decision after M-d2 (open
+item for him; not amended here).** The bullets below that say MC-3a "has
 not started" or M-d2 "waits" are the close-out's; §5.11 is current. The "Implementation status" below is the
 detailed log, written as the work went; where they differ, this block is current. Every figure
 here names its source; the libraries are `build/libimmerdink_host.so` sha256 `466acdb4…`
@@ -201,10 +205,10 @@ since the design draft (39972b7), `include/` only in comments.
   stay caller recipes (Q15 (a); B6 shows no value at the sizes measured).
 
 **What remains for C1** (round 2, GPU; updated 2026-10-09): MC-3a is done (§5.11) and MC-3
-is closed without a calibration change, pending the independent reviewer's reading of the one
-in-sample condition (if "worsen" is read against the same records, the candidate
-calibration passes every check and the re-derivations of §5.11 "Verdict" come before M-d2).
-What remains is M-d2 (§4.3; the driver re-registered with the NaN-filled bit-exact check first, then
+is closed without a calibration change (independent review, 2026-10-09, binding ruling A:
+the one in-sample condition is read against the shipped fit's table, so MC-3a does not pass,
+§5.11 "Verdict"). Whether C1's done condition "M-c has passed" is amended is Eric's decision
+after M-d2 (open item for him; not amended). What remains is M-d2 (§4.3; the driver re-registered with the NaN-filled bit-exact check first, then
 eight `run` processes into one records file and one `judge`). In the same GPU round, a
 re-run of `bench/first_call.py --sweep` on the current build (about a minute of GPU), whose
 records name the commit, the library sha256s and the host API (final review; DESIGN §6g.6). Until M-c passes, figures at N ∉ {8, 10, 14, 16} keep
@@ -5053,7 +5057,11 @@ of this section; they are binding.
        - KL A's per-phase median |error| on the allowed narrow-KL records must improve.
        - No phase class's in-sample median or p90 (`perf_fit`'s table) may worsen by more
          than 1 point. KL A, KL B, KF and K4 are reported before and after, also on M-c's
-         Jacobi calls.
+         Jacobi calls. **For future attempts (MC-3a review, 2026-10-09, binding, §5.11):
+         "before" means the shipped fit's `perf_fit` table, as written, and the records a
+         candidate has to add to fit what it models are themselves charged to the candidate
+         (what they do to other classes counts against it). A same-records reading may be
+         reported and is not the condition.**
        - A fresh narrow-KL hold-out must meet every §6c.5 class target. It is committed,
          with a `sweep_disjoint.py` check against `sweep_calib.txt`, `sweep_calib_n.txt`,
          `sweep_mc.txt` and `sweep_perf_validate.txt`, before the refit: at least 3 new
@@ -5451,10 +5459,18 @@ section; M-d2 may run on its pre-registered bands (below). Source: immerdink-eva
   with its size and trigger). This is the cost of "one attempt": the exploration fits were the
   KL class alone on the allowed records, no full calibration was refitted for it.
 - *The key's storage.* A new field in `imd_perf_calib_t` would grow the struct (API 14), so
-  `warm.kl_drop` lives in the first unused parameter slot (`param[72]`, the capacity holds
-  four classes more than exist); the struct, host API 13 and format 2 are unchanged, and a
-  library without it rejects a file that has it. The alternative, a free slot of the `call`
-  class, was rejected as a name that does not describe a cache term. **Please confirm.**
+  `warm.kl_drop` lives in a parameter slot past the classes (the capacity holds four classes
+  more than exist); the struct, host API 13 and format 2 are unchanged, and a library without
+  it rejects a file that has it. The alternative, a free slot of the `call` class, was
+  rejected as a name that does not describe a cache term. The slot was `param[72]` (the first
+  one past the classes) at d974bfc; on the reviewer's must-fix it is the named constant
+  `IMD_PERF_PARAM_KL_DROP_SLOT` = `IMD_PERF_PARAM_CAPACITY - 1` = 95 (header, `perf.cpp`,
+  `host.py`, tests), with a `static_assert` that the classes' slots end before it. The file
+  names the key and the slot is only the in-memory place, so the on-disk format and every file
+  read or written are independent of the slot: the shipped calibration has no such key
+  (byte-identical to before; predictions with the key absent unchanged), and a key written by
+  the earlier build parses to the same value. A hand-built `imd_perf_calib_t` must zero
+  `param` (header note).
 - *The "before" of the in-sample condition* (MC-3a item 4, second bullet). Read literally it
   is the shipped fit's `perf_fit` table (the shipped records only); the refit adds Q24's
   records, and the K4 classes' fit depends on them and not on the key. Both readings are
@@ -5470,7 +5486,7 @@ section; M-d2 may run on its pre-registered bands (below). Source: immerdink-eva
 | in-sample phase classes, `perf_fit` table, **literal** (shipped fit's table → candidate; median / p90, %) | k0 4.4 / 15.4 → 4.4 / 15.5; kf 6.4 / 23.8 → 6.3 / 23.7; kl 6.3 / 16.9 → 6.7 / 17.6; pack unchanged; k4_128x256 3.8 / 15.3 → 3.7 / 14.5; k4_128x128 8.4 / 14.1 → 8.4 / **15.1 (+1.02)**; k4_64x128 9.0 / 22.3 → **10.6 (+1.63)** / 20.8; k4_64x64 9.0 / 28.1 → 9.2 / 24.2; k5 4.5 / 14.4 → 4.5 / 14.1; direct unchanged. **Not met** (two entries, both K4) |
 | the same, **same records** (n1: the refit with Q24 and no key → candidate) | K4 and k0, kf, pack, k5, direct identical (the key does not touch them); kl 8.1 / 19.7 → **6.7 / 17.6**. Met |
 | v1.18 hold-out, all 73 cases in the class statistics (199 calls) | < 100 µs 3.7 / 10.6, 100 µs – 1 ms 2.9 / 7.3, ≥ 1 ms 2.2 / 7.5 % (shipped 3.8 / 10.7, 2.7 / 8.2, 2.5 / 6.4): all met |
-| v1.18 hold-out, the 66 whose GEMM view matches no fit case (171 calls) | 3.7 / 10.1, 2.8 / 7.7, 1.9 / 4.2 % (shipped 3.8 / 10.1, 2.8 / 8.3, 2.2 / 4.5): all met |
+| v1.18 hold-out, the 66 whose GEMM view matches no fit case (69 minus the 3 cache pairs; 171 calls) | 3.7 / 10.1, 2.8 / 7.7, 1.9 / 4.2 % (shipped 3.8 / 10.1, 2.8 / 8.3, 2.2 / 4.5): all met |
 | `mc.jsonl`, 160 calls | < 100 µs 2.9 / 6.9, 100 µs – 1 ms 2.3 / 6.6, ≥ 1 ms 3.0 / 13.5 % (shipped 15.8 / 28.4, 2.5 / 14.7, 3.0 / 7.3): all met, on the M-c N only, the anchors, normal and decay_opp too |
 | `mc_with_repeat_small.jsonl` | 2.1 / 9.5, 2.1 / 4.8, 3.0 / 13.5 %: all met |
 | fresh narrow-KL hold-out (`h_*`, 30 calls: 18 KL, 12 KF; 20 calls < 100 µs, 10 in 100 µs – 1 ms) | **< 100 µs 4.3 / 15.7, 100 µs – 1 ms 2.7 / 6.6 %: met** (shipped 8.2 / 25.5, 3.6 / 15.7: also met). KL shapes +0.7 … +6.6 % except `h_kl3` (`ik,jk->ij`, 1152 × 80 × 1664) +11 … +16 %; KF −7.3 … +4.1 % unchanged |
@@ -5500,20 +5516,34 @@ enters the fit. The call terms stay near the shipped ones (`call.call` +6 %). So
 records, not the key, are what fail the literal in-sample condition and what move the PPL
 view; the key is what removes n1's KL degradation (kl 8.1 / 19.7 → 6.7 / 17.6).
 
-**Verdict.** Not a pass, by the literal reading of one pre-registered condition. If the
-independent reviewer reads "worsen" against the same records (the n1 column), MC-3a would meet
-every check and the following would then be done before M-d2, none of it started: ship
-`mc3a.calib` (with `perf_validate.py --bands` bands), remove the marks for the covered N,
-re-run M-b's [M] figures, re-derive and pre-register the M-d2 bars (the PPL view's +10 … +17 %
-bias would move its bar), re-register `md2_time.py`'s `REGISTERED_CALIB`. Until such a ruling:
-- M-c is FAILED; the marks stay; C1's "M-c has passed" is not met; C1 is open on that
-  condition and on M-d2.
-- **MC-3 is closed without a calibration change** by this section; M-d2 runs on its
-  pre-registered bands with the shipped calibration: 0.750 (PPL view) / 0.664 (DF) / 0.673
-  (4096³), ± the §6c.5 p90 of the class, and ≤ 0.8 (§5.9 "M-d2 ordering"). M-c's and MC-3a's
-  measured ratios must not be used to set or adjust the bars.
-- `warm.kl_drop` stays in the library and the fitter (optional, absent = 0, bit-identical
-  without it, tested) and not in the shipped file.
+**Verdict.** Independent review of MC-3a (2026-10-09, binding): ruling A. Item 4 of §5.9 MC-3a
+("no phase class's in-sample median or p90 may worsen by more than 1 point") is read against
+the shipped fit's `perf_fit` table, as written. Two K4 entries worsen by more than 1 point
+(64x128 median +1.63, 128x128 p90 +1.02), because MC-3 step 3 puts Q24's records into the
+refit. The same-records (n1) reading, against which the candidate meets every check, is
+informative and is not adopted. The pre-registered conditions do not show a pass, so MC-3a
+does not pass. M-c stays FAILED, the shipped calibration (`d31f62ca…`) stays, and MC-3 closes
+without a calibration change. The candidate carries the costs for which §5.9 MC-1 upheld the
+NO on n1 (PPL view +10 … +17.5 % against +2 … +9.7 % shipped, ≥ 1 ms p90 13.2–14.0 % against
+7.3–8.3 %, K4 path parameters fitted to a cache state, and a change to every [M] figure of
+M-b). The shipped calibration also meets every §6c.5 target on the fresh M-c run (13.8 / 28.8,
+2.0 / 14.7, 3.5 / 7.9 %), so there is no demonstrated need that outweighs them; that
+observation is recorded and is not a pass (M-c's first-run miss was marginal and
+run-dependent). `mc3a.calib` stays in immerdink-eval. `warm.kl_drop` stays in the library and
+the fitter (optional, absent = 0, tested, bit-identical when absent; slot
+`IMD_PERF_PARAM_KL_DROP_SLOT`). KL B stays an open model defect (DESIGN §6c.9, §7, NOTES-B2
+§12) with its size and trigger; no second key is tried. M-d2 runs on the shipped calibration
+and its pre-registered bars (0.750 / 0.664 / 0.673, ± the class p90, ≤ 0.8) with run-time
+provenance (commit, dirty flag, library sha256). Whether C1's done condition ("M-c has
+passed") is amended is for Eric to decide after M-d2. No M-c re-run on the shipped
+calibration is to be used to claim a pass.
+
+Consequences, as bound: M-c is FAILED and the [M, model-only, outside hold-out] marks stay;
+C1 is open on its done condition and on M-d2. **M-d2's provenance includes the library
+sha256 and the commit**: the library now contains the `warm.kl_drop` code (d974bfc and the
+slot constant), which is bit-identical to the design-phase [M] library's predictions when the
+key is absent (tested: `suite_perf_v119` and `test_host_c`; the shipped file has no key), so
+the library hash differs from `466acdb4…` and each M-d2 record names the hash it ran on.
 
 **Provenance.** The hold-out, the refit and both M-c judgements use the product commits above;
 the refit's input records are those of the shipped calibration (`calib-20261006-2110`,

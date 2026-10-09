@@ -420,6 +420,8 @@ IMD_API const char* imd_status_string(imd_status_t status);
                                        read, and each is written as itself                  */
 #define IMD_PERF_MAX_PARAMS 6       /* parameters (features) per class                       */
 #define IMD_PERF_PARAM_CAPACITY 96  /* imd_perf_calib_t.param slots: class * 6 + j            */
+#define IMD_PERF_PARAM_KL_DROP_SLOT (IMD_PERF_PARAM_CAPACITY - 1) /* param[] slot of warm.kl_drop
+                                       (v1.19, 95): the last slot, past every class's slots     */
 #define IMD_PERF_MAX_PHASES 16      /* imd_perf_t.phase capacity                              */
 
 /* Kernel classes (one parameter set each; file key prefix in parentheses). */
@@ -528,9 +530,13 @@ typedef struct {
                                      and plane bytes beyond it (§6c.1)                      */
   char gpu[64], date[32], version[64], clocks[128], notes[128];
   double param[IMD_PERF_PARAM_CAPACITY]; /* param[class * IMD_PERF_MAX_PARAMS + j]; 0 unused;
-                             v1.19 (§6c.9): param[IMD_PERF_CLASS_COUNT * IMD_PERF_MAX_PARAMS] =
-                             key warm.kl_drop (optional, 0 when absent, in [0, 1]), the share of
-                             the REPEAT / WARM saving that KL reads do not get                */
+                             v1.19 (§6c.9): param[IMD_PERF_PARAM_KL_DROP_SLOT] = key
+                             warm.kl_drop (optional, 0 when absent, in [0, 1]), the share of
+                             the REPEAT / WARM saving that KL reads do not get. The file names
+                             the key, so the text format does not depend on the slot. A hand-
+                             built imd_perf_calib_t MUST zero `param` (memset the struct): the
+                             last slot is read, and a nonzero one is a warm.kl_drop (outside
+                             [0, 1]: not a valid calibration)                                 */
   /* ---- v7 (format 2). A caller with a version-6 struct_size gets a true format-1 view of a
    *      format-2 calibration: the format-2 parameters zeroed, built-in occupancy, no power
    *      model, no cache term, no bands: a degraded model. Such callers should pass NULL. ---- */

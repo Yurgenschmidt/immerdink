@@ -1775,7 +1775,7 @@ V119_KEY = "warm.kl_drop"
 
 def suite_perf_v119(cal):
     """DESIGN v1.19 §6c.9 (host API 13, no struct growth): the optional key warm.kl_drop, the
-    share of the REPEAT / WARM saving that KL reads do not get (stored in the first parameter
+    share of the REPEAT / WARM saving that KL reads do not get (stored in the last parameter
     slot past the classes). Absent or 0 predicts bit-identically; format 2 only, a number in
     [0, 1], written only when non-zero, round trip; KL phases keep (1 - d) of the saving, every
     other phase, COLD and CLEAN are unchanged; d = 1 puts a KL read at its COLD time."""
@@ -1815,6 +1815,18 @@ def suite_perf_v119(cal):
     back = host.Calibration.parse(tf)
     if bytes(back._raw) != bytes(full._raw) or back.format() != tf:
         raise Fail("warm.kl_drop round trip")
+    # the slot is the named constant (the last slot); the file names the key, so the text does
+    # not depend on it: the key's line is the only difference to the calibration without it
+    if (host._PERF_PARAM_KL_DROP_SLOT != host._PERF_PARAM_CAPACITY - 1 or
+            host._PERF_PARAM_KL_DROP_SLOT < len(host.PERF_CLASSES) * host._PERF_MAX_PARAMS or
+            full._raw.param[host._PERF_PARAM_KL_DROP_SLOT] != d1 or
+            any(full._raw.param[i] != base._raw.param[i]
+                for i in range(host._PERF_PARAM_CAPACITY) if i != host._PERF_PARAM_KL_DROP_SLOT)):
+        raise Fail("warm.kl_drop is not in param[IMD_PERF_PARAM_KL_DROP_SLOT] alone")
+    if [ln for ln in tf.splitlines() if ln not in tb.splitlines()] != [f"{V119_KEY} = {d1}"]:
+        raise Fail("warm.kl_drop: the text differs from the calibration without it by more "
+                   "than the key's line")
+    count += 2
     v6 = host.Calibration.load(os.path.join(ROOT, "tests/data/perf_calib_v6_format1.calib"))
     for why, (t, reason) in {"format-2 key in format 1": (v6.format() + f"{V119_KEY} = 0.5\n",
                                                           "FORMAT2_KEY"),

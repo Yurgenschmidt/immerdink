@@ -159,10 +159,13 @@ first.
     pre-registered in-sample condition fails under its literal reading (two K4 entries, from
     Q24's records), so no pass is declared: M-c stays FAILED, the marks stay, the shipped
     calibration is unchanged, KL B is an open model defect (DESIGN §7), and MC-3 is closed
-    without a calibration change as MC-3a's recorded outcome. For the reviewer: if the
-    in-sample condition is read against the same records, the candidate calibration
-    (immerdink-eval `results/c1/mc3a/refit/mc3a.calib`) passes every check and must be shipped
-    and the bars re-derived before M-d2 (NOTES-C1 §5.11 "Verdict"). Next: M-d2, whose
+    without a calibration change as MC-3a's recorded outcome. **Independent review, binding
+    ruling A (2026-10-09):** the in-sample condition is read against the shipped fit's table, so
+    MC-3a does not pass; the candidate calibration (immerdink-eval
+    `results/c1/mc3a/refit/mc3a.calib`) stays there, `warm.kl_drop` stays in the library and
+    the fitter (slot `IMD_PERF_PARAM_KL_DROP_SLOT` = 95), no second key; **open item for Eric:**
+    whether C1's done condition ("M-c has passed") is amended, decided after M-d2 (NOTES-C1
+    §5.11 "Verdict"). Next: M-d2, whose
     protocol and driver `bench/accuracy/md2_time.py` are pre-registered at 35eeb46 (NOTES-C1
     §4.3, §5.10; one normative records file, the driver frozen from the first M-d2 record on),
     with `--md2-cleared` citing the closure commit and NOTES-C1 §5.11.

@@ -1636,11 +1636,15 @@ c, the small COLD calls ≈ 1.0–1.2 µs faster. The v12-sized struct view (fig
       fitted once, `warm.kl_drop` (the share of the REPEAT saving that KL reads do not get;
       0.70 with Q24 in the fit): KL A's per-phase median |error| on the allowed narrow-KL
       records 35.4 → 4.8 %, and every §6c.5 class target is met on a fresh narrow-KL hold-out,
-      the v1.18 hold-out (all cases and the 69 whose view matches no fit case), `mc.jsonl`
+      the v1.18 hold-out (all 73 cases and the 66 whose view matches no fit case: 69 minus the 3
+      cache pairs, 171 calls), `mc.jsonl`
       with and without the repeat, and a fresh full M-c run; one pre-registered in-sample
       condition (no phase class worsens by more than 1 point) fails on two K4 entries (+1.6
       and +1.0 points) that come from Q24's records, so no pass was declared and the
       candidate calibration is not shipped.
+      Independent review (2026-10-09, binding, ruling A): the condition is read against the
+      shipped fit's table, so MC-3a does not pass; M-c stays failed, the shipped calibration
+      stays, no second key is tried.
     - **KL B stays an open model defect, with its size and trigger.** Size: ×1.50–1.81 its
       REPEAT prediction on Q24's narrow multi-pass packs under the shipped calibration;
       −18 % median signed on M-c's Jacobi KL B marks, 12 % median |error| on the allowed
