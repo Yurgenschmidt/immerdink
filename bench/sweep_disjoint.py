@@ -69,7 +69,9 @@ def self_test():
     """The matching rule and the exit codes on made-up sweeps, then the committed invariant:
     the M-c hold-out (bench/sweep_mc.txt) shares no GEMM view with either fit sweep, and the
     Q24 fit cases (bench/sweep_calib_n.txt) none with M-c or the product hold-out
-    (NOTES-C1 §5.9 MC-3 (4) re-runs M-c on this case list after a refit that includes them)."""
+    (NOTES-C1 §5.9 MC-3 (4) re-runs M-c on this case list after a refit that includes them),
+    and the MC-3a narrow-KL hold-out (bench/sweep_mc3a_holdout.txt, NOTES-C1 §5.11) none with
+    either of those or the fit sweeps."""
     def view(s):
         spec, ext = s.split("|")
         return gemm_view(spec, parse_ext(ext))
@@ -146,16 +148,20 @@ def self_test():
                 fail += 1
 
     bench = os.path.dirname(os.path.abspath(__file__))
-    mc, calib, calib_n, hold_v = (os.path.join(bench, f) for f in (
-        "sweep_mc.txt", "sweep_calib.txt", "sweep_calib_n.txt", "sweep_perf_validate.txt"))
+    mc, calib, calib_n, hold_v, mc3a = (os.path.join(bench, f) for f in (
+        "sweep_mc.txt", "sweep_calib.txt", "sweep_calib_n.txt", "sweep_perf_validate.txt",
+        "sweep_mc3a_holdout.txt"))
     for argv, what in (([mc, "--against", calib, calib_n], "M-c against the fit sweeps"),
                        ([calib_n, "--against", mc, hold_v], "the Q24 cases against M-c and "
-                                                            "the product hold-out")):
+                                                            "the product hold-out"),
+                       ([mc3a, "--against", calib, calib_n, mc, hold_v],
+                        "the MC-3a hold-out against the fit sweeps, M-c and the product "
+                        "hold-out")):
         rc, out = run(argv)
         if rc != 0:
             print(f"FAIL: {what}: a shared GEMM view\n{out}")
             fail += 1
-    n_checked = 2 * len(pairs) + 1 + len(checks) + 2
+    n_checked = 2 * len(pairs) + 1 + len(checks) + 3
     print(f"sweep_disjoint self-test: {n_checked - fail} of {n_checked} checks pass")
     return 1 if fail else 0
 
