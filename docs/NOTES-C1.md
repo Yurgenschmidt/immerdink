@@ -2,21 +2,21 @@
 
 ## Status
 
-**Status at the C1/C2 close-out, 2026-10-07: C2 done; C1 open (next: MC-3a, then M-d2)**
-(branch `claude/ozaki-kernels-immerdink-1089fd`, not pushed). This block is the current
-summary; C1's record continues with MC-3a. **Update, 2026-10-09: MC-3a has been executed
+**Status at the C1/C2 close-out, 2026-10-07: C2 done; C1 open then. Updated 2026-10-09: C1 DONE AS AMENDED (decision by Eric)**
+(branch `claude/ozaki-kernels-immerdink-1089fd`, PR #6 into dev). This block is the current
+summary; C1's record ran on through MC-3a and M-d2. **Update, 2026-10-09: MC-3a has been executed
 (§5.11): every §6c.5 class target is met on every set, one pre-registered in-sample
 condition is not met under its literal reading, so no pass is declared; M-c stays FAILED,
-the marks stay, the shipped calibration is unchanged, MC-3 is closed without a calibration
-change, and M-d2 may run on its pre-registered bands. **Update, 2026-10-09 (later): M-d2 ran
-and PASSES (§5.12): PPL view 0.769 / 0.769 (bar 0.750, band 0.6375-0.8000), DF 0.695 / 0.698 (bar
-0.664, band 0.5644-0.7636), 4096^3 0.696 / 0.692 (bar 0.673, band 0.5721-0.7740), normal /
-decay_opp, 8 first records, all admissible and bit-exact; C1 stays open only on "M-c has
-passed", an open item for Eric.** Independent review of MC-3a
-(2026-10-09, binding, ruling A, §5.11): the in-sample condition is read against the shipped
-fit's table, so MC-3a does not pass; M-c stays FAILED, the shipped calibration stays, and
-whether C1's done condition "M-c has passed" is amended is Eric's decision after M-d2 (open
-item for him; not amended here).** The bullets below that say MC-3a "has
+the marks stay, the shipped calibration is unchanged, and MC-3 is closed without a calibration
+change. Independent review of MC-3a (2026-10-09, binding, ruling A, §5.11): the in-sample
+condition is read against the shipped fit's table, so MC-3a does not pass. **Update, 2026-10-09
+(later): M-d2 ran and PASSES (§5.12): PPL view 0.769 / 0.769 (bar 0.750, band 0.6375-0.8000), DF
+0.695 / 0.698 (bar 0.664, band 0.5644-0.7636), 4096^3 0.696 / 0.692 (bar 0.673, band
+0.5721-0.7740), normal / decay_opp, 8 first records, all admissible and bit-exact. Decision by
+Eric (the maintainer), 2026-10-09: C1's done condition "M-c has passed" is amended, because M-d2
+passed on the shipped calibration, so C1 does not wait on M-c passing; C1 is done as amended, like
+C2 (§4.11). M-c stays FAILED, MC-3a is not a pass (ruling A), and the marks `[M, model-only,
+outside hold-out]` for N outside {8, 10, 14, 16} stay.** The bullets below that say MC-3a "has
 not started" or M-d2 "waits" are the close-out's; §5.11 is current. The "Implementation status" below is the
 detailed log, written as the work went; where they differ, this block is current. Every figure
 here names its source; the libraries are `build/libimmerdink_host.so` sha256 `466acdb4…`
@@ -38,7 +38,8 @@ the `libimmerdink.so` builds named per item.
     revival trigger "a real-operand family meeting (i)" (§4.5, DESIGN §7, ROADMAP C2).
   - The stage-6 gate is decided: **deferred**, with its trigger (§4.7, DESIGN §7, ROADMAP C2).
   - ROADMAP C2 is retitled per Q7 (IR18).
-- **C1 is not done: two of its five conditions are not met.**
+- **C1 was not done at the close-out (two of its five conditions not met); it is done as amended
+  (decision by Eric, 2026-10-09: the condition "M-c has passed" is amended, M-d2 having passed).**
   - Met: stages 0 and 1 shipped with their tests and certificates (`host_footprint_monotone`,
     `host_precision`, `cert_footprint_monotone`, `cert_rho_recipe`).
   - Met: the round-2 stage-0 GPU tests pass, at 4ba78b1 (`libimmerdink.so` `c4bdcc4f…`;
@@ -51,7 +52,7 @@ the `libimmerdink.so` builds named per item.
     `bench/first_call.py` before its first commit (8b58101) and were never re-run on
     committed code; the build is the summary's account, not a record field (DESIGN §6g.6).
     A re-run on the current build is in "What remains" below.
-  - **Not met: M-c has not passed.** It ran on 2026-10-07 and failed one §6c.5 target: the
+  - **Not met, then amended (decision by Eric, 2026-10-09; §4.11): M-c has not passed.** It ran on 2026-10-07 and failed one §6c.5 target: the
     < 100 µs median error is 15.8 % against 15 % (16.1 % in a repeat). The Q24 refit was not
     adopted (§5.9 MC-1). The only authorized path to a pass, the MC-3 feature(s) as amended
     (§5.9 MC-3a), ran on 2026-10-09 (§5.11): one optional key (`warm.kl_drop`, DESIGN §6c.9)
@@ -69,6 +70,9 @@ the `libimmerdink.so` builds named per item.
     (§5.12). (Text written at the close-out, when M-d2 had not run, follows.) Its protocol and
     driver are pre-registered (`bench/accuracy/md2_time.py`, re-registered at fce29e9 with the
     NaN-filled bit-exact check, sha256 `dbbbfe18…`; before it 35eeb46, sha256 `90fa7f92…`).
+  - **Amended 2026-10-09 (decision by Eric):** the condition "M-c has passed" is amended because M-d2
+    passed on the shipped calibration. M-c stays FAILED, MC-3a is not a pass (ruling A), and the
+    marks stay. With it, all five conditions are met or amended: C1 is done as amended.
   - Met: the ROADMAP C1 row shows the Q6 decision column and "stage 5 deferred (triggers
     T1–T3)" (the latter added at this close-out).
 - Every deferral names its trigger in DESIGN §7 or the ROADMAP: met (stage 4, stage 5, stage 6,
@@ -209,13 +213,14 @@ since the design draft (39972b7), `include/` only in comments.
   the N-range plan and Ozaki-I slices parked with triggers (§3.2, §3.3); K-segmentation and B6
   stay caller recipes (Q15 (a); B6 shows no value at the sizes measured).
 
-**What remains for C1** (round 2, GPU; updated 2026-10-09): MC-3a is done (§5.11) and MC-3
+**What remains for C1** (round 2, GPU; updated 2026-10-09): nothing. MC-3a is done (§5.11) and MC-3
 is closed without a calibration change (independent review, 2026-10-09, binding ruling A:
 the one in-sample condition is read against the shipped fit's table, so MC-3a does not pass,
 §5.11 "Verdict"). **M-d2 and the first-call re-run are done (2026-10-09, §5.12):** M-d2
 PASSES; `bench/first_call.py --sweep` re-run on commit 243d9c0 with records naming the commit,
-the library sha256s and the host API (DESIGN §6g.6). Whether C1's done condition "M-c has
-passed" is amended is Eric's decision (open item for him; not amended) and is all that remains. Until M-c passes, figures at N ∉ {8, 10, 14, 16} keep
+the library sha256s and the host API (DESIGN §6g.6). **Decision by Eric, 2026-10-09: C1's done
+condition "M-c has passed" is amended** (M-d2 passed on the shipped calibration), so C1 is done as
+amended. M-c stays failed, so figures at N ∉ {8, 10, 14, 16} keep
 the mark [M, model-only, outside hold-out]. Open outside C1: a `PrecisionPlan` member role
 "A=B" for a self-contraction reading one shared pack through both roles (M-b below; named
 "AB" before the close-out review, which renamed it because `"AB"` is the pack-mode value for
@@ -838,7 +843,8 @@ order of work and a definition of done. They override the earlier text wherever 
 - **At the close-out (2026-10-07): C2 is done, C1 is open** (Status, "Status at the C1/C2
   close-out"). C1 continues with MC-3a (a performance-model feature and refit, GPU) and then
   M-d2. MC-3 can close without a calibration change only as MC-3a's recorded outcome or by
-  Eric's explicit decision (§5.10 MD2-0).
+  Eric's explicit decision (§5.10 MD2-0). (Both ran on 2026-10-09, and Eric amended C1's done
+  condition the same day: C1 is done as amended; Status.)
 - **IR26's premise was wrong (close-out review, 2026-10-07).** GPU performance counters are
   open to all users on this machine, as HANDOFF and the ROADMAP say, not admin-only. Stage 5's
   cost bar keeps its content (A/B timing at stock clocks, the compiler's register count, the
@@ -866,8 +872,8 @@ order of work and a definition of done. They override the earlier text wherever 
 - [I]: inference, not checked.
 
 **Provenance.**
-- Design-phase scratch directory: `/home/ef/.claude/jobs/ca28e7d2/tmp/c1/` (ephemeral). **Copied
-  to immerdink-eval in stage 0** (IR9): the scripts to `scripts/c1/design-phase/`, the records to
+- Design-phase work was done in the author's local scratch directory (ephemeral, not a repo path).
+  **Copied to immerdink-eval in stage 0** (IR9): the scripts to `scripts/c1/design-phase/`, the records to
   `results/c1/design-phase/`, each with its sha256 in `findings/c1-design-phase-manifest.md`. The
   file names below are relative to those directories.
   - Scripts: emulator `emu.py`; scaling variants `exp_acc.py`, `exp_hyb.py`, `exp_lowN.py`;
@@ -3620,6 +3626,10 @@ never as open.
     2026-10-07, failed);
   - M-d1 and M-d2 are reported with their success criteria evaluated;
   - the ROADMAP C1 row shows the Q6 decision column and "stage 5 deferred (triggers T1–T3)".
+  - **Amendment (decision by Eric, 2026-10-09):** the condition "M-c has passed" is amended,
+    because M-d2 passed on the shipped calibration. M-c stays FAILED, MC-3a is not a pass
+    (ruling A, §5.11) and the marks `[M, model-only, outside hold-out]` stay. C1 is done as
+    amended.
 - **C2 is done when:**
   - the M-a summary is published;
   - stage 3 has shipped, including L3c and L7 in Lean;
@@ -3628,6 +3638,11 @@ never as open.
   - the stage-6 gate has been decided: built if it passed, deferred with its trigger otherwise;
   - the ROADMAP C2 row is retitled per Q7.
 - Every deferral names its trigger in DESIGN §7 or the ROADMAP.
+
+*Update, 2026-10-09 (decision by Eric):* MC-3a and M-d2 have run (§5.11, §5.12; M-d2 passed on
+the shipped calibration) and the condition "M-c has passed" is amended: **C1 is done as
+amended**, like C2. M-c stays FAILED, MC-3a is not a pass (ruling A) and the marks stay. The
+paragraph that follows is the close-out's text, kept as written.
 
 *Checked at the close-out, 2026-10-07* (Status, "Status at the C1/C2 close-out"): **C2 is
 done**; **C1 is not, and stays open** (it is neither closed nor deferred; its record continues
@@ -5543,14 +5558,16 @@ observation is recorded and is not a pass (M-c's first-run miss was marginal and
 run-dependent). `mc3a.calib` stays in immerdink-eval. `warm.kl_drop` stays in the library and
 the fitter (optional, absent = 0, tested, bit-identical when absent; slot
 `IMD_PERF_PARAM_KL_DROP_SLOT`). KL B stays an open model defect (DESIGN §6c.9, §7, NOTES-B2
-§12) with its size and trigger; no second key is tried. M-d2 runs on the shipped calibration
+§12; [GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog)) with its size and trigger; no second key is tried. M-d2 runs on the shipped calibration
 and its pre-registered bars (0.750 / 0.664 / 0.673, ± the class p90, ≤ 0.8) with run-time
 provenance (commit, dirty flag, library sha256). Whether C1's done condition ("M-c has
-passed") is amended is for Eric to decide after M-d2. No M-c re-run on the shipped
+passed") is amended was for Eric to decide after M-d2 (he amended it on 2026-10-09 after
+M-d2's pass: §5.12). No M-c re-run on the shipped
 calibration is to be used to claim a pass.
 
 Consequences, as bound: M-c is FAILED and the [M, model-only, outside hold-out] marks stay;
-C1 is open on its done condition and on M-d2. **M-d2's provenance includes the library
+C1 was open on its done condition and on M-d2 (M-d2 passed, §5.12, and Eric amended the
+condition on 2026-10-09: C1 is done as amended). **M-d2's provenance includes the library
 sha256 and the commit**: the library now contains the `warm.kl_drop` code (d974bfc and the
 slot constant), which is bit-identical to the design-phase [M] library's predictions when the
 key is absent (tested: `suite_perf_v119` and `test_host_c`; the shipped file has no key), so
@@ -5570,8 +5587,9 @@ their band on both data sets, every record is admissible and bit-exact, and the 
 the first and only attempts (no re-run, no excess record). Source: immerdink-eval
 `findings/c1-m-d2.md`; records `results/c1/m_d2/md2.jsonl` (the one normative file, 8 records),
 `judge.out` / `judge.json`, `run.log`. This is a time result on the shipped calibration; it
-does not change M-c (FAILED, §5.11 ruling A), and C1's done condition ("M-c has passed") is not
-amended here: that is **Eric's decision, an open item for him**.
+does not change M-c (FAILED, §5.11 ruling A). C1's done condition ("M-c has passed") is not
+amended by this section; **Eric amended it by his decision of 2026-10-09**, on the strength of
+this pass, so C1 is done as amended (§4.11); M-c stays FAILED and the marks stay.
 
 **Order and provenance.**
 1. The two must-fix and docs items of the MC-3a ruling (d1d474e: the named slot constant, the
@@ -5666,12 +5684,11 @@ N = 14: +89 µs, 2.0 % of the call, against about +9 µs in the design-phase run
 and not repeated; cold capture first / steady replay 1.00-1.10 (IR10's 2 x bar is not met).
 Records: immerdink-eval `results/c1/first_call_243d9c0.jsonl`, 20 s of GPU.
 
-**What remains for C1 after M-d2.** The definition of done (§4.11) has one condition not met,
-"M-c has passed" (FAILED, §5.9; MC-3a did not pass, §5.11). **Open item for Eric:** whether
-that condition is amended, and how (for instance to M-c's measured status plus M-d2's pass, or
-a new hold-out run on a shipped calibration chosen by a later review). It is not amended
-here, and no M-c re-run on the shipped calibration is used to claim a pass. Until then the
-[M, model-only, outside hold-out] marks stay.
+**What remains for C1 after M-d2: nothing.** The definition of done (§4.11) had one condition not met,
+"M-c has passed" (FAILED, §5.9; MC-3a did not pass, §5.11). **Decision by Eric, 2026-10-09:** that
+condition is amended, because M-d2 passed on the shipped calibration, and C1 is done as amended.
+M-c stays FAILED, MC-3a is not a pass (ruling A), no M-c re-run on the shipped calibration is used
+to claim a pass, and the [M, model-only, outside hold-out] marks stay.
 
 ---
 

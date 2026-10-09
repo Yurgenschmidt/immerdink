@@ -59,7 +59,8 @@ v1.19 (DESIGN §6c.9, NOTES-C1 §5.9 MC-3a, host API 13): the optional key warm.
 of the REPEAT / WARM saving that KL reads do not get, is fitted after the cache term, against the
 KL phase marks (fit_kl_drop: a scan of d in 0 ... 1 that refits the KL class on the phases raised
 to COLD with the share (1 - d) of the model's saving and scores the REPEAT-state prediction of
-every KL phase against its mark); --kl-drop D fixes it (0: absent, the v1.18 rule).
+every KL phase against its mark). The default is --kl-drop 0 (absent, the v1.18 rule), so a routine
+recalibration never ships a nonzero warm.kl_drop; --kl-drop scan runs the scan, --kl-drop D fixes it.
 
 Host API 10 (DESIGN §6c.3): the metadata strings are checked against the calibration's field
 sizes before anything is written (check_meta: UTF-8 bytes, NUL included, no line break, no
@@ -1085,10 +1086,11 @@ def main(argv=None):
                          "Default delta,omega: the per-call REPEAT saving c is not identifiable "
                          "from the pair records (NOTES-B2 §12 \"Decision: c dropped\"); "
                          "delta,c,omega is the perf-minor fit")
-    ap.add_argument("--kl-drop", default="scan",
+    ap.add_argument("--kl-drop", default="0",
                     help="v1.19: warm.kl_drop, the share of the REPEAT / WARM saving that KL reads "
-                         "do not get: 'scan' (the default: fitted against the KL phase marks) or a "
-                         "number in [0, 1] (0: absent, the v1.18 rule)")
+                         "do not get: a number in [0, 1] (the default 0: the key is absent, the "
+                         "v1.18 rule, so a routine recalibration cannot ship a nonzero key) or "
+                         "'scan' (opt in: fitted against the KL phase marks)")
     ap.add_argument("--byte-pj", type=float, default=0.0,
                     help="scaled form: the fixed unscaled byte energy (pJ per DRAM byte; 0, or "
                          "a stated prior), written as power.byte_pj")

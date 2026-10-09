@@ -533,10 +533,12 @@ typedef struct {
                              v1.19 (§6c.9): param[IMD_PERF_PARAM_KL_DROP_SLOT] = key
                              warm.kl_drop (optional, 0 when absent, in [0, 1]), the share of
                              the REPEAT / WARM saving that KL reads do not get. The file names
-                             the key, so the text format does not depend on the slot. A hand-
-                             built imd_perf_calib_t MUST zero `param` (memset the struct): the
-                             last slot is read, and a nonzero one is a warm.kl_drop (outside
-                             [0, 1]: not a valid calibration)                                 */
+                             the key, so the text format does not depend on the slot. The
+                             struct's layout and size are unchanged (the slot was unused), but
+                             the slot is now meaningful: a hand-built imd_perf_calib_t MUST
+                             zero `param` (memset the struct): the last slot is read, and a
+                             nonzero one is a warm.kl_drop (outside [0, 1]: not a valid
+                             calibration)                                                     */
   /* ---- v7 (format 2). A caller with a version-6 struct_size gets a true format-1 view of a
    *      format-2 calibration: the format-2 parameters zeroed, built-in occupancy, no power
    *      model, no cache term, no bands: a degraded model. Such callers should pass NULL. ---- */

@@ -53,7 +53,7 @@ Spec follow-ups, to do before or alongside M2/M3 (see `spec/README.md`):
 - Statements use exact arithmetic only; the final FP rounding is a hypothesis.
 
 **Exit:** all four lemmas machine-checked with no `sorry`. A CI target builds `proofs/`.
-**Status:** met. `tools/check_proofs.sh` passes; 48 headline theorems use only the standard axioms.
+**Status:** met. `tools/check_proofs.sh` passes; 71 headline theorems use only the standard axioms.
 
 ## M0 — Scaffolding
 
@@ -195,9 +195,10 @@ comparisons are kept outside this repository (docs/BENCHMARKING.md). Note that c
   shipped as precision phases (a plan and a pack per N, published footprint guarantees,
   §6g.1–§6g.9); auto-N is host-side (`precision.PrecisionPlan` over `imd_err_min_moduli` /
   rank, and the rigorous `rho_from_output`, §6g.10–§6g.11); the Ozaki-I slice mode is parked
-  with its triggers (DESIGN §7). C1 is still open: MC-3a ran once (2026-10-09, NOTES-C1 §5.11)
-  and declared no pass, so the performance model's small-N hold-out stays failed; the GPU
-  timing of the schedules (M-d2) remains.
+  with its triggers (DESIGN §7). C1 is done as amended (decision by Eric, 2026-10-09): MC-3a ran once (2026-10-09,
+  NOTES-C1 §5.11) and declared no pass, so the performance model's small-N hold-out (M-c) stays
+  failed; M-d2, the GPU timing of the schedules, ran on 2026-10-09 and passed (§5.12) on the
+  shipped calibration, and Eric amended the done condition "M-c has passed" accordingly.
 - **Packed symmetric tensor contractions** (generic permutational symmetry). Wanted by
   Eric (2026-10-03), long-term; motivating case: the particle–particle ladder (PPL) in
   DF-CCSD. Operands and/or output are stored packed over permutational symmetry groups

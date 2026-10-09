@@ -1645,7 +1645,8 @@ c, the small COLD calls ≈ 1.0–1.2 µs faster. The v12-sized struct view (fig
       Independent review (2026-10-09, binding, ruling A): the condition is read against the
       shipped fit's table, so MC-3a does not pass; M-c stays failed, the shipped calibration
       stays, no second key is tried.
-    - **KL B stays an open model defect, with its size and trigger.** Size: ×1.50–1.81 its
+    - **KL B stays an open model defect, with its size and trigger** (tracked as
+      [GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog)). Size: ×1.50–1.81 its
       REPEAT prediction on Q24's narrow multi-pass packs under the shipped calibration;
       −18 % median signed on M-c's Jacobi KL B marks, 12 % median |error| on the allowed
       narrow-KL records, under the candidate. The v1.8 compute chain was re-tested offline

@@ -134,10 +134,14 @@ first.
   calls (+2 … +5 %), pre-packed g < N in the S rule, tiny-shape K4 / KF. GPU: 18.7 min (90 min
   sweep wall time, mostly gate waits for other GPU users).
 - **Adaptive precision C1 / C2 (2026-10-07, branch `claude/ozaki-kernels-immerdink-1089fd`,
-  not pushed; DESIGN v1.19 §6g and §3.8, host API 13, no ABI, calibration-format or TLA+
-  change):** the design and the current state are docs/NOTES-C1.md (read its Status, "Status
+  PR #6 into dev; DESIGN v1.19 §6g and §3.8, host API 13, no ABI-layout, calibration-format or
+  TLA+ change; `imd_perf_calib_t` keeps its layout and size, but `param[95]` is now the optional
+  key `warm.kl_drop`, so a hand-built struct must zero `param`):** the design and the current state are docs/NOTES-C1.md (read its Status, "Status
   at the C1/C2 close-out", first). **C2 is done** by its definition of done (NOTES-C1 §4.11);
-  **C1 is open**: M-c failed (MC-3a did not pass, ruling A); **M-d2 ran on 2026-10-09 and PASSES** (NOTES-C1 §5.12); what remains is Eric's decision on C1's done condition "M-c has passed".
+  **C1 is done as amended** (decision by Eric, 2026-10-09): M-c failed (MC-3a did not pass,
+  ruling A), **M-d2 ran on 2026-10-09 and PASSES** (NOTES-C1 §5.12), and Eric amended C1's
+  done condition "M-c has passed" because M-d2 passed on the shipped calibration; M-c stays
+  FAILED and the `[M, model-only, outside hold-out]` marks stay.
   - Shipped: stage 0, precision phases (a plan and a pack per N, published footprint
     monotonicity F1–F3, the re-pack rule, `PackedBuffer`); stage 1,
     `immerdink.precision.PrecisionPlan` and `rho_from_output`; stage 3, the K-segmentation
@@ -148,7 +152,7 @@ first.
     K-equilibration) closed by its gate (no real psi4 contraction of the ≥ 2048³ class passes the guard); stage 6
     (library-internal weights) deferred; stage 5 (K5 statistics + device certificate) deferred,
     triggers T1–T3.
-  - **Open (C1, GPU):** M-c ran on 2026-10-07 and **failed** (binding, NOTES-C1 §5.9): the
+  - **C1 record (GPU), closed as amended:** M-c ran on 2026-10-07 and **failed** (binding, NOTES-C1 §5.9): the
     < 100 µs median was missed (15.8 % against 15 %) through a small-N optimism on the KF path
     (1024³ at N = 4) and narrow-n KL calls (KL A keeps only part of its REPEAT credit, the
     narrow pack KL B is slow in every cache state; per-phase table in immerdink-eval
@@ -158,20 +162,22 @@ first.
     with Q24, a fresh 160-call M-c run. Every §6c.5 class target is met on every set, but one
     pre-registered in-sample condition fails under its literal reading (two K4 entries, from
     Q24's records), so no pass is declared: M-c stays FAILED, the marks stay, the shipped
-    calibration is unchanged, KL B is an open model defect (DESIGN §7), and MC-3 is closed
+    calibration is unchanged, KL B is an open model defect (DESIGN §7; [GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog)), and MC-3 is closed
     without a calibration change as MC-3a's recorded outcome. **Independent review, binding
     ruling A (2026-10-09):** the in-sample condition is read against the shipped fit's table, so
     MC-3a does not pass; the candidate calibration (immerdink-eval
     `results/c1/mc3a/refit/mc3a.calib`) stays there, `warm.kl_drop` stays in the library and
-    the fitter (slot `IMD_PERF_PARAM_KL_DROP_SLOT` = 95), no second key; **open item for Eric:**
-    whether C1's done condition ("M-c has passed") is amended, decided after M-d2 (NOTES-C1
-    §5.11 "Verdict"). **M-d2 ran on 2026-10-09 and PASSES** (NOTES-C1 §5.12, DESIGN §6g.9;
+    the fitter (slot `IMD_PERF_PARAM_KL_DROP_SLOT` = 95), no second key. **Decision by Eric,
+    2026-10-09, after M-d2 (NOTES-C1 §5.11 "Verdict", §5.12):** C1's done condition ("M-c has
+    passed") is amended, because M-d2 passed on the shipped calibration; C1 is done as amended.
+    `perf_fit.py --kl-drop` now defaults to 0 (key absent, the v1.18 rule; `scan` is opt-in), so
+    a routine `tools/calibrate.sh` run cannot ship a nonzero `warm.kl_drop`. **M-d2 ran on 2026-10-09 and PASSES** (NOTES-C1 §5.12, DESIGN §6g.9;
     driver `bench/accuracy/md2_time.py` re-registered at fce29e9 with the NaN-filled bit-exact
     check; records and findings in immerdink-eval `results/c1/m_d2/md2.jsonl`,
     `findings/c1-m-d2.md`): the schedule against fixed N = 14, normal / decay_opp, PPL view
     0.769 / 0.769 (bar 0.750), DF 0.695 / 0.698 (0.664), 4096^3 0.696 / 0.692 (0.673), all
-    inside their bands; `bench/first_call.py --sweep` re-run on 243d9c0 (DESIGN §6g.6). What
-    remains for C1 is Eric's decision on the done condition "M-c has passed".
+    inside their bands; `bench/first_call.py --sweep` re-run on 243d9c0 (DESIGN §6g.6). Nothing
+    remains for C1.
   - Open outside C1: a `PrecisionPlan` member role "A=B" (one shared pack read through both
     roles; named "AB" before the close-out review), trigger the ehrenfest-side integration of
     the B2 performance model declaring DF-factor sharing (ROADMAP C1).
@@ -188,9 +194,9 @@ first.
 - **D3 gate (Eric, 2026-10-04):** D3 begins with a design/theory discussion with Eric to narrow
   the questions. Do not start D3 agents or specs before that.
 - **Roadmap done:** A1, A2, A3, A4, A5 (2026-10-04, docs/NOTES-A5.md), D1, D4 part 1, B1, B2;
-  C2 (2026-10-07, on the C1/C2 branch above, not merged). Next by Eric's priority: D3 (packed
-  symmetric contractions; design preference: one generic kernel, else split; TLA+ first),
-  and C1's remaining GPU work (MC-3a, then M-d2; the C1/C2 bullet above).
+  C1 and C2 (2026-10-09 and 2026-10-07; PR #6 into dev, the C1/C2 bullet above; C1 done as amended).
+  Next by Eric's priority: D3 (packed
+  symmetric contractions; design preference: one generic kernel, else split; TLA+ first).
   SE items are parked. For tiny-call timings use `imd_bench --methods duel` (two immerdink
   configurations interleaved; docs/BENCHMARKING.md, NOTES-A5 §1.2). The bench is
   immerdink-only; comparisons with other libraries live in the evaluation workspace.

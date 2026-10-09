@@ -95,8 +95,11 @@ stage-6 gates: caller-side K-equilibration (stage 4) is closed and library-inter
 evidence (NOTES-C1 IR26). Each has its trigger in §7, and the convergence study's caller
 guidance is in §6g.12. The performance model's small-N hold-out (M-c) failed, so levels
 outside N ∈ {8, 10, 14, 16} stay [M, model-only, outside hold-out] (§6g.9; the one MC-3a attempt
-of 2026-10-09 declared no pass, §6c.9), and the GPU timing of the schedules (M-d2) ran on 2026-10-09 and passes (§6g.9, NOTES-C1 §5.12). No semantic, layout, launch, pack-format, API,
-calibration-format or TLA+ change; changed text is marked **[v1.19]**.
+of 2026-10-09 declared no pass, §6c.9), and the GPU timing of the schedules (M-d2) ran on 2026-10-09 and passes (§6g.9, NOTES-C1 §5.12). No semantic, launch, pack-format, API,
+calibration-format or TLA+ change; changed text is marked **[v1.19]**. The one ABI-adjacent
+point: `imd_perf_calib_t` keeps its layout and size, but `param[95]` (the last slot, unused
+before) is now the optional key `warm.kl_drop` (§6c.9), so a hand-built `imd_perf_calib_t` must
+zero `param`.
 The change lists are at the end.
 
 Sources:
@@ -1919,6 +1922,10 @@ there is no budget option (BENCHMARKS "Residue-group size g" gives the speed sid
   grow by one whenever a function, an enum value or a trailing `imd_lowering_t` field is
   added. Nothing that exists changes meaning, signature or layout; a change that would is
   a new function name.
+- **[v1.19]** `imd_perf_calib_t`'s layout and size are unchanged by the optional key
+  `warm.kl_drop` (§6c.9), but `param[IMD_PERF_PARAM_KL_DROP_SLOT]` (= 95, the last of the 96
+  slots, unused before) is now meaningful: a caller that builds an `imd_perf_calib_t` by hand
+  must zero `param` (memset the struct), or a stray value in that slot is read as the key.
 - `imd_lowering_t` is versioned by `struct_size`: an older caller's smaller struct gets the
   fields it knows; a newer caller's larger struct keeps its unknown trailing fields
   untouched. Callers check `imd_host_api_version() >= ` the version they need.
@@ -4396,7 +4403,9 @@ the saving the model credits is C − R and the share the mark keeps is (C − m
   saving, and the REPEAT-state prediction θ · x − (1 − d)(C − R) of **every KL phase** (A and B,
   every record with the narrow-KL shapes of Q24 among them) is scored against its mark by
   relative squared error; the smallest sum wins. It is chosen on the KL A / KL B phase marks, not
-  on call totals, and the scan is printed. `--kl-drop D` fixes it (0: the v1.18 rule).
+  on call totals, and the scan is printed. The scan is opt-in, `--kl-drop scan`: the default is
+  `--kl-drop 0` (key absent, the v1.18 rule), so a routine recalibration (`tools/calibrate.sh`)
+  cannot ship a nonzero `warm.kl_drop`; `--kl-drop D` fixes it.
 - **Where it is stored.** `imd_perf_calib_t` keeps its size (host API 13, calibration format 2):
   the key lives in the last parameter slot, `param[IMD_PERF_PARAM_KL_DROP_SLOT]` (the macro,
   `IMD_PERF_PARAM_CAPACITY - 1` = 95; the capacity of 96 slots holds four classes more than there
@@ -4407,7 +4416,7 @@ the saving the model credits is C − R and the share the mark keeps is (C − m
   Python: `Calibration.warm["warm.kl_drop"]`.
 
 **Not modeled.**
-- *KL B's multi-pass time (open model defect).* The candidate named by the v1.8 data, a compute
+- *KL B's multi-pass time (open model defect, tracked as [GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog)).* The candidate named by the v1.8 data, a compute
   chain `nc · values · g` steps on the busiest SM (`kl` slot 4, the retired `op_eps` slot),
   fits Q24's narrow packs at 57 ns per step (A and B alike: 1.36 and 0.68 µs per modulus over 24
   and 12 steps) but the calibration's wide launches reject that coefficient: the NNLS gives
@@ -4417,7 +4426,8 @@ the saving the model credits is C − R and the share the mark keeps is (C − m
   `scripts/c1/mc3a/kl_cv.py`, diff of the trial in `results/c1/mc3a/chain_exploration.diff`).
   A feature restricted to underfilled launches would fit, but its switch breaks the monotonicity
   of the prediction in the shape (a bigger shape would take less). So no second key; the
-  defect is recorded with its size and a trigger in NOTES-B2 §12 and §7 below. The narrow packs
+  defect is recorded with its size and a trigger in NOTES-B2 §12 and §7 below, and tracked as
+  [GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog). The narrow packs
   of Q24 enter the refit, which absorbs part of it into `kl.wave` and `kl.launch` (NOTES-C1 §5.11
   reports by how much).
 - *KF's saving against N and with g < N.* No key. The marks above are the evidence; the Q24 KF
@@ -5273,8 +5283,9 @@ it.
     calibration change. Independent review (2026-10-09, binding, ruling A, NOTES-C1 §5.11): the
     in-sample condition is read against the shipped fit's table, so MC-3a does not pass; the
     shipped calibration stays, `mc3a.calib` stays in immerdink-eval, `warm.kl_drop` stays in
-    the library and the fitter, and no second key is tried. Whether C1's done condition
-    ("M-c has passed") is amended is Eric's decision after M-d2 (not amended).
+    the library and the fitter, and no second key is tried. C1's done condition
+    ("M-c has passed") was amended by Eric's decision of 2026-10-09, after M-d2's pass (C1 is
+    done as amended; M-c stays failed and the marks stay).
   - Indicative, not M-d2, and never used to set its bars: the schedule ending at N = 14,
     computed from M-c's single-call medians, is 0.003–0.023 above its [M] ratio on 2000³,
     4096³, DF, QZ and the PPL view, and 0.005–0.028 below on 1024³ and skinny. On the Jacobi
@@ -5749,7 +5760,7 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 | Multi-N packs; round-to-odd reference-integer packs; lower-N planes from a higher-N pack (NOTES-C1 §3.1 A3, A4, A6) | A multi-N pack has the same bytes as separate packs and saves one FP64 read per pack creation, for N-set key semantics. A round-to-odd pack takes 5 / 8 / 9 / 11 B per element at N_max = 8 / 14 / 16 / 20 (≥ FP64 from N_max = 14), each call still reads ≥ 8 B per element, and it saves only the S pass that KL already fuses. Lower-N planes cannot come from a higher-N pack: σ depends on N, rounding is not modular, and the CRT over a prefix gives z mod P(N′) (PackedOperand `neg_n`). |
 | Choosing N on the device within a call | N fixes the launch sequence, the K5 instantiation, W, the workspace and σ itself, and kernel scope forbids the sync. N is chosen on the host per phase (§6g.10). |
 | Ozaki-I slice mode: prefix slices, one pack for every precision (C1(c), NOTES-C1 §2.9, §3.3) | Parked. Faster than Ozaki-II only on benign data below about 1e−8, break-even near 1e−10, 1.25–1.75× slower at FP64 level [E], no win beyond S = 2 slices on heavy-tailed rows; and no operand is needed at two N at once. **Triggers:** a consumer needs one operand at two or more precisions at once under memory pressure, or M-d measures phase-switch re-packs at ≥ 5 % of a phase. A revival must beat the prefix-plane option and the best configuration without slices (a shared pack, separate packs or in-line). On the DF-CCSD contraction set a pack serving every N could save nothing in the 12 forcing-rule cases with real operands (the best of those configurations is already at or below the ideal: each member at its own floor reading one pack) and up to 9.1 % per iteration with one member's floor a level apart (16.0 % at 8 against 14) in synthetic floor patterns [M, model-only, outside hold-out; the slice pack priced as an ordinary pack at the group's top floor, no slice per-call penalty; B roles of one-factor contractions in-line, bare-factor norms; NOTES-C1 §3.3, M-b]. The share-group raise cost (shared against separate packs) is not that bar. A revival builds its TLA+ then. |
-| **[v1.19]** KL B, the narrow operand's pack on the multi-pass launch (rows of three or more chunks, a grid of fewer CTAs than SMs): its time model (NOTES-C1 §5.9 MC-3a, §5.11; §6c.9) | **Open model defect.** Shipped model: ×1.50–1.81 its REPEAT and ×1.31–1.65 its COLD prediction on Q24's three narrow-KL shapes, ×1.65–2.02 on M-c's Jacobi view; after the MC-3a candidate refit (Q24 in the fit) −18 % median signed on the Jacobi view's KL B marks (12 % median \|error\| on the allowed narrow-KL records), partly hidden at the call total by a KL A / K4 over-prediction of +9 %. The compute chain `nc · values · g` fits Q24 at 57 ns per step but not the calibration's wide launches (6–13 ns), and an underfilled-only feature breaks monotonicity (§6c.9). **Trigger:** a consumer whose planner decision depends on a narrow-n KL call below about 150 µs (the shipped model is 25–45 % low on its KL B phase and 26–29 % low on its total), or a calibration sweep that adds narrow multi-pass KL packs (which would identify the feature), or an explicit decision to adopt the candidate calibration (the independent review of 2026-10-09, ruling A, declined: MC-3a did not pass). |
+| **[v1.19]** KL B, the narrow operand's pack on the multi-pass launch (rows of three or more chunks, a grid of fewer CTAs than SMs): its time model (NOTES-C1 §5.9 MC-3a, §5.11; §6c.9) | **Open model defect** ([GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog)). Shipped model: ×1.50–1.81 its REPEAT and ×1.31–1.65 its COLD prediction on Q24's three narrow-KL shapes, ×1.65–2.02 on M-c's Jacobi view; after the MC-3a candidate refit (Q24 in the fit) −18 % median signed on the Jacobi view's KL B marks (12 % median \|error\| on the allowed narrow-KL records), partly hidden at the call total by a KL A / K4 over-prediction of +9 %. The compute chain `nc · values · g` fits Q24 at 57 ns per step but not the calibration's wide launches (6–13 ns), and an underfilled-only feature breaks monotonicity (§6c.9). **Trigger:** a consumer whose planner decision depends on a narrow-n KL call below about 150 µs (the shipped model is 25–45 % low on its KL B phase and 26–29 % low on its total), or a calibration sweep that adds narrow multi-pass KL packs (which would identify the feature), or an explicit decision to adopt the candidate calibration (the independent review of 2026-10-09, ruling A, declined: MC-3a did not pass). |
 | K5 statistics and a device a-posteriori certificate (lemma L6; NOTES-C1 stage 5) | Deferred: no consumer issues elementwise targets, and the host-side `rho_from_output` (§6g.11) gives a rigorous ρ now. **Triggers** (NOTES-C1 §4.6): T1, a consumer issues ELEMENTWISE requests per phase and the recipe's measured cost is ≥ 3 % of its run; T2, a consumer needs a rigorous per-call elementwise certificate on every call; T3, Eric asks for it. On a trigger it is built as NOTES-C1 §4.6 designs it, with its cost bar restated without `ncu` (compiler resource usage, the occupancy query and A/B timing; IR26). C1's definition of done does not need it (IR26, IR29). |
 | FP8 / INT4 paths | FP8 can't hold residues exactly at speed on Ada. INT4 forces p ≤ 16. |
 
@@ -6657,7 +6668,9 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     automatic continuation after two inadmissible attempts, STOPPED or a refused file;
     library identity and `--md2-cleared`'s citation checked; re-registered at 35eeb46.
 - **C1/C2 close-out** (NOTES-C1 §4.11, IR29; 2026-10-07; docs and docstrings only). No
-  library, calibration or ABI change in v1.19: host API 13. Since the C1 design draft
+  library, calibration or ABI *layout* change in v1.19: host API 13 (the later MC-3a key
+  `warm.kl_drop` uses the previously unused `param[95]` of `imd_perf_calib_t`, same layout and
+  size; a hand-built struct must zero `param`, §6c.9). Since the C1 design draft
   (39972b7) `src/` has not changed, `include/` only in comments (§6a F1–F3), and Python
   gained `precision.py`, `PackSpec.with_moduli` and `PackedBuffer` (§6g.5, §6g.10).
   - §6g.12: the M-d1 caller guidance (DIIS reset at a switch, a subspace's recompute and its
@@ -6679,11 +6692,12 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     "restated without `ncu`" stands).
   - The definition of done (NOTES-C1 §4.11): **C2 is done** (M-a published; stage 3 shipped
     with L3c and L7 in Lean; stage 4 closed and stage 6 deferred, each with its trigger;
-    ROADMAP C2 retitled). **C1 is not:** stages 0 and 1, the round-2 stage-0 GPU tests and
-    M-d1 are done and stage 5 is deferred (T1–T3), but M-c failed. M-d2 has since run and
-    passed (NOTES-C1 §5.12); what remains is Eric's decision on the done condition "M-c has
-    passed". MC-3a was executed on 2026-10-09 and recorded
-    (NOTES-C1 §5.11), with no pass (independent review, ruling A, binding, 2026-10-09).
+    ROADMAP C2 retitled). **C1 was not at the close-out:** stages 0 and 1, the round-2 stage-0
+    GPU tests and M-d1 were done and stage 5 deferred (T1–T3), but M-c failed. MC-3a was
+    executed on 2026-10-09 and recorded (NOTES-C1 §5.11), with no pass (independent review,
+    ruling A, binding, 2026-10-09). M-d2 then ran and passed (NOTES-C1 §5.12), and **Eric
+    amended the done condition "M-c has passed" (decision, 2026-10-09; M-d2 passed on the
+    shipped calibration): C1 is done as amended.** M-c stays FAILED and the marks stay.
 - **Final review of C1/C2** (three independent reviewers, approve-with-fixes, 2026-10-07;
   NOTES-C1 Status, "Final review"). No library, calibration, ABI or TLA+ change: host API 13.
   - §3.8: `params.kseg_request` returns None, not 0.0, when no N is certified (rank reads a
