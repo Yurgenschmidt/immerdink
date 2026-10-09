@@ -166,7 +166,7 @@ first.
     the fitter (slot `IMD_PERF_PARAM_KL_DROP_SLOT` = 95), no second key; **open item for Eric:**
     whether C1's done condition ("M-c has passed") is amended, decided after M-d2 (NOTES-C1
     §5.11 "Verdict"). Next: M-d2, whose
-    protocol and driver `bench/accuracy/md2_time.py` are pre-registered at 35eeb46 (NOTES-C1
+    protocol and driver `bench/accuracy/md2_time.py` are pre-registered, re-registered at fce29e9 with the NaN-filled bit-exact check (NOTES-C1
     §4.3, §5.10; one normative records file, the driver frozen from the first M-d2 record on),
     with `--md2-cleared` citing the closure commit and NOTES-C1 §5.11.
   - Open outside C1: a `PrecisionPlan` member role "A=B" (one shared pack read through both

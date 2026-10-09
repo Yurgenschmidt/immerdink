@@ -63,7 +63,8 @@ the `libimmerdink.so` builds named per item.
     reported and meets its criterion on every system; **M-d2 has not run**: the binding
     ordering made it wait for MC-3a (§5.9 "M-d2 ordering", §5.10 MD2-0); MC-3a's recorded
     outcome (§5.11) closes MC-3 without a calibration change, so it may now run. Its protocol and
-    driver are pre-registered (`bench/accuracy/md2_time.py` at 35eeb46, sha256 `90fa7f92…`).
+    driver are pre-registered (`bench/accuracy/md2_time.py`, re-registered at fce29e9 with the
+    NaN-filled bit-exact check, sha256 `dbbbfe18…`; before it 35eeb46, sha256 `90fa7f92…`).
   - Met: the ROADMAP C1 row shows the Q6 decision column and "stage 5 deferred (triggers
     T1–T3)" (the latter added at this close-out).
 - Every deferral names its trigger in DESIGN §7 or the ROADMAP: met (stage 4, stage 5, stage 6,
@@ -651,12 +652,13 @@ what has been built since is recorded under "Implementation status".
   MC-3a's recorded outcome or by Eric's explicit decision. Instead, before any M-d2
   measurement:
   - *Protocol and driver pre-registered,* first at 3254b15, re-registered at daf3583 after
-    the review (approve-with-fixes, §5.10), and **re-registered at 35eeb46** after the
-    re-review (approve-with-fixes, §5.10 "Re-review"), which is normative:
-    `bench/accuracy/md2_time.py`, sha256 `90fa7f92a143…` (in full in §4.3), whose
+    the review (approve-with-fixes, §5.10), re-registered at 35eeb46 after the
+    re-review (approve-with-fixes, §5.10 "Re-review"), and **re-registered at fce29e9** with the
+    NaN-filled bit-exact check (final review's requirement; no M-d2 record existed), which is
+    normative: `bench/accuracy/md2_time.py`, sha256 `dbbbfe18bc4e…` (in full in §4.3), whose
     docstring is the protocol (§4.3 "M-d2", "Pre-registered protocol"). It has four modes:
     `predict` (CPU), `run` (GPU, one fresh process per system and data set), `judge` (CPU)
-    and `selftest` (CPU, the decision and provenance rules, 95 checks; the CPU-only ctest
+    and `selftest` (CPU, the decision and provenance rules, 102 checks since fce29e9, 95 before; the CPU-only ctest
     `md2_time_selftest`).
     - `judge` decides per system *and data set* by the pre-registered rules (a)–(d) (§4.3):
       records that are contaminated, or whose bit-exact check is not true at every level,
@@ -2412,9 +2414,12 @@ under 100 µs (10–13 %).
     N = 8–9 is reported even if small.
   - **Pre-registered protocol** (2026-10-07, before any M-d2 measurement). Not run: it waits
     for the MC-3 path (Status "M-d2").
-    - *Normative driver:* `bench/accuracy/md2_time.py` at **35eeb46**, sha256
-      `90fa7f92a1439f4056253aa69d378fadda4cee3751b2ec5ce0b221ca262f5b9a`; its docstring is
-      normative. It replaces daf3583 (sha256 `b4cb9326…`), which the re-review found to
+    - *Normative driver:* `bench/accuracy/md2_time.py` at **fce29e9**, sha256
+      `dbbbfe18bc4e68ce3ba834d33fd21a7dc993fa6f9f0f75fda8eab04057593b7c`; its docstring is
+      normative. It differs from 35eeb46 (sha256 `90fa7f92a1439f4056253aa69d378fadda4cee3751b2ec5ce0b221ca262f5b9a`)
+      only by the NaN-filled bit-exact check below (and three new selftest checks; the protocol,
+      bars, bands and `REGISTERED_CALIB` are unchanged: the calibration did not change, §5.11),
+      and was re-registered on 2026-10-09 when no M-d2 record existed. It replaces 35eeb46, daf3583 (sha256 `b4cb9326…`), which the re-review found to
       leave forking paths open outside one records file, and 3254b15 (sha256
       `95ed2f6c…`), whose judge the first review found wrong (§5.10).
     - *Decisions:* §5.10 MD2-0 to MD2-8, reviewed twice (approve-with-fixes both times; the
@@ -2423,15 +2428,18 @@ under 100 µs (10–13 %).
       then exits 1). Update the bars, the band classes and `REGISTERED_CALIB` in the
       driver, and commit before any M-d2 run. That re-registers the driver: a new commit
       and sha256 here (allowed before the first M-d2 record; below).
-    - *Required at the next re-registration, before any M-d2 run, whether or not the
-      calibration changes* (final review of C1/C2, binding): `run`'s bit-exact check (rule
+    - ***Applied at fce29e9*** (the next re-registration; no M-d2 record existed). The
+      requirement (final review of C1/C2, binding), whether or not the
+      calibration changes: `run`'s bit-exact check (rule
       (a)) fills C with a NaN bit pattern before the in-line reference call and before the
       packed call, and counts a level as bit-exact only if the in-line call wrote every
       element (no pattern left) and the packed result equals it. At 35eeb46 C is not reset
       between the two calls, so a packed call that writes nothing would compare equal
-      (`tests/test_phases.py` guards the same case: "the reference is not vacuous"). Not
-      applied now: changing the driver re-registers it, and the review placed the fix in the
-      next re-registration; M-d2 cannot run before one (the ordering above).
+      (`tests/test_phases.py` guards the same case: "the reference is not vacuous"). The
+      pattern is `NAN_BITS` = 0x7FF8DEADBEEF0001; `bitexact_level` is the rule (selftest:
+      equal and written, a differing bit, vacuous both, packed wrote nothing, one element
+      unwritten, another NaN payload is a result; mutants that drop the written test fail
+      two checks each); each record also carries `bitexact_unwritten` per level.
     - *Records, freeze and continuation* (binding; the re-review's must-fix, §5.10 MD2-8 as
       amended; mirrored in the driver's docstring):
       - *One normative records file:* immerdink-eval `results/c1/m_d2/md2.jsonl`. Every
@@ -2525,7 +2533,7 @@ under 100 µs (10–13 %).
         `host_lib_sha256`, `host_api`).
 
       `run` also refuses a re-run of a decided pair, a third record, and any M-d2 system
-      after a bit-exact failure in the file. `md2_time.py selftest` (95 checks, the bars,
+      after a bit-exact failure in the file. `md2_time.py selftest` (102 checks, the bars,
       bands, runs and protocol constants pinned as literals) is the CPU-only ctest
       `md2_time_selftest`.
     - *Budget:* about 3 min of GPU in all for 8 processes, each well under 1 min per lock

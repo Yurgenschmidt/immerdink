@@ -5275,7 +5275,8 @@ it.
     calibration change only as MC-3a's recorded outcome or by Eric's decision); MC-3a's
     recorded outcome (NOTES-C1 §5.11) closes it, so M-d2 may run on its pre-registered bars.
     - Its protocol and driver are pre-registered: `bench/accuracy/md2_time.py`,
-      re-registered after two reviews, now at 35eeb46 (sha256 `90fa7f92…`; NOTES-C1 §4.3).
+      re-registered after two reviews at 35eeb46 and, with the NaN-filled bit-exact check, at
+      fce29e9 (sha256 `dbbbfe18…`; NOTES-C1 §4.3).
     - The review (approve-with-fixes; NOTES-C1 §5.10, binding) upheld MD2-0 to MD2-7.
       The fixes:
       - the judge decides per system *and* data set, by rules (a)–(d): contaminated or
@@ -6616,7 +6617,8 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     view matches no fit case.
 - **M-d2, pre-registered and not run** (NOTES-C1 §4.3, §5.10; 2026-10-07; no library,
   calibration or ABI change). `bench/accuracy/md2_time.py` (3254b15; re-registered after
-  review at daf3583 and after the re-review at 35eeb46) has four modes:
+  review at daf3583, after the re-review at 35eeb46, and at fce29e9 with the NaN-filled
+  bit-exact check) has four modes:
   - `predict` (CPU) checks that the shipped calibration reproduces the registered bars, and
     that the library's embedded calibration equals the registered file;
   - `run` (GPU) times the 16-call schedules end to end, in-line (gated) and with the
