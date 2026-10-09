@@ -30,6 +30,13 @@ downloaded, never built from source.
 | L4b (carry) | `Chunk.epi_modEq_total`, `epi_mem_range`, end to end `carry_correct` | `Proofs/Chunk.lean` |
 | L4c (int32 epilogue) | `Chunk.epi_input_range`, `epi_input_int32`, `design_constants` | `Proofs/Chunk.lean` |
 | "L1c + L2c ⇒ exact" | `Exact.emulated_product_exact` (L1c + L4 + L2c chained) | `Proofs/Exact.lean` |
+| L3c (1), the ν form | `Error.l3c_unit` (E = `unitE δ ν_a ν_b s d k`) | `Proofs/Error.lean` |
+| L3c (2), the compositions | `Error.round_step`, `l3c_normwise`, `l3c_elementwise`, `l3c_absolute` (with the subnormal term η) | `Proofs/Error.lean` |
+| L3c (3), the native FMA chain | `Summation.fma_chain` (γ_k) | `Proofs/Summation.lean` |
+| L7a (recursive summation, γ_k) | `Summation.recsum` (power form `recsum_pow`; `pow_sub_one_le_gam`, `gam_nonneg`) | `Proofs/Summation.lean` |
+| L7b (segmented bound) | `Segments.kseg_compose` (`kseg_compose_sub` with gradual underflow; per band `band_bound`); from the band rows through L3c (1): `kseg_rows` | `Proofs/Segments.lean` |
+| L7c (metric forms) | `Segments.bands_norm_le` (N_S ≤ ‖a‖‖b‖), `kseg_normwise` (NORMWISE); (3) the underflow term: `kseg_compose_sub`; E monotone (`E_s ≤ E(k)`): `Error.unitE_mono`; (7) ρ_S from the output: `kseg_wbar_le`, `kseg_rho_le`. The ELEMENTWISE and ABSOLUTE forms of (2) are one-line corollaries of `kseg_compose` (with N_S ≤ ρ_S·|x|, N_S ≤ M̄) and are not restated | `Proofs/Segments.lean`, `Proofs/Error.lean` |
+| L7d (the recipe's request) | `Segments.gam_mul_le`, `kseg_request_core` (the exact half) | `Proofs/Segments.lean` |
 
 ## Modelling choices
 
@@ -63,6 +70,28 @@ These choices are faithful to PROOFS.md, but they are not literal transcriptions
   `Σ_{h∈C}|r_h s_h| ≤ A`, which follows from `|r_h s_h| ≤ Q`, `|C| ≤ K` and `Q·K ≤ A`.
 - **Partition (L4b).** The chunks are any family `C 0 … C (n−1)` that is pairwise disjoint
   with union `range k`. They need not be contiguous.
+- **L3c and L7 (NOTES-C1 IR5, stage 3).**
+  - The final rounding is the hypothesis `|D − y| ≤ u|y|` (normal range), or
+    `|D − y| ≤ u|y| + η` where D may be subnormal; L3b's `|D − y| ≤ u|D|` is the other
+    standard form and is kept for L3b.
+  - Floating-point addition enters only through the per-step hypothesis
+    `|fl(a + b) − (a + b)| ≤ u|a + b|`. There is still no IEEE model.
+  - L7's bands are indexed by `ℕ` over `range (m + 1)`, so `S = m + 1` and `γ = γ_m`.
+    `kseg_compose` takes each band's statistics abstractly (`|x_s| ≤ n_s`,
+    `|y_s − x_s| ≤ E_s n_s`); `kseg_rows` instantiates them from band rows of lengths
+    `ks s` (a dependent family `(s : ℕ) → Fin (ks s) → ℝ`) through `l3c_unit`. That the
+    contraction's sum is the sum of the band sums is the partition itself and is not
+    restated. `kseg_rows`' hypothesis `hσb` (`2^-σ ≤ 2‖a^s‖·sf/d`) cannot hold for a band
+    whose row is zero (its right side is 0), so such a band enters only through
+    `kseg_compose`, with `x_s = y_s = 0` and `n_s = 0` given directly.
+  - L7d's FP evaluation of `t′` (two roundings, `params.kseg_request`) is not modelled;
+    `kseg_request_core` proves the exact half, and `cert_kseg_composition` checks the
+    rounding. Likewise L7c (7): `kseg_wbar_le` and `kseg_rho_le` are the exact statements;
+    their outward-rounded evaluation (`params.kseg_wbar_up`, `params.rho_recipe`) is checked
+    by `cert_kseg_composition` (7). The ρ_S without the normal-range hypothesis (DESIGN
+    §3.8: the absolute term `(1 + γ)·S·η ≤ S·2⁻¹⁰⁷⁴`, `params.kseg_eta`) is the same
+    argument as `kseg_rho_le` with `W̄·N_S + (1 + γ)·S·η` from `kseg_compose_sub`; it is a
+    hand corollary (PROOFS L7c (7)), not restated in Lean.
 
 ## Discrepancies with PROOFS.md and proposed text
 
@@ -128,6 +157,9 @@ a statement that the formalization proves in a more general form.
    PROOFS states the concrete numbers, so its claim is correct as written.
 
 ## Remaining work / not formalized
+
+- L5 (K-weights) and L6 (the a-posteriori certificate) are not formalized: NOTES-C1's
+  stage 4 is closed by its gate and stage 5 is deferred. L5d and L6 would build on L3c here.
 
 - The IEEE side, in particular `fl` satisfying `|fl(x) − x| ≤ u|fl(x)|` in the normal range,
   is a hypothesis by design.

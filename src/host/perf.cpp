@@ -80,6 +80,16 @@ constexpr bool kFormat2Param[IMD_PERF_CLASS_COUNT][kP] = {
 constexpr bool optional_param(int cl, int j) {
   return (cl == IMD_PERF_CLASS_KF && j == 4) || (cl == IMD_PERF_CLASS_PACK && j == 3);
 }
+// v1.19 (§6c.9, host API 13, no struct growth): the optional key warm.kl_drop, the share of the
+// REPEAT / WARM saving that KL reads do not get, lives in param[IMD_PERF_PARAM_KL_DROP_SLOT],
+// the last slot (IMD_PERF_PARAM_CAPACITY holds four classes more than IMD_PERF_CLASS_COUNT; the
+// slots between are unused and 0). 0 = absent = the saving of every reading phase as before;
+// format 2 only, in [0, 1]. The file names the key: the text format does not depend on the slot.
+constexpr int kKlDropIdx = IMD_PERF_PARAM_KL_DROP_SLOT;
+static_assert(IMD_PERF_CLASS_COUNT * kP <= IMD_PERF_PARAM_KL_DROP_SLOT,
+              "warm.kl_drop slot is past every class's slots");
+static_assert(kKlDropIdx == IMD_PERF_PARAM_CAPACITY - 1, "warm.kl_drop slot");
+constexpr const char* kKlDropKey = "warm.kl_drop";
 // v1.15 / v1.17: the retired op_eps keys (formats 1 and 2): accepted (a number >= 0, at most
 // once) and discarded, never written.
 constexpr const char* kRetiredKeys[] = {"kf.op_eps", "kl.op_eps", "pack.op_eps"};
@@ -244,6 +254,7 @@ void to_format1_params(imd_perf_calib_t* cal) {
   for (int cl = 0; cl < IMD_PERF_CLASS_COUNT; ++cl)
     for (int j = 0; j < kP; ++j)
       if (kFormat2Param[cl][j]) cal->param[cl * kP + j] = 0;
+  cal->param[kKlDropIdx] = 0;  // v1.19
 }
 
 // ---- features -----------------------------------------------------------------------------
@@ -671,7 +682,8 @@ bool calib_valid(const imd_perf_calib_t& c) {
       const double v = c.param[cl * kP + j];
       if (!std::isfinite(v) || (cl != IMD_PERF_CLASS_CALL && v < 0)) return false;
     }
-  if (c.format == 1) return true;  // the v7 fields are migrated (resolve_calib)
+  if (!(c.param[kKlDropIdx] >= 0 && c.param[kKlDropIdx] <= 1)) return false;  // v1.19, NaN too
+  if (c.format == 1) return c.param[kKlDropIdx] == 0;  // the v7 fields are migrated (resolve_calib)
   for (int k = 0; k < IMD_PERF_KERNEL_COUNT; ++k) {
     const imd_perf_kernel_t& q = c.kernel[k];
     if (q.resident < 1 || q.regs < 0 || q.smem_bytes < 0 || q.threads < 0) return false;
@@ -911,6 +923,12 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
           r.*(kOptKeys[i].field) = d;
           slot = kOptSlot + i, v2 = true;
         }
+      if (slot < 0 && key == kKlDropKey) {  // v1.19 (§6c.9): stored in param[kKlDropIdx]
+        double d = 0;
+        if (!parse_number(val, &d) || !(d >= 0 && d <= 1)) return bad("a number in [0, 1]");
+        r.param[kKlDropIdx] = d;
+        slot = kFixed + kKlDropIdx, v2 = true;
+      }
       for (int i = 0; i < kRetiredKeyCount && slot < 0; ++i)
         if (key == kRetiredKeys[i]) {  // v1.17: accepted in formats 1 and 2, discarded
           double d = 0;
@@ -1075,6 +1093,12 @@ std::string format_calib(const imd_perf_calib_t& c) {
       s += ok.key;
       s += " = ";
       append_number(&s, c.*(ok.field));
+      s += '\n';
+    }
+    if (sk.field == &imd_perf_calib_t::warm_l2byte_ns && c.param[kKlDropIdx] != 0) {  // v1.19
+      s += kKlDropKey;
+      s += " = ";
+      append_number(&s, c.param[kKlDropIdx]);
       s += '\n';
     }
   }
@@ -1251,7 +1275,9 @@ struct Req {
 struct CacheTerms {
   double inputs = 0;    // I, the call's input bytes
   double res = 0;       // resident input bytes
-  double cache_ns = 0;  // split over the reading phases by in_bytes / I, clamped at 0 per phase
+  double res_ns = 0;    // -res * Delta, split over the reading phases by in_bytes / I,
+  double call_ns = 0;   // -c (res > 0), likewise; both clamped at 0 per phase
+  double kl_keep = 1;   // v1.19: the share of res_ns a KL read keeps, 1 - warm.kl_drop
   double clean_ns = 0;  // on the call phase
 };
 
@@ -1268,7 +1294,9 @@ CacheTerms cache_terms(const imd_perf_calib_t& cal, const PerfPhases& P, int32_t
   const bool cold = cache == IMD_PERF_CACHE_COLD || cache == IMD_PERF_CACHE_CLEAN;
   c.inputs = I;
   c.res = cold ? 0.0 : res_repeat;
-  c.cache_ns = -c.res * cal.warm_l2byte_ns - (c.res > 0 ? cal.warm_call_ns : 0.0);
+  c.res_ns = -c.res * cal.warm_l2byte_ns;
+  c.call_ns = -(c.res > 0 ? cal.warm_call_ns : 0.0);
+  c.kl_keep = 1.0 - cal.param[kKlDropIdx];
   c.clean_ns = cache == IMD_PERF_CACHE_CLEAN
                    ? -cal.warm_clean_byte_ns *
                          std::min(std::max(P.footprint - I, 0.0), std::max(Lw, 0.0))
@@ -1281,7 +1309,10 @@ CacheTerms cache_terms(const imd_perf_calib_t& cal, const PerfPhases& P, int32_t
 double phase_seconds(const imd_perf_calib_t& cal, const PerfPhase& p, double scale,
                      const CacheTerms& c) {
   double t = perf_phase_seconds(cal, p, scale);
-  if (c.inputs > 0 && p.in_bytes > 0) t = std::max(0.0, t + c.cache_ns * 1e-9 * p.in_bytes / c.inputs);
+  if (c.inputs > 0 && p.in_bytes > 0) {
+    const double ns = c.res_ns * (p.cls == IMD_PERF_CLASS_KL ? c.kl_keep : 1.0) + c.call_ns;
+    t = std::max(0.0, t + ns * 1e-9 * p.in_bytes / c.inputs);
+  }
   if (p.cls == IMD_PERF_CLASS_CALL && c.clean_ns != 0) t += c.clean_ns * 1e-9;
   return t;
 }

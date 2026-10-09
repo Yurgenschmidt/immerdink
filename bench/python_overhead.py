@@ -10,6 +10,8 @@ A tiny contraction (default "ik,kj->ij" 16^3, N = 8) is enqueued in batches of -
   cai         Plan.contract with __cuda_array_interface__ objects (layout checks included)
   dlpack      Plan.contract with DLPack producers (hand-built capsules; producer cost included)
   einsum      immerdink.contract with a cached plan (CAI objects)
+  packed      Plan.contract of a plan with A packed (DESIGN §6b), the packed buffer raw
+  packed_guard  the same with a PackedBuffer (DESIGN v1.19 §6g): + its lock-and-compare
 Methods are interleaved round by round; the median and minimum host time per call are
 reported (µs), and the overhead over `ctypes`. Host time only: the call returns after
 enqueuing its kernels. JSON with --json.
@@ -55,6 +57,13 @@ def main():
     cache = imd.PlanCache()
     imd.contract(spec, *cai, N=a.N, workspace=W, plan_cache=cache)
     f, h = lib.lib.imd_contract, plan._h
+    # DESIGN v1.19 §6g: a packed plan, its buffer raw or a PackedBuffer (lock-and-compare)
+    pk = imd.Pack(imd.pack_spec(spec, *cai, operand=0, N=a.N))
+    pplan = imd.Plan(spec, *cai, N=a.N, packs=(pk, None))
+    pbuf, pws = cu.malloc(pk.pack_bytes), cu.malloc(pk.workspace_bytes)
+    guard = imd.PackedBuffer((pbuf, pk.pack_bytes))
+    pk.pack(cai[0], guard, workspace=(pws, pk.workspace_bytes))
+    PW = (ws, pplan.workspace_bytes)
 
     def m_ctypes():
         f(h, 1.0, p[0], p[1], 0.0, p[2], ws, nws, 0)
@@ -71,8 +80,14 @@ def main():
     def m_einsum():
         imd.contract(spec, cai[0], cai[1], cai[2], N=a.N, workspace=W, plan_cache=cache)
 
+    def m_packed():
+        pplan.contract(cai[0], cai[1], cai[2], workspace=PW, packed=((pbuf, pk.pack_bytes), None))
+
+    def m_packed_guard():
+        pplan.contract(cai[0], cai[1], cai[2], workspace=PW, packed=(guard, None))
+
     methods = {"ctypes": m_ctypes, "ptr": m_ptr, "cai": m_cai, "dlpack": m_dlpack,
-               "einsum": m_einsum}
+               "einsum": m_einsum, "packed": m_packed, "packed_guard": m_packed_guard}
     for fn in methods.values():   # warm up
         for _ in range(a.batch):
             fn()
@@ -100,9 +115,9 @@ def main():
                           "rounds": a.rounds, "rows": rows}))
     else:
         print(f"{spec} {n}^3 N={a.N}: host time per call, {a.rounds} rounds x {a.batch} calls")
-        print(f"{'method':<8} {'median us':>10} {'min us':>8} {'vs ctypes':>10}")
+        print(f"{'method':<12} {'median us':>10} {'min us':>8} {'vs ctypes':>10}")
         for r in rows:
-            print(f"{r['method']:<8} {r['median_us']:>10.2f} {r['min_us']:>8.2f} "
+            print(f"{r['method']:<12} {r['median_us']:>10.2f} {r['min_us']:>8.2f} "
                   f"{r['overhead_us']:>+10.2f}")
     cu.free_all()
 

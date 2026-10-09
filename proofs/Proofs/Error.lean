@@ -185,6 +185,119 @@ theorem zero_row {a b : Fin k → ℝ} (ha : ∀ h, a h = 0) {a' b' : Fin k → 
     |D - ∑ h, a h * b h| ≤ eps * |D| := by
   simpa [ha, ha'] using hD
 
+/-! ### L3c: accuracy-aware planning (PROOFS.md L3c, DESIGN §6f.2; NOTES-C1 IR5)
+
+`δ = ½` (RN) or `1` (TRUNC) bounds the quantization error, `d = T − κ/2` (RN) or `T` (TRUNC),
+`s = √(1 + k·2^{−F})`, and L1d gives `2^{−σ} ≤ 2‖a‖s/d`. The ℓ1 ratios `ν_a, ν_b` bound
+`‖a‖₁ ≤ ν_a‖a‖` and `‖b‖₁ ≤ ν_b‖b‖` (`ν = √k` always qualifies, `l1_le_sqrt_mul_l2`). The final
+binary64 rounding is the hypothesis `|D − y| ≤ u|y|` (normal range), or `|D − y| ≤ u|y| + η`
+when D may be subnormal (`η = 2^{−1075}`). -/
+
+/-- L3c's unit bound `E = 2δ(ν_a + ν_b)s/d + 4δ²k s²/d²`. -/
+noncomputable def unitE (δ νa νb s d : ℝ) (k : ℕ) : ℝ :=
+  2 * δ * (νa + νb) * s / d + 4 * δ ^ 2 * k * s ^ 2 / d ^ 2
+
+/-- **L3c (1), the ν form.** `|y − x| ≤ E·‖a‖‖b‖`, with `y = z·2^{−σ−τ}`, `x = Σ a_h b_h`. -/
+theorem l3c_unit {a b : Fin k → ℝ} {a' b' : Fin k → ℤ} {σ τ : ℤ} {δ : ℝ} (hδ0 : 0 ≤ δ)
+    (hδ : ∀ h, |(a' h : ℝ) - a h * 2 ^ σ| ≤ δ) (hε : ∀ h, |(b' h : ℝ) - b h * 2 ^ τ| ≤ δ)
+    {νa νb s d : ℝ} (hd : 0 < d) (hνa : l1 a ≤ νa * l2 a) (hνb : l1 b ≤ νb * l2 b)
+    (hσb : (2 : ℝ) ^ (-σ) ≤ 2 * l2 a * s / d) (hτb : (2 : ℝ) ^ (-τ) ≤ 2 * l2 b * s / d) :
+    |((∑ h, a' h * b' h : ℤ) : ℝ) * 2 ^ (-σ - τ) - ∑ h, a h * b h|
+      ≤ unitE δ νa νb s d k * (l2 a * l2 b) := by
+  have L3a := l1_form hδ hε
+  have hla := l2_nonneg a
+  have hlb := l2_nonneg b
+  have hl1a : 0 ≤ l1 a := sum_nonneg fun _ _ => abs_nonneg _
+  have hl1b : 0 ≤ l1 b := sum_nonneg fun _ _ => abs_nonneg _
+  have hτ0 : (0 : ℝ) < 2 ^ (-τ) := zpow_pos two_pos _
+  have hσ0 : (0 : ℝ) < 2 ^ (-σ) := zpow_pos two_pos _
+  have t1 : 2 ^ (-τ) * l1 a ≤ (2 * l2 b * s / d) * (νa * l2 a) :=
+    mul_le_mul hτb hνa hl1a (hτ0.le.trans hτb)
+  have t2 : 2 ^ (-σ) * l1 b ≤ (2 * l2 a * s / d) * (νb * l2 b) :=
+    mul_le_mul hσb hνb hl1b (hσ0.le.trans hσb)
+  have hst : (2 : ℝ) ^ (-σ - τ) = 2 ^ (-σ) * 2 ^ (-τ) := by
+    rw [sub_eq_add_neg, zpow_add₀ two_ne_zero]
+  have t3 : (2 : ℝ) ^ (-σ - τ) ≤ (2 * l2 a * s / d) * (2 * l2 b * s / d) := by
+    rw [hst]; exact mul_le_mul hσb hτb hτ0.le (hσ0.le.trans hσb)
+  have hk : (0 : ℝ) ≤ k := Nat.cast_nonneg _
+  have e1 := mul_le_mul_of_nonneg_left (add_le_add t1 t2) hδ0
+  have e2 := mul_le_mul_of_nonneg_left t3 (mul_nonneg hk (sq_nonneg δ))
+  have : δ * ((2 * l2 b * s / d) * (νa * l2 a) + (2 * l2 a * s / d) * (νb * l2 b))
+      + k * δ ^ 2 * ((2 * l2 a * s / d) * (2 * l2 b * s / d))
+      = unitE δ νa νb s d k * (l2 a * l2 b) := by
+    unfold unitE; field_simp; ring
+  linarith
+
+/-- The final rounding step: `|D − y| ≤ u|y|` gives `|D − x| ≤ u|x| + (1 + u)|y − x|`. -/
+theorem round_step {x y D u : ℝ} (hu : 0 ≤ u) (hD : |D - y| ≤ u * |y|) :
+    |D - x| ≤ u * |x| + (1 + u) * |y - x| := by
+  have hy : |y| ≤ |x| + |y - x| := by
+    have := abs_sub_abs_le_abs_sub y x; linarith
+  calc |D - x| ≤ |D - y| + |y - x| := abs_sub_le _ _ _
+    _ ≤ u * |y| + |y - x| := by linarith
+    _ ≤ u * (|x| + |y - x|) + |y - x| := by nlinarith
+    _ = u * |x| + (1 + u) * |y - x| := by ring
+
+/-- **L3c (2), NORMWISE.** `|x| ≤ n` (Cauchy–Schwarz, `n = ‖a‖‖b‖`) and `|y − x| ≤ E·n`:
+`|D − x| ≤ (E(1 + u) + u)·n`. -/
+theorem l3c_normwise {x y D u E n : ℝ} (hu : 0 ≤ u) (hx : |x| ≤ n) (hyx : |y - x| ≤ E * n)
+    (hD : |D - y| ≤ u * |y|) : |D - x| ≤ (E * (1 + u) + u) * n := by
+  have := round_step (x := x) hu hD
+  have h1 := mul_le_mul_of_nonneg_left hx hu
+  have h2 := mul_le_mul_of_nonneg_left hyx (by linarith : (0 : ℝ) ≤ 1 + u)
+  nlinarith
+
+/-- **L3c (2), ELEMENTWISE.** `n ≤ ρ|x|` (ρ bounds `‖a‖‖b‖/|x|`): `|D − x| ≤ (Eρ(1 + u) + u)|x|`. -/
+theorem l3c_elementwise {x y D u E n ρ : ℝ} (hu : 0 ≤ u) (hE : 0 ≤ E) (hρ : n ≤ ρ * |x|)
+    (hyx : |y - x| ≤ E * n) (hD : |D - y| ≤ u * |y|) :
+    |D - x| ≤ (E * ρ * (1 + u) + u) * |x| := by
+  have := round_step (x := x) hu hD
+  have h1 : |y - x| ≤ E * (ρ * |x|) := hyx.trans (mul_le_mul_of_nonneg_left hρ hE)
+  have h2 := mul_le_mul_of_nonneg_left h1 (by linarith : (0 : ℝ) ≤ 1 + u)
+  nlinarith
+
+/-- **L3c (2), ABSOLUTE**, with a possibly subnormal D (`|D − y| ≤ u|y| + η`; `η = 0` in the
+normal range): `|x| ≤ n ≤ M` gives `|D − x| ≤ (E(1 + u) + u)·M + η`. -/
+theorem l3c_absolute {x y D u E n M η : ℝ} (hu : 0 ≤ u) (hE : 0 ≤ E) (hx : |x| ≤ n)
+    (hnM : n ≤ M) (hyx : |y - x| ≤ E * n) (hD : |D - y| ≤ u * |y| + η) :
+    |D - x| ≤ (E * (1 + u) + u) * M + η := by
+  have hy : |y| ≤ |x| + |y - x| := by
+    have := abs_sub_abs_le_abs_sub y x; linarith
+  have h0 : |D - x| ≤ |D - y| + |y - x| := abs_sub_le _ _ _
+  have h1 : |y - x| ≤ E * M := hyx.trans (mul_le_mul_of_nonneg_left hnM hE)
+  have h2 : |x| ≤ M := hx.trans hnM
+  have h3 := mul_le_mul_of_nonneg_left hy hu
+  have h4 := mul_le_mul_of_nonneg_left h2 hu
+  have h5 := mul_le_mul_of_nonneg_left h1 hu
+  nlinarith
+
+/-- **L3c / L7c (4): E is monotone.** Larger ν, s or k, or a smaller d, never decrease E; a band
+of `k_s ≤ k` entries (`κ_s ≤ κ`, so `d_s ≥ d`, and `s_s ≤ s`, `ν_s ≤ √k_s ≤ √k`) has
+`E_s ≤ E(k)` at the same N. -/
+theorem unitE_mono {δ νa νb s d νa' νb' s' d' : ℝ} {k k' : ℕ} (hδ : 0 ≤ δ) (hνa : νa ≤ νa')
+    (hνb : νb ≤ νb') (hν : 0 ≤ νa + νb) (hs : 0 ≤ s) (hss : s ≤ s') (hd' : 0 < d') (hdd : d' ≤ d)
+    (hk : k ≤ k') : unitE δ νa νb s d k ≤ unitE δ νa' νb' s' d' k' := by
+  unfold unitE
+  have hd : 0 < d := hd'.trans_le hdd
+  have hk' : (k : ℝ) ≤ k' := by exact_mod_cast hk
+  have hν' : 0 ≤ νa' + νb' := hν.trans (add_le_add hνa hνb)
+  have hs' : 0 ≤ s' := hs.trans hss
+  have n1 : 2 * δ * (νa + νb) * s ≤ 2 * δ * (νa' + νb') * s' :=
+    mul_le_mul (mul_le_mul_of_nonneg_left (add_le_add hνa hνb) (by positivity)) hss hs
+      (mul_nonneg (by positivity) hν')
+  have n2 : 4 * δ ^ 2 * k * s ^ 2 ≤ 4 * δ ^ 2 * k' * s' ^ 2 := by
+    have := pow_le_pow_left₀ hs hss 2
+    have hk0 : (0 : ℝ) ≤ k := Nat.cast_nonneg _
+    gcongr
+  have e1 : 2 * δ * (νa + νb) * s / d ≤ 2 * δ * (νa' + νb') * s' / d' :=
+    (div_le_div_of_nonneg_right n1 hd.le).trans
+      (div_le_div_of_nonneg_left (mul_nonneg (mul_nonneg (by positivity) hν') hs') hd' hdd)
+  have e2 : 4 * δ ^ 2 * k * s ^ 2 / d ^ 2 ≤ 4 * δ ^ 2 * k' * s' ^ 2 / d' ^ 2 :=
+    (div_le_div_of_nonneg_right n2 (by positivity)).trans
+      (div_le_div_of_nonneg_left (by positivity) (by positivity)
+        (pow_le_pow_left₀ hd'.le hdd 2))
+  linarith
+
 /-- Any round-to-nearest `q` (`|q x − x| ≤ 1/2`) maps 0 to 0, as does any `|q x| ≤ |x|`. -/
 theorem q_zero_rn {q : ℝ → ℤ} (hq : ∀ x, |(q x : ℝ) - x| ≤ 1 / 2) : q 0 = 0 := by
   have h := hq 0

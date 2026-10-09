@@ -1569,3 +1569,93 @@ c, the small COLD calls ≈ 1.0–1.2 µs faster. The v12-sized struct view (fig
 - [review] A v7…v12-sized caller struct reads the shipped file as a never-fitted model (a
   stated exception, DESIGN §6c.2 / §6c.8 "Host API 13"); an adapter like `fold_byte_f` is
   possible if a caller ever needs it (none known: ehrenfest passes NULL).
+- [C1 M-c, 2026-10-07; corrected at the second review] **KL-path calls with a narrow n whose
+  inputs fit the REPEAT window are predicted too fast, through two KL effects.** Source:
+  NOTES-C1 Status "M-c" and §5.9 (MC-3, MC-3a); immerdink-eval `findings/c1-m-c.md`,
+  `results/c1/m_c/phases.md` (per phase) and `cold_check.md` (per call).
+  - The Jacobi view (`abcd,cdij->abij`, 1600 × 100 × 1600) is predicted 26–29 % too fast at
+    every N ≤ 10, the anchor N = 8 included; at N = 12–14 (the anchor N = 14 included) it is
+    −14 to −15 %, where the model's K4 time (64×128) steps up more than the measured one
+    (N = 12: predicted 32.9 µs, measured 24.6 µs) and offsets part of it.
+  - So are 1408 × 96 × 1408, a 1296 × 144 × 1296 tensor and 1792 × 128 × 1280 (−12 to −35 %).
+  - *KL A, the wide operand's pack, keeps only part of its REPEAT saving:* 27–50 % of its
+    modeled 26.8 µs credit on the Jacobi view at N ≤ 10 (55–65 % at N = 12–14), 5–52 % on
+    those three, 14–33 % on the in-sample `c_skin1280` (−20.4 / −10.6 %) and `c_k3hit`
+    (−10.8 / −6.4 %).
+  - *KL B, the narrow operand's pack, is slow in every cache state:* ×1.65–1.89 its REPEAT
+    and ×1.49–1.72 its COLD prediction on the Jacobi view at N ≤ 10 (×1.94–2.02 / ×1.77–1.85
+    at N = 12–14), ×1.50–1.81 / ×1.31–1.65 on the three; 47–59 % of the Jacobi call's miss
+    at N ≤ 10, 92–105 % at N = 12–14. A path error, mechanism unknown. `c_skin1280` and
+    `c_k3hit` do not show it (×1.00–1.09).
+  - At the call total the two cancel against the COLD prediction (−10 to +12 %), which the
+    first account read as "the measured REPEAT time matches the COLD prediction".
+  - KF calls (1024³, 1280² × 960) keep most of the saving, but not in the modeled shape:
+    1024³'s KF phase keeps about 74 % of its credit at N = 4 and about 157 % at N = 14;
+    `q_kf1` 80 % at N = 4, 163 % at N = 12. The share kept rises with N, while the modeled
+    credit is flat (21.9 µs on 1024³ up to N = 12) and then falls with F − I (15.3 µs at
+    N = 14). The small-N KF optimism may be this shape, not an N effect (to be examined on
+    `q_kf1` and the cache sweep's `x_s1024`).
+  - It is one of the two effects behind M-c's failed < 100 µs median; the other is a small-N
+    optimism on the KF path (1024³ at N = 4, 16–21 points below the mean of its anchors'
+    errors, 8.2 / 15.4 below the N = 8 anchor alone). Each is necessary (NOTES-C1 Status,
+    "Cause").
+  - **No setting of `warm.l2_bytes` / `warm.l2byte` can fix KL A**, since the rule depends on
+    capacity only: res = clamp(L_w − (F − I), 0, I). 1024³'s KF phase needs about 15–18 MB
+    credited at a modeled F − I of 49.3 / 52.5 MB (N = 13 / 14), while the Jacobi view's KL A
+    needs about 6–10 MB at 13.0–30.5 MB (N = 4–10). Any rule in F − I alone credits the
+    Jacobi view at least as much. A refit with N-specific cases of this class
+    (`bench/sweep_calib_n.txt`) moves path parameters instead (`kl.wave` 2.16 → 4.45 µs,
+    which partly fits KL B; K4's effective L2 0.4 → 0.3 × nominal), which raises the
+    100 × 9216 × 9216 view by about 10 points. It was not adopted (NOTES-C1 §5.9 MC-1).
+  - **The fix is a feature (NOTES-C1 §5.9 MC-3, amended as MC-3a; under DESIGN §6c.5's
+    feature rule).** At most one optional key per physically distinct effect, two in all:
+    the REPEAT credit (KL A, and KF's credit against N) and the KL narrow-pack time (KL B).
+    Each has absent = 0 in format 2, `host_perf` tests and DESIGN text.
+    - The DESIGN §6c text comes first, from a per-phase decomposition of the allowed
+      records only (calibration, cache, `calib_n.jsonl`, the v1.18 hold-out; never M-c's).
+    - The cache key is chosen and fitted against the KL A and KF phase marks; a key whose
+      call-level fit relies on KL A cancelling KL B does not count (for example candidate
+      (b) as zero credit, which puts KL A at its COLD prediction, 2–33 % slow on the
+      allowed records).
+    - Candidates for the REPEAT credit, to be chosen from those records: (a) add K4's split-K
+      W-plane traffic, Σ_groups g_i·b·m·n̂·(2·k_chunks − 1), to F − I in res_repeat, as
+      `warm.pack_l2_planes` adds it to PACK's set S (traffic between two re-reads, not
+      capacity; F already holds the workspace with the KL residue planes, so counting those
+      planes again would double them); (b) no REPEAT credit for the input bytes a KL pack
+      reads, the KF credit kept; as zero credit it does not count (above).
+    - A fresh narrow-KL hold-out (≥ 3 new shapes of the class, ≥ 1 KF shape of similar
+      footprint, N ∈ {4, 8, 13}, both data sets) is committed and checked disjoint before
+      the refit. The pass adds: KL A's per-phase median |error| improves on the allowed
+      narrow-KL records; no phase class's in-sample median or p90 worsens by more than
+      1 point; the narrow-KL hold-out, the v1.18 hold-out (all cases, and the 69 whose GEMM
+      view matches no fit case), `mc.jsonl` with and without the repeat, and a fresh M-c
+      run each meet every §6c.5 class target.
+    - **Open if not modeled:** if MC-3 does not model KL B, it stays here as an open model
+      defect with its size and a trigger, and in DESIGN §7.
+    - **MC-3a outcome (2026-10-09; NOTES-C1 §5.11, DESIGN §6c.9, §7).** One key was built and
+      fitted once, `warm.kl_drop` (the share of the REPEAT saving that KL reads do not get;
+      0.70 with Q24 in the fit): KL A's per-phase median |error| on the allowed narrow-KL
+      records 35.4 → 4.8 %, and every §6c.5 class target is met on a fresh narrow-KL hold-out,
+      the v1.18 hold-out (all 73 cases and the 66 whose view matches no fit case: 69 minus the 3
+      cache pairs, 171 calls), `mc.jsonl`
+      with and without the repeat, and a fresh full M-c run; one pre-registered in-sample
+      condition (no phase class worsens by more than 1 point) fails on two K4 entries (+1.6
+      and +1.0 points) that come from Q24's records, so no pass was declared and the
+      candidate calibration is not shipped.
+      Independent review (2026-10-09, binding, ruling A): the condition is read against the
+      shipped fit's table, so MC-3a does not pass; M-c stays failed, the shipped calibration
+      stays, no second key is tried.
+    - **KL B stays an open model defect, with its size and trigger** (tracked as
+      [GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog)). Size: ×1.50–1.81 its
+      REPEAT prediction on Q24's narrow multi-pass packs under the shipped calibration;
+      −18 % median signed on M-c's Jacobi KL B marks, 12 % median |error| on the allowed
+      narrow-KL records, under the candidate. The v1.8 compute chain was re-tested offline
+      (57 ns per step from Q24's slopes against 6–13 ns fitted over the calibration's wide
+      launches; 13.7 → 12.7 % on a held-out shape's KL B) and not adopted. **Trigger:** see
+      DESIGN §7 (a consumer's planner decision on a narrow-n KL call below about 150 µs;
+      narrow multi-pass KL packs in a calibration sweep; or adoption of the candidate).
+    - **KF's saving against N** (the second half of the REPEAT-credit effect) has no key: the
+      cache sweep's `x_s1024` pairs follow the modeled window collapse (CLEAN − REPEAT 16.4 /
+      13.3 / 12.3 / 8.3 / 4.0 µs against 18.4 / 17.8 / 17.1 / 9.8 / 0.9), the KF phase marks
+      of `v_sq1024` and `q_kf1` do not (KF's modeled slope in N is 1.6–1.9 µs per modulus
+      against 1.0 measured). sq1024 at N = 4 is still −13.6 / −14.1 % under the candidate.

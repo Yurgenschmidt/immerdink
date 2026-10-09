@@ -12,6 +12,7 @@ PyTorch interop runs when importable.
 """
 
 import ctypes as C
+import dataclasses
 import os
 import random
 import re
@@ -809,6 +810,278 @@ def test_errors(cuda):
     with pytest.raises(ValueError, match="without packs"):
         plan.contract(A, B, Cc, workspace=W, packed=((ws, 256), None))
     plan.close()
+
+
+# ------------------------------------------------------------------------------------------
+# Tests: precision phases (DESIGN v1.19 §6g), CPU only: a fake libimmerdink, no GPU
+
+class _FakeC:
+    """Stands in for libimmerdink's C functions: statuses chosen by the test, every imd_pack
+    and imd_contract_packed recorded, no GPU. Output pointers are ctypes byref objects."""
+
+    def __init__(self):
+        self.next, self.calls, self.pack_status = 0x1000, [], 0
+
+    def _new(self, out):
+        self.next += 0x10
+        out._obj.value = self.next
+        return 0
+
+    def imd_create(self, out):
+        return self._new(out)
+
+    def imd_destroy(self, h):
+        return 0
+
+    def imd_pack_create(self, h, desc, out):
+        st = self._new(out)
+        self.n_of = getattr(self, "n_of", {})
+        self.n_of[out._obj.value] = desc._obj.num_moduli
+        return st
+
+    def imd_pack_destroy(self, h):
+        return 0
+
+    def imd_pack_bytes(self, h, pb, wb):
+        pb._obj.value, wb._obj.value = 256 * (4 + self.n_of[h]), 256   # grows with N (F2)
+        return 0
+
+    def imd_pack(self, h, X, packed, nbytes, ws, wsb, stream):
+        self.calls.append(("pack", self.n_of[h], packed, nbytes))
+        return self.pack_status
+
+    def imd_plan_create_packed(self, h, A, B, C, o, pa, pb, out):
+        return self._new(out)
+
+    def imd_plan_create(self, h, A, B, C, o, out):
+        return self._new(out)
+
+    def imd_workspace_size(self, A, B, C, o, out):
+        out._obj.value = 4096
+        return 0
+
+    def imd_contract(self, plan, alpha, A, B, beta, C, ws, wsb, stream):
+        self.calls.append(("contract", None, 0))
+        return 0
+
+    def imd_workspace_size_packed(self, A, B, C, o, packing, out):
+        out._obj.value = 4096
+        return 0
+
+    def imd_plan_device_bytes(self, plan, out):
+        out._obj.value = 0
+        return 0
+
+    def imd_plan_destroy(self, plan):
+        return 0
+
+    def imd_contract_packed(self, plan, alpha, opA, opB, beta, C, ws, wsb, stream):
+        self.calls.append(("contract", opA._obj.packed, opA._obj.packed_bytes))
+        return 0
+
+
+class _FakeLib(_capi.Library):
+    """A _capi.Library whose device functions are _FakeC's; the host library is the real
+    CUDA-free one (pack descriptors, key digests)."""
+
+    def __init__(self):
+        p = os.environ.get("IMMERDINK_LIB")
+        sib = os.path.join(os.path.dirname(p), "libimmerdink_host.so") if p else None
+        self.path, self.version, self.cudart = "fake", _capi.API_VERSION, None
+        self.lib = _FakeC()
+        self.host = host.load(sib if sib and os.path.exists(sib) else None)
+
+
+def test_pack_spec_with_moduli():
+    ps = host.PackSpec(host.Desc((5, 7), (7, 1), (1, 3)), 14, "TRUNC", "GIVEN", (3,), (), (1,))
+    p8 = ps.with_moduli(8)
+    assert p8.num_moduli == 8 and ps.num_moduli == 14
+    assert p8 == host.PackSpec(ps.tensor, 8, "TRUNC", "GIVEN", (3,), (), (1,))
+    assert p8.with_moduli(14) == ps and hash(p8.with_moduli(14)) == hash(ps)
+
+
+def test_packed_buffer_guard_cpu():
+    """PackedBuffer (DESIGN v1.19 §6g) through a fake library: Pack.pack records the pack at
+    enqueue; Plan.contract and immerdink.contract refuse a buffer whose record is not the
+    plan slot's pack (PackMismatchError) before any C call, and one never packed; a raw
+    buffer is never checked; a failed imd_pack keeps the record, a CUDA_ERROR clears it."""
+    lib = _FakeLib()
+    spec = "ik,kj->ij"
+    lay = (imd.Layout((5, 7)), imd.Layout((7, 4)), imd.Layout((5, 4)))
+    ps14 = imd.pack_spec(spec, *lay, operand=0, N=14, lib=lib)
+    pk14, pk8 = imd.Pack(ps14, lib=lib), imd.Pack(ps14.with_moduli(8), lib=lib)
+    pk8t = imd.Pack(dataclasses.replace(ps14, num_moduli=8, rounding="TRUNC"), lib=lib)
+    assert pk8.pack_bytes <= pk14.pack_bytes
+    A, B, Cc = (Cai(0x100000 * (t + 1), x.shape) for t, x in enumerate(lay))
+    X = A
+    p14 = imd.Plan(spec, *lay, N=14, packs=(pk14, None), lib=lib)
+    p8 = imd.Plan(spec, *lay, N=8, packs=(pk8, None), lib=lib)
+    W, PW = (0x900000, 4096), (0xA00000, 256)
+    buf = imd.PackedBuffer((0x800000, pk14.pack_bytes))
+    calls = lib.lib.calls
+
+    def contract(plan, packed):
+        n0 = len(calls)
+        plan.contract(A, B, Cc, workspace=W, packed=(packed, None))
+        assert len(calls) == n0 + 1 and calls[-1][0] == "contract"
+        return calls[-1]
+
+    def refused(plan, packed, match):
+        n0 = len(calls)
+        with pytest.raises(imd.PackMismatchError, match=match) as e:
+            plan.contract(A, B, Cc, workspace=W, packed=(packed, None))
+        assert len(calls) == n0, "a refused call reached the library"
+        assert isinstance(e.value, ValueError) and e.value.reason is None
+
+    assert buf.last_pack is None
+    refused(p14, buf, "no pack recorded")
+    pk14.pack(X, buf, workspace=PW)
+    assert buf.last_pack == pk14.record and buf.last_pack.N == 14
+    assert calls[-1] == ("pack", 14, 0x800000, pk14.pack_bytes)
+    assert contract(p14, buf) == ("contract", 0x800000, pk14.pack_bytes)
+    refused(p8, buf, "buffer last packed at N=14, plan expects N=8")
+    # re-pack at N = 8 in place (C-pack: the N = 14 buffer holds it)
+    assert pk8.pack(X, buf, workspace=PW) is buf and buf.last_pack.N == 8
+    refused(p14, buf, "buffer last packed at N=8, plan expects N=14")
+    contract(p8, buf)
+    with pytest.raises(imd.PackMismatchError, match="plan expects N=14"):   # einsum front end
+        imd.contract(spec, A, B, Cc, N=14, packs=(pk14, None), packed=(buf, None),
+                     workspace=W, plan_cache=False, lib=lib)
+    # a raw buffer is never checked (behaves as before): the stale plan reaches the library
+    assert contract(p14, (0x800000, pk14.pack_bytes))[1] == 0x800000
+    # rounding and other-key records
+    pk8t.pack(X, buf, workspace=PW)
+    refused(p8, buf, "last packed with TRUNC, plan expects RN")
+    pk8.pack(X, buf, workspace=PW)
+    other = imd.Pack(imd.pack_spec(spec, *lay, operand=1, N=8, lib=lib), lib=lib)
+    assert other.record.N == 8 and other.record.key_digest != pk8.record.key_digest
+    other.pack(Cai(0x200000, (7, 4)), buf, workspace=PW)
+    refused(p8, buf, "another key")
+    # a second Pack of the same key has the same record: accepted
+    same = imd.Pack(ps14.with_moduli(8), lib=lib)
+    same.pack(X, buf, workspace=PW)
+    assert same.record == pk8.record
+    contract(p8, buf)
+    # a rejected imd_pack (nothing enqueued) keeps the record; a CUDA_ERROR clears it
+    lib.lib.pack_status = 4
+    with pytest.raises(imd.InsufficientWorkspaceError):
+        pk14.pack(X, buf, workspace=PW)
+    assert buf.last_pack == pk8.record
+    lib.lib.pack_status = 6
+    with pytest.raises(imd.CudaError):
+        pk14.pack(X, buf, workspace=PW)
+    assert buf.last_pack is None
+    lib.lib.pack_status = 0
+    # nbytes caps the bytes passed; it may not exceed the buffer; a raw pointer needs it
+    capped = imd.PackedBuffer(imd.DeviceArray(0x800000, (pk14.pack_bytes,), dtype="u1"),
+                              nbytes=pk8.pack_bytes)
+    pk8.pack(X, capped, workspace=PW)
+    assert calls[-1] == ("pack", 8, 0x800000, pk8.pack_bytes)
+    assert contract(p8, capped) == ("contract", 0x800000, pk8.pack_bytes)
+    with pytest.raises(ValueError, match="nbytes"):
+        pk14.pack(X, imd.PackedBuffer(imd.DeviceArray(0x800000, (16,), dtype="u1"), 32),
+                  workspace=PW)
+    with pytest.raises(ValueError, match="nbytes"):
+        imd.PackedBuffer(0x800000)
+    assert imd.PackedBuffer(0x800000, 512).buf == (0x800000, 512)
+    with pytest.raises(TypeError):
+        imd.PackedBuffer(buf)
+    assert "N=8" in repr(capped) and "never packed" in repr(imd.PackedBuffer((1, 2)))
+    for x in (p14, p8):
+        x.close()
+
+
+def test_precision_plans_cpu():
+    """The plans and packs a PrecisionPlan names (DESIGN v1.19 §6g.10: "creating these plans
+    before the loop covers every phase"), through a fake library: every configs() choice and
+    two phases' choices make a Plan from Choice.options() and Packs from pack_specs (in-line,
+    packed and the DIRECT level), and a packed call takes a PackedBuffer that the choice's
+    own Pack wrote; in a share group one buffer, packed by one member's Pack, serves the
+    other member's plan (one key), and a buffer packed at another level is refused."""
+    from immerdink import planner, precision
+    lib = _FakeLib()
+    pl = planner.Planner(lib=lib.host)
+    shapes = {"x": ("ik,kj->ij", dict(i=48, k=300, j=40), ((48, 300), (300, 40), (48, 40))),
+              "y": ("ik,kl->il", dict(i=48, k=300, l=24), ((48, 300), (300, 24), (48, 24))),
+              "z": ("ik,kj->ij", dict(i=40, k=64, j=40), ((40, 64), (64, 40), (40, 40)))}
+    pp = precision.PrecisionPlan(
+        pl, {n: (spec, ext) for n, (spec, ext, _) in shapes.items()},
+        levels=(6, 8, precision.DIRECT), share=[("G", [("x", "A"), ("y", "A")])],
+        packs={"x": {"NONE", "A", "AB"}, "y": {"A", "AB"}})
+    ops = {n: tuple(Cai(0x100000 * (8 * i + t + 1), sh) for t, sh in enumerate(shp))
+           for i, (n, (_, _, shp)) in enumerate(shapes.items())}
+    W, PW = (0x900000, 4096), (0xA00000, 256)
+    calls = lib.lib.calls
+    made = {"inline": 0, "packed": 0, "direct": 0}
+
+    def plan_of(n, ch, packs=None):
+        spec, _, shp = shapes[n]
+        if packs is None:
+            packs = tuple(imd.Pack(ch.pack_specs[r], lib=lib) if r in ch.pack_specs else None
+                          for r in "AB")
+        plan = imd.Plan(spec, *(imd.Layout(x) for x in shp), lib=lib,
+                        packs=None if packs == (None, None) else packs, **ch.options())
+        assert {k: plan.options[k] for k in ch.options()} == ch.options()
+        return plan, packs
+
+    def run(n, ch, plan, packs, bufs=None):
+        A, B, Cc = ops[n]
+        if packs == (None, None):
+            plan.contract(A, B, Cc, workspace=W)
+            made["direct" if ch.mode == "DIRECT" else "inline"] += 1
+            return
+        if bufs is None:
+            bufs = tuple(None if pk is None else imd.PackedBuffer((0xB00000 + 0x100000 * r,
+                                                                    pk.pack_bytes))
+                         for r, pk in enumerate(packs))
+            for pk, X, buf in zip(packs, (A, B), bufs):
+                if pk is not None:
+                    pk.pack(X, buf, workspace=PW)
+        n0 = len(calls)
+        plan.contract(A, B, Cc, workspace=W, packed=bufs)
+        assert len(calls) == n0 + 1 and calls[-1][0] == "contract"
+        made["packed"] += 1
+
+    for n, by in pp.configs().items():
+        for lv, ch in by.items():
+            assert ch is not None, (n, lv)
+            assert (ch.mode == "DIRECT") == (lv == precision.DIRECT)
+            plan, packs = plan_of(n, ch)
+            run(n, ch, plan, packs)
+            plan.close()
+    acc = host.Accuracy("NORMWISE", 1e-4)     # N = 6, then x at 1e-6 raises the group to 8
+    levels = []
+    for targets in ({"x": acc, "y": acc, "z": acc},
+                    {"x": host.Accuracy("NORMWISE", 1e-6), "y": acc, "z": acc}):
+        ph = pp.phase(targets)
+        assert ph.N["x"] == ph.N["y"] != precision.DIRECT and ph.packed["x"] in ("A", "AB")
+        levels.append(ph.N["x"])
+        cx, cy = ph.choices["x"], ph.choices["y"]
+        px, kx = plan_of("x", cx)
+        py, ky = plan_of("y", cy)
+        run("x", cx, px, kx)
+        pz, kz = plan_of("z", ph.choices["z"])         # outside the group, in-line
+        run("z", ph.choices["z"], pz, kz)
+        pz.close()
+        # one buffer for the group: x's Pack writes it, y's plan (made with its own Pack of
+        # the same key) reads it
+        shared = imd.PackedBuffer((0xC00000, kx[0].pack_bytes))
+        kx[0].pack(ops["x"][0], shared, workspace=PW)
+        assert shared.last_pack == ky[0].record
+        bufs = (shared, None if ky[1] is None else imd.PackedBuffer((0xD00000, ky[1].pack_bytes)))
+        if ky[1] is not None:
+            ky[1].pack(ops["y"][1], bufs[1], workspace=PW)
+        run("y", cy, py, ky, bufs)
+        # the shared buffer re-packed at the other level: refused
+        other = 6 if ph.N["x"] == 8 else 8
+        imd.Pack(cx.pack_specs["A"].with_moduli(other), lib=lib).pack(ops["x"][0], shared,
+                                                                      workspace=PW)
+        with pytest.raises(imd.PackMismatchError, match=f"plan expects N={ph.N['y']}"):
+            py.contract(*ops["y"], workspace=W, packed=bufs)
+        for p_ in (px, py):
+            p_.close()
+    assert levels == [6, 8] and made["inline"] and made["packed"] and made["direct"], \
+        (levels, made)
 
 
 # ------------------------------------------------------------------------------------------

@@ -1,0 +1,30 @@
+# C1 M-c: the small-N hold-out of the performance model (docs/NOTES-C1.md §4.3, IR4; DESIGN
+# §6c.5). N = 4, 5, 6, 7, 9, 10, 12, 13 (no calibration or hold-out case had 5, 6, 7, 9 or 13)
+# plus the anchors N = 8 and 14 on the same shapes, so a shape error separates from an N error.
+# The shapes of the [M] figures DESIGN and NOTES-C1 cite, with their specs (NOTES-C1 §2.3,
+# §2.4): square ik,kj->ij; DF 64^4, Q = 2032; QZ (o 21, v 489, Q 1122); skinny 256^2 x 65536;
+# the PPL view 100 x 9216 x 9216 (o 10, v 96); the Jacobi view 1600 x 100 x 1600 (v 40, o 10).
+# sq2048 is a calibration shape (c_sq2048), so it is replaced by 2000^3 (the decision's
+# example); bench/sweep_disjoint.py checks by extents that no case below is in
+# bench/sweep_calib.txt. Data: --data normal (the bench default, phi = 0.5) and --data
+# decay_opp (bench/accuracy/c2_fixtures.py's decay_opp, [KT26]'s data-dependent INT8
+# throughput). 8 shapes x 10 N x 2 data = 160 timed calls, g = N, GENERATE, the rule's K4.
+# Run like the hold-out (bench/run_sweep.sh: quiet gate, GPU lock, 3 s warm-up, stock clocks)
+# and judge with bench/perf_validate.py (BURST, REPEAT, the shipped calibration).
+# name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
+m_sq1024n | ik,kj->ij | i=1024,k=1024,j=1024 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 100 --phase-reps 10 --max-seconds 1
+m_sq1024d | ik,kj->ij | i=1024,k=1024,j=1024 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 100 --phase-reps 10 --max-seconds 1 --data decay_opp
+m_sq2000n | ik,kj->ij | i=2000,k=2000,j=2000 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 50 --phase-reps 5 --max-seconds 1
+m_sq2000d | ik,kj->ij | i=2000,k=2000,j=2000 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 50 --phase-reps 5 --max-seconds 1 --data decay_opp
+m_sq4096n | ik,kj->ij | i=4096,k=4096,j=4096 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 10 --phase-reps 5 --max-seconds 1
+m_sq4096d | ik,kj->ij | i=4096,k=4096,j=4096 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 10 --phase-reps 5 --max-seconds 1 --data decay_opp
+m_dfn     | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2032 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 10 --phase-reps 3 --max-seconds 1
+m_dfd     | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2032 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 10 --phase-reps 3 --max-seconds 1 --data decay_opp
+m_qzn     | kiQ,acQ->kiac | k=21,i=21,a=489,c=489,Q=1122 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 10 --phase-reps 3 --max-seconds 1
+m_qzd     | kiQ,acQ->kiac | k=21,i=21,a=489,c=489,Q=1122 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 10 --phase-reps 3 --max-seconds 1 --data decay_opp
+m_skinn   | ik,jk->ij | i=256,j=256,k=65536 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 10 --phase-reps 3 --max-seconds 1
+m_skind   | ik,jk->ij | i=256,j=256,k=65536 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 10 --phase-reps 3 --max-seconds 1 --data decay_opp
+m_ppln    | ijcd,abcd->ijab | i=10,j=10,a=96,b=96,c=96,d=96 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 10 --phase-reps 3 --max-seconds 1
+m_ppld    | ijcd,abcd->ijab | i=10,j=10,a=96,b=96,c=96,d=96 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 10 --phase-reps 3 --max-seconds 1 --data decay_opp
+m_jacn    | abcd,cdij->abij | a=40,b=40,c=40,d=40,i=10,j=10 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 300 --phase-reps 10 --max-seconds 1
+m_jacd    | abcd,cdij->abij | a=40,b=40,c=40,d=40,i=10,j=10 | imd | 4,5,6,7,8,9,10,12,13,14 | --reps 300 --phase-reps 10 --max-seconds 1 --data decay_opp

@@ -1,7 +1,8 @@
 # Proofs of the parametric lemmas (Lean blueprint)
 
 DESIGN.md's correctness rests on four lemmas that must hold **for every k, every N and
-every input**. The other checks only cover finitely many cases:
+every input**; L7 (v1.19) adds the bound of the K-segmentation caller recipe. The other checks
+only cover finitely many cases:
 - TLA+ checks them exhaustively at toy sizes;
 - `params.py` checks real-width instances;
 - the oracle tests random and adversarial inputs.
@@ -206,13 +207,117 @@ saturation.
 
 ---
 
+## L5, L6 (reserved)
+
+L5 (K-weight cancellation and the guard) and L6 (the a-posteriori certificate) are the
+numbers NOTES-C1 §4.9 reserves for C2's K-weights and C1's device statistics. Each is proved
+here only in the stage that first relies on it: stage 4 is closed by its gate and stage 5 is
+deferred with triggers (NOTES-C1 §4.5, §4.6). Their statements and hand proofs are recorded in
+NOTES-C1 §4.4.
+
+---
+
+## L7. Segmented accumulation (DESIGN §3.8 "Segmented accumulation", the K-segmentation recipe)
+
+**Setting.**
+- K is partitioned into S ≥ 1 bands K_1 … K_S (any partition; the recipe uses contiguous
+  bands of the canonical order). For a row a and a column b, `a^s` and `b^s` are their
+  restrictions to K_s, `k_s = |K_s|`, `x_s = Σ_{h∈K_s} a_h b_h`, so `x = Σ_s x_s`.
+- D_s is the emulated product of band s: one call at (N_s, k_s, rounding) with α = 1 and
+  β = 0. Each band has its own σ_s, τ_s and N_s. A band of k_s = 1 is K-empty and runs
+  DIRECT (one fma, `D_s = RN(a_h b_h)`, so `|D_s − x_s| ≤ u|x_s|`): it satisfies everything
+  below with E_s = 0.
+- `C_1 = D_1` and `C_s = fl(C_{s−1} + D_s)`: the calls after the first use β = 1 at α = 1, and
+  §3.7's `fma(1, C, E)` is one rounding of the exact sum.
+- `n_s = ‖a^s‖‖b^s‖`. E_s is L3c's E at (N_s, k_s, rounding) with the band's ν:
+  ‖a^s‖₁ ≤ ν_a^s‖a^s‖ and ‖b^s‖₁ ≤ ν_b^s‖b^s‖ (ν = √k_s always qualifies).
+- `γ_j = j·u/(1 − j·u)` for `j·u < 1`, and `γ = γ_{S−1}`.
+- Hypotheses: every D_s satisfies L3c's final rounding `|D_s − y_s| ≤ u|y_s|` (normal range);
+  every addition satisfies `|C_s − (C_{s−1} + D_s)| ≤ u|C_{s−1} + D_s|`. RN satisfies the
+  latter absent overflow: an addition whose result underflows is exact.
+
+**Claim L7a (recursive summation, γ_k).** Let `d_1 … d_S` be reals, `c_1 = d_1`, and
+`|c_s − (c_{s−1} + d_s)| ≤ u|c_{s−1} + d_s|` for s ≥ 2. If `(S − 1)u < 1` then
+`|c_S − Σ_s d_s| ≤ γ_{S−1}·Σ_s |d_s|`.
+
+*Proof.* By induction on s, with `e_s = c_s − Σ_{t≤s} d_t` and `A_s = Σ_{t≤s} |d_t|`, show
+`|e_s| ≤ γ_{s−1} A_s`. At s = 1, `e_1 = 0`. For the step, `c_{s+1} = c_s + d_{s+1} + θ`
+with `|θ| ≤ u(|c_s| + |d_{s+1}|) ≤ u((1 + γ_{s−1})A_s + |d_{s+1}|)`, using
+`|c_s| ≤ A_s + |e_s|`. So `|e_{s+1}| ≤ ((1 + γ_{s−1})(1 + u) − 1)A_s + u|d_{s+1}|`. Now
+`(1 + γ_j)(1 + u) ≤ 1 + γ_{j+1}`, because `1 + γ_j = 1/(1 − ju)` and
+`(1 + u)(1 − (j+1)u) = 1 − ju − (j+1)u² ≤ 1 − ju`; and `u ≤ γ_s` for s ≥ 1. Hence
+`|e_{s+1}| ≤ γ_s A_{s+1}`. ∎ (Higham, Accuracy and Stability, §4.2, for recursive summation.)
+
+**Claim L7b (segmented bound).** `|C_S − x| ≤ Σ_s n_s·W_s`, with
+`W_s = u + (1 + u)E_s + γ(1 + u)(1 + E_s)`.
+
+*Proof.* L3c (2) for band s: `|D_s − x_s| ≤ u|x_s| + (1 + u)|y_s − x_s| ≤ (u + (1 + u)E_s)n_s`,
+using `|x_s| ≤ n_s` (Cauchy–Schwarz). Hence `|D_s| ≤ |x_s| + |D_s − x_s| ≤ (1 + u)(1 + E_s)n_s`.
+L7a with `d_s = D_s` gives `|C_S − Σ D_s| ≤ γ Σ|D_s|`. The triangle inequality,
+`|C_S − x| ≤ |C_S − Σ D_s| + Σ|D_s − x_s|`, finishes it. ∎
+
+**Claim L7c (metric forms).** Let `W̄ = max_s W_s` and `N_S = Σ_s n_s`.
+1. `N_S ≤ ‖a‖‖b‖`: Cauchy–Schwarz on the vectors `(‖a^s‖)_s`, `(‖b^s‖)_s`, with
+   `Σ_s ‖a^s‖² = ‖a‖²`.
+2. NORMWISE: `|C_S − x| ≤ W̄·‖a‖‖b‖`. ELEMENTWISE, if `N_S ≤ ρ_S|x|`:
+   `|C_S − x| ≤ W̄ρ_S·|x|`, and ρ_S ≤ ρ. ABSOLUTE, if `N_S ≤ M̄`: `|C_S − x| ≤ W̄·M̄`.
+3. With gradual underflow of some D_s (L3c's hypothesis `|D_s − y_s| ≤ u|y_s| + η`,
+   η = 2⁻¹⁰⁷⁵), each band adds η to `|D_s − x_s|` and to `|D_s|`, so the bound gains
+   `(1 + γ)·S·η`. Only the ABSOLUTE form keeps a meaning there.
+4. Against L3c's unsegmented bound **with ν = √k** at the same N: `E_s ≤ E(k)`, since E grows
+   with ν, s and k and falls with d, and `ν_s ≤ √k_s ≤ √k`, `s_s ≤ s`, `k_s ≤ k`,
+   `κ_s ≤ κ` (so `d_s ≥ d`). So `W̄ ≤ E(1 + u) + u + γ(1 + u)(1 + E)`: the NORMWISE and
+   ABSOLUTE bounds exceed L3c's by `γ(1 + u)(1 + E)·‖a‖‖b‖` only.
+5. A whole-row ν < √k does **not** bound a band's ν_s. For `a = (1, ε, …, ε)` the whole-row
+   ratio is near 1, while a band without the first entry has ratio √k_s. So compare only with
+   the ν = √k bound, or measure ν per band.
+6. ELEMENTWISE is **worse** than L3c's `u + Eρ(1 + u)` at high N: W̄ρ_S contains
+   `(u + γ(1 + u))ρ_S` where L3c has u. Segmentation gives up the single final rounding.
+7. ρ_S from the output. With `U_s = E_s(1 + u) + u` and `U ≥ max_s U_s`:
+   `W̄ ≤ U + Su(1 + U)`, since `W_s = U_s + γ(1 + u)(1 + E_s)`, `γ(1 + u) ≤ Su` (L7d step 1,
+   S ≤ 2²⁶) and `E_s ≤ U_s`. If `|C_S| > W̄·N_S` then
+   `|x| ≥ |C_S| − |C_S − x| ≥ |C_S| − W̄·N_S > 0`, so `N_S/|x| ≤ N_S/(|C_S| − W̄·N_S)`, which
+   increases with N_S and W̄: upper bounds of both, rounded outward as in DESIGN §6g.11, give
+   a valid ρ_S. Without the normal-range hypothesis on the D_s (which a caller cannot check:
+   D_s for s ≥ 2 is never materialized), (3) gives `|C_S − x| ≤ W̄·N_S + (1 + γ)·S·η`, and
+   the same argument holds with the denominator `|C_S| − W̄·N_S − (1 + γ)·S·η`. Since γ ≤ 1
+   for S ≤ 2²⁶, `(1 + γ)·S·η ≤ S·2⁻¹⁰⁷⁴`, a double (`params.kseg_eta`), which DESIGN §3.8's
+   evaluation adds to U·n rounding upward. ∎
+
+**Claim L7d (the recipe's request).** Let `t_eff > 0` be RN of a positive rational t̄, let
+`S ≤ 2²⁶`, and let `t′ = RN(RN(min(t_eff, 1)·(1 − 2⁻⁵⁰)) − 4S·2⁻⁵³)` (`params.kseg_request`).
+If `E(1 + u) + u ≤ t′` then `u + (1 + u)E + γ(1 + u)(1 + E) ≤ t̄`.
+
+*Proof.*
+1. `γ_{S−1}(1 + u) ≤ Su`: with j = S − 1 it is `j(1 + u) ≤ (j + 1)(1 − ju)`, i.e.
+   `j(j + 2)u ≤ 1`, true for S ≤ 2²⁶.
+2. `E ≤ E(1 + u) + u ≤ t′ ≤ 1`, so the left side is `≤ t′ + Su(1 + t′) ≤ t′ + 2Su`.
+3. If `t_eff ≤ 1`: everything is in the normal range, since `t′ ≥ u` (step 2) forces
+   `RN(min(t_eff, 1)(1 − 2⁻⁵⁰)) > 4Su ≥ 2⁻⁵¹`, so t_eff, t̄, the product and the difference
+   are all normal. Hence `t_eff ≤ t̄(1 + u)`, the product rounds up by at most a factor
+   `1 + u`, and `t′ > 0` rounds up by at most `1 + u` too, so
+   `t′ ≤ t̄(1 − 2⁻⁵⁰)(1 + u)³ − 4Su < t̄(1 − 4u) − 4Su`, and `t′ + 2Su < t̄`.
+4. If `t_eff > 1` then `t̄ > 1` (RN is monotone and 1 is a double), and
+   `t′ ≤ (1 − 2⁻⁵⁰)(1 + u) − 4Su`, so `t′ + 2Su < 1 < t̄`. ∎
+
+Checked by `cert_kseg_composition` (params.py) against exact rationals; `oracle.contract_segments`
+is the recipe's bit-exact reference.
+
+---
+
 ## Formalization status
 
 **Done.** All lemmas are machine-checked in `proofs/` (Lean 4.34.1, Mathlib v4.34.1), with no
 `sorry`, `admit` or new axioms. The capstone `emulated_product_exact` chains L1c + L4 + L2c.
-Run `tools/check_proofs.sh`. The lemma-to-theorem map and modelling choices are in
-`proofs/NOTES.md`. Still taken as hypotheses:
-- the IEEE rounding property;
+**[v1.19]** L3c (the ν form, its NORMWISE / ELEMENTWISE / ABSOLUTE compositions with the
+final rounding, and the native chain's γ_k) and L7 (the recursive-summation lemma L7a,
+`kseg_compose`, `kseg_rows` from the band rows; of the metric forms L7c, N_S ≤ ‖a‖‖b‖, the
+NORMWISE form, the underflow term of (3), E's monotonicity (4) and the exact statements of
+(7); and the exact half of L7d) were added for NOTES-C1 stage 3 (IR5). L7c (2)'s ELEMENTWISE
+and ABSOLUTE forms are one-line corollaries of `kseg_compose` and are not restated. Run `tools/check_proofs.sh`. The lemma-to-theorem map
+and modelling choices are in `proofs/NOTES.md`. Still taken as hypotheses:
+- the IEEE rounding properties (of the final conversion, `|fl(y) − y| ≤ u|fl(y)|` or
+  `≤ u|y|`, and of an addition, `|fl(a + b) − (a + b)| ≤ u|a + b|`);
 - the residue map's int8 range;
 - facts about the 20 concrete moduli, which `spec/params.py` certifies.
 

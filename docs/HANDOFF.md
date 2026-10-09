@@ -1,4 +1,4 @@
-# Handoff (2026-10-04)
+# Handoff (2026-10-04; C1 / C2 state updated 2026-10-07)
 
 State of immerdink for a fresh session, written before switching the dev box to a
 console-only (no graphics) setup. Read this, `docs/ROADMAP.md` and the auto-loaded memory
@@ -133,14 +133,76 @@ first.
   (dropped, above; with the launch-timing check), streaming K2 of g < N KL
   calls (+2 … +5 %), pre-packed g < N in the S rule, tiny-shape K4 / KF. GPU: 18.7 min (90 min
   sweep wall time, mostly gate waits for other GPU users).
+- **Adaptive precision C1 / C2 (2026-10-07, branch `claude/ozaki-kernels-immerdink-1089fd`,
+  PR #6 into dev; DESIGN v1.19 §6g and §3.8, host API 13, no ABI-layout, calibration-format or
+  TLA+ change; `imd_perf_calib_t` keeps its layout and size, but `param[95]` is now the optional
+  key `warm.kl_drop`, so a hand-built struct must zero `param`):** the design and the current state are docs/NOTES-C1.md (read its Status, "Status
+  at the C1/C2 close-out", first). **C2 is done** by its definition of done (NOTES-C1 §4.11);
+  **C1 is done as amended** (decision by Eric, 2026-10-09): M-c failed (MC-3a did not pass,
+  ruling A), **M-d2 ran on 2026-10-09 and PASSES** (NOTES-C1 §5.12), and Eric amended C1's
+  done condition "M-c has passed" because M-d2 passed on the shipped calibration; M-c stays
+  FAILED and the `[M, model-only, outside hold-out]` marks stay.
+  - Shipped: stage 0, precision phases (a plan and a pack per N, published footprint
+    monotonicity F1–F3, the re-pack rule, `PackedBuffer`); stage 1,
+    `immerdink.precision.PrecisionPlan` and `rho_from_output`; stage 3, the K-segmentation
+    caller recipe (§3.8, PROOFS L7, `cert_kseg_composition`, `oracle.contract_segments`) and
+    L3c + L7 in Lean; `oracle.kweights` and the M-a study (C2's deliverable); the M-d1 caller
+    guidance (DESIGN §6g.12). The round-2 stage-0 GPU tests pass (4ba78b1). M-b is done.
+  - Closed or deferred, each with its trigger (DESIGN §7, ROADMAP C1/C2): stage 4 (caller-side
+    K-equilibration) closed by its gate (no real psi4 contraction of the ≥ 2048³ class passes the guard); stage 6
+    (library-internal weights) deferred; stage 5 (K5 statistics + device certificate) deferred,
+    triggers T1–T3.
+  - **C1 record (GPU), closed as amended:** M-c ran on 2026-10-07 and **failed** (binding, NOTES-C1 §5.9): the
+    < 100 µs median was missed (15.8 % against 15 %) through a small-N optimism on the KF path
+    (1024³ at N = 4) and narrow-n KL calls (KL A keeps only part of its REPEAT credit, the
+    narrow pack KL B is slow in every cache state; per-phase table in immerdink-eval
+    `results/c1/m_c/phases.md`); the Q24 refit was not adopted and the [M, model-only, outside
+    hold-out] marks stay. **MC-3a was executed once on 2026-10-09 (NOTES-C1 §5.11, DESIGN
+    §6c.9):** one key (`warm.kl_drop`, fitted 0.70), a fresh narrow-KL hold-out, one refit
+    with Q24, a fresh 160-call M-c run. Every §6c.5 class target is met on every set, but one
+    pre-registered in-sample condition fails under its literal reading (two K4 entries, from
+    Q24's records), so no pass is declared: M-c stays FAILED, the marks stay, the shipped
+    calibration is unchanged, KL B is an open model defect (DESIGN §7; [GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog)), and MC-3 is closed
+    without a calibration change as MC-3a's recorded outcome. **Independent review, binding
+    ruling A (2026-10-09):** the in-sample condition is read against the shipped fit's table, so
+    MC-3a does not pass; the candidate calibration (immerdink-eval
+    `results/c1/mc3a/refit/mc3a.calib`) stays there, `warm.kl_drop` stays in the library and
+    the fitter (slot `IMD_PERF_PARAM_KL_DROP_SLOT` = 95), no second key. **Decision by Eric,
+    2026-10-09, after M-d2 (NOTES-C1 §5.11 "Verdict", §5.12):** C1's done condition ("M-c has
+    passed") is amended, because M-d2 passed on the shipped calibration; C1 is done as amended.
+    `perf_fit.py --kl-drop` now defaults to 0 (key absent, the v1.18 rule; `scan` is opt-in), so
+    a routine `tools/calibrate.sh` run cannot ship a nonzero `warm.kl_drop`. **M-d2 ran on 2026-10-09 and PASSES** (NOTES-C1 §5.12, DESIGN §6g.9;
+    driver `bench/accuracy/md2_time.py` re-registered at fce29e9 with the NaN-filled bit-exact
+    check; records and findings in immerdink-eval `results/c1/m_d2/md2.jsonl`,
+    `findings/c1-m-d2.md`): the schedule against fixed N = 14, normal / decay_opp, PPL view
+    0.769 / 0.769 (bar 0.750), DF 0.695 / 0.698 (0.664), 4096^3 0.696 / 0.692 (0.673), all
+    inside their bands; `bench/first_call.py --sweep` re-run on 243d9c0 (DESIGN §6g.6). Nothing
+    remains for C1.
+  - Open outside C1: a `PrecisionPlan` member role "A=B" (one shared pack read through both
+    roles; named "AB" before the close-out review), trigger the ehrenfest-side integration of
+    the B2 performance model declaring DF-factor sharing (ROADMAP C1).
+  - **Final checks (2026-10-09, at 28f2841, the commit of the final-review fixes; later commits are
+    docs only):** `tools/test.sh` 58 of 58 (the 18 CPU-only ctest tests, then the 40 GPU tests
+    under the GPU lock; the library rebuilt after the header comment change), `spec/params.py
+    --check` 33 of 33, `spec/test_oracle.py` ALL PASS; `perf_fit.py --check` passes on the shipped
+    calibration, and a default fit on the shipped records plus `calib_n.jsonl` writes no
+    `warm.kl_drop` key (`--kl-drop scan` reproduces 0.70).
+  - Close-out checks (2026-10-07, CPU only): `tools/test.sh`'s 18 CPU-only ctest tests,
+    `spec/params.py --check` 33 of 33 and `spec/test_oracle.py` pass (immerdink-eval
+    `findings/c1-closeout.md`); the GPU suite last ran at 4ba78b1 (56 of 56; no `src/` or
+    `include/` change since). The close-out review's fixes (docs and one docstring) re-ran the
+    18 CPU-only tests: pass.
+  - Evaluation records and summaries are in immerdink-eval `results/c1/` and
+    `findings/c1-*.md`.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
 - **D3 gate (Eric, 2026-10-04):** D3 begins with a design/theory discussion with Eric to narrow
   the questions. Do not start D3 agents or specs before that.
-- **Roadmap done:** A1, A2, A3, A4, A5 (2026-10-04, docs/NOTES-A5.md), D1, D4 part 1. Next by Eric's priority: D3 (packed
-  symmetric contractions; design preference: one generic kernel, else split; TLA+ first),
-  then B2 (performance model that ehrenfest can call), B1, then C1 after Ozaki-II is polished.
+- **Roadmap done:** A1, A2, A3, A4, A5 (2026-10-04, docs/NOTES-A5.md), D1, D4 part 1, B1, B2;
+  C1 and C2 (2026-10-09 and 2026-10-07; PR #6 into dev, the C1/C2 bullet above; C1 done as amended).
+  Next by Eric's priority: D3 (packed
+  symmetric contractions; design preference: one generic kernel, else split; TLA+ first).
   SE items are parked. For tiny-call timings use `imd_bench --methods duel` (two immerdink
   configurations interleaved; docs/BENCHMARKING.md, NOTES-A5 §1.2). The bench is
   immerdink-only; comparisons with other libraries live in the evaluation workspace.
@@ -160,6 +222,16 @@ first.
    `bench/sweep_d1.txt`) once the 4090 has no desktop on it, ideally with persistence mode on
    (`sudo nvidia-smi -pm 1`). Records now carry `attempts` and `contaminated`.
 4. **Decided 2026-10-04: not now** (revisit for a paper or sub-percent tiny-shape numbers) — GPU clock locking for paper-grade small-shape numbers (`sudo nvidia-smi -lgc`): optional.
+5. **C1/C2 (2026-10-07; docs/NOTES-C1.md "To report to Eric")**, none blocking:
+   - Q6 and Q7 (ROADMAP C1's decision column, C2's new title) were approved on Eric's behalf
+     by the independent reviewer (IR18); Eric may overrule.
+   - MC-3 can close without a calibration change only as MC-3a's recorded outcome or by
+     Eric's explicit decision (NOTES-C1 §5.10 MD2-0); done: MC-3a closed it, M-d2 ran (§5.11, §5.12).
+   - Stage 5 (device statistics, the a-posteriori certificate) is deferred with triggers
+     T1–T3; T3 is Eric asking for the device certificate (NOTES-C1 §4.6).
+   - IR26's premise was wrong: GPU counters are open to all users here. Stage 5's cost bar
+     keeps its content; `ncu` is a diagnostic only, with `--clock-control none` (NOTES-C1
+     §4.6, "Correction").
 
 ## Machine notes
 
@@ -169,7 +241,10 @@ first.
 - Heavy jobs run inside `tools/memcap.sh` (shared cgroup budget, RAM/2). The tools already do.
 - PCIe was stuck at gen1 on 2026-10-03 and recovered after the reboot (gen4 x16, 21 GB/s).
 - Nsight Systems at `~/nsight-systems-2026.5.1/target-linux-x64/nsys`; `ncu` in the immerdink
-  env; GPU counters enabled for all users.
+  env; GPU counters enabled for all users. Run `ncu` only with `--clock-control none` (its
+  default, `boost`, locks the clocks), under the GPU lock, once a busy check shows no
+  ehrenfest timing tests running, in holds of at most 5 minutes (NOTES-K5-bimodal ran it with
+  `--clock-control none` under the lock; NOTES-C1 §4.6, "Correction").
 - Benchmarks: `bench/run_sweep.sh` / `bench/run_ab.sh` (quiet-gated, warm-up, retries,
   clock-state records). Correctness tests are not quiet-gated.
 

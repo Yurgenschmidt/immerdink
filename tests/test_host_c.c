@@ -456,6 +456,39 @@ int main(void) {
     CHECK(strcmp(back.gpu, cal.gpu) == 0 && strcmp(back.clocks, cal.clocks) == 0);
     CHECK(back.sm_count == cal.sm_count &&
           memcmp(&back.peak_dram_bytes_per_s, &cal.peak_dram_bytes_per_s, 4 * sizeof(double)) == 0);
+    /* v1.19 (DESIGN §6c.9, host API 13, no struct growth): the optional warm.kl_drop lives in
+     * param[IMD_PERF_PARAM_KL_DROP_SLOT], in [0, 1], written only when non-zero */
+    {
+      static char t0[16700], t1[16700], bad[16800];
+      static imd_perf_calib_t kd, kb;
+      const int kslot = IMD_PERF_PARAM_KL_DROP_SLOT;
+      size_t n0 = 0, n1 = 0;
+      int32_t el = -1;
+      CHECK(kslot == IMD_PERF_PARAM_CAPACITY - 1 && kslot == 95 &&
+            kslot >= IMD_PERF_CLASS_COUNT * IMD_PERF_MAX_PARAMS &&
+            cal.format == IMD_PERF_CALIB_FORMAT);
+      kd = cal;
+      kd.param[kslot] = 0;
+      CHECK(imd_perf_calib_format(&kd, t0, sizeof t0, &n0) == IMD_STATUS_SUCCESS &&
+            strstr(t0, "warm.kl_drop") == NULL);
+      kd.param[kslot] = 0.5;
+      CHECK(imd_perf_calib_format(&kd, t1, sizeof t1, &n1) == IMD_STATUS_SUCCESS &&
+            strstr(t1, "\nwarm.kl_drop = 0.5\n") != NULL && n1 > n0);
+      memset(&kb, 0x5a, sizeof kb);
+      kb.struct_size = sizeof kb;
+      CHECK(imd_perf_calib_parse(t1, n1, &kb, &el) == IMD_STATUS_SUCCESS && el == 0 &&
+            kb.param[kslot] == 0.5 && memcmp(kb.param, kd.param, sizeof kd.param) == 0);
+      {
+        const char* const bads[3] = {"1.5", "-0.25", "nan"};
+        int i;
+        for (i = 0; i < 3; ++i) {
+          snprintf(bad, sizeof bad, "%s\nwarm.kl_drop = %s\n", t0, bads[i]);
+          el = 0;
+          CHECK(imd_perf_calib_parse(bad, strlen(bad), &kb, &el) == IMD_STATUS_INVALID_VALUE &&
+                el > 0);
+        }
+      }
+    }
     /* host API 11 (DESIGN v1.15 §6c.7): the optional power.byte_f_pj, and the folded view
      * energy_byte_pj = byte + byte_f of a v7..v10-sized struct (nothing written beyond it) */
     {

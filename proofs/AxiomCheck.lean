@@ -59,6 +59,34 @@ open Immerdink
 #print axioms Error.end_to_end_trunc
 #print axioms Error.zero_row
 #print axioms Error.q_zero_rn
+-- L3c (Error.lean; NOTES-C1 IR5)
+#print axioms Error.l3c_unit
+#print axioms Error.round_step
+#print axioms Error.l3c_normwise
+#print axioms Error.l3c_elementwise
+#print axioms Error.l3c_absolute
+#print axioms Error.unitE_mono
+
+-- L7a recursive summation, L3c (3) native chain (Summation.lean)
+#print axioms Summation.pow_mul_le_one
+#print axioms Summation.pow_sub_one_le_gam
+#print axioms Summation.gam_nonneg
+#print axioms Summation.recsum_pow
+#print axioms Summation.recsum
+#print axioms Summation.fma_chain
+
+-- L7 segmented accumulation (Segments.lean)
+#print axioms Segments.band_bound
+#print axioms Segments.kseg_compose_sub
+#print axioms Segments.kseg_compose
+#print axioms Segments.abs_dot_le
+#print axioms Segments.kseg_rows
+#print axioms Segments.bands_norm_le
+#print axioms Segments.kseg_normwise
+#print axioms Segments.gam_mul_le
+#print axioms Segments.kseg_request_core
+#print axioms Segments.kseg_wbar_le
+#print axioms Segments.kseg_rho_le
 
 -- Capstone (Exact.lean): L1c + L4 + L2c
 #print axioms Exact.emulated_product_exact
