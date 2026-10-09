@@ -56,6 +56,11 @@ The protocol (pre-registered before any M-d2 measurement):
   Every call: alpha = 1, beta = 0, the same operands (an iteration's operands are fixed in
   shape; their values do not change the GEMM work), one CUDA stream, the raw entry points
   Plan.contract_ptr / Pack.pack_ptr (the checked calls run in the bit-exact check).
+  The bit-exact check (rule (a)) fills C with a NaN bit pattern (NAN_BITS) before the in-line
+  reference call and again before the packed call, and counts a level as bit-exact only if
+  the in-line call wrote every element (no pattern left) and the packed result equals it
+  bit for bit (so a packed call that writes nothing cannot compare equal to a reference
+  that is itself vacuous). Registered with this fix at the commit NOTES-C1 §4.3 names.
 - Timing: GPU events. Before each run a cudaMemsetAsync of a scratch buffer (--primer-mib,
   default 1024) keeps the GPU busy while the host enqueues the run, so the run's calls
   follow each other on the GPU without host gaps (queued_ahead records whether the whole
@@ -191,6 +196,21 @@ DEFAULT_LIB = os.path.join(ROOT, "build", "libimmerdink.so")
 # --md2-cleared cites the commit and the NOTES-C1 section that record MC-3's closure
 CLEARED_COMMIT = re.compile(r"\b[0-9a-f]{7,40}\b")
 CLEARED_SECTION = re.compile(r"NOTES-C1 §\d+(\.\d+)*")
+
+
+# The bit-exact check fills C with this NaN (a quiet NaN with a payload no kernel produces)
+# before each call, so that a call that writes nothing leaves it in place and is detected.
+NAN_BITS = 0x7FF8DEADBEEF0001
+
+
+def bitexact_level(ref_bits, got_bits):
+    """(bit-exact, in-line elements still holding NAN_BITS, packed elements still holding it)
+    for one level; the arguments are numpy uint64 arrays (C's bits after each call). Bit-exact
+    only if the in-line call left no pattern (it wrote every element) and the packed result
+    equals the in-line one."""
+    ref_left, got_left = int((ref_bits == NAN_BITS).sum()), int((got_bits == NAN_BITS).sum())
+    equal = bool((ref_bits == got_bits).all())
+    return (ref_left == 0 and equal), ref_left, got_left
 
 
 def sha256(path):
@@ -790,18 +810,24 @@ def cmd_run(a):
     pb = imd.PackedBuffer(pbuf, npk)
     nC = math.prod(cshape)
     ref, got = np.empty(nC), np.empty(nC)
+    nan_c = np.full(nC, NAN_BITS, dtype=np.uint64).view(np.float64)
     rec["bitexact_packed_vs_inline"] = {}
+    rec["bitexact_unwritten"] = {}  # per level: elements still holding NAN_BITS, in-line / packed
     for N in LEVELS:
+        rt.upload(dC, nan_c)  # C := NaN pattern, then the in-line reference call
         plans[N].contract(xA, xB, xC, workspace=wsa, stream=st)
         rt.sync(st)
         rt.download(ref, dC)
         packs[N].pack(X, pb, workspace=pwa, stream=st)
+        rt.sync(st)
+        rt.upload(dC, nan_c)  # C := NaN pattern again, then the packed call
         pplans[N].contract(xA, xB, xC, workspace=wsa, stream=st,
                            packed=(pb, None) if op == 0 else (None, pb))
         rt.sync(st)
         rt.download(got, dC)
-        rec["bitexact_packed_vs_inline"][str(N)] = bool(np.array_equal(ref.view(np.uint64),
-                                                                       got.view(np.uint64)))
+        ok, ref_left, got_left = bitexact_level(ref.view(np.uint64), got.view(np.uint64))
+        rec["bitexact_packed_vs_inline"][str(N)] = ok
+        rec["bitexact_unwritten"][str(N)] = [ref_left, got_left]
 
     def contract(N, packed):
         if packed:
@@ -1231,6 +1257,27 @@ def cmd_selftest(a):
     check("file: a smoke record of another library is no M-d2 record",
           file_problems(all_pass() + [rec("smoke", "normal", 0.86, lib_sha256="c" * 64,
                                           md2_cleared=None)], anc), [])
+    # the NaN-filled bit-exact check (numpy only here; skipped if it is not installed)
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None:
+        v = np.array([1.5, -2.0, 3.25, 0.0]).view(np.uint64)
+        nanv = np.full(4, NAN_BITS, dtype=np.uint64)
+        check("NaN pattern is a NaN", bool(np.isnan(nanv.view(np.float64)).all()), True)
+        check("bit-exact: equal and fully written", bitexact_level(v, v.copy()), (True, 0, 0))
+        check("bit-exact: a differing bit", bitexact_level(v, v ^ np.uint64(1))[0], False)
+        check("bit-exact: nothing written by either call (vacuous)",
+              bitexact_level(nanv, nanv.copy()), (False, 4, 4))
+        check("bit-exact: the packed call wrote nothing", bitexact_level(v, nanv), (False, 0, 4))
+        w = v.copy()
+        w[2] = NAN_BITS
+        check("bit-exact: one element unwritten by both", bitexact_level(w, w.copy()),
+              (False, 1, 1))
+        check("bit-exact: a NaN result of another payload is a result",
+              bitexact_level(np.array([float("nan")]).view(np.uint64),
+                             np.array([float("nan")]).view(np.uint64))[0], True)
     print(f"md2_time selftest: {n[0] - len(fails)} of {n[0]} checks passed")
     for f in fails:
         print("  FAIL " + f)
