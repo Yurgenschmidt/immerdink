@@ -181,6 +181,12 @@ first.
   - Open outside C1: a `PrecisionPlan` member role "A=B" (one shared pack read through both
     roles; named "AB" before the close-out review), trigger the ehrenfest-side integration of
     the B2 performance model declaring DF-factor sharing (ROADMAP C1).
+  - **Final checks (2026-10-09, at 28f2841, the commit of the final-review fixes; later commits are
+    docs only):** `tools/test.sh` 58 of 58 (the 18 CPU-only ctest tests, then the 40 GPU tests
+    under the GPU lock; the library rebuilt after the header comment change), `spec/params.py
+    --check` 33 of 33, `spec/test_oracle.py` ALL PASS; `perf_fit.py --check` passes on the shipped
+    calibration, and a default fit on the shipped records plus `calib_n.jsonl` writes no
+    `warm.kl_drop` key (`--kl-drop scan` reproduces 0.70).
   - Close-out checks (2026-10-07, CPU only): `tools/test.sh`'s 18 CPU-only ctest tests,
     `spec/params.py --check` 33 of 33 and `spec/test_oracle.py` pass (immerdink-eval
     `findings/c1-closeout.md`); the GPU suite last ran at 4ba78b1 (56 of 56; no `src/` or
