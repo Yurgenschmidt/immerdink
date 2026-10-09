@@ -137,7 +137,7 @@ first.
   not pushed; DESIGN v1.19 §6g and §3.8, host API 13, no ABI, calibration-format or TLA+
   change):** the design and the current state are docs/NOTES-C1.md (read its Status, "Status
   at the C1/C2 close-out", first). **C2 is done** by its definition of done (NOTES-C1 §4.11);
-  **C1 is open**: M-c failed and M-d2 has not run, and its record continues with MC-3a.
+  **C1 is open**: M-c failed (MC-3a did not pass, ruling A); **M-d2 ran on 2026-10-09 and PASSES** (NOTES-C1 §5.12); what remains is Eric's decision on C1's done condition "M-c has passed".
   - Shipped: stage 0, precision phases (a plan and a pack per N, published footprint
     monotonicity F1–F3, the re-pack rule, `PackedBuffer`); stage 1,
     `immerdink.precision.PrecisionPlan` and `rho_from_output`; stage 3, the K-segmentation
@@ -165,10 +165,13 @@ first.
     `results/c1/mc3a/refit/mc3a.calib`) stays there, `warm.kl_drop` stays in the library and
     the fitter (slot `IMD_PERF_PARAM_KL_DROP_SLOT` = 95), no second key; **open item for Eric:**
     whether C1's done condition ("M-c has passed") is amended, decided after M-d2 (NOTES-C1
-    §5.11 "Verdict"). Next: M-d2, whose
-    protocol and driver `bench/accuracy/md2_time.py` are pre-registered, re-registered at fce29e9 with the NaN-filled bit-exact check (NOTES-C1
-    §4.3, §5.10; one normative records file, the driver frozen from the first M-d2 record on),
-    with `--md2-cleared` citing the closure commit and NOTES-C1 §5.11.
+    §5.11 "Verdict"). **M-d2 ran on 2026-10-09 and PASSES** (NOTES-C1 §5.12, DESIGN §6g.9;
+    driver `bench/accuracy/md2_time.py` re-registered at fce29e9 with the NaN-filled bit-exact
+    check; records and findings in immerdink-eval `results/c1/m_d2/md2.jsonl`,
+    `findings/c1-m-d2.md`): the schedule against fixed N = 14, normal / decay_opp, PPL view
+    0.769 / 0.769 (bar 0.750), DF 0.695 / 0.698 (0.664), 4096^3 0.696 / 0.692 (0.673), all
+    inside their bands; `bench/first_call.py --sweep` re-run on 243d9c0 (DESIGN §6g.6). What
+    remains for C1 is Eric's decision on the done condition "M-c has passed".
   - Open outside C1: a `PrecisionPlan` member role "A=B" (one shared pack read through both
     roles; named "AB" before the close-out review), trigger the ehrenfest-side integration of
     the B2 performance model declaring DF-factor sharing (ROADMAP C1).
@@ -211,7 +214,7 @@ first.
    - Q6 and Q7 (ROADMAP C1's decision column, C2's new title) were approved on Eric's behalf
      by the independent reviewer (IR18); Eric may overrule.
    - MC-3 can close without a calibration change only as MC-3a's recorded outcome or by
-     Eric's explicit decision (NOTES-C1 §5.10 MD2-0); otherwise M-d2 waits for MC-3a.
+     Eric's explicit decision (NOTES-C1 §5.10 MD2-0); done: MC-3a closed it, M-d2 ran (§5.11, §5.12).
    - Stage 5 (device statistics, the a-posteriori certificate) is deferred with triggers
      T1–T3; T3 is Eric asking for the device certificate (NOTES-C1 §4.6).
    - IR26's premise was wrong: GPU counters are open to all users here. Stage 5's cost bar

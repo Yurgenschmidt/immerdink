@@ -8,7 +8,11 @@ summary; C1's record continues with MC-3a. **Update, 2026-10-09: MC-3a has been 
 (§5.11): every §6c.5 class target is met on every set, one pre-registered in-sample
 condition is not met under its literal reading, so no pass is declared; M-c stays FAILED,
 the marks stay, the shipped calibration is unchanged, MC-3 is closed without a calibration
-change, and M-d2 may run on its pre-registered bands. Independent review of MC-3a
+change, and M-d2 may run on its pre-registered bands. **Update, 2026-10-09 (later): M-d2 ran
+and PASSES (§5.12): PPL view 0.769 / 0.769 (bar 0.750, band 0.6375-0.8000), DF 0.695 / 0.698 (bar
+0.664, band 0.5644-0.7636), 4096^3 0.696 / 0.692 (bar 0.673, band 0.5721-0.7740), normal /
+decay_opp, 8 first records, all admissible and bit-exact; C1 stays open only on "M-c has
+passed", an open item for Eric.** Independent review of MC-3a
 (2026-10-09, binding, ruling A, §5.11): the in-sample condition is read against the shipped
 fit's table, so MC-3a does not pass; M-c stays FAILED, the shipped calibration stays, and
 whether C1's done condition "M-c has passed" is amended is Eric's decision after M-d2 (open
@@ -59,10 +63,10 @@ the `libimmerdink.so` builds named per item.
     `results/c1/m_c/mc.jsonl` (sha256 `24fa699d…`, case list at 530ff81, profiling build at
     530ff81 with `libimmerdink.so` `9181dc3f…` and `libimmerdink_host.so` `466acdb4…`, the
     shipped calibration `d31f62ca…`, stock clocks with no lock as in §6c.5's validation).
-  - **Not met: "M-d1 and M-d2 are reported with their success criteria evaluated".** M-d1 is
-    reported and meets its criterion on every system; **M-d2 has not run**: the binding
-    ordering made it wait for MC-3a (§5.9 "M-d2 ordering", §5.10 MD2-0); MC-3a's recorded
-    outcome (§5.11) closes MC-3 without a calibration change, so it may now run. Its protocol and
+  - **Now met (2026-10-09): "M-d1 and M-d2 are reported with their success criteria
+    evaluated".** M-d1 is reported and meets its criterion on every system; M-d2 ran after
+    MC-3a's recorded outcome (§5.11) closed MC-3 without a calibration change, and passes
+    (§5.12). (Text written at the close-out, when M-d2 had not run, follows.) Its protocol and
     driver are pre-registered (`bench/accuracy/md2_time.py`, re-registered at fce29e9 with the
     NaN-filled bit-exact check, sha256 `dbbbfe18…`; before it 35eeb46, sha256 `90fa7f92…`).
   - Met: the ROADMAP C1 row shows the Q6 decision column and "stage 5 deferred (triggers
@@ -208,11 +212,10 @@ since the design draft (39972b7), `include/` only in comments.
 **What remains for C1** (round 2, GPU; updated 2026-10-09): MC-3a is done (§5.11) and MC-3
 is closed without a calibration change (independent review, 2026-10-09, binding ruling A:
 the one in-sample condition is read against the shipped fit's table, so MC-3a does not pass,
-§5.11 "Verdict"). Whether C1's done condition "M-c has passed" is amended is Eric's decision
-after M-d2 (open item for him; not amended). What remains is M-d2 (§4.3; the driver re-registered with the NaN-filled bit-exact check first, then
-eight `run` processes into one records file and one `judge`). In the same GPU round, a
-re-run of `bench/first_call.py --sweep` on the current build (about a minute of GPU), whose
-records name the commit, the library sha256s and the host API (final review; DESIGN §6g.6). Until M-c passes, figures at N ∉ {8, 10, 14, 16} keep
+§5.11 "Verdict"). **M-d2 and the first-call re-run are done (2026-10-09, §5.12):** M-d2
+PASSES; `bench/first_call.py --sweep` re-run on commit 243d9c0 with records naming the commit,
+the library sha256s and the host API (DESIGN §6g.6). Whether C1's done condition "M-c has
+passed" is amended is Eric's decision (open item for him; not amended) and is all that remains. Until M-c passes, figures at N ∉ {8, 10, 14, 16} keep
 the mark [M, model-only, outside hold-out]. Open outside C1: a `PrecisionPlan` member role
 "A=B" for a self-contraction reading one shared pack through both roles (M-b below; named
 "AB" before the close-out review, which renamed it because `"AB"` is the pack-mode value for
@@ -645,7 +648,7 @@ what has been built since is recorded under "Implementation status".
     fit case). Also applied: the exact n1 change list, which overlaps share N with a fit
     sample (4 of 7), the anchors' baseline next to "16–21 points", and the run-to-run
     figure of the Jacobi error.
-- **M-d2 (§4.3) has not run: the binding ordering holds** (§5.9 "M-d2 ordering": M-d2 waits
+- **(Superseded: M-d2 ran on 2026-10-09 and passes, §5.12.) M-d2 (§4.3) has not run: the binding ordering holds** (§5.9 "M-d2 ordering": M-d2 waits
   until the MC-3 path closes, and MC-3 has not started). A workflow task of 2026-10-07 asked
   for M-d2; no M-d2 system was run on the GPU. The independent reviewer upheld this (§5.10
   MD2-0, binding): MC-3a comes first. MC-3 may close without a calibration change only as
@@ -3596,7 +3599,7 @@ dependencies:
   re-derived if the calibration changes. Still strictly before M-d2.
 - M-d2 against its pre-registered bands, after the MC-3 path closes (§5.9 "M-d2 ordering").
   *Its protocol and driver are pre-registered (re-registered after two reviews, now at
-  35eeb46, §4.3, §5.10), and it has not run.*
+  35eeb46, §4.3, §5.10), and it has not run.* (It ran on 2026-10-09 and passes, §5.12.)
   Once the ordering is met, the library is built at the registered commit and its sha256
   named in the findings; then it is eight `md2_time.py run` processes into the one
   normative records file, and one `judge` (§4.3 "Records, freeze and continuation").
@@ -5559,6 +5562,116 @@ the refit's input records are those of the shipped calibration (`calib-20261006-
 `perf_fit.py` once more with a three-decimal copy of its table (`/tmp`, same inputs, same
 output, sha256 equal) to read the K4 differences above exactly. The mc.jsonl-based reports were
 read once, after the refit, as the pass checks; no choice depends on them.
+
+### 5.12 M-d2: the run and its verdict (implementer, 2026-10-09)
+
+**M-d2 PASSES** by the pre-registered rules (§4.3, §5.10): all three gated systems are INSIDE
+their band on both data sets, every record is admissible and bit-exact, and the 8 records are
+the first and only attempts (no re-run, no excess record). Source: immerdink-eval
+`findings/c1-m-d2.md`; records `results/c1/m_d2/md2.jsonl` (the one normative file, 8 records),
+`judge.out` / `judge.json`, `run.log`. This is a time result on the shipped calibration; it
+does not change M-c (FAILED, §5.11 ruling A), and C1's done condition ("M-c has passed") is not
+amended here: that is **Eric's decision, an open item for him**.
+
+**Order and provenance.**
+1. The two must-fix and docs items of the MC-3a ruling (d1d474e: the named slot constant, the
+   closure text); `tools/test.sh` passed on that tree (the CPU-only pass 18 of 18, the GPU pass under the lock 40
+   of 40), `spec/params.py
+   --check` 33 of 33, and with the key absent the shipped calibration file is byte-identical
+   (sha256 `d31f62ca…`) and 720 predictions (three calibrations, 5 shapes, N 4 / 8 / 14, g,
+   regimes, cache states, including a calibration with `warm.kl_drop` = 0.35) hash equal before
+   and after the slot move.
+2. The driver re-registered at **fce29e9** (NaN-filled bit-exact check, §4.3; selftest 102
+   checks; sha256 `dbbbfe18bc4e…`), recorded at 243d9c0. `predict` (CPU) reproduces the bars
+   (calibration file registered, library calibration equal, bars 0.750 / 0.664 / 0.673 and the
+   Jacobi view's 0.786). A tooling smoke on `smoke` and `smoke_t` (not M-d2 evidence,
+   `results/c1/m_d2/rereg3/`): bit-exact True with 0 unwritten elements at every level,
+   admissible.
+3. The 8 `run` processes, each a fresh process under `tools/run_quiet.sh` (quiet gate, GPU
+   lock, memcap), each chunk (at most 2 processes, about 20 s each) after a FREE busy check in
+   its own call, into `md2.jsonl`; `--md2-cleared` "MC-3 closed: MC-3a's recorded outcome at
+   d1d474e, NOTES-C1 §5.11". Every record: commit 243d9c0, dirty false, driver `dbbbfe18…`,
+   `libimmerdink.so` `2c998dbc…`, `libimmerdink_host.so` `35e6f89d…`, host API 13. One `judge`.
+   About 3 minutes of GPU for the 8 runs (12:35:25 to 12:38:15), about 1 minute for the smoke,
+   20 s for first_call. The library differs from the design-phase one by the `warm.kl_drop`
+   code and the slot constant only (bit-identical predictions with the key absent).
+
+**Verdict per system** (S14 = 5 x N6 + 4 x N8 + 4 x N10 + 3 x N14 against F14 = 16 x N14; the
+statistic r = median S14 / median F14; band = bar x (1 -/+ 15 %), capped at 0.8; TFLOPS-eq is
+2 m n k / time, time alongside):
+
+| system | data | S14 TFLOPS-eq (ms) | F14 TFLOPS-eq (ms) | r measured | r predicted (bar) | band | verdict |
+|---|---|---|---|---|---|---|---|
+| PPL view 100 x 9216 x 9216 | normal | 6.01 (45.215) | 4.62 (58.771) | **0.7693** | 0.7501 (0.750) | [0.6375, 0.8000] | INSIDE |
+| | decay_opp | 6.04 (45.024) | 4.64 (58.562) | **0.7688** | | | INSIDE |
+| DF 4096 x 4096 x 2032 | normal | 39.31 (27.749) | 27.32 (39.937) | **0.6948** | 0.6635 (0.664) | [0.5644, 0.7636] | INSIDE |
+| | decay_opp | 39.29 (27.766) | 27.41 (39.797) | **0.6977** | | | INSIDE |
+| 4096^3 | normal | 43.88 (50.110) | 30.53 (72.026) | **0.6957** | 0.6728 (0.673) | [0.5721, 0.7740] | INSIDE |
+| | decay_opp | 44.18 (49.776) | 30.55 (71.984) | **0.6915** | | | INSIDE |
+| Jacobi view 1600 x 100 x 1600 (reported, not gated) | normal | 5.00 (1.638) | 4.14 (1.976) | 0.8290 | 0.7865 | [0.5502, 1.0218] | inside (reported) |
+| | decay_opp | 4.99 (1.642) | 4.13 (1.983) | 0.8278 | | | inside (reported) |
+
+**M-d2: PASS** (PPL view PASS, DF PASS, 4096^3 PASS). The schedule runs 1.30 x (PPL view), 1.44 x
+(DF), 1.44 x (4096^3) and 1.21 x (Jacobi view) faster than fixed N = 14 on the same stream,
+in TFLOPS-eq 6.0 against 4.6, 39.3 against 27.3 and 43.9 / 44.2 against 30.5, with the
+phases' bit-exact packed = in-line check (NaN-filled) true at every level of every record.
+
+**What the numbers say, beyond the pass.**
+- Every measured ratio is above its prediction: by +0.019 (PPL view, +2.6 %), +0.031 / +0.034
+  (DF, +4.7 / +5.2 %), +0.023 / +0.019 (4096^3, +3.4 / +2.8 %) and +0.043 (Jacobi view, +5.4 %
+  against DEFAULT/COLD; the BURST/REPEAT prediction is 0.728, as M-c's Jacobi marks showed).
+  All are far inside the +-15 % band (PPL view: 0.031 under the 0.8 cap). On the three gated
+  systems the N = 14 phase's time is over-predicted (+3.0 ... +8.9 %).
+- Per phase of S14, measured against the DEFAULT/COLD prediction (error of the prediction):
+  PPL view +2.5 / +4.3 / +7.9 / +8.9 % at N = 6 / 8 / 10 / 14; DF -5.7 / -2.0 / -0.5 / +3.5 %;
+  4096^3 -3.4 / +0.4 / +2.2 / +4.4 %; Jacobi view -3.7 / +3.1 / +0.4 / +9.4 %. N = 6 and
+  N = 9 are outside the performance model's hold-out; these are phase errors on three large
+  calls and one small one, not an M-c pass: the marks stay (§5.11, ruling A).
+- Gain against a fixed N = 8-9 (reported): S9/F9 0.934 / 0.933 (PPL view; predicted 0.925),
+  0.909 / 0.912 (DF; 0.888), 0.903 / 0.906 (4096^3; 0.892), 0.967 / 0.965 (Jacobi view; 0.967).
+  t14 / t8 is 1.37 (PPL view), 1.61 (DF), 1.60 (4096^3) and 1.27-1.28 (Jacobi view).
+- Re-packs of the invariant operand (reported, per switch, ms measured / predicted): PPL view
+  N6 1.67 / 1.72, N8 1.82 / 1.89, N10 1.90 / 2.06, N14 2.20 / 2.41; DF 0.157 / 0.144, 0.169 /
+  0.161, 0.186 / 0.177, 0.223 / 0.211; 4096^3 0.289 / 0.279, 0.316 / 0.313, 0.353 / 0.347, 0.431
+  / 0.414; the Jacobi view's are 0.047-0.071 against 0.054-0.074. P14 / PF14 and P14 / F14: PPL
+  view 0.902 / 0.389, DF 0.693 / 0.630, 4096^3 0.683 / 0.629. Packing the PPL view's
+  invariant B per phase (P14: 11.9 TFLOPS-eq, 22.8 ms) is 2.0 x faster than the in-line
+  schedule (S14: 6.0, 45.2 ms) and 2.6 x faster than in-line fixed N = 14 (F14: 4.6, 58.8 ms),
+  the caller note of §6g.12.
+- Conditions: worst spread 0.79-0.95 % (PPL view, Jacobi view) and 4.0-4.7 % (DF, 4096^3, below
+  the 5 % rule; no `contaminated` record); queued ahead 99-100 % of the runs and 0 of 30 gated
+  S14 / F14 runs not queued ahead per record.
+
+**Decisions made without a reviewer (for the independent reviewer to confirm).**
+- *Smoke before M-d2.* Following the previous re-registrations, a smoke on `smoke` and
+  `smoke_t` ran after the driver change, into `results/c1/m_d2/rereg3/smoke.jsonl` (a separate
+  file; none of the M-d2 systems; a bit-exact failure there would have stopped M-d2 under rule
+  (a), and none occurred).
+- *Closure commit cited.* `--md2-cleared` cites d1d474e (the commit that records the ruling and
+  the closure), as the task named; the driver commit fce29e9 and its docs commit 243d9c0 are
+  descendants of it.
+- *Commit order.* The ruling commit was made after `tools/test.sh` passed on its tree instead
+  of before it (the tests then ran on the committed tree's sources: the later commits changed
+  only the driver and docs).
+- *`bitexact_unwritten`.* The records carry an extra per-level field (elements still holding
+  the NaN pattern, in-line / packed); `judge` ignores it, as it ignores any unknown field.
+
+**First call at a new N** (`bench/first_call.py --sweep`, DESIGN §6g.6): re-run on this build;
+see §6g.6 for the table. Commit 243d9c0, dirty false, `libimmerdink.so` `2c998dbc…`,
+`libimmerdink_host.so` `35e6f89d…`, host API 13, in every one of the 16 records (the
+provenance limit of the design-phase records is closed). The switch is as cheap as measured
+at the design phase: 11.7-37.5 µs more enqueue time than a steady call, at most 7.4 µs more
+from enqueue to completion at 1024^3 and -0.4 ... +2.1 µs at 4096^3, except one sample (4096^3,
+N = 14: +89 µs, 2.0 % of the call, against about +9 µs in the design-phase run), which is reported
+and not repeated; cold capture first / steady replay 1.00-1.10 (IR10's 2 x bar is not met).
+Records: immerdink-eval `results/c1/first_call_243d9c0.jsonl`, 20 s of GPU.
+
+**What remains for C1 after M-d2.** The definition of done (§4.11) has one condition not met,
+"M-c has passed" (FAILED, §5.9; MC-3a did not pass, §5.11). **Open item for Eric:** whether
+that condition is amended, and how (for instance to M-c's measured status plus M-d2's pass, or
+a new hold-out run on a shipped calibration chosen by a later review). It is not amended
+here, and no M-c re-run on the shipped calibration is used to claim a pass. Until then the
+[M, model-only, outside hold-out] marks stay.
 
 ---
 

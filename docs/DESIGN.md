@@ -95,7 +95,7 @@ stage-6 gates: caller-side K-equilibration (stage 4) is closed and library-inter
 evidence (NOTES-C1 IR26). Each has its trigger in §7, and the convergence study's caller
 guidance is in §6g.12. The performance model's small-N hold-out (M-c) failed, so levels
 outside N ∈ {8, 10, 14, 16} stay [M, model-only, outside hold-out] (§6g.9; the one MC-3a attempt
-of 2026-10-09 declared no pass, §6c.9), and the GPU timing of the schedules (M-d2) has not run. No semantic, layout, launch, pack-format, API,
+of 2026-10-09 declared no pass, §6c.9), and the GPU timing of the schedules (M-d2) ran on 2026-10-09 and passes (§6g.9, NOTES-C1 §5.12). No semantic, layout, launch, pack-format, API,
 calibration-format or TLA+ change; changed text is marked **[v1.19]**.
 The change lists are at the end.
 
@@ -5098,9 +5098,18 @@ the 16 records carry only a date, no commit, library sha256 or host API. They we
 (05:04) by `bench/first_call.py` before its first commit (8b58101, 05:13), and that run is the
 only one; the script's later changes (0197351, d22a686, and the final review's host-API
 field) touch its table and provenance code only. So the build named above is the summary's
-account of the library in place at the time, not a field of the records. A re-run on the
-current build, whose records name all three, is due in the remaining C1 GPU round (NOTES-C1
-Status, "What remains for C1").
+account of the library in place at the time, not a field of the records. **Re-run
+2026-10-09** on commit 243d9c0 (`libimmerdink.so` `2c998dbc…`, `libimmerdink_host.so`
+`35e6f89d…`, host API 13, dirty false; all 16 records name them; immerdink-eval
+`results/c1/first_call_243d9c0.jsonl`): the first call at a never-launched N costs 11.7-37.5 µs
+more enqueue time than a steady call and, from enqueue to completion, at most 7.4 µs more
+(1024^3) and -0.4 ... +2.1 µs (4096^3), except one sample (4096^3, N = 14: +89 µs, 2.0 % of the
+4.4 ms call; the design-phase run had about +9 µs; reported, not repeated). Steady / first
+call: 1024^3 27.1 / 25.1 (N = 6), 23.6 / 22.2, 20.6 / 19.2, 15.5 / 15.0 TFLOPS-eq (0.079 /
+0.086 ... 0.139 / 0.143 ms); 4096^3 61.2 / 61.2, 49.6 / 49.6, 41.4 / 41.4, 31.1 / 30.5
+(2.245 ... 4.417 / 4.506 ms). First plan creation 0.011-0.157 ms; re-pack of A 0.018-0.023 ms
+(1024^3) and 0.276-0.421 ms (4096^3); cold capture first / steady replay 1.00-1.10, so the
+conclusions below stand, with no plan-time preload.
 
 | m = n = k | N | steady call | first call at the new N | first plan creation | re-pack of A (GPU) | cold capture: first / steady replay |
 |---:|---:|---|---|---:|---:|---:|
@@ -5270,7 +5279,16 @@ it.
     computed from M-c's single-call medians, is 0.003–0.023 above its [M] ratio on 2000³,
     4096³, DF, QZ and the PPL view, and 0.005–0.028 below on 1024³ and skinny. On the Jacobi
     view it is 0.044–0.047 above (0.830 against 0.786).
-  - **M-d2 has not run** (2026-10-09). It waited for the MC-3 path (NOTES-C1 §5.9 "M-d2
+  - **M-d2 ran on 2026-10-09 and PASSES** (NOTES-C1 §5.12; immerdink-eval `findings/c1-m-d2.md`;
+    commit 243d9c0, driver `dbbbfe18…`, `libimmerdink.so` `2c998dbc…`, host API 13). The
+    schedule 5 x N6 + 4 x N8 + 4 x N10 + 3 x N14 against fixed N = 14 on the shipped
+    calibration, normal / decay_opp (bar, band; TFLOPS-eq first, time alongside): PPL view
+    0.7693 / 0.7688 (0.750, 0.6375-0.8000; S14 6.0 TFLOPS-eq, 45.2 ms against F14 4.6, 58.8
+    ms), DF 0.6948 / 0.6977 (0.664, 0.5644-0.7636; 39.3, 27.7 ms against 27.3-27.4, 39.8-39.9
+    ms), 4096^3 0.6957 / 0.6915 (0.673, 0.5721-0.7740; 43.9-44.2, 49.8-50.1 ms against 30.5,
+    72.0 ms); the Jacobi view (reported) 0.8290 / 0.8278. All eight first records are
+    admissible and bit-exact; every ratio is 0.019-0.034 above its prediction. This is a time
+    result: M-c stays failed and the marks stay. M-d2 waited for the MC-3 path (NOTES-C1 §5.9 "M-d2
     ordering", binding; upheld in review, §5.10 MD2-0: MC-3a first, closed without a
     calibration change only as MC-3a's recorded outcome or by Eric's decision); MC-3a's
     recorded outcome (NOTES-C1 §5.11) closes it, so M-d2 may run on its pre-registered bars.
@@ -6615,7 +6633,7 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     more than 1 point; a fresh narrow-KL hold-out, committed before the refit, meets every
     class target). The v1.18 hold-out is judged on all its cases and on the 69 whose GEMM
     view matches no fit case.
-- **M-d2, pre-registered and not run** (NOTES-C1 §4.3, §5.10; 2026-10-07; no library,
+- **M-d2, pre-registered 2026-10-07 and run 2026-10-09: PASS** (NOTES-C1 §4.3, §5.12, §5.10; 2026-10-07; no library,
   calibration or ABI change). `bench/accuracy/md2_time.py` (3254b15; re-registered after
   review at daf3583, after the re-review at 35eeb46, and at fce29e9 with the NaN-filled
   bit-exact check) has four modes:
@@ -6662,8 +6680,9 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
   - The definition of done (NOTES-C1 §4.11): **C2 is done** (M-a published; stage 3 shipped
     with L3c and L7 in Lean; stage 4 closed and stage 6 deferred, each with its trigger;
     ROADMAP C2 retitled). **C1 is not:** stages 0 and 1, the round-2 stage-0 GPU tests and
-    M-d1 are done and stage 5 is deferred (T1–T3), but M-c failed and M-d2 has not run.
-    What remains is M-d2 (NOTES-C1 §4.3, §5.10); MC-3a was executed on 2026-10-09 and recorded
+    M-d1 are done and stage 5 is deferred (T1–T3), but M-c failed. M-d2 has since run and
+    passed (NOTES-C1 §5.12); what remains is Eric's decision on the done condition "M-c has
+    passed". MC-3a was executed on 2026-10-09 and recorded
     (NOTES-C1 §5.11), with no pass (independent review, ruling A, binding, 2026-10-09).
 - **Final review of C1/C2** (three independent reviewers, approve-with-fixes, 2026-10-07;
   NOTES-C1 Status, "Final review"). No library, calibration, ABI or TLA+ change: host API 13.
