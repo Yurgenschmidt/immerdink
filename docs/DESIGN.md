@@ -4327,6 +4327,100 @@ the v11 view is exact for a v1.17-style file and is the documented degraded view
 shipped one. `host_c_api`: the v13 size and
 offsets, `IMD_PERF_CACHE_CLEAN` accepted, 4 rejected.
 
+### 6c.9 The KL share of the REPEAT saving, `warm.kl_drop` **[v1.19]**
+
+Status: designed for MC-3a (NOTES-C1 §5.9, the second review's amendment of MC-3); the account
+below comes from the **allowed records only**: the calibration records, the cache sweep, the
+Q24 cases (`calib_n.jsonl`) and the v1.18 hold-out, never `mc.jsonl` (evaluation workspace
+`findings/c1-mc3a.md`, `scripts/c1/mc3a/account.py`, shipped calibration, BURST, the phase marks
+against the model's per-phase REPEAT and COLD predictions). The mechanisms are **[I]**, not
+measured. The refit, the pass checks and the fresh M-c run are NOTES-C1 §5.11; if the key is in
+the shipped file the figures below are those of the v1.18 calibration it replaces.
+
+**What the phase marks show.** For a phase with mark m and model times R (REPEAT) and C (COLD),
+the saving the model credits is C − R and the share the mark keeps is (C − m) / (C − R).
+- *KL A, the wide operand's pack, keeps part of its saving, and the part depends on the call,
+  not on the footprint rule.* Q24's three narrow-KL shapes (`q_kl1`, `q_kl2`, `q_kl4`; savings
+  17.6–24.0 µs): 5–52 % (medians 31 / 19 / 39 %), the share rising with N while the credit stays
+  flat. The in-sample records with g < N (`c_k3hit`, `c_skin1280`, `p_k3c`, `c_k3miss`,
+  `c_l2s1472`): −74 to 35 %, median 16 %; `p_k3c` at g = N, N = 14 / 16 (a credit of 14.5 / 7.2
+  µs, near the end of the window): 113 / 152 %. The rule `res = clamp(L_w − (F − I), 0, I)` (§6c.1
+  "Cache state") cannot separate them from the KF calls below.
+- *KF keeps its saving, and more than the rule credits at large N.* Most calibration and
+  hold-out calls at g = N keep 80–130 % (`c_s768`, `c_s1000`, `c_rkf1` at N = 8, `k_*`, `w_*`,
+  `v_s900`, `v_cc12`); the exceptions are small shapes (`c_tcc8`, `v_s512`, `v_rsm1`: 8–73 %)
+  and calls where the rule's saving has already collapsed (`c_rkf1` N = 14 211 %, `k_b` 193–285
+  %). `q_kf1` keeps 80 % at N = 4 and 142 % at N = 10 (a credit of 25.7 → 13.1 µs), the hold-out's
+  `v_sq1024` 90 % at N = 8 and 160 % at N = 14. With g < N, KF keeps nothing: `c_s1000` g = 4
+  (three calls) and `c_s768` g = 3 (six) −10 to −2 %, `v_s512` g = 4 26–29 %.
+  The cache sweep's `x_s1024` pairs (whole calls) measure CLEAN − REPEAT = 16.4 / 13.3 / 12.3 /
+  8.3 / 4.0 µs at N = 8 / 10 / 12 / 14 / 16 against the model's 18.4 / 17.8 / 17.1 / 9.8 /
+  0.9 µs: the window's collapse is in the pairs (it is where L_w was fitted), while the KF phase
+  marks of `v_sq1024` and `q_kf1` do not show it (KF REPEAT predicted 44.5 µs, mark 35.7 µs at
+  N = 14). The marks' share rising with N is, to the extent it is not that collapse, the slope:
+  KF's modeled COLD time grows 1.6 µs per modulus on `v_sq1024` (N = 8 to 14) and 1.9 on `q_kf1`
+  (N = 4 to 7), the marks 1.0.
+  KF is not changed by this section (below).
+- *KL B, the narrow operand's pack, is slow on the multi-pass launch, in every cache state.*
+  Q24's narrow packs (96–144 rows, rows of 3 chunks, 1024-thread CTAs, a grid of 12–18 CTAs):
+  m / R 1.50–1.81 and m / C 1.31–1.65 (savings 1.4–2.0 µs). The narrow packs in the
+  calibration (`c_rskin2`, `c_rskin2g`, `p_k3a`, `p_k3b`, `c_skin1280`; rows of one chunk) are
+  at 0.87–1.20, the g = 4 packs of `p_k3c` and `c_l2s1472` at 1.10–1.44. Q24's excess is in its
+  N slope (0.64–0.68 µs per modulus) and its intercept (17.8–18.3 µs at N → 0).
+- *The two KL effects need not be one.* A KL A that kept all of its saving would still leave KL B
+  under-predicted, and the call totals cancel against COLD only by accident (NOTES-C1 §5.9).
+
+**The key.** One optional format-2 key, `warm.kl_drop` = d ∈ [0, 1], absent = 0:
+- In REPEAT and WARM, the saving of a **KL** phase (`KL A`, `KL B`, `pack KL`) is (1 − d) times
+  the rule's `res · Δ` share of that phase (the per-call part c, if fitted, is not scaled).
+  KF, K5, COLD, CLEAN and every other phase are exactly as in §6c.8; with d = 0 every prediction
+  is bit-identical to the calibration without the key (`host_perf`, v1.19).
+- d = 1 is the **path** candidate of the MC-3 text (b), no saving on a KL read; d = 0 the rule.
+  The **traffic** candidate (a) (K4's split-K W planes added to F − I) moves the saving the wrong
+  way: Q24's share of the saving rises with N while the planes grow with N. A rule in F − I
+  alone cannot work (NOTES-C1 §5.9 MC-3: KF's sq1024 keeps 99–157 % at a modeled F − I of
+  49–53 MB where the Jacobi view's KL A keeps 27–50 % at 13–31 MB; both sides of that statement
+  are now also visible on allowed records, `v_sq1024`, `q_kf1`, `q_kl1`).
+- **Fit** (`perf_fit.fit_kl_drop`, after the cache term): for d = 0, 0.05, …, 1 the KL class is
+  refitted (exact NNLS) on the KL phase marks raised to COLD with (1 − d) times the model's
+  saving, and the REPEAT-state prediction θ · x − (1 − d)(C − R) of **every KL phase** (A and B,
+  every record with the narrow-KL shapes of Q24 among them) is scored against its mark by
+  relative squared error; the smallest sum wins. It is chosen on the KL A / KL B phase marks, not
+  on call totals, and the scan is printed. `--kl-drop D` fixes it (0: the v1.18 rule).
+- **Where it is stored.** `imd_perf_calib_t` keeps its size (host API 13, calibration format 2):
+  the key lives in the first parameter slot past the classes, `param[IMD_PERF_CLASS_COUNT ·
+  IMD_PERF_MAX_PARAMS]` (the capacity of 96 slots holds four classes more than there are),
+  zeroed in a format-1 view and checked to lie in [0, 1]. A library without it rejects a file
+  that has the key (unknown key), so no file is read with a feature it was not fitted with.
+  Python: `Calibration.warm["warm.kl_drop"]`.
+
+**Not modeled.**
+- *KL B's multi-pass time (open model defect).* The candidate named by the v1.8 data, a compute
+  chain `nc · values · g` steps on the busiest SM (`kl` slot 4, the retired `op_eps` slot),
+  fits Q24's narrow packs at 57 ns per step (A and B alike: 1.36 and 0.68 µs per modulus over 24
+  and 12 steps) but the calibration's wide launches reject that coefficient: the NNLS gives
+  6–13 ns per step with the chain over every launch, over the underfilled ones or over the
+  4-value ones, and the leave-one-shape-out median error of a held-out Q24 shape's KL B goes
+  13.7 → 12.7 % at the best of them, with d = 0.75 (offline, KL class only, allowed records;
+  `scripts/c1/mc3a/kl_cv.py`, diff of the trial in `results/c1/mc3a/chain_exploration.diff`).
+  A feature restricted to underfilled launches would fit, but its switch breaks the monotonicity
+  of the prediction in the shape (a bigger shape would take less). So no second key; the
+  defect is recorded with its size and a trigger in NOTES-B2 §12 and §7 below. The narrow packs
+  of Q24 enter the refit, which absorbs part of it into `kl.wave` and `kl.launch` (NOTES-C1 §5.11
+  reports by how much).
+- *KF's saving against N and with g < N.* No key. The marks above are the evidence; the Q24 KF
+  cases (`q_kf1`) enter the refit, and a KF shape of the fresh hold-out (NOTES-C1 §5.11) tests
+  it. Open if that misses (§7).
+
+**Tests** (`host_perf`, C and Python, v1.19): absent or explicit 0 is bit-identical across
+every regime, cache state and a set of KL / KF shapes; the grammar (optional, format 2 only, a
+number in [0, 1], not repeated; negative, above 1 and `nan` rejected), written only when
+non-zero, round trip; the rule on a KL narrow-n case, the Jacobi view and a KF case: a KL
+phase's REPEAT time is COLD − (1 − d)(COLD − REPEAT at d = 0), WARM = REPEAT, d = 1 puts a KL
+read at its COLD time, COLD / CLEAN and every non-KL phase are unchanged (a mutant that applies
+the share to every phase, and one that ignores the key, are caught); `host_c_api`: the slot, the
+round trip, the three rejections.
+
 ---
 
 ## 6e. Hot-path planner queries from Python [v1.11]

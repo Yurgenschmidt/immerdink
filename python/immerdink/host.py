@@ -856,7 +856,9 @@ class Calibration:
                 "warm.pack_l2_bytes": r.pack_l2_hit_bytes,  # v12 (§6c.1; 0: absent)
                 # v13 (DESIGN v1.18 §6c.8; 0: absent)
                 "warm.pack_l2_planes": r.pack_l2_planes, "warm.call_ns": r.warm_call_ns,
-                "warm.clean_byte": r.warm_clean_byte_ns}
+                "warm.clean_byte": r.warm_clean_byte_ns,
+                # v1.19 (§6c.9; 0: absent): stored in the first param slot past the classes
+                "warm.kl_drop": r.param[len(PERF_CLASSES) * _PERF_MAX_PARAMS]}
 
     @property
     def bands(self):

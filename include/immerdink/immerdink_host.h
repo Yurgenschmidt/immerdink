@@ -527,7 +527,10 @@ typedef struct {
   double l2_bytes;                /* L2 cache bytes: the K4 DRAM term counts a group's operand
                                      and plane bytes beyond it (§6c.1)                      */
   char gpu[64], date[32], version[64], clocks[128], notes[128];
-  double param[IMD_PERF_PARAM_CAPACITY]; /* param[class * IMD_PERF_MAX_PARAMS + j]; 0 unused */
+  double param[IMD_PERF_PARAM_CAPACITY]; /* param[class * IMD_PERF_MAX_PARAMS + j]; 0 unused;
+                             v1.19 (§6c.9): param[IMD_PERF_CLASS_COUNT * IMD_PERF_MAX_PARAMS] =
+                             key warm.kl_drop (optional, 0 when absent, in [0, 1]), the share of
+                             the REPEAT / WARM saving that KL reads do not get                */
   /* ---- v7 (format 2). A caller with a version-6 struct_size gets a true format-1 view of a
    *      format-2 calibration: the format-2 parameters zeroed, built-in occupancy, no power
    *      model, no cache term, no bands: a degraded model. Such callers should pass NULL. ---- */

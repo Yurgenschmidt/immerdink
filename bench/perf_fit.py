@@ -55,6 +55,12 @@ the median clock of the windows that never touched the power cap) with gamma 2.5
 the f_ref scan goes down to 2255 MHz on the 4090. The busy share and the DRAM bytes of a window
 come from the C model (a probe calibration), not from a formula here.
 
+v1.19 (DESIGN §6c.9, NOTES-C1 §5.9 MC-3a, host API 13): the optional key warm.kl_drop, the share
+of the REPEAT / WARM saving that KL reads do not get, is fitted after the cache term, against the
+KL phase marks (fit_kl_drop: a scan of d in 0 ... 1 that refits the KL class on the phases raised
+to COLD with the share (1 - d) of the model's saving and scores the REPEAT-state prediction of
+every KL phase against its mark); --kl-drop D fixes it (0: absent, the v1.18 rule).
+
 Host API 10 (DESIGN §6c.3): the metadata strings are checked against the calibration's field
 sizes before anything is written (check_meta: UTF-8 bytes, NUL included, no line break, no
 leading or trailing blank); a --version or --notes that does not fit is an error, the generated
@@ -963,6 +969,65 @@ def fit_warm_clean(cases, meta, params, extra, l2, lib=None, min_effect=0.03, ve
             "warm.clean_byte": float(om)}, effects
 
 
+def kl_drop_columns(samples, cal0, fref=0.0):
+    """v1.19 (§6c.9): per KL phase of a measured (REPEAT-state) sample, its features x (the clock
+    normalization of the fit applied), the measured time m and the model's REPEAT saving
+    credit = COLD - REPEAT of that phase under cal0 (warm.kl_drop 0). Method packed's samples are
+    COLD already and skipped, as the raising of the fit skips them."""
+    X, m, cu, lab = [], [], [], []
+    for s in samples:
+        if " pack " in s.label:
+            continue
+        cold, rep = s.again(cal0, "COLD"), s.again(cal0, "REPEAT")
+        for qc, qr in zip(cold.phases, rep.phases):
+            if qc.cls != "kl" or qc.name not in s.measured or s.measured[qc.name] <= 0:
+                continue
+            x = np.array(qr.x)
+            if fref > 0 and s.clock > 0:
+                for j in CLOCK_BOUND["kl"]:
+                    x[j] *= fref / s.clock
+            X.append(x)
+            m.append(s.measured[qc.name])
+            cu.append(qc.time_s - qr.time_s)
+            lab.append(f"{s.label} {qc.name}")
+    return np.array(X), np.array(m), np.array(cu), lab
+
+
+def fit_kl_drop(samples, cal0, names, fref=0.0, grid=None, verbose=True):
+    """v1.19 (§6c.9): the share d of the REPEAT / WARM saving that KL reads do not get
+    (warm.kl_drop). For each d of the grid the KL class is refitted (exact NNLS, relative) on the
+    phase marks raised to COLD with (1 - d) x the model's saving, and the REPEAT-state
+    prediction theta . x - (1 - d) credit of every KL phase is scored against its mark (relative
+    squared error); the d with the smallest sum is kept (0 when no KL phase has a saving)."""
+    X, m, cu, lab = kl_drop_columns(samples, cal0, fref)
+    if len(m) == 0 or not np.any(cu > 0):
+        if verbose:
+            print("KL credit: no KL phase with a modeled saving: warm.kl_drop = 0")
+        return 0.0
+    used = [j for j, n in enumerate(names["kl"]) if n]
+    grid = np.round(np.arange(0.0, 1.0001, 0.05), 2) if grid is None else grid
+    best = None
+    has = cu > 0
+    if verbose:
+        print(f"KL credit scan (warm.kl_drop): {len(m)} KL phases, {int(has.sum())} with a saving")
+        print(f"  {'d':>5} {'rel SSE':>9} {'median|err|':>12} {'p90|err|':>9}  (REPEAT-state KL phases; "
+              f"with saving: median, p90)")
+    for d in grid:
+        th = np.zeros(X.shape[1])
+        th[used] = nnls_relative(X[:, used], m + (1 - d) * cu)
+        e = (X @ th - (1 - d) * cu - m) / m
+        sse = float(np.sum(e ** 2))
+        if verbose:
+            print(f"  {d:5.2f} {sse:9.3f} {100 * np.median(np.abs(e)):11.1f}% "
+                  f"{100 * np.percentile(np.abs(e), 90):8.1f}%  "
+                  f"{100 * np.median(np.abs(e[has])):6.1f}% {100 * np.percentile(np.abs(e[has]), 90):6.1f}%")
+        if best is None or sse < best[0] - 1e-12:
+            best = (sse, float(d))
+    if verbose:
+        print(f"KL credit: warm.kl_drop = {best[1]:.2f} (relative SSE {best[0]:.3f})")
+    return best[1]
+
+
 def main(argv=None):
     global USE_RECORD_CLOCK
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -1020,6 +1085,10 @@ def main(argv=None):
                          "Default delta,omega: the per-call REPEAT saving c is not identifiable "
                          "from the pair records (NOTES-B2 §12 \"Decision: c dropped\"); "
                          "delta,c,omega is the perf-minor fit")
+    ap.add_argument("--kl-drop", default="scan",
+                    help="v1.19: warm.kl_drop, the share of the REPEAT / WARM saving that KL reads "
+                         "do not get: 'scan' (the default: fitted against the KL phase marks) or a "
+                         "number in [0, 1] (0: absent, the v1.18 rule)")
     ap.add_argument("--byte-pj", type=float, default=0.0,
                     help="scaled form: the fixed unscaled byte energy (pJ per DRAM byte; 0, or "
                          "a stated prior), written as power.byte_pj")
@@ -1061,6 +1130,13 @@ def main(argv=None):
         ap.error("records and -o/--out are required (or --check FILE...)")
     if a.format1:
         a.no_clock = a.no_chain = True
+    if a.kl_drop != "scan":
+        try:
+            a.kl_drop = float(a.kl_drop)
+        except ValueError:
+            ap.error("--kl-drop must be 'scan' or a number in [0, 1]")
+        if not 0 <= a.kl_drop <= 1:
+            ap.error("--kl-drop must be 'scan' or a number in [0, 1]")
     if a.byte_pj < 0 or not math.isfinite(a.byte_pj):
         ap.error("--byte-pj must be a finite number >= 0")
     if a.byte_pj != 0 and a.power_form == "unscaled":
@@ -1152,6 +1228,16 @@ def main(argv=None):
         wm, _ = fit_warm(cases, meta, params0, extra, l2, a.lib, form=a.cache_form,
                          terms=tuple(a.cache_terms.split(",")))
         extra.update(wm)
+        if wm["warm.l2byte"] > 0 and not a.format1:
+            # v1.19 (§6c.9): the KL share of the saving, against the KL phase marks, with the
+            # cache term fitted above (Delta, L_w) and the KL class refitted at each d
+            if a.kl_drop == "scan":
+                cal0 = host.Calibration.from_values(meta, params0, a.lib, extra)
+                kd = fit_kl_drop(samples, cal0, host.param_names(a.lib), fnorm)
+            else:
+                kd = a.kl_drop
+            if kd > 0:
+                extra["warm.kl_drop"] = kd
         if wm["warm.l2byte"] > 0 or wm.get("warm.call_ns", 0) > 0:
             calw = host.Calibration.from_values(meta, params0, a.lib, extra)
             added = []
