@@ -214,9 +214,9 @@ TFLOPS-equivalent numerator is always `2·m·n·k·b` (the FP64 operation count)
 
 The energy sweep runs sq2048 (2048³, `ik,jk->ij`), sq4096, sq8192, t_df, t_cc, t_batch and s_batch.
 
-The native batched baseline (`cublasGemmStridedBatchedEx` FP64) and every other comparison library
-(cuBLAS DGEMM, GEMMul8, cuBLAS emulation, cuTENSOR) exist only in the evaluation workspace's
-`eval_bench`; this repository's sweeps measure immerdink only.
+Besides immerdink, this repository's sweeps measure cuTENSOR native and emulated FP64 (Test 3). The
+native batched baseline (`cublasGemmStridedBatchedEx` FP64) and the other comparison libraries
+(cuBLAS DGEMM, GEMMul8, cuBLAS FP64 emulation) exist only in the evaluation workspace's `eval_bench`.
 
 ### Test 1: throughput and accuracy (`bench/sweep_imd.txt`)
 
@@ -254,6 +254,45 @@ instant-power cross-check `avg_power_w_inst`. The energy counter is a property o
 driver: on a part whose counter is missing or does not step (some data-centre or virtualized GPUs),
 the energy records are errors, not wrong numbers.
 
+### Test 3: cuTENSOR native and emulated FP64 (`bench/sweep_baselines.txt`, energy sweep)
+
+The only comparison libraries in this repository are the two cuTENSOR modes (optional: `imd_bench`
+is built with them only if `cutensor.h` and `libcutensor` are found, `CUTENSOR_ROOT`; otherwise those
+methods are compiled out and a run asking for them records an error). Same cases, data, reference
+and timing code as Test 1, with the einsum given to cuTENSOR directly (no GEMM lowering, no extra
+permutations):
+
+- `cutensor`: `cutensorContract` with `CUTENSOR_COMPUTE_DESC_64F` (native FP64; this is also the
+  "DGEMM-level" accuracy reference, about 3.5e-16 normwise at φ = 0.5).
+- `cutensor-emu`: the same with `CUTENSOR_COMPUTE_DESC_8XINT8`, cuTENSOR's INT8-based FP64 emulation
+  (cuTENSOR ≥ 2.4; its header lists it as Hopper+; the number of retained mantissa bits is chosen at
+  runtime to match native accuracy). Since cuTENSOR 2.6 it **falls back to native FP64 silently**
+  where it does not apply, so a record alone cannot tell whether the emulation ran:
+  `bench/summarize.py` compares the emulated record with the native one of the same case and flags it
+  "not engaged (time within 5 % of native, same error)". A plan that cuTENSOR refuses is an error
+  record, not a failure of the sweep.
+- Energy: methods `energy-cutensor` and `energy-cutensor-emu` in `bench/sweep_energy.txt` use the
+  protocol of Test 2 (same process, same idle baseline).
+
+Records carry `compute_desc`, `cutensor_version` and `emulated_requested`. The cuBLAS DGEMM (and
+strided-batched DGEMM), GEMMul8 and cuBLAS FP64-emulation baselines are **not in this repository**;
+they exist only in the separate evaluation workspace.
+
+### Calibration (`bench/calibrate.sh`)
+
+Before the sweeps `bench/run_metrics.sh` calibrates the GPU: a sustained dense load (4096³, N = 14,
+back to back, through the same gate as every timed run) while `nvidia-smi` is sampled at 1 Hz, until
+the state is **stable**: over the last 20 s the SM clock varies by ≤ 30 MHz and the temperature by
+≤ 1 °C (after ≥ 30 s of load; timeout 180 s). It reports the steady SM clock (median/min/max of the last
+30 s), power, temperature, the share of samples with the power-cap / thermal / HW slowdown event
+reasons, whether the clocks are locked, and a **recommended lock**: the lowest sustained SM clock minus
+30 MHz, floored to a 15 MHz step, with the exact `sudo nvidia-smi -lgc F,F` command (it must be a
+supported graphics clock: `nvidia-smi -q -d SUPPORTED_CLOCKS`). Result: `calibration.json`, copied into
+`conditions.txt`. With the clocks locked it verifies the lock holds (SM at the lock in every sample, no
+cap). It never changes clocks itself; `LOCK_CLOCKS=auto` (passwordless sudo needed) locks at the
+recommendation, re-calibrates, and restores the clocks on exit. `CALIBRATE=0` skips it. Each case still
+begins with the 3 s warm-up of `bench/warm_run.sh`, now on an already hot GPU.
+
 ### Machine conditions
 
 Every case runs through `tools/run_bench.sh` (see "Getting clean numbers"): machine-wide lock,
@@ -273,21 +312,24 @@ git clone --branch dev https://github.com/Yurgenschmidt/immerdink.git && cd imme
 git submodule update --init --depth 1 third_party/cutlass   # login node: needs network
 
 # On the GPU node (e.g. srun --gres=gpu:1 --exclusive --pty bash):
-bench/preflight.sh                       # checks toolchain, GPU, NVML, sudo, quiet; says what to fix
+bench/preflight.sh                       # checks toolchain, cuTENSOR, GPU, NVML, sudo, quiet; says what to fix
+export CUTENSOR_ROOT=/path/to/cutensor   # only if `module load cutensor` does not make it findable (>= 2.4)
 bench/build.sh                           # detects the GPU architecture (120 on RTX PRO 6000 Blackwell)
 bench/run_metrics.sh $HOME/imd-metrics/$(hostname)-$(date +%Y%m%d)
 ```
 
-- `bench/run_metrics.sh <outdir>` builds if needed, then runs the throughput/accuracy sweep and the
+- `bench/run_metrics.sh <outdir>` builds if needed, then calibrates the GPU (see "Calibration"), runs the
+  throughput/accuracy sweep, the cuTENSOR native/emulated baselines (if built with cuTENSOR) and the
   energy sweep. The output directory must be outside the repository.
-- **Clock lock (recommended, needs root):** `sudo nvidia-smi -lgc <f>,<f>` at a frequency the card sustains
-  under its power cap (log clocks with `bench/clocklog.sh` during a dense run to find it), `-rgc`
-  afterwards. Without it the run still works; say "unlocked" in the report.
+- **Clock lock (recommended, needs root):** the calibration prints the exact command
+  (`sudo nvidia-smi -lgc <f>,<f>`, a frequency the card sustains under its power cap); run it, start again,
+  and undo with `-rgc` afterwards. With passwordless sudo, `LOCK_CLOCKS=auto bench/run_metrics.sh <outdir>` does
+  lock, re-calibrate and unlock by itself. Without a lock the run still works; say "unlocked" in the report.
 - **Dedicated node:** the gate is on by default (quiet machine, machine-wide lock). If the batch system
   already gives you the GPU exclusively, `IMMERDINK_GPU_LOCK=none` skips only the shared advisory lock.
   If the quiet check blocks on harmless node daemons, relax it (`QUIET_LOAD`, `QUIET_CPU`,
   `QUIET_GPU_IGNORE`, see `tools/quiet_check.sh`); never edit it out.
-- `SWEEPS=imd` or `SWEEPS=energy` runs one sweep; `CASES='sq8192|t_cc' bench/run_sweep.sh
+- `SWEEPS="imd energy"` (any of `imd baseline energy`) selects sweeps; `CALIBRATE=0` skips the calibration; `CASES='sq8192|t_cc' bench/run_sweep.sh
   bench/sweep_energy.txt out.jsonl` runs a subset. `CMAKE_CUDA_ARCHITECTURES=<n>` overrides the
   detected architecture (use a fresh `IMMERDINK_BENCH_BUILD` directory when changing it).
 - **Check the accuracy before believing the speed:** the library's kernels were developed on sm_89, so on a

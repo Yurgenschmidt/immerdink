@@ -51,6 +51,9 @@
 #include <dlfcn.h>
 #include <sys/resource.h>
 #include <immerdink/immerdink.h>
+#ifdef IMD_BENCH_CUTENSOR
+#include <cutensor.h>  // optional baseline: native and emulated FP64 contractions (bench/CMakeLists.txt)
+#endif
 
 #ifdef IMD_BENCH_PROFILE
 #include "profile_hooks.h"  // src/: per-phase event marks (libimmerdink built with IMMERDINK_PROFILE)
@@ -96,6 +99,14 @@ struct Failure : std::runtime_error {
     imd_status_t s_ = (x);                                                                   \
     if (s_ != IMD_STATUS_SUCCESS) throw Failure(std::string(#x) + ": " + imd_status_string(s_)); \
   } while (0)
+
+#ifdef IMD_BENCH_CUTENSOR
+#define CT(x)                                                                                \
+  do {                                                                                       \
+    cutensorStatus_t s_ = (x);                                                               \
+    if (s_ != CUTENSOR_STATUS_SUCCESS) throw Failure(std::string(#x) + ": " + cutensorGetErrorString(s_)); \
+  } while (0)
+#endif
 
 // ----------------------------------------------------------------------- device buffer ---
 struct DevBuf {
@@ -1012,6 +1023,9 @@ struct Bench {
     meta.integer("l2_bytes", (long long)p.l2CacheSize);
     meta.str("driver", sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null"));
     meta.integer("cuda_driver_api", drv).integer("cuda_runtime", rt);
+#ifdef IMD_BENCH_CUTENSOR
+    meta.integer("cutensor", (long long)cutensorGetVersion());
+#endif
     meta.str("gpu_max_clocks", sh("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem "
                                   "--format=csv,noheader 2>/dev/null"));
     meta.str("commit", getenv_or("BENCH_COMMIT", "unknown"));
@@ -1236,25 +1250,10 @@ struct Bench {
     e.raw("energy_counter", c.dump());
     return e;
   }
-  void method_energy(int N) {
-    if (!nvml_e().ok || !nvml_e().energy) throw Failure("NVML energy counter unavailable");
-    auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
-      lab.assign(x.labels.begin(), x.labels.end());
-      return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
-    };
-    std::vector<int32_t> la, lb, lc;
-    imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
-    imd_options_t opt{N, 0, IMD_RN, o.mode, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
-    size_t wsb = 0;
-    CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
-    imd_plan_t plan = nullptr;
-    CI(imd_plan_create(imd, &A, &B, &C, &opt, &plan));
-    auto destroy = [](imd_plan_t p) { cudaDeviceSynchronize(); imd_plan_destroy(p); };
-    std::unique_ptr<imd_plan_st, decltype(destroy)> guard(plan, destroy);
-    DevBuf ws(wsb);
-    auto run = [&] {
-      CI(imd_contract(plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
-    };
+  // The measurement shared by every method: `run` is one call (already planned), accuracy of its
+  // first result against the shared reference, then energy_run and the record.
+  void energy_measure(const std::function<void()>& run, const std::string& method,
+                      const std::string& variant, int N, size_t wsb, Json extra) {
     poison_C();
     run();  // accuracy on the shared inputs (the first call includes the plan's first-call setup)
     CU(cudaStreamSynchronize(s));
@@ -1284,9 +1283,118 @@ struct Bench {
       g_sampler.stop();
       throw;
     }
-    e.integer("g", N);
-    record("imd", "RN g=N", N, T, &acc, flops(), wsb, e);
+    for (auto& kv : extra.kv) e.kv.push_back(kv);
+    record(method, variant, N, T, &acc, flops(), wsb, e);
   }
+  void method_energy(int N) {
+    if (!nvml_e().ok || !nvml_e().energy) throw Failure("NVML energy counter unavailable");
+    auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
+      lab.assign(x.labels.begin(), x.labels.end());
+      return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
+    };
+    std::vector<int32_t> la, lb, lc;
+    imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
+    imd_options_t opt{N, 0, IMD_RN, o.mode, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    size_t wsb = 0;
+    CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
+    imd_plan_t plan = nullptr;
+    CI(imd_plan_create(imd, &A, &B, &C, &opt, &plan));
+    auto destroy = [](imd_plan_t p) { cudaDeviceSynchronize(); imd_plan_destroy(p); };
+    std::unique_ptr<imd_plan_st, decltype(destroy)> guard(plan, destroy);
+    DevBuf ws(wsb);
+    auto run = [&] {
+      CI(imd_contract(plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
+    };
+    Json extra;
+    extra.integer("g", N);
+    energy_measure(run, "imd", "RN g=N", N, wsb, extra);
+  }
+
+  // ------------------------------------------------------- cuTENSOR baselines (optional) ---
+  // `cutensor`: the contraction on the original layouts with CUTENSOR_COMPUTE_DESC_64F (native
+  // FP64). `cutensor-emu`: the same with CUTENSOR_COMPUTE_DESC_8XINT8, cuTENSOR's INT8-based FP64
+  // emulation (cuTENSOR >= 2.4; the header lists it as Hopper+; since 2.6 it falls back to native
+  // FP64 where it does not apply, silently: the record cannot tell, so compare its time and error
+  // with the native record of the same case: bench/summarize.py flags "not engaged"). A plan that
+  // cuTENSOR refuses is recorded as an error, never fatal. Same inputs, same reference, same timing
+  // code as method imd; `energy-cutensor[-emu]` use the energy protocol of method energy.
+#ifdef IMD_BENCH_CUTENSOR
+  cutensorHandle_t tens = nullptr;
+  struct CtPlan {
+    cutensorPlan_t plan = nullptr;
+    uint64_t wsb = 0;
+    CtPlan() = default;
+    CtPlan(const CtPlan&) = delete;
+    CtPlan& operator=(const CtPlan&) = delete;
+    ~CtPlan() {
+      cudaDeviceSynchronize();
+      if (plan) cutensorDestroyPlan(plan);
+    }
+  };
+  void make_ct(CtPlan& P, bool emu) {
+    if (!tens) CT(cutensorCreate(&tens));
+    cutensorTensorDescriptor_t d[3] = {nullptr, nullptr, nullptr};
+    cutensorOperationDescriptor_t op = nullptr;
+    cutensorPlanPreference_t pref = nullptr;
+    const Operand* X[3] = {&c.A, &c.B, &c.C};
+    std::vector<int32_t> m[3];
+    auto cleanup = [&] {
+      for (auto x : d) if (x) cutensorDestroyTensorDescriptor(x);
+      if (op) cutensorDestroyOperationDescriptor(op);
+      if (pref) cutensorDestroyPlanPreference(pref);
+    };
+    try {
+      for (int i = 0; i < 3; ++i) {
+        m[i].assign(X[i]->labels.begin(), X[i]->labels.end());
+        CT(cutensorCreateTensorDescriptor(tens, &d[i], uint32_t(X[i]->labels.size()), X[i]->extent.data(),
+                                          X[i]->stride.data(), CUTENSOR_R_64F, 256));
+      }
+      CT(cutensorCreateContraction(tens, &op, d[0], m[0].data(), CUTENSOR_OP_IDENTITY, d[1], m[1].data(),
+                                   CUTENSOR_OP_IDENTITY, d[2], m[2].data(), CUTENSOR_OP_IDENTITY, d[2],
+                                   m[2].data(), emu ? CUTENSOR_COMPUTE_DESC_8XINT8 : CUTENSOR_COMPUTE_DESC_64F));
+      CT(cutensorCreatePlanPreference(tens, &pref, CUTENSOR_ALGO_DEFAULT, CUTENSOR_JIT_MODE_NONE));
+      CT(cutensorEstimateWorkspaceSize(tens, op, pref, CUTENSOR_WORKSPACE_DEFAULT, &P.wsb));
+      CT(cutensorCreatePlan(tens, &P.plan, op, pref, P.wsb));
+    } catch (...) {
+      cleanup();
+      throw;
+    }
+    cleanup();
+  }
+  Json ct_extra(bool emu) {
+    Json e;
+    e.str("compute_desc", emu ? "CUTENSOR_COMPUTE_DESC_8XINT8" : "CUTENSOR_COMPUTE_DESC_64F");
+    e.integer("cutensor_version", (long long)cutensorGetVersion());
+    e.raw("emulated_requested", emu ? "true" : "false");
+    if (emu) e.str("note", "emulation may fall back to native FP64 silently (cuTENSOR >= 2.6): compare with the cutensor record");
+    return e;
+  }
+  void method_cutensor(bool emu, bool energy) {
+    if (energy && (!nvml_e().ok || !nvml_e().energy)) throw Failure("NVML energy counter unavailable");
+    CtPlan P;
+    make_ct(P, emu);
+    DevBuf ws(P.wsb);
+    const double one = 1.0, zero = 0.0;
+    auto run = [&] {
+      CT(cutensorContract(tens, P.plan, &one, dA.p, dB.p, &zero, dC.p, dC.p, ws.p, P.wsb, s));
+    };
+    const std::string name = emu ? "cutensor-emu" : "cutensor";
+    const std::string variant = emu ? "CUTENSOR_COMPUTE_DESC_8XINT8" : "CUTENSOR_COMPUTE_DESC_64F";
+    if (energy) {
+      energy_measure(run, name, variant, 0, P.wsb, ct_extra(emu));
+      return;
+    }
+    poison_C();
+    Timing T = time_it(run, s, o);
+    Accuracy acc = result_accuracy();
+    record(name, variant, 0, T, &acc, flops(), P.wsb, ct_extra(emu));
+  }
+#else
+  void method_cutensor(bool, bool) {
+    throw Failure("built without cuTENSOR: module load cutensor / set CUTENSOR_ROOT, then rebuild "
+                  "(bench/build.sh, fresh build directory)");
+  }
+#endif
 
   // k4: -1 the plan-time rule, -2 the k4_tune plan option, >= 0 a forced configuration
   // (benchmark hook; needs the profiling build).
@@ -2036,7 +2144,9 @@ void usage() {
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
           "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"
           "  [--k-align auto|16|64] (v1.13 §4b: force the K alignment of every plan / pack)\n"
-          "  methods: imd,packed,duel,bw,occupancy,sustained,pair,energy (default imd)\n"
+          "  methods: imd,packed,duel,bw,occupancy,sustained,pair,energy (default imd);\n"
+          "      optional baselines (built with cuTENSOR): cutensor, cutensor-emu (CUTENSOR_COMPUTE_DESC_8XINT8),\n"
+          "      energy-cutensor, energy-cutensor-emu\n"
           "  [--energy-warmup 3] [--energy-seconds 10] [--energy-min-calls 50] [--energy-max-seconds 30]\n"
           "  [--energy-idle 3] [--energy-step-ms <counter step period; default: measured>] (method energy)\n"
           "  [--out file.jsonl]\n");
@@ -2069,9 +2179,10 @@ int main(int argc, char** argv) {
   }
   for (auto& m : split(a["methods"], ','))
     if (m != "imd" && m != "packed" && m != "duel" && m != "bw" && m != "occupancy" &&
-        m != "sustained" && m != "pair" && m != "energy") {
-      fprintf(stderr, "unknown method %s (immerdink only: imd, packed, duel, bw, occupancy, "
-                      "sustained, pair, energy)\n", m.c_str());
+        m != "sustained" && m != "pair" && m != "energy" && m != "cutensor" && m != "cutensor-emu" &&
+        m != "energy-cutensor" && m != "energy-cutensor-emu") {
+      fprintf(stderr, "unknown method %s (imd, packed, duel, bw, occupancy, sustained, pair, energy; "
+                      "baselines: cutensor, cutensor-emu, energy-cutensor, energy-cutensor-emu)\n", m.c_str());
       return 2;
     }
   if (!a.count("name") || !a.count("spec") || !a.count("ext")) { usage(); return 2; }
@@ -2146,6 +2257,7 @@ int main(int argc, char** argv) {
   }
   std::vector<int> Ns;
   for (auto& x : split(a["N"], ',')) Ns.push_back(std::stoi(x));
+  bool idle_done = false, idle_ok = true;
   for (auto& m : split(a["methods"], ',')) {
     auto guarded = [&](const std::string& name, const std::string& variant, int N, auto&& fn) {
       try {
@@ -2162,13 +2274,23 @@ int main(int argc, char** argv) {
           for (int g : B.o.groups)
             for (int k4 : B.o.k4)
               if (g <= N) guarded(m, "", N, [&] { B.method_imd(N, v, g, k4); });
-    } else if (m == "energy") {  // board energy per call, immerdink at each N (idle baseline first)
-      bool idle_ok = true;
-      guarded("idle", "GPU idle (CUDA context open)", 0, [&] {
-        try { B.idle_baseline(); } catch (...) { idle_ok = false; throw; }
-      });
-      if (idle_ok)
-        for (int N : Ns) guarded(m, "", N, [&] { B.method_energy(N); });
+    } else if (m == "cutensor" || m == "cutensor-emu") {  // optional baselines (docs/BENCHMARKING.md)
+      guarded(m, "", 0, [&] { B.method_cutensor(m == "cutensor-emu", false); });
+    } else if (m == "energy" || m == "energy-cutensor" || m == "energy-cutensor-emu") {
+      // board energy per call (idle baseline first, once per process): immerdink at each N, or
+      // cuTENSOR native / emulated
+      if (!idle_done) {
+        idle_done = true;
+        guarded("idle", "GPU idle (CUDA context open)", 0, [&] {
+          try { B.idle_baseline(); } catch (...) { idle_ok = false; throw; }
+        });
+      }
+      if (idle_ok) {
+        if (m == "energy")
+          for (int N : Ns) guarded(m, "", N, [&] { B.method_energy(N); });
+        else
+          guarded(m.substr(7), "", 0, [&] { B.method_cutensor(m == "energy-cutensor-emu", true); });
+      }
     } else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
     else if (m == "occupancy") guarded(m, "", 0, [&] { B.method_occupancy(); });
     else if (m == "sustained") {

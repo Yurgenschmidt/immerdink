@@ -11,6 +11,9 @@
 #                          fetched here if missing: needs network, so do it on a login node)
 #   CMAKE_CUDA_ARCHITECTURES  GPU architecture(s) (default: detected from nvidia-smi, e.g. 120 for
 #                          RTX PRO 6000 Blackwell, else 89); changing it needs a fresh build directory
+#   CUTENSOR_ROOT          (or CUTENSOR_DIR / CUTENSOR_HOME) a cuTENSOR install (include/cutensor.h, lib/libcutensor.so);
+#                          optional: enables the cutensor / cutensor-emu baselines (also found in the CUDA
+#                          toolkit and the conda env)
 #   IMMERDINK_LIBRARY      link this prebuilt libimmerdink.so instead of building one
 # The build is CPU-heavy: it runs under nice and takes the machine-wide benchmark lock,
 # so it never overlaps a gated timing run; it runs inside tools/memcap.sh with at most 4 jobs.

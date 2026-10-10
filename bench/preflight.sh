@@ -32,6 +32,32 @@ command -v python3 >/dev/null && ok "python3 (summary tables)" || warn "no pytho
 if [ -f "$root/third_party/cutlass/include/cutlass/cutlass.h" ] || [ -f "${IMMERDINK_CUTLASS_DIR:-/nonexistent}/include/cutlass/cutlass.h" ]; then ok "CUTLASS present"
 else warn "CUTLASS missing: bench/build.sh will fetch it (needs network); or run git submodule update --init --depth 1 third_party/cutlass"; fi
 
+ct_hdr=""
+for d in "${CUTENSOR_ROOT:-}" "${CUTENSOR_DIR:-}" "${CUTENSOR_HOME:-}" "${CUTENSOR_PATH:-}" "${CUDA_HOME:-}" "${CUDA_PATH:-}" "$env_dir" "${CONDA_PREFIX:-}" /usr/local/cuda /usr /usr/local; do
+  [ -n "$d" ] || continue
+  for sub in include include/libcutensor libcutensor/include; do
+    [ -f "$d/$sub/cutensor.h" ] && { ct_hdr="$d/$sub/cutensor.h"; break 2; }
+  done
+done
+if [ -n "$ct_hdr" ]; then
+  tv=""
+  for h in "$ct_hdr" "$(dirname "$ct_hdr")/cutensor/types.h"; do
+    [ -f "$h" ] || continue
+    ma="$(sed -n 's/^#define CUTENSOR_MAJOR[[:space:]]*\([0-9]*\).*/\1/p' "$h" | head -1)"
+    mi="$(sed -n 's/^#define CUTENSOR_MINOR[[:space:]]*\([0-9]*\).*/\1/p' "$h" | head -1)"
+    [ -n "$ma" ] && { tv="$ma.${mi:-0}"; break; }
+  done
+  ok "cuTENSOR ${tv:-?} ($ct_hdr): the cutensor / cutensor-emu baselines will be built"
+  if [ -n "$tv" ]; then
+    [ "$(printf '2.4\n%s\n' "$tv" | sort -V | head -1)" = 2.4 ] \
+      || warn "cuTENSOR $tv < 2.4 has no emulated FP64 (CUTENSOR_COMPUTE_DESC_8XINT8): the cutensor-emu records will be errors"
+    [ "$(printf '2.6\n%s\n' "$tv" | sort -V | head -1)" = 2.6 ] \
+      || warn "cuTENSOR $tv < 2.6: emulation is not guaranteed to fall back to native FP64 where it does not apply"
+  fi
+else
+  warn "cuTENSOR not found: the cuTENSOR baselines are skipped (module load cutensor, or export CUTENSOR_ROOT=<dir with include/cutensor.h and lib/libcutensor.so>, then rebuild in a fresh IMMERDINK_BENCH_BUILD)"
+fi
+
 echo "GPU:"
 if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
   nvidia-smi --query-gpu=index,name,compute_cap,driver_version,power.limit,clocks.max.sm,persistence_mode --format=csv,noheader | sed 's/^/  gpu   /'
@@ -45,6 +71,9 @@ if ldconfig -p 2>/dev/null | grep -q libnvidia-ml.so.1 || [ -e /usr/lib64/libnvi
 else warn "libnvidia-ml.so.1 not on the default path: the energy sweep dlopens it; add its directory to LD_LIBRARY_PATH"; fi
 echo "  (the energy method checks the counter itself and stops with a clear error if it does not step)"
 
+echo "calibration:"
+echo "  bench/run_metrics.sh calibrates first (bench/calibrate.sh: sustained dense load until the clock and"
+echo "  temperature are stable, steady clock/power, recommended lock); run it alone with: bench/calibrate.sh"
 echo "clocks:"
 lock="$(nvidia-smi --query-gpu=clocks.sm,clocks.max.sm --format=csv,noheader,nounits 2>/dev/null | head -1)"
 echo "  sm / max sm MHz (idle): $lock"

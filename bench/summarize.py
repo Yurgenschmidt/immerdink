@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Summarize imd_bench JSON lines as the Markdown tables (see docs/BENCHMARKING.md).
 
-    python3 bench/summarize.py bench/results/<run>.jsonl [--N 14]
+    python3 bench/summarize.py <run>.jsonl [<more>.jsonl ...] [--N 14]   (files are merged)
 
 Tables: (1) every case at the headline N, (2) the N sweep of imd, (3) immerdink phase lower
 bounds (MEMORY_MODEL §4) against the measured whole call, (4) measured phases (event marks),
 (5) duel (interleaved configurations) and packed (operand reuse) records, if any, and
-(6) before / after of imd with --before.
+(6) before / after of imd with --before, (7) the cuTENSOR native / emulated baselines next
+to immerdink, if any records of methods cutensor / cutensor-emu are present.
 """
 import argparse
 import json
@@ -228,18 +229,89 @@ def before_after(before, after, N):
               f"{(rb['median_s'] / r['median_s']) if rb else float('nan'):.2f}× | {tf(r['tflops_eq'])} |")
 
 
+def cutensor_table(recs, N):
+    """cuTENSOR native (CUTENSOR_COMPUTE_DESC_64F) and emulated (8XINT8) next to immerdink at N.
+
+    cuTENSOR falls back to native FP64 silently where its emulation does not apply, so "engaged" is
+    inferred: the emulated record is flagged "not engaged" when its time is within 5 % of the native
+    record's and its error is within 2x of it (same case, same inputs).
+    """
+    print("| case | m×n×k | immerdink N=%d TFLOPS-eq | err | cuTENSOR native TFLOPS-eq | err | "
+          "cuTENSOR emulated TFLOPS-eq | err | emulation | imd / native | imd / emulated |" % N)
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
+    for name, rs in cases(recs).items():
+        def pick(m):
+            return next((r for r in rs if r.get("method") == m and r.get("status") == "ok"), None)
+        nat, emu = pick("cutensor"), pick("cutensor-emu")
+        emu_err = next((r for r in rs if r.get("method") == "cutensor-emu" and r.get("status") != "ok"), None)
+        if not nat and not emu and not emu_err:
+            continue
+        imd = next((r for r in rs if r.get("method") == "imd" and r.get("N") == N
+                    and r.get("status") == "ok"), None)
+        ref = next((r for r in (imd, nat, emu) if r), None)
+        if ref is None or "m" not in ref:
+            continue
+        if emu:
+            if nat and abs(emu["median_s"] / nat["median_s"] - 1) <= 0.05 \
+                    and emu.get("max_normerr", 0) <= 2 * max(nat.get("max_normerr", 0), 1e-300) \
+                    and emu.get("max_normerr", 0) * 2 >= nat.get("max_normerr", 0):
+                state = "not engaged (time within 5 % of native, same error)"
+            elif nat:
+                state = "engaged" if emu["median_s"] < nat["median_s"] else "slower than native"
+            else:
+                state = "no native record to compare"
+        else:
+            state = emu_err["status"][:60] if emu_err else "—"
+        def cell(r):
+            return (tf(r.get("tflops_eq")), err(r.get("max_normerr"))) if r else ("—", "—")
+        def ratio(a, b):
+            return f"{a['tflops_eq'] / b['tflops_eq']:.1f}×" if a and b else "—"
+        ci, cn, ce = cell(imd), cell(nat), cell(emu)
+        print(f"| {name} | {shape(ref)} | {ci[0]} | {ci[1]} | {cn[0]} | {cn[1]} | {ce[0]} | {ce[1]} | "
+              f"{state} | {ratio(imd, nat)} | {ratio(imd, emu)} |")
+
+
+def energy_table(recs):
+    """Records of the energy methods (bench_mode energy): per case, GFLOPS-eq per watt, J per call,
+    average board power and sustained TFLOPS-eq of every configuration (+ the idle baseline)."""
+    print("| case | m×n×k | configuration | GFLOPS-eq/W | J / call | avg W | TFLOPS-eq (sustained) | "
+          "max normwise err | SM MHz (median) |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for name, rs in cases(recs).items():
+        rows = [r for r in rs if r.get("bench_mode") == "energy"]
+        idle = next((r for r in rows if r.get("method") == "idle" and r.get("status") == "ok"), None)
+        first = True
+        for r in rows:
+            if r.get("method") == "idle":
+                continue
+            lab = label(r) if r.get("method") in ("imd",) else (r.get("method") + " " + r.get("variant", "")).strip()
+            if r.get("status") != "ok":
+                print(f"| {name if first else ''} | | {lab} | {r.get('status', '?')[:80]} | | | | | |")
+            else:
+                j = r.get("energy_j_per_call")
+                jt = "—" if j is None else (f"{j * 1e3:.3g} mJ" if j < 1 else f"{j:.3g} J")
+                sm = r.get("sm_mhz_median")
+                print(f"| {name if first else ''} | {shape(r) if first else ''} | {lab} | "
+                      f"{r.get('gflops_per_w', float('nan')):.1f} | {jt} | {r.get('avg_power_w', float('nan')):.0f} | "
+                      f"{r.get('tflops_eq_mean', float('nan')):.1f} | {err(r.get('max_normerr'))} | "
+                      f"{'—' if sm is None else f'{sm:.0f}'} |")
+            first = False
+        if idle:
+            print(f"| | | idle (awake) | | | {idle['idle_power_w']:.0f} | | | |")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("jsonl")
+    ap.add_argument("jsonl", nargs="+")
     ap.add_argument("--N", type=int, default=14)
     ap.add_argument("--before", help="an earlier run's JSONL: adds a before/after table")
     ap.add_argument("--sweep-cases", default="sq4096,sq8192")
     ap.add_argument("--phase-cases", default="sq1024,sq2048,sq4096,sq8192,sq16384,r_lowk,r_bigk,"
                     "r_skinny,r_mm,t_nn,t_batch,t_ikl,t_df,t_cc,t_permout")
     a = ap.parse_args()
-    recs = load(a.jsonl)
+    recs = [r for f in a.jsonl for r in load(f)]
     meta = next((r for r in recs if r.get("status") == "ok"), {})
-    print(f"<!-- {a.jsonl}: commit {meta.get('commit')}, env {meta.get('env')}, {meta.get('gpu')}, "
+    print(f"<!-- {' '.join(a.jsonl)}: commit {meta.get('commit')}, env {meta.get('env')}, {meta.get('gpu')}, "
           f"driver {meta.get('driver')}, CUDA runtime {meta.get('cuda_runtime')} -->")
     rss = [(r["host_maxrss_mib"], r["case"]) for r in recs if r.get("host_maxrss_mib") is not None]
     if rss:
@@ -248,10 +320,18 @@ def main():
     if cg:
         print(f"<!-- peak cgroup (memcap scope) memory of any bench process: {max(cg)[0]:.0f} MiB "
               f"(case {max(cg)[1]}) -->")
+    if any(r.get("bench_mode") == "energy" for r in recs):
+        print("\n### Board energy (NVML energy counter; GFLOPS-eq per watt = 2·m·n·k·b / energy per call)\n")
+        energy_table(recs)
+        if all(r.get("bench_mode") == "energy" or "method" not in r for r in recs):
+            return
     print(f"\n### All cases (N = {a.N})\n")
     headline(recs, a.N)
     print("\n### N sweep\n")
     nsweep(recs, a.sweep_cases.split(","))
+    if any(r.get("method") in ("cutensor", "cutensor-emu") for r in recs):
+        print("\n### cuTENSOR native / emulated FP64 next to immerdink\n")
+        cutensor_table(recs, a.N)
     print(f"\n### immerdink phase lower bounds (MEMORY_MODEL §4, N = {a.N}, ms)\n")
     phase_table(recs, a.phase_cases.split(","), a.N)
     if any("phases" in r for r in recs):
