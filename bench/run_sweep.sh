@@ -5,7 +5,7 @@
 # Defaults: bench/sweep_imd.txt, bench/results/<date>-<commit>.jsonl. Builds first
 # (bench/build.sh). Only cases whose name matches $CASES (a grep -E regex) run, if set.
 # If the machine never gets quiet (run_bench.sh exit 3), the sweep stops there and says so;
-# it never bypasses the gate.
+# it never bypasses the gate. Exit 4: one or more cases failed (the others still ran and are recorded).
 # Environment: IMMERDINK_ENV, IMMERDINK_BENCH_BUILD, plus what bench/build.sh and
 # tools/run_bench.sh read (QUIET_WAIT, QUIET_LOAD, QUIET_CPU, QUIET_GPU, QUIET_GPU_IGNORE).
 set -uo pipefail
@@ -28,6 +28,7 @@ export BENCH_COMMIT="$commit" BENCH_ENV="$([ -d "$env_dir" ] && basename "$env_d
 "$here/build.sh" || exit 1
 logdir="$(mktemp -d "${TMPDIR:-/tmp}/imd-bench.XXXXXX")"
 echo "sweep $sweep -> $out (commit $commit, env $BENCH_ENV)"
+failed=()
 
 while IFS='|' read -r name spec ext methods Ns extra; do
   name="$(echo "$name" | xargs)"
@@ -48,6 +49,11 @@ while IFS='|' read -r name spec ext methods Ns extra; do
     exit 3
   elif [ $rc != 0 ]; then
     echo "case $name failed (exit $rc); continuing" >&2
+    failed+=("$name")
   fi
 done < "$sweep"
+if [ ${#failed[@]} -gt 0 ]; then
+  echo "done WITH FAILURES (${failed[*]}): $out" >&2
+  exit 4
+fi
 echo "done: $out"
