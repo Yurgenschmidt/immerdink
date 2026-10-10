@@ -22,8 +22,8 @@ mkdir -p "$(dirname "$out")"
 # The Claude desktop app keeps a GPU *renderer* process resident (like gnome-shell); it is
 # not a compute load. GPU utilization is still gated by QUIET_GPU.
 export QUIET_GPU_IGNORE="${QUIET_GPU_IGNORE:-gnome-remote-desktop-daemon|Xorg|gnome-shell|claude-desktop --type=gpu-process}"
-export BENCH_COMMIT="$commit" BENCH_ENV="$(basename "$env_dir")"
-export LD_LIBRARY_PATH="$env_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export BENCH_COMMIT="$commit" BENCH_ENV="$([ -d "$env_dir" ] && basename "$env_dir" || echo system)"
+[ -d "$env_dir/lib" ] && export LD_LIBRARY_PATH="$env_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 "$here/build.sh" || exit 1
 logdir="$(mktemp -d "${TMPDIR:-/tmp}/imd-bench.XXXXXX")"

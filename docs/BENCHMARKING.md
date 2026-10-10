@@ -265,28 +265,32 @@ VBIOS, clocks, conditions) is in the JSONL.
 
 ## Recreating the metrics on another machine
 
+Needs only a CUDA toolkit (nvcc >= 12.8, 13.x preferred), a C++20 host compiler (gcc >= 11), cmake >= 3.28
+and git; no conda. On an HPC system: `module load cuda gcc cmake` (names vary).
+
 ```sh
-# 1. Build for the GPU's architecture into a fresh build directory (default sm_89; Blackwell
-#    workstation parts are sm_120). IMMERDINK_ENV is a prefix with bin/nvcc, gcc, g++ and python3 (a
-#    conda env); CUTLASS comes from third_party/cutlass or IMMERDINK_CUTLASS_DIR.
-CMAKE_CUDA_ARCHITECTURES=120 IMMERDINK_BENCH_BUILD=$HOME/imd-build-sm120 bench/build.sh
+git clone --branch dev https://github.com/Yurgenschmidt/immerdink.git && cd immerdink
+git submodule update --init --depth 1 third_party/cutlass   # login node: needs network
 
-# 2. Lock the clocks (needs root) at a frequency the card sustains under its power cap;
-#    verify with nvidia-smi -q -d CLOCK, undo afterwards with -rgc.
-sudo nvidia-smi -pm 1
-sudo nvidia-smi -lgc <f>,<f>
-
-# 3. Run both sweeps; the output directory must be outside the repository.
-#    (a dedicated node with no other GPU jobs: IMMERDINK_GPU_LOCK=none skips only the shared
-#    advisory lock, the quiet checks stay)
-CMAKE_CUDA_ARCHITECTURES=120 IMMERDINK_BENCH_BUILD=$HOME/imd-build-sm120 \
-  bench/run_metrics.sh $HOME/imd-metrics/$(hostname)-$(date +%Y%m%d)
-
-sudo nvidia-smi -rgc
+# On the GPU node (e.g. srun --gres=gpu:1 --exclusive --pty bash):
+bench/preflight.sh                       # checks toolchain, GPU, NVML, sudo, quiet; says what to fix
+bench/build.sh                           # detects the GPU architecture (120 on RTX PRO 6000 Blackwell)
+bench/run_metrics.sh $HOME/imd-metrics/$(hostname)-$(date +%Y%m%d)
 ```
 
-`SWEEPS=imd` or `SWEEPS=energy` runs one sweep; `CASES='sq8192|t_cc' bench/run_sweep.sh
-bench/sweep_energy.txt out.jsonl` runs a subset. The architecture is a build option only: the
-library's kernels are developed on sm_89, so a new architecture has to pass the correctness tests
-(`tools/test.sh`) before its numbers mean anything. If the machine never gets quiet, the sweep stops
-with exit 3 instead of recording contaminated numbers.
+- `bench/run_metrics.sh <outdir>` builds if needed, then runs the throughput/accuracy sweep and the
+  energy sweep. The output directory must be outside the repository.
+- **Clock lock (recommended, needs root):** `sudo nvidia-smi -lgc <f>,<f>` at a frequency the card sustains
+  under its power cap (log clocks with `bench/clocklog.sh` during a dense run to find it), `-rgc`
+  afterwards. Without it the run still works; say "unlocked" in the report.
+- **Dedicated node:** the gate is on by default (quiet machine, machine-wide lock). If the batch system
+  already gives you the GPU exclusively, `IMMERDINK_GPU_LOCK=none` skips only the shared advisory lock.
+  If the quiet check blocks on harmless node daemons, relax it (`QUIET_LOAD`, `QUIET_CPU`,
+  `QUIET_GPU_IGNORE`, see `tools/quiet_check.sh`); never edit it out.
+- `SWEEPS=imd` or `SWEEPS=energy` runs one sweep; `CASES='sq8192|t_cc' bench/run_sweep.sh
+  bench/sweep_energy.txt out.jsonl` runs a subset. `CMAKE_CUDA_ARCHITECTURES=<n>` overrides the
+  detected architecture (use a fresh `IMMERDINK_BENCH_BUILD` directory when changing it).
+- **Check the accuracy before believing the speed:** the library's kernels were developed on sm_89, so on a
+  new architecture the first thing to read is `max_normerr` in the records (about 1e-16 at N = 14,
+  1e-9 at N = 8; `nonfinite` must be 0). `tools/test.sh` runs the correctness tests.
+- If the machine never gets quiet, the sweep stops with exit 3 instead of recording contaminated numbers.
