@@ -25,7 +25,7 @@ def gpu_id():
 def sample(gid):
     try:
         out = subprocess.run(["nvidia-smi", "-i", gid, f"--query-gpu={FIELDS}", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=10).stdout.strip()
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True, timeout=10).stdout.strip()
     except Exception:
         return None
     f = [x.strip() for x in out.split(",")]
