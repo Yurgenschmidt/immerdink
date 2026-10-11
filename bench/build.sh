@@ -29,6 +29,9 @@ build="${IMMERDINK_BENCH_BUILD:-$root/build/bench}"
 cfg=(-S "$here" -B "$build")
 if [ -x "$env_dir/bin/nvcc" ]; then
   export PATH="$env_dir/bin:$PATH" CONDA_PREFIX="$env_dir"
+  # a loaded gcc module exports GCC_EXEC_PREFIX / COMPILER_PATH; with them set the env's g++ looks for cc1plus in the
+  # module's tree and fails ("cannot execute cc1plus"): the env toolchain must not see them
+  unset GCC_EXEC_PREFIX COMPILER_PATH
   cfg+=(-DCMAKE_C_COMPILER="$env_dir/bin/gcc" -DCMAKE_CXX_COMPILER="$env_dir/bin/g++"
         -DCMAKE_CUDA_COMPILER="$env_dir/bin/nvcc" -DCMAKE_CUDA_HOST_COMPILER="$env_dir/bin/g++"
         -DPython3_EXECUTABLE="$env_dir/bin/python3")

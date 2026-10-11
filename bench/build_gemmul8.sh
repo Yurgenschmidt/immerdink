@@ -55,6 +55,9 @@ env_dir="${IMMERDINK_ENV:-$HOME/miniforge3/envs/immerdink}"
 cuda_path=""
 if [ -x "$env_dir/bin/nvcc" ]; then
   export PATH="$env_dir/bin:$PATH" CONDA_PREFIX="$env_dir"
+  # a loaded gcc module exports GCC_EXEC_PREFIX / COMPILER_PATH; with them set the env's g++ looks for cc1plus in the
+  # module's tree and fails ("cannot execute cc1plus"): the env toolchain must not see them
+  unset GCC_EXEC_PREFIX COMPILER_PATH
   cuda_path="$env_dir"
   [ -x "$env_dir/bin/g++" ] && export NVCC_PREPEND_FLAGS="-ccbin $env_dir/bin/g++ ${NVCC_PREPEND_FLAGS:-}"
 else
