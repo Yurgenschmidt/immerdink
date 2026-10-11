@@ -100,6 +100,8 @@ python3 bench/ab_ratio.py <before.jsonl> <after.jsonl>
     use many timed calls (`--reps 300` in the sweep's extra arguments) and repeat the A/B,
     because each side is its own process.
 - **Profiling:**
+  - `bench/profile_nsys.sh` (Test 5, run by `bench/run_metrics.sh` as its last sweep): short nsys runs of
+    immerdink and the baselines, summarized by kernel category;
   - `bench/nsys_case.sh` and `bench/nsys_sweep.sh` (Nsight Systems; add
     `--gpuctxsw=true` to see context switches) and `bench/ncu_sass.sh` (Nsight Compute;
     GPU counters must be enabled for all users);
@@ -187,8 +189,8 @@ immerdink against immerdink, and the interleaved `pareto` timing stays in `eval_
 
 The metrics suite is sweeps of `bench/imd_bench`: throughput and accuracy
 (`bench/sweep_imd.txt`), board energy (`bench/sweep_energy.txt`), the cuTENSOR baselines
-(`bench/sweep_baselines.txt`) and the comparison with all baselines (`bench/sweep_compare.txt`,
-`bench/sweep_compare_energy.txt`). All are driven by `bench/run_metrics.sh` (see "Recreating the
+(`bench/sweep_baselines.txt`), the comparison with all baselines (`bench/sweep_compare.txt`,
+`bench/sweep_compare_energy.txt`) and the nsys profile pass (`bench/sweep_profile.txt`). All are driven by `bench/run_metrics.sh` (see "Recreating the
 metrics on another machine").
 
 **What every test is.** One *case* is one FP64 contraction `C = A·B` (an einsum spec on row-major
@@ -363,6 +365,63 @@ against 7.7; immerdink N = 14: 17.8 against 17.2). The 4096³-sized tensor cases
 campaign's locked-clock numbers, the clock: unlocked 2.8 GHz against locked 2.2 GHz for the compute-bound
 DGEMM. Do not mix the two protocols in one table.
 
+### Test 5: nsys profiles (`bench/profile_nsys.sh`, `bench/sweep_profile.txt`)
+
+Where the GPU time goes, per method, and whether the INT8 tensor cores were used at all. `bench/run_metrics.sh`
+runs it last (`SWEEPS` element `profile`; alone: `bench/profile_nsys.sh <outdir>` or
+`SWEEPS=profile bench/run_metrics.sh <outdir>`). Each line of `bench/sweep_profile.txt` is one short
+`imd_bench` run (5 repetitions after 2 warm-up calls, 4096 error samples, one method and one N or variant)
+under `nsys profile -t cuda` (CUDA trace only: no CPU sampling, so no `perf_event_paranoid` requirement), started
+through `tools/run_bench.sh` (quiet gate, shared GPU lock). Default list (about 35 runs, a few seconds each plus
+nsys start-up and export): immerdink N = 14 and N = 8 on `sq4096`, `sq8192`, `t_cc`, `t_df`, `s_cc16`,
+`r_lowk`; cuTENSOR native, cuTENSOR emulated (`cutensor-emu`), cuBLAS DGEMM, cuBLAS emulation (`dyn`,
+`fix55`) and GEMMul8 (fast and accurate, N = 14) on `sq4096` (a plain GEMM) and `t_cc` (a permuted
+contraction: the matrix-only methods run as `perm+<method>`); `cutensor`, `cutensor-emu`, `dgemm` on
+`sq8192` and `cutensor`, `cutensor-emu` on `t_df`. `PROFILE_TAGS='<regex>'` selects runs by tag, `PROFILE_LIST`
+another list.
+
+Output in `<outdir>/profile/` (and `<outdir>/profile.md`, a table of all runs):
+- `index.json`: `[{tag, case, method, N, variant, nsys_rep, summary, engaged_int8}]` (paths relative to `profile/`;
+  `N` is the moduli count for `imd` / `gemmul8`, null otherwise; `variant` is `fast` / `accu` for GEMMul8 and
+  `dyn` / `fix55` for `emu`);
+- `<tag>/summary.json`: `{tag, case, method, N, variant, gpu, wall_ms, kernels: [{name, category, time_ms,
+  share_pct, count}], engaged_int8, int8_share_pct, windows, bench_status, nsys_version, notes}`;
+- `<tag>/records.jsonl` (the run's `imd_bench` records, including errors) and `run.log`;
+- `<tag>/<tag>.nsys-rep` only with `PROFILE_KEEP=1` (open it with `nsys-ui`). The reports and the sqlite exports
+  (tens of MB) are otherwise deleted after the summary is written.
+
+How a summary is made (`bench/nsys_summarize.py`, standard library only): the sqlite export is read; only GPU
+activity (kernels, memcpy, memset) inside the **timed windows** of `imd_bench` counts, so setup, the accuracy
+reference, the warm-up and the untimed identity checks (for `cutensor-emu`, a native cuTENSOR call) are excluded,
+and the first window is dropped. `time_ms` is the mean time per timed call spent in a kernel name, `count` its
+launches per call, `share_pct` its share of the GPU activity time of a call (sum of durations, not the span).
+`wall_ms` (the median window, first activity to last, under the profiler) is for orientation: throughput numbers
+come from the sweeps. Categories (name patterns in `CATEGORY_RULES`, tested in `bench/test_nsys_summarize.py`;
+`python3 bench/nsys_summarize.py classify '<kernel name>'` prints one): `int8_gemm` (cuBLAS / CUTLASS INT8
+tensor-core GEMM names with `imma`, `i8816`, `i16832`, `s8s8`, `int8`..., immerdink's `k4_kernel`), `fp64_gemm`
+(`dgemm`, `d884`, `f64`..., e.g. cuTENSOR native's `cutlass_80_tensorop_d884gemm`), `conversion_pack_crt` (the
+Ozaki-II scaling / residue / pack / CRT kernels of immerdink, GEMMul8 and the cuBLAS emulation), `permute`
+(cuTENSOR permutations, transposes), `memcpy_memset`, `other` (a share above 20 % is flagged in the notes: the
+name patterns need a look). **`engaged_int8`** is true when `int8_gemm` is at least 10 % of the call's GPU time,
+false below that (`int8_share_pct` says how much), null without data. It is the decisive check for
+`cutensor-emu`: native FP64 fall-back shows only `fp64_gemm` kernels, an engaged emulation shows INT8 GEMMs
+(the `notes` of those tags say which); the identical-results check of Test 3 is the second source.
+The name patterns were derived from real profiles on an RTX 4090 (sm_89, CUDA 13.4, cuBLAS 13.8, cuTENSOR 2.8.1:
+immerdink, GEMMul8, cuBLAS DGEMM and emulation, cuTENSOR native; there `cutensor-emu` ran only
+`cutlass_80_tensorop_d884gemm` kernels, i.e. native FP64, so `engaged_int8` was false); the Hopper and
+Blackwell kernel names (`sm90_xmma_*`, `cutlass3x_sm90_*`, `sm100_*`, `nvjet_sm90_*`) are matched by their
+published naming conventions but were **not seen** by the author: on a new architecture read the `other`
+share first and extend `CATEGORY_RULES` (and its test) with the names the first profile shows.
+
+nsys is looked for in `$NSYS`, `PATH`, `$IMMERDINK_ENV/bin`, `$CUDA_HOME/bin`, `/usr/local/cuda*/bin`,
+`/opt/nvidia/nsight-systems*` and `~/nsight-systems-*` (`bench/preflight.sh` checks). Without it the pass logs the
+reason, writes `profile/NSYS_MISSING.txt`, an `index.json` and summaries with `engaged_int8: null` and the
+reason in the notes, and exits 0: a missing profiler never fails the metrics run. Methods that are not built in
+(no GEMMul8, no CUDA 13 cuBLAS, no cuTENSOR) give a summary with the `imd_bench` error in the notes. Variables:
+`NSYS`, `PROFILE_KEEP`, `PROFILE_TAGS`, `PROFILE_LIST`, `PROFILE_REPS`, `PROFILE_WARMUP`, `PROFILE_TMP`
+(where the reports are written before they are summarized: node-local scratch on an HPC node),
+`QUIET_RAW_WAIT` (10 s here, not the 300 s of timed runs: a profile is not a throughput measurement).
+
 ### Calibration (`bench/calibrate.sh`)
 
 Before the sweeps `bench/run_metrics.sh` calibrates the GPU: a sustained dense load (4096³, N = 14,
@@ -410,7 +469,8 @@ bench/run_metrics.sh $HOME/imd-metrics/$(hostname)-$(date +%Y%m%d)
 - `bench/run_metrics.sh <outdir>` builds if needed, then calibrates the GPU (see "Calibration"), runs the
   throughput/accuracy sweep, the cuTENSOR native/emulated baselines (if built with cuTENSOR), the
   comparison sweeps of Test 4 (`compare`, `compare_energy`; the baselines that are not built in record
-  errors) and the energy sweep. The output directory must be outside the repository.
+  errors), the energy sweep and, last, the nsys profile pass of Test 5 (`profile/`; it needs nsys, and without
+  it records a note). The output directory must be outside the repository.
 - **Toolchain for the full comparison:** the cuBLAS FP64 emulation baseline needs a CUDA 13 cuBLAS, and
   cuTENSOR's INT8 emulation is documented to need a recent CUDA too (nvcc, cuBLAS and cuTENSOR from a CUDA
   13 install, e.g. the conda env named by `IMMERDINK_ENV`): on CUDA 12.x `emu` records "needs CUDA 13
@@ -424,8 +484,8 @@ bench/run_metrics.sh $HOME/imd-metrics/$(hostname)-$(date +%Y%m%d)
   already gives you the GPU exclusively, `IMMERDINK_GPU_LOCK=none` skips only the shared advisory lock.
   If the quiet check blocks on harmless node daemons, relax it (`QUIET_LOAD`, `QUIET_CPU`,
   `QUIET_GPU_IGNORE`, see `tools/quiet_check.sh`); never edit it out.
-- `SWEEPS="imd energy"` (any of `imd baseline compare compare_energy energy`; the default is all five, in
-  that order) selects sweeps; `CALIBRATE=0` skips the calibration; `CASES='sq8192|t_cc' bench/run_sweep.sh
+- `SWEEPS="imd energy"` (any of `imd baseline compare compare_energy energy profile`; the default is all six, in
+  that order; `profile` is the nsys pass of Test 5) selects sweeps; `CALIBRATE=0` skips the calibration; `CASES='sq8192|t_cc' bench/run_sweep.sh
   bench/sweep_energy.txt out.jsonl` runs a subset. `CMAKE_CUDA_ARCHITECTURES=<n>` overrides the
   detected architecture (use a fresh `IMMERDINK_BENCH_BUILD` directory when changing it).
 - **Check the accuracy before believing the speed:** the library's kernels were developed on sm_89, so on a
