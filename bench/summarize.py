@@ -7,7 +7,21 @@ Tables: (1) every case at the headline N, (2) the N sweep of imd, (3) immerdink 
 bounds (MEMORY_MODEL §4) against the measured whole call, (4) measured phases (event marks),
 (5) duel (interleaved configurations) and packed (operand reuse) records, if any, and
 (6) before / after of imd with --before, (7) the cuTENSOR native / emulated baselines next
-to immerdink, if any records of methods cutensor / cutensor-emu are present.
+to immerdink, if any records of methods cutensor / cutensor-emu are present, and (8) the comparison
+of immerdink with the baselines (GEMMul8, cuBLAS FP64 emulation, cuBLAS DGEMM, cuTENSOR native and
+emulated) at DGEMM-level accuracy, if any records of methods dgemm / emu / gemmul8 are present.
+
+    python3 bench/summarize.py --only-compare compare.jsonl            # just section (8), also for energy
+    python3 bench/summarize.py --only-compare compare_energy.jsonl     # records (GFLOPS-eq per watt)
+
+Section (8) (see "Test 4" in docs/BENCHMARKING.md): per case, the cuBLAS DGEMM record's max normwise error
+is the accuracy bar ("DGEMM-level": at or below it, the rule of the evaluation campaigns); for each method
+family the fastest (energy: the most efficient) configuration that meets it is shown, with the ratio of
+immerdink's best to the best emulator and to DGEMM and cuTENSOR native. The cuTENSOR emulation (8XINT8) is
+checked for being engaged: cuTENSOR falls back to native FP64 silently, which shows as an emulated C that is
+bit-identical to the native one (the bench's identical-results test: identical_to_native, else the c_hash
+of the two records). Every table is robust to missing methods (a baseline that was not built in or failed
+gives an error record, listed at the end, and a dash in the table).
 """
 import argparse
 import json
@@ -50,6 +64,12 @@ def label(r):
         return f"imd N={r['N']}" + (f" {v}" if v else "")
     if m in ("packed", "duel-a", "duel-b"):
         return f"{m} {r['variant'].replace(', interleaved', '')}"
+    base = m.replace("perm+", "")
+    pre = "perm+" if m.startswith("perm+") else ""
+    if base == "gemmul8":
+        return f"{pre}gemmul8-{r.get('g8_mode', 'fast')} N={r.get('N')}"
+    if base == "emu":
+        return f"{pre}emu {r.get('variant', '')}".strip()
     return m
 
 
@@ -229,12 +249,245 @@ def before_after(before, after, N):
               f"{(rb['median_s'] / r['median_s']) if rb else float('nan'):.2f}× | {tf(r['tflops_eq'])} |")
 
 
+def emu_verdict(nat, emu):
+    """Was cuTENSOR's emulation (CUTENSOR_COMPUTE_DESC_8XINT8) engaged? -> (code, text), code in
+    yes / no / maybe / none. cuTENSOR (>= 2.6) falls back to native FP64 silently where the emulation
+    does not apply, so the answer comes from the results, not from the status:
+      1. the identical-results test of the bench itself: the emulated record's identical_to_native (its C,
+         bit for bit, against a native call on the same inputs, in the same process);
+      2. else the c_hash (hash of every bit of C) of the emulated and the native record of the case;
+      3. else the older heuristic on time and sampled error (weaker evidence).
+    Bit-identical results prove that the emulation did NOT run. Results that differ do not prove that it
+    did: asking for 8XINT8 can also select another native algorithm (seen on the RTX 4090: a C different
+    from the native plan's but equal to cuBLAS DGEMM's, with the native time and error). So "differs" is
+    only "likely engaged" when the time or the error also differ from native; the kernel list of the nsys
+    run of the cutensor-emu method (INT8 tensor-core GEMM kernels) is the decisive check. A native result
+    that is not run-to-run reproducible (repeat_identical false) cannot show a difference by itself."""
+    if emu is None:
+        return "none", "—"
+
+    def similar():  # time within 5 % and error within a factor 2 of native
+        if not nat:
+            return False
+        te, tn = emu.get("median_s"), nat.get("median_s")
+        ee, en = emu.get("max_normerr"), nat.get("max_normerr")
+        close_t = te is not None and tn and abs(te / tn - 1) <= 0.05
+        close_e = ee is not None and en is not None and en / 2 <= ee <= 2 * max(en, 1e-300)
+        return bool(close_t and close_e)
+
+    ident = emu.get("identical_to_native")
+    src = "C bit-identical to native"
+    if ident is None and nat and nat.get("c_hash") and emu.get("c_hash"):
+        ident = nat["c_hash"] == emu["c_hash"]
+        src = "C hash equals the native record's"
+    if ident is True:
+        return "no", f"NOT engaged ({src})"
+    if ident is False:
+        if nat and nat.get("repeat_identical") is False and similar():
+            return "maybe", "inconclusive (native FP64 is not run-to-run reproducible; time and error match it)"
+        if similar():
+            return "no", ("NOT engaged? (C differs bit for bit from native, but time within 5 % and error comparable: "
+                          "another native algorithm; confirm with nsys)")
+        return "yes", "likely engaged (C and time or error differ from native; confirm with the nsys kernel list)"
+    if not nat:
+        return "maybe", "no native record to compare"
+    if similar():
+        return "no", "not engaged? (time within 5 % of native, same error; no identical-results test in the record)"
+    return "yes", "engaged? (time or error differ from native; no identical-results test in the record)"
+
+
+# Method families of the comparison. dgemm and cutensor are the native references, not candidates.
+FAMILIES = [("imd", "immerdink"), ("gemmul8-fast", "GEMMul8 fast"), ("gemmul8-accu", "GEMMul8 accurate"),
+            ("emu-fixed", "cuBLAS emu (fixed)"), ("emu-dyn", "cuBLAS emu (dyn)"),
+            ("cutensor-emu", "cuTENSOR emu"), ("cutensor", "cuTENSOR FP64"), ("dgemm", "cuBLAS DGEMM")]
+EMULATORS = ("gemmul8-fast", "gemmul8-accu", "emu-fixed", "emu-dyn", "cutensor-emu")
+
+
+def family(r):
+    m = r.get("method", "").replace("perm+", "")
+    if m == "gemmul8":
+        return "gemmul8-" + r.get("g8_mode", "fast")
+    if m == "emu":
+        return "emu-dyn" if str(r.get("variant", "")).startswith("dyn") else "emu-fixed"
+    return m
+
+
+def cfg_name(r):
+    f = family(r)
+    if f in ("imd", "gemmul8-fast", "gemmul8-accu"):
+        return f"N={r.get('N')}"
+    if f in ("emu-fixed",):
+        return f"fix{r.get('N')}"
+    return ""
+
+
+def cfg_long(r):
+    """Configuration column of the per-configuration table."""
+    f = family(r)
+    if f.startswith("gemmul8"):
+        return f"{f.split('-')[1]} N={r.get('N')}"
+    return cfg_name(r) or ("dyn" if f == "emu-dyn" else str(r.get("variant", ""))[:28])
+
+
+def case_families(rs):
+    """Records of one case grouped by family; a bare GEMM record (layout gemm-view...) is dropped where the
+    family also has its perm+ record (the permutations are part of the honest comparison)."""
+    out = OrderedDict()
+    for r in rs:
+        if r.get("status") != "ok" or r.get("method") in (None, "idle", "bw"):
+            continue
+        f = family(r)
+        if f in dict(FAMILIES):
+            out.setdefault(f, []).append(r)
+    for f, lst in out.items():
+        if any(str(r["method"]).startswith("perm+") for r in lst):
+            out[f] = [r for r in lst if not str(r.get("layout", "")).startswith("gemm-view")]
+    return out
+
+
+def dgemm_level(fams, key):
+    """(reference error, source) and, per family, the best record (highest `key`) whose max normwise error is
+    at or below the reference and which has no non-finite output. dgemm / cutensor: their own record."""
+    ref, src = None, "no DGEMM record"
+    for f, name in (("dgemm", "cuBLAS DGEMM"), ("cutensor", "cuTENSOR native")):
+        e = [r["max_normerr"] for r in fams.get(f, []) if r.get("max_normerr") is not None]
+        if e:
+            ref, src = min(e), name
+            break
+    best = {}
+    for f, lst in fams.items():
+        if f in ("dgemm", "cutensor"):
+            cand = lst
+        else:
+            cand = [r for r in lst if ref is not None and r.get("max_normerr") is not None
+                    and r["max_normerr"] <= ref and not r.get("nonfinite")]
+        cand = [r for r in cand if r.get(key) is not None]
+        if cand:
+            best[f] = max(cand, key=lambda r: r[key])
+    return ref, src, best
+
+
+def _t(r):  # time cell
+    return ms(r["median_s"]) + " ms" if r.get("median_s") is not None else ""
+
+
+def compare_tables(recs, energy=False):
+    """The comparison of immerdink with the baselines at DGEMM-level accuracy (section 8 of the docstring)."""
+    key = "gflops_per_w" if energy else "tflops_eq"
+    unit = "GFLOPS-eq/W" if energy else "TFLOPS-eq"
+    rows = [r for r in recs if (r.get("bench_mode") == "energy") == energy]
+    cs = cases(rows)
+    if not cs:
+        print("(no records)")
+        return
+
+    def cell(r, f, flag=""):
+        if r is None:
+            return "—"
+        v = r.get(key)
+        extra = f"{r['energy_j_per_call']:.3g} J" if energy and r.get("energy_j_per_call") is not None else _t(r)
+        c = cfg_name(r)
+        sfx = "*" if r.get("contaminated") and not energy else ""  # an energy window has its own criteria
+        return f"{v:.3g}{sfx} ({extra}{', ' + c if c else ''}){flag}"
+
+    print(f"Per method, the best configuration at DGEMM-level accuracy (max normwise error at or below the "
+          f"cuBLAS DGEMM record's on the same inputs), {unit} with the {'energy per call' if energy else 'time'} "
+          "and the configuration." + ("" if energy else " `*`: the case's retries did not get the spread below the "
+          "limit (record flagged contaminated).") + " \"none\": the method ran but no configuration reached "
+          "DGEMM-level accuracy.\n")
+    print("| case | m×n×k | DGEMM error | " + " | ".join(n for _, n in FAMILIES) +
+          " | imd / best emulator | imd / DGEMM | imd / cuTENSOR |")
+    print("|---|---|---|" + "---|" * (len(FAMILIES) + 3))
+    errors = OrderedDict()
+    verdicts = OrderedDict()
+    for name, rs in cs.items():
+        fams = case_families(rs)
+        for r in rs:
+            if r.get("status", "ok") != "ok" and r.get("method") not in (None, "idle"):
+                errors.setdefault(name, OrderedDict()).setdefault((r["method"], r["status"][:100]), 0)
+                errors[name][(r["method"], r["status"][:100])] += 1
+        if not fams:
+            continue
+        ref, src, best = dgemm_level(fams, key)
+        shp = next((shape(r) for lst in fams.values() for r in lst if "m" in r), "")
+        verdict = emu_verdict((fams.get("cutensor") or [None])[0], (fams.get("cutensor-emu") or [None])[0])
+        verdicts[name] = verdict
+        cells = []
+        for f, _ in FAMILIES:
+            if f not in fams:
+                cells.append("—")
+            elif f not in best:
+                cells.append("none")
+            elif f == "cutensor-emu":
+                cells.append(cell(best[f], f, {"no": " (not engaged)", "maybe": " (engagement unconfirmed)"}.get(verdict[0], " (likely engaged)")))
+            else:
+                cells.append(cell(best[f], f))
+        emus = [best[f][key] for f in EMULATORS if f in best and not (f == "cutensor-emu" and verdict[0] != "yes")]
+        imd = best["imd"][key] if "imd" in best else None
+
+        def ratio(x, y):
+            return f"{x / y:.2f}×" if x and y else "—"
+        print(f"| {name} | {shp} | {err(ref) if ref is not None else '—'} | " + " | ".join(cells) +
+              f" | {ratio(imd, max(emus) if emus else None)} | "
+              f"{ratio(imd, best['dgemm'][key]) if 'dgemm' in best else '—'} | "
+              f"{ratio(imd, best['cutensor'][key]) if 'cutensor' in best else '—'} |")
+    if not energy and any("cutensor-emu" in case_families(rs) for rs in cs.values()):
+        print("\n#### Is the cuTENSOR emulation (8XINT8) engaged?\n")
+        print("| case | cuTENSOR native error | emulated error | native / emulated time | verdict |")
+        print("|---|---|---|---|---|")
+        for name, rs in cs.items():
+            fams = case_families(rs)
+            nat, emu = (fams.get("cutensor") or [None])[0], (fams.get("cutensor-emu") or [None])[0]
+            if emu is None:
+                continue
+            tr = f"{nat['median_s'] / emu['median_s']:.2f}" if nat and emu.get("median_s") else "—"
+            print(f"| {name} | {err(nat.get('max_normerr')) if nat else '—'} | {err(emu.get('max_normerr'))} | "
+                  f"{tr} | {verdicts[name][1]} |")
+    if errors:
+        print("\n#### Methods that did not run (error records)\n")
+        print("| case | method | error | records |")
+        print("|---|---|---|---|")
+        for name, d in errors.items():
+            for (m, why), n in d.items():
+                print(f"| {name} | {m} | {why} | {n} |")
+
+
+def config_table(recs, energy=False):
+    """Every configuration of every case (the long table behind compare_tables), with the DGEMM-level flag."""
+    key = "gflops_per_w" if energy else "tflops_eq"
+    rows = [r for r in recs if (r.get("bench_mode") == "energy") == energy]
+    print(f"| case | method | configuration | {'GFLOPS-eq/W' if energy else 'TFLOPS-eq'} | "
+          f"{'J / call' if energy else 'median ms'} | {'avg W' if energy else 'spread %'} | max normwise err | "
+          "max rel err | DGEMM-level |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for name, rs in cases(rows).items():
+        fams = case_families(rs)
+        ref, _, _ = dgemm_level(fams, key)
+        first = True
+        for f, _n in FAMILIES:
+            for r in sorted(fams.get(f, []), key=lambda r: (r.get("N") or 0, str(r.get("variant")))):
+                ok = ref is not None and r.get("max_normerr") is not None and r["max_normerr"] <= ref \
+                    and not r.get("nonfinite")
+                lvl = "native reference" if f in ("dgemm", "cutensor") else ("yes" if ok else "no")
+                v = r.get(key)
+                j = r.get("energy_j_per_call")
+                tcell = f"{j:.3g}" if energy and j is not None else (ms(r["median_s"]) if r.get("median_s") else "—")
+                flag = "*" if r.get("contaminated") and not energy else ""
+                last = f"{r.get('avg_power_w', float('nan')):.0f}" if energy else f"{r.get('spread_pct', float('nan')):.1f}"
+                print(f"| {name if first else ''} | {r['method']} | {cfg_long(r)} | "
+                      f"{'—' if v is None else f'{v:.3g}'}{flag} | {tcell} | "
+                      f"{last} | {err(r.get('max_normerr'))} | "
+                      f"{err(r.get('max_relerr'))} | {lvl} |")
+                first = False
+
+
 def cutensor_table(recs, N):
     """cuTENSOR native (CUTENSOR_COMPUTE_DESC_64F) and emulated (8XINT8) next to immerdink at N.
 
     cuTENSOR falls back to native FP64 silently where its emulation does not apply, so "engaged" is
-    inferred: the emulated record is flagged "not engaged" when its time is within 5 % of the native
-    record's and its error is within 2x of it (same case, same inputs).
+    inferred from the results (emu_verdict): bit-identical to the native C = not engaged; a different C
+    with the native time and error = probably another native algorithm; a different C and time = likely
+    engaged (confirm with the nsys kernel list).
     """
     print("| case | m×n×k | immerdink N=%d TFLOPS-eq | err | cuTENSOR native TFLOPS-eq | err | "
           "cuTENSOR emulated TFLOPS-eq | err | emulation | imd / native | imd / emulated |" % N)
@@ -252,14 +505,7 @@ def cutensor_table(recs, N):
         if ref is None or "m" not in ref:
             continue
         if emu:
-            if nat and abs(emu["median_s"] / nat["median_s"] - 1) <= 0.05 \
-                    and emu.get("max_normerr", 0) <= 2 * max(nat.get("max_normerr", 0), 1e-300) \
-                    and emu.get("max_normerr", 0) * 2 >= nat.get("max_normerr", 0):
-                state = "not engaged (time within 5 % of native, same error)"
-            elif nat:
-                state = "engaged" if emu["median_s"] < nat["median_s"] else "slower than native"
-            else:
-                state = "no native record to compare"
+            state = emu_verdict(nat, emu)[1]
         else:
             state = emu_err["status"][:60] if emu_err else "—"
         def cell(r):
@@ -305,6 +551,10 @@ def main():
     ap.add_argument("jsonl", nargs="+")
     ap.add_argument("--N", type=int, default=14)
     ap.add_argument("--before", help="an earlier run's JSONL: adds a before/after table")
+    ap.add_argument("--only-compare", action="store_true",
+                    help="print only the comparison tables (immerdink vs the baselines at DGEMM-level accuracy)")
+    ap.add_argument("--no-configs", action="store_true",
+                    help="omit the per-configuration table behind the comparison")
     ap.add_argument("--sweep-cases", default="sq4096,sq8192")
     ap.add_argument("--phase-cases", default="sq1024,sq2048,sq4096,sq8192,sq16384,r_lowk,r_bigk,"
                     "r_skinny,r_mm,t_nn,t_batch,t_ikl,t_df,t_cc,t_permout")
@@ -320,10 +570,31 @@ def main():
     if cg:
         print(f"<!-- peak cgroup (memcap scope) memory of any bench process: {max(cg)[0]:.0f} MiB "
               f"(case {max(cg)[1]}) -->")
-    if any(r.get("bench_mode") == "energy" for r in recs):
+    has_energy = any(r.get("bench_mode") == "energy" for r in recs)
+    has_cmp = any(r.get("method") and family(r) in ("dgemm", "emu-dyn", "emu-fixed", "gemmul8-fast", "gemmul8-accu")
+                  for r in recs)
+
+    def compare_section():
+        for en in (False, True):
+            if not any((r.get("bench_mode") == "energy") == en and r.get("method") not in (None, "idle")
+                       for r in recs):
+                continue
+            print(f"\n### immerdink against the baselines at DGEMM-level accuracy "
+                  f"({'board energy' if en else 'throughput'})\n")
+            compare_tables(recs, energy=en)
+            if not a.no_configs:
+                print(f"\n### Every configuration ({'board energy' if en else 'throughput'})\n")
+                config_table(recs, energy=en)
+
+    if a.only_compare:
+        compare_section()
+        return
+    if has_energy:
         print("\n### Board energy (NVML energy counter; GFLOPS-eq per watt = 2·m·n·k·b / energy per call)\n")
         energy_table(recs)
         if all(r.get("bench_mode") == "energy" or "method" not in r for r in recs):
+            if has_cmp:
+                compare_section()
             return
     print(f"\n### All cases (N = {a.N})\n")
     headline(recs, a.N)
@@ -346,6 +617,8 @@ def main():
     if a.before:
         print(f"\n### Before / after (N = {a.N}; before: {a.before})\n")
         before_after(load(a.before), recs, a.N)
+    if has_cmp:
+        compare_section()
 
 
 if __name__ == "__main__":
