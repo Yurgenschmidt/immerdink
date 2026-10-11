@@ -614,6 +614,7 @@ struct Options {
   int energy_min_calls = 50;
   // baselines (methods dgemm, emu, gemmul8)
   std::vector<std::string> emu_variants = {"dyn"};  // --emu dyn,fix39,fix55 (cuBLAS fixed-point emulation)
+  std::string ct_ws;                                // --ct-ws min|default|max: cuTENSOR workspace preference (empty: native default, emulation max)
   size_t emu_ws_mib = 2048;                         // --emu-ws-mib: the emulation workspace given to cuBLAS
   std::vector<std::string> g8modes = {"fast"};      // --g8mode fast,accu (GEMMul8)
   std::vector<int> g8fast_N, g8accu_N;              // --g8fast-N / --g8accu-N: moduli per GEMMul8 mode (empty: --N)
@@ -1443,6 +1444,15 @@ struct Bench {
       if (plan) cutensorDestroyPlan(plan);
     }
   };
+  static const char* ct_ws_name(cutensorWorksizePreference_t w) {
+    return w == CUTENSOR_WORKSPACE_MIN ? "min" : w == CUTENSOR_WORKSPACE_MAX ? "max" : "default";
+  }
+  cutensorWorksizePreference_t ct_ws_pref(bool emu) const {
+    if (o.ct_ws == "min") return CUTENSOR_WORKSPACE_MIN;
+    if (o.ct_ws == "default") return CUTENSOR_WORKSPACE_DEFAULT;
+    if (o.ct_ws == "max") return CUTENSOR_WORKSPACE_MAX;
+    return emu ? CUTENSOR_WORKSPACE_MAX : CUTENSOR_WORKSPACE_DEFAULT;
+  }
   void make_ct(CtPlan& P, bool emu) {
     if (!tens) CT(cutensorCreate(&tens));
     cutensorTensorDescriptor_t d[3] = {nullptr, nullptr, nullptr};
@@ -1465,7 +1475,11 @@ struct Bench {
                                    CUTENSOR_OP_IDENTITY, d[2], m[2].data(), CUTENSOR_OP_IDENTITY, d[2],
                                    m[2].data(), emu ? CUTENSOR_COMPUTE_DESC_8XINT8 : CUTENSOR_COMPUTE_DESC_64F));
       CT(cutensorCreatePlanPreference(tens, &pref, CUTENSOR_ALGO_DEFAULT, CUTENSOR_JIT_MODE_NONE));
-      CT(cutensorEstimateWorkspaceSize(tens, op, pref, CUTENSOR_WORKSPACE_DEFAULT, &P.wsb));
+      // The preference decides which algorithms are candidates: DEFAULT "aims to attain high performance while also
+      // reducing the workspace requirement", only MAX makes "all algorithms available" (cutensor/types.h). The INT8
+      // emulation needs scratch for its slices, so it is planned at MAX unless --ct-ws says otherwise (a plan that
+      // excludes the emulation falls back to native FP64 silently); native stays at DEFAULT, as users call it.
+      CT(cutensorEstimateWorkspaceSize(tens, op, pref, ct_ws_pref(emu), &P.wsb));
       CT(cutensorCreatePlan(tens, &P.plan, op, pref, P.wsb));
     } catch (...) {
       cleanup();
@@ -1478,6 +1492,7 @@ struct Bench {
     e.str("compute_desc", emu ? "CUTENSOR_COMPUTE_DESC_8XINT8" : "CUTENSOR_COMPUTE_DESC_64F");
     e.integer("cutensor_version", (long long)cutensorGetVersion());
     e.raw("emulated_requested", emu ? "true" : "false");
+    e.str("ct_ws", ct_ws_name(ct_ws_pref(emu)));
     if (emu) e.str("note", "emulation may fall back to native FP64 silently (cuTENSOR >= 2.6): compare with the cutensor record");
     return e;
   }
@@ -2534,6 +2549,7 @@ void usage() {
           "      optional baselines (built with cuTENSOR): cutensor, cutensor-emu (CUTENSOR_COMPUTE_DESC_8XINT8),\n"
           "      energy-cutensor, energy-cutensor-emu; cuBLAS: dgemm, emu (FP64 fixed-point emulation, CUDA 13\n"
           "      cuBLAS), energy-dgemm, energy-emu; GEMMul8 (built with GEMMUL8_DIR): gemmul8, energy-gemmul8\n"
+          "  [--ct-ws min|default|max] (cuTENSOR workspace preference; default: native default, emulation max)\n"
           "  [--emu dyn,fix39,fix55] [--emu-ws-mib 2048] (method emu) [--g8mode fast,accu] (gemmul8; --N = moduli,\n"
           "      or --g8fast-N / --g8accu-N for one mode)\n"
           "  [--gemm-view 0|1] (dgemm, emu, gemmul8 on a case not in the GEMM view: 1 also records the bare GEMM;\n"
@@ -2557,7 +2573,7 @@ int main(int argc, char** argv) {
                                       "sustain-warm-s", "sustain-trace-s", "k-align",
                                       "energy-warmup", "energy-seconds", "energy-max-seconds",
                                       "energy-idle", "energy-min-calls", "energy-step-ms",
-                                      "emu", "emu-ws-mib", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
+                                      "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -2620,6 +2636,13 @@ int main(int argc, char** argv) {
     if (a.count("energy-step-ms")) B.o.energy_step_ms = std::stod(a["energy-step-ms"]);
     if (a.count("emu")) B.o.emu_variants = split(a["emu"], ',');
     if (a.count("emu-ws-mib")) B.o.emu_ws_mib = size_t(std::stoll(a["emu-ws-mib"]));
+    if (a.count("ct-ws")) {
+      B.o.ct_ws = a["ct-ws"];
+      if (B.o.ct_ws != "min" && B.o.ct_ws != "default" && B.o.ct_ws != "max") {
+        fprintf(stderr, "--ct-ws must be min, default or max\n");
+        return 2;
+      }
+    }
     if (a.count("g8mode")) {
       B.o.g8modes = split(a["g8mode"], ',');
       for (auto& g : B.o.g8modes)

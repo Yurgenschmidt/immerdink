@@ -15,6 +15,8 @@
 #   baselines.jsonl   cuTENSOR native / emulated throughput records
 #   energy.jsonl      energy records (idle baseline + one record per case and N)
 #   compare.jsonl     throughput / accuracy of immerdink and the baselines on the same inputs (sweep_compare.txt)
+#   cutensor_ws.jsonl     cuTENSOR native vs emulated at workspace preference default and max (sweep_cutensor_ws.txt);
+#                         cutensor_ws.md is its table (cutws_table.py)
 #   compare_energy.jsonl  board-energy records of the same configurations (sweep_compare_energy.txt)
 #   profile/          nsys pass: index.json, <tag>/summary.json (kernels by category, engaged_int8), <tag>/run.log;
 #                     the .nsys-rep files only with PROFILE_KEEP=1 (bench/profile_nsys.sh, docs/BENCHMARKING.md)
@@ -31,7 +33,7 @@
 # (docs/BENCHMARKING.md): `sudo nvidia-smi -lgc <f>,<f>` first, `-rgc` afterwards.
 # Environment: what bench/build.sh, bench/run_sweep.sh and tools/run_bench.sh read (IMMERDINK_ENV,
 # IMMERDINK_BENCH_BUILD, CMAKE_CUDA_ARCHITECTURES, IMMERDINK_GPU_LOCK, QUIET_*), plus
-#   SWEEPS="imd baseline compare compare_energy energy profile"   which sweeps to run (the default, in this
+#   SWEEPS="imd baseline cutws compare compare_energy energy profile"   which sweeps to run (the default, in this
 #                         order; compare / compare_energy are the baselines of docs/BENCHMARKING.md Test 4;
 #                         profile = the nsys pass, always last: it needs nsys, and skips itself with a
 #                         note when there is none)
@@ -150,7 +152,7 @@ fi
 # --- sweeps ---------------------------------------------------------------------------------
 build="${IMMERDINK_BENCH_BUILD:-$root/build/bench}"
 rc=0
-for sw in ${SWEEPS:-imd baseline compare compare_energy energy profile}; do
+for sw in ${SWEEPS:-imd baseline cutws compare compare_energy energy profile}; do
   case "$sw" in
     imd)
       "$here/run_sweep.sh" "$here/sweep_imd.txt" "$outdir/sweep_imd.jsonl" 2>&1 | tee "$outdir/sweep.out"
@@ -169,6 +171,12 @@ for sw in ${SWEEPS:-imd baseline compare compare_energy energy profile}; do
       BENCH_RETRIES=1 "$here/run_sweep.sh" "$here/sweep_energy.txt" "$outdir/energy.jsonl" 2>&1 | tee "$outdir/energy.out"
       st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
       ;;
+    cutws)
+      # cuTENSOR emulation vs native planned at workspace preference DEFAULT and MAX (bench/sweep_cutensor_ws.txt):
+      # is the emulation held back by the plan's workspace preference? -> cutensor_ws.jsonl, cutensor_ws.md
+      "$here/run_sweep.sh" "$here/sweep_cutensor_ws.txt" "$outdir/cutensor_ws.jsonl" 2>&1 | tee "$outdir/cutensor_ws.out"
+      st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
+      ;;
     compare)
       # immerdink vs GEMMul8 / cuBLAS emulation / DGEMM / cuTENSOR native + emulated; a method that is not built in
       # (no GEMMUL8_DIR, no CUDA 13 cuBLAS, no cuTENSOR) records an error and the rest still runs
@@ -185,13 +193,14 @@ for sw in ${SWEEPS:-imd baseline compare compare_energy energy profile}; do
       "$here/profile_nsys.sh" "$outdir" 2>&1 | tee "$outdir/profile.out"
       st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
       ;;
-    *) echo "unknown sweep '$sw' in SWEEPS (imd, baseline, compare, compare_energy, energy, profile)" >&2; exit 2 ;;
+    *) echo "unknown sweep '$sw' in SWEEPS (imd, baseline, cutws, compare, compare_energy, energy, profile)" >&2; exit 2 ;;
   esac
 done
 if command -v python3 >/dev/null; then
   files=(); for f in sweep_imd.jsonl baselines.jsonl; do [ -s "$outdir/$f" ] && files+=("$outdir/$f"); done
   [ ${#files[@]} -gt 0 ] && python3 "$here/summarize.py" "${files[@]}" > "$outdir/summary.md" 2>/dev/null
   [ -s "$outdir/energy.jsonl" ] && python3 "$here/summarize.py" "$outdir/energy.jsonl" > "$outdir/energy.md" 2>/dev/null
+  [ -s "$outdir/cutensor_ws.jsonl" ] && python3 "$here/cutws_table.py" "$outdir/cutensor_ws.jsonl" > "$outdir/cutensor_ws.md" 2>/dev/null
   [ -s "$outdir/compare.jsonl" ] && python3 "$here/summarize.py" --only-compare "$outdir/compare.jsonl" > "$outdir/compare.md" 2>/dev/null
   [ -s "$outdir/compare_energy.jsonl" ] && python3 "$here/summarize.py" --only-compare "$outdir/compare_energy.jsonl" > "$outdir/compare_energy.md" 2>/dev/null
 fi

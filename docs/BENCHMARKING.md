@@ -353,13 +353,22 @@ results are comparable with them):
   identical-results test (`identical_to_native`), with `c_hash` as the second source. Identical = not
   engaged; different = "likely engaged" only with a different time or error too. The decisive
   confirmation is the Nsight Systems kernel list of the `cutensor-emu` run (INT8 tensor-core kernels).
+- *Workspace preference (`--ct-ws min|default|max`).* The plan's workspace preference decides which cuTENSOR
+  algorithms are candidates: `default` "aims to attain high performance while also reducing the workspace
+  requirement", only `max` makes "all algorithms available" (`cutensor/types.h`); an emulation that is excluded
+  falls back to native FP64 silently. `cutensor` is planned at `default` (how it is normally called) and
+  `cutensor-emu` at `max` unless `--ct-ws` is given; records carry `ct_ws` and `ws_bytes`. The sweep
+  `bench/sweep_cutensor_ws.txt` (`SWEEPS=cutws`, output `cutensor_ws.jsonl` / `cutensor_ws.md`, built by
+  `bench/cutws_table.py`) runs native and emulated at both preferences on `sq4096`, `sq8192`, `t_cc` and `t_df`:
+  it separates a harness choice (the emulation engages at `max` only) from an unsupported GPU/CUDA combination.
 - *Is the cuBLAS emulation real?* The `emu` method sets the EAGER strategy ("emulate whenever possible"); where
   cuBLAS does not emulate (device, shape, workspace) it presumably runs native FP64 without an error (not
   verified on any card). `bench/summarize.py` compares the `c_hash` of every `emu` record with the `dgemm` and
   `cutensor` records of the case: an equal hash means the emulation did not run, the record is marked
   `native_fallback`, cannot be the best emulator, and the table shows "not engaged" (the energy records carry
   no hash, so this check applies to the timing tables only). A different C does not prove that it ran: the
-  Nsight Systems run of `emu` (`engaged_int8`) is the decisive check (`bench/sweep_profile.txt`).
+  Nsight Systems run of `emu` (`engaged_int8`) would be the decisive check, but the default profile list covers
+  immerdink and cuTENSOR only: add `emu` lines to `bench/sweep_profile.txt` (or `PROFILE_LIST`) to check it.
 
 **What is not the same as the evaluation workspace's campaigns.** The methods of a case run one after the
 other in the process, not interleaved round-robin as `eval_bench`'s `pareto` method does: all see the same
@@ -383,13 +392,13 @@ runs it last (`SWEEPS` element `profile`; alone: `bench/profile_nsys.sh <outdir>
 `SWEEPS=profile bench/run_metrics.sh <outdir>`). Each line of `bench/sweep_profile.txt` is one short
 `imd_bench` run (5 repetitions after 2 warm-up calls, 4096 error samples, one method and one N or variant)
 under `nsys profile -t cuda` (CUDA trace only: no CPU sampling, so no `perf_event_paranoid` requirement), started
-through `tools/run_bench.sh` (quiet gate, shared GPU lock). Default list (33 runs, a few seconds each plus
+through `tools/run_bench.sh` (quiet gate, shared GPU lock). Default list (20 runs, a few seconds each plus
 nsys start-up and export): immerdink N = 14 and N = 8 on `sq4096`, `sq8192`, `t_cc`, `t_df`, `s_cc16`,
-`r_lowk`; cuTENSOR native, cuTENSOR emulated (`cutensor-emu`), cuBLAS DGEMM, cuBLAS emulation (`dyn`,
-`fix55`) and GEMMul8 (fast and accurate, N = 14) on `sq4096` (a plain GEMM) and `t_cc` (a permuted
-contraction: the matrix-only methods run as `perm+<method>`); `cutensor`, `cutensor-emu`, `dgemm` on
-`sq8192` and `cutensor`, `cutensor-emu` on `t_df`; cuBLAS emulation `fix55` on `sq8192` and on the batched
-`s_batch`. `PROFILE_TAGS='<regex>'` selects runs by tag, `PROFILE_LIST` another list.
+`r_lowk`; cuTENSOR native and cuTENSOR emulated (`cutensor-emu`, planned at workspace preference `max`) on
+`sq4096` (a plain GEMM), `t_cc` (a permuted contraction), `sq8192` and `t_df`. Only immerdink and cuTENSOR are
+profiled: the pass shows where immerdink's time goes and settles whether cuTENSOR's emulation runs INT8
+tensor-core kernels; cuBLAS DGEMM / emulation and GEMMul8 are timed in the comparison sweeps only (a profile list
+may still name them: `dgemm`, `emu`, `gemmul8` are accepted by `profile_nsys.sh`). `PROFILE_TAGS='<regex>'` selects runs by tag, `PROFILE_LIST` another list.
 
 Output in `<outdir>/profile/` (and `<outdir>/profile.md`, a table of all runs):
 - `index.json`: `[{tag, case, method, N, variant, nsys_rep, summary, engaged_int8}]` (paths relative to `profile/`;

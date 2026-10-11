@@ -3,12 +3,13 @@
 #   case | method | argument
 # The case's einsum spec and extents come from bench/sweep_compare.txt (same name). The argument is
 #   imd        N (moduli count)
-#   gemmul8    <fast|accu>:N
-#   emu        the cuBLAS emulation variant (dyn, fix55, ...)
-#   cutensor, cutensor-emu, dgemm   -   (no argument)
-# Tag = <case>-<method>[-<argument with ':' as '-'>] ; N 14 is the DGEMM-level setting, 8 the low-accuracy point.
-# Methods that are not built in (no GEMMUL8_DIR, no CUDA 13 cuBLAS, no cuTENSOR) give a summary with the imd_bench
-# error in the notes and engaged_int8 null; the rest still run.
+#   cutensor, cutensor-emu   -   (no argument)
+# Only immerdink and cuTENSOR (native and emulated FP64) are profiled: the nsys pass exists to see where immerdink's time
+# goes and to prove whether cuTENSOR's emulation runs INT8 tensor-core kernels (cutensor-emu is planned at workspace
+# preference max, see --ct-ws). cuBLAS DGEMM / emulation and GEMMul8 are timed in the comparison sweeps only.
+# Tag = <case>-<method>[-<argument>] ; N 14 is the DGEMM-level setting, 8 the low-accuracy point.
+# A method that is not built in (no cuTENSOR) gives a summary with the imd_bench error in the notes and engaged_int8
+# null; the rest still run.
 # immerdink: square, tensor-contraction (t_cc, t_df, s_cc16) and low-K shapes
 sq4096 | imd | 14
 sq4096 | imd | 8
@@ -22,28 +23,15 @@ s_cc16 | imd | 14
 s_cc16 | imd | 8
 r_lowk | imd | 14
 r_lowk | imd | 8
-# baselines on a plain GEMM (sq4096) and a permuted contraction (t_cc)
+# cuTENSOR on a plain GEMM (sq4096) and a permuted contraction (t_cc)
 sq4096 | cutensor      | -
 sq4096 | cutensor-emu  | -
-sq4096 | dgemm         | -
-sq4096 | emu           | dyn
-sq4096 | emu           | fix55
-sq4096 | gemmul8       | fast:14
-sq4096 | gemmul8       | accu:14
 t_cc   | cutensor      | -
 t_cc   | cutensor-emu  | -
-t_cc   | dgemm         | -
-t_cc   | emu           | dyn
-t_cc   | emu           | fix55
-t_cc   | gemmul8       | fast:14
-t_cc   | gemmul8       | accu:14
 # is the cuTENSOR emulation engaged at the large size and on the other contraction shapes?
 sq8192 | cutensor      | -
 sq8192 | cutensor-emu  | -
-sq8192 | dgemm         | -
 t_df   | cutensor      | -
 t_df   | cutensor-emu  | -
 # does the cuBLAS emulation engage at the large size and on a batched case? (the identical-C check of bench/summarize.py
 # needs a dgemm record in the same process; here the nsys INT8-kernel check, engaged_int8, answers it)
-sq8192 | emu | fix55
-s_batch | emu | fix55
