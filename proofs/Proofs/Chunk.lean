@@ -213,7 +213,8 @@ theorem epi_input_range {p Q K : ℤ} (hp : 0 < p) {acc : ℕ → ℤ}
 `Q·K_c ≤ 2³¹ − 1`, the chunk bound `131056` (the v1.12 `K_c'`) also fits, and for every
 `p ≤ 256` the epilogue range `[−Q·131056, (p−1) + Q·131056]` lies inside int32 (max
 `2147221759`). Since DESIGN v1.13 the used `K_c' = 131008 ≤ 131056`, so it is covered a
-fortiori (tight max `2146435327`, checked in `spec/params.py`); not re-instantiated. -/
+fortiori (tight max `2146435327`; re-instantiated with the exact range in
+`Moduli.epilogue_range_v113`). -/
 theorem design_constants :
     (128 ^ 2 : ℤ) * 131071 ≤ 2 ^ 31 - 1 ∧ (128 ^ 2 : ℤ) * 131072 > 2 ^ 31 - 1 ∧
     (128 ^ 2 : ℤ) * 131056 ≤ 2 ^ 31 - 1 ∧

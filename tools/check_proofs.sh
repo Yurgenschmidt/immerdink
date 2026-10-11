@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build the Lean proofs (proofs/) and fail on any escape hatch.
 #
-#   1. grep: no `sorry`, `admit` or `axiom` token anywhere in proofs/Proofs*.
+#   1. grep: no `sorry`, `admit` or `axiom` token anywhere in proofs/Proofs*; the moduli in
+#      proofs/Proofs/Moduli.lean must equal spec/params_out.json's.
 #   2. lake build must succeed (Mathlib oleans come from `lake exe cache get`).
 #   3. #print axioms on every headline theorem listed in proofs/AxiomCheck.lean must
 #      report only Lean's standard axioms (propext, Classical.choice, Quot.sound).
@@ -11,7 +12,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Lean/Mathlib elaboration is memory-hungry: run inside the shared budget.
-grep -q "/immerdink.slice/" /proc/self/cgroup 2>/dev/null || exec "$ROOT/tools/memcap.sh" "$ROOT/tools/check_proofs.sh" "$@"
+# (Without a systemd user manager memcap.sh runs the command uncapped and outside the slice, so
+# the marker stops a second re-exec.)
+if ! grep -q "/immerdink.slice/" /proc/self/cgroup 2>/dev/null && [[ -z "${IMMERDINK_IN_MEMCAP:-}" ]]; then
+  export IMMERDINK_IN_MEMCAP=1
+  exec "$ROOT/tools/memcap.sh" "$ROOT/tools/check_proofs.sh" "$@"
+fi
 PROOFS="$ROOT/proofs"
 LAKE="${LAKE:-$(command -v lake || echo "$HOME/.elan/bin/lake")}"
 
@@ -23,6 +29,18 @@ if grep -rnwE 'sorry|admit|axiom' Proofs Proofs.lean; then
   exit 1
 fi
 echo "ok: none found"
+
+echo "== Moduli.lean's moduli match spec/params_out.json"
+python3 - "$PROOFS/Proofs/Moduli.lean" "$ROOT/spec/params_out.json" <<'PY'
+import json, re, sys
+src = open(sys.argv[1]).read()
+m = re.search(r"def moduli : List ℕ :=\s*\[([^\]]*)\]", src)
+lean = [int(t) for t in m.group(1).replace("\n", " ").split(",")] if m else None
+spec = [int(t) for t in json.load(open(sys.argv[2]))["moduli"]]
+if lean != spec:
+    sys.exit(f"FAIL: Lean moduli {lean} != params_out.json {spec}")
+print(f"ok: {len(spec)} moduli agree")
+PY
 
 echo "== lake exe cache get"
 "$LAKE" exe cache get >/dev/null 2>&1 || echo "warning: cache get failed (offline?)"

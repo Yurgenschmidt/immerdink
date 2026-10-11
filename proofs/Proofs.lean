@@ -5,3 +5,9 @@ import Proofs.Error
 import Proofs.Exact
 import Proofs.Summation
 import Proofs.Segments
+import Proofs.Residue
+import Proofs.CRTWord
+import Proofs.Moduli
+import Proofs.ShiftRule
+import Proofs.KWeights
+import Proofs.Apost

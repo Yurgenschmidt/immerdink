@@ -160,8 +160,8 @@ are NaN, but their payload and sign are unspecified.
 | `M_l, q_l` | `M_l = P/p_l` and `q_l = M_l⁻¹ mod p_l ∈ [1,p_l)`. Then `M_l q_l ≡ δ_lj (mod p_j)`. |
 | `T` | `⌊√H⌋`, the per-side norm budget. `T² ≤ H < (T+1)²`. |
 | `K_c` | `131071 = ⌊(2³¹−1)/128²⌋`. It is tight: `128²·(K_c+1) > 2³¹−1`. CUTLASS 2.x int8 MMA is `.satfinite` ([CUT] `mma_sm80.h`), so overflow **saturates silently**. **Every modulus, including p = 256, must be K-chunked.** The wraparound exemption [G8] relies on with cuBLAS does not apply here. **[spec: OzakiCRT ChunkFits, neg_chunk, neg_order]** |
-| `K_c'` | **[v1.13]** `131008 = ⌊K_c/64⌋·64 = 2047·64` is the chunk length used (it was `131056 = ⌊K_c/16⌋·16`). Numerically any chunk length ≤ K_c is exact. A multiple of 16 keeps CUTLASS pointers 16-byte aligned (correctness). A multiple of 64, K4's threadblock K tile, keeps every full chunk free of a residue tile, so a row's K4 load phase depends on k̂ alone (§4b, performance). 131008 is the largest such multiple ≤ K_c **[cert: cert_kc, cert_row_phase]**. |
-| `L_w` | Width of the **unsigned** CRT word, `32·L32` with `L32` minimal such that `2P ≤ 2^{L_w}`. `L32` = 1 for N ≤ 3, 2 for N ≤ 7, 3 for N ≤ 12, 4 for N ≤ 16, 5 for N ≤ 20. The bound is exact: the reachable peak needs every bit. |
+| `K_c'` | **[v1.13]** `131008 = ⌊K_c/64⌋·64 = 2047·64` is the chunk length used (it was `131056 = ⌊K_c/16⌋·16`). Numerically any chunk length ≤ K_c is exact. A multiple of 16 keeps CUTLASS pointers 16-byte aligned (correctness). A multiple of 64, K4's threadblock K tile, keeps every full chunk free of a residue tile, so a row's K4 load phase depends on k̂ alone (§4b, performance). 131008 is the largest such multiple ≤ K_c **[cert: cert_kc, cert_row_phase; proof: PROOFS R6 `chunk_constants`]**. |
+| `L_w` | Width of the **unsigned** CRT word, `32·L32` with `L32` minimal such that `2P ≤ 2^{L_w}`. `L32` = 1 for N ≤ 3, 2 for N ≤ 7, 3 for N ≤ 12, 4 for N ≤ 16, 5 for N ≤ 20. The bound is exact: the reachable peak needs every bit **[cert: cert_limbs, cert_crt_peak; proof: PROOFS R6 `L32_exact`, `peak_needs_every_limb`]**. |
 
 All constants are generated and checked by `spec/params.py` in exact integer arithmetic.
 It is the only producer of the device constant tables (`--emit-header`, which writes
@@ -190,21 +190,22 @@ significand:
    - Each term is computed **from integers**, as `ceil_shift(m_h², 2(e_h − γ) + F)`, never
      by FP scaling: `2^{−γ}` overflows, and ldexp underflows.
    - Any nonzero entry contributes at least 1.
-   - Terms are < 2⁶³. S is exact, order-independent, and fits uint128 for `k < 2⁶⁶`.
+   - Terms are < 2⁶³. S is exact, order-independent, and fits uint128 for `k < 2⁶⁶`
+     **[proof: PROOFS R3]**.
    - `‖x‖²·2^F ≤ S < ‖x‖²·2^F + k`.
 4. **Shift.** `σ = u − γ`, where `u` is the **largest integer** satisfying
    - RN: `4·S·4^u ≤ R·2^F`, with `R = (2T − κ)²`;
    - TRUNC: `S·4^u ≤ R·2^F`, with `R = T²`.
 
    Here `κ = ⌈√k⌉` is computed exactly in integers (`c = isqrt(k); κ = c + (c² < k)`).
-   Using `⌊√k⌋` is **unsound** **[spec: OzakiScaling neg_kappa_floor; cert]**.
+   Using `⌊√k⌋` is **unsound** **[spec: OzakiScaling neg_kappa_floor; cert; proof: PROOFS R1]**.
 
    Computing u:
    - R is a per-plan constant of at most 157 bits.
    - Estimate `c = (bitlen(R·2^F) − bitlen(LhsCoef·S) + 1) >> 1`. This must be an
      **arithmetic (floor) shift**, because the difference can be negative at real widths.
    - Then do one exact multi-word compare (about 220 bits at N = 20): `u = Rule(c) ? c : c−1`.
-   - **[spec: OzakiScaling ShiftIsMaximal, UOf; cert]**
+   - **[spec: OzakiScaling ShiftIsMaximal, UOf; cert; proof: PROOFS R2]**
 5. **Store.** `σ` is stored as int16.
    - The exact range is `[−1037, 1151]` for k ≤ 2⁴⁰, N = 2…20, both roundings.
    - `σ + τ ∈ [−2074, 2302]` also fits int16.
@@ -254,8 +255,8 @@ Why we deviate:
 
 ### 3.4 Residues
 - `r_l(a') = SMod(a', p_l) ∈ [−⌊p_l/2⌋, ⌈p_l/2⌉−1]`. This fits int8 (`[−128,127]` for
-  p = 256).
-- It is computed exactly as `SMod((μ mod p_l)·(2^ε mod p_l), p_l)`.
+  p = 256) **[proof: PROOFS R4]**.
+- It is computed exactly as `SMod((μ mod p_l)·(2^ε mod p_l), p_l)` **[proof: PROOFS R4]**.
   - `mod` here is the **non-negative** mathematical mod. C `%` on a negative μ is wrong.
   - It uses a `2^ε mod p_l` table.
 - Any exact reduction is allowed (Barrett, dp4a byte weights); only the congruence class
@@ -328,8 +329,8 @@ the lanes' distinct ε. The cost depended on the data (§6c "The eps path").
   needed.
   `r = s − p_l·umulhi(s, ⌈2³²/p_l⌉)` is the non-negative `s mod p_l` for every s < 2²⁴
   (the A5 `mod_p_bytes32` lemma: s·e < 2³² for e = ⌈2³²/p⌉·p − 2³² < p ≤ 256;
-  `mod_p_words32<W>`, device/modp.hpp). For p = 256 the weights are 1, 0, 0, …, so s is
-  the low byte and the quotient is 0.
+  `mod_p_words32<W>`, device/modp.hpp; **[proof: PROOFS R5 `mod_p_bytes32`]**). For p = 256
+  the weights are 1, 0, 0, …, so s is the low byte and the quotient is 0.
 - **Sign and SMod** as before (A5): `SMod(r)`, negated for a' < 0 (SMod(−r mod p) =
   −SMod(r) for odd p; both give the byte (−r) mod 256 for p = 256).
 - **The weights** (`PackWeights`, src/device/residue.hpp, `__constant__ c_pack_weights`) are
@@ -411,7 +412,7 @@ N = 13; the product A/B is in the v1.14 changelog entry.
   - **[v1.13]** For p = 256 the range is `[−2129666048, 2146435327]` (−128·127·K_c' and
     128²·K_c' + 255); it fits int32 **[cert: cert_kc]** **[spec: apalache Epilogue]**. With
     the old 131056 the maximum was 2147221759.
-- **Realization [cert: cert_barrett]:**
+- **Realization [cert: cert_barrett; proof: PROOFS R5 `barrett_epilogue`]:**
   - p = 256: `v & 255`;
   - otherwise: `n = v + bias` (u32, `bias = p·⌈2³¹/p⌉`), `q = umulhi64(⌈2⁶⁴/p⌉, n)`,
     `v mod p = n − p·q`.
@@ -430,13 +431,13 @@ z ← (x ≤ H) ? x : x − P                      (z ∈ [H+1−P, H] = [−P/2
 ```
 - `Σ_h|a'||b'| ≤ H` implies `z = (A'B')_īj̄` exactly; at H+1 this can fail.
   **[spec: OzakiCRT CRTExact, neg_bound; CRTRealization Refines (3 layers: exact CRT →
-  word → limbs); cert: cert_crt_peak, cert_crt_roundtrip; proof: PROOFS L2]**
+  word → limbs); cert: cert_crt_peak, cert_crt_roundtrip; proof: PROOFS L2, R6]**
 - The word is **unsigned**. A signed `__int128` would need `2P ≤ 2^{L_w−1}`, and signed
   overflow is UB.
 - In the centering step, compare the sign bit with the borrow-out
-  **[spec: CRTRealization pos_wordref_nosub]**.
+  **[spec: CRTRealization pos_wordref_nosub; proof: PROOFS R6 `center_word`]**.
 - "No division" means no wide division. `x + M_l y = P` can never occur exactly, so `≥` and
-  `>` behave the same.
+  `>` behave the same **[proof: PROOFS R6 `xp_ne_P`]**.
 - [G8]'s Garner tree is an equivalent exact alternative. [OZ2]'s double-double FP
   reconstruction is superseded, and its error term R_64 disappears.
 
