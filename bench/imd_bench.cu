@@ -6,7 +6,8 @@
 // Run it through bench/run_sweep.sh (which goes through tools/run_bench.sh); see
 // docs/BENCHMARKING.md. Every operand is dense row-major in its label order (last label
 // fastest). One JSON object per (method, variant) is appended to --out (default stdout).
-// immerdink only: comparisons with other libraries live in a separate evaluation workspace.
+// The comparison baselines (cuBLAS DGEMM / emulation, GEMMul8, cuTENSOR) are optional methods, see below;
+// the interleaved comparison campaigns live in a separate evaluation workspace (eval_bench).
 //
 // Methods
 //   imd       immerdink imd_plan_create + imd_contract, N from --N. With a library built

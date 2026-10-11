@@ -354,6 +354,14 @@ inputs and, after the 3 s warm-up of `bench/warm_run.sh`, a similar GPU state, b
 between configurations (a power-limited or unlocked card moves 10 to 20 % between performance states), so
 the ratios of tiny shapes (calls of tens of µs: s256, s512, s_cc16, s_batch, sq1024) are indicative only;
 the records' `contaminated` flags and spreads mark them. The energy runs are sequential by construction.
+Check on the RTX 4090 (not a result): the maximum normwise errors of every method equal the campaign's to
+all printed digits, so the numerics and the data are the same. At 4096³ (unlocked, same clock state as the
+interleaved unlocked campaign) the sequential TFLOPS-eq agree within 3 % for every method (immerdink N = 14
+31.8 against 31.7, GEMMul8 fast N = 14 22.9 against 22.4, cuBLAS emulation fix55 19.9 against 20.0, DGEMM 1.21
+against 1.22). At 1024³ the sequential numbers are higher than the interleaved ones (GEMMul8 fast N = 14: 12.5
+against 7.7; immerdink N = 14: 17.8 against 17.2). The 4096³-sized tensor cases are 5 to 23 % above the
+campaign's locked-clock numbers, the clock: unlocked 2.8 GHz against locked 2.2 GHz for the compute-bound
+DGEMM. Do not mix the two protocols in one table.
 
 ### Calibration (`bench/calibrate.sh`)
 

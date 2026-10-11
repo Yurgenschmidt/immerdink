@@ -3,7 +3,7 @@
 # (CUTENSOR_COMPUTE_DESC_8XINT8, method cutensor-emu; cuTENSOR >= 2.4, Hopper+ per its header; it may
 # fall back to native FP64 silently, which bench/summarize.py flags). Needs imd_bench built with cuTENSOR
 # (bench/preflight.sh; set CUTENSOR_ROOT). Same format as sweep_imd.txt; the N column is unused.
-# The cuBLAS DGEMM / GEMMul8 / cuBLAS-emulation baselines are NOT in this repository.
+# The cuBLAS DGEMM / GEMMul8 / cuBLAS-emulation baselines are in bench/sweep_compare.txt.
 s256    | ik,jk->ij | i=256,j=256,k=256      | cutensor,cutensor-emu | |
 s512    | ik,jk->ij | i=512,j=512,k=512      | cutensor,cutensor-emu | |
 s_cc16  | kjbc,kiac->abij | i=16,j=16,k=16,a=96,b=96,c=96 | cutensor,cutensor-emu | |

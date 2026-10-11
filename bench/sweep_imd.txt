@@ -1,5 +1,5 @@
-# immerdink-only performance regression sweep (no competitor baselines; comparisons live in the
-# separate evaluation workspace).
+# immerdink-only performance regression sweep (no competitor baselines: those are
+# bench/sweep_baselines.txt (cuTENSOR) and bench/sweep_compare.txt (all baselines)).
 # name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
 s256    | ik,jk->ij | i=256,j=256,k=256      | imd | 8,14 |
 s512    | ik,jk->ij | i=512,j=512,k=512      | imd | 8,14 |
@@ -15,7 +15,7 @@ t_ikl   | ikl,kjl->ijl | i=1024,j=1024,k=1024,l=16 | imd | 8,14 |
 t_df    | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | imd | 8,14 |
 t_cc    | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | imd | 8,14 |
 t_permout | abk,kcd->cadb | a=64,b=64,c=64,d=64,k=4096 | imd | 8,14 |
-# batched GEMMs (the native cuBLAS strided-batched DGEMM reference exists only in the evaluation workspace)
+# batched GEMMs (the native cuBLAS strided-batched DGEMM reference is method dgemm in bench/sweep_compare.txt)
 t_batch | lik,ljk->lij | i=1024,j=1024,k=1024,l=16 | imd | 8,14 |
 # s_batch is tiny (tens of µs per call): its spread is jitter-dominated like s256's (records are flagged
 # contaminated when > 5 %); use --methods duel (docs/BENCHMARKING.md "Tiny shapes") for a stable A/B number.
