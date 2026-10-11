@@ -2,6 +2,9 @@
 # Run a benchmark sweep: every case is one imd_bench process, run through
 # tools/run_bench.sh (machine-wide lock + wait for a quiet machine + QUIET_LOG).
 #   bench/run_sweep.sh [sweep file] [results.jsonl]
+# A sweep line's extra-args column may carry per-case environment settings as @NAME=VALUE tokens (only
+# BENCH_* names, e.g. @BENCH_MAX_SPREAD=10 for a tiny case or @BENCH_RETRIES=1 for an energy case);
+# they are exported to that case's warm_run.sh and are not passed to imd_bench.
 # Defaults: bench/sweep_imd.txt, bench/results/<date>-<commit>.jsonl. Builds first
 # (bench/build.sh). Only cases whose name matches $CASES (a grep -E regex) run, if set.
 # If the machine never gets quiet (run_bench.sh exit 3), the sweep stops there and says so;
@@ -37,10 +40,15 @@ while IFS='|' read -r name spec ext methods Ns extra; do
   args=(--name "$name" --spec "$(echo "$spec" | xargs)" --ext "$(echo "$ext" | xargs)"
         --methods "$(echo "$methods" | xargs)" --out "$out")
   [ -n "$(echo "$Ns" | xargs)" ] && args+=(--N "$(echo "$Ns" | xargs)")
-  # shellcheck disable=SC2206
-  args+=($extra)
-  echo "== $name $(date -Is)"
-  QUIET_LOG="$logdir/$name.quiet" "$root/tools/run_bench.sh" "$here/warm_run.sh" "$build/imd_bench" "${args[@]}" </dev/null
+  envs=()
+  for tok in $extra; do
+    case "$tok" in
+      @BENCH_*=*) envs+=("${tok#@}") ;;
+      *) args+=("$tok") ;;
+    esac
+  done
+  echo "== $name $(date -Is)${envs[*]:+ (${envs[*]})}"
+  env ${envs[@]+"${envs[@]}"} QUIET_LOG="$logdir/$name.quiet" "$root/tools/run_bench.sh" "$here/warm_run.sh" "$build/imd_bench" "${args[@]}" </dev/null
   rc=$?
   if [ $rc = 3 ]; then
     echo "machine never got quiet; stopping the sweep before case $name" >&2
