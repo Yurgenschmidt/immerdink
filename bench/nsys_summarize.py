@@ -376,6 +376,8 @@ def main(argv=None):
         print(profile_table(a.dir))
         return 0
     os.makedirs(a.outdir, exist_ok=True)
+    if getattr(a, "variant", None) in ("", "-"):
+        a.variant = None
     if a.cmd == "summarize":
         try:
             summ = make_summary(a.tag, a.case, a.method, _N(a.N), a.variant or None, a.db, a.gpu, a.nsys_version,
