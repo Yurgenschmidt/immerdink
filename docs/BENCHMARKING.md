@@ -1,8 +1,10 @@
 # Benchmarking immerdink
 
 How to measure immerdink's performance reliably. This file covers methodology only. The
-benchmark here measures immerdink alone and needs no other library. Comparison campaigns
-against other libraries, their harness and their raw results are kept outside this
+benchmark measures immerdink alone and needs no other library; the comparison baselines
+(cuBLAS DGEMM, cuBLAS FP64 emulation, GEMMul8, cuTENSOR native and emulated) are optional extras
+that the same tool can time on identical inputs (Test 3 and Test 4 below). The earlier
+campaigns on the RTX 4090, their harness and their raw results are kept outside this
 repository, in a separate local evaluation workspace.
 
 ## The tool
@@ -23,6 +25,12 @@ Every record carries:
 | `packed` | D1 operand reuse: R × `imd_contract` against `imd_pack` + R × `imd_contract_packed` (`--pack A,B`, `--reuse 1,4,16`), interleaved per repetition; the packed C is checked bit for bit against the plain one. |
 | `duel` | Two immerdink configurations interleaved call by call in one process (`--duel-a`, `--duel-b`; see "Tiny shapes" below). |
 | `bw` | A device-to-device copy of A: the achievable DRAM bandwidth, a hardware reference. |
+| `energy` | Board energy per call of imd at each N (Test 2). |
+| `cutensor`, `cutensor-emu` | Optional baselines (built with cuTENSOR): cuTENSOR native FP64 and its INT8 emulation, on the original layouts (Test 3). |
+| `dgemm` | Optional baseline: cuBLAS FP64 GEMM (`CUBLAS_COMPUTE_64F_PEDANTIC`; strided-batched when b > 1) (Test 4). |
+| `emu` | Optional baseline: cuBLAS FP64 fixed-point emulation, one record per `--emu` variant. Needs a CUDA 13 cuBLAS (Test 4). |
+| `gemmul8` | Optional baseline: GEMMul8 (INT8 backend), `--g8mode fast,accu`, `--N` moduli. Built in with `GEMMUL8_DIR` (Test 4). |
+| `energy-cutensor`, `energy-cutensor-emu`, `energy-dgemm`, `energy-emu`, `energy-gemmul8` | The energy protocol of Test 2 for each baseline. |
 
 - **Data:** `(u − ½)·exp(φ·g)`, with `u ~ U[0,1)`, `g ~ N(0,1)` and φ = 0.5. It is generated
   on the device from a counter-based hash, so it is reproducible. `--data dominant` gives each
@@ -170,13 +178,18 @@ this repository.
 The comparison methods of `imd_bench` went the same way: up to `db8bfbd` the bench also
 timed other libraries (and `perm+X` wrappers that permute the operands to the GEMM view),
 and its `duel` paired imd with one of them. The evaluation workspace keeps that version of
-the bench. NOTES files that mention other libraries' calls in the same process refer to it.
+the bench (`eval_bench`, which also has the interleaved `pareto` method and the 4090
+campaigns). NOTES files that mention other libraries' calls in the same process refer to it.
+The baselines came back to `imd_bench` as optional methods (Test 3 and Test 4); `duel` stays
+immerdink against immerdink, and the interleaved `pareto` timing stays in `eval_bench`.
 
 ## Test definitions
 
-The metrics suite is two sweeps of `bench/imd_bench`: throughput and accuracy
-(`bench/sweep_imd.txt`) and board energy (`bench/sweep_energy.txt`). Both are driven by
-`bench/run_metrics.sh` (see "Recreating the metrics on another machine").
+The metrics suite is sweeps of `bench/imd_bench`: throughput and accuracy
+(`bench/sweep_imd.txt`), board energy (`bench/sweep_energy.txt`), the cuTENSOR baselines
+(`bench/sweep_baselines.txt`) and the comparison with all baselines (`bench/sweep_compare.txt`,
+`bench/sweep_compare_energy.txt`). All are driven by `bench/run_metrics.sh` (see "Recreating the
+metrics on another machine").
 
 **What every test is.** One *case* is one FP64 contraction `C = A·B` (an einsum spec on row-major
 operands) computed by immerdink's Ozaki-II emulation (INT8 tensor cores) with N moduli. Each case
@@ -214,9 +227,9 @@ TFLOPS-equivalent numerator is always `2·m·n·k·b` (the FP64 operation count)
 
 The energy sweep runs sq2048 (2048³, `ik,jk->ij`), sq4096, sq8192, t_df, t_cc, t_batch and s_batch.
 
-Besides immerdink, this repository's sweeps measure cuTENSOR native and emulated FP64 (Test 3). The
-native batched baseline (`cublasGemmStridedBatchedEx` FP64) and the other comparison libraries
-(cuBLAS DGEMM, GEMMul8, cuBLAS FP64 emulation) exist only in the evaluation workspace's `eval_bench`.
+Besides immerdink, the sweeps can measure cuTENSOR native and emulated FP64 (Test 3), and cuBLAS DGEMM
+(`cublasGemmEx`, and `cublasGemmStridedBatchedEx` on the batched cases), cuBLAS FP64 emulation and GEMMul8
+(Test 4): all optional, each compiled in only where its library is available.
 
 ### Test 1: throughput and accuracy (`bench/sweep_imd.txt`)
 
@@ -268,15 +281,79 @@ permutations):
   (cuTENSOR ≥ 2.4; its header lists it as Hopper+; the number of retained mantissa bits is chosen at
   runtime to match native accuracy). Since cuTENSOR 2.6 it **falls back to native FP64 silently**
   where it does not apply, so a record alone cannot tell whether the emulation ran:
-  `bench/summarize.py` compares the emulated record with the native one of the same case and flags it
-  "not engaged (time within 5 % of native, same error)". A plan that cuTENSOR refuses is an error
-  record, not a failure of the sweep.
+  the emulated record carries an **identical-results test**: after the timed loop the bench runs the
+  native plan once on the same inputs and compares the whole C bit for bit (`identical_to_native`,
+  `native_c_hash`; `c_hash` is a hash of every bit of C in every record with an accuracy;
+  `repeat_identical`: a second call of the same plan gives the same bits). `bench/summarize.py` reads
+  that: an emulated C equal to the native one is "NOT engaged" (certain). A C that differs does not prove
+  that the emulation ran: on the RTX 4090 (not Hopper+) `cutensor-emu` returned a C different from the
+  native plan's but identical to cuBLAS DGEMM's, with the native time and error (another native
+  algorithm); so a different C counts as "likely engaged" only when the time or error also differ, and the
+  Nsight Systems kernel list of the `cutensor-emu` run (INT8 tensor-core GEMM kernels) is the decisive
+  check. Only without those fields does the summary fall back to the older rule (time within 5 % of
+  native, same error). A plan that cuTENSOR refuses is an error record, not a failure of the sweep.
 - Energy: methods `energy-cutensor` and `energy-cutensor-emu` in `bench/sweep_energy.txt` use the
   protocol of Test 2 (same process, same idle baseline).
 
-Records carry `compute_desc`, `cutensor_version` and `emulated_requested`. The cuBLAS DGEMM (and
-strided-batched DGEMM), GEMMul8 and cuBLAS FP64-emulation baselines are **not in this repository**;
-they exist only in the separate evaluation workspace.
+Records carry `compute_desc`, `cutensor_version` and `emulated_requested`. cuTENSOR's emulation needs
+a recent cuTENSOR and CUDA (its documentation: it falls back to native FP64 silently where the CUDA
+version or the device does not support it, and recommends the newest CUDA); on a CUDA 12.9 toolchain it
+did not engage on any card in the first PACE run (errors identical to native). Run it with the CUDA 13
+toolchain (Test 4) and read the engaged check.
+
+### Test 4: comparison with the baselines (`bench/sweep_compare.txt`, `bench/sweep_compare_energy.txt`)
+
+The comparison of the RTX 4090 campaigns, reproducible on any card: immerdink against
+
+| method | baseline | notes |
+|---|---|---|
+| `gemmul8` | GEMMul8 v3.5.2 (commit `6a9eff8`, API generation 3, INT8 backend), fast and accurate mode | optional: `GEMMUL8_DIR`; the pin is `bench/GEMMUL8_PIN`; records carry `g8_name`, `g8_commit`, `g8_api`, `g8_mode` |
+| `dgemm` | cuBLAS FP64 GEMM, `CUBLAS_COMPUTE_64F_PEDANTIC` | always built |
+| `emu` | cuBLAS FP64 fixed-point emulation, `CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT`, EAGER strategy, dynamic (`dyn`) or fixed (`fix<bits>`) mantissa control | needs a **CUDA 13 cuBLAS** (the build tests for the API); otherwise a recorded error "needs CUDA 13 cuBLAS", never fatal |
+| `cutensor`, `cutensor-emu` | cuTENSOR native FP64 and `CUTENSOR_COMPUTE_DESC_8XINT8` (Test 3) | optional: cuTENSOR |
+
+`energy-dgemm`, `energy-emu`, `energy-gemmul8` (with `energy-cutensor`, `energy-cutensor-emu`) measure the
+same configurations with the energy protocol of Test 2.
+
+**The rules that make it a fair comparison** (the rules of the evaluation campaigns, kept so that the
+results are comparable with them):
+- *Same inputs, same reference.* Every method of a case runs in the case's one process on the same data
+  and is checked against the same double-double reference on the same sampled outputs. The comparison
+  sweeps check 262 144 outputs (1 048 576 on the squares up to 4096; all of C when it is smaller), not
+  `imd_bench`'s default 256: the maximum error depends on the number of checked outputs, so **never
+  compare an error of the comparison sweeps with one of `sweep_imd.txt`**.
+- *GEMM view and `perm+X`.* `dgemm`, `emu` and `gemmul8` are matrix-only: they need A = [L][I|K],
+  B = [L][J|K], C = [L][I][J]. A case in another layout (the tensor cases) is timed as `perm+<method>`:
+  cuTENSOR permutations of A and B before the GEMM and of C after it are inside the timed window, as
+  the price of using a matrix library on a tensor contraction (immerdink and cuTENSOR contract the
+  original layouts directly). `--gemm-view 1` also records the bare GEMM on pre-permuted operands.
+  Without cuTENSOR in the build, a `perm+` case is an error record.
+- *Batched cases.* `dgemm` and `emu` use `cublasGemmStridedBatchedEx`; GEMMul8 has no batched API (one
+  call per batch slice, noted in the record).
+- *Flops.* `2·m·n·k·b` for every method, whatever N or mantissa width: TFLOPS-eq.
+- *Configurations.* `N` is the number of moduli for `imd` and `gemmul8` (`--N`, or `--g8fast-N` /
+  `--g8accu-N` per mode); for `emu`, `N` in the record is the mantissa bit count of `fix<bits>` (0 for
+  `dyn`) and the emulation workspace is `--emu-ws-mib` (default 2048; use 4096 at 16384³). The N and
+  bit counts of `sweep_compare.txt` bracket DGEMM-level accuracy at φ = 0.5 (N = 14 or 15, fix55; N = 13
+  and fix47 fail it) plus lower-accuracy points.
+- *DGEMM-level.* Per method, the fastest (energy: the most efficient) configuration whose max normwise
+  error is at or below cuBLAS DGEMM's own error on the same case. `bench/summarize.py --only-compare
+  compare.jsonl` makes the table (also for `compare_energy.jsonl`): per case and method the best such
+  configuration with TFLOPS-eq and time (or GFLOPS-eq per watt and joules), the ratio of immerdink to the
+  best emulator, to DGEMM and to cuTENSOR native, then every configuration with its flag. A method that
+  did not run (not built in, unsupported on this card) gives an error record, a dash in the table, and a
+  row in the list of failures; the rest of the comparison is unaffected.
+- *Is the cuTENSOR emulation real?* See Test 3: the table has a verdict per case from the
+  identical-results test (`identical_to_native`), with `c_hash` as the second source. Identical = not
+  engaged; different = "likely engaged" only with a different time or error too. The decisive
+  confirmation is the Nsight Systems kernel list of the `cutensor-emu` run (INT8 tensor-core kernels).
+
+**What is not the same as the evaluation workspace's campaigns.** The methods of a case run one after the
+other in the process, not interleaved round-robin as `eval_bench`'s `pareto` method does: all see the same
+inputs and, after the 3 s warm-up of `bench/warm_run.sh`, a similar GPU state, but the clock can move
+between configurations (a power-limited or unlocked card moves 10 to 20 % between performance states), so
+the ratios of tiny shapes (calls of tens of µs: s256, s512, s_cc16, s_batch, sq1024) are indicative only;
+the records' `contaminated` flags and spreads mark them. The energy runs are sequential by construction.
 
 ### Calibration (`bench/calibrate.sh`)
 
@@ -314,13 +391,23 @@ git submodule update --init --depth 1 third_party/cutlass   # login node: needs 
 # On the GPU node (e.g. srun --gres=gpu:1 --exclusive --pty bash):
 bench/preflight.sh                       # checks toolchain, cuTENSOR, GPU, NVML, sudo, quiet; says what to fix
 export CUTENSOR_ROOT=/path/to/cutensor   # only if `module load cutensor` does not make it findable (>= 2.4)
+# optional: the GEMMul8 baseline (the pinned commit, bench/GEMMUL8_PIN; clone it on a login node)
+git clone https://github.com/RIKEN-RCCS/GEMMul8.git ../gemmul8-src && git -C ../gemmul8-src checkout $(awk '!/^#/{print $2; exit}' bench/GEMMUL8_PIN)
+bench/build_gemmul8.sh ../gemmul8-src 90 $HOME/gemmul8-sm90   # 90 = H100/H200, 120 = RTX PRO 6000 Blackwell, 89 = RTX 4090
+export GEMMUL8_DIR=$HOME/gemmul8-sm90    # printed by the script's last line
 bench/build.sh                           # detects the GPU architecture (120 on RTX PRO 6000 Blackwell)
 bench/run_metrics.sh $HOME/imd-metrics/$(hostname)-$(date +%Y%m%d)
 ```
 
 - `bench/run_metrics.sh <outdir>` builds if needed, then calibrates the GPU (see "Calibration"), runs the
-  throughput/accuracy sweep, the cuTENSOR native/emulated baselines (if built with cuTENSOR) and the
-  energy sweep. The output directory must be outside the repository.
+  throughput/accuracy sweep, the cuTENSOR native/emulated baselines (if built with cuTENSOR), the
+  comparison sweeps of Test 4 (`compare`, `compare_energy`; the baselines that are not built in record
+  errors) and the energy sweep. The output directory must be outside the repository.
+- **Toolchain for the full comparison:** the cuBLAS FP64 emulation baseline needs a CUDA 13 cuBLAS, and
+  cuTENSOR's INT8 emulation is documented to need a recent CUDA too (nvcc, cuBLAS and cuTENSOR from a CUDA
+  13 install, e.g. the conda env named by `IMMERDINK_ENV`): on CUDA 12.x `emu` records "needs CUDA 13
+  cuBLAS" and `cutensor-emu` can fall back to native FP64 silently (the engaged check tells). The GEMMul8
+  build needs the same nvcc, no GPU.
 - **Clock lock (recommended, needs root):** the calibration prints the exact command
   (`sudo nvidia-smi -lgc <f>,<f>`, a frequency the card sustains under its power cap); run it, start again,
   and undo with `-rgc` afterwards. With passwordless sudo, `LOCK_CLOCKS=auto bench/run_metrics.sh <outdir>` does
@@ -329,7 +416,8 @@ bench/run_metrics.sh $HOME/imd-metrics/$(hostname)-$(date +%Y%m%d)
   already gives you the GPU exclusively, `IMMERDINK_GPU_LOCK=none` skips only the shared advisory lock.
   If the quiet check blocks on harmless node daemons, relax it (`QUIET_LOAD`, `QUIET_CPU`,
   `QUIET_GPU_IGNORE`, see `tools/quiet_check.sh`); never edit it out.
-- `SWEEPS="imd energy"` (any of `imd baseline energy`) selects sweeps; `CALIBRATE=0` skips the calibration; `CASES='sq8192|t_cc' bench/run_sweep.sh
+- `SWEEPS="imd energy"` (any of `imd baseline compare compare_energy energy`; the default is all five, in
+  that order) selects sweeps; `CALIBRATE=0` skips the calibration; `CASES='sq8192|t_cc' bench/run_sweep.sh
   bench/sweep_energy.txt out.jsonl` runs a subset. `CMAKE_CUDA_ARCHITECTURES=<n>` overrides the
   detected architecture (use a fresh `IMMERDINK_BENCH_BUILD` directory when changing it).
 - **Check the accuracy before believing the speed:** the library's kernels were developed on sm_89, so on a
