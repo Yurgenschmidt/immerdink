@@ -70,6 +70,25 @@ def main():
     idle = {"sm": first["sm"], "sm_max": first["sm_max"], "temp": first["temp"], "power": first["power"],
             "pstate": first["pstate"], "appclk_reason": first["appclk"]}
 
+    # The load detector below is "utilization >= 80 %": it cannot tell our load from someone else's. So first make
+    # sure nobody else is on the GPU, or calibration would measure a foreign workload (and report its clock/power
+    # as ours while our own runner waits at the quiet gate).
+    pre = []
+    for _ in range(6):
+        t = sample(gid)
+        if t is not None:
+            pre.append(t["util"])
+        time.sleep(0.5)
+    busy = sum(pre) / len(pre) if pre else 0.0
+    if busy >= 5.0:
+        msg = (f"calibrate: GPU {gid} is already busy before our load (utilization {busy:.0f} %, idle clock "
+               f"{idle['sm']:.0f} MHz, {idle['pstate']}): another process is using it (shared GPU?). "
+               "Calibration would measure that workload, not ours; not calibrating.")
+        print(msg, file=sys.stderr, flush=True)
+        with open(os.path.join(a.out, "calibration.json"), "w") as fh:
+            json.dump({"valid": False, "gpu_busy_before_load_pct": busy, "idle": idle, "reason": msg}, fh, indent=2)
+        return 5
+
     cmd = [a.runner, a.bench, "--name", "calibrate", "--spec", "ik,jk->ij", "--ext", "i=4096,j=4096,k=4096",
            "--methods", "imd", "--N", "14", "--reps", "10000000", "--warmup", "2", "--max-seconds",
            str(a.max_seconds + 600), "--phase-reps", "0", "--samples", "16", "--out", "/dev/null"]

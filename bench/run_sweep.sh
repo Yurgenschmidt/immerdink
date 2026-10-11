@@ -31,7 +31,7 @@ echo "sweep $sweep -> $out (commit $commit, env $BENCH_ENV)"
 failed=()
 
 while IFS='|' read -r name spec ext methods Ns extra; do
-  name="$(echo "$name" | xargs)"
+  name="${name#"${name%%[![:space:]]*}"}"; name="${name%"${name##*[![:space:]]}"}"   # trim (xargs chokes on quotes in comments)
   case "$name" in ''|'#'*) continue ;; esac
   if [ -n "${CASES:-}" ] && ! echo "$name" | grep -Eq "$CASES"; then continue; fi
   args=(--name "$name" --spec "$(echo "$spec" | xargs)" --ext "$(echo "$ext" | xargs)"

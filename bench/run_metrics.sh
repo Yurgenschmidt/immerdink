@@ -81,6 +81,13 @@ if [ "${CALIBRATE:-1}" != 0 ] && command -v python3 >/dev/null; then
   "$here/calibrate.sh" --out "$pre" 2>&1 | tee "$outdir/calibration.out"
   crc=${PIPESTATUS[0]}
   [ "$crc" = 3 ] && { echo "machine never got quiet; stopping" >&2; exit 3; }
+  if [ "$crc" = 5 ]; then
+    if [ "${QUIET_MODE:-gate}" = record ]; then
+      echo "WARNING: the GPU is busy with another process; QUIET_MODE=record: continuing, the numbers will be contaminated" >&2
+    else
+      echo "the GPU is busy with another process (shared GPU?); stopping (QUIET_MODE=record continues anyway, contaminated)" >&2; exit 3
+    fi
+  fi
   if [ "${LOCK_CLOCKS:-}" = auto ] && [ -s "$pre/calibration.json" ]; then
     lock_mhz="$(jget "$pre/calibration.json" 'd.get("recommended_lock_mhz") if "lock_command" in d else ""')"
     if [ -n "$lock_mhz" ]; then
