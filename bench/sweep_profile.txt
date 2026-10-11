@@ -43,3 +43,7 @@ sq8192 | cutensor-emu  | -
 sq8192 | dgemm         | -
 t_df   | cutensor      | -
 t_df   | cutensor-emu  | -
+# does the cuBLAS emulation engage at the large size and on a batched case? (the identical-C check of bench/summarize.py
+# needs a dgemm record in the same process; here the nsys INT8-kernel check, engaged_int8, answers it)
+sq8192 | emu | fix55
+s_batch | emu | fix55

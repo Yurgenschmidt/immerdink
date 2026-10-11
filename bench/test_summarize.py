@@ -61,6 +61,29 @@ out = render(recs)
 check("80" in out and "imd / best emulator" in out, "comparison table renders")
 check("1.60×" in out, "immerdink 80 over the best eligible emulator (GEMMul8 fast, 50) is 1.60×")
 
+# --- cuBLAS emulation that fell back to native (C hash equal to DGEMM's) -------------------------
+recs3 = [
+    rec("f", "dgemm", "CUBLAS_COMPUTE_64F_PEDANTIC", tf=50, ms=1.0, e=4e-16, c_hash="aa"),
+    rec("f", "imd", "RN g=N", N=14, tf=40, e=1e-16, c_hash="ii"),
+    rec("f", "emu", "fix55", N=55, tf=48, e=4e-16, c_hash="aa"),     # same C as DGEMM: did not emulate
+    rec("f", "emu", "dyn", N=0, tf=30, e=2e-17, c_hash="dd"),          # different C: counted
+    rec("g", "dgemm", "CUBLAS_COMPUTE_64F_PEDANTIC", tf=50, ms=1.0, e=4e-16, c_hash="aa"),
+    rec("g", "imd", "RN g=N", N=14, tf=40, e=1e-16, c_hash="ii"),
+    rec("g", "emu", "fix55", N=55, tf=48, e=4e-16, c_hash="aa"),
+    rec("h", "dgemm", "CUBLAS_COMPUTE_64F_PEDANTIC", tf=50, ms=1.0, e=4e-16),
+    rec("h", "emu", "fix55", N=55, tf=48, e=4e-16),                    # no hashes: stays counted
+]
+f3 = S.case_families([r for r in recs3 if r["case"] == "f"])
+check(f3["emu-fixed"][0].get("native_fallback") is True and not f3["emu-dyn"][0].get("native_fallback"),
+      "emu record with the DGEMM record's c_hash is flagged native_fallback")
+_, _, b3 = S.dgemm_level(f3, "tflops_eq")
+check("emu-fixed" not in b3 and b3["emu-dyn"]["variant"] == "dyn", "fallback emu record is not a candidate for the best emulator")
+out3 = render(recs3)
+check("not engaged (1 of 1 configurations = native C)" in out3, "all-fallback emu family is shown as not engaged")
+check("1.33×" in out3, "case f: imd 40 over the only real emulator (dyn 30) is 1.33x")
+f3h = S.case_families([r for r in recs3 if r["case"] == "h"])
+check(not f3h["emu-fixed"][0].get("native_fallback"), "no c_hash: not flagged")
+
 # --- perm+ records win over the bare GEMM record ---------------------------------------------------
 recs2 = [
     rec("t", "dgemm", "CUBLAS_COMPUTE_64F_PEDANTIC", tf=1.5, e=3e-16, layout="gemm-view (operands pre-permuted)"),

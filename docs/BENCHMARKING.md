@@ -152,8 +152,11 @@ tools/calibrate.sh [-o my_gpu.calib] [--validate]
    - it records the conditions, and never bypasses the gate.
 4. **Warm-up and retries** (`bench/warm_run.sh`, used by the sweep and A/B scripts):
    - a fixed 3 s dense warm-up in the same lock hold (`BENCH_WARMUP_S`);
-   - up to 3 attempts while the spread is > 5 % (`BENCH_RETRIES`, `BENCH_MAX_SPREAD`);
-   - records get `attempts` and `contaminated`, and a `clock_state` line follows each case.
+   - up to 3 attempts (`BENCH_RETRIES`) while more than 10 % of the case's records (`BENCH_MAX_BAD_FRAC`, 0.1)
+     have a spread above 5 % (`BENCH_MAX_SPREAD`); the attempt kept has the most ok records, then the fewest
+     noisy ones (`bench/warm_run_pick.py`);
+   - records get `attempts` and `contaminated` (the record's own spread above the limit, or every record when the
+     kept attempt still has too many noisy ones), and a `clock_state` line follows each case.
      In a clean bench-mode session, `contaminated` on tiny shapes usually just means jitter
      above 5 %.
 5. **Clock locking**, for publication-grade numbers: `sudo nvidia-smi -lgc <f>,<f>` at a
@@ -240,7 +243,8 @@ stream, at least 3 and at most 10 repetitions, capped at 15 s per method (6 s fo
 median is reported with min, max and the spread `(max − min)/median`. Then 5 profiled calls give
 the per-phase times (K0 vec, K1 scale, K2/K3 pack, KL, K4 INT8 GEMM, K5 CRT) against the
 memory-model lower bounds. Before each case: a 3 s dense warm-up in the same lock hold, and up to 3
-attempts while the spread exceeds 5 % (records get `attempts` and `contaminated`).
+attempts while more than 10 % of the case's records have a spread above 5 % (records get `attempts` and
+`contaminated`; see "Getting clean numbers" for the exact rule).
 
 Reported: median time, `TFLOPS-eq = 2·m·n·k·b / median`, spread, both error metrics, workspace
 bytes, phase times, and per case a clock-state line after the warm-up (SM MHz, power, temperature,
@@ -349,6 +353,13 @@ results are comparable with them):
   identical-results test (`identical_to_native`), with `c_hash` as the second source. Identical = not
   engaged; different = "likely engaged" only with a different time or error too. The decisive
   confirmation is the Nsight Systems kernel list of the `cutensor-emu` run (INT8 tensor-core kernels).
+- *Is the cuBLAS emulation real?* The `emu` method sets the EAGER strategy ("emulate whenever possible"); where
+  cuBLAS does not emulate (device, shape, workspace) it presumably runs native FP64 without an error (not
+  verified on any card). `bench/summarize.py` compares the `c_hash` of every `emu` record with the `dgemm` and
+  `cutensor` records of the case: an equal hash means the emulation did not run, the record is marked
+  `native_fallback`, cannot be the best emulator, and the table shows "not engaged" (the energy records carry
+  no hash, so this check applies to the timing tables only). A different C does not prove that it ran: the
+  Nsight Systems run of `emu` (`engaged_int8`) is the decisive check (`bench/sweep_profile.txt`).
 
 **What is not the same as the evaluation workspace's campaigns.** The methods of a case run one after the
 other in the process, not interleaved round-robin as `eval_bench`'s `pareto` method does: all see the same
@@ -372,13 +383,13 @@ runs it last (`SWEEPS` element `profile`; alone: `bench/profile_nsys.sh <outdir>
 `SWEEPS=profile bench/run_metrics.sh <outdir>`). Each line of `bench/sweep_profile.txt` is one short
 `imd_bench` run (5 repetitions after 2 warm-up calls, 4096 error samples, one method and one N or variant)
 under `nsys profile -t cuda` (CUDA trace only: no CPU sampling, so no `perf_event_paranoid` requirement), started
-through `tools/run_bench.sh` (quiet gate, shared GPU lock). Default list (about 35 runs, a few seconds each plus
+through `tools/run_bench.sh` (quiet gate, shared GPU lock). Default list (33 runs, a few seconds each plus
 nsys start-up and export): immerdink N = 14 and N = 8 on `sq4096`, `sq8192`, `t_cc`, `t_df`, `s_cc16`,
 `r_lowk`; cuTENSOR native, cuTENSOR emulated (`cutensor-emu`), cuBLAS DGEMM, cuBLAS emulation (`dyn`,
 `fix55`) and GEMMul8 (fast and accurate, N = 14) on `sq4096` (a plain GEMM) and `t_cc` (a permuted
 contraction: the matrix-only methods run as `perm+<method>`); `cutensor`, `cutensor-emu`, `dgemm` on
-`sq8192` and `cutensor`, `cutensor-emu` on `t_df`. `PROFILE_TAGS='<regex>'` selects runs by tag, `PROFILE_LIST`
-another list.
+`sq8192` and `cutensor`, `cutensor-emu` on `t_df`; cuBLAS emulation `fix55` on `sq8192` and on the batched
+`s_batch`. `PROFILE_TAGS='<regex>'` selects runs by tag, `PROFILE_LIST` another list.
 
 Output in `<outdir>/profile/` (and `<outdir>/profile.md`, a table of all runs):
 - `index.json`: `[{tag, case, method, N, variant, nsys_rep, summary, engaged_int8}]` (paths relative to `profile/`;

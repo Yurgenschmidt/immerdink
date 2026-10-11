@@ -342,7 +342,22 @@ def case_families(rs):
     for f, lst in out.items():
         if any(str(r["method"]).startswith("perm+") for r in lst):
             out[f] = [r for r in lst if not str(r.get("layout", "")).startswith("gemm-view")]
+    mark_native_fallback(out)
     return out
+
+
+def mark_native_fallback(fams):
+    """Flag (r["native_fallback"] = True) the cuBLAS emulation records whose whole-C hash equals one of the
+    native records' of the case (cuBLAS DGEMM, cuTENSOR native). The bench sets CUBLAS_EMULATION_STRATEGY_EAGER
+    ("emulate whenever possible"); where cuBLAS does not emulate (device, shape, workspace) the call
+    presumably runs native FP64 without an error, and a bit-identical C is proof that the emulation did not run
+    (a different C does not prove that it did). Such a record is not an emulator result: dgemm_level skips it,
+    so it cannot enter "imd / best emulator". Records without a c_hash (older results) stay unflagged."""
+    native = {r["c_hash"] for f in ("dgemm", "cutensor") for r in fams.get(f, []) if r.get("c_hash")}
+    for f in ("emu-fixed", "emu-dyn"):
+        for r in fams.get(f, []):
+            if r.get("c_hash") and r["c_hash"] in native:
+                r["native_fallback"] = True
 
 
 def dgemm_level(fams, key):
@@ -360,7 +375,7 @@ def dgemm_level(fams, key):
             cand = lst
         else:
             cand = [r for r in lst if ref is not None and r.get("max_normerr") is not None
-                    and r["max_normerr"] <= ref and not r.get("nonfinite")]
+                    and r["max_normerr"] <= ref and not r.get("nonfinite") and not r.get("native_fallback")]
         cand = [r for r in cand if r.get(key) is not None]
         if cand:
             best[f] = max(cand, key=lambda r: r[key])
@@ -392,8 +407,8 @@ def compare_tables(recs, energy=False):
 
     print(f"Per method, the best configuration at DGEMM-level accuracy (max normwise error at or below the "
           f"cuBLAS DGEMM record's on the same inputs), {unit} with the {'energy per call' if energy else 'time'} "
-          "and the configuration." + ("" if energy else " `*`: the case's retries did not get the spread below the "
-          "limit (record flagged contaminated).") + " \"none\": the method ran but no configuration reached "
+          "and the configuration." + ("" if energy else " `*`: the record's own spread is above the limit, or the "
+          "case's retries did not get its share of noisy records below the limit (record flagged contaminated).") + " \"none\": the method ran but no configuration reached "
           "DGEMM-level accuracy.\n")
     print("| case | m×n×k | DGEMM error | " + " | ".join(n for _, n in FAMILIES) +
           " | imd / best emulator | imd / DGEMM | imd / cuTENSOR |")
@@ -417,7 +432,9 @@ def compare_tables(recs, energy=False):
             if f not in fams:
                 cells.append("—")
             elif f not in best:
-                cells.append("none")
+                fb = [r for r in fams[f] if r.get("native_fallback")]
+                cells.append(f"not engaged ({len(fb)} of {len(fams[f])} configurations = native C)"
+                             if fb and f.startswith("emu-") else "none")
             elif f == "cutensor-emu":
                 cells.append(cell(best[f], f, {"no": " (not engaged)", "maybe": " (engagement unconfirmed)"}.get(verdict[0], " (likely engaged)")))
             else:
@@ -469,6 +486,8 @@ def config_table(recs, energy=False):
                 ok = ref is not None and r.get("max_normerr") is not None and r["max_normerr"] <= ref \
                     and not r.get("nonfinite")
                 lvl = "native reference" if f in ("dgemm", "cutensor") else ("yes" if ok else "no")
+                if r.get("native_fallback"):
+                    lvl = "no (not engaged: C identical to native)"
                 v = r.get(key)
                 j = r.get("energy_j_per_call")
                 tcell = f"{j:.3g}" if energy and j is not None else (ms(r["median_s"]) if r.get("median_s") else "—")
