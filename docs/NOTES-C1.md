@@ -5809,6 +5809,12 @@ the registered calibration of the M-d2 driver (`bench/accuracy/md2_time.py`, REG
 (the recorded M-d2 pass of §5.12 stands on its calibration); the marks `[M, model-only, outside hold-out]` are unchanged; COLD predictions of small warm calls are about 20 %
 high (see above), which is the end of the KL A / K4 cancellation, not a new error source.
 
+**M-d2 driver re-registered (2026-10-12).** `bench/accuracy/md2_time.py`: REGISTERED_CALIB is the shipped file's sha256 (`67791a4a…`); the bars are `predict`'s on it, rounded to 3 decimals:
+PPL view 0.773, DF 0.665, 4096³ 0.674 (bands [0.6571, 0.8], [0.5653, 0.7647], [0.5729, 0.7751]; p90 15 %), the Jacobi view (reported) 0.809, whose levels are now all in the
+100 µs – 1 ms class (p90 20 %, was 30 %). They were derived after the recorded pass of §5.12 (made on the previous calibration, bars 0.750 / 0.664 / 0.673 / 0.786) and are not used to
+re-score it; `judge` of this driver refuses the old `md2.jsonl` (calibration not the registered one), which stays the record of that pass. `selftest` 102 of 102, `predict` "bars reproduced".
+A new M-d2 run, if wanted, is judged by these bars, with the usual ordering rules and a fresh records file.
+
 The two-locked-clock pass needs the sudo clock lock (docs/BENCHMARKING.md): Eric's call, not run by an agent.
 
 ---

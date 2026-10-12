@@ -83,10 +83,11 @@ The protocol (pre-registered before any M-d2 measurement):
   Band: r_bar x (1 -/+ p90), p90 = DESIGN §6c.5's 90th-percentile target of the call class
   (>= 1 ms: 15 %; every level of every gated system is predicted >= 1 ms), and r <= 0.8.
   A system whose levels' predicted (DEFAULT/COLD) calls span classes takes the largest p90
-  among them (the Jacobi view: < 100 us at N = 6, 8, 100 us - 1 ms at 9-14, so 30 %).
-  r_bar = the registered bar (SYSTEMS' "bar": 0.750 / 0.664 / 0.673, NOTES-C1 §4.3, M-b;
+  among them (the Jacobi view: 100 us - 1 ms at every level on the kl.chain calibration, so 20 %;
+  < 100 us at N = 6, 8 and 30 % on the previous one).
+  r_bar = the registered bar (SYSTEMS' "bar": 0.773 / 0.665 / 0.674, NOTES-C1 §4.3, M-b;
   [M] shipped calibration, DEFAULT regime, COLD, GENERATE, g = N). The Jacobi view's band
-  (predicted 0.786, < 100 µs class, p90 30 %) is reported only.
+  (predicted 0.809, 100 µs - 1 ms class, p90 20 %) is reported only.
 - Admissibility, re-runs and the decision (pre-registered with the reviewer's verdict,
   NOTES-C1 §5.10 MD2-3, MD2-6; `selftest` checks them). Per (system, data):
   (a) a record is INADMISSIBLE, neither PASS nor FAIL, when contaminated is not false (the
@@ -163,14 +164,14 @@ ORDER = ("S14", "F14", "S9", "F9", "F8", "P14", "PF14")
 # "kn", else "nk"), registered bar (None: reported only), the class's p90 (DESIGN §6c.5)
 SYSTEMS = {
     "ppl": dict(spec="ijcd,abcd->ijab", ext=dict(i=10, j=10, a=96, b=96, c=96, d=96),
-                inv="B", mnk=(100, 9216, 9216), b_layout="nk", bar=0.750, p90=0.15),
+                inv="B", mnk=(100, 9216, 9216), b_layout="nk", bar=0.773, p90=0.15),
     "df": dict(spec="acQ,bdQ->acbd", ext=dict(a=64, b=64, c=64, d=64, Q=2032),
-               inv="B", mnk=(4096, 4096, 2032), b_layout="nk", bar=0.664, p90=0.15),
+               inv="B", mnk=(4096, 4096, 2032), b_layout="nk", bar=0.665, p90=0.15),
     "sq4096": dict(spec="ik,kj->ij", ext=dict(i=4096, k=4096, j=4096),
-                   inv="A", mnk=(4096, 4096, 4096), b_layout="kn", bar=0.673, p90=0.15),
+                   inv="A", mnk=(4096, 4096, 4096), b_layout="kn", bar=0.674, p90=0.15),
     "jacobi": dict(spec="abcd,cdij->abij", ext=dict(a=40, b=40, c=40, d=40, i=10, j=10),
-                   inv="A", mnk=(1600, 100, 1600), b_layout="kn", bar=None, predicted=0.786,
-                   p90=0.30),
+                   inv="A", mnk=(1600, 100, 1600), b_layout="kn", bar=None, predicted=0.809,
+                   p90=0.20),
     # tooling checks only, not M-d2 systems: a square with A invariant, and a small PPL-like
     # tensor contraction with B invariant (GEMM view 100 x 576 x 576)
     "smoke": dict(spec="ik,kj->ij", ext=dict(i=512, k=512, j=512),
@@ -183,9 +184,12 @@ GATED = ("ppl", "df", "sq4096")
 DATA = ("normal", "decay_opp")      # both gated (MD2-3)
 CAP = 0.8
 CLASSES = ((1e-3, ">= 1 ms", 0.15), (1e-4, "100 us - 1 ms", 0.20), (0.0, "< 100 us", 0.30))
-# The calibration the bars were derived with (src/host/calib/rtx4090_sm89.calib, shipped
-# since v1.18; NOTES-C1 §5.9 MC-1: unchanged after M-c).
-REGISTERED_CALIB = "d31f62ca5e8d8893bed427f5a6e1a7905e1acf008ab1f4743cc2dcbb2a60e933"
+# The calibration the bars were derived with (src/host/calib/rtx4090_sm89.calib). Re-registered
+# 2026-10-12 for the kl.chain calibration (DESIGN §6c.10, NOTES-C1 §5.13): the bars below
+# (0.773 / 0.665 / 0.674, the Jacobi view 0.809) are `predict`'s on it, derived after the
+# recorded M-d2 pass of NOTES-C1 §5.12 (made on the previous file, sha256 d31f62ca…, bars
+# 0.750 / 0.664 / 0.673 / 0.786) and not used to re-score it; a new M-d2 run is judged by these.
+REGISTERED_CALIB = "67791a4a857aa78a73a00c5fd52a85f3ec8f6a9f7fda34b87ca53a09b167e8f9"
 CALIB_FILE = os.path.join(ROOT, "src", "host", "calib", "rtx4090_sm89.calib")
 # The bars' configuration at every level N (with num_moduli = g = N; MD2-7)
 BAR_CONFIG = dict(vec_mode="GENERATE", packed="NONE", rounding="RN", mode="EMULATE")
@@ -1095,7 +1099,7 @@ def cmd_selftest(a):
 
     # the registered constants, pinned as literals (a change to any is a re-registration)
     check("bars and p90", [(SYSTEMS[s]["bar"], SYSTEMS[s]["p90"]) for s in GATED],
-          [(0.750, 0.15), (0.664, 0.15), (0.673, 0.15)])
+          [(0.773, 0.15), (0.665, 0.15), (0.674, 0.15)])
     check("protocol constants", (LEVELS, MAX_SPREAD, ATTEMPTS, WARMUP_S, REPS, PHI, SEED,
                                  PRIMER_MIB, MAX_RECORDS, CAP, DATA, GATED, MD2_SYSTEMS),
           ((6, 8, 9, 10, 14), 5.0, 2, 3.0, 15, 0.5, 1, 1024, 2, 0.8, ("normal", "decay_opp"),
@@ -1119,7 +1123,7 @@ def cmd_selftest(a):
                                               "normal"), "OUTSIDE")
     # one data set outside fails the system and M-d2
     recs = [r for s in ("ppl", "df") for r in both(s, SYSTEMS[s]["bar"], SYSTEMS[s]["bar"])]
-    recs += both("sq4096", 0.673, 0.80)
+    recs += both("sq4096", 0.674, 0.80)
     _, _, systems, md2 = decide(recs)
     check("decay_opp outside: sq4096", systems["sq4096"], "FAIL")
     check("decay_opp outside: M-d2", md2, "FAIL")
@@ -1127,48 +1131,48 @@ def cmd_selftest(a):
           decide([rec("df", "normal", 0.9)])[2]["df"], "FAIL")
     # band edges: relative band, cap 0.8 on the gated three; every band pinned as literals
     b = band("ppl")
-    check("ppl band", (b["lo"], b["hi"]), (0.750 * (1 - 0.15), 0.8))
+    check("ppl band", (b["lo"], b["hi"]), (0.773 * (1 - 0.15), 0.8))
     for r_, want in ((b["lo"], "INSIDE"), (math.nextafter(b["lo"], 0), "OUTSIDE"),
                      (0.8, "INSIDE"), (math.nextafter(0.8, 1), "OUTSIDE")):
         check(f"ppl at {r_!r}", outcome([rec("ppl", "normal", r_)], "ppl", "normal"), want)
     b = band("df")
-    check("df band", (b["lo"], b["hi"]), (0.664 * (1 - 0.15), 0.664 * (1 + 0.15)))
+    check("df band", (b["lo"], b["hi"]), (0.665 * (1 - 0.15), 0.665 * (1 + 0.15)))
     b = band("sq4096")
-    check("sq4096 band", (b["lo"], b["hi"]), (0.673 * (1 - 0.15), 0.673 * (1 + 0.15)))
+    check("sq4096 band", (b["lo"], b["hi"]), (0.674 * (1 - 0.15), 0.674 * (1 + 0.15)))
     check("the bands, rounded", [tuple(round(band(s)[k], 4) for k in ("lo", "hi"))
                                  for s in GATED],
-          [(0.6375, 0.8), (0.5644, 0.7636), (0.5721, 0.774)])
+          [(0.6571, 0.8), (0.5653, 0.7647), (0.5729, 0.7751)])
     b = band("jacobi")
     check("jacobi band (reported)", (b["lo"], b["hi"], b["gated"]),
-          (0.786 * (1 - 0.30), 0.786 * (1 + 0.30), False))
+          (0.809 * (1 - 0.20), 0.809 * (1 + 0.20), False))
     # rule (a): contaminated or not bit-exact is inadmissible, never PASS or FAIL
-    bad = rec("df", "normal", 0.664, contaminated=True)
+    bad = rec("df", "normal", 0.665, contaminated=True)
     check("contaminated inside alone", outcome([bad], "df", "normal"), "INCOMPLETE")
     check("contaminated outside alone", outcome([rec("df", "normal", 0.9, contaminated=True)],
                                                 "df", "normal"), "INCOMPLETE")
-    check("contaminated, then inside", outcome([bad, rec("df", "normal", 0.664)], "df",
+    check("contaminated, then inside", outcome([bad, rec("df", "normal", 0.665)], "df",
                                                "normal"), "INSIDE")
     check("contaminated, then outside", outcome([bad, rec("df", "normal", 0.9)], "df",
                                                 "normal"), "OUTSIDE")
-    check("contaminated missing", outcome([rec("df", "normal", 0.664, contaminated=None)], "df",
+    check("contaminated missing", outcome([rec("df", "normal", 0.665, contaminated=None)], "df",
                                           "normal"), "INCOMPLETE")
-    nobe = rec("df", "normal", 0.664, bitexact_packed_vs_inline={"6": True})
+    nobe = rec("df", "normal", 0.665, bitexact_packed_vs_inline={"6": True})
     check("bit-exact check missing: inadmissible", outcome([nobe], "df", "normal"), "INCOMPLETE")
     check("bit-exact check missing: not a defect", bitexact_failed(nobe), [])
     # a bit-exact value that is not literally true is inadmissible, and not a defect
     for v in (None, 0, 1, "yes", "true"):
-        r_ = rec("df", "normal", 0.664,
+        r_ = rec("df", "normal", 0.665,
                  bitexact_packed_vs_inline={str(N): True for N in LEVELS} | {"10": v})
         check(f"bit-exact {v!r} at a level: inadmissible", outcome([r_], "df", "normal"),
               "INCOMPLETE")
         check(f"bit-exact {v!r} at a level: not STOPPED", decide(all_pass() + [r_])[3], "PASS")
     # rule (c): the first admissible record decides; a later one never replaces it
-    check("outside, then inside", outcome([rec("df", "normal", 0.9), rec("df", "normal", 0.664)],
+    check("outside, then inside", outcome([rec("df", "normal", 0.9), rec("df", "normal", 0.665)],
                                           "df", "normal"), "OUTSIDE")
-    check("inside, then outside", outcome([rec("df", "normal", 0.664), rec("df", "normal", 0.9)],
+    check("inside, then outside", outcome([rec("df", "normal", 0.665), rec("df", "normal", 0.9)],
                                           "df", "normal"), "INSIDE")
     # rule (b)/(d): one re-run; both inadmissible -> INCOMPLETE; a third is excess
-    recs = [bad, bad, rec("df", "normal", 0.664)]
+    recs = [bad, bad, rec("df", "normal", 0.665)]
     roles, pairs, _, _ = decide(recs)
     check("two inadmissible, then a third", pairs[("df", "normal")]["outcome"], "INCOMPLETE")
     check("two inadmissible: the cause", pairs[("df", "normal")].get("why", "").startswith("both"), True)
@@ -1180,9 +1184,9 @@ def cmd_selftest(a):
     # a bit-exact failure on any record in the file stops M-d2, whatever else holds
     nbe = {str(N): N != 10 for N in LEVELS}
     check("bit-exact failure (Jacobi view)", decide(all_pass() + [
-        rec("jacobi", "normal", 0.786, bitexact_packed_vs_inline=nbe)])[3], "STOPPED")
+        rec("jacobi", "normal", 0.809, bitexact_packed_vs_inline=nbe)])[3], "STOPPED")
     check("bit-exact failure (excess record)", decide(all_pass() + [
-        rec("df", "normal", 0.664), rec("df", "normal", 0.664, bitexact_packed_vs_inline=nbe)
+        rec("df", "normal", 0.665), rec("df", "normal", 0.665, bitexact_packed_vs_inline=nbe)
     ])[3], "STOPPED")
     check("bit-exact failure on a smoke record", decide(all_pass() + [
         rec("smoke", "normal", 0.86, bitexact_packed_vs_inline=nbe)])[3], "STOPPED")
@@ -1190,9 +1194,9 @@ def cmd_selftest(a):
                                                                bitexact_packed_vs_inline=nbe)),
           [10])
     check("bit-exact failure: inadmissible", outcome(
-        [rec("df", "normal", 0.664, bitexact_packed_vs_inline=nbe)], "df", "normal"),
+        [rec("df", "normal", 0.665, bitexact_packed_vs_inline=nbe)], "df", "normal"),
         "INCOMPLETE")
-    why = decide([rec("df", "normal", 0.664, bitexact_packed_vs_inline=nbe)])[1][
+    why = decide([rec("df", "normal", 0.665, bitexact_packed_vs_inline=nbe)])[1][
         ("df", "normal")].get("why", "")
     check("STOPPED: the failing pair offers no re-run",
           (why.startswith("M-d2 STOPPED"), "one re-run allowed" in why), (True, False))
@@ -1211,7 +1215,7 @@ def cmd_selftest(a):
         [rec("ppl", "normal", 0.7, bitexact_packed_vs_inline={"6": None})], "df", "normal"), [])
     # provenance: a clean record passes; each departure is refused
     check("provenance: clean", provenance_problems(rec("ppl", "normal", 0.75), anc), [])
-    check("file: clean", file_problems(all_pass() + both("jacobi", 0.786, 0.786), anc), [])
+    check("file: clean", file_problems(all_pass() + both("jacobi", 0.809, 0.809), anc), [])
     lv = {str(N): dict(num_moduli=N, g=N) | BAR_CONFIG for N in LEVELS}
     for what, kw in (
             ("dirty", dict(dirty=True)), ("dirty unknown", dict(dirty=None)),
@@ -1252,7 +1256,7 @@ def cmd_selftest(a):
                      ("another host library", dict(host_lib_sha256="c" * 64)),
                      ("another host API", dict(host_api=12)),
                      ("no library recorded", dict(lib_sha256=None))):
-        recs = all_pass()[:-1] + [rec("sq4096", "decay_opp", 0.673, **kw)]
+        recs = all_pass()[:-1] + [rec("sq4096", "decay_opp", 0.674, **kw)]
         check(f"file refused: {what}", bool(file_problems(recs, anc)), True)
     check("file: a smoke record of another library is no M-d2 record",
           file_problems(all_pass() + [rec("smoke", "normal", 0.86, lib_sha256="c" * 64,
