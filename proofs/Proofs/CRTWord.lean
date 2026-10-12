@@ -68,7 +68,7 @@ theorem R_dvd_x : ∀ l ≤ N, R N p l ∣ x N p q W l
       dvd_add h1 ((R_succ_dvd_M l).mul_right _)
     rw [x_succ]
     split_ifs
-    · exact Nat.dvd_sub' h2 (R_dvd_P _)
+    · exact Nat.dvd_sub h2 (R_dvd_P _)
     · exact h2
 
 /-- `x_l ≤ P − R_l`. -/
@@ -115,7 +115,7 @@ theorem xp_ne_P (hp : ∀ l < N, 0 < p l)
   have hpl_x : p l ∣ x N p q W l := hpl_R.trans (R_dvd_x l hl.le)
   have hpl_P : p l ∣ P N p := by rw [P_eq_mul_M hl]; exact dvd_mul_right _ _
   have hMy : M N p l * y p q W l = P N p - x N p q W l := by unfold xp at h; omega
-  have hdvd : p l ∣ M N p l * y p q W l := by rw [hMy]; exact Nat.dvd_sub' hpl_P hpl_x
+  have hdvd : p l ∣ M N p l * y p q W l := by rw [hMy]; exact Nat.dvd_sub hpl_P hpl_x
   have hy : p l ∣ y p q W l := (coprime_M hcop hl).symm.dvd_of_dvd_mul_left hdvd
   have hy0 : y p q W l = 0 :=
     Nat.eq_zero_of_dvd_of_lt hy (Nat.mod_lt _ (hp l hl))
@@ -146,11 +146,10 @@ def toSigned (L w : ℕ) : ℤ := if w < 2 ^ (L - 1) then w else (w : ℤ) - 2 ^
 modulo `2^L`. -/
 def centerWord (L Pw H x : ℕ) : ℕ := if x ≤ H then x else (x + 2 ^ L - Pw) % 2 ^ L
 
-/-- **Centring on the word.** With `1 ≤ L`, `2P ≤ 2^L`, `2H + 1 ≤ P` and `x < P`: the word is
+/-- **Centring on the word.** With `1 ≤ L`, `2P ≤ 2^L` and `x < P` (any `H`): the word is
 `< 2^L`, its sign bit (`≥ 2^{L−1}`) is set exactly when the subtraction is taken (`H < x`, where
 the borrow-out of `x − P` is 1), and read as two's complement it is the centred value. -/
-theorem center_word {L Pw H x : ℕ} (hL : 1 ≤ L) (hw : 2 * Pw ≤ 2 ^ L) (hH : 2 * H + 1 ≤ Pw)
-    (hx : x < Pw) :
+theorem center_word {L Pw H x : ℕ} (hL : 1 ≤ L) (hw : 2 * Pw ≤ 2 ^ L) (hx : x < Pw) :
     centerWord L Pw H x < 2 ^ L ∧
       (2 ^ (L - 1) ≤ centerWord L Pw H x ↔ H < x) ∧
       toSigned L (centerWord L Pw H x) = if x ≤ H then (x : ℤ) else (x : ℤ) - Pw := by
@@ -159,16 +158,17 @@ theorem center_word {L Pw H x : ℕ} (hL : 1 ≤ L) (hw : 2 * Pw ≤ 2 ^ L) (hH 
     rw [← pow_succ']; congr 1; omega
   generalize 2 ^ (L - 1) = A at h2 ⊢
   by_cases hxH : x ≤ H
-  · simp only [hxH, if_true]
+  · simp only [hxH, ↓reduceIte]
     have : x < A := by omega
     refine ⟨by omega, by omega, ?_⟩
     simp [this]
-  · simp only [hxH, if_false]
+  · simp only [hxH, ↓reduceIte]
     have hlt : x + 2 ^ L - Pw < 2 ^ L := by omega
     rw [Nat.mod_eq_of_lt hlt]
     have hge : A ≤ x + 2 ^ L - Pw := by omega
     refine ⟨hlt, by omega, ?_⟩
-    rw [if_neg (by omega)]
+    have hnot : ¬ x + 2 ^ L - Pw < A := by omega
+    simp only [hnot, ↓reduceIte]
     have : ((x + 2 ^ L - Pw : ℕ) : ℤ) = (x : ℤ) + 2 ^ L - Pw := by
       have : Pw ≤ x + 2 ^ L := by omega
       push_cast [this]; ring
@@ -177,9 +177,9 @@ theorem center_word {L Pw H x : ℕ} (hL : 1 ≤ L) (hw : 2 * Pw ≤ 2 ^ L) (hH 
 /-- **DESIGN §3.6's centring, on the word.** The running CRT's final word, centred on an
 unsigned `L_w`-bit word and read back as two's complement, is `z`. -/
 theorem z_word (hp : ∀ l < N, 0 < p l) {Lw : ℕ} (hL : 1 ≤ Lw) (hw : 2 * P N p ≤ 2 ^ Lw)
-    {H : ℕ} (hH : 2 * H + 1 ≤ P N p) :
+    (H : ℕ) :
     toSigned Lw (centerWord Lw (P N p) H (x N p q W N)) = z N p q W H := by
-  rw [(center_word hL hw hH (x_lt_P hp N le_rfl)).2.2]
+  rw [(center_word (H := H) hL hw (x_lt_P hp N le_rfl)).2.2]
   unfold z; split_ifs <;> rfl
 
 /-! ### The peak is attained -/
@@ -221,9 +221,9 @@ theorem peak_attained (hp : ∀ l < N, 0 < p l)
   let W : ℕ → ℕ := fun j =>
     if j < l then t % p j else if j = l then (p l - 1) * M N p l % p l else 0
   refine ⟨W, fun j hj => ?_, ?_⟩
-  · simp only [W]; split_ifs
+  · simp only [W]; split_ifs with h1 h2
     · exact Nat.mod_lt _ (hp j hj)
-    · exact Nat.mod_lt _ (hp j hj)
+    · subst h2; exact Nat.mod_lt _ (hp _ hj)
     · exact hp j hj
   -- 1. x_l = t, by CRT: both are < P and congruent modulo every p_i
   have hRP := R_dvd_P (N := N) (p := p) l
@@ -238,13 +238,13 @@ theorem peak_attained (hp : ∀ l < N, 0 < p l)
       refine Int.natCast_modEq_iff.2 (hxs.trans ?_)
       rcases Nat.lt_or_ge i l with hil | hil
       · refine (prefix_sum_modEq hq hl.le hil).trans ?_
-        simp only [W, if_pos hil]; exact Nat.mod_modEq _ _
+        simp only [W, hil, ↓reduceIte]; exact Nat.mod_modEq _ _
       · have h1 : ∑ j ∈ range l, M N p j * y p q W j ≡ 0 [MOD p i] :=
           (Nat.modEq_zero_iff_dvd).2 (prefix_sum_dvd hil hi)
         have hpiR : p i ∣ R N p l :=
           Finset.dvd_prod_of_mem p (mem_Ico.2 ⟨hil, hi⟩)
         have hpiP : p i ∣ P N p := hpiR.trans hRP
-        have h2 : t ≡ 0 [MOD p i] := (Nat.modEq_zero_iff_dvd).2 (Nat.dvd_sub' hpiP hpiR)
+        have h2 : t ≡ 0 [MOD p i] := (Nat.modEq_zero_iff_dvd).2 (Nat.dvd_sub hpiP hpiR)
         exact h1.trans h2.symm
     have hdvd : (P N p : ℤ) ∣ (x N p q W l : ℤ) - t :=
       P_dvd_of_forall hcop fun i hi => (hcong i hi).symm.dvd
@@ -260,7 +260,7 @@ theorem peak_attained (hp : ∀ l < N, 0 < p l)
   have hy : y p q W l = p l - 1 := by
     have hpl := hp l hl
     have e : y p q W l = (q l * ((p l - 1) * M N p l % p l)) % p l := by
-      simp only [y, W, lt_irrefl, if_false, if_true]
+      simp only [y, W, lt_irrefl, ↓reduceIte]
     have hc : q l * ((p l - 1) * M N p l % p l) ≡ p l - 1 [MOD p l] :=
       calc q l * ((p l - 1) * M N p l % p l) ≡ q l * ((p l - 1) * M N p l) [MOD p l] :=
             Nat.ModEq.mul_left _ (Nat.mod_modEq _ _)

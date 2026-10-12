@@ -118,33 +118,32 @@ theorem chunk_sum_range {f : ℕ → ℤ} {lo hi K : ℤ} (hlo : lo ≤ 0) (hhi 
 (for `p = 256` the maximum is `2146435327`). -/
 theorem epilogue_range_v113 {p : ℕ} (hp : 0 < p) (hp256 : p ≤ 256) {pr : ℕ}
     (hpr : 0 < pr) (hpr256 : pr ≤ 256) {a' b' : ℕ → ℤ} {C : ℕ → Finset ℕ}
-    (hC : ∀ c, ((C c).card : ℤ) ≤ 131008) (c : ℕ) :
-    let acc : ℕ → ℤ := fun c => ∑ h ∈ C c, smod (a' h) pr * smod (b' h) pr
-    -2129666048 ≤ epi p acc c + acc (c + 1) ∧
+    (hC : ∀ c, ((C c).card : ℤ) ≤ 131008) {acc : ℕ → ℤ}
+    (hacc : ∀ c, acc c = ∑ h ∈ C c, smod (a' h) pr * smod (b' h) pr) (c : ℕ) :
+    (-2129666048 : ℤ) ≤ epi p acc c + acc (c + 1) ∧
       epi p acc c + acc (c + 1) ≤ (p - 1) + 2146435072 ∧
       (p - 1 : ℤ) + 2146435072 ≤ 2146435327 ∧ (2146435327 : ℤ) ≤ 2 ^ 31 - 1 ∧
       -(2 ^ 31 : ℤ) ≤ -2129666048 := by
-  intro acc
   have hp' : (0 : ℤ) < p := by exact_mod_cast hp
   have hp256' : (p : ℤ) ≤ 256 := by exact_mod_cast hp256
   have hW := epi_mem_range hp' acc c
-  have hacc := chunk_sum_range (lo := -(128 * 127)) (hi := 128 ^ 2) (by norm_num) (by norm_num)
+  have hsum := chunk_sum_range (lo := -(128 * 127)) (hi := 128 ^ 2) (by norm_num) (by norm_num)
     (hC (c + 1)) (f := fun h => smod (a' h) pr * smod (b' h) pr) fun h _ =>
       ⟨smod_mul_ge _ _ hpr hpr256 hpr hpr256,
         (abs_le.1 (smod_mul_abs_le _ _ hpr hpr256 hpr hpr256)).2⟩
-  simp only [acc] at hW ⊢
-  refine ⟨by linarith [hacc.1], by linarith [hacc.2], by linarith, by norm_num, by norm_num⟩
+  rw [hacc (c + 1)]
+  refine ⟨by linarith [hsum.1], by linarith [hsum.2], by linarith, by norm_num, by norm_num⟩
 
 /-! ### The capstone at the real moduli -/
 
-/-- **End-to-end exactness for the shipped design** (DESIGN §3.2–§3.6). For `1 ≤ N ≤ 20`
+/-- **End-to-end exactness for the shipped design** (DESIGN §3.2–§3.6). For `N ≤ 20`
 moduli of DESIGN §2, `H = ⌊(P−1)/2⌋`, `T = ⌊√H⌋`, quantized rows with `‖a'‖, ‖b'‖ ≤ T` (L1),
 SMod residues (§3.4), chunks of at most `K_c' = 131008` products accumulated in a saturating
 int32 (`A = 2³¹ − 1`) in any order, the modular carry (§3.5) and the running CRT (§3.6): the
 CRT output is exactly `Σ_h a'_h b'_h`. Its only remaining hypothesis on the constants is the
 choice of the multipliers `q_l` (any `M_l·q_l ≡ 1 (mod p_l)`; they exist by
 `exists_q_design`). -/
-theorem emulated_product_exact_design {N : ℕ} (hN1 : 1 ≤ N) (hN : N ≤ 20)
+theorem emulated_product_exact_design {N : ℕ} (hN : N ≤ 20)
     {q : ℕ → ℕ} (hq : ∀ j < N, M N pm j * q j ≡ 1 [MOD pm j])
     {k T : ℕ} {a' b' : ℕ → ℤ} (hT : T = Nat.sqrt ((P N pm - 1) / 2))
     (ha : ∑ h ∈ range k, a' h ^ 2 ≤ (T : ℤ) ^ 2) (hb : ∑ h ∈ range k, b' h ^ 2 ≤ (T : ℤ) ^ 2)

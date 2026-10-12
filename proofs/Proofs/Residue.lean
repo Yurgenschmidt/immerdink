@@ -83,7 +83,7 @@ theorem smod_mul_abs_le (x y : ℤ) {p p' : ℕ} (hp : 0 < p) (hp256 : p ≤ 256
 `r·s ≤ 128²` is `smod_mul_abs_le`). -/
 theorem int8_mul_ge {r s : ℤ} (hr : -128 ≤ r ∧ r ≤ 127) (hs : -128 ≤ s ∧ s ≤ 127) :
     -(128 * 127) ≤ r * s := by
-  rcases le_or_lt 0 r with h | h
+  rcases le_or_gt 0 r with h | h
   · nlinarith
   · nlinarith
 
@@ -225,7 +225,7 @@ theorem barrett_epilogue {p : ℕ} (hp : 0 < p) (hp256 : p ≤ 256) {v : ℤ}
   have hb31 : 2 ^ 31 ≤ bias := by
     have := Nat.div_add_mod (2 ^ 31 + p - 1) p
     have := Nat.mod_lt (2 ^ 31 + p - 1) hp
-    rw [hbias]; nlinarith
+    rw [hbias]; omega
   have hn0 : 0 ≤ v + (bias : ℤ) := by
     have : (2 ^ 31 : ℤ) ≤ bias := by exact_mod_cast hb31
     linarith
@@ -246,7 +246,7 @@ theorem barrett_epilogue {p : ℕ} (hp : 0 < p) (hp256 : p ≤ 256) {v : ℤ}
     have := Nat.div_add_mod n p; omega
   rw [hmod]
   push_cast
-  rw [Int.natCast_mod, hnv]
+  rw [hnv]
   -- (v + bias) mod p = v mod p since p ∣ bias
   have : ((bias : ℕ) : ℤ) = p * (((2 ^ 31 + p - 1) / p : ℕ) : ℤ) := by rw [hbias]; push_cast; ring
   rw [this, Int.add_mul_emod_self_left]
@@ -296,8 +296,8 @@ theorem emulated_product_exact_smod
     z N p q W H = ∑ h ∈ range k, a' h * b' h :=
   Exact.emulated_product_exact hp hcop hq hH hT ha hb
     (r := fun j h => smod (a' h) (p j)) (s := fun j h => smod (b' h) (p j))
-    (fun j _ h => smod_modEq _ _) (fun j _ h => smod_modEq _ _)
-    (fun j hj h => smod_mul_abs_le _ _ (hp j hj) (hp256 j hj) (hp j hj) (hp256 j hj))
+    (fun _ _ _ => smod_modEq _ _) (fun _ _ _ => smod_modEq _ _)
+    (fun j hj _ => smod_mul_abs_le _ _ (hp j hj) (hp256 j hj) (hp j hj) (hp256 j hj))
     hQK hn hK hdisj hcover hord
 
 end Immerdink.Residue

@@ -67,8 +67,8 @@ theorem shift_estimate {nA nB : ℕ} (hA : 0 < nA) (hB : 0 < nB) :
     let c : ℤ := ((nB.size : ℤ) - nA.size + 1) / 2
     (nA : ℝ) * 4 ^ (c - 1) ≤ nB ∧ (nB : ℝ) < nA * 4 ^ (c + 1) := by
   intro c
-  set a : ℤ := nA.size
-  set b : ℤ := nB.size
+  set a : ℤ := (nA.size : ℤ)
+  set b : ℤ := (nB.size : ℤ)
   have hc1 : 2 * c ≤ b - a + 1 := by omega
   have hc2 : b - a ≤ 2 * c := by omega
   have hA1 := two_pow_size_pred hA
@@ -95,12 +95,12 @@ theorem shift_estimate {nA nB : ℕ} (hA : 0 < nA) (hB : 0 < nB) :
 
 /-- **DESIGN §3.2, one compare.** If `c·S = A` and `R·2^F = B` are positive integers and `u` is
 the largest integer with `Rule c R S F u`, then `u = Rule(ĉ) ? ĉ : ĉ − 1` with
-`ĉ = ⌊(bitlen B − bitlen A + 1)/2⌋`. -/
+`ĉ = ⌊(bitlen B − bitlen A + 1)/2⌋` (stated as the two branches). -/
 theorem u_eq_estimate {c R : ℝ} {S : ℤ} {F : ℕ} {nA nB : ℕ} (hA : 0 < nA) (hB : 0 < nB)
     (hnA : (nA : ℝ) = c * S) (hnB : (nB : ℝ) = R * 2 ^ F) {u : ℤ} (hu : Rule c R S F u)
     (hmax : ∀ v, Rule c R S F v → v ≤ u) :
     let ĉ : ℤ := ((nB.size : ℤ) - nA.size + 1) / 2
-    u = if Rule c R S F ĉ then ĉ else ĉ - 1 := by
+    (Rule c R S F ĉ → u = ĉ) ∧ (¬ Rule c R S F ĉ → u = ĉ - 1) := by
   intro ĉ
   obtain ⟨h1, h2⟩ := shift_estimate hA hB
   have hlo : ĉ - 1 ≤ u := hmax _ (by unfold Rule; rw [← hnA, ← hnB]; exact h1)
@@ -112,10 +112,9 @@ theorem u_eq_estimate {c R : ℝ} {S : ℤ} {F : ℕ} {nA nB : ℕ} (hA : 0 < nA
       mul_le_mul_of_nonneg_left (zpow_le_zpow_right₀ (by norm_num) hle) hApos.le
     unfold Rule at hu; rw [← hnA, ← hnB] at hu
     linarith
-  split_ifs with h
-  · exact le_antisymm hhi (hmax _ h)
-  · have : u ≠ ĉ := fun he => h (he ▸ hu)
-    omega
+  refine ⟨fun h => le_antisymm hhi (hmax _ h), fun h => ?_⟩
+  have : u ≠ ĉ := fun he => h (he ▸ hu)
+  omega
 
 /-! ### The width of S -/
 
@@ -128,7 +127,7 @@ theorem S_le {k : ℕ} {a : Fin k → ℝ} {γ : ℤ} (hγ : ∀ h, |a h| < (2 :
     intro h
     rw [Int.ceil_le]
     have hx : |a h * 2 ^ (-γ)| < 2 := by
-      rw [abs_mul, abs_of_pos (zpow_pos two_pos _)]
+      rw [abs_mul, abs_of_pos (zpow_pos two_pos (-γ) : (0 : ℝ) < 2 ^ (-γ))]
       have e : (2 : ℝ) ^ (γ + 1) * 2 ^ (-γ) = 2 := by
         rw [← zpow_add₀ two_ne_zero]; norm_num
       calc |a h| * 2 ^ (-γ) < 2 ^ (γ + 1) * 2 ^ (-γ) :=
@@ -136,10 +135,11 @@ theorem S_le {k : ℕ} {a : Fin k → ℝ} {γ : ℤ} (hγ : ∀ h, |a h| < (2 :
         _ = 2 := e
     have hsq : (a h * 2 ^ (-γ)) ^ 2 ≤ 4 := by
       rw [← sq_abs]; nlinarith [abs_nonneg (a h * 2 ^ (-γ))]
-    push_cast
-    calc (a h * 2 ^ (-γ)) ^ 2 * 2 ^ 60 ≤ 4 * 2 ^ 60 :=
-          mul_le_mul_of_nonneg_right hsq (by positivity)
-      _ = 2 ^ 62 := by norm_num
+    have h62 : (a h * 2 ^ (-γ)) ^ 2 * 2 ^ 60 ≤ (2 : ℝ) ^ 62 :=
+      calc (a h * 2 ^ (-γ)) ^ 2 * 2 ^ 60 ≤ 4 * 2 ^ 60 :=
+            mul_le_mul_of_nonneg_right hsq (by positivity)
+        _ = 2 ^ 62 := by norm_num
+    exact_mod_cast h62
   calc ∑ h, ⌈(a h * 2 ^ (-γ)) ^ 2 * 2 ^ 60⌉ ≤ ∑ _h : Fin k, (2 : ℤ) ^ 62 :=
         sum_le_sum fun h _ => hterm h
     _ = k * 2 ^ 62 := by simp

@@ -106,7 +106,7 @@ theorem kweight_ratio_trunc {a aw : Fin k → ℝ} {γ γw : ℤ} (hγ : ∃ h, 
 
 /-- **L5c, the pair.** If both sides satisfy `kweight_ratio`'s conclusion and
 `G ≤ (σ̃ − σ) + (τ̃ − τ)`, then `‖ã‖‖b̃‖ < 4s²·2^{−G}·‖a‖‖b‖`, for any integer `G`. -/
-theorem kweight_guard {na nb nwa nwb s : ℝ} {σ σw τ τw G : ℤ} (hs : 0 ≤ s) (hna : 0 ≤ na)
+theorem kweight_guard {na nb nwa nwb s : ℝ} {σ σw τ τw G : ℤ} (hna : 0 ≤ na)
     (hnb : 0 ≤ nb) (hnwa : 0 ≤ nwa) (hnwb : 0 ≤ nwb)
     (ha : nwa < 2 * s * 2 ^ (σ - σw) * na) (hb : nwb < 2 * s * 2 ^ (τ - τw) * nb)
     (hG : G ≤ (σw - σ) + (τw - τ)) :
@@ -136,11 +136,11 @@ theorem sF_sq_le {k : ℕ} (hk : k ≤ 2 ^ 40) : sF k 60 ^ 2 ≤ 1 + 2 ^ (-20 : 
 /-- **L5c, the guard.** With `G ≥ 3` and `s² ≤ 1 + 2^{−20}`, the weighted norm product is
 strictly below the plain one (when the plain one is positive): weighting never worsens the
 §3.8 bound. -/
-theorem kweight_guard_lt {na nb nwa nwb s : ℝ} {σ σw τ τw G : ℤ} (hs : 0 ≤ s)
+theorem kweight_guard_lt {na nb nwa nwb s : ℝ} {σ σw τ τw G : ℤ}
     (hs2 : s ^ 2 ≤ 1 + 2 ^ (-20 : ℤ)) (hna : 0 ≤ na) (hnb : 0 ≤ nb) (hnwa : 0 ≤ nwa)
     (hnwb : 0 ≤ nwb) (ha : nwa < 2 * s * 2 ^ (σ - σw) * na) (hb : nwb < 2 * s * 2 ^ (τ - τw) * nb)
     (hG : G ≤ (σw - σ) + (τw - τ)) (hG3 : 3 ≤ G) : nwa * nwb < na * nb := by
-  have h := kweight_guard hs hna hnb hnwa hnwb ha hb hG
+  have h := kweight_guard hna hnb hnwa hnwb ha hb hG
   have hg : (2 : ℝ) ^ (-G) ≤ 2 ^ (-3 : ℤ) := zpow_le_zpow_right₀ (by norm_num) (by omega)
   have h20 : (2 : ℝ) ^ (-20 : ℤ) ≤ 1 := zpow_le_one_of_nonpos₀ (by norm_num) (by norm_num)
   have h3 : (2 : ℝ) ^ (-3 : ℤ) = 1 / 8 := by norm_num

@@ -65,7 +65,7 @@ theorem apost_scaled {a b : Fin k → ℝ} {σ τ : ℤ} {d : ℝ}
   have hτ : (0 : ℝ) < 2 ^ τ := zpow_pos two_pos _
   constructor
   · have h1 : |x * 2 ^ (σ + τ)| = |x| * 2 ^ (σ + τ) := by
-      rw [abs_mul, abs_of_pos (zpow_pos two_pos _)]
+      rw [abs_mul, abs_of_pos (zpow_pos two_pos (σ + τ) : (0 : ℝ) < 2 ^ (σ + τ))]
     have := abs_sub_abs_le_abs_sub z (x * 2 ^ (σ + τ))
     linarith
   · rw [l2_mul_const a hσ.le] at hda
@@ -112,7 +112,7 @@ theorem apost_elementwise {σ τ : ℤ} {z x Bbar D u : ℝ} (hu : 0 ≤ u)
   have hyx : |z * 2 ^ (-σ - τ) - x| ≤ Bbar * 2 ^ (-σ - τ) := by
     have e : z * 2 ^ (-σ - τ) - x = (z - x * 2 ^ (σ + τ)) * 2 ^ (-σ - τ) := by
       rw [hinv]; field_simp
-    rw [e, abs_mul, abs_of_pos (zpow_pos two_pos _)]
+    rw [e, abs_mul, abs_of_pos (zpow_pos two_pos (-σ - τ) : (0 : ℝ) < 2 ^ (-σ - τ))]
     exact mul_le_mul_of_nonneg_right hB (zpow_pos two_pos _).le
   -- 2^{−σ−τ} ≤ |x|/Y, from Y ≤ |x|·2^{σ+τ}
   have hsc : |z| - Bbar ≤ |x| * 2 ^ (σ + τ) := by
