@@ -102,6 +102,14 @@ class Lint(unittest.TestCase):
             with self.subTest(name):
                 self.assertTrue(self.errors(self.good(), decisions=text), name)
 
+    def test_pin_rewrites_the_pins(self):
+        path = fx.make_manifest(self.tmp, "1" * 40, self.good())
+        fx.wr(os.path.join(self.tmp, "R0.decisions.toml"), fx.rd(os.path.join(self.tmp, "R0.decisions.toml")) + "\n# more\n")
+        mf.repin(path, self.src)
+        m = mf.load(path)
+        self.assertEqual(m.data["campaign"]["immerdink_commit"], self.commit)
+        self.assertEqual([f for f in mf.lint(m, self.src) if f.level == "error"], [])
+
     def test_classify_and_plan_order(self):
         m = mf.load(fx.make_manifest(self.tmp, self.commit, [
             fx.py_exp("c", fx.WRITE_OK, prio="P1"), fx.py_exp("b", fx.WRITE_OK, risky=True), fx.py_exp("a", fx.WRITE_OK),

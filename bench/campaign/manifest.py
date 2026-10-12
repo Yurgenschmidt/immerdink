@@ -19,6 +19,7 @@ data exist, pinned by its sha256). The runner executes it, the analyzer judges t
     id = "x.run"       kind = "cmd"     priority = "P1"   est_min = 5   argv = ["{build}/imd_bench", ...]
 
 `lint` implements gate G1. `python3 manifest.py lint MANIFEST [--src DIR]` prints the findings and exits 1 on any error.
+`python3 manifest.py pin MANIFEST --src DIR` rewrites the pins (HEAD of DIR, its CUTLASS entry and GEMMul8 pin) and the decisions hash.
 """
 import hashlib
 import os
@@ -285,7 +286,37 @@ def _check_pins(src, c, err):
             err("campaign.gemmul8_commit", f"bench/GEMMUL8_PIN at the pinned commit names {words[1][:12]}, the manifest {c['gemmul8_commit'][:12]}")
 
 
+def repin(path, src):
+    """Rewrite the pins of a manifest to the checkout `src` (its HEAD, the CUTLASS gitlink, bench/GEMMUL8_PIN if the
+    manifest has a gemmul8_commit) and the decisions hash to the file's current one. Keeps the file's layout."""
+    with open(path) as f:
+        text = f.read()
+    m = load(path)
+    c = m.data["campaign"]
+    head = _git_out(src, "rev-parse", "HEAD").strip()
+    tree = _git_out(src, "ls-tree", head, "third_party/cutlass")
+    cut = tree.split()[2] if tree and len(tree.split()) >= 3 else c["cutlass_commit"]
+    new = {"immerdink_commit": head, "cutlass_commit": cut, "decisions_sha256": sha256_file(m.decisions_path())}
+    if "gemmul8_commit" in c:
+        pin = _git_out(src, "show", f"{head}:bench/GEMMUL8_PIN") or ""
+        words = next((l.split() for l in pin.splitlines() if l.strip() and not l.strip().startswith("#")), [])
+        if len(words) >= 2 and len(words[1]) == 40:
+            new["gemmul8_commit"] = words[1]
+    for k, v in new.items():
+        text, n = re.subn(rf'(?m)^({k}\s*=\s*")[^"]*(")', lambda mo: mo.group(1) + v + mo.group(2), text, count=1)
+        if n != 1:
+            raise SystemExit(f"no '{k} = \"...\"' line in {path}")
+    with open(path, "w") as f:
+        f.write(text)
+    return new
+
+
 def main(argv):
+    if len(argv) >= 4 and argv[1] == "pin":
+        new = repin(argv[2], argv[argv.index("--src") + 1])
+        for k, v in new.items():
+            print(f"{k} = {v}")
+        return 0
     if len(argv) < 3 or argv[1] != "lint":
         print(__doc__)
         return 2

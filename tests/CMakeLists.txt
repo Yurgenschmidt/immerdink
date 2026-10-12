@@ -106,7 +106,7 @@ if(Python3_FOUND)
   # guard), the manifest lint (gate G1), the resumable runner (kill -9, resume, time limits, copy-back) and the analyzer
   # (a damaged folder gives INVALID; the issue-11 folders reproduce their tables when they are on this machine).
   # CPU only, standard library, about 25 s in all.
-  foreach(t stats manifest runner analyze)
+  foreach(t stats manifest runner analyze archgate)
     add_test(NAME campaign_${t}_selftest
              COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/campaign/test_${t}.py")
   endforeach()
