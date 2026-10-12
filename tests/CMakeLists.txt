@@ -67,6 +67,41 @@ if(Python3_FOUND)
   add_test(NAME host_accuracy
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_accuracy.py"
                    --host-lib "$<TARGET_FILE:immerdink_host>" -v)
+  # DESIGN v1.19 §6g (NOTES-C1 §4.1): the footprints precision phases rely on, on the library
+  # == spec/params.py: F1 / F2 (published from API 13 on: workspace and pack bytes
+  # nondecreasing in N and g), C-ws / C-pack, and the internal facts I1-I3. CPU only.
+  add_test(NAME host_footprint_monotone
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_footprint.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" -v)
+  # DESIGN v1.19 §6g.10-§6g.11 (NOTES-C1 §4.2, stage 1): python/immerdink/precision.py, the
+  # PrecisionPlan phase rule == a brute-force composition from host.py's queries (per-role
+  # pack cost, share groups, BUDGET / MISSED / DIRECT, monotone floor), its footprints, and
+  # rho_from_output == spec/params.py rho_recipe bit for bit. CPU only (needs numpy).
+  add_test(NAME host_precision
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_precision.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>" -v)
+  # NOTES-C1 §4.3 (stage 2): the C2 study's exact engine (bench/accuracy/kw_engine.py: sigma,
+  # K-weights, emulation, exact references) and its several-partner / batched paths
+  # (c2_gate.py run_multi / run_batched) == spec/oracle.py, so a later change to the oracle
+  # cannot silently invalidate the M-a / M-d1 engine. CPU only (numpy), about 10 s.
+  add_test(NAME c2_engine_selftest
+           COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/c2_gate.py" selftest)
+  # NOTES-C1 §4.3 M-c (§5.9): bench/sweep_disjoint.py, the check that a hold-out shares no
+  # GEMM view with the fit sweeps. Its matching rule (another spec, A and B swapped, a tensor
+  # equal to a square, near sizes, the batch), its exit codes (--against fails, --report only
+  # lists), and the committed sweeps: M-c against sweep_calib.txt and sweep_calib_n.txt, and
+  # the Q24 cases (sweep_calib_n.txt) against M-c and the product hold-out
+  # (sweep_perf_validate.txt). CPU only, standard library, under a second.
+  add_test(NAME sweep_disjoint_selftest
+           COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/sweep_disjoint.py" --self-test)
+  # NOTES-C1 §4.3 M-d2 (§5.10): bench/accuracy/md2_time.py's pre-registered rules on
+  # synthetic records: the decision per system and data set (rules (a)-(d), STOPPED on any
+  # bit-exact failure in the file), the bars, bands and protocol constants pinned as
+  # literals, and the provenance checks (calibration, registered_check, the --md2-cleared
+  # citation, driver, parameters, configuration, one library per file). Registering it does
+  # not change the driver's sha256. CPU only, standard library, under a second.
+  add_test(NAME md2_time_selftest
+           COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/md2_time.py" selftest)
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
@@ -204,6 +239,33 @@ if(Python3_FOUND)
     set_tests_properties(packed_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
+
+  # DESIGN v1.19 §6g (NOTES-C1 §4.1, stage 0): precision phases on the GPU vs spec/oracle.py,
+  # one fresh process per suite (graph_phases captures phases whose N never ran in its
+  # process): a buffer re-packed in place at another N (PackedBuffer refuses the stale plan),
+  # one workspace for plans at every N, CUDA graphs per phase with cold captures, and F3's
+  # write extent of imd_pack (sentinels, every pack launch shape) with packed contracts on
+  # exactly sized packs on every producer path.
+  foreach(pair packed_repack_n:repack_n workspace_shared_n:workspace_shared_n
+               graph_phases:graph_phases pack_write_extent:write_extent)
+    string(REPLACE ":" ";" pair "${pair}")
+    list(GET pair 0 name)
+    list(GET pair 1 suite)
+    add_test(NAME ${name}
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_phases.py"
+                     --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+    set_tests_properties(${name} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                         ENVIRONMENT "LD_PRELOAD=${shim}")
+  endforeach()
+  # F3 under compute-sanitizer memcheck: every allocation exactly sized, clean; a pack
+  # allocation 16 bytes short must be reported (tests/memcheck_pack_extent.sh).
+  if(_imd_san)
+    add_test(NAME pack_write_extent_memcheck
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/memcheck_pack_extent.sh" "${_imd_san}"
+                     "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_phases.py"
+                     "$<TARGET_FILE:immerdink>")
+    set_tests_properties(pack_write_extent_memcheck PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800)
+  endif()
 
   # DESIGN v1.9 §6d: the Python device API (python/immerdink: Plan, Pack, contract) on the
   # GPU, bit for bit vs spec/oracle.py, with the allocation shim (pytest; CAI / DLPack

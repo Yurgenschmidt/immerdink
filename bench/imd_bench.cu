@@ -199,6 +199,37 @@ __global__ void k_fill(double* p, size_t n, uint64_t seed, double phi, size_t do
   }
 }
 
+// --data decay_opp (C1 M-c, docs/NOTES-C1.md §4.3): bench/accuracy/c2_fixtures.py's decay_opp
+// family, generated on the device: x = ±U(0.5, 1) · 10^(−1 − 9h − 3r/(R − 1)), h = κ/(k − 1) in
+// A and 1 − κ/(k − 1) in B, κ the contracted index in the canonical K order (both operands
+// agree on it, whatever their mode order), r the operand's index over its other modes (R of
+// them). A falls over 9 decades along K and B rises: after the row scaling most entries of a
+// row are tiny, the data-dependent INT8 throughput M-c covers. Up to 8 modes per operand.
+struct DecayMap {
+  int nd = 0;
+  int64_t ext[8] = {}, kmul[8] = {}, rmul[8] = {};  // per mode: weight in κ or in r (one is 0)
+  int64_t kn = 1, rn = 1;                            // k and R
+  int flip = 0;                                      // B: h -> 1 - h
+};
+__global__ void k_fill_decay(double* p, size_t n, uint64_t seed, DecayMap d) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x) {
+    uint64_t h1 = splitmix64(seed ^ (2 * i)), h2 = splitmix64(seed ^ (2 * i + 1));
+    int64_t rem = int64_t(i), kk = 0, rr = 0;
+    for (int q = d.nd - 1; q >= 0; --q) {
+      const int64_t x = rem % d.ext[q];
+      rem /= d.ext[q];
+      kk += x * d.kmul[q];
+      rr += x * d.rmul[q];
+    }
+    double h = d.kn > 1 ? double(kk) / double(d.kn - 1) : 0.0;
+    if (d.flip) h = 1.0 - h;
+    const double rf = d.rn > 1 ? double(rr) / double(d.rn - 1) : 0.0;
+    const double u = 0.5 + 0.5 * (double(h1 >> 11) * 0x1.0p-53);
+    p[i] = ((h2 >> 63) ? -u : u) * exp10(-1.0 - 9.0 * h - 3.0 * rf);
+  }
+}
+
 // ----------------------------------------------------------------------- the contraction ---
 struct Operand {
   std::string labels;          // one char per mode, outermost first
@@ -265,6 +296,32 @@ Case parse_case(const std::string& name, const std::string& spec, const std::str
   for (char x : c.K) c.k *= c.ext[x];
   for (char x : c.L) c.b *= c.ext[x];
   return c;
+}
+
+// --data decay_opp: the index map of an operand (κ over c.K in its canonical order, r over the
+// operand's other modes in its own order).
+DecayMap decay_map(const Operand& x, const Case& c, bool flip) {
+  DecayMap d;
+  if (x.labels.size() > 8) throw Failure("--data decay_opp: at most 8 modes per operand");
+  d.nd = int(x.labels.size());
+  d.flip = flip ? 1 : 0;
+  int64_t rmul = 1;
+  for (int q = d.nd - 1; q >= 0; --q) {
+    const char l = x.labels[q];
+    d.ext[q] = x.extent[q];
+    const auto pos = c.K.find(l);
+    if (pos == std::string::npos) {
+      d.rmul[q] = rmul;
+      rmul *= x.extent[q];
+    } else {
+      int64_t km = 1;
+      for (size_t t = pos + 1; t < c.K.size(); ++t) km *= c.ext.at(c.K[t]);
+      d.kmul[q] = km;
+    }
+  }
+  d.kn = c.k;
+  d.rn = rmul;
+  return d;
 }
 
 // ---------------------------------------------------------------------- device reference ---
@@ -445,6 +502,7 @@ struct Options {
   std::vector<int> k4 = {-1};
   double phi = 0.5;
   bool dominant = false;  // --data dominant (B2 eps-path calibration: one dominant entry per row)
+  bool decay_opp = false;  // --data decay_opp (C1 M-c: c2_fixtures.py's decay_opp, k_fill_decay)
   // v1.10 (DESIGN §6c): --clock-probe 1 records the SM clock after every timed call (also
   // IMD_BENCH_CLOCK=1); --l2 flush writes a 2 x L2 buffer before every timed imd call (outside
   // the timed window: the COLD state; default repeat); --sustain-s / --sustain-warm-s: method
@@ -730,8 +788,15 @@ struct Bench {
     dB = DevBuf(c.B.size * 8);
     dC = DevBuf(c.C.size * 8);
     const size_t dom = o.dominant ? size_t(c.k) : 0;
-    k_fill<<<1024, 256, 0, s>>>(dA.as<double>(), c.A.size, splitmix64(o.seed * 3 + 0), o.phi, dom);
-    k_fill<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1), o.phi, dom);
+    if (o.decay_opp) {
+      k_fill_decay<<<1024, 256, 0, s>>>(dA.as<double>(), c.A.size, splitmix64(o.seed * 3 + 0),
+                                        decay_map(c.A, c, false));
+      k_fill_decay<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1),
+                                        decay_map(c.B, c, true));
+    } else {
+      k_fill<<<1024, 256, 0, s>>>(dA.as<double>(), c.A.size, splitmix64(o.seed * 3 + 0), o.phi, dom);
+      k_fill<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1), o.phi, dom);
+    }
     CU(cudaStreamSynchronize(s));
     CU(cudaGetLastError());
     R = make_reference(c, dA.as<double>(), dB.as<double>(), o.samples, o.seed, s);
@@ -760,7 +825,7 @@ struct Bench {
     meta.raw("perm_needed", std::string("\"") + (needA ? "A" : "") + (needB ? "B" : "") + (needC ? "C" : "") + "\"");
     meta.num("phi", o.phi).integer("seed", (long long)o.seed);
     meta.integer("k_align_hook", o.k_align_hook);  // v1.13 §4b: 0 = AUTO, else forced A
-    meta.str("data", o.dominant ? "dominant" : "normal");
+    meta.str("data", o.decay_opp ? "decay_opp" : o.dominant ? "dominant" : "normal");
     meta.str("gpu", p.name).integer("sm_count", p.multiProcessorCount);
     meta.integer("l2_bytes", (long long)p.l2CacheSize);
     meta.str("driver", sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null"));
@@ -1513,7 +1578,7 @@ void usage() {
           "  [--N 8,14,20] [--reps 10] [--warmup 2]\n"
           "  [--max-seconds 15] [--samples 256] [--phi 0.5] [--seed 1] [--phase-reps 5]\n"
           "  [--vec generate,resident] [--g 1,2,4,0 (0 = N)] [--k4 rule,tune,0,1,2,3]\n"
-          "  [--mode emulate|direct] (method imd) [--data normal|dominant]\n"
+          "  [--mode emulate|direct] (method imd) [--data normal|dominant|decay_opp]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
           "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, ka=auto|16|64)\n"
@@ -1583,8 +1648,10 @@ int main(int argc, char** argv) {
       B.o.mode = a["mode"] == "direct" ? IMD_DIRECT : IMD_EMULATE;
     }
     if (a.count("data")) {
-      if (a["data"] != "normal" && a["data"] != "dominant") throw Failure("--data normal|dominant");
+      if (a["data"] != "normal" && a["data"] != "dominant" && a["data"] != "decay_opp")
+        throw Failure("--data normal|dominant|decay_opp");
       B.o.dominant = a["data"] == "dominant";
+      B.o.decay_opp = a["data"] == "decay_opp";
     }
     if (a.count("phi")) B.o.phi = std::stod(a["phi"]);
     if (a.count("clock-probe")) B.o.clock_probe = a["clock-probe"] == "1";

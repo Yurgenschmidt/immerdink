@@ -25,7 +25,10 @@ Every record carries:
 | `bw` | A device-to-device copy of A: the achievable DRAM bandwidth, a hardware reference. |
 
 - **Data:** `(u − ½)·exp(φ·g)`, with `u ~ U[0,1)`, `g ~ N(0,1)` and φ = 0.5. It is generated
-  on the device from a counter-based hash, so it is reproducible.
+  on the device from a counter-based hash, so it is reproducible. `--data dominant` gives each
+  row one entry 2²⁰ larger; `--data decay_opp` (C1 M-c) is `bench/accuracy/c2_fixtures.py`'s
+  `decay_opp`: magnitudes falling over 9 decades along K in A and rising in B, and over 3
+  decades along the rows.
 - **Accuracy:** 256 sampled outputs, or all of them when C is small, against a double-double
   (Dot2) reference computed on the device. Two metrics are reported:
   - the max normwise error `|c − r| / (‖a_i‖₂‖b_j‖₂)`, the DESIGN §3.8 metric;

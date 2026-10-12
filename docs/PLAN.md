@@ -53,7 +53,17 @@ Spec follow-ups, to do before or alongside M2/M3 (see `spec/README.md`):
 - Statements use exact arithmetic only; the final FP rounding is a hypothesis.
 
 **Exit:** all four lemmas machine-checked with no `sorry`. A CI target builds `proofs/`.
-**Status:** met. `tools/check_proofs.sh` passes; 48 headline theorems use only the standard axioms.
+**Status:** met. `tools/check_proofs.sh` passes; 71 headline theorems use only the standard axioms.
+**Issue #12 (2026-10-11):** the formalization is extended to cover:
+- the realization lemmas R1–R6 (κ and u as computed, S width, SMod and the int8 store, the
+  multiply-high reductions, the CRT word's exact peak, compare, wrap and centring, and the
+  20 design moduli);
+- L5, L6, and L7c's remaining forms;
+- the algorithm-level capstone at the real moduli with the shipped multipliers
+  (`Moduli.emulated_product_exact_shipped`).
+
+145 headline theorems use only the standard axioms. PROOFS "Formalization status" lists the
+remaining hypotheses and the unmodelled machine-level details.
 
 ## M0 — Scaffolding
 
@@ -190,6 +200,15 @@ comparisons are kept outside this repository (docs/BENCHMARKING.md). Note that c
   - **Ozaki-II with per-call N**. Changing N changes the scaling, so operands must be
     re-packed;
   - a data-driven **auto / bounded-auto N** policy on top of either.
+
+  **Outcome (C1, 2026-10-07; DESIGN v1.19 §6g, docs/NOTES-C1.md):** Ozaki-II with per-call N
+  shipped as precision phases (a plan and a pack per N, published footprint guarantees,
+  §6g.1–§6g.9); auto-N is host-side (`precision.PrecisionPlan` over `imd_err_min_moduli` /
+  rank, and the rigorous `rho_from_output`, §6g.10–§6g.11); the Ozaki-I slice mode is parked
+  with its triggers (DESIGN §7). C1 is done as amended (decision by Eric, 2026-10-09): MC-3a ran once (2026-10-09,
+  NOTES-C1 §5.11) and declared no pass, so the performance model's small-N hold-out (M-c) stays
+  failed; M-d2, the GPU timing of the schedules, ran on 2026-10-09 and passed (§5.12) on the
+  shipped calibration, and Eric amended the done condition "M-c has passed" accordingly.
 - **Packed symmetric tensor contractions** (generic permutational symmetry). Wanted by
   Eric (2026-10-03), long-term; motivating case: the particle–particle ladder (PPL) in
   DF-CCSD. Operands and/or output are stored packed over permutational symmetry groups
@@ -201,7 +220,9 @@ comparisons are kept outside this repository (docs/BENCHMARKING.md). Note that c
   without Ozaki. Design questions for later: the symmetry descriptor in the API (groups,
   sign), whether to skip redundant output blocks in the GEMM tiling or only in the scatter,
   and IndexMap/TLA+ extensions for packed legality and injectivity. Not before M4.
-- Accurate-mode scaling.
+- Accurate-mode scaling. **Re-rejected (C2, 2026-10-07; DESIGN §7, NOTES-C1 §2.8):** C2 became
+  K-equilibration (closed by its gate, with a revival trigger) plus the K-segmentation caller
+  recipe (DESIGN §3.8).
 - Python package, device arrays only (cupy / DLPack); no host-array transfers. **Done (B1,
   2026-10-05): ctypes over the C ABI, not nanobind (Eric), DESIGN v1.9 §6d.**
 - **Next after the g sweep (Eric, 2026-10-03):**

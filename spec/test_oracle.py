@@ -34,6 +34,18 @@ What is checked (numbers refer to the oracle task list, sections to DESIGN.md):
         A7 §3.7 native path canonical k order ([MAX, MAX, -Inf].[2, 2, 1] = NaN).
         A8 §3.5 default chunk 131008 actually splits (k = 131009, and 131056 in the v1.13
            window) and add-mod is exact.
+  (12) K-weights (NOTES-C1 §4.5, stage 2): oracle.kweights against an independent brute
+      force of the rule and the FP64-exact clamp (edge exponents, subnormals), the Q9 order,
+      the multi-partner union extrema and G = min_p G_p (and the rejection of partners over
+      other labels), the guard against materialized weighted rows, exactness of every scaled
+      entry, joint-K-permutation invariance, determinism, L5c in exact rationals, the CRT
+      precondition and z on the weighted operands, DIRECT results bitwise unchanged.
+  (13) K-segmentation (NOTES-C1 §4.4, stage 3): oracle.contract_segments against the
+      recipe's calls through contract_tensor on moved sub-views and against an independent
+      composition of per-band library calls and exact RN(C + E_s) steps, S = 1 bitwise
+      equal to contract(), K-empty bands (k_s = 1) DIRECT, per-band sigma / z / CRT
+      precondition, PROOFS L7's proof skeleton in exact rationals, alpha / beta (alpha = 0
+      without A, B), band-local flags, per-band RN acceptance, the decay_opp gain, validation.
   NB residue-group size g cannot influence the oracle's result by construction (each plane
   is computed independently from the same quantized operands); g-independence of the real
   buffer schedule is the Pipeline spec's job. The g loop in (3) only checks plumbing.
@@ -1625,6 +1637,708 @@ def check_fusion(v, g):
 
 
 
+def kw_ilogb(x):
+    """floor(log2 |x|) through math.frexp (independent of oracle.dyadic / ilogb)."""
+    return math.frexp(x)[1] - 1
+
+
+def kw_brute(xs_at, ys_at, deadband, max_abs):
+    """Independent restatement of NOTES-C1 §4.5 steps 1-4 from the finite nonzero values at
+    each shared index (xs_at[q]: X's, ys_at[q]: every partner's): frexp exponents,
+    statistics.median_low, math.floor, and a scan of every candidate weight for the feasible
+    one nearest to w0 (feasibility as the clamp's text states it)."""
+    cX = [max(map(kw_ilogb, v)) if v else None for v in xs_at]
+    mX = [min(map(kw_ilogb, v)) if v else None for v in xs_at]
+    cY = [max(map(kw_ilogb, v)) if v else None for v in ys_at]
+    mY = [min(map(kw_ilogb, v)) if v else None for v in ys_at]
+    delta = [None if a is None or b is None else b - a for a, b in zip(cX, cY)]
+    dd = [d for d in delta if d is not None]
+    med = statistics.median_low(dd) if dd else None
+    w0 = [0 if d is None or abs(d - med) <= deadband else math.floor((d - med) / 2)
+          for d in delta]
+
+    def feasible(q, w):
+        if w > 0:
+            return (cX[q] is None or cX[q] + w <= 1023) and (mY[q] is None or mY[q] - w >= -1022)
+        if w < 0:
+            return (mX[q] is None or mX[q] + w >= -1022) and (cY[q] is None or cY[q] - w <= 1023)
+        return True
+    w = [min((c for c in range(-max_abs, max_abs + 1) if feasible(q, c)),
+             key=lambda c: abs(c - w0[q])) for q in range(len(xs_at))]
+    return w, w0, med
+
+
+def kw_rand_entry(rng, center):
+    """A random entry around 2^center: zeros, non-finite values, subnormals and entries at
+    the top of the range appear with small probabilities (the clamp's edges)."""
+    r = rng.random()
+    if r < 0.08:
+        return 0.0
+    if r < 0.10:
+        return rng.choice([math.inf, -math.inf, math.nan])
+    if r < 0.14:
+        return rng.choice([-1, 1]) * math.ldexp(rng.randrange(1, 2**20), -1074)   # subnormal
+    if r < 0.18:
+        return rng.choice([-1, 1]) * math.ldexp(1 + rng.random(), rng.randrange(1000, 1024))
+    e = max(-1070, min(1022, center + rng.randrange(-6, 7)))
+    return rng.choice([-1, 1]) * math.ldexp(1 + rng.random(), e)
+
+
+def kw_frac_norm2(v):
+    return sum(Fraction(x) ** 2 for x in v)
+
+
+def kw_gain_brute(Xt, Yt, C, N, rnd, x_role, labels, qstride, w):
+    """G_p of one pair from MATERIALIZED weighted tensors (kweights_apply) and
+    oracle.scale_vector on gathered rows: the independent path of the guard."""
+    Xw = o.kweights_apply(Xt, labels, qstride, w, +1)
+    Yw = o.kweights_apply(Yt, labels, qstride, w, -1)
+    plain, weighted = ((Xt, Yt), (Xw, Yw)) if x_role == "A" else ((Yt, Xt), (Yw, Xw))
+    v = o.lower(plain[0].desc, plain[1].desc, C)
+    plan = o.Plan(N, v.k, rnd)
+    if v.swapped:                       # post-swap A is the caller's B (contract_tensor)
+        plain, weighted = plain[::-1], weighted[::-1]
+    vec, gains = v.vec, []
+    for role, (T0, T1) in (("A", (plain[0], weighted[0])), ("B", (plain[1], weighted[1]))):
+        if role == "A":
+            fib = [(vec["A_bat"][l] + vec["A_row"][i], vec["A_k"]) for l in range(v.b)
+                   for i in range(v.m)]
+        else:
+            fib = [(vec["B_bat"][l] + vec["B_col"][j], vec["B_k"]) for l in range(v.b)
+                   for j in range(v.n)]
+        g = None
+        for o0, kv in fib:
+            r0 = [T0.buf[T0.base + o0 + kv[h]] for h in range(v.k)]
+            r1 = [T1.buf[T1.base + o0 + kv[h]] for h in range(v.k)]
+            s0, f0, *_ = o.scale_vector(r0, plan)
+            s1, f1, *_ = o.scale_vector(r1, plan)
+            assert f0 == f1                                    # flags unchanged by weighting
+            if f0 or all(x == 0.0 for x in r0):
+                continue
+            g = s1 - s0 if g is None else min(g, s1 - s0)
+        gains.append(g)
+    x_post_a = (x_role == "A") != v.swapped
+    return (gains[0], gains[1]) if x_post_a else (gains[1], gains[0])
+
+
+def kw_fixture(fam, m, n, k, rng):
+    """Small stdlib versions of the M5 / C2 families (bench/accuracy/contractions.gen,
+    NOTES-C1 §2.1), GEMM view: A m x k, B k x n."""
+    def u(a, b):
+        return a + (b - a) * rng.random()
+    sg = lambda: rng.choice([-1.0, 1.0])  # noqa: E731
+    h1 = [h / max(k - 1, 1) for h in range(k)]
+    if fam == "uniform":
+        return ([[u(-1, 1) for _ in range(k)] for _ in range(m)],
+                [[u(-1, 1) for _ in range(n)] for _ in range(k)])
+    if fam in ("decay_same", "decay_opp"):
+        da = [10.0 ** (-1 - 9 * t) for t in h1]
+        db = da if fam == "decay_same" else da[::-1]
+        return ([[sg() * u(0.5, 1) * da[h] * 10.0 ** (-3 * i / max(m - 1, 1)) for h in range(k)]
+                 for i in range(m)],
+                [[sg() * u(0.5, 1) * db[h] * 10.0 ** (-3 * j / max(n - 1, 1)) for j in range(n)]
+                 for h in range(k)])
+    if fam == "opp_nonsep":
+        pa = [u(0.5, 2) for _ in range(m)]
+        pb = [u(0.5, 2) for _ in range(n)]
+        return ([[sg() * u(0.5, 1) * 10.0 ** (-1 - 9 * h1[h] ** pa[i]) for h in range(k)]
+                 for i in range(m)],
+                [[sg() * u(0.5, 1) * 10.0 ** (-1 - 9 * (1 - h1[h]) ** pb[j]) for j in range(n)]
+                 for h in range(k)])
+    if fam == "outliers":
+        A = [[rng.gauss(0, 1) for _ in range(k)] for _ in range(m)]
+        B = [[rng.gauss(0, 1) for _ in range(n)] for _ in range(k)]
+        for _ in range(2):
+            for i in range(m):
+                A[i][rng.randrange(k)] *= 10.0 ** u(3, 8)
+            for j in range(n):
+                B[rng.randrange(k)][j] *= 10.0 ** u(3, 8)
+        return A, B
+    if fam == "phi4":
+        return ([[(rng.random() - 0.5) * math.exp(4 * rng.gauss(0, 1)) for _ in range(k)]
+                 for _ in range(m)],
+                [[(rng.random() - 0.5) * math.exp(4 * rng.gauss(0, 1)) for _ in range(n)]
+                 for _ in range(k)])
+    raise ValueError(fam)
+
+
+def test_kweights():
+    """(12) NOTES-C1 §4.5 K-weights (stage 2): oracle.kweights against independent brute
+    forces (rule, clamp, Q9 order, multi-partner union extrema and min-G guard, swapped and
+    X = B views), FP64
+    exactness of every scaled entry (incl. subnormals and the top of the range), invariance
+    under a joint K permutation, determinism, L5c in exact rationals, the CRT precondition
+    and z = sum a'b' on the weighted operands, bitwise-equal DIRECT results, validation."""
+    rng = random.Random(4519)
+    cnt = {"rule": 0, "clamped_fp64": 0, "clamped_max_abs": 0, "guard_pairs": 0,
+           "l5c_pairs": 0, "crt_outputs": 0, "multi": 0, "views": 0}
+
+    # --- rule + clamp vs brute force, single partner (GEMM) and guard vs the float path
+    for trial in range(220):
+        m, n, k = rng.randrange(1, 4), rng.randrange(1, 4), rng.randrange(2, 13)
+        cen = [rng.randrange(-1060, 1015) if rng.random() < 0.3 else rng.randrange(-40, 40)
+               for _ in range(k)]
+        cenb = [rng.randrange(-1060, 1015) if rng.random() < 0.3 else c + rng.randrange(-60, 61)
+                for c in cen]
+        A = [[kw_rand_entry(rng, cen[h]) for h in range(k)] for _ in range(m)]
+        B = [[kw_rand_entry(rng, cenb[h]) for _ in range(n)] for h in range(k)]
+        db, ma = rng.choice([0, 1, 2, 3, 5, 40]), rng.choice([1, 3, 20, 127])
+        N, rnd = rng.choice([3, 6, 8, 14, 20]), rng.choice(["RN", "TRUNC"])
+        try:
+            w, rep = o.kweights_gemm(A, B, N, rnd, deadband=db, max_abs=ma)
+        except o.NotSupported:
+            assert rnd == "RN" and o.ceil_sqrt(k) >= o.Plan(N, 1).T
+            continue
+        fin = lambda x: math.isfinite(x) and x != 0.0  # noqa: E731
+        xs = [[A[i][h] for i in range(m) if fin(A[i][h])] for h in range(k)]
+        ys = [[B[h][j] for j in range(n) if fin(B[h][j])] for h in range(k)]
+        wb, w0b, med = kw_brute(xs, ys, db, ma)
+        assert w == wb and rep["w0"] == w0b, (trial, w, wb)
+        assert rep["median"] == (o.INT32_MIN if med is None else med)
+        assert rep["num_weighted"] == sum(x != 0 for x in w)
+        assert rep["max_abs_w"] == max(map(abs, w)) and rep["k_s"] == k
+        assert rep["clamped"] == sum(a != b for a, b in zip(w, w0b))
+        cnt["rule"] += 1
+        cnt["clamped_fp64"] += rep["clamped_fp64"]
+        cnt["clamped_max_abs"] += rep["clamped_max_abs"]
+        TA, TB, C = o.gemm_tensors(A, B)
+        Aw = o.kweights_apply(TA, rep["labels"], rep["qstride"], w, +1)   # asserts exactness
+        Bw = o.kweights_apply(TB, rep["labels"], rep["qstride"], w, -1)
+        for x, y in zip(TA.buf + TB.buf, Aw.buf + Bw.buf):              # independent check
+            if math.isfinite(x):
+                assert (Fraction(y) == 0) == (x == 0.0)
+            else:
+                assert not math.isfinite(y)
+        for h in range(k):
+            for i in range(m):
+                if math.isfinite(A[i][h]):
+                    assert Fraction(Aw.buf[i * k + h]) == Fraction(A[i][h]) * Fraction(2) ** w[h]
+            for j in range(n):
+                if math.isfinite(B[h][j]):
+                    assert Fraction(Bw.buf[h * n + j]) == Fraction(B[h][j]) / Fraction(2) ** w[h]
+        gx, gy = kw_gain_brute(TA, TB, C, N, rnd, "A", rep["labels"], rep["qstride"], w)
+        gp = None if gx is None or gy is None else gx + gy
+        assert rep["gain"] == (o.INT32_MIN if gp is None else gp)
+        assert rep["guard"] == (1 if gp is None or gp >= 3 else 0)
+        if gp is not None:
+            assert (rep["gain_row_min"], rep["gain_col_min"]) == (gx, gy)
+            cnt["guard_pairs"] += 1
+    assert cnt["clamped_fp64"] > 20 and cnt["clamped_max_abs"] > 20, cnt
+
+    # --- targeted clamp edges: overflow of X (c_X = 1020), a subnormal partner entry, the
+    # least subnormal and the largest double; every scaled entry exact (kweights_apply)
+    k = 7
+    A = [[1.5 * 2.0**1020] + [1.0] * (k - 1)]
+    B = [[1.75 * 2.0**1023]] + [[2.0**-100] for _ in range(k - 1)]
+    w, rep = o.kweights_gemm(A, B, 8, deadband=0)
+    assert rep["median"] == -100 and rep["w0"][0] == 51 and w[0] == 3 and rep["clamped_fp64"] == 1
+    B[0] = [1.75 * 2.0**1023, 5e-324]                                   # partner subnormal
+    A = [A[0], [0.0] * k]
+    w, rep = o.kweights_gemm(A, [B[0]] + [[2.0**-100, 0.0] for _ in range(k - 1)], 8, deadband=0)
+    assert w[0] == 0 and rep["w0"][0] > 0
+    A = [[5e-324] + [2.0**-30] * (k - 1)]                               # X subnormal: w < 0 barred
+    B = [[2.0**-1060]] + [[2.0**20] for _ in range(k - 1)]
+    w, rep = o.kweights_gemm(A, B, 8, deadband=0)
+    assert rep["w0"][0] < 0 and w[0] == 0
+    A = [[1.0] * k]                                                     # X up to the top
+    B = [[2.0**900]] + [[1.0] for _ in range(k - 1)]
+    w, rep = o.kweights_gemm(A, B, 8, deadband=0)
+    assert w[0] == 127 and rep["clamped_max_abs"] == 1
+    w, rep = o.kweights_gemm(A, B, 8, deadband=0, max_abs=5)
+    assert w[0] == 5
+
+    # --- Q9 order: repeated (diagonal) label, one-sided K label, extent-1 shared label
+    X = o.Tensor([rng.uniform(-1, 1) * 10.0 ** rng.uniform(-6, 0) for _ in range(3 * 2 * 3 * 4)],
+                 0, o.Desc([3, 2, 3, 4, 1], [1, 3, 6, 18, 72], ["h", "i", "h", "g", "e"]))
+    Y = o.Tensor([rng.uniform(-1, 1) for _ in range(3 * 5)], 0,
+                 o.Desc([1, 3, 5], [15, 5, 1], ["e", "h", "j"]))
+    C = o.Desc([2, 5], [5, 1], ["i", "j"])
+    labels, qstride, ks = o.kw_layout(X.desc, Y.desc, C)
+    assert labels == ["h", "e"] and qstride == {"h": 1, "e": 3} and ks == 3
+    w, rep = o.kweights(X, [o.KwPartner(Y, C, 8)], deadband=0)
+    assert rep["labels"] == labels and rep["k_s"] == 3
+    Xw = o.kweights_apply(X, labels, qstride, w)
+    for h in range(3):                            # w constant along the one-sided label g
+        for i in range(2):
+            for g in range(4):
+                off = h + 3 * i + 6 * h + 18 * g
+                assert Fraction(Xw.buf[off]) == Fraction(X.buf[off]) * Fraction(2) ** w[h]
+    gx, gy = kw_gain_brute(X, Y, C, 8, "RN", "A", labels, qstride, w)
+    assert rep["gain"] == gx + gy
+
+    # --- several partners (IR6): X = Bov kcQ is the plan's B of ldQ,kcQ->ldkc and of
+    # aiQ,kcQ->aikc; union extrema and G = min_p G_p; a partner over other labels is rejected
+    for trial in range(30):
+        o_, v_, q_ = 2, 3, rng.randrange(3, 9)
+        cen = [rng.randrange(-30, 30) for _ in range(q_)]
+
+        def bt(ext, lab, off):
+            n_ = math.prod(ext)
+            st = [math.prod(ext[:t]) for t in range(len(ext))]
+            vals = [kw_rand_entry(rng, cen[(x // st[-1]) % q_] + off) for x in range(n_)]
+            return o.Tensor(vals, 0, o.Desc(ext, st, lab))
+        Xt = bt([o_, v_, q_], ["k", "c", "Q"], 0)
+        Y1 = bt([o_, v_, q_], ["l", "d", "Q"], rng.randrange(-20, 21))
+        Y2 = bt([v_, o_, q_], ["a", "i", "Q"], rng.randrange(-20, 21))
+        C1 = o.Desc([o_, v_, o_, v_], [1, o_, o_ * v_, o_ * o_ * v_], ["l", "d", "k", "c"])
+        C2 = o.Desc([v_, o_, o_, v_], [1, v_, v_ * o_, v_ * o_ * o_], ["a", "i", "k", "c"])
+        N1, N2 = rng.choice([6, 8, 14]), rng.choice([8, 12, 20])
+        ps = [o.KwPartner(Y1, C1, N1, "RN", "B"), o.KwPartner(Y2, C2, N2, "TRUNC", "B")]
+        db = rng.choice([0, 2, 3])
+        w, rep = o.kweights(Xt, ps, deadband=db)
+        fin = lambda x: math.isfinite(x) and x != 0.0  # noqa: E731
+        xs = [[x for t, x in enumerate(Xt.buf) if t // (o_ * v_) == q and fin(x)]
+              for q in range(q_)]
+        ys = [[x for T in (Y1, Y2) for t, x in enumerate(T.buf) if t // (o_ * v_) == q and fin(x)]
+              for q in range(q_)]
+        wb, _, _ = kw_brute(xs, ys, db, 127)
+        assert w == wb and rep["labels"] == ["Q"]
+        Gs = []
+        for p in ps:
+            gx, gy = kw_gain_brute(Xt, p.Y, p.C, p.N, p.rounding, "B", ["Q"], {"Q": 1}, w)
+            Gs.append(None if gx is None or gy is None else gx + gy)
+        assert [d["G"] for d in rep["pairs"]] == Gs
+        dG = [g for g in Gs if g is not None]
+        assert rep["gain"] == (min(dG) if dG else o.INT32_MIN)
+        assert rep["guard"] == (1 if not dG or min(dG) >= 3 else 0)
+        cnt["multi"] += 1
+    # --- the remaining views: a swapped single-partner GEMM (column-major C, X = A, so the
+    # post-swap X is the plan's B) and an unswapped partner with X = B (row-major C). The
+    # report names the caller's A rows / B columns and does not depend on C's layout.
+    rep_fields = ("guard", "gain", "gain_row_min", "gain_col_min", "median", "num_weighted",
+                  "max_abs_w", "clamped")
+    for trial in range(40):
+        m, n, k = rng.randrange(2, 4), rng.randrange(2, 4), rng.randrange(2, 10)
+        cen = [rng.randrange(-40, 40) for _ in range(k)]
+        A = [[kw_rand_entry(rng, cen[h]) for h in range(k)] for _ in range(m)]
+        B = [[kw_rand_entry(rng, cen[h] + rng.randrange(-30, 31)) for _ in range(n)]
+             for h in range(k)]
+        db, N, rnd = rng.choice([0, 2, 3]), rng.choice([6, 8, 14]), rng.choice(["RN", "TRUNC"])
+        TA, TB, Crow = o.gemm_tensors(A, B)
+        Ccol = o.Desc([m, n], [1, m], ["i", "j"])
+        assert o.lower(TA.desc, TB.desc, Ccol).swapped
+        assert not o.lower(TA.desc, TB.desc, Crow).swapped
+        fin = lambda x: math.isfinite(x) and x != 0.0  # noqa: E731
+        a_at = [[A[i][h] for i in range(m) if fin(A[i][h])] for h in range(k)]
+        b_at = [[B[h][j] for j in range(n) if fin(B[h][j])] for h in range(k)]
+        # (a) X = A, swapped
+        wa, ra = o.kweights(TA, [o.KwPartner(TB, Ccol, N, rnd, "A")], deadband=db)
+        wr, rr = o.kweights(TA, [o.KwPartner(TB, Crow, N, rnd, "A")], deadband=db)
+        assert wa == wr and all(ra[f] == rr[f] for f in rep_fields), trial
+        assert wa == kw_brute(a_at, b_at, db, 127)[0]
+        gx, gy = kw_gain_brute(TA, TB, Ccol, N, rnd, "A", ra["labels"], ra["qstride"], wa)
+        gp = None if gx is None or gy is None else gx + gy
+        assert ra["gain"] == (o.INT32_MIN if gp is None else gp)
+        if gp is not None:
+            assert (ra["gain_row_min"], ra["gain_col_min"]) == (gx, gy)    # X = caller's A
+        # (b) X = B, unswapped
+        wb, rb = o.kweights(TB, [o.KwPartner(TA, Crow, N, rnd, "B")], deadband=db)
+        assert rb["labels"] == ["h"] and wb == kw_brute(b_at, a_at, db, 127)[0]
+        gx, gy = kw_gain_brute(TB, TA, Crow, N, rnd, "B", rb["labels"], rb["qstride"], wb)
+        gp = None if gx is None or gy is None else gx + gy
+        assert rb["gain"] == (o.INT32_MIN if gp is None else gp)
+        assert rb["guard"] == (1 if gp is None or gp >= 3 else 0)
+        if gp is not None:
+            assert (rb["gain_row_min"], rb["gain_col_min"]) == (gy, gx)    # X = caller's B
+        cnt["views"] += 1
+
+    Y3 = o.Tensor([1.0] * (v_ * v_ * q_), 0, o.Desc([v_, v_, q_], [1, v_, v_ * v_], ["a", "c", "Q"]))
+    C3 = o.Desc([v_, o_], [1, v_], ["a", "k"])
+    try:
+        o.kweights(Xt, ps + [o.KwPartner(Y3, C3, 8, "RN", "B")])
+        raise AssertionError("partners over different shared-K labels accepted")
+    except o.InvalidValue:
+        pass
+
+    # --- fixtures: invariance, determinism, L5c in exact rationals, CRT precondition and
+    # z = sum a'b' on the weighted operands, x unchanged, DIRECT bitwise unchanged
+    s_found = {"guard0": False}
+    for fam in ("decay_opp", "decay_same", "opp_nonsep", "outliers", "phi4", "uniform"):
+        for db in (0, 3):
+            m, n, k = 4, 3, 30
+            A, B = kw_fixture(fam, m, n, k, rng)
+            N, rnd = rng.choice([(6, "RN"), (8, "TRUNC"), (14, "RN")])
+            w, rep = o.kweights_gemm(A, B, N, rnd, deadband=db)
+            assert o.kweights_gemm(A, B, N, rnd, deadband=db) == (w, rep)   # determinism
+            perm = list(range(k))
+            rng.shuffle(perm)
+            wp, rp = o.kweights_gemm([[r[p] for p in perm] for r in A], [B[p] for p in perm],
+                                     N, rnd, deadband=db)
+            assert wp == [w[p] for p in perm]
+            for f in ("guard", "gain", "median", "num_weighted", "max_abs_w", "clamped"):
+                assert rp[f] == rep[f], f
+            Aw = [[math.ldexp(x, w[h]) for h, x in enumerate(r)] for r in A]
+            Bw = [[math.ldexp(x, -w[h]) for x in B[h]] for h in range(k)]
+            G = rep["gain"]
+            s2 = 1 + Fraction(k, 2**60)
+            for i in range(m):
+                for j in range(n):
+                    bj, bwj = [B[h][j] for h in range(k)], [Bw[h][j] for h in range(k)]
+                    assert o.exact_dot(A[i], bj) == o.exact_dot(Aw[i], bwj)       # L5a
+                    lhs = kw_frac_norm2(Aw[i]) * kw_frac_norm2(bwj)
+                    rhs = kw_frac_norm2(A[i]) * kw_frac_norm2(bj)
+                    assert lhs < 16 * s2**2 * Fraction(4) ** (-G) * rhs            # L5c, any G
+                    if G >= 3:
+                        assert lhs < rhs
+                    cnt["l5c_pairs"] += 1
+            if rep["guard"] == 0:
+                s_found["guard0"] = True
+            t = {}
+            D = o.contract(Aw, Bw, [[0.0] * n for _ in range(m)], 1.0, 0.0, N, rnd, trace=t)
+            for i in range(m):
+                for j in range(n):
+                    qa, qb = t["QA"][i], [t["QB"][j][h] for h in range(k)]
+                    assert sum(abs(o.qvalue(a) * o.qvalue(b)) for a, b in zip(qa, qb)) <= t["plan"].H
+                    assert t["z"][i][j] == sum(o.qvalue(a) * o.qvalue(b) for a, b in zip(qa, qb))
+                    cnt["crt_outputs"] += 1
+            TA, TB, C = o.gemm_tensors(A, B)
+            TAw, TBw, _ = o.gemm_tensors(Aw, Bw)
+            d0 = o.contract_tensor(TA, TB, o.Tensor([0.0] * (m * n), 0, C), 1.0, 0.0, N, rnd,
+                                   mode=o.DIRECT)
+            d1 = o.contract_tensor(TAw, TBw, o.Tensor([0.0] * (m * n), 0, C), 1.0, 0.0, N, rnd,
+                                   mode=o.DIRECT)
+            assert all(same_bits(x, y) for x, y in zip(d0, d1))    # every product unchanged
+            del D
+
+    # --- ZERO_ON_FAIL, guard off, undefined G, validation, NOT_SUPPORTED
+    for seed in range(200):
+        r2 = random.Random(seed)
+        A, B = kw_fixture("phi4", 5, 5, 24, r2)
+        w, rep = o.kweights_gemm(A, B, 8, deadband=0)
+        if rep["guard"] == 0:
+            wz, rz = o.kweights_gemm(A, B, 8, deadband=0, flags=o.KW_GUARD | o.KW_ZERO_ON_FAIL)
+            assert wz == [0] * 24 and rz["guard"] == 0 and rz["gain"] == rep["gain"]
+            assert rz["num_weighted"] == 0 and rz["max_abs_w"] == 0
+            assert rz["clamped"] == sum(x != 0 for x in rep["w0"])
+            break
+    else:
+        raise AssertionError("no failing guard found for ZERO_ON_FAIL")
+    w2, r2_ = o.kweights_gemm(A, B, 8, deadband=0, flags=0)
+    assert w2 == w and r2_["guard"] == -1 and r2_["gain"] == o.INT32_MIN
+    w3, r3 = o.kweights_gemm([[0.0] * 6] * 2, [[1.0] * 2 for _ in range(6)], 8)
+    assert r3["guard"] == 1 and r3["gain"] == o.INT32_MIN and r3["median"] == o.INT32_MIN
+    assert w3 == [0] * 6
+    for bad in (dict(deadband=-1), dict(max_abs=0), dict(max_abs=128), dict(flags=4),
+                dict(flags=o.KW_ZERO_ON_FAIL)):
+        try:
+            o.kweights_gemm(A, B, 8, **bad)
+            raise AssertionError(f"accepted {bad}")
+        except o.InvalidValue:
+            pass
+    Xg = o.Tensor([1.0, 2.0], 0, o.Desc([1, 2], [2, 1], ["i", "g"]))  # one-sided K only
+    Yg = o.Tensor([1.0, 3.0], 0, o.Desc([2], [1], ["j"]))
+    for call in (lambda: o.kweights_gemm([[1.0]], [[1.0]], 8),                  # k = 1
+                 lambda: o.kweights(Xg, [o.KwPartner(Yg, o.Desc([1, 2], [2, 1], ["i", "j"]),
+                                                     8)])):                      # k_s = 1
+        try:
+            call()
+            raise AssertionError("k <= 1 / k_s <= 1 accepted")
+        except o.NotSupported:
+            pass
+    RESULTS["kweights"] = (f"rule cases {cnt['rule']} (FP64 clamp binding {cnt['clamped_fp64']}"
+                           f"x, max_abs {cnt['clamped_max_abs']}x), guard pairs "
+                           f"{cnt['guard_pairs']}, multi-partner {cnt['multi']}, swapped / "
+                           f"X = B views {cnt['views']}, L5c pairs "
+                           f"{cnt['l5c_pairs']}, CRT outputs {cnt['crt_outputs']}, failing "
+                           f"guard seen on fixtures: {s_found['guard0']}")
+
+
+def seg_band_tensor(A, B, Cflat, alpha, beta, N, rnd, b0, b1, trace=None):
+    """One band of the recipe as the library runs it (DESIGN §3.8 step 1): contract_tensor on
+    the sub-view of row-major A (m x k) and B (k x n), K's extent cut to b1 - b0 and both base
+    pointers advanced by b0 x K's stride; C row-major m x n. Returns C's new flat buffer."""
+    m, n, k = len(A), len(B[0]), len(B)
+    i, j, kk = 1, 2, 3
+    Ad = o.Desc([m, b1 - b0], [k, 1], [i, kk])
+    Bd = o.Desc([b1 - b0, n], [n, 1], [kk, j])
+    Cd = o.Desc([m, n], [n, 1], [i, j])
+    return o.contract_tensor(o.Tensor([v for r in A for v in r], b0, Ad),
+                             o.Tensor([v for r in B for v in r], b0 * n, Bd),
+                             o.Tensor(Cflat, 0, Cd), alpha, beta, N, rnd, trace=trace)
+
+
+def seg_library(A, B, C, N, rnd, bounds, alpha=1.0, beta=0.0):
+    """The recipe's calls through the library's front end: seg_band_tensor per band, band 1
+    with (alpha, beta), later bands with (alpha, 1), C's buffer chained. Returns (C_S as an
+    m x n list, the per-band dispatch kinds)."""
+    m, n = len(A), len(B[0])
+    Cf, kinds = [v for r in C for v in r], []
+    for s, (b0, b1) in enumerate(zip(bounds, bounds[1:])):
+        t = {}
+        Cf = seg_band_tensor(A, B, Cf, alpha, beta if s == 0 else 1.0, N, rnd, b0, b1, t)
+        kinds.append(t["kind"])
+    return [Cf[i * n:(i + 1) * n] for i in range(m)], kinds
+
+
+def seg_compose(A, B, C, N, rnd, bounds, alpha=1.0, beta=0.0):
+    """Independent composition of the K-segmentation recipe: each band's product D_s from a
+    plain library call on the band's sub-view (seg_band_tensor, alpha = 1, beta = 0: GEMM, or
+    DIRECT for a K-empty band of k_s = 1), E_s = RN(alpha D_s), and the accumulation by exact
+    rationals and one correct rounding (round_fraction): C_1 = RN(beta C + E_1) (or E_1 for
+    beta = 0), C_s = RN(C_{s-1} + E_s). Returns (C_S, the per-band D lists)."""
+    m, n = len(A), len(B[0])
+    Ds, out = [], None
+    for b0, b1 in zip(bounds, bounds[1:]):
+        Df = seg_band_tensor(A, B, [0.0] * (m * n), 1.0, 0.0, N, rnd, b0, b1)
+        D = [Df[i * n:(i + 1) * n] for i in range(m)]
+        Ds.append(D)
+        E = [[x if alpha == 1.0 else o.round_fraction(fr(alpha) * fr(x)) for x in r] for r in D]
+        if out is None:
+            out = E if beta == 0.0 else \
+                [[o.round_fraction(fr(beta) * fr(C[i][j]) + fr(E[i][j])) for j in range(n)]
+                 for i in range(m)]
+        else:
+            out = [[o.round_fraction(fr(out[i][j]) + fr(E[i][j])) for j in range(n)]
+                   for i in range(m)]
+    return out, Ds
+
+
+def test_segments():
+    """(13) K-segmentation (NOTES-C1 §4.4, stage 3; DESIGN §3.8 "Segmented accumulation"):
+    oracle.contract_segments against the recipe's calls through contract_tensor on moved
+    sub-views (seg_library) and against an independent composition (seg_compose), S = 1
+    bitwise equal to contract(), segment_bounds against the array_split rule, each band's
+    dispatch (a K-empty band of k_s = 1 runs DIRECT, as the library's), each GEMM band's sigma
+    from the band alone and its z = sum a'b' with the CRT precondition, PROOFS L7's proof
+    skeleton in exact rationals (every band's L3a l1 bound, 0 for a DIRECT band, plus u|D_s|,
+    plus gamma_{S-1} sum |D_s|), determinism across chunk lengths and g, alpha / beta and an
+    unread C (also a K-empty first band with beta not a power of two: one fma), alpha = 0 with
+    unread A and B, band-local flags, the per-band RN acceptance, the decay_opp gain,
+    validation."""
+    rng = random.Random(7303)
+    cnt = {"cases": 0, "outputs": 0, "bands": 0, "direct": 0, "l7_tight": Fraction(0)}
+    # --- segment_bounds: the array_split rule (the first k mod S bands one longer)
+    for k in range(1, 41):
+        for S in range(1, k + 1):
+            bd = o.segment_bounds(k, S)
+            lens = [b1 - b0 for b0, b1 in zip(bd, bd[1:])]
+            assert bd[0] == 0 and bd[-1] == k and len(lens) == S
+            assert lens == [k // S + (1 if s < k % S else 0) for s in range(S)]
+    for bad in ((5, 0), (5, 6), (0, 1)):
+        try:
+            o.segment_bounds(*bad)
+            raise AssertionError(f"segment_bounds{bad} accepted")
+        except o.InvalidValue:
+            pass
+
+    # --- random fixtures: composition, per-band sigma / z / CRT, L7 skeleton, determinism
+    fams = ("uniform", "decay_same", "decay_opp", "opp_nonsep", "outliers", "phi4")
+    for trial in range(48):
+        fam = fams[trial % len(fams)]
+        m, n, k = rng.randrange(1, 4), rng.randrange(1, 4), rng.randrange(4, 41)
+        A, B = kw_fixture(fam, m, n, k, rng)
+        N, rnd = rng.choice([3, 4, 6, 8, 14, 20]), rng.choice(["RN", "TRUNC"])
+        S = rng.randrange(1, 5)
+        bounds = o.segment_bounds(k, S) if trial % 2 == 0 else \
+            [0] + sorted(rng.sample(range(1, k), S - 1)) + [k]
+        t = {}
+        R = o.contract_segments(A, B, [[0.0] * n for _ in range(m)], N, rnd, bounds, trace=t)
+        Rc, Ds = seg_compose(A, B, None, N, rnd, bounds)
+        Rl, kinds = seg_library(A, B, [[0.0] * n for _ in range(m)], N, rnd, bounds)
+        assert all(same_bits(x, y) for r1, r2 in zip(R, Rc) for x, y in zip(r1, r2)), trial
+        assert all(same_bits(x, y) for r1, r2 in zip(R, Rl) for x, y in zip(r1, r2)), trial
+        assert t["bounds"] == bounds and len(t["segments"]) == S and t["partial"][-1] == R
+        assert [ts["kind"] for ts in t["segments"]] == kinds == \
+            ["DIRECT" if b1 - b0 == 1 else "GEMM" for b0, b1 in zip(bounds, bounds[1:])]
+        if S == 1:
+            R1 = o.contract(A, B, [[0.0] * n for _ in range(m)], 1.0, 0.0, N, rnd)
+            assert all(same_bits(x, y) for r1, r2 in zip(R, R1) for x, y in zip(r1, r2))
+        for chunk, g in ((1, 1), (3, None), (7, 2)):
+            Rd = o.contract_segments(A, B, [[0.0] * n for _ in range(m)], N, rnd, bounds,
+                                     chunk=chunk, g=min(g or N, N))
+            assert all(same_bits(x, y) for r1, r2 in zip(R, Rd) for x, y in zip(r1, r2))
+        Bt = [[B[h][j] for h in range(k)] for j in range(n)]
+        u = U
+        gam = Fraction(S - 1) * u / (1 - (S - 1) * u)
+        delta = Fraction(1, 2) if rnd == "RN" else Fraction(1)
+        for s, (b0, b1) in enumerate(zip(bounds, bounds[1:])):
+            ts, ks = t["segments"][s], b1 - b0
+            cnt["bands"] += 1
+            if ks == 1:                   # K-empty: D_s = fma(a, b, +0) = RN(a b), no plan
+                assert all(same_bits(Ds[s][i][j], o.fma(A[i][b0], B[b0][j], 0.0))
+                           for i in range(m) for j in range(n))
+                cnt["direct"] += 1
+                continue
+            plan = ts["plan"]
+            assert plan.k == ks
+            for i in range(m):
+                assert ts["sigma"][i] == o.scale_vector(A[i][b0:b1], o.Plan(N, ks, rnd))[0]
+            for j in range(n):
+                assert ts["tau"][j] == o.scale_vector(Bt[j][b0:b1], o.Plan(N, ks, rnd))[0]
+            for i in range(m):
+                for j in range(n):
+                    qa, qb = ts["QA"][i], ts["QB"][j]
+                    assert sum(abs(o.qvalue(a) * o.qvalue(b)) for a, b in zip(qa, qb)) <= plan.H
+                    assert ts["z"][i][j] == sum(o.qvalue(a) * o.qvalue(b) for a, b in zip(qa, qb))
+        # L7's proof skeleton, exact: |C_S - x| <= sum_s (L3a_s + u|D_s|) + gamma sum_s |D_s|
+        for i in range(m):
+            for j in range(n):
+                x = sum(fr(a) * fr(b) for a, b in zip(A[i], Bt[j]))
+                rhs, sumD = Fraction(0), Fraction(0)
+                for s, (b0, b1) in enumerate(zip(bounds, bounds[1:])):
+                    ts = t["segments"][s]
+                    if b1 - b0 == 1:      # DIRECT: y_s = x_s, only the rounding u|D_s|
+                        l3a = Fraction(0)
+                    else:
+                        sg, ta = ts["sigma"][i], ts["tau"][j]
+                        l1a = sum(abs(fr(v)) for v in A[i][b0:b1])
+                        l1b = sum(abs(fr(v)) for v in Bt[j][b0:b1])
+                        l3a = delta * (Fraction(2) ** -ta * l1a + Fraction(2) ** -sg * l1b) + \
+                            (b1 - b0) * delta ** 2 * Fraction(2) ** -(sg + ta)
+                    Dij = abs(fr(Ds[s][i][j]))
+                    rhs += l3a + u * Dij
+                    sumD += Dij
+                rhs += gam * sumD
+                err = abs(fr(R[i][j]) - x)
+                assert err <= rhs, (trial, i, j)
+                if rhs:
+                    cnt["l7_tight"] = max(cnt["l7_tight"], err / rhs)
+                cnt["outputs"] += 1
+        cnt["cases"] += 1
+
+    # --- alpha / beta: band 1 carries the caller's beta, later bands beta = 1; C unread at
+    # beta = 0; K-empty bands (k_s = 1) first, last and adjacent
+    for trial in range(16):
+        m, n, k = 2, 3, rng.randrange(6, 30)
+        A, B = kw_fixture(rng.choice(fams), m, n, k, rng)
+        C0 = [[rng.uniform(-1, 1) for _ in range(n)] for _ in range(m)]
+        bounds = rng.choice([o.segment_bounds(k, rng.randrange(2, 5)), [0, 1, k],
+                             [0, k - 1, k], [0, 1, 2, k], [0, 3, 4, k]])
+        alpha, beta = rng.choice([(1.0, 1.0), (0.375, 0.0), (3.0, -0.5), (1.0, 2.0 ** -40)])
+        N, rnd = rng.choice([4, 8, 14]), rng.choice(["RN", "TRUNC"])
+        Cin = Poison(m) if beta == 0.0 else C0
+        R = o.contract_segments(A, B, Cin, N, rnd, bounds, alpha=alpha, beta=beta)
+        Rc, _ = seg_compose(A, B, C0, N, rnd, bounds, alpha, beta)
+        Rl, _ = seg_library(A, B, C0, N, rnd, bounds, alpha, beta)
+        assert all(same_bits(x, y) for r1, r2 in zip(R, Rc) for x, y in zip(r1, r2)), trial
+        assert all(same_bits(x, y) for r1, r2 in zip(R, Rl) for x, y in zip(r1, r2)), trial
+    # a K-empty first band with a beta that is not a power of two: C_1 = fma(beta, C, E_1),
+    # one rounding; RN(RN(beta C) + E_1) differs on some outputs here, so the check can fail
+    # (final review of C1/C2: every beta above is 0, 1 or a power of two)
+    rb, twice = random.Random(7311), 0
+    for beta in (0.3, 3.0, -0.7):
+        for alpha in (1.0, 0.375):
+            for first in ([0, 1], [0, 1, 2]):
+                m, n, k = 3, 4, rb.randrange(6, 20)
+                A, B = kw_fixture(rb.choice(fams), m, n, k, rb)
+                C0 = [[rb.uniform(-1, 1) for _ in range(n)] for _ in range(m)]
+                bounds = first + [k]
+                N, rnd = rb.choice([4, 8, 14]), rb.choice(["RN", "TRUNC"])
+                R = o.contract_segments(A, B, C0, N, rnd, bounds, alpha=alpha, beta=beta)
+                Rc, _ = seg_compose(A, B, C0, N, rnd, bounds, alpha, beta)
+                Rl, _ = seg_library(A, B, C0, N, rnd, bounds, alpha, beta)
+                assert all(same_bits(x, y) for r1, r2 in zip(R, Rc) for x, y in zip(r1, r2))
+                assert all(same_bits(x, y) for r1, r2 in zip(R, Rl) for x, y in zip(r1, r2))
+                for i in range(m):
+                    for j in range(n):
+                        D = o.fma(A[i][0], B[0][j], 0.0)
+                        E = D if alpha == 1.0 else o.mul(alpha, D)
+                        twice += not same_bits(o.fma(beta, C0[i][j], E),
+                                               o.fma(1.0, o.mul(beta, C0[i][j]), E))
+    assert twice > 0, "a two-rounding beta step would pass"
+
+    # --- a K-empty band runs DIRECT as in the library (independent review of stage 3, MF1):
+    # k = 1 at N = 3 is fma(0.1, 0.3, +0), not the emulated 0.029997557401657104
+    t = {}
+    R = o.contract_segments([[0.1]], [[0.3]], Poison(1), 3, "RN", [0, 1], trace=t)
+    Rl, kinds = seg_library([[0.1]], [[0.3]], [[0.0]], 3, "RN", [0, 1])
+    assert same_bits(R[0][0], o.fma(0.1, 0.3, 0.0)) and same_bits(R[0][0], Rl[0][0])
+    assert t["segments"][0]["kind"] == kinds[0] == "DIRECT"
+    assert not same_bits(R[0][0], o.contract([[0.1]], [[0.3]], None, 1.0, 0.0, 3)[0][0])
+    A, B = [[0.1, 0.7, -0.2, 0.5]], [[0.9], [-0.3], [0.6], [0.25]]
+    for bounds in ([0, 1, 4], [0, 3, 4], [0, 1, 2, 3, 4]):
+        R = o.contract_segments(A, B, [[0.0]], 3, "RN", bounds)
+        Rl, kinds = seg_library(A, B, [[0.0]], 3, "RN", bounds)
+        assert same_bits(R[0][0], Rl[0][0]), (bounds, R, Rl)
+    # alpha = 0: A and B are not read (None, shapes given), C <- RN(beta C) or +0
+    C0 = [[0.75, -3.0], [2.0 ** -1074, 5.0]]
+    for beta in (0.0, -2.0, 1.0):
+        for bounds in ([0, 2, 5], [0, 1, 5], [0, 4, 5]):
+            Cin = Poison(2) if beta == 0.0 else C0
+            R = o.contract_segments(None, None, Cin, 8, "RN", bounds, alpha=0.0, beta=beta,
+                                    m=2, n=2, k=5)
+            want = [[(0.0 if beta == 0.0 else o.mul(beta, c)) for c in r] for r in C0]
+            assert all(same_bits(x, y) for r1, r2 in zip(R, want) for x, y in zip(r1, r2))
+
+    # --- band-local flags: an Inf in band 2 makes that band native, band 1 stays emulated
+    A = [[0.5, -0.25, 0.125, 1.0, math.inf, 2.0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]
+    B = [[1.0, -1.0], [0.5, 0.25], [2.0, 1.0], [1.0, 1.0], [0.0, 1.0], [1.0, -2.0]]
+    t = {}
+    R = o.contract_segments(A, B, [[0.0] * 2 for _ in range(2)], 8, "RN", [0, 3, 6], trace=t)
+    assert t["segments"][0]["fA"] == [False, False] and t["segments"][1]["fA"] == [True, False]
+    D1 = o.contract([r[:3] for r in A], B[:3], [[0.0] * 2] * 2, 1.0, 0.0, 8)[0]
+    for j in range(2):
+        nat = o.native_dot(A[0][3:], [B[h][j] for h in range(3, 6)])
+        want = o.fma(1.0, D1[j], nat)
+        assert same_bits(R[0][j], want), (R[0][j], want)
+    assert math.isnan(R[0][0]) and R[0][1] == math.inf     # Inf * 0 in column 0, as natively
+
+    # --- RN acceptance is per band: k = 32042 > rn_feasible_kmax(2) = 32041 is rejected
+    # whole at N = 2 and accepted as two bands of 16021
+    k = 32042
+    a = [[(1.0 + h % 7) * 2.0 ** -(h % 5) for h in range(k)]]
+    b = [[(-1.0) ** h * (1.0 + h % 3)] for h in range(k)]
+    try:
+        o.contract(a, b, [[0.0]], 1.0, 0.0, 2, "RN")
+        raise AssertionError("N = 2 RN accepted k = 32042")
+    except o.NotSupported:
+        pass
+    R = o.contract_segments(a, b, [[0.0]], 2, "RN", [0, 16021, k])
+    Rc, _ = seg_compose(a, b, None, 2, "RN", [0, 16021, k])
+    assert same_bits(R[0][0], Rc[0][0])
+
+    # --- the gain on banded anti-correlated data (NOTES-C1 §2.7): max normwise error relative
+    # to the plain norms, decay_opp, k = 240, N = 10: S = 4 bands below the unsegmented call
+    rng2 = random.Random(11)
+    m, n, k = 3, 3, 240
+    A, B = kw_fixture("decay_opp", m, n, k, rng2)
+    Bt = [[B[h][j] for h in range(k)] for j in range(n)]
+
+    def max_nw(R):
+        worst = Fraction(0)
+        for i in range(m):
+            for j in range(n):
+                x = sum(fr(p) * fr(q) for p, q in zip(A[i], Bt[j]))
+                na2 = sum(fr(v) ** 2 for v in A[i])
+                nb2 = sum(fr(v) ** 2 for v in Bt[j])
+                worst = max(worst, (fr(R[i][j]) - x) ** 2 / (na2 * nb2))
+        return float(worst) ** 0.5
+    e1 = max_nw(o.contract(A, B, [[0.0] * n for _ in range(m)], 1.0, 0.0, 10, "RN"))
+    e4 = max_nw(o.contract_segments(A, B, [[0.0] * n for _ in range(m)], 10, "RN",
+                                    o.segment_bounds(k, 4)))
+    assert e4 * 100 < e1, (e1, e4)
+
+    # --- validation
+    A, B = [[1.0] * 4], [[1.0] for _ in range(4)]
+    for bad in ([0, 0, 4], [1, 4], [0, 3], [0, 3, 2, 4], [0], [0, 2, 5], [0, 2.0, 4],
+                [0, "2", 4], 4):
+        try:
+            o.contract_segments(A, B, [[0.0]], 8, "RN", bad)
+            raise AssertionError(f"bounds {bad} accepted")
+        except o.InvalidValue:
+            pass
+    try:
+        o.contract_segments([[]], [], [[0.0]], 8, "RN", k=0)
+        raise AssertionError("k = 0 accepted")
+    except o.InvalidValue:
+        pass
+    for kw in ({"N": 1}, {"N": 21}, {"rounding": "RZ"}, {"g": 9}):   # as each band's call,
+        args = {"N": 8, "rounding": "RN", **kw}                      # also with k_s = 1 only
+        for bounds in ([0, 2, 4], [0, 1, 2, 3, 4]):
+            try:
+                o.contract_segments(A, B, [[0.0]], args["N"], args["rounding"], bounds,
+                                    g=kw.get("g"))
+                raise AssertionError(f"{kw} accepted")
+            except o.InvalidValue:
+                pass
+    assert cnt["direct"] > 0, "no K-empty band among the random fixtures"
+    RESULTS["segments"] = (f"{cnt['cases']} cases ({cnt['bands']} bands, {cnt['direct']} "
+                           f"K-empty / DIRECT, {cnt['outputs']} outputs; "
+                           f"max err / L7 skeleton bound {float(cnt['l7_tight']):.3f}), "
+                           f"decay_opp N = 10 max normwise {e1:.2e} unsegmented vs {e4:.2e} at "
+                           f"S = 4")
+
+
 def sigma_extremes():
     """Theoretical sigma range (§3.2 step 5): k=1 row holding the least subnormal at N=20
     (largest sigma); k = 2^40 rows of values just below 2^1024 at N=2, TRUNC (smallest)."""
@@ -1719,14 +2433,16 @@ def main():
                      ("dgemm-like (7)", test_dgemm_like), ("tensor front end (8)", test_tensor),
                      ("lazy lowering (9)", test_lazy_lower),
                      ("packed operands (10)", test_packed),
-                     ("k alignment (11, v1.13 §4b)", test_k_align)):
+                     ("k alignment (11, v1.13 §4b)", test_k_align),
+                     ("K-weights (12, NOTES-C1)", test_kweights),
+                     ("K-segments (13, NOTES-C1)", test_segments)):
         t1 = time.time()
         fn()
         print(f"PASS  {name:24s} {time.time() - t1:7.1f}s", flush=True)
     hi, hi_rn, lo = sigma_extremes()
     print()
     print("moduli source:", o.MODULI_SOURCE)
-    for key in ("tensor", "packed", "k_align", "params_crosscheck", "fma_checked", "crt_L128_N17_overflows", "neg_rn_without_kappa",
+    for key in ("tensor", "packed", "k_align", "kweights", "segments", "params_crosscheck", "fma_checked", "crt_L128_N17_overflows", "neg_rn_without_kappa",
                 "rn_boundary_N2_k32041", "sweep_runs", "determinism_runs"):
         print(f"{key}: {RESULTS[key]}")
     print(f"bound tightness: max |emul-exact|/l1-bound = {BOUND_STATS['l1_max_ratio']:.3f}; "

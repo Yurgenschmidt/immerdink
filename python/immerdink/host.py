@@ -30,7 +30,7 @@ import ctypes as C
 import ctypes.util
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "workspace_size",
            "workspace_layout", "plan_bytes", "lowering", "g_tradeoff", "PackSpec", "pack_layout",
@@ -63,6 +63,7 @@ PERF_CLASSES = ["k0", "kf", "kl", "pack", "k4_128x256", "k4_128x128", "k4_64x128
 PERF_PHASES = ["K0 vec", "KF fused", "KL A", "KL B", "K2 pack A", "K3 pack B", "K4 gemm",
                "K5 crt", "DIRECT", "K5 beta-only", "call", "pack prep", "pack KL"]
 _PERF_MAX_PARAMS, _PERF_PARAM_CAPACITY, _PERF_MAX_PHASES = 6, 96, 16
+_PERF_PARAM_KL_DROP_SLOT = _PERF_PARAM_CAPACITY - 1  # IMD_PERF_PARAM_KL_DROP_SLOT (v1.19, 95)
 _PERF_BETA_NONZERO, _PERF_ALPHA_ZERO = 1, 2
 _PERF_VEC = {"GENERATE": 1, "RESIDENT": 2}
 _PERF_PACK = {"NONE": 1, "A": 2, "B": 4, "AB": 8}
@@ -503,6 +504,13 @@ class PackSpec:
     batch: tuple = ()
     rows: tuple = ()
 
+    def with_moduli(self, N):
+        """This descriptor at another N (DESIGN v1.19 §6g, a precision phase): every other
+        field, the orders included, unchanged. N is part of a pack's key, so a pack serves
+        one N; a buffer of pack_bytes at the largest N holds the pack at any smaller N (§6a
+        C-pack)."""
+        return replace(self, num_moduli=int(N))
+
 
 class _PackArg:
     """A _PackDesc and the arrays it points to."""
@@ -849,7 +857,9 @@ class Calibration:
                 "warm.pack_l2_bytes": r.pack_l2_hit_bytes,  # v12 (§6c.1; 0: absent)
                 # v13 (DESIGN v1.18 §6c.8; 0: absent)
                 "warm.pack_l2_planes": r.pack_l2_planes, "warm.call_ns": r.warm_call_ns,
-                "warm.clean_byte": r.warm_clean_byte_ns}
+                "warm.clean_byte": r.warm_clean_byte_ns,
+                # v1.19 (§6c.9; 0: absent): stored in param[IMD_PERF_PARAM_KL_DROP_SLOT]
+                "warm.kl_drop": r.param[_PERF_PARAM_KL_DROP_SLOT]}
 
     @property
     def bands(self):

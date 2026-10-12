@@ -64,7 +64,9 @@ typedef struct imd_pack_s* imd_pack_t; /* immutable host object: the key and the
 IMD_API imd_status_t imd_pack_create(imd_handle_t handle, const imd_pack_desc_t* desc,
                                      imd_pack_t* pack);
 IMD_API imd_status_t imd_pack_destroy(imd_pack_t pack);
-/* The packed buffer's bytes (§6b.4) and the workspace imd_pack needs (either may be NULL). */
+/* The packed buffer's bytes (§6b.4) and the workspace imd_pack needs (either may be NULL).
+ * pack_bytes is nondecreasing in N from host API 13 on (DESIGN §6a F2); pack_ws_bytes is not
+ * covered by that promise. */
 IMD_API imd_status_t imd_pack_bytes(imd_pack_t pack, size_t* pack_bytes, size_t* pack_ws_bytes);
 /* Pack X (the FP64 operand the descriptor describes) into `packed` on `stream`. Checks, in
  * order: null pointers (pack; X and packed when pack_bytes > 0; ws when pack_ws_bytes > 0)
@@ -72,8 +74,9 @@ IMD_API imd_status_t imd_pack_bytes(imd_pack_t pack, size_t* pack_bytes, size_t*
  * X or packed); MISALIGNED (X 8 bytes, packed and ws 256); packed_bytes < pack_bytes or
  * ws_bytes < pack_ws_bytes -> INSUFFICIENT_WORKSPACE. Then it only launches kernels (two):
  * no allocation, no synchronization, capture-safe. Every byte of [packed, packed +
- * pack_bytes) is written. The caller orders the packed buffer: contracts that read it
- * after this call (stream order or an event), a re-pack or free after them. */
+ * pack_bytes) is written, and no byte beyond pack_bytes is (guaranteed from host API 13 on,
+ * DESIGN §6a F3). The caller orders the packed buffer: contracts that read it after this
+ * call (stream order or an event), a re-pack or free after them. */
 IMD_API imd_status_t imd_pack(imd_pack_t pack, const double* X, void* packed,
                               size_t packed_bytes, void* ws, size_t ws_bytes,
                               cudaStream_t stream);

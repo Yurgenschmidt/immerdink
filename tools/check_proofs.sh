@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Build the Lean proofs (proofs/) and fail on any escape hatch.
 #
-#   1. grep: no `sorry`, `admit` or `axiom` token anywhere in proofs/Proofs*.
+#   1. grep: no `sorry`, `admit`, `axiom` or `native_decide` token anywhere in proofs/Proofs*
+#      (`native_decide` trusts the compiler: it adds an axiom per use); the moduli in
+#      proofs/Proofs/Moduli.lean must equal spec/params_out.json's.
 #   2. lake build must succeed (Mathlib oleans come from `lake exe cache get`).
 #   3. #print axioms on every headline theorem listed in proofs/AxiomCheck.lean must
 #      report only Lean's standard axioms (propext, Classical.choice, Quot.sound).
@@ -11,18 +13,35 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Lean/Mathlib elaboration is memory-hungry: run inside the shared budget.
-grep -q "/immerdink.slice/" /proc/self/cgroup 2>/dev/null || exec "$ROOT/tools/memcap.sh" "$ROOT/tools/check_proofs.sh" "$@"
+# (Without a systemd user manager memcap.sh runs the command uncapped and outside the slice, so
+# the marker stops a second re-exec.)
+if ! grep -q "/immerdink.slice/" /proc/self/cgroup 2>/dev/null && [[ -z "${IMMERDINK_IN_MEMCAP:-}" ]]; then
+  export IMMERDINK_IN_MEMCAP=1
+  exec "$ROOT/tools/memcap.sh" "$ROOT/tools/check_proofs.sh" "$@"
+fi
 PROOFS="$ROOT/proofs"
 LAKE="${LAKE:-$(command -v lake || echo "$HOME/.elan/bin/lake")}"
 
 cd "$PROOFS"
 
-echo "== grep for sorry/admit/axiom"
-if grep -rnwE 'sorry|admit|axiom' Proofs Proofs.lean; then
+echo "== grep for sorry/admit/axiom/native_decide"
+if grep -rnwE 'sorry|admit|axiom|native_decide' Proofs Proofs.lean; then
   echo "FAIL: forbidden token found above" >&2
   exit 1
 fi
 echo "ok: none found"
+
+echo "== Moduli.lean's moduli match spec/params_out.json"
+python3 - "$PROOFS/Proofs/Moduli.lean" "$ROOT/spec/params_out.json" <<'PY'
+import json, re, sys
+src = open(sys.argv[1]).read()
+m = re.search(r"def moduli : List ℕ :=\s*\[([^\]]*)\]", src)
+lean = [int(t) for t in m.group(1).replace("\n", " ").split(",")] if m else None
+spec = [int(t) for t in json.load(open(sys.argv[2]))["moduli"]]
+if lean != spec:
+    sys.exit(f"FAIL: Lean moduli {lean} != params_out.json {spec}")
+print(f"ok: {len(spec)} moduli agree")
+PY
 
 echo "== lake exe cache get"
 "$LAKE" exe cache get >/dev/null 2>&1 || echo "warning: cache get failed (offline?)"
@@ -37,7 +56,8 @@ if [[ -f AxiomCheck.lean ]]; then
   echo "== #print axioms (headline theorems)"
   out="$("$LAKE" env lean AxiomCheck.lean 2>&1)" || { echo "$out"; echo "FAIL: AxiomCheck.lean" >&2; exit 1; }
   echo "$out" | grep -cE "depends on axioms|does not depend on any axioms" | sed 's/^/theorems checked: /'
-  bad="$(echo "$out" | grep -oE '\[[^]]*\]' | tr -d '[]' | tr ',' '\n' | sed 's/ //g' \
+  # Lean wraps a long axiom list over several lines: join the output before parsing it.
+  bad="$(echo "$out" | tr '\n' ' ' | grep -oE '\[[^]]*\]' | tr -d '[]' | tr ',' '\n' | sed 's/ //g' \
          | grep -vE '^(propext|Classical\.choice|Quot\.sound)?$' || true)"
   if [[ -n "$bad" ]] || echo "$out" | grep -q "error"; then
     echo "$out"

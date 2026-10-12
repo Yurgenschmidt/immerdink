@@ -1770,6 +1770,119 @@ def suite_perf_v118(cal):
     return count
 
 
+V119_KEY = "warm.kl_drop"
+
+
+def suite_perf_v119(cal):
+    """DESIGN v1.19 §6c.9 (host API 13, no struct growth): the optional key warm.kl_drop, the
+    share of the REPEAT / WARM saving that KL reads do not get (stored in the last parameter
+    slot past the classes). Absent or 0 predicts bit-identically; format 2 only, a number in
+    [0, 1], written only when non-zero, round trip; KL phases keep (1 - d) of the saving, every
+    other phase, COLD and CLEAN are unchanged; d = 1 puts a KL read at its COLD time."""
+    count = 0
+    shapes = [("ik,kj->ij", dict(i=1600, k=1600, j=100)),     # KL, narrow n, inputs resident
+              ("abcd,cdij->abij", dict(a=40, b=40, c=40, d=40, i=10, j=10)),  # the Jacobi view
+              ("ik,jk->ij", dict(i=1024, j=1024, k=1024)),   # KF, inputs resident
+              ("ik,jk->ij", dict(i=256, j=256, k=256)),
+              ("ik,jk->ij", dict(i=2048, j=2048, k=2048)),   # KL, nothing resident
+              ("ik,jk->ij", dict(i=1500, j=96, k=40000))]
+    caches = ("COLD", "REPEAT", "WARM", "CLEAN")
+
+    def preds(c):
+        return [host.predict(sp, ex, N=N, g=g, regime=rg, cache=cc, calib=c)
+                for sp, ex in shapes for N in (4, 8, 14) for g in (0, 4)
+                for rg in ("BURST", "SUSTAINED") for cc in caches]
+
+    # (1) absent == explicit 0 == the calibration without the key, bit for bit
+    extra0 = dict(cal.extra, **{V119_KEY: 0.0})
+    base = host.Calibration.from_values(cal.meta, cal.params, extra=extra0)
+    tb = base.format()
+    if f"\n{V119_KEY} = " in tb:
+        raise Fail("warm.kl_drop written although 0")
+    explicit = host.Calibration.parse(tb + f"{V119_KEY} = 0\n")
+    if bytes(explicit._raw) != bytes(base._raw) or explicit.format() != tb:
+        raise Fail("warm.kl_drop: explicit 0 is not the calibration without it")
+    p0 = preds(base)
+    if preds(explicit) != p0:
+        raise Fail("warm.kl_drop explicitly 0 does not predict bit-identically")
+    count += len(p0) + 1
+    # (2) grammar: optional, format 2 only, a number in [0, 1], not repeated
+    d1 = 0.35
+    full = host.Calibration.from_values(cal.meta, cal.params, extra=dict(extra0, **{V119_KEY: d1}))
+    tf = full.format()
+    if f"\n{V119_KEY} = " not in tf or full.warm[V119_KEY] != d1 or full.extra[V119_KEY] != d1:
+        raise Fail("warm.kl_drop not written or not in Calibration.warm / .extra")
+    back = host.Calibration.parse(tf)
+    if bytes(back._raw) != bytes(full._raw) or back.format() != tf:
+        raise Fail("warm.kl_drop round trip")
+    # the slot is the named constant (the last slot); the file names the key, so the text does
+    # not depend on it: the key's line is the only difference to the calibration without it
+    if (host._PERF_PARAM_KL_DROP_SLOT != host._PERF_PARAM_CAPACITY - 1 or
+            host._PERF_PARAM_KL_DROP_SLOT < len(host.PERF_CLASSES) * host._PERF_MAX_PARAMS or
+            full._raw.param[host._PERF_PARAM_KL_DROP_SLOT] != d1 or
+            any(full._raw.param[i] != base._raw.param[i]
+                for i in range(host._PERF_PARAM_CAPACITY) if i != host._PERF_PARAM_KL_DROP_SLOT)):
+        raise Fail("warm.kl_drop is not in param[IMD_PERF_PARAM_KL_DROP_SLOT] alone")
+    if [ln for ln in tf.splitlines() if ln not in tb.splitlines()] != [f"{V119_KEY} = {d1}"]:
+        raise Fail("warm.kl_drop: the text differs from the calibration without it by more "
+                   "than the key's line")
+    count += 2
+    v6 = host.Calibration.load(os.path.join(ROOT, "tests/data/perf_calib_v6_format1.calib"))
+    for why, (t, reason) in {"format-2 key in format 1": (v6.format() + f"{V119_KEY} = 0.5\n",
+                                                          "FORMAT2_KEY"),
+                             "negative": (tb + f"{V119_KEY} = -0.1\n", "VALUE"),
+                             "above 1": (tb + f"{V119_KEY} = 1.01\n", "VALUE"),
+                             "not a number": (tb + f"{V119_KEY} = nan\n", "VALUE"),
+                             "repeated": (tf + f"{V119_KEY} = 0.5\n", "REPEATED_KEY")}.items():
+        try:
+            host.Calibration.parse(t)
+            raise Fail(f"accepted warm.kl_drop: {why}")
+        except host.CalibrationError as e:
+            if e.reason != reason or e.key != V119_KEY:
+                raise Fail(f"warm.kl_drop {why}: {e.reason} {e.key}")
+        count += 1
+    for ok in (0.0, 1.0, 0.75):
+        host.Calibration.parse(tb + f"{V119_KEY} = {ok}\n")
+        count += 1
+    # (3) the rule: with a small Delta nothing is clamped, so a KL phase's REPEAT time is
+    # COLD - (1 - d) (COLD - REPEAT at d = 0); every other phase, COLD and CLEAN are unchanged
+    lw, dl = 6.0e7, 1e-4
+    cw = host.Calibration.from_values(cal.meta, cal.params, extra=dict(
+        extra0, **{"warm.l2_bytes": lw, "warm.l2byte": dl}))
+    n_seen = {"kl": 0, "kf": 0, "kl_none": 0}
+    for d in (0.25, 0.8, 1.0):
+        cd = host.Calibration.from_values(cal.meta, cal.params, extra=dict(
+            extra0, **{"warm.l2_bytes": lw, "warm.l2byte": dl, V119_KEY: d}))
+        for sp, ex in shapes:
+            for N in (4, 8, 14):
+                for g in (0, 4):
+                    kw = dict(N=N, g=g, regime="BURST")
+                    c0 = {st: host.predict(sp, ex, cache=st, calib=cw, **kw) for st in caches}
+                    cx = {st: host.predict(sp, ex, cache=st, calib=cd, **kw) for st in caches}
+                    if c0["COLD"].status != "SUCCESS":
+                        continue
+                    if repr(cx["COLD"]) != repr(c0["COLD"]) or repr(cx["CLEAN"]) != repr(c0["CLEAN"]):
+                        raise Fail(f"warm.kl_drop changed COLD / CLEAN: {sp} {ex} N={N} g={g}")
+                    if [q.time_s for q in cx["WARM"].phases] != [q.time_s for q in cx["REPEAT"].phases]:
+                        raise Fail("WARM is not REPEAT with warm.kl_drop")
+                    for a, b, r in zip(c0["COLD"].phases, c0["REPEAT"].phases, cx["REPEAT"].phases):
+                        if a.cls == "kl":
+                            want = a.time_s - (1 - d) * (a.time_s - b.time_s)
+                            if not close(r.time_s, want, 1e-12):
+                                raise Fail(f"KL phase {r.name}: {r.time_s} vs {want} (d={d})")
+                            n_seen["kl" if a.time_s != b.time_s else "kl_none"] += 1
+                            if d == 1.0 and r.time_s != a.time_s:
+                                raise Fail("d = 1: a KL read keeps part of the saving")
+                        else:
+                            if r.time_s != b.time_s:
+                                raise Fail(f"warm.kl_drop changed the non-KL phase {r.name}")
+                            n_seen["kf"] += a.cls == "kf" and a.time_s != b.time_s
+                    count += 1
+    if not (n_seen["kl"] and n_seen["kf"] and n_seen["kl_none"]):
+        raise Fail(f"warm.kl_drop: the rule is not exercised on all sides: {n_seen}")
+    return count
+
+
 def suite_calib_errors(cal, lib_path):
     """Host API 10 (DESIGN §6c.3): every calibration rejection as a CalibrationError with its
     line, reason, key and message; the shipped calibration loads (no error kept); the
@@ -2199,6 +2312,10 @@ def suite_perf(args):
     if args.verbose:
         print(f"  ok  v1.18: {n_v118} checks (seven optional keys, grammar, CLEAN / REPEAT cache "
               f"terms, S with planes, boost clock, busy power, DRAM energy, v12 view)")
+    n_v119 = suite_perf_v119(cal)  # DESIGN v1.19 §6c.9 (host API 13, warm.kl_drop)
+    if args.verbose:
+        print(f"  ok  v1.19: {n_v119} checks (warm.kl_drop optional, grammar, KL share of the "
+              f"REPEAT saving, COLD / CLEAN / non-KL phases unchanged)")
     if args.verbose:
         print(f"  ok  calibration round trip, {n_feat} feature transcriptions, K4 == A3 "
               f"estimate, {mono} monotonicity pairs, statuses, packed, {n_rank} ranked "

@@ -124,7 +124,14 @@ typedef struct {
 IMD_API uint32_t imd_host_api_version(void);
 
 /* Exact workspace bytes of DESIGN §4a (the bytes imd_contract needs). SUCCESS,
- * INVALID_VALUE or NOT_SUPPORTED (§5 rows 1-5); never applies the §3.2 RN acceptance rule. */
+ * INVALID_VALUE or NOT_SUPPORTED (§5 rows 1-5); never applies the §3.2 RN acceptance rule.
+ * Guaranteed from host API 13 on (§6a F1): with the descriptors, mode and vec_mode fixed, the
+ * bytes are nondecreasing in N at every fixed g >= 1, in g in [1, N], and in N with g = 0,
+ * where the query succeeds. The one status that depends on (N, g), INVALID_VALUE for a size
+ * past uint64, occurs only at the largest N and g, so the N where it succeeds at a fixed g
+ * form an interval. If it succeeds at (N_max, g_max), it succeeds at every (N, g) with
+ * g <= N <= N_max and g <= g_max (g = 0 counts as N) with at most those bytes, so that one
+ * workspace serves the plans at all of them (§6a C-ws). */
 IMD_API imd_status_t imd_workspace_size(const imd_tensor_t* A, const imd_tensor_t* B,
                                         const imd_tensor_t* C, const imd_options_t* options,
                                         size_t* bytes);
@@ -342,7 +349,11 @@ typedef struct {
  * overflow); NOT_SUPPORTED (§6b.3: K empty after dropping extent-1 labels, or RN with k >= 2
  * and kappa >= T). With INVALID_VALUE only struct_size and status are written; with
  * NOT_SUPPORTED also the sizes and the layout (key_digest 0). A pack with b r k = 0 is valid
- * and has 0 bytes. */
+ * and has 0 bytes. Guaranteed from host API 13 on (§6a F2): with the rest of the descriptor
+ * fixed, pack_bytes is nondecreasing in N where it is reported (a size past uint64 occurs
+ * only at the largest N), so a buffer of the largest N's pack_bytes holds the pack at any
+ * smaller N (§6a C-pack). pack_ws_bytes and the region offsets carry no such
+ * promise (a caller sizing imd_pack's workspace once takes the maximum over its N). */
 IMD_API imd_status_t imd_pack_layout(const imd_pack_desc_t* desc, imd_pack_layout_t* out);
 
 /* GIVEN descriptor of operand `operand` (0 = the caller's A, 1 = B) with exactly the classes
@@ -364,7 +375,13 @@ IMD_API imd_status_t imd_pack_desc_for(const imd_tensor_t* A, const imd_tensor_t
  * region order, bytes = 0 = absent). Statuses: imd_workspace_size's (§5 rows 1-5), then
  * each pack descriptor's (imd_pack_layout: INVALID_VALUE / NOT_SUPPORTED), then
  * PACK_MISMATCH (the plan-time compatibility check, no GPU needed). Never the §3.2 kappa
- * rule of the plan. */
+ * rule of the plan. From host API 13 on, F1 holds as for imd_workspace_size with the packed
+ * roles fixed too (each pack descriptor at the query's N and rounding). One more status
+ * depends on N: an RN pack is NOT_SUPPORTED at the smallest N, those where kappa >= T(N).
+ * INVALID_VALUE also covers a pack's size past uint64, at the largest N. So if the query
+ * succeeds at (N_max, g_max), every (N, g) below it (as for imd_workspace_size) either
+ * succeeds with at most those bytes or is that NOT_SUPPORTED. The N where it succeeds at a
+ * fixed g form an interval, not an up-set. */
 IMD_API imd_status_t imd_workspace_size_packed(const imd_tensor_t* A, const imd_tensor_t* B,
                                                const imd_tensor_t* C,
                                                const imd_options_t* options,
@@ -403,6 +420,8 @@ IMD_API const char* imd_status_string(imd_status_t status);
                                        read, and each is written as itself                  */
 #define IMD_PERF_MAX_PARAMS 6       /* parameters (features) per class                       */
 #define IMD_PERF_PARAM_CAPACITY 96  /* imd_perf_calib_t.param slots: class * 6 + j            */
+#define IMD_PERF_PARAM_KL_DROP_SLOT (IMD_PERF_PARAM_CAPACITY - 1) /* param[] slot of warm.kl_drop
+                                       (v1.19, 95): the last slot, past every class's slots     */
 #define IMD_PERF_MAX_PHASES 16      /* imd_perf_t.phase capacity                              */
 
 /* Kernel classes (one parameter set each; file key prefix in parentheses). */
@@ -510,7 +529,16 @@ typedef struct {
   double l2_bytes;                /* L2 cache bytes: the K4 DRAM term counts a group's operand
                                      and plane bytes beyond it (§6c.1)                      */
   char gpu[64], date[32], version[64], clocks[128], notes[128];
-  double param[IMD_PERF_PARAM_CAPACITY]; /* param[class * IMD_PERF_MAX_PARAMS + j]; 0 unused */
+  double param[IMD_PERF_PARAM_CAPACITY]; /* param[class * IMD_PERF_MAX_PARAMS + j]; 0 unused;
+                             v1.19 (§6c.9): param[IMD_PERF_PARAM_KL_DROP_SLOT] = key
+                             warm.kl_drop (optional, 0 when absent, in [0, 1]), the share of
+                             the REPEAT / WARM saving that KL reads do not get. The file names
+                             the key, so the text format does not depend on the slot. The
+                             struct's layout and size are unchanged (the slot was unused), but
+                             the slot is now meaningful: a hand-built imd_perf_calib_t MUST
+                             zero `param` (memset the struct): the last slot is read, and a
+                             nonzero one is a warm.kl_drop (outside [0, 1]: not a valid
+                             calibration)                                                     */
   /* ---- v7 (format 2). A caller with a version-6 struct_size gets a true format-1 view of a
    *      format-2 calibration: the format-2 parameters zeroed, built-in occupancy, no power
    *      model, no cache term, no bands: a degraded model. Such callers should pass NULL. ---- */

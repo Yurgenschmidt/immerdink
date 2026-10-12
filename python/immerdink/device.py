@@ -24,11 +24,11 @@ import ctypes as ct
 from . import _arrays, _capi, host
 from ._arrays import DeviceArray, get_cai_stream_policy, set_cai_stream_policy, stream_handle
 
-__all__ = ["Handle", "Plan", "Pack", "PlanCache", "Layout", "DeviceArray", "contract",
-           "workspace_size", "pack_spec", "default_handle", "default_plan_cache",
-           "load_library", "ImmerdinkError", "InvalidValueError", "NotSupportedError",
-           "AliasingError", "InsufficientWorkspaceError", "MisalignedError", "CudaError",
-           "AllocFailedError", "PackMismatchError", "set_cai_stream_policy",
+__all__ = ["Handle", "Plan", "Pack", "PackedBuffer", "PackRecord", "PlanCache", "Layout",
+           "DeviceArray", "contract", "workspace_size", "pack_spec", "default_handle",
+           "default_plan_cache", "load_library", "ImmerdinkError", "InvalidValueError",
+           "NotSupportedError", "AliasingError", "InsufficientWorkspaceError", "MisalignedError",
+           "CudaError", "AllocFailedError", "PackMismatchError", "set_cai_stream_policy",
            "get_cai_stream_policy"]
 
 ImmerdinkError = host.ImmerdinkError
@@ -319,6 +319,7 @@ class Pack:
         self._x = _Expect(_as_desc(spec.tensor), "X")
         self._fn = self.lib.lib.imd_pack
         self._layout = None
+        self._rec = None        # PackRecord of this pack's key (PackedBuffer), made on first use
         self._lock = threading.Lock()
         self._users = 0         # open plans made with this pack (they pass its handle)
         self.closed = False
@@ -344,25 +345,45 @@ class Pack:
             self._layout = host.pack_layout(self.spec, lib=self.lib.host)
         return self._layout
 
+    @property
+    def record(self):
+        """The PackRecord of this pack's key: what a PackedBuffer records when this pack is
+        written into it, and what a plan made with it expects (DESIGN v1.19 §6g)."""
+        if self._rec is None:
+            self._rec = PackRecord(int(self.spec.num_moduli), self.spec.rounding, self.pack_bytes,
+                                   self.layout.key_digest)
+        return self._rec
+
     def pack(self, X, out, *, workspace=None, stream=None):
         """imd_pack: X (float64, the descriptor's layout) -> `out` (>= pack_bytes, 256-byte
-        aligned) on `stream`; `workspace` >= workspace_bytes. Returns out."""
+        aligned) on `stream`; `workspace` >= workspace_bytes. `out` may be a PackedBuffer:
+        it then records this pack (DESIGN v1.19 §6g). Returns out."""
         s = stream_handle(stream)
         h = self._h
         if self.closed:
             raise ValueError(f"{self!r} is closed")
         dev = self.handle.device
         px = _ptr(X, self._x, s, device=dev)
-        po, no = _arrays.buffer(out, "packed buffer", stream=s, device=dev)
         pw, nw = _arrays.buffer(workspace, "workspace", stream=s, device=dev)
-        st = self._fn(h, px, po, no, pw, nw, s)
+        if isinstance(out, PackedBuffer):
+            rec = self.record
+            po, no = out._resolve("packed buffer", True, s, dev)
+            with out._lock:     # the record follows host enqueue order
+                st = self._fn(h, px, po, no, pw, nw, s)
+                if st == 0:
+                    out._last = rec
+                elif st == 6:   # CUDA_ERROR: the launches may have run in part
+                    out._last = None
+        else:
+            po, no = _arrays.buffer(out, "packed buffer", stream=s, device=dev)
+            st = self._fn(h, px, po, no, pw, nw, s)
         if st:
             raise _error(st, "imd_pack", f" (pack {self.pack_bytes} bytes, workspace "
                                          f"{self.workspace_bytes} bytes needed; given {no}, {nw})")
         return out
 
     def pack_ptr(self, X, packed, packed_bytes, ws, ws_bytes, stream=0):
-        """imd_pack with raw integers (no Python-side layout check)."""
+        """imd_pack with raw integers (no Python-side layout check; no PackedBuffer record)."""
         if self.closed:
             raise ValueError(f"{self!r} is closed")
         st = self._fn(self._h, X, packed, packed_bytes, ws, ws_bytes, stream)
@@ -390,6 +411,88 @@ class Pack:
     def __repr__(self):
         return (f"<immerdink.Pack {self.pack_bytes} bytes, workspace {self.workspace_bytes}"
                 f"{', closed' if self.closed else ''}>")
+
+
+class PackRecord(namedtuple("PackRecord", "N rounding pack_bytes key_digest")):
+    """What a PackedBuffer holds: N, rounding ("RN" / "TRUNC"), pack_bytes and the key digest
+    (imd_pack_layout's FNV-1a of the key words: diagnostics only) of a pack."""
+    __slots__ = ()
+
+
+class PackedBuffer:
+    """A caller-owned packed buffer that remembers the pack last written into it (DESIGN v1.19
+    §6g, re-packing one buffer at several N).
+
+    buf: a contiguous CUDA array (any dtype), an (int pointer, nbytes) tuple, or an int
+    pointer with `nbytes`; nbytes (optional for an array) caps the bytes used. Pack.pack(X,
+    PackedBuffer) records the pack's PackRecord on the host at enqueue, under a lock;
+    Plan.contract / immerdink.contract refuse a PackedBuffer whose record differs from the
+    plan slot's pack (PackMismatchError, e.g. "buffer last packed at N=8, plan expects
+    N=14"), and one with no record. Allocates nothing; raw buffers behave as before.
+
+    A safety net, not a proof: the key digest is a hash, and the record follows host enqueue
+    order, not GPU order. Under CUDA graph replay, or across streams ordered by events, the
+    record can differ from what the GPU sees (a graph that captured a contract on the buffer
+    must not be replayed after a re-pack with another key; DESIGN §6b.7). It guards the plain
+    stream-ordered pattern only. Pack.pack_ptr and other writes bypass the record. One host
+    thread per buffer: the lock covers the record, not the contract's enqueue, so a Pack.pack
+    into the buffer from another thread between the check and the enqueue is not seen;
+    callers that pack and contract on one buffer from several threads serialize them."""
+
+    __slots__ = ("buf", "nbytes", "_last", "_lock")
+
+    def __init__(self, buf, nbytes=None):
+        if isinstance(buf, PackedBuffer):
+            raise TypeError("buf is already a PackedBuffer")
+        if buf is None:
+            raise ValueError("PackedBuffer needs a buffer")
+        if isinstance(buf, int):
+            if nbytes is None:
+                raise ValueError("a raw pointer needs nbytes")
+            buf = (buf, int(nbytes))
+        self.buf = buf
+        self.nbytes = None if nbytes is None else int(nbytes)
+        self._last = None
+        self._lock = threading.Lock()
+
+    @property
+    def last_pack(self):
+        """The PackRecord of the last successful Pack.pack into this buffer, or None."""
+        return self._last
+
+    def _resolve(self, what, writable, stream, device):
+        p, n = _arrays.buffer(self.buf, what, writable, stream, device)
+        if self.nbytes is not None:
+            if self.nbytes > n:
+                raise ValueError(f"{what}: nbytes {self.nbytes} > the buffer's {n} bytes")
+            n = self.nbytes
+        return p, n
+
+    def _expect(self, rec, what):
+        """PackMismatchError unless the recorded pack is `rec` (lock-and-compare: the lock
+        guards the read of the record only; the caller's enqueue follows it unlocked)."""
+        with self._lock:
+            got = self._last
+        if got == rec:
+            return
+        if got is None:
+            msg = "no pack recorded (written only by Pack.pack into this PackedBuffer)"
+        elif got.N != rec.N:
+            msg = f"buffer last packed at N={got.N}, plan expects N={rec.N}"
+        elif got.rounding != rec.rounding:
+            msg = f"buffer last packed with {got.rounding}, plan expects {rec.rounding}"
+        else:
+            msg = (f"buffer last packed with another key (digest {got.key_digest:#x}, "
+                   f"{got.pack_bytes} bytes), plan expects digest {rec.key_digest:#x}")
+        e = PackMismatchError(8, what)
+        e.args = (f"{what}: {msg}",)
+        raise e
+
+    def __repr__(self):
+        r = self._last
+        return ("<immerdink.PackedBuffer " +
+                ("never packed" if r is None else
+                 f"last packed at N={r.N} {r.rounding}, {r.pack_bytes} bytes") + ">")
 
 
 def _pack_specs(packs):
@@ -539,8 +642,9 @@ class Plan:
         """C <- alpha A.B + beta C on `stream` (imd_contract / imd_contract_packed). A, B, C:
         float64 CUDA arrays of the plan's shapes and strides; workspace: >= workspace_bytes
         (256-byte aligned), at most one in-flight call per workspace; packed: (buffer or
-        None, buffer or None), the packed buffers of a packed plan's slots. No allocation,
-        no synchronization: capture-safe. Returns C."""
+        None, buffer or None), the packed buffers of a packed plan's slots (a PackedBuffer
+        must hold the slot's pack: PackMismatchError otherwise, DESIGN v1.19 §6g). No
+        allocation, no synchronization: capture-safe. Returns C."""
         h = self._h
         if h is None:
             raise ValueError("plan is closed")
@@ -574,7 +678,10 @@ class Plan:
                     raise ValueError(f"packed[{x}] given for an in-line operand")
                 ops.append(_capi.Operand(data, None, 0, None))
             else:
-                if isinstance(buf, tuple) or buf is None:
+                if isinstance(buf, PackedBuffer):    # DESIGN v1.19 §6g
+                    buf._expect(pk.record, f"packed[{x}]")
+                    p, n = buf._resolve(f"packed[{x}]", False, s, self.device)
+                elif isinstance(buf, tuple) or buf is None:
                     p, n = _arrays.buffer(buf, f"packed[{x}]")
                 else:
                     p, n = _arrays.buffer(buf, f"packed[{x}]", False, s, self.device)

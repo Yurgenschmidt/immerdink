@@ -1,0 +1,23 @@
+# C1 MC-3a (docs/NOTES-C1.md §5.9, MC-3a item 4): the fresh narrow-KL hold-out, committed BEFORE
+# the refit of the two new optional keys (DESIGN §6c.9) and never used to fit or choose them.
+# Shapes of M-c's missed class and a contrast: the KL path (k_hat > 1024) with a narrow n
+# (n <= 160) whose inputs lie inside the REPEAT window (A about 15-19 MB, B about 1-2 MB), in a
+# square, a tensor and a transposed-B spec; and the KF path at a similar footprint (inputs
+# 17-20 MB). N = 4, 8, 13 (the small-N levels M-c and Q24 used and the anchor 8), both data
+# sets (normal, and decay_opp as bench/sweep_mc.txt). 5 shapes x 3 N x 2 data = 30 timed calls.
+# bench/sweep_disjoint.py checks, by extents, that no shape is in bench/sweep_calib.txt,
+# bench/sweep_calib_n.txt, bench/sweep_mc.txt or bench/sweep_perf_validate.txt (also in
+# sweep_disjoint_selftest; NOTES-C1 §5.11). Run like the hold-out (bench/run_sweep.sh: quiet
+# gate, GPU lock, 3 s warm-up, stock clocks); judged with bench/perf_validate.py against
+# DESIGN §6c.5's targets.
+# name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
+h_kl1n    | ik,kj->ij | i=1536,k=1536,j=112 | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_kl1d    | ik,kj->ij | i=1536,k=1536,j=112 | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1 --data decay_opp
+h_kl2n    | abcd,cdij->abij | a=38,b=38,c=36,d=36,i=10,j=13 | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_kl2d    | abcd,cdij->abij | a=38,b=38,c=36,d=36,i=10,j=13 | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1 --data decay_opp
+h_kl3n    | ik,jk->ij | i=1152,j=80,k=1664 | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_kl3d    | ik,jk->ij | i=1152,j=80,k=1664 | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1 --data decay_opp
+h_kf1n    | ik,kj->ij | i=1216,k=1024,j=1216 | imd | 4,8,13 | --reps 100 --phase-reps 10 --max-seconds 1
+h_kf1d    | ik,kj->ij | i=1216,k=1024,j=1216 | imd | 4,8,13 | --reps 100 --phase-reps 10 --max-seconds 1 --data decay_opp
+h_kf2n    | ik,jk->ij | i=1088,j=1088,k=896 | imd | 4,8,13 | --reps 100 --phase-reps 10 --max-seconds 1
+h_kf2d    | ik,jk->ij | i=1088,j=1088,k=896 | imd | 4,8,13 | --reps 100 --phase-reps 10 --max-seconds 1 --data decay_opp
