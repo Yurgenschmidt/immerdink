@@ -113,6 +113,13 @@ class Basics(RunnerBase):
         self.assertEqual(rc, 0, e)
         self.assertEqual(rs.read_json(os.path.join(self.out, rs.LOCK))["pin_check"], "skipped")
 
+    def test_relative_paths(self):
+        m = self.manifest([fx.py_exp("work", fx.WRITE_OK)])
+        cmd = [fx.PY, "-I", RUNNER, "run", os.path.relpath(m, self.tmp), "--out", "out", "--src", "src", "--build", "bld"]
+        r = subprocess.run(cmd, cwd=self.tmp, env=ENV, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(rs.verify_exp(os.path.join(self.tmp, "out", "exp", "work"))[0], "ok")
+
     def test_lint_errors_block(self):
         m = self.manifest([fx.py_exp("work", fx.WRITE_OK, est=-1)])
         rc, o, e = run_runner(m, self.out, self.src)

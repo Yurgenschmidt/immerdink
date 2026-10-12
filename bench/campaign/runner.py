@@ -186,7 +186,9 @@ class Terminated(Exception):
 
 class Run:
     def __init__(self, a):
-        self.a = a
+        a.src, a.build, a.manifest = os.path.abspath(a.src), os.path.abspath(a.build), os.path.abspath(a.manifest)
+        a.copy_to = os.path.abspath(a.copy_to) if a.copy_to else None
+        self.a = a      # (experiments run in their own folders: every path they receive must be absolute)
         self.out = os.path.abspath(a.out)
         self.m = mf.load(a.manifest)
         self.child = None
