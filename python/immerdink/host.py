@@ -81,7 +81,7 @@ INFEASIBLE = {"STATUS": 1, "BUDGET": 2, "ACCURACY": 4}  # imd_perf_candidate_t.i
 # §6c.1): kf.elem and pack.dram, optional (absent = 0).
 FORMAT2_PARAMS = frozenset({"k0.chain", "kl.wave", "pack.chain", "pack.wave", "k5.chain",
                             "k5.dram",
-                            "direct.chain", "beta.chain", "kf.elem", "pack.dram"})
+                            "direct.chain", "beta.chain", "kf.elem", "pack.dram", "kl.chain"})
 
 
 # Host API 10 (DESIGN §6c.3): why a calibration was rejected (IMD_PERF_CALIB_*, by value).

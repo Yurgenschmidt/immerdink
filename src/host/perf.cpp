@@ -51,7 +51,7 @@ const char* const kClassNames[IMD_PERF_CLASS_COUNT] = {
 const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
     {"launch", "byte", "chain", nullptr, nullptr, nullptr},          // k0
     {"launch", "byte", "op", "row", "elem", "chain"},                // kf (v1.17: elem)
-    {"launch", "byte", "op", "l2byte", nullptr, "wave"},             // kl (slot 4: retired op_eps)
+    {"launch", "byte", "op", "l2byte", "chain", "wave"},             // kl (v1.20: chain; was op_eps)
     {"launch", "byte", "op", "dram", "chain", "wave"},               // pack (v1.17: dram)
     {"round", "mac1", nullptr, nullptr, "byte", "mac_ktail"},        // k4_128x256 (1 CTA per SM)
     {"round", "mac1", "mac2", nullptr, "byte", "mac_ktail"},         // k4_128x128 (2)
@@ -67,7 +67,7 @@ const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
 constexpr bool kFormat2Param[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, true, false, false, false},   // k0.chain
     {false, false, false, false, true, false},   // kf.elem (v1.17; kf.chain is format 1)
-    {false, false, false, false, false, true},   // kl.wave
+    {false, false, false, false, true, true},    // kl.chain (v1.20), kl.wave
     {false, false, false, true, true, true},     // pack.dram (v1.17), pack.chain, pack.wave
     {}, {}, {}, {},
     {false, false, false, true, true, false},    // k5.chain, k5.dram
@@ -77,8 +77,10 @@ constexpr bool kFormat2Param[IMD_PERF_CLASS_COUNT][kP] = {
 // v1.17 (§6c.1, §6c.2): the slots the eps path freed hold kf.elem and pack.dram, optional
 // (absent = 0) format-2 parameters written only when non-zero, so a calibration without them
 // predicts and formats exactly as in host API 11.
+constexpr int kKlChainSlot = 4;  // v1.20 (§6c.10): kl.chain, the slot of the retired kl.op_eps
 constexpr bool optional_param(int cl, int j) {
-  return (cl == IMD_PERF_CLASS_KF && j == 4) || (cl == IMD_PERF_CLASS_PACK && j == 3);
+  return (cl == IMD_PERF_CLASS_KF && j == 4) || (cl == IMD_PERF_CLASS_PACK && j == 3) ||
+         (cl == IMD_PERF_CLASS_KL && j == kKlChainSlot);  // v1.20 (§6c.10)
 }
 // v1.19 (§6c.9, host API 13, no struct growth): the optional key warm.kl_drop, the share of the
 // REPEAT / WARM saving that KL reads do not get, lives in param[IMD_PERF_PARAM_KL_DROP_SLOT],
@@ -99,7 +101,7 @@ constexpr int kRetiredKeyCount = sizeof kRetiredKeys / sizeof kRetiredKeys[0];
 constexpr bool kClockBound[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, true, false, false, false},   // k0: chain
     {false, false, true, true, false, true},     // kf: op, row, chain (v1.17: not elem, latency)
-    {false, false, true, true, false, false},    // kl: op, l2byte (not wave: memory)
+    {false, false, true, true, true, false},     // kl: op, l2byte, chain (v1.20; not wave: memory)
     {false, false, true, false, true, false},    // pack: op, chain (not dram, wave: memory)
     {true, true, true, true, false, true},       // k4: the round model, not the DRAM term
     {true, true, true, true, false, true},
@@ -343,8 +345,9 @@ double u128_to_double(u128 v) { return static_cast<double>(v); }
 // KL of one operand (rows, padded rows, g moduli of group 1, KL tile): launch, DRAM bytes
 // (read the operand once, write group 1's residues, sigma and the flag), residue ops, the
 // L2 re-read of rows longer than two tiles (passes 2 and 3 re-read the middle chunks), the
-// slot 4 0 (the retired op_eps), and (v1.10) the chain of its launch (kl_launch: rows per
-// batch rows_b, radix; lg_rows >= 0 for imd_pack's tile).
+// slot 4 (v1.20, §6c.10: the busiest SM's nc x g steps, only when kl.chain > 0, else 0 as the
+// retired op_eps was), and (v1.10) the wave of its launch (kl_launch: rows per batch rows_b,
+// radix; lg_rows >= 0 for imd_pack's tile).
 void add_kl(PerfPhases* P, const imd_perf_calib_t& cal, int32_t phase, double rows, double pad,
             double k, double k_hat, double g, bool along_rows, int64_t k_hat_i,
             int32_t lg_rows, int64_t b, int64_t rows_b, int64_t radix) {
@@ -358,7 +361,16 @@ void add_kl(PerfPhases* P, const imd_perf_calib_t& cal, int32_t phase, double ro
       chain_of(L.grid, 1, L.tiles, dbl(L.nc),
                resident_of(cal, L.values == 4 ? IMD_PERF_KERNEL_KL4 : IMD_PERF_KERNEL_KL8),
                cal.sm_count);
-  add_phase(P, phase, IMD_PERF_CLASS_KL, 1, {1, bytes, g * rows * k, l2, 0, wave}, bytes)
+  // v1.20 (§6c.10): s = waves x ceil(tiles / grid) x nc x g, values-free (a step does th x tk = 4096
+  // elements whatever the values per thread); filled only for a calibration with kl.chain, so the
+  // features of a file without the key are what they were.
+  const double chain =
+      cal.param[IMD_PERF_CLASS_KL * kP + kKlChainSlot] > 0
+          ? chain_of(L.grid, 1, L.tiles, dbl(L.nc) * g,
+                     resident_of(cal, L.values == 4 ? IMD_PERF_KERNEL_KL4 : IMD_PERF_KERNEL_KL8),
+                     cal.sm_count)
+          : 0.0;
+  add_phase(P, phase, IMD_PERF_CLASS_KL, 1, {1, bytes, g * rows * k, l2, chain, wave}, bytes)
       .in_bytes = 8 * rows * k;
 }
 
@@ -613,6 +625,14 @@ double perf_phase_seconds(const imd_perf_calib_t& cal, const PerfPhase& p, doubl
     for (int j = 0; j < kP; ++j)
       if (j != kK4ByteSlot) rounds += th[j] * p.x[j];
     return std::max(rounds * scale, th[kK4ByteSlot] * p.x[kK4ByteSlot]) * 1e-9;
+  }
+  if (p.cls == IMD_PERF_CLASS_KL && th[kKlChainSlot] > 0) {
+    // v1.20 (§6c.10): the byte arm against the chain arm (a work/span bound); the rest as below.
+    double ns = 0, nsc = 0;
+    for (int j = 0; j < kP; ++j)
+      if (j != 1 && j != kKlChainSlot) (cb[j] ? nsc : ns) += th[j] * p.x[j];
+    return (ns + nsc * scale + std::max(th[1] * p.x[1], th[kKlChainSlot] * p.x[kKlChainSlot] * scale)) *
+           1e-9;
   }
   double ns = 0, nsc = 0;
   for (int j = 0; j < kP; ++j) (cb[j] ? nsc : ns) += th[j] * p.x[j];

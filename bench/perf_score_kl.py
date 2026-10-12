@@ -58,7 +58,7 @@ def rows_of(records, calib, ratio_calib, lib):
             if rep_r is not None:
                 th = ratio_calib.params
                 byte = th["kl.byte"] * p.x[1]
-                chain = th.get("kl.chain", 0.0) * p.x[4]
+                chain = th.get("kl.chain", 0.0) * rep_r.phases[i].x[4]
                 ratio = chain / byte if byte > 0 else None
             out.append(dict(case=s.case, label=s.label, phase=p.name, wave=int(p.x[5]), bytes=p.x[1],
                             m=m, pred=p.time_s, err=(p.time_s - m) / m, ratio=ratio,

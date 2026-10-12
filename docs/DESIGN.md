@@ -3032,6 +3032,7 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
   meaning change is part of host API 11's change set):
   - the `op_eps` feature slots (`kf` slot 4, `kl` slot 4, `pack` slot 3) are always 0, and the
     chain features (`kf.chain`, `pack.chain`) no longer carry the (1 + f) factor;
+    [v1.20: `kl` slot 4 is `kl.chain`'s feature s when the calibration has `kl.chain` > 0, else 0; §6c.10]
   - `imd_perf_request_t.eps_fraction` and `imd_perf_rank_request_t.eps_fraction` are
     **validated as before** (< 0, or 0 … 1; NaN and > 1 are INVALID_VALUE) **and then ignored**;
   - `imd_perf_t.eps_s`, `.eps_fraction` and the rank candidates' `eps_s`, `eps_fraction` are
@@ -3751,7 +3752,7 @@ enum { IMD_PERF_ORDER_TIME = 0, IMD_PERF_ORDER_TIES_BY_FOOTPRINT = 1 };
 - **[v1.17] host API 12:** `imd_perf_calib_t` grows by `pack_l2_hit_bytes` (8 bytes, 3680 →
   3688); a struct of the v7–v11 size is read with it 0 (§6c.2). `imd_perf_param_name`
   returns `"elem"` for KF slot 4 and `"dram"` for PACK slot 3 (were `"op_eps"`) and NULL for
-  KL slot 4 (retired). Python: `Calibration.warm` has `"warm.pack_l2_bytes"`,
+  KL slot 4 (retired; v1.20: `"chain"`, §6c.10). Python: `Calibration.warm` has `"warm.pack_l2_bytes"`,
   `host.FORMAT2_PARAMS` has `kf.elem` and `pack.dram`; `host.API_VERSION` 12.
 - **[v1.18] host API 13:** `imd_perf_calib_t` grows by `clock_boost_mhz`, `power_act_w`,
   `power_act_gap_us`, `energy_dram_pj`, `warm_call_ns`, `warm_clean_byte_ns`,

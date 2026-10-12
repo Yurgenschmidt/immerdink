@@ -5747,6 +5747,16 @@ sweep, by GEMM view). The hold-out is never used to fit or choose `kl.chain`. Ba
 - The `cold` group (`--l2 flush`) yields call totals only (the phase marks stay REPEAT state; the records' prediction state is CLEAN)
   and is confounded by KF / K4 error: it is reported, and the cache credit is not changed on its evidence alone. `warm.kl_drop` is
   re-scanned on the KL A marks alone after the chain is in, and stays 0 unless the scan shows a gain by the §5.11 rule.
+**Implemented (2026-10-12), before any sweep run.** `kl.chain` (KL slot 4), the max branch in `perf_phase_seconds`, `x[4]` of a KL
+phase filled only when `kl.chain` > 0, `perf_fit --kl-chain` (opt-in; the (byte rate, chain) scan with leave-one-shape-out
+selection, P4), `host_perf` v1.20 (1982 checks: bit-identity at 0, grammar, spec transcription of the features and the max form,
+clock scaling, locality, monotone scans; mutants with a sum instead of the max, `values` in the feature and an unscaled chain arm
+are caught) and `host_c_api`. A first fit on the SEEN data only (calibration, cache, Q24, sustained; not a result of this section,
+the hold-out is untouched): `kl.chain` 393 ns per unit, kept by the leave-one-shape-out rule (7.44 against 8.67), `kl.launch` /
+`kl.byte` / `kl.l2byte` / `kl.wave` 6500 ns / 0.00096 / 0.00031 / 2806 ns (the shipped 6609 / 0.001003 / 0.000361 / 2160), whereas
+the refit without the key moves `kl.wave` to 4453 ns and `kl.launch` to 5857 ns as §5.11 found; narrow KL B on the seen records
+(Q24 and Jacobi) 42.7 % with the shipped calibration, 18.2 % with the refit without the key, 6.2 % with the chain.
+
 The two-locked-clock pass needs the sudo clock lock (docs/BENCHMARKING.md): Eric's call, not run by an agent.
 
 ---

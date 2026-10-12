@@ -418,7 +418,8 @@ int main(void) {
           offsetof(imd_perf_calib_t, pack_l2_planes) == 3736 && IMD_PERF_CACHE_CLEAN == 3);
     CHECK(strcmp(imd_perf_param_name(IMD_PERF_CLASS_KF, 4), "elem") == 0 &&
           strcmp(imd_perf_param_name(IMD_PERF_CLASS_PACK, 3), "dram") == 0 &&
-          imd_perf_param_name(IMD_PERF_CLASS_KL, 4) == NULL);
+          strcmp(imd_perf_param_name(IMD_PERF_CLASS_KL, 4), "chain") == 0 &&
+          IMD_PERF_CLASS_KL * IMD_PERF_MAX_PARAMS + 4 == 16);
     CHECK(sizeof(imd_perf_phase_t) == 96 &&
           sizeof(imd_perf_t) == 1976 && sizeof(imd_perf_candidate_t) == 192 &&
           sizeof(imd_perf_rank_request_t) == 96 && sizeof(imd_perf_request_t) == 48);
@@ -488,6 +489,32 @@ int main(void) {
                 el > 0);
         }
       }
+    }
+    /* v1.20 (DESIGN §6c.10, no struct growth): the optional kl.chain lives in KL slot 4
+     * (param[16]), >= 0, written only when non-zero; kl.op_eps stays accepted and discarded */
+    {
+      static char t0[16700], t1[16700], bad[16800];
+      static imd_perf_calib_t kc, kb;
+      const int cslot = IMD_PERF_CLASS_KL * IMD_PERF_MAX_PARAMS + 4;
+      size_t n0 = 0, n1 = 0;
+      int32_t el = -1;
+      kc = cal;
+      CHECK(kc.param[cslot] == 0); /* the shipped calibration has no kl.chain */
+      CHECK(imd_perf_calib_format(&kc, t0, sizeof t0, &n0) == IMD_STATUS_SUCCESS &&
+            strstr(t0, "kl.chain") == NULL);
+      kc.param[cslot] = 0.25;
+      CHECK(imd_perf_calib_format(&kc, t1, sizeof t1, &n1) == IMD_STATUS_SUCCESS &&
+            strstr(t1, "\nkl.chain = 0.25\n") != NULL && n1 > n0);
+      memset(&kb, 0x5a, sizeof kb);
+      kb.struct_size = sizeof kb;
+      CHECK(imd_perf_calib_parse(t1, n1, &kb, &el) == IMD_STATUS_SUCCESS && el == 0 &&
+            kb.param[cslot] == 0.25 && memcmp(kb.param, kc.param, sizeof kc.param) == 0);
+      snprintf(bad, sizeof bad, "%s\nkl.chain = -1\n", t0);
+      el = 0;
+      CHECK(imd_perf_calib_parse(bad, strlen(bad), &kb, &el) == IMD_STATUS_INVALID_VALUE && el > 0);
+      snprintf(bad, sizeof bad, "%s\nkl.chain = 0.5\nkl.chain = 0.5\n", t0);
+      el = 0;
+      CHECK(imd_perf_calib_parse(bad, strlen(bad), &kb, &el) != IMD_STATUS_SUCCESS && el > 0);
     }
     /* host API 11 (DESIGN v1.15 §6c.7): the optional power.byte_f_pj, and the folded view
      * energy_byte_pj = byte + byte_f of a v7..v10-sized struct (nothing written beyond it) */

@@ -945,7 +945,7 @@ def spec_kf_chain(rows, k_hat, g, sms, r16=2, r4=4, elem=False):
 
 
 def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod=64, l_hit=0.0,
-                planes=False):
+                planes=False, kl_chain=False):
     """[(name, launches, x)] of one imd_contract (DESIGN §6c.1 table) from the lowering
     summary and the operands' read direction (along rows: KL tiles of 512). occ: kernel name ->
     CTAs per SM (the calibration's occupancy table); the chains assume radix 1 (operands read
@@ -999,9 +999,12 @@ def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod
             values = 4 if nc > 2 else 8
             wave = spec_chain(min(tiles, 1 << 20), 1, tiles, nc,
                               r("kl4" if values == 4 else "kl8"), sms)
+            # v1.20 (§6c.10): slot 4 = the busiest SM's nc x g steps, only with kl.chain > 0
+            chain = (spec_chain(min(tiles, 1 << 20), 1, tiles, nc * g,
+                                r("kl4" if values == 4 else "kl8"), sms) if kl_chain else 0)
             ph.append((name, 1, [1, 8 * rows[x] * k + g * pad[x] * kh + 3 * rows[x],
                                  g * rows[x] * k, 16 * rows[x] * max(0, kh - 2 * tk),
-                                 wide * g * rows[x] * k, wave]))
+                                 chain, wave]))
     G = lw.num_groups
     sizes = [g] * (N // g) + ([N % g] if N % g else [])
     # v1.17: the PACK hit rule: the group working set (both operands, one group's residues)
@@ -1051,8 +1054,8 @@ def close(a, b, rel=1e-12):
 # DESIGN v1.10 §6c.1: the feature slots whose time scales with the SM clock (an independent
 # transcription of "ops, chains, L2 traffic, K4's round model; not DRAM bytes, launches, call").
 SPEC_CLOCK_BOUND = {
-    # v1.17: not kf.elem (slot 4), pack.dram (slot 3); kl slot 4 is unused (retired op_eps)
-    "k0": (2,), "kf": (2, 3, 5), "kl": (2, 3), "pack": (2, 4), "k5": (2, 3),  # not pack.wave
+    # v1.17: not kf.elem (slot 4), pack.dram (slot 3); v1.20: kl slot 4 is kl.chain (clock-bound)
+    "k0": (2,), "kf": (2, 3, 5), "kl": (2, 3, 4), "pack": (2, 4), "k5": (2, 3),  # not pack.wave
     "direct": (2, 3), "beta": (2,), "call": ()}
 
 
@@ -1082,8 +1085,11 @@ def phase_ns(params, names, q, scale=1.0):
         rounds = sum(params.get(f"{q.cls}.{n}", 0.0) * x for j, (n, x) in
                      enumerate(zip(names[q.cls], q.x)) if n and j != 4)
         return max(rounds * scale, params.get(f"{q.cls}.byte", 0.0) * q.x[4])
-    return sum(params.get(f"{q.cls}.{n}", 0.0) * x * (scale if j in SPEC_CLOCK_BOUND[q.cls] else 1)
-               for j, (n, x) in enumerate(zip(names[q.cls], q.x)) if n)
+    terms = [params.get(f"{q.cls}.{n}", 0.0) * x * (scale if j in SPEC_CLOCK_BOUND[q.cls] else 1)
+             if n else 0.0 for j, (n, x) in enumerate(zip(names[q.cls], q.x))]
+    if q.cls == "kl" and params.get("kl.chain", 0.0) > 0:  # v1.20 (§6c.10): byte arm vs chain arm
+        return sum(terms) - terms[1] - terms[4] + max(terms[1], terms[4])
+    return sum(terms)
 
 
 def suite_perf_v110(cal, names, rng):
@@ -1773,6 +1779,188 @@ def suite_perf_v118(cal):
 V119_KEY = "warm.kl_drop"
 
 
+def suite_perf_v120(cal):
+    """DESIGN v1.20 §6c.10 (no struct growth): the optional key kl.chain (KL slot 4, ns per unit
+    of s = waves x ceil(tiles / grid) x nc x g). Absent or 0 predicts bit-identically and the KL
+    features stay what they were (x[4] = 0); format 2 only, >= 0, written only when non-zero,
+    round trip, in param[16]; with it a KL phase costs launch + wave + l2byte + op + max(byte
+    arm, chain arm x clock scale), the feature x[4] is s (an independent transcription), only
+    chain-bound KL phases change, and the prediction is non-decreasing in k_hat (through nc
+    2 -> 3 and the tile doublings), in rows (through 128 / 129 and 256 / 257 CTAs), g and N."""
+    count = 0
+    key = "kl.chain"
+    shapes = [("ik,kj->ij", dict(i=1600, k=1600, j=100)),     # KL B narrow, nc 4
+              ("ik,kj->ij", dict(i=1408, k=1408, j=96)),      # nc 3
+              ("ik,kj->ij", dict(i=1024, k=1536, j=1032)),    # 129 CTAs: two waves
+              ("ik,jk->ij", dict(i=1536, j=96, k=4608)),      # B along k, nc 2 (KL8)
+              ("abcd,cdij->abij", dict(a=40, b=40, c=40, d=40, i=10, j=10)),
+              ("ik,jk->ij", dict(i=256, j=256, k=256)),       # KF: no KL phase
+              ("ik,jk->ij", dict(i=2048, j=2048, k=2048))]    # wide KL: DRAM-bound
+    caches = ("COLD", "REPEAT")
+
+    def preds(c, **kw):
+        return [host.predict(sp, ex, N=N, g=g, regime=rg, cache=cc, calib=c, **kw)
+                for sp, ex in shapes for N in (4, 8, 14) for g in (0, 4)
+                for rg in ("BURST", "SUSTAINED") for cc in caches]
+
+    # (1) absent == explicit 0 == the calibration without the key, bit for bit, and x[4] = 0
+    if key in cal.extra or cal.params[key] != 0:
+        raise Fail("the shipped calibration has kl.chain")
+    base = host.Calibration.from_values(cal.meta, cal.params, extra=cal.extra or None)
+    tb = base.format()
+    if "kl.chain" in tb:
+        raise Fail("kl.chain written although 0")
+    explicit = host.Calibration.parse(tb + f"{key} = 0\n")
+    if bytes(explicit._raw) != bytes(base._raw) or explicit.format() != tb:
+        raise Fail("kl.chain: explicit 0 is not the calibration without it")
+    p0 = preds(base)
+    if preds(explicit) != p0:
+        raise Fail("kl.chain explicitly 0 does not predict bit-identically")
+    if any(q.x[4] != 0 for p in p0 for q in p.phases if q.cls == "kl"):
+        raise Fail("kl.chain absent but a KL feature x[4] is not 0")
+    count += len(p0) + 2
+    # (2) grammar and storage
+    c1 = 250.5
+    full = host.Calibration.from_values(cal.meta, dict(cal.params, **{key: c1}),
+                                        extra=cal.extra or None)
+    tf = full.format()
+    if f"\n{key} = {c1}\n" not in tf or full.params[key] != c1:
+        raise Fail("kl.chain not written or not in Calibration.params")
+    back = host.Calibration.parse(tf)
+    if bytes(back._raw) != bytes(full._raw) or back.format() != tf:
+        raise Fail("kl.chain round trip")
+    slot = host.PERF_CLASSES.index("kl") * host._PERF_MAX_PARAMS + 4
+    if slot != 16 or full._raw.param[slot] != c1 or any(
+            full._raw.param[i] != base._raw.param[i] for i in range(host._PERF_PARAM_CAPACITY)
+            if i != slot):
+        raise Fail("kl.chain is not in param[16] alone")
+    if [ln for ln in tf.splitlines() if ln not in tb.splitlines()] != [f"{key} = {c1}"]:
+        raise Fail("kl.chain: the text differs from the calibration without it by more than "
+                   "the key's line")
+    for bad, why in ((f"{key} = -1\n", "negative"), (f"{key} = nan\n", "nan"),
+                     (f"{key} = 1\n{key} = 1\n", "repeated")):
+        try:
+            host.Calibration.parse(tb + bad)
+        except host.CalibrationError:
+            continue
+        raise Fail(f"kl.chain accepted ({why})")
+    v6 = host.Calibration.load(os.path.join(ROOT, "tests/data/perf_calib_v6_format1.calib"))
+    try:
+        host.Calibration.parse(v6.format() + f"{key} = 1\n")
+    except host.CalibrationError as e:
+        if e.reason != "FORMAT2_KEY":
+            raise Fail(f"kl.chain in a format-1 file: reason {e.reason}")
+    else:
+        raise Fail("kl.chain accepted in a format-1 file")
+    if host.Calibration.parse(full.format()).params[key] != c1 or "kl.chain" in (
+            host.Calibration.parse(tf.replace("format = 2", "format = 2")).extra):
+        raise Fail("kl.chain round trip through parse")
+    count += 6
+    # (3) the model: x[4] = s (spec transcription), the max form, locality
+    names = host.param_names()
+    sms = cal.meta["sm_count"]
+    occ = {n: v[0] for n, v in cal.kernels.items()}
+    n_bound = n_same = 0
+    for chain in (50.0, 300.0, 3000.0):
+        cc = host.Calibration.from_values(cal.meta, dict(cal.params, **{key: chain}),
+                                          extra=cal.extra or None)
+        params = dict(cal.params, **{key: chain})
+        for (sp, ex), N, g in itertools.product(shapes, (4, 8, 14), (0, 4)):
+            for rg, cache in (("BURST", "REPEAT"), ("BURST", "COLD")):
+                lw = host.lowering(sp, ex, N=N, g=g)
+                pb = host.predict(sp, ex, N=N, g=g, regime=rg, cache=cache, calib=base)
+                pc = host.predict(sp, ex, N=N, g=g, regime=rg, cache=cache, calib=cc)
+                if pb.status != pc.status:
+                    raise Fail("kl.chain changes a status")
+                if pb.status != "SUCCESS":
+                    continue
+                for qb, qc in zip(pb.phases, pc.phases):
+                    if qb.cls != "kl":
+                        if repr(qb) != repr(qc):
+                            raise Fail(f"kl.chain changes a non-KL phase {qb.name}")
+                        continue
+                    byte_arm = params["kl.byte"] * qc.x[1]
+                    chain_arm = chain * qc.x[4]
+                    want = phase_ns(params, names, qc) * 1e-9
+                    # the cache terms act on the phase after (§6c.8): compare the COLD phase time
+                    if cache == "COLD" and not close(qc.time_s, want, 1e-9):
+                        raise Fail(f"kl.chain: {sp} {ex} N={N} g={g} {qc.name}: "
+                                   f"{qc.time_s} vs spec {want}")
+                    if chain_arm > byte_arm:
+                        n_bound += 1
+                        if qc.time_s < qb.time_s * (1 - 1e-12):
+                            raise Fail("kl.chain made a phase faster")
+                    else:
+                        n_same += 1
+                        if not close(qc.time_s, qb.time_s, 1e-9):
+                            raise Fail(f"kl.chain changed a byte-bound KL phase: {sp} {ex}")
+                    if qc.x[:4] != qb.x[:4] or qc.x[5] != qb.x[5] or qc.x[4] < 0:
+                        raise Fail("kl.chain changed the other KL features")
+                if cache == "COLD" and rg == "BURST":
+                    along = (False, False) if sp.split(",")[0].endswith("k") and \
+                        sp.split(",")[1].startswith("j") else None
+                    if along is not None:
+                        want_ph = spec_phases(lw, "GENERATE", along, cal.meta["l2_bytes"], occ=occ,
+                                              sms=sms, tail_mod=32, kl_chain=True)
+                        got_kl = [list(q.x) for q in pc.phases if q.cls == "kl"]
+                        want_kl = [ph[2] for ph in want_ph if ph[0] in ("KL A", "KL B")]
+                        if got_kl and got_kl != want_kl:
+                            raise Fail(f"kl.chain: KL features {got_kl} vs spec {want_kl}")
+    # the chain arm is clock-bound (twice the time at half the reference clock), the byte arm not
+    fref = cal.power["power.clock_eff_mhz"]
+    cs = host.Calibration.from_values(cal.meta, dict(cal.params, **{key: 300.0}), extra=cal.extra)
+    n_clk = 0
+    for (sp, ex), N in itertools.product(shapes, (4, 8)):
+        kw = dict(N=N, g=0, calib=cs, cache="COLD")
+        pf = host.predict(sp, ex, clock_mhz=fref, **kw)
+        ph = host.predict(sp, ex, clock_mhz=fref / 2, **kw)
+        if pf.status != "SUCCESS":
+            continue
+        for qf, qh in zip(pf.phases, ph.phases):
+            if qf.cls == "kl" and not close(qh.time_s, 1e-9 * phase_ns(dict(cal.params, **{key: 300.0}),
+                                                                      names, qf, 2.0), 1e-9):
+                raise Fail(f"kl.chain clock scaling: {sp} {ex} {qf.name}: {qh.time_s}")
+            n_clk += qf.cls == "kl" and 300.0 * qf.x[4] > cal.params["kl.byte"] * qf.x[1]
+    if n_clk == 0:
+        raise Fail("kl.chain: no chain-bound KL phase in the clock check")
+    count += n_clk
+    if n_bound == 0 or n_same == 0:
+        raise Fail(f"kl.chain: no chain-bound ({n_bound}) or no byte-bound ({n_same}) KL phase")
+    count += n_bound + n_same
+    # (4) monotonicity of the KL phases in k_hat, rows, g and N with a strong chain arm
+    strong = host.Calibration.from_values(cal.meta, dict(cal.params, **{key: 300.0}),
+                                          extra=cal.extra or None)
+
+    def kl_time(sp, ex, N, g, which="KL B"):
+        p = host.predict(sp, ex, N=N, g=g, regime="BURST", cache="COLD", calib=strong)
+        q = p.phase(which) if p.status == "SUCCESS" else None
+        return None if q is None else q.time_s
+
+    def check_mono(label, series):
+        prev = None
+        for key_, t in series:
+            if t is None:
+                continue
+            if prev is not None and t < prev[1] * (1 - 1e-12):
+                raise Fail(f"kl.chain monotonicity ({label}): {key_} {t} < {prev[0]} {prev[1]}")
+            prev = (key_, t)
+        return len([1 for _, t in series if t is not None])
+
+    for N, g in ((8, 0), (8, 3), (14, 4)):
+        count += check_mono(f"k_hat, N={N} g={g}", [
+            (k, kl_time("ik,kj->ij", dict(i=512, k=k, j=96), N, g)) for k in range(1040, 4400, 16)])
+        count += check_mono(f"k_hat along k, N={N} g={g}", [
+            (k, kl_time("ik,jk->ij", dict(i=512, j=96, k=k), N, g)) for k in range(1040, 9000, 64)])
+        for lo, hi in ((900, 1100), (1980, 2100), (400, 520)):
+            count += check_mono(f"rows {lo}..{hi}, N={N} g={g}", [
+                (j, kl_time("ik,kj->ij", dict(i=512, k=1536, j=j), N, g)) for j in range(lo, hi, 4)])
+    count += check_mono("g", [(g, kl_time("ik,kj->ij", dict(i=512, k=1792, j=96), 14, g))
+                              for g in range(1, 15)])
+    count += check_mono("N", [(N, kl_time("ik,kj->ij", dict(i=512, k=1792, j=96), N, 0))
+                              for N in range(2, 21)])
+    return count
+
+
 def suite_perf_v119(cal):
     """DESIGN v1.19 §6c.9 (host API 13, no struct growth): the optional key warm.kl_drop, the
     share of the REPEAT / WARM saving that KL reads do not get (stored in the last parameter
@@ -2313,6 +2501,10 @@ def suite_perf(args):
         print(f"  ok  v1.18: {n_v118} checks (seven optional keys, grammar, CLEAN / REPEAT cache "
               f"terms, S with planes, boost clock, busy power, DRAM energy, v12 view)")
     n_v119 = suite_perf_v119(cal)  # DESIGN v1.19 §6c.9 (host API 13, warm.kl_drop)
+    n_v120 = suite_perf_v120(cal)  # DESIGN v1.20 §6c.10 (kl.chain)
+    if args.verbose:
+        print(f"  ok  v1.20: {n_v120} checks (kl.chain optional, grammar, bit-identical at 0, "
+              f"max form vs spec, only chain-bound KL phases change, monotone scans)")
     if args.verbose:
         print(f"  ok  v1.19: {n_v119} checks (warm.kl_drop optional, grammar, KL share of the "
               f"REPEAT saving, COLD / CLEAN / non-KL phases unchanged)")
