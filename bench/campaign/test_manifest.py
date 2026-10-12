@@ -69,6 +69,22 @@ class Lint(unittest.TestCase):
         m = mf.load(fx.make_manifest(self.tmp, "f" * 40, self.good()))
         self.assertTrue(any("commit not found" in str(f) for f in mf.lint(m, self.src)))
 
+    def test_submodule_and_gemmul8_pins_follow_the_pinned_commit(self):
+        m = mf.load(fx.make_manifest(self.tmp, self.commit, self.good(), extra_campaign=f'gemmul8_commit = "{"a" * 40}"'))
+        errs = [str(f) for f in mf.lint(m, self.src) if f.level == "error"]
+        self.assertTrue(any("no bench/GEMMUL8_PIN" in e for e in errs), errs)
+        fx.wr(os.path.join(self.src, "bench", "GEMMUL8_PIN"), f"# pin\ng8 {'a' * 40} 3\n")
+        fx.git(self.src, "add", "-A")
+        fx.git(self.src, "commit", "-qm", "pin")
+        commit2 = fx.git(self.src, "rev-parse", "HEAD")
+        m = mf.load(fx.make_manifest(self.tmp, commit2, self.good(), extra_campaign=f'gemmul8_commit = "{"a" * 40}"'))
+        self.assertEqual([f for f in mf.lint(m, self.src) if f.level == "error"], [])
+        m = mf.load(fx.make_manifest(self.tmp, commit2, self.good(), extra_campaign=f'gemmul8_commit = "{"b" * 40}"'))
+        self.assertTrue(any("GEMMUL8_PIN" in str(f) for f in mf.lint(m, self.src) if f.level == "error"))
+        m = mf.load(fx.make_manifest(self.tmp, commit2, self.good()))
+        m.data["campaign"]["cutlass_commit"] = "d" * 40
+        self.assertTrue(any("records CUTLASS" in str(f) for f in mf.lint(m, self.src) if f.level == "error"))
+
     def test_decisions_binding_and_content(self):
         path = fx.make_manifest(self.tmp, self.commit, self.good())
         fx.wr(os.path.join(self.tmp, "R0.decisions.toml"), fx.rd(os.path.join(self.tmp, "R0.decisions.toml")) + "\n# edited\n")

@@ -253,9 +253,36 @@ def lint(m, src=None, check_decisions=True):
             import decisions
             for f in decisions.lint(dp, seen):
                 F.append(f)
-    if src and HEX40.match(str(c.get("immerdink_commit", ""))) and not _git_has(src, c["immerdink_commit"]):
-        err("campaign.immerdink_commit", f"commit not found in {src}")
+    if src and HEX40.match(str(c.get("immerdink_commit", ""))):
+        if not _git_has(src, c["immerdink_commit"]):
+            err("campaign.immerdink_commit", f"commit not found in {src}")
+        else:
+            _check_pins(src, c, err)
     return F
+
+
+def _git_out(src, *args):
+    r = subprocess.run(["git", "-C", src, *args], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def _check_pins(src, c, err):
+    """The manifest's CUTLASS and GEMMul8 pins must be the ones the pinned immerdink commit itself records."""
+    commit = c["immerdink_commit"]
+    tree = _git_out(src, "ls-tree", commit, "third_party/cutlass")
+    got = tree.split()[2] if tree and len(tree.split()) >= 3 else None
+    if got is None:
+        err("campaign.cutlass_commit", "the pinned immerdink commit has no third_party/cutlass submodule entry")
+    elif HEX40.match(str(c.get("cutlass_commit", ""))) and got != c["cutlass_commit"]:
+        err("campaign.cutlass_commit", f"the pinned immerdink commit records CUTLASS {got[:12]}, the manifest {c['cutlass_commit'][:12]}")
+    if "gemmul8_commit" in c and HEX40.match(str(c["gemmul8_commit"])):
+        pin = _git_out(src, "show", f"{commit}:bench/GEMMUL8_PIN")
+        line = next((l for l in (pin or "").splitlines() if l.strip() and not l.strip().startswith("#")), "")
+        words = line.split()
+        if len(words) < 2:
+            err("campaign.gemmul8_commit", "the pinned immerdink commit has no bench/GEMMUL8_PIN")
+        elif not c["gemmul8_commit"].startswith(words[1]):
+            err("campaign.gemmul8_commit", f"bench/GEMMUL8_PIN at the pinned commit names {words[1][:12]}, the manifest {c['gemmul8_commit'][:12]}")
 
 
 def main(argv):

@@ -31,7 +31,9 @@ def make_src(tmp):
     os.makedirs(os.path.join(src, "bench"))
     wr(os.path.join(src, "bench", "sweep_x.txt"), "# empty sweep\n")
     git(src, "init", "-q")
+    os.makedirs(os.path.join(src, "third_party", "cutlass"))   # an empty directory = an uninitialised submodule
     git(src, "add", "-A")
+    git(src, "update-index", "--add", "--cacheinfo", f"160000,{'c' * 40},third_party/cutlass")   # a submodule entry
     git(src, "commit", "-q", "-m", "init")
     return src, git(src, "rev-parse", "HEAD")
 
