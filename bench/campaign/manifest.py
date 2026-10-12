@@ -116,6 +116,11 @@ def _git_has(src, commit, path=None):
     return r.returncode == 0
 
 
+def _rank(e):
+    p = e.get("priority")
+    return PRIORITIES.index(p) if p in PRIORITIES else len(PRIORITIES)
+
+
 def lint(m, src=None, check_decisions=True):
     """Gate G1. Returns a list of Finding; an error-level finding blocks any submission."""
     F = []
@@ -218,7 +223,7 @@ def lint(m, src=None, check_decisions=True):
         for n in e.get("needs", []):
             if n not in seen:
                 err(f"experiment {eid}", f"needs unknown experiment {n!r}")
-            elif PRIORITIES.index(seen[n].get("priority", "P2")) > PRIORITIES.index(e.get("priority", "P0")):
+            elif _rank(seen[n]) > _rank(e):
                 err(f"experiment {eid}", f"needs {n!r}, which has a lower priority (it may not run)")
             elif order[n] >= order[eid] and seen[n].get("priority") == e.get("priority"):
                 err(f"experiment {eid}", f"needs {n!r}, which is listed after it")

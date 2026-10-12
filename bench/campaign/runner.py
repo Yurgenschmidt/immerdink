@@ -247,6 +247,7 @@ class Run:
             return 3
         lock = {"campaign": m.id, "manifest_sha256": m.sha256,
                 "decisions_sha256": m.data["campaign"]["decisions_sha256"], "class": self.cls,
+                "gpu_name": gpu_name(), "gpu_name_overridden": bool(os.environ.get("CAMPAIGN_GPU_NAME")),
                 "pinned_commit": pinned, "src_commit": src_commit, "src_dirty": bool(dirty), "pin_check": "ok" if pin_ok else "skipped",
                 "cutlass_pinned": m.data["campaign"]["cutlass_commit"]}
         lp = os.path.join(self.out, rs.LOCK)
