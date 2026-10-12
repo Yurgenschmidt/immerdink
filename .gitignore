@@ -18,3 +18,4 @@ bench/accuracy/__pycache__/
 bench/results/
 bench/accuracy/results/
 __pycache__/
+bench/campaign/__pycache__/
