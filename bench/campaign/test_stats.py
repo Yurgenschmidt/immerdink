@@ -97,6 +97,22 @@ class Guard(unittest.TestCase):
             self.assertTrue(flagged, (seed, slowdown, tol))
             self.assertAlmostEqual(slowdown, 0.10, delta=0.02)
 
+    def test_real_rtx4090_repetitions(self):
+        """Real per-repetition times of immerdink on the RTX 4090 (testdata/): their range spread is 8-12 %, the robust
+        spread about 1 %, so halves of one series pass the guard and a 10 % slowdown does not slip through."""
+        import json
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "real_samples_4090.json")) as f:
+            cases = json.load(f)["cases"]
+        self.assertGreaterEqual(len(cases), 3)
+        for name, c in cases.items():
+            x = c["samples_s"]
+            with self.subTest(name):
+                self.assertGreater(stats.spread_pct(x), 5.0)             # the range alone would hide a 10 % slowdown
+                self.assertLess(stats.robust_spread_pct(x), 3.0)
+                self.assertFalse(stats.guard_samples(x[::2], x[1::2])[0])
+                self.assertFalse(stats.guard_samples(x[: len(x) // 2], x[len(x) // 2:])[0])
+                self.assertTrue(stats.guard_samples(x, [v * 1.10 for v in x])[0])
+
     def test_floor_and_spread(self):
         self.assertFalse(stats.guard(1.0, 0.5, 1.015, 0.5)[0])          # inside the 2 % floor
         self.assertTrue(stats.guard(1.0, 0.5, 1.03, 0.5)[0])

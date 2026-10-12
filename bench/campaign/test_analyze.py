@@ -226,6 +226,27 @@ class Decisions(unittest.TestCase):
         self.assertEqual(v["verdict"], "PASS")
 
 
+class GuardWithSamples(unittest.TestCase):
+    """A record that carries its repetitions is judged by the robust spread (a range of 12 % would hide a 10 % slowdown)."""
+
+    def test_guard_decision_uses_samples(self):
+        rng = random.Random(21)
+
+        def rec(level):
+            xs = [level * (1.0 + rng.gauss(0.0, 0.004)) for _ in range(60)]
+            xs[3] *= 1.12                                          # one outlier: range spread ~ 13 %
+            return {"case": "a", "method": "imd", "median_s": sorted(xs)[30], "spread_pct": 13.0, "samples_s": xs, "status": "ok"}
+
+        g = dict(Decisions.GUARD)
+        v = dc.evaluate(g, FakeCtx([rec(1.10e-3)], [rec(1.0e-3)]))
+        self.assertEqual(v["verdict"], "FLAGGED", v)
+        v = dc.evaluate(g, FakeCtx([rec(1.0e-3)], [rec(1.0e-3)]))
+        self.assertEqual(v["verdict"], "PASS", v)
+        no_samples = lambda r: {k: x for k, x in r.items() if k != "samples_s"}
+        v = dc.evaluate(g, FakeCtx([no_samples(rec(1.10e-3))], [no_samples(rec(1.0e-3))]))
+        self.assertEqual(v["verdict"], "PASS", v)                  # the summary alone cannot see it: the range is 13 %
+
+
 @unittest.skipUnless(os.path.isdir(GOLDEN), "the issue-11 result folders are not on this machine")
 class Golden(unittest.TestCase):
     """The analyzer regenerates the issue-11 tables (summary, energy, cuTENSOR workspace, comparison, comparison energy) from the

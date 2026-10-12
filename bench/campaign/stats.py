@@ -4,13 +4,18 @@ Standard library only (the cluster job environment carries no numpy at run time 
 Three pieces, all pure functions of timing samples or of summary records:
 
   median_ci        distribution-free confidence interval of a median (order statistics of the
-                   binomial), valid for any sample shape; no normality assumption, robust to outliers
+                   binomial), valid for any sample shape; no normality assumption, robust to outliers.
+                   W. R. Thompson, "On confidence ranges for the median and other expectation distributions for
+                   populations of unknown distribution form", Annals of Mathematical Statistics 7(3):122-128, 1936,
+                   https://doi.org/10.1214/aoms/1177732502
   paired_ratio     the median of the per-pair ratios t_a / t_b of an INTERLEAVED comparison and its
                    interval (ratio > 1: B is faster), computed on log ratios
   classify_pair    the tie rule: inside the interval, or under 10 % on a noisy case, is a tie
   guard            the regression guard: a slowdown beyond max(floor, 2 x spread) is flagged
 
-"spread" is the bench's own definition (bench/imd_bench.cu): (max - min) / median, in percent.
+"spread" in records is the bench's own definition (bench/imd_bench.cu): (max - min) / median, in percent. With the raw
+repetitions at hand the guard uses the robust spread instead (robust_spread_pct): the range is dominated by one outlier
+(8-17 % on a quiet RTX 4090) and would hide a 10 % slowdown.
 """
 import math
 
@@ -101,6 +106,16 @@ def classify_pair(p, spread=0.0, noisy_spread=NOISY_SPREAD_PCT, noisy_min_effect
     return "faster" if p.ratio > 1.0 else "slower"
 
 
+def robust_spread_pct(xs):
+    """The noise of a median, in percent: half the width of its 95 % interval over the median. Unlike the bench's range
+    spread (max - min, which one outlier or one clock-quantised repetition inflates to 8-17 % on a quiet machine), it
+    shrinks with the number of repetitions. Falls back to the range spread when the sample is too small for an interval."""
+    ci = median_ci(xs)
+    if ci is None:
+        return spread_pct(xs)
+    return 100.0 * (ci[1] - ci[0]) / (2.0 * median(xs))
+
+
 def guard(base_median, base_spread_pct, new_median, new_spread_pct, floor=GUARD_FLOOR, k=GUARD_K):
     """The regression guard on two summaries. Returns (flagged, slowdown, tolerance).
 
@@ -113,5 +128,5 @@ def guard(base_median, base_spread_pct, new_median, new_spread_pct, floor=GUARD_
 
 
 def guard_samples(base, new, floor=GUARD_FLOOR, k=GUARD_K):
-    """`guard` on two raw timing series."""
-    return guard(median(base), spread_pct(base), median(new), spread_pct(new), floor, k)
+    """`guard` on two raw timing series, with the robust spread (a median's noise), not the range."""
+    return guard(median(base), robust_spread_pct(base), median(new), robust_spread_pct(new), floor, k)

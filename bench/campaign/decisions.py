@@ -11,7 +11,8 @@ Kinds (each a pure function of the records; a verdict is one of VERDICTS):
   threshold  one number from the records against two limits: GO / NO-GO / INCONCLUSIVE
   paired     interleaved A/B records (duel-b rows with pair_t_a / pair_t_b arrays): per case a
              faster / tie / slower class by the tie rule (stats.py); ADOPT / KEEP / INCONCLUSIVE
-  guard      records against a stored baseline file: PASS / FLAGGED by the regression guard
+  guard      records against a stored baseline file: PASS / FLAGGED by the regression guard (field: a time, e.g. median_s;
+             a slowdown is new / base - 1; records with samples_s use the robust spread)
 
 `requires` lists the experiments whose data the verdict stands on. A damaged one makes the verdict
 INVALID (the analyzer decides that, analyze.py); one that simply did not run (failed, skipped for time)
@@ -204,6 +205,12 @@ def _guard(dec, ctx):
     def idx(rs):
         return {tuple(r.get(k) for k in key): r for r in rs if r.get("status", "ok") == "ok" and _num(r.get(f)) is not None}
 
+    def noise(r):      # the robust spread when the record carries its repetitions, else the bench's range spread
+        s = r.get("samples_s")
+        if isinstance(s, list) and len(s) >= stats.MIN_PAIRS and f == "median_s":
+            return stats.robust_spread_pct(s)
+        return _num(r.get(sp)) or 0.0
+
     new, old = idx(recs), idx(base)
     flagged, checked = [], 0
     for k, r in new.items():
@@ -211,7 +218,7 @@ def _guard(dec, ctx):
         if b is None:
             continue
         checked += 1
-        fl, slow, tol = stats.guard(b[f], _num(b.get(sp)) or 0.0, r[f], _num(r.get(sp)) or 0.0,
+        fl, slow, tol = stats.guard(b[f], noise(b), r[f], noise(r),
                                     dec.get("floor", stats.GUARD_FLOOR), dec.get("k", stats.GUARD_K))
         if fl:
             flagged.append({"key": list(k), "slowdown": slow, "tolerance": tol})
