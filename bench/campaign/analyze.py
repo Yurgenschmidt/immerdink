@@ -3,6 +3,7 @@
 
     analyze.py verdicts FOLDER [--decisions FILE] [--accept-unpinned] [--json OUT] [--strict]
     analyze.py tables   FOLDER [--out DIR]      the comparison tables of the folder's JSONL records (bench/summarize.py)
+    analyze.py bitcheck FOLDER                  gate G5: every bit_identical / elements_differing field must say identical
     analyze.py golden   JOBFOLDER [...]         regenerate an older (issue 11 style) job folder's tables and diff them
                                                 against the .md files the job itself wrote
 
@@ -152,6 +153,33 @@ def verdicts(folder, decisions_file=None, accept_unpinned=False):
     return out, info
 
 
+def bitcheck(folder):
+    """Gate G5 on a result folder: every record that says whether a variant's output is bit-identical to its reference
+    must say yes. Returns (n_checked, list of problems). Reads the JSONL files of the experiments whose DONE.json verifies."""
+    n, bad = 0, []
+    exp_root = os.path.join(folder, "exp")
+    for eid in sorted(os.listdir(exp_root)) if os.path.isdir(exp_root) else []:
+        d = os.path.join(exp_root, eid)
+        if rs.verify_exp(d)[0] not in ("ok", "failed"):
+            bad.append(f"{eid}: folder not intact, cannot check")
+            continue
+        for fn in rs.exp_files(d):
+            if not fn.endswith(".jsonl"):
+                continue
+            try:
+                recs = rs.read_jsonl(os.path.join(d, fn))
+            except ValueError as e:
+                bad.append(f"{eid}/{fn}: {e}")
+                continue
+            for r in recs:
+                if "bit_identical" in r or "elements_differing" in r:
+                    n += 1
+                    if r.get("bit_identical") is not True or r.get("elements_differing", 0):
+                        bad.append(f"{eid}/{fn}: case {r.get('case')} {r.get('variant', r.get('method'))}: "
+                                   f"bit_identical={r.get('bit_identical')} elements_differing={r.get('elements_differing')}")
+    return n, bad
+
+
 def render(vs, info):
     lock = info.get("lock", {})
     lines = [f"# Verdicts: campaign {lock.get('campaign', '?')}, class {lock.get('class', '?')}, "
@@ -233,6 +261,8 @@ def main(argv=None):
     t = s.add_parser("tables")
     t.add_argument("folder")
     t.add_argument("--out")
+    b = s.add_parser("bitcheck")
+    b.add_argument("folder")
     g = s.add_parser("golden")
     g.add_argument("jobs", nargs="+")
     a = p.parse_args(argv)
@@ -251,6 +281,12 @@ def main(argv=None):
             else:
                 print(f"<!-- {name} -->\n{text}")
         return 0
+    if a.cmd == "bitcheck":
+        n, bad = bitcheck(a.folder)
+        for x in bad:
+            print("NOT IDENTICAL", x)
+        print(f"G5 bit identity: {n} record(s) checked, {len(bad)} problem(s)")
+        return 1 if bad else 0
     bad = 0
     for job in a.jobs:
         checked, diffs = golden(job)

@@ -100,7 +100,9 @@ def probe_tools(out):
     info = {}
     for tool, flag in TOOLS:
         path = shutil.which(tool)
-        info[tool] = {"path": path, "version": (run_text([path, flag]).splitlines() or [""])[-1 if tool in ("nvcc", "ptxas", "cuobjdump", "nvdisasm") else 0]} if path else None
+        text = run_text([path, flag]).splitlines() if path else []
+        info[tool] = {"path": path, "version": (text[-1] if tool in ("nvcc", "ptxas", "cuobjdump", "nvdisasm") else (text or [""])[0]),
+                      "output": text[:6]} if path else None
     py = {}
     for pkg in PIP:
         try:
