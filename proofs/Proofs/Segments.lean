@@ -233,6 +233,24 @@ theorem kseg_rho_le_sub {C x Wbar NS η' : ℝ} (hNS : 0 ≤ NS) (herr : |C - x|
     have := abs_sub_abs_le_abs_sub C x; linarith
   exact div_le_div_of_nonneg_left hNS (by linarith) hx
 
+/-- **L7c (3) + (7) chained:** with gradual underflow (`kseg_compose_sub`) and every
+`W_s ≤ W̄`, `|C_S − x| ≤ W̄·N_S + (1 + γ)·S·η`, the hypothesis of `kseg_rho_le_sub` with
+`η' = (1 + γ)·S·η`. -/
+theorem kseg_wbar_sub {u η Wbar : ℝ} (hu : 0 ≤ u) {m : ℕ} (hm : m * u < 1)
+    {x y D E n C : ℕ → ℝ} (hn : ∀ s, 0 ≤ n s) (hx : ∀ s ≤ m, |x s| ≤ n s)
+    (hyx : ∀ s ≤ m, |y s - x s| ≤ E s * n s) (hD : ∀ s ≤ m, |D s - y s| ≤ u * |y s| + η)
+    (hW : ∀ s ≤ m, W u (E s) m ≤ Wbar) (h0 : C 0 = D 0)
+    (hstep : ∀ i < m, |C (i + 1) - (C i + D (i + 1))| ≤ u * |C i + D (i + 1)|) :
+    |C m - ∑ s ∈ range (m + 1), x s|
+      ≤ Wbar * ∑ s ∈ range (m + 1), n s + (1 + gam m u) * (m + 1) * η := by
+  have h1 := kseg_compose_sub hu hm hx hyx hD h0 hstep
+  have h2 : ∑ s ∈ range (m + 1), n s * W u (E s) m ≤ Wbar * ∑ s ∈ range (m + 1), n s := by
+    rw [mul_sum]
+    exact sum_le_sum fun s hs => by
+      rw [mul_comm Wbar]
+      exact mul_le_mul_of_nonneg_left (hW s (Nat.lt_succ_iff.1 (mem_range.1 hs))) (hn s)
+  linarith
+
 /-- L7c (2), the common step: with every `W_s ≤ W̄`, `|C_S − x| ≤ W̄·N_S`, `N_S = Σ_s n_s`. -/
 theorem kseg_wbar {u Wbar : ℝ} (hu : 0 ≤ u) {m : ℕ} (hm : m * u < 1) {x y D E n C : ℕ → ℝ}
     (hn : ∀ s, 0 ≤ n s) (hx : ∀ s ≤ m, |x s| ≤ n s) (hyx : ∀ s ≤ m, |y s - x s| ≤ E s * n s)

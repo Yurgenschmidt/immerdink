@@ -432,7 +432,8 @@ what has been built since is recorded under "Implementation status".
     and cite M-a (IR12): final, not "provisional", since the M-a summary is published. [M]
     figures at N ∉ {8, 10, 14, 16} stay tagged until M-c (IR4).
   - *PROOFS L7* (L7a recursive summation γ_{S−1}, L7b the bound, L7c the metric forms, L7d
-    the request); L5 and L6 stay reserved.
+    the request); L5 and L6 stay reserved (their lemmas were later proved for issue #12:
+    PROOFS L5, L6).
   - *Lean (IR5): done.* L3c (the ν form `l3c_unit`, the NORMWISE / ELEMENTWISE / ABSOLUTE
     compositions with the normal-range final rounding and the subnormal term, the native
     chain `fma_chain`), the summation lemma γ_k (`Summation.recsum`) and L7 (`kseg_compose`,
@@ -2650,7 +2651,8 @@ b̃_hj = b_hj·2^{−w_h}.
     (§4.5).
 
 **L6 (a-posteriori certificate)** **[stage 5, deferred (IR26); cert: cert_apost, cert_stats_constants,
-cert_stats_bin; TLA+: OzakiScaling `CertSound`; Lean `apost_cert`]**
+cert_stats_bin; TLA+: OzakiScaling `CertSound`; Lean `apost_cert`, proved for issue #12 as
+`Apost.apost_bound`, `apost_rho`, `apost_elementwise`, `apost_pow2`]**
 
 *Setting.* As L3, possibly with weighted operands (L5b). Take δ = ½ (RN) or 1 (TRUNC),
 d = T − κ/2 (RN) or T (TRUNC), and κ = ⌈√k⌉. Define:
@@ -3325,7 +3327,8 @@ zero_exempt=False) -> float`, whose result goes into an ordinary
 - IndexMap: the stats argument checks in the §6b.5 order (`neg_stats_alias`).
 - OzakiScaling JointSpec: `CertSound` (L6a/b on the toy enumeration, the in-range condition
   included), with negatives `neg_cert_no_kdelta2` and `neg_cert_floor_kappa`.
-- PROOFS L6 with its Lean proof `apost_cert`; the stage-5 certificates of §4.4
+- PROOFS L6 with its Lean proof (`apost_cert`; proved for issue #12 as `Apost.apost_bound` …
+  `apost_pow2`, the stage itself still deferred); the stage-5 certificates of §4.4
   (`cert_stats_constants`, `cert_stats_bin`, `cert_apost`); `oracle.stats` and
   `oracle.apost_bin`.
 
@@ -3494,7 +3497,7 @@ No new phase.
 | PackedOperand.tla | 6 | `pos_kw_from_pack`, `neg_kw_partner_own`, `neg_kw_both_packed` |
 | Pipeline.tla | 6 | kw read-only input, read through the q map; `neg_kw_helper_race` |
 | OzakiCRT, CRTRealization, K4Align | — | no change: integer back end independent of how the scaling is chosen (OzakiCRT `CRTExact`) |
-| PROOFS / Lean | 3, 4, 5 | L3c and the FP summation lemma γ_k, then L7 `kseg_compose` (3, IR5); L5 `kweight_cancel`, `kweight_guard` (4); L6 `apost_cert` (5, deferred) |
+| PROOFS / Lean | 3, 4, 5 | L3c and the FP summation lemma γ_k, then L7 `kseg_compose` (3, IR5); L5 `kweight_cancel`, `kweight_guard` (4); L6 `apost_cert` (5, deferred; the lemma proved for issue #12 as `Apost.apost_*`) |
 | params.py | 0, 1, 3, 4, 5, 6 | `cert_footprint_monotone` with I3 (0); `cert_rho_recipe` (1); `cert_kseg_composition` (3); `cert_kw_rule` (multi-partner), `cert_kw_fp64_exact`, `cert_kw_guard` (4); `cert_stats_constants`, `cert_stats_bin`, `cert_apost` (5, deferred); `cert_kw_shift_range`, `cert_workspace`/`cert_plan_bytes` for weighted vec sizes, and reruns (6) |
 | oracle.py | 2, 3, 5, 6 | `kweights` with multi-partner mode (2); `contract_segments` (3); `apost_bin`, `stats` (5, deferred); the weighted quantizer (6) |
 

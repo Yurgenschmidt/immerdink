@@ -161,7 +161,7 @@ are NaN, but their payload and sign are unspecified.
 | `T` | `⌊√H⌋`, the per-side norm budget. `T² ≤ H < (T+1)²`. |
 | `K_c` | `131071 = ⌊(2³¹−1)/128²⌋`. It is tight: `128²·(K_c+1) > 2³¹−1`. CUTLASS 2.x int8 MMA is `.satfinite` ([CUT] `mma_sm80.h`), so overflow **saturates silently**. **Every modulus, including p = 256, must be K-chunked.** The wraparound exemption [G8] relies on with cuBLAS does not apply here. **[spec: OzakiCRT ChunkFits, neg_chunk, neg_order]** |
 | `K_c'` | **[v1.13]** `131008 = ⌊K_c/64⌋·64 = 2047·64` is the chunk length used (it was `131056 = ⌊K_c/16⌋·16`). Numerically any chunk length ≤ K_c is exact. A multiple of 16 keeps CUTLASS pointers 16-byte aligned (correctness). A multiple of 64, K4's threadblock K tile, keeps every full chunk free of a residue tile, so a row's K4 load phase depends on k̂ alone (§4b, performance). 131008 is the largest such multiple ≤ K_c **[cert: cert_kc, cert_row_phase; proof: PROOFS R6 `chunk_constants`]**. |
-| `L_w` | Width of the **unsigned** CRT word, `32·L32` with `L32` minimal such that `2P ≤ 2^{L_w}`. `L32` = 1 for N ≤ 3, 2 for N ≤ 7, 3 for N ≤ 12, 4 for N ≤ 16, 5 for N ≤ 20. The bound is exact: the reachable peak needs every bit **[cert: cert_limbs, cert_crt_peak; proof: PROOFS R6 `L32_exact`, `peak_needs_every_limb`]**. |
+| `L_w` | Width of the **unsigned** CRT word, `32·L32` with `L32` minimal such that `2P ≤ 2^{L_w}`. `L32` = 1 for N ≤ 3, 2 for N ≤ 7, 3 for N ≤ 12, 4 for N ≤ 16, 5 for N ≤ 20. The bound is exact: the reachable peak needs every limb **[cert: cert_limbs, cert_crt_peak; proof: PROOFS R6 `L32_exact`, `peak_needs_every_limb`]**. |
 
 All constants are generated and checked by `spec/params.py` in exact integer arithmetic.
 It is the only producer of the device constant tables (`--emit-header`, which writes
@@ -412,7 +412,7 @@ N = 13; the product A/B is in the v1.14 changelog entry.
   - **[v1.13]** For p = 256 the range is `[−2129666048, 2146435327]` (−128·127·K_c' and
     128²·K_c' + 255); it fits int32 **[cert: cert_kc]** **[spec: apalache Epilogue]**. With
     the old 131056 the maximum was 2147221759.
-- **Realization [cert: cert_barrett; proof: PROOFS R5 `barrett_epilogue`]:**
+- **Realization [cert: cert_barrett; proof: PROOFS R5 `barrett_epilogue`, `barrett_epilogue_v113`]:**
   - p = 256: `v & 255`;
   - otherwise: `n = v + bias` (u32, `bias = p·⌈2³¹/p⌉`), `q = umulhi64(⌈2⁶⁴/p⌉, n)`,
     `v mod p = n − p·q`.
@@ -424,7 +424,7 @@ N = 13; the product A/B is in the v1.14 changelog entry.
 ### 3.6 CRT reconstruction (exact, multi-word) — **[deviation from D10 as first stated]**
 ```
 x ← 0                                        (unsigned L_w-bit word: L32 little-endian u32 limbs)
-for l = 1..N:  y ← (q_l·W_l) mod p_l         (16-bit value; same umulhi64(⌈2⁶⁴/p⌉) reduction as §3.5)
+for l = 1..N:  y ← (q_l·W_l) mod p_l         (q_l·W_l < 2¹⁶; the 32-bit magic umulhi(·, ⌈2³²/p⌉), mod_p_small32)
                x ← x + M_l·y                 (one fused carry chain: t = x_k + M_l,k·y + carry in u64)
                if x ≥ P: x ← x − P           (invariant x < P; peak < 2P ≤ 2^{L_w})
 z ← (x ≤ H) ? x : x − P                      (z ∈ [H+1−P, H] = [−P/2, P/2−1])
@@ -435,7 +435,9 @@ z ← (x ≤ H) ? x : x − P                      (z ∈ [H+1−P, H] = [−P/2
 - The word is **unsigned**. A signed `__int128` would need `2P ≤ 2^{L_w−1}`, and signed
   overflow is UB.
 - In the centering step, compare the sign bit with the borrow-out
-  **[spec: CRTRealization pos_wordref_nosub; proof: PROOFS R6 `center_word`]**.
+  **[spec: CRTRealization pos_wordref_nosub; proof: PROOFS R6 `center_word` (word form);
+  the device's sign-magnitude form (`crt_finish`: `neg = x > H`, `|z| = P − x`) is
+  `center_signmag`]**.
 - "No division" means no wide division. `x + M_l y = P` can never occur exactly, so `≥` and
   `>` behave the same **[proof: PROOFS R6 `xp_ne_P`]**.
 - [G8]'s Garner tree is an equivalent exact alternative. [OZ2]'s double-double FP

@@ -88,6 +88,7 @@ open Immerdink
 #print axioms Segments.kseg_wbar_le
 #print axioms Segments.kseg_rho_le
 #print axioms Segments.kseg_rho_le_sub
+#print axioms Segments.kseg_wbar_sub
 #print axioms Segments.kseg_wbar
 #print axioms Segments.kseg_elementwise
 #print axioms Segments.kseg_absolute
@@ -101,6 +102,7 @@ open Immerdink
 #print axioms Scaling.u_eq_estimate
 #print axioms Scaling.S_le
 #print axioms Scaling.S_lt_two_pow_128
+#print axioms Scaling.S_shift_lt
 
 -- DESIGN §3.4-§3.6 residues and exact reductions (Residue.lean)
 #print axioms Residue.smod_modEq
@@ -118,7 +120,8 @@ open Immerdink
 #print axioms Residue.mulhi_div_eq
 #print axioms Residue.mod_p_bytes32
 #print axioms Residue.barrett_epilogue
-#print axioms Residue.crt_y_reduction
+#print axioms Residue.residue_mul_reduction
+#print axioms Residue.crt_y_small32
 #print axioms Residue.emulated_product_exact_smod
 
 -- DESIGN §3.6 the CRT word: peak, compare, wrap, centring (CRTWord.lean)
@@ -131,6 +134,8 @@ open Immerdink
 #print axioms CRT.xp_mod_word
 #print axioms CRT.center_word
 #print axioms CRT.z_word
+#print axioms CRT.center_signmag
+#print axioms CRT.z_signmag
 #print axioms CRT.peak_attained
 #print axioms CRT.crtPeak_attained
 
@@ -146,7 +151,10 @@ open Immerdink
 #print axioms Moduli.chunk_constants
 #print axioms Moduli.chunk_sum_range
 #print axioms Moduli.epilogue_range_v113
+#print axioms Moduli.barrett_epilogue_v113
+#print axioms Moduli.qd_inv
 #print axioms Moduli.emulated_product_exact_design
+#print axioms Moduli.emulated_product_exact_shipped
 
 -- L5 K-weights (KWeights.lean; NOTES-C1 §4.4)
 #print axioms KWeights.kweight_cancel

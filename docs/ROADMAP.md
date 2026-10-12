@@ -76,7 +76,7 @@ milestone like M2/M3, L ≈ multi-milestone or research.
 | # | Item | Addresses | Size |
 |---|---|---|---|
 | F1 | Test gaps: compute-sanitizer racecheck; a real n̂ > 16.7M split run (sampled check) | coverage | S |
-| F2 | Paper track (if wanted): clock-locked runs, H100 numbers (E1), Lean proofs completed against DESIGN v1.3, write-up. **Clock-locked comparison done (2026-10-04)** (local evaluation workspace). **Lean proofs completed against the current DESIGN (issue #12, 2026-10-11)**: R1–R6, L5, L6 and the capstone at the real moduli (PROOFS.md) | credibility | L |
+| F2 | Paper track (if wanted): clock-locked runs, H100 numbers (E1), Lean proofs completed against DESIGN v1.3, write-up. **Clock-locked comparison done (2026-10-04)** (local evaluation workspace). **Lean proofs extended for issue #12 (2026-10-11)**: R1–R6, L5, L6, and the algorithm-level capstone at the real moduli with the shipped multipliers. The remaining unmodelled machine-level details are listed in PROOFS.md "Formalization status" | credibility | L |
 
 ## Out of scope (decided)
 

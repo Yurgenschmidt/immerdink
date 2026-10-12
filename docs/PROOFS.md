@@ -395,11 +395,17 @@ exponent), each term is `≤ 2⁶²`, so `S < 2¹²⁸` for `k < 2⁶⁶`.
 - If `s·e < D`, then `⌊s·m/D⌋ = ⌊s/p⌋`.
   - *Proof.* Write `s = pq + r`. Multiplying by p: `qD ≤ sm` and
     `p·sm = sD + se < sD + D ≤ p(q+1)D`. ∎
-- Instances:
-  - `mod_p_bytes32`: `D = 2³²`, `s < 2²⁴`, `p ≤ 256`.
+- Instances (each is the reduction the device code uses):
+  - `mod_p_bytes32` (the packs): `D = 2³²`, `s < 2²⁴`, `p ≤ 256`.
+  - The CRT digit `(q·W) mod p` (`crt_step`, `mod_p_small32`): `q·W < 2¹⁶`, so
+    `mod_p_bytes32` applies.
   - The epilogue's `umulhi64`: `D = 2⁶⁴`, `n = v + p⌈2³¹/p⌉ < 2³²`, giving `v mod p`, because
     p divides the bias.
-  - The CRT digit `(q·W) mod p`: `q, W < p ≤ 256`.
+    - On every reachable epilogue input this hypothesis holds (with R6's range, since
+      `bias ≤ 2³¹ + p − 1`).
+    - The same `umulhi64` reduces the residue map's `r·(2^ε mod p)`, with both factors `< p`.
+- The device's 64-bit `umulhi` is built from 32-bit pieces (`src/device/modp.hpp`). That
+  decomposition is not modelled; Lean models `⌊n·m/2⁶⁴⌋` directly.
 
 **R6 (the CRT word, DESIGN §2, §3.6).** Let `R_l = ∏_{j≥l} p_j`.
 - **Peak bound.** `R_l | x_l`, so `x_l ≤ P − R_l` and `x'_l ≤ (P − R_l) + M_l(p_l − 1)`.
@@ -407,15 +413,23 @@ exponent), each term is `≤ 2⁶²`, so `S < 2¹²⁸` for `k < 2⁶⁶`.
     `W_l = (p_l − 1)M_l mod p_l`.
 - **No exact hit.** `x'_l = P` never occurs: it would force `p_l | M_l y_l`, hence `y_l = 0`
   and `x_l = P`. So `≥` and `>` agree.
-- **Centring on the word.** On an unsigned `L_w`-bit word with `2P ≤ 2^{L_w}`, centring by a
-  wrapped subtraction gives a word that, read as two's complement, is z. Its sign bit equals
-  the borrow-out of `x − P`.
+- **Centring.**
+  - **Word form** (DESIGN §3.6 and `CRTRealization`): on an unsigned `L_w`-bit word with
+    `2P ≤ 2^{L_w}`, centring by a wrapped subtraction gives a word that, read as two's
+    complement, is z.
+    - Its sign bit is set exactly when the subtraction is taken. The subtraction's borrow-out
+      is then 1, since `x < P`.
+    - Borrows themselves are not modelled.
+  - **Sign-magnitude form the device computes** (`crt_finish`: `neg = x > H`,
+    `|z| = neg ? P − x : x`): this is z.
 - **The design instance (the 20 moduli of DESIGN §2).** Pairwise coprime, P even,
   `T ≥ 180` for N ≥ 2.
   - L32 is the least limb count with `2P ≤ 2^{32·L32}`.
   - The exact peak is `≥ 2^{32(L32−1)}`, so every limb is needed.
-  - The exact epilogue range at `K_c' = 131008` is
+  - The epilogue range at `K_c' = 131008` is
     `[−2129666048, (p − 1) + 2146435072] ⊆ int32`.
+    - It is tight at p = 256. Odd p have the narrower `±⌊p/2⌋²·K_c'`.
+  - The multipliers `q_l = M_l⁻¹ mod p_l` satisfy `M_l q_l ≡ 1` for every N ≤ 20.
 
 ---
 
@@ -429,6 +443,13 @@ modelling choices are in `proofs/NOTES.md`.
   - `Residue.emulated_product_exact_smod` feeds it the SMod residues the device stores.
   - `Moduli.emulated_product_exact_design` instantiates it at the 20 moduli, K_c' = 131008
     and int32 saturation.
+  - `Moduli.emulated_product_exact_shipped` does the same with the multipliers `q_l`
+    checked in Lean.
+- **Algorithm level only.** The capstones are stated at the algorithm level: the mathematical
+  mod in the epilogue, and the CRT word as a natural number.
+  - R5–R6 prove each machine-word realization step separately: the reductions, the epilogue's
+    u32 / u64 Barrett on every reachable input, the centring forms, and no wrap.
+  - They are not composed into one statement about the kernel.
 - **[v1.19]** L3c (the ν form, its NORMWISE / ELEMENTWISE / ABSOLUTE compositions with the
   final rounding, and the native chain's γ_k) and L7 were added for NOTES-C1 stage 3 (IR5).
   - L7 includes L7a, `kseg_compose`, `kseg_rows`, L7c (1)–(4) and (7), and the exact half of
@@ -444,10 +465,16 @@ Still taken as hypotheses:
   `≤ u|y|`, and of an addition, `|fl(a + b) − (a + b)| ≤ u|a + b|`);
 - the floating-point evaluation of the requests (L5d's `1 ± 2^{−19}`, L7d's `t′`, ρ̂_S), which
   `params.py` certifies;
-- the choice of the multipliers `q_l` (any `M_l·q_l ≡ 1 (mod p_l)`; they exist, `exists_q`).
+- the machine-level details of the realization that R5–R6 do not model:
+  - the 32-bit decomposition of `umulhi64`;
+  - the limb carry and borrow chains (TLA+ `CRTRealization`);
+  - the composition of the pack path (byte weights → reduction → SMod → sign) into a single
+    "emitted byte = SMod(a', p)" statement.
 
-The residue map's int8 range and the facts about the 20 concrete moduli are no longer
-hypotheses (R4, R6).
+The following are now proved instead of assumed (R4, R5, R6):
+- the residue map's int8 range;
+- the facts about the 20 concrete moduli;
+- the multipliers `q_l`.
 
 ## Formalization plan (as written before the proofs)
 

@@ -15,8 +15,9 @@ hypotheses (`r ≡ a'`, `|r·s| ≤ Q`):
   byte-weight residue (`byte_weights_modEq`, `byte_weights_le`);
 * the multiply-high reductions: the generic Granlund–Montgomery lemma
   (`mulhi_div_eq`), the A5 `mod_p_bytes32` lemma (`mod_p_bytes32`), the epilogue's
-  `umulhi64` Barrett reduction with the bias (`barrett_epilogue`) and the CRT's
-  `y = (q·W) mod p` (`crt_y_reduction`);
+  `umulhi64` Barrett reduction with the bias (`barrett_epilogue`), the residue map's
+  `(r·(2^ε mod p)) mod p` by the same `umulhi64` (`residue_mul_reduction`), and the CRT digit
+  `y = (q·W) mod p` by the 32-bit magic `mod_p_small32` (`crt_y_small32`);
 * the capstone `emulated_product_exact_smod`: `Exact.emulated_product_exact` with the residues
   the device actually computes, `r = smod a' p`, `s = smod b' p`, so the residue hypotheses
   are discharged.
@@ -251,9 +252,10 @@ theorem barrett_epilogue {p : ℕ} (hp : 0 < p) (hp256 : p ≤ 256) {v : ℤ}
   have : ((bias : ℕ) : ℤ) = p * (((2 ^ 31 + p - 1) / p : ℕ) : ℤ) := by rw [hbias]; push_cast; ring
   rw [this, Int.add_mul_emod_self_left]
 
-/-- **The CRT digit (DESIGN §3.6).** `y = (q·W) mod p` by the same `umulhi64(⌈2⁶⁴/p⌉)`
-reduction, for `q, W < p ≤ 256`. -/
-theorem crt_y_reduction {p qd w : ℕ} (hp : 0 < p) (hp256 : p ≤ 256) (hq : qd < p) (hw : w < p) :
+/-- **The residue map's product (DESIGN §3.4; `residue()` in `src/kernels/numerics.cuh`).**
+`(r·(2^ε mod p)) mod p` with both factors `< p ≤ 256`, by the epilogue's `umulhi64(⌈2⁶⁴/p⌉)`
+(`mod_p_small` with `epi_magic`). -/
+theorem residue_mul_reduction {p qd w : ℕ} (hp : 0 < p) (hp256 : p ≤ 256) (hq : qd < p) (hw : w < p) :
     qd * w - p * (qd * w * ((2 ^ 64 + p - 1) / p) / 2 ^ 64) = qd * w % p := by
   have he : (2 ^ 64 + p - 1) / p * p - 2 ^ 64 < p := by
     have := Nat.div_mul_le_self (2 ^ 64 + p - 1) p
@@ -269,6 +271,17 @@ theorem crt_y_reduction {p qd w : ℕ} (hp : 0 < p) (hp256 : p ≤ 256) (hq : qd
       _ ≤ 2 ^ 64 := by norm_num
   rw [mulhi_div_eq hp hse]
   have := Nat.div_add_mod (qd * w) p
+  omega
+
+/-- **The CRT digit (DESIGN §3.6; `crt_step` in `src/kernels/numerics.cuh`).**
+`y = (q·W) mod p` for `q, W < p ≤ 256` by the 32-bit magic `umulhi(q·W, ⌈2³²/p⌉)`
+(`mod_p_small32`, `c_magic32`): `q·W < 2¹⁶ < 2²⁴`, so `mod_p_bytes32` applies (for `p = 256`
+the device masks instead, which gives the same `q·W mod 256`). -/
+theorem crt_y_small32 {p qd w : ℕ} (hp : 0 < p) (hp256 : p ≤ 256) (hq : qd < p) (hw : w < p) :
+    qd * w - p * (qd * w * ((2 ^ 32 + p - 1) / p) / 2 ^ 32) = qd * w % p := by
+  refine mod_p_bytes32 hp hp256 ?_
+  have : qd * w < 256 * 256 :=
+    lt_of_lt_of_le (Nat.mul_lt_mul_of_lt_of_le (by omega) (by omega) (by omega)) le_rfl
   omega
 
 /-! ### Capstone with the device's residues -/

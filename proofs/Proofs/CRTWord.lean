@@ -15,11 +15,14 @@ DESIGN §3.6 states about the realization, which `spec/params.py` (`cert_crt_pea
   subtraction may compare either way (`le_xp_iff_lt`);
 * **no wrap.** With `2P ≤ 2^{L_w}` every word value is exact modulo `2^{L_w}`
   (`xp_mod_word`);
-* **centring on the word** (`center_word`, `z_word`): `z = (x ≤ H) ? x : x − P` computed on
-  the unsigned `L_w`-bit word (the subtraction wraps, two's complement) and read back as a
-  signed word is `z`, and its sign bit equals the borrow-out of `x − P` (set exactly when the
-  subtraction is taken). This is CRTRealization's `pos_wordref_nosub` check
-  `SignBit(x2) = borrow`.
+* **centring, in both realizations:**
+  - the two's-complement word form of DESIGN §3.6 and `spec/CRTRealization.tla`
+    (`center_word`, `z_word`): `z = (x ≤ H) ? x : x − P` computed on the unsigned `L_w`-bit word
+    (the subtraction wraps) and read back as a signed word is `z`; its sign bit is set exactly
+    when the subtraction is taken, which is when its borrow-out is 1 (`x < P`), as the TLA+
+    check `SignBit(x2) = borrow` requires. Borrows themselves are not modelled;
+  - the sign-magnitude form the device computes (`crt_finish` in `src/kernels/numerics.cuh`:
+    `neg = x > H`, `|z| = neg ? P − x : x`) is `z` (`center_signmag`, `z_signmag`).
 
 The limb-by-limb carry and borrow chains stay in TLA+ (`CRTRealization` `RefinesWord`).
 -/
@@ -146,9 +149,10 @@ def toSigned (L w : ℕ) : ℤ := if w < 2 ^ (L - 1) then w else (w : ℤ) - 2 ^
 modulo `2^L`. -/
 def centerWord (L Pw H x : ℕ) : ℕ := if x ≤ H then x else (x + 2 ^ L - Pw) % 2 ^ L
 
-/-- **Centring on the word.** With `1 ≤ L`, `2P ≤ 2^L` and `x < P` (any `H`): the word is
-`< 2^L`, its sign bit (`≥ 2^{L−1}`) is set exactly when the subtraction is taken (`H < x`, where
-the borrow-out of `x − P` is 1), and read as two's complement it is the centred value. -/
+/-- **Centring on the word** (DESIGN §3.6, `CRTRealization`'s word form). With `1 ≤ L`,
+`2P ≤ 2^L` and `x < P` (any `H`): the word is `< 2^L`, its sign bit (`≥ 2^{L−1}`) is set exactly
+when the subtraction is taken (`H < x`; that subtraction's borrow-out is then 1, since `x < P`),
+and read as two's complement it is the centred value. -/
 theorem center_word {L Pw H x : ℕ} (hL : 1 ≤ L) (hw : 2 * Pw ≤ 2 ^ L) (hx : x < Pw) :
     centerWord L Pw H x < 2 ^ L ∧
       (2 ^ (L - 1) ≤ centerWord L Pw H x ↔ H < x) ∧
@@ -180,6 +184,25 @@ theorem z_word (hp : ∀ l < N, 0 < p l) {Lw : ℕ} (hL : 1 ≤ Lw) (hw : 2 * P 
     (H : ℕ) :
     toSigned Lw (centerWord Lw (P N p) H (x N p q W N)) = z N p q W H := by
   rw [(center_word (H := H) hL hw (x_lt_P hp N le_rfl)).2.2]
+  unfold z; split_ifs <;> rfl
+
+/-- **Centring as the device computes it** (`crt_finish`): sign `neg = (x > H)` and magnitude
+`P − x` or `x`; with `x < P` the signed value is the centred one. -/
+theorem center_signmag {Pw H x : ℕ} (hx : x < Pw) :
+    (if H < x then -(((Pw - x : ℕ) : ℤ)) else ((x : ℕ) : ℤ)) =
+      if x ≤ H then (x : ℤ) else (x : ℤ) - Pw := by
+  by_cases h : x ≤ H
+  · have h' : ¬ H < x := by omega
+    simp only [h, h', ↓reduceIte]
+  · have h' : H < x := by omega
+    simp only [h, h', ↓reduceIte]
+    push_cast [hx.le]; ring
+
+/-- The running CRT's final word, centred in the device's sign-magnitude form, is `z`. -/
+theorem z_signmag (hp : ∀ l < N, 0 < p l) (H : ℕ) :
+    (if H < x N p q W N then -(((P N p - x N p q W N : ℕ) : ℤ))
+      else ((x N p q W N : ℕ) : ℤ)) = z N p q W H := by
+  rw [center_signmag (x_lt_P hp N le_rfl)]
   unfold z; split_ifs <;> rfl
 
 /-! ### The peak is attained -/

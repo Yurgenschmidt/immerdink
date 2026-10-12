@@ -12,8 +12,9 @@ computation at toy widths. Here it is proved for all widths:
   the estimate `ĉ = (bitlen(B) − bitlen(A) + 1) >> 1` (an arithmetic, i.e. floor, shift)
   satisfies the rule at `ĉ − 1` and fails it at `ĉ + 1`, so the largest `u` is
   `Rule(ĉ) ? ĉ : ĉ − 1`: one exact compare suffices;
-* **S** (`S_le`, `S_lt_two_pow_128`): with `F = 60` and the row exponent's upper half
-  (`max|x_h| < 2`), every term `⌈x_h²·2^F⌉ ≤ 2⁶²`, so `S < 2¹²⁸` (uint128) for `k < 2⁶⁶`.
+* **S** (`S_le`, `S_lt_two_pow_128`, `S_shift_lt`): with `F = 60` and the row exponent's upper
+  half (`max|x_h| < 2`), every term `⌈x_h²·2^F⌉ ≤ 2⁶²`, so `S < 2¹²⁸` (uint128) for `k < 2⁶⁶`, and
+  the device's RN left side `L = 4·S < 2¹²⁷` for `k < 2⁶³`.
 -/
 
 namespace Immerdink.Scaling
@@ -154,5 +155,19 @@ theorem S_lt_two_pow_128 {k : ℕ} (hk : k < 2 ^ 66) {a : Fin k → ℝ} {γ : �
         have : (0 : ℤ) < 2 ^ 62 := by positivity
         nlinarith
     _ = 2 ^ 128 := by norm_num
+
+/-- **The device's shifted sum** (`largest_u` in `src/kernels/numerics.cuh`: `L = S << 2` for
+RN in a u128): for `k < 2⁶³`, `S < 2¹²⁵` and `4·S < 2¹²⁷`. -/
+theorem S_shift_lt {k : ℕ} (hk : k < 2 ^ 63) {a : Fin k → ℝ} {γ : ℤ}
+    (hγ : ∀ h, |a h| < (2 : ℝ) ^ (γ + 1)) : S a γ 60 < 2 ^ 125 ∧ 4 * S a γ 60 < 2 ^ 127 := by
+  have := S_le hγ
+  have hk' : (k : ℤ) < 2 ^ 63 := by exact_mod_cast hk
+  have h1 : S a γ 60 < 2 ^ 125 :=
+    calc S a γ 60 ≤ k * 2 ^ 62 := this
+      _ < 2 ^ 63 * 2 ^ 62 := by
+          have : (0 : ℤ) < 2 ^ 62 := by positivity
+          nlinarith
+      _ = 2 ^ 125 := by norm_num
+  exact ⟨h1, by linarith⟩
 
 end Immerdink.Scaling
