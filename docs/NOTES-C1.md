@@ -5786,6 +5786,19 @@ Candidate: `kl.chain` 320.5 ns per unit, kept by the leave-one-shape-out rule (1
   seen records), but it is biased 7–9 % low on narrow multi-pass KL B, and a plain refit that includes the new sweep is about as accurate on this hold-out (6.3 / 17.7 %). Shipping
   either is a new calibration with its own review; M-c / M-d2 are not re-scored.
 
+**The two shipping checks (2026-10-12; immerdink-eval `scripts/c1/klb/cold_check.py`, `results/c1/klb/md2_predict_candidate.json`).**
+- **Cache state.** The records are REPEAT-warm calls, so the REPEAT-state prediction is the like-for-like one; predicting them in the COLD state is a different question. In REPEAT,
+  calls < 100 µs, median signed error shipped / refit without the key / candidate: klb hold-out −16.7 / −7.9 / −6.7 %, Q24 −25.1 / −12.5 / −11.3 %, Jacobi −15.8 / −11.9 / −9.6 %;
+  100 µs–1 ms and ≥ 1 ms within ±3.3 % for all; v1.18 hold-out unchanged (< 100 µs 3.7 / 4.0 / 4.0 %). COLD-state predictions of the same warm calls (not their state) go from
+  +10.5 / +6.0 / +20.0 % (klb hold-out / Q24 / Jacobi, < 100 µs, shipped) to +19.9 / +16.2 / +21.1 % (candidate): the cancellation with the KL A / K4 over-prediction (§5.11) is gone, as
+  expected, and a COLD prediction of a small call is now about 20 % high where it was 6–20 %. On the six `--l2 flush` calls of the fit sweep (inputs cold, CLEAN state; in the fit set,
+  n = 6): errors of the shipped model −5.4 … +4.9 % (median |err| 5.2 %), refit without the key −1.8 … +5.4 % (1.7 %), candidate −2.7 … +8.5 % (4.8 %): no better than shipped there, and
+  the cache credit under a chain arm is not examined by this (too few cold rows).
+- **M-d2 ratios predicted with the candidate against the recorded measurements (no GPU run: the ratios S14 / F14 of §5.12 are measured, only the prediction changes).** PPL view 0.7731
+  predicted against 0.7693 / 0.7688 measured (−0.5 %; the shipped bar 0.750: +2.6 %), DF 0.6650 against 0.6948 / 0.6977 (+4.5 / +4.9 %; shipped +4.7 / +5.2 %), 4096³ 0.6744 against
+  0.6957 / 0.6915 (+3.2 / +2.5 %; shipped +3.4 / +2.8 %), Jacobi view (reported) 0.8088 against 0.8290 / 0.8278 (+2.5 %; shipped 0.7865: +5.4 %); BURST / REPEAT 0.7634 (shipped 0.728).
+  All inside the registered bands. This re-scores nothing: M-d2's pass stays what §5.12 says, on the shipped calibration, and these systems are not a hold-out of the candidate.
+
 The two-locked-clock pass needs the sudo clock lock (docs/BENCHMARKING.md): Eric's call, not run by an agent.
 
 ---
