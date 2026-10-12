@@ -194,6 +194,17 @@ first.
     18 CPU-only tests: pass.
   - Evaluation records and summaries are in immerdink-eval `results/c1/` and
     `findings/c1-*.md`.
+- **Ozaki II proofs (issue #12, 2026-10-11, branch `12-ozaki-scheme-ii-proofs`):** the Lean
+  formalization now covers the realization lemmas PROOFS R1–R6 (`proofs/Proofs/{ShiftRule,
+  Residue,CRTWord,Moduli}.lean`), L5 and L6 (`KWeights.lean`, `Apost.lean`; the lemmas only, and
+  stages 4 and 5 stay closed / deferred), and L7c's remaining forms. The capstone at the real
+  moduli is `Moduli.emulated_product_exact_design`; with the multipliers checked in Lean it is
+  `emulated_product_exact_shipped`. The capstones are at the algorithm level. R5 and R6 prove
+  the machine-word steps separately; PROOFS "Formalization status" lists what is still unmodelled.
+  An independent review found nothing blocking, and its fixes are in. 145 headline theorems.
+  No TLA+ change: every new claim is arithmetic, and the protocol claims were already
+  model-checked. `tools/check_proofs.sh` also checks the Lean moduli against
+  `spec/params_out.json`.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
