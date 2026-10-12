@@ -5693,6 +5693,62 @@ condition is amended, because M-d2 passed on the shipped calibration, and C1 is 
 M-c stays FAILED, MC-3a is not a pass (ruling A), no M-c re-run on the shipped calibration is used
 to claim a pass, and the [M, model-only, outside hold-out] marks stay.
 
+### 5.13 Issue #7: the KL chain term, its offline evidence, review and pre-registered bars (implementer and independent reviewer, 2026-10-12)
+
+C1 is done (§5.12); this is the follow-up of the open defect of §5.11 / DESIGN §6c.9 / §7, reopened by its trigger
+"a calibration sweep that adds narrow multi-pass KL packs". Design: DESIGN §6c.10. Nothing here re-scores M-c
+or M-d2.
+
+**Offline evidence (CPU, allowed records only; immerdink-eval `scripts/c1/klb/`, `FINDINGS.md`).**
+1. KL B's excess tracks a per-(chunk, modulus) chain: Jacobi 0.92 µs per modulus over 16 steps (57 ns),
+   Q24 q_kl1 0.64 µs over 12 (53 ns). The additive chain of §5.11 fits 6–13 ns per step on wide launches
+   because there it hides under the DRAM time; a `max(byte arm, chain arm)` fits both.
+2. Independent review (read-only agent, 2026-10-12), accepted with changes: (a) feature `nc · g · waves`, not
+   `nc · values · g` (`values` flips 8 → 4 at nc 2 → 3, non-monotone; per `nc · g` unit: Q24 KL B 214 / 229 / 209 ns,
+   Jacobi 226 / 225; all KL4 with `values` = 4, so the data cannot separate the two features there, and q_ppl's KL A
+   (nc = 2, KL8, byte-dominated) is no evidence either way; the nc ≤ 2 rows of the new sweep are the test); (b) `wave` outside the max (inside it, launch / byte /
+   l2byte refit to 9.2 µs / 1.153 / 0.542 against 6.6 / 1.003 / 0.361); (c) with `4 · nc · g`, the KL class refit gives narrow KL B
+   4.9 % in-sample and 5.8 % on the Jacobi view, all-KL 6.1 / 17.9 (median / p90), and with all shipped thetas frozen and only
+   the chain fitted, narrow KL B goes 42.7 → 8.2 % and exactly 37 of 728 KL rows change.
+3. Corrections to the first offline run: the Jacobi view is no longer a hold-out (the rate was derived from it);
+   the 7.0 % figure pooled 17 Q24 in-sample rows with 20 Jacobi rows; the baselines did not use `perf_fit`'s machinery
+   (fref normalization), so "shipped ~40 % low" was compared against a different refit; the regime iteration was
+   initialization-dependent (replaced by the (byte rate, chain) scan of DESIGN §6c.10). Only 24 of 448 fit rows are
+   chain-bound, hence the sweep.
+
+**Pre-registered, before any new GPU data.** Fit sweep `bench/sweep_klb_calib.txt` and hold-out `bench/sweep_klb_holdout.txt`
+(committed with this section, the scorer and DESIGN §6c.10 in one commit, the first in `git log -- bench/sweep_klb_calib.txt`, before the first run; `bench/sweep_disjoint.py`: hold-out disjoint from the fit sweep and from every earlier
+sweep, by GEMM view). The hold-out is never used to fit or choose `kl.chain`. Bars, on the hold-out's REPEAT phase marks
+(`bench/perf_validate.py` per-phase), the candidate against the refit without the key by the same `perf_fit`:
+- **Scorer.** `bench/perf_score_kl.py` (committed with the sweeps, before the first run): per-phase signed and unsigned errors of KL
+  phases against the REPEAT marks for every call length (`perf_validate.py --phases` drops calls under 1 ms and reports unsigned
+  pooled errors, so it cannot score this), with filters nc / waves / g / grid, the chain arm / byte arm ratio of the candidate, and
+  per-shape and per-bin counts. Fit data of both fits (candidate and refit without the key): the shipped calibration's sweeps
+  (`sweep_calib.txt`, `sweep_cache.txt`), `sweep_calib_n.txt` and `sweep_klb_calib.txt`; never `sweep_klb_holdout.txt`,
+  `sweep_mc.txt` and `sweep_mc3a_holdout.txt` (the last two were seen by the offline analysis and are reported, not scored).
+  Phase marks are quantized at 1.024 µs; KL B phases are 13–40 µs.
+- **P1** narrow multi-pass KL B (nc ≥ 3, grid below 128 CTAs) on the hold-out: median |err| ≤ 10 %, p90 ≤ 20 %, and no signed
+  bias beyond ±5 % overall or in an nc bin pooled as {3}, {4}, {≥ 5}; a bin of fewer than 3 distinct shapes, and the waves and g bins
+  (waves is 1 when the grid is below 128 CTAs; the g rows are few), are reported, not scored. The risk is stated in advance: part
+  of the small-g miss is a g-independent per-chunk part, which the refit may put in `kl.wave`; if the signed bias at g = 3 / 6 then
+  exceeds 5 %, P1 fails and that is recorded, not adjusted.
+- **P2** every other KL phase (KL A, wide KL B, nc ≤ 2, the pack KL case) and every other class: median and p90 not worse by more than
+  1 point than the refit without the key; with `kl.chain` absent or 0 the prediction is bit-identical to the current library.
+- **P3** call level, REPEAT and COLD, before and after, on the hold-out, Q24 and the Jacobi view: reported with the per-phase
+  decomposition. The cancellation with KL A / K4's +9 % (§5.11) is expected to move COLD call errors negative (Jacobi ≈ +9 → ≈ −4 %,
+  q_kl2 N = 6 ≈ −10 → ≈ −17 %); the size-class targets of DESIGN §6c.5 must still hold on the v1.18 hold-out, or the shipping decision
+  goes to Eric with the numbers.
+- **P4** the chain is kept only if the fit's shape-blocked held-out error beats the fit without it; otherwise the key stays absent.
+- **P5** crossover: the hold-out rows whose chain arm / byte arm (the candidate's own arms) lies in [0.5, 2], at least 6 rows from at
+  least 3 shapes: median |err| ≤ 15 %; fewer rows is reported as "not tested". If it fails, the p-norm fallback of DESIGN §6c.10 is
+  designed (a further optional key, reviewed before use).
+- **If P1 or P2 fails** the key stays absent in the shipped calibration, the candidate and its numbers are recorded here as a negative
+  result, and the tests and the code path may stay only if inert (P2's bit-identity).
+- The `cold` group (`--l2 flush`) yields call totals only (the phase marks stay REPEAT state; the records' prediction state is CLEAN)
+  and is confounded by KF / K4 error: it is reported, and the cache credit is not changed on its evidence alone. `warm.kl_drop` is
+  re-scanned on the KL A marks alone after the chain is in, and stays 0 unless the scan shows a gain by the §5.11 rule.
+The two-locked-clock pass needs the sudo clock lock (docs/BENCHMARKING.md): Eric's call, not run by an agent.
+
 ---
 
 ## Appendix A. Claims corrected in review (not carried into this design)

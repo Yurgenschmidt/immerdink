@@ -1,0 +1,54 @@
+# Issue #7 (KL B, the narrow operand's multi-pass pack): the fit sweep for the optional key kl.chain
+# (docs/DESIGN.md §6c.10, docs/NOTES-C1.md §5.13), committed BEFORE any run and before any
+# fit with the key. Geometry of the KL launch (src/host/analysis.hpp kl_launch): a pack read along
+# rows takes th = 8 rows x tk = 512 per tile, nc = ceil(k_hat / 512) chunks, one CTA per tile, so
+# 'ik,kj->ij' with a narrow j puts B on the multi-pass launch (nc >= 3; KL4, 1 CTA/SM resident,
+# waves = ceil(tiles / 128)); 'ik,jk->ij' reads B along k (tk = pow2 >= k_hat, capped at 4096:
+# nc = 1 for k_hat <= 4096, 2 up to 8192; KL8 with values = 8 for nc <= 2). What each group identifies:
+#   nc      k = 1088 .. 6144: nc = 3, 4, 5, 6, 7, 8, 12 (all KL4, values = 4: nc*g and nc*values*g differ
+#           by a constant there; only the nc <= 2 rows below, values = 8, can tell them apart)
+#   nc12    B along k, nc = 1 and 2 (values = 8): k_bnc1, k_bnc2
+#   waves   j = 1024 / 1032 / 2048 / 2056 at nc = 3: tiles 128 / 129 / 256 / 257 (waves 1, 2, 2, 3). These are
+#           DRAM-bound (chain arm / byte arm about 0.2): they test that the max does not fire there
+#   cross   j = 128 .. 8192 at nc = 3: chain arm / byte arm about 0.2 .. 2 (at 0.22 us per nc*g unit); a ratio
+#           near 3 needs nc >= 4. j = 320 puts a row near 1
+#   g       g = 2, 4 at N = 5, 9, 13 (g < N, separate g from N). Expect a g-independent per-chunk part too:
+#           the shipped kl.wave may be too small for KL4 narrow launches (DESIGN §6c.10)
+#   side    KL A narrow, nc = 1 (ik,kj) and multi-pass (ki,kj; nc >= 3), B along k, a batch label, a tensor
+#           spec, imd_pack's KL (method packed)
+#   cold    --l2 flush: call TOTALS only (the phase marks stay REPEAT state; the records' prediction state is
+#           CLEAN), confounded by KF/K4 error: reported, not a decisive test of the cache credit; k_cold3 is
+#           DRAM-bound (a control)
+# Shapes are disjoint from bench/sweep_klb_holdout.txt, sweep_calib.txt, sweep_calib_n.txt,
+# sweep_mc.txt, sweep_mc3a_holdout.txt and sweep_perf_validate.txt (bench/sweep_disjoint.py).
+# Run like the calibration (bench/run_sweep.sh: quiet gate, GPU lock, stock clocks). A second
+# locked-clock pass needs the sudo clock lock of docs/BENCHMARKING.md: Eric's call, not run here.
+# name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
+k_nc3     | ik,kj->ij | i=1536,k=1088,j=96  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_nc4     | ik,kj->ij | i=1536,k=1792,j=96  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_nc5     | ik,kj->ij | i=1536,k=2304,j=96  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_nc6     | ik,kj->ij | i=1536,k=2816,j=96  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_nc7     | ik,kj->ij | i=1536,k=3584,j=96  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_nc8     | ik,kj->ij | i=1536,k=4096,j=96  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_nc12    | ik,kj->ij | i=1024,k=6144,j=96  | imd | 4,13 | --reps 100 --phase-reps 10 --max-seconds 1
+k_w128    | ik,kj->ij | i=1024,k=1536,j=1024 | imd | 8,13 | --reps 100 --phase-reps 10 --max-seconds 1
+k_w129    | ik,kj->ij | i=1024,k=1536,j=1032 | imd | 8,13 | --reps 100 --phase-reps 10 --max-seconds 1
+k_w256    | ik,kj->ij | i=1024,k=1536,j=2048 | imd | 8,13 | --reps 100 --phase-reps 10 --max-seconds 1
+k_w257    | ik,kj->ij | i=1024,k=1536,j=2056 | imd | 8,13 | --reps 100 --phase-reps 10 --max-seconds 1
+k_x128    | ik,kj->ij | i=1024,k=1536,j=128  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_x256    | ik,kj->ij | i=1024,k=1536,j=256  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_x320    | ik,kj->ij | i=1024,k=1536,j=320  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_x512    | ik,kj->ij | i=1024,k=1536,j=512  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_x4096   | ik,kj->ij | i=1024,k=1536,j=4096 | imd | 8,13 | --reps 20 --phase-reps 5 --max-seconds 1
+k_x8192   | ik,kj->ij | i=1024,k=1536,j=8192 | imd | 8,13 | --reps 20 --phase-reps 5 --max-seconds 1
+k_g       | ik,kj->ij | i=1536,k=1792,j=96  | imd | 5,9,13 | --reps 300 --phase-reps 10 --max-seconds 1 --g 2,4
+k_bnc1    | ik,jk->ij | i=1536,j=96,k=1792  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_anmp    | ki,kj->ij | i=88,k=1664,j=1536  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_anarrow | ik,kj->ij | i=96,k=1536,j=1536  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_bnc2    | ik,jk->ij | i=1536,j=96,k=4608  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_batch   | bik,bkj->bij | b=8,i=256,k=1536,j=64 | imd | 4,8 | --reps 100 --phase-reps 10 --max-seconds 1
+k_tensor  | abcd,cdij->abij | a=28,b=28,c=40,d=40,i=8,j=12 | imd | 5,9,13 | --reps 300 --phase-reps 10 --max-seconds 1
+k_pack    | ik,kj->ij | i=1536,k=1792,j=96  | packed | 4,8 | --reps 100 --phase-reps 10 --max-seconds 1 --pack B --reuse 1
+k_cold1   | ik,kj->ij | i=1536,k=1792,j=96  | imd | 4,13 | --reps 300 --phase-reps 10 --max-seconds 1 --l2 flush
+k_cold2   | ik,kj->ij | i=1024,k=1536,j=128  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1 --l2 flush
+k_cold3   | ik,kj->ij | i=1024,k=1536,j=2048 | imd | 8,13 | --reps 100 --phase-reps 10 --max-seconds 1 --l2 flush

@@ -4428,8 +4428,8 @@ the saving the model credits is C − R and the share the mark keeps is (C − m
   13.7 → 12.7 % at the best of them, with d = 0.75 (offline, KL class only, allowed records;
   `scripts/c1/mc3a/kl_cv.py`, diff of the trial in `results/c1/mc3a/chain_exploration.diff`).
   A feature restricted to underfilled launches would fit, but its switch breaks the monotonicity
-  of the prediction in the shape (a bigger shape would take less). So no second key; the
-  defect is recorded with its size and a trigger in NOTES-B2 §12 and §7 below, and tracked as
+  of the prediction in the shape (a bigger shape would take less). So no second key *in v1.19*; v1.20 (§6c.10) proposes a max form with a
+  values-independent feature; the defect is recorded with its size and a trigger in NOTES-B2 §12 and §7 below, and tracked as
   [GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog). The narrow packs
   of Q24 enter the refit, which absorbs part of it into `kl.wave` and `kl.launch` (NOTES-C1 §5.11
   reports by how much).
@@ -4445,6 +4445,67 @@ phase's REPEAT time is COLD − (1 − d)(COLD − REPEAT at d = 0), WARM = REPE
 read at its COLD time, COLD / CLEAN and every non-KL phase are unchanged (a mutant that applies
 the share to every phase, and one that ignores the key, are caught); `host_c_api`: the slot (95), the
 round trip, the three rejections.
+
+### 6c.10 The KL chain term, `kl.chain` **[v1.20, proposed: design only until NOTES-C1 §5.13's gates pass]**
+
+Closes (or records the failure of) the open model defect of [GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7):
+KL B on the multi-pass launch (rows of three or more chunks, fewer CTAs than SMs) runs ×1.5–2.0
+its REPEAT prediction.
+
+- **Evidence.** On the shipped calibration's marks, KL B's measured time rises by about 0.9 µs per
+  modulus on the Jacobi view (nc = 4) and 0.64–0.68 µs on Q24 (nc = 3), against 0.18 µs
+  predicted for Jacobi (0.14 and 0.19 µs for q_kl1 and q_kl2); the wide launches of the fit
+  (which are DRAM-bound) show none of it. The time per `nc · g` unit is 209–229 ns on the KL B of
+  nc = 3 and 4. All of those are KL4 (`values` = 4), so the data cannot tell `nc · g` from
+  `nc · values · g` there (they differ by the constant 4); the choice rests on monotonicity and on
+  the work argument below, and the sweep's nc ≤ 2 rows (`values` = 8) are the data test. About
+  half of the excess at small g is independent of g (Jacobi: 10.7 µs at N = 4, of which 3.7 µs is
+  slope), a per-chunk part that a refit is expected to move into `kl.wave` (2.16 µs now); the
+  chain alone does not explain it, and the sweep's `g` group separates the two (NOTES-C1 §5.13).
+- **Model.** A KL phase costs
+  `launch + wave · w + l2byte · l2 + op · ops + max(byte · bytes, chain · s · scale)`,
+  `s = chain_of(grid, 1, tiles, nc · g, resident)` = waves · ceil(tiles / grid) · nc · g, the
+  busiest SM's serial (chunk, modulus) steps, `scale` the SM-clock scale of §6c.1. It is a work/span
+  bound, as K4's `max(round model, DRAM term)`: the chip's DRAM throughput against the critical
+  path of the busiest SM, whose memory latency a wide launch hides under its other CTAs and a
+  grid of fewer CTAs than SMs cannot. `wave` stays outside the max: put inside it, the refit moves
+  `launch`, `byte` and `l2byte` away from their fitted values (9.2 µs / 1.15 / 0.54 against 6.6 /
+  1.00 / 0.36) and puts nc = 1 launches in the chain-bound set.
+- **`values` is not in the feature.** `values` is 8 for nc ≤ 2 and 4 above, so `nc · values · g`
+  falls by 25 % at nc 2 → 3 while the bytes grow, which would let a bigger shape predict less.
+  `s` is non-decreasing in every plan input and the byte arm is too, so the max is.
+- **Key.** `kl.chain` (ns per unit), optional, format 2 only, in KL slot 4 (flat `param[16]`, the
+  slot of the retired `op_eps`; `kl.op_eps` stays accepted and discarded), ≥ 0, written only when
+  non-zero, taken as clock-bound (compute steps, as §6c.1's chain; an assumption the stock-clock sweeps
+  cannot test: the locked-clock pass is Eric's). Absent = 0 = the loop of §6c.1 unchanged, bit-identical predictions and
+  text, and `x[4]` of a KL phase is filled only when `kl.chain` > 0 (so the features `imd_perf_t`
+  returns, and the tests that read them, do not change for a file without the key);
+  `imd_perf_calib_t` and the host API version are unchanged; a library without the key
+  rejects a file that has it. `to_format1_params` zeroes it. One key for one physical effect
+  (§6c.5).
+- **Fit.** Not in the plain NNLS column set (a routine recalibration must not fit it: an additive
+  chain fits 0 or 6–13 ns per step on the calibration's wide launches). `perf_fit --kl-chain` scans
+  `(byte rate, chain)`, fits `launch, l2byte, wave` by NNLS on the remainder, takes the global
+  minimum of the relative squared error, and writes the key only if the shape-blocked held-out
+  error beats the fit without it. Opt-in, like `--kl-drop`.
+- **Not modeled / known weak spots.** Within a CTA load, sync and emit are serial, so near the
+  crossover the truth lies between the max and the sum (the hard max is low by up to half the
+  smaller arm at equal arms); no shipped fit row sits there, the fit sweep's `cross` group does. If
+  it shows a systematic error the fallback is one more optional key (a p-norm of the two arms). The
+  cache credit (§6c.8) is subtracted after the phase time; in a chain-bound phase the DRAM
+  saving may be hidden, which the `cold` group decides. KL A and K4's over-prediction (+9 % in
+  total) no longer cancels KL B's miss at the call total: the call-level effect is reported
+  before shipping (NOTES-C1 §5.13).
+- **Text to update with the code** (it says KL `x[4]` is always 0 and the sum has no max for KL):
+  `include/immerdink/immerdink_host.h` (the feature table and the `sum_j param * x` sentence, K4's
+  max only), §6c.1 (the feature table and the lines on the retired KL slot 4), §6c.2 (the slot
+  names: `imd_perf_param_name` returns NULL for KL slot 4 today and `kl.chain` after),
+  `kParamNames` / `kFormat2Param` / `optional_param` / `kClockBound` in `src/host/perf.cpp`,
+  `CLOCK_BOUND` in `bench/perf_fit.py` and `python/immerdink/host.py`.
+- **Tests** (`host_perf`, planned): absent or 0 bit-identical across shapes and regimes; grammar
+  and slot; only chain-bound KL phases change (the count on a recorded shape set); the monotone
+  scan (`k_hat` through nc 2 → 3 and the tile doublings, rows through 128 / 129 and 256 / 257
+  CTAs, g, N); the C and Python clock-bound tables agree.
 
 ---
 
