@@ -5757,6 +5757,35 @@ the hold-out is untouched): `kl.chain` 393 ns per unit, kept by the leave-one-sh
 the refit without the key moves `kl.wave` to 4453 ns and `kl.launch` to 5857 ns as §5.11 found; narrow KL B on the seen records
 (Q24 and Jacobi) 42.7 % with the shipped calibration, 18.2 % with the refit without the key, 6.2 % with the chain.
 
+**Run and verdict (2026-10-12; sweeps at commit 4c37dc1, machine quiet and the GPU lock free at the start).** Records in immerdink-eval
+`results/c1/klb/` (`klb_calib.jsonl` 69 ok calls, `klb_holdout.jsonl` 61 ok calls; 55 and 51 of them flagged `contaminated` by
+`warm_run.sh`'s 5 % spread rule, the usual state of 100 µs calls: Q24 had 38 of 43; median spread 10.9 % against Q24's 6.4 %, so
+the marks are noisier than Q24's), candidate and refit without the key (`candidate_chain.calib`, `refit_without_key.calib`, same fit
+data: calibration, cache, Q24, sustained, `klb_calib`), scorer output `score_holdout_*.txt`. The hold-out was not used to fit or choose.
+Candidate: `kl.chain` 320.5 ns per unit, kept by the leave-one-shape-out rule (10.88 against 12.31; 85 shapes); `kl.launch` 5902 ns, `kl.byte`
+0.000888, `kl.l2byte` 0.000217, `kl.wave` 3927 ns. The refit without the key moves `kl.wave` to 5537 ns, `kl.launch` to 5179 ns and `kl.byte` to
+0.000673.
+- **Narrow multi-pass KL B on the hold-out (n = 44, 17 shapes), median / p90 |err|, median signed:** shipped 41.7 / 51.8 %, −41.7 %; refit
+  without the key 6.3 / 17.7 %, −5.3 %; candidate 6.9 / 14.2 %, −6.9 %. The shipped model's defect is therefore mostly a coverage gap: with narrow
+  multi-pass packs in the fit set a plain refit also fits them on the hold-out. Bins of the candidate (signed): nc 3 −3.4 %, nc 4 −2.9 %, nc ≥ 5 −9.2 %;
+  arm ratio 0.5 .. 2 (16 rows, 9 shapes) 9.7 / 15.0 %, −9.7 %; ratio > 2 5.8 / 12.0 %, −5.6 %.
+- **P1: FAILS on its bias clause** (median 6.9 % ≤ 10 %, p90 14.2 % ≤ 20 % pass; signed bias −6.9 % overall and −9.2 % at nc ≥ 5, beyond ±5 %). Recorded, not
+  adjusted. The bias is negative and largest near the crossover and for deep chains, which is the hard max's known weak spot (DESIGN §6c.10).
+- **P2: met against the refit without the key** on what is measured: other KL phases on the hold-out 14.7 / 37.9 % against 15.6 / 38.4 % (all three calibrations
+  are about 14–17 % low on those, a KL A / cache-credit matter outside this change); the in-sample class table of the fit moves only in KL (median 7.7 against 9.1 %,
+  p90 20.4 against 21.6 %), the other classes are identical. Absent or 0 is bit-identical (`host_perf` v1.20). No per-class hold-out table beyond KL was
+  computed.
+- **P3 (call level, `perf_validate`, records' REPEAT state; COLD not run separately):** klb hold-out < 100 µs median / p90 17.6 / 29.9 % shipped
+  (target missed), 7.9 / 20.9 % refit without the key, 6.8 / 19.9 % candidate; 100 µs–1 ms 5.7 / 21.2 % (missed) → 2.8 / 12.4 % → 2.7 / 13.9 %. v1.18 hold-out
+  (no narrow multi-pass shape): all targets met by all three (≥ 1 ms 2.5 / 6.4 % shipped, 2.5 / 5.1 % refit without, 2.4 / 4.8 % candidate). Q24 + Jacobi (in the fit sets):
+  < 100 µs 25.0 / 28.6 % shipped (missed), 11.9 / 15.5 % refit without, 11.1 / 17.6 % candidate; ≥ 1 ms p90 7.0 % shipped, **18.3 % refit without the key (missed, the §5.11
+  distortion)**, 12.5 % candidate (met, but above the shipped 7.0 %).
+- **P4: passes. P5: passes** (9.7 % on 16 rows from 9 shapes, ≤ 15 %).
+- **Verdict.** By the pre-registered rule P1's failure keeps `kl.chain` out of the shipped calibration; the code (optional key, inert when absent) and the candidate stay. The
+  evidence for Eric's decision: the candidate fixes the < 1 ms calls as a refit would, without the ≥ 1 ms distortion of a refit without the key (18.3 against 12.5 % p90 on the
+  seen records), but it is biased 7–9 % low on narrow multi-pass KL B, and a plain refit that includes the new sweep is about as accurate on this hold-out (6.3 / 17.7 %). Shipping
+  either is a new calibration with its own review; M-c / M-d2 are not re-scored.
+
 The two-locked-clock pass needs the sudo clock lock (docs/BENCHMARKING.md): Eric's call, not run by an agent.
 
 ---
