@@ -171,3 +171,168 @@ The comparison methods of `imd_bench` went the same way: up to `db8bfbd` the ben
 timed other libraries (and `perm+X` wrappers that permute the operands to the GEMM view),
 and its `duel` paired imd with one of them. The evaluation workspace keeps that version of
 the bench. NOTES files that mention other libraries' calls in the same process refer to it.
+
+## Test definitions
+
+The metrics suite is two sweeps of `bench/imd_bench`: throughput and accuracy
+(`bench/sweep_imd.txt`) and board energy (`bench/sweep_energy.txt`). Both are driven by
+`bench/run_metrics.sh` (see "Recreating the metrics on another machine").
+
+**What every test is.** One *case* is one FP64 contraction `C = A·B` (an einsum spec on row-major
+operands) computed by immerdink's Ozaki-II emulation (INT8 tensor cores) with N moduli. Each case
+runs in its own process. Tensor cases are lowered to a GEMM view `m×n×k` with batch `b`; the
+TFLOPS-equivalent numerator is always `2·m·n·k·b` (the FP64 operation count), whatever N is.
+
+- **Data:** `(u − ½)·exp(φ·g)`, φ = 0.5, `u ~ U[0,1)`, `g ~ N(0,1)`, generated on the device from a
+  counter-based hash (seed 1): every run sees the same inputs.
+- **Accuracy:** against a double-double (Dot2) reference on the device, for 256 sampled outputs
+  (all of C if it is smaller; 262 144 in the energy sweep). The metric is the max normwise error
+  `|c − r| / (‖a_i‖₂ ‖b_j‖₂)`; the max relative error `|c − r| / |r|` is recorded too.
+  "DGEMM-level" means at or below cuBLAS DGEMM's normwise error on the same inputs (about 3.5e-16
+  at φ = 0.5); N = 14 is the smallest N that reaches it for this data.
+
+### Cases
+
+| case | einsum | extents | GEMM view m×n×k (b) | what it is |
+|---|---|---|---|---|
+| s256 | `ik,jk->ij` | i=j=k=256 | 256³ | tiny GEMM (µs scale) |
+| s512 | `ik,jk->ij` | i=j=k=512 | 512³ | small GEMM |
+| s_cc16 | `kjbc,kiac->abij` | i=j=k=16, a=b=c=96 | 1536³ | small coupled-cluster-style contraction |
+| s_batch | `lik,ljk->lij` | i=j=k=64, l=256 | 64³, b=256 | tiny batched GEMM |
+| sq1024 | `ik,jk->ij` | i=j=k=1024 | 1024³ | square GEMM |
+| sq4096 | `ik,jk->ij` | i=j=k=4096 | 4096³ | square GEMM |
+| sq8192 | `ik,jk->ij` | i=j=k=8192 | 8192³ | large square GEMM |
+| r_lowk | `ik,jk->ij` | i=j=8192, k=1024 | 8192×8192×1024 | low k (CRT-bound) |
+| r_bigk | `ik,jk->ij` | i=j=2048, k=32768 | 2048×2048×32768 | big k |
+| r_skinny | `ik,jk->ij` | i=16384, j=512, k=4096 | 16384×512×4096 | skinny |
+| r_mm | `ik,jk->ij` | i=1000, j=64, k=50000 | 1000×64×50000 | matrix-vector-like, memory-bound |
+| t_batch | `lik,ljk->lij` | i=j=k=1024, l=16 | 1024³, b=16 | batched GEMM |
+| t_ikl | `ikl,kjl->ijl` | i=j=k=1024, l=16 | 1024³, b=16 | batched GEMM, batch index last |
+| t_df | `acQ,bdQ->acbd` | a=b=c=d=64, Q=2048 | 4096×4096×2048 | density-fitting contraction |
+| t_cc | `kjbc,kiac->abij` | i=j=k=32, a=b=c=128 | 4096³ | CC particle-hole contraction |
+| t_permout | `abk,kcd->cadb` | a=b=c=d=64, k=4096 | 4096³ | permuted output |
+
+The energy sweep runs sq2048 (2048³, `ik,jk->ij`), sq4096, sq8192, t_df, t_cc, t_batch and s_batch.
+
+Besides immerdink, this repository's sweeps measure cuTENSOR native and emulated FP64 (Test 3). The
+native batched baseline (`cublasGemmStridedBatchedEx` FP64) and the other comparison libraries
+(cuBLAS DGEMM, GEMMul8, cuBLAS FP64 emulation) exist only in the evaluation workspace's `eval_bench`.
+
+### Test 1: throughput and accuracy (`bench/sweep_imd.txt`)
+
+For each case and N ∈ {8, 14}: 2 warm-up calls, then timed calls with CUDA events on a non-blocking
+stream, at least 3 and at most 10 repetitions, capped at 15 s per method (6 s for sq8192). The
+median is reported with min, max and the spread `(max − min)/median`. Then 5 profiled calls give
+the per-phase times (K0 vec, K1 scale, K2/K3 pack, KL, K4 INT8 GEMM, K5 CRT) against the
+memory-model lower bounds. Before each case: a 3 s dense warm-up in the same lock hold, and up to 3
+attempts while the spread exceeds 5 % (records get `attempts` and `contaminated`).
+
+Reported: median time, `TFLOPS-eq = 2·m·n·k·b / median`, spread, both error metrics, workspace
+bytes, phase times, and per case a clock-state line after the warm-up (SM MHz, power, temperature,
+event reasons). s256, s512 and s_batch take tens of µs per call: their spread is jitter-dominated
+(often flagged `contaminated`); use `--methods duel` for a stable A/B number on those.
+
+### Test 2: board energy (`--methods energy`, `bench/sweep_energy.txt`)
+
+Per case, for N ∈ {8, 11, 13, 14, 16}, one N at a time: an accuracy check, a 3 s back-to-back
+warm-up, then back-to-back calls for at least 10 s (at least 50 calls while that fits in 30 s),
+queued ahead so the GPU never idles. Energy is the NVML total-energy counter
+(`nvmlDeviceGetTotalEnergyConsumption`) over whole counter steps with exactly two reads: the counter
+advances in steps on a firmware timer (about 100 ms on an RTX 4090) and every read costs a little
+energy, so the window starts at an observed step and ends at a step, with no reads inside (details
+in the comment above `struct ERead` in `bench/imd_bench.cu`). The step period is **measured at idle
+at the start of every case** (30 consecutive steps; the run fails with a clear error if the counter
+does not step regularly) unless `--energy-step-ms` sets it; each record carries
+`energy_counter.step_period_ms`, `step_period_calibrated` and `next_step_resid_ms` (the step after
+the window must fall on the step grid).
+
+Reported (per case and N): `gflops_per_w = 2·m·n·k·b / (energy per call)` (GFLOPS-eq per watt =
+TFLOPS-eq per kW), `energy_j_per_call`, `avg_power_w`, the sustained `tflops_eq_mean` (back-to-back,
+gaps included), the same quantities above the case's awake-idle power (an idle measurement per case,
+record `method: idle`), the SM clock and clock-event reasons over the window (`nvml`), and the
+instant-power cross-check `avg_power_w_inst`. The energy counter is a property of the GPU and
+driver: on a part whose counter is missing or does not step (some data-centre or virtualized GPUs),
+the energy records are errors, not wrong numbers.
+
+### Test 3: cuTENSOR native and emulated FP64 (`bench/sweep_baselines.txt`, energy sweep)
+
+The only comparison libraries in this repository are the two cuTENSOR modes (optional: `imd_bench`
+is built with them only if `cutensor.h` and `libcutensor` are found, `CUTENSOR_ROOT`; otherwise those
+methods are compiled out and a run asking for them records an error). Same cases, data, reference
+and timing code as Test 1, with the einsum given to cuTENSOR directly (no GEMM lowering, no extra
+permutations):
+
+- `cutensor`: `cutensorContract` with `CUTENSOR_COMPUTE_DESC_64F` (native FP64; this is also the
+  "DGEMM-level" accuracy reference, about 3.5e-16 normwise at φ = 0.5).
+- `cutensor-emu`: the same with `CUTENSOR_COMPUTE_DESC_8XINT8`, cuTENSOR's INT8-based FP64 emulation
+  (cuTENSOR ≥ 2.4; its header lists it as Hopper+; the number of retained mantissa bits is chosen at
+  runtime to match native accuracy). Since cuTENSOR 2.6 it **falls back to native FP64 silently**
+  where it does not apply, so a record alone cannot tell whether the emulation ran:
+  `bench/summarize.py` compares the emulated record with the native one of the same case and flags it
+  "not engaged (time within 5 % of native, same error)". A plan that cuTENSOR refuses is an error
+  record, not a failure of the sweep.
+- Energy: methods `energy-cutensor` and `energy-cutensor-emu` in `bench/sweep_energy.txt` use the
+  protocol of Test 2 (same process, same idle baseline).
+
+Records carry `compute_desc`, `cutensor_version` and `emulated_requested`. The cuBLAS DGEMM (and
+strided-batched DGEMM), GEMMul8 and cuBLAS FP64-emulation baselines are **not in this repository**;
+they exist only in the separate evaluation workspace.
+
+### Calibration (`bench/calibrate.sh`)
+
+Before the sweeps `bench/run_metrics.sh` calibrates the GPU: a sustained dense load (4096³, N = 14,
+back to back, through the same gate as every timed run) while `nvidia-smi` is sampled at 1 Hz, until
+the state is **stable**: over the last 20 s the SM clock varies by ≤ 30 MHz and the temperature by
+≤ 1 °C (after ≥ 30 s of load; timeout 180 s). It reports the steady SM clock (median/min/max of the last
+30 s), power, temperature, the share of samples with the power-cap / thermal / HW slowdown event
+reasons, whether the clocks are locked, and a **recommended lock**: the lowest sustained SM clock minus
+30 MHz, floored to a 15 MHz step, with the exact `sudo nvidia-smi -lgc F,F` command (it must be a
+supported graphics clock: `nvidia-smi -q -d SUPPORTED_CLOCKS`). Result: `calibration.json`, copied into
+`conditions.txt`. With the clocks locked it verifies the lock holds (SM at the lock in every sample, no
+cap). It never changes clocks itself; `LOCK_CLOCKS=auto` (passwordless sudo needed) locks at the
+recommendation, re-calibrates, and restores the clocks on exit. `CALIBRATE=0` skips it. Each case still
+begins with the 3 s warm-up of `bench/warm_run.sh`, now on an already hot GPU.
+
+### Machine conditions
+
+Every case runs through `tools/run_bench.sh` (see "Getting clean numbers"): machine-wide lock,
+shared GPU lock, a wait for low load, no CPU hog, no compute processes and raw GPU utilization ≤ 1 %.
+Note whether the clocks were locked (`applications_clocks_setting` in the `clock_state` lines,
+`conditions.txt` of `bench/run_metrics.sh`): with the clocks free, large shapes sit at the power
+limit and efficiency tracks throughput. The per-record provenance (commit, driver, CUDA, GPU and
+VBIOS, clocks, conditions) is in the JSONL.
+
+## Recreating the metrics on another machine
+
+Needs only a CUDA toolkit (nvcc >= 12.8, 13.x preferred), a C++20 host compiler (gcc >= 11), cmake >= 3.28
+and git; no conda. On an HPC system: `module load cuda gcc cmake` (names vary).
+
+```sh
+git clone --branch dev https://github.com/Yurgenschmidt/immerdink.git && cd immerdink
+git submodule update --init --depth 1 third_party/cutlass   # login node: needs network
+
+# On the GPU node (e.g. srun --gres=gpu:1 --exclusive --pty bash):
+bench/preflight.sh                       # checks toolchain, cuTENSOR, GPU, NVML, sudo, quiet; says what to fix
+export CUTENSOR_ROOT=/path/to/cutensor   # only if `module load cutensor` does not make it findable (>= 2.4)
+bench/build.sh                           # detects the GPU architecture (120 on RTX PRO 6000 Blackwell)
+bench/run_metrics.sh $HOME/imd-metrics/$(hostname)-$(date +%Y%m%d)
+```
+
+- `bench/run_metrics.sh <outdir>` builds if needed, then calibrates the GPU (see "Calibration"), runs the
+  throughput/accuracy sweep, the cuTENSOR native/emulated baselines (if built with cuTENSOR) and the
+  energy sweep. The output directory must be outside the repository.
+- **Clock lock (recommended, needs root):** the calibration prints the exact command
+  (`sudo nvidia-smi -lgc <f>,<f>`, a frequency the card sustains under its power cap); run it, start again,
+  and undo with `-rgc` afterwards. With passwordless sudo, `LOCK_CLOCKS=auto bench/run_metrics.sh <outdir>` does
+  lock, re-calibrate and unlock by itself. Without a lock the run still works; say "unlocked" in the report.
+- **Dedicated node:** the gate is on by default (quiet machine, machine-wide lock). If the batch system
+  already gives you the GPU exclusively, `IMMERDINK_GPU_LOCK=none` skips only the shared advisory lock.
+  If the quiet check blocks on harmless node daemons, relax it (`QUIET_LOAD`, `QUIET_CPU`,
+  `QUIET_GPU_IGNORE`, see `tools/quiet_check.sh`); never edit it out.
+- `SWEEPS="imd energy"` (any of `imd baseline energy`) selects sweeps; `CALIBRATE=0` skips the calibration; `CASES='sq8192|t_cc' bench/run_sweep.sh
+  bench/sweep_energy.txt out.jsonl` runs a subset. `CMAKE_CUDA_ARCHITECTURES=<n>` overrides the
+  detected architecture (use a fresh `IMMERDINK_BENCH_BUILD` directory when changing it).
+- **Check the accuracy before believing the speed:** the library's kernels were developed on sm_89, so on a
+  new architecture the first thing to read is `max_normerr` in the records (about 1e-16 at N = 14,
+  1e-9 at N = 8; `nonfinite` must be 0). `tools/test.sh` runs the correctness tests.
+- If the machine never gets quiet, the sweep stops with exit 3 instead of recording contaminated numbers.

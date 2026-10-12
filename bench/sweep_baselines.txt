@@ -1,0 +1,22 @@
+# cuTENSOR baselines for the throughput sweep: the same cases as sweep_imd.txt, native FP64
+# (CUTENSOR_COMPUTE_DESC_64F, method cutensor) and cuTENSOR's INT8-based FP64 emulation
+# (CUTENSOR_COMPUTE_DESC_8XINT8, method cutensor-emu; cuTENSOR >= 2.4, Hopper+ per its header; it may
+# fall back to native FP64 silently, which bench/summarize.py flags). Needs imd_bench built with cuTENSOR
+# (bench/preflight.sh; set CUTENSOR_ROOT). Same format as sweep_imd.txt; the N column is unused.
+# The cuBLAS DGEMM / GEMMul8 / cuBLAS-emulation baselines are NOT in this repository.
+s256    | ik,jk->ij | i=256,j=256,k=256      | cutensor,cutensor-emu | |
+s512    | ik,jk->ij | i=512,j=512,k=512      | cutensor,cutensor-emu | |
+s_cc16  | kjbc,kiac->abij | i=16,j=16,k=16,a=96,b=96,c=96 | cutensor,cutensor-emu | |
+sq1024  | ik,jk->ij | i=1024,j=1024,k=1024   | cutensor,cutensor-emu | |
+sq4096  | ik,jk->ij | i=4096,j=4096,k=4096   | cutensor,cutensor-emu | |
+sq8192  | ik,jk->ij | i=8192,j=8192,k=8192   | cutensor,cutensor-emu | | --max-seconds 6
+r_lowk  | ik,jk->ij | i=8192,j=8192,k=1024   | cutensor,cutensor-emu | |
+r_bigk  | ik,jk->ij | i=2048,j=2048,k=32768  | cutensor,cutensor-emu | |
+r_skinny| ik,jk->ij | i=16384,j=512,k=4096   | cutensor,cutensor-emu | |
+r_mm    | ik,jk->ij | i=1000,j=64,k=50000    | cutensor,cutensor-emu | |
+t_ikl   | ikl,kjl->ijl | i=1024,j=1024,k=1024,l=16 | cutensor,cutensor-emu | |
+t_df    | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | cutensor,cutensor-emu | |
+t_cc    | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | cutensor,cutensor-emu | |
+t_permout | abk,kcd->cadb | a=64,b=64,c=64,d=64,k=4096 | cutensor,cutensor-emu | |
+t_batch | lik,ljk->lij | i=1024,j=1024,k=1024,l=16 | cutensor,cutensor-emu | |
+s_batch | lik,ljk->lij | i=64,j=64,k=64,l=256 | cutensor,cutensor-emu | |

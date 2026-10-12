@@ -33,6 +33,9 @@
 //             configuration (k4_config in both records) the run is an A/A resolution check.
 //             Records duel-a and duel-b; duel-b carries ratio_median = median over pairs of
 //             t_a / t_b (> 1: B faster), its p10 / p90, and whether the two C are bit-identical
+//   energy    board energy per call (NVML total-energy counter, whole counter steps, idle
+//             baseline) of imd at each --N: avg_power_w, energy_j_per_call, gflops_per_w
+//             (GFLOPS-eq per watt), sustained tflops_eq_mean; see Bench::method_energy
 //   bw        device-to-device copy of A (achievable DRAM bandwidth; a hardware reference)
 //
 // --k-align auto|16|64 (DESIGN v1.13 §4b.6): the K alignment of every plan and pack the run
@@ -48,6 +51,9 @@
 #include <dlfcn.h>
 #include <sys/resource.h>
 #include <immerdink/immerdink.h>
+#ifdef IMD_BENCH_CUTENSOR
+#include <cutensor.h>  // optional baseline: native and emulated FP64 contractions (bench/CMakeLists.txt)
+#endif
 
 #ifdef IMD_BENCH_PROFILE
 #include "profile_hooks.h"  // src/: per-phase event marks (libimmerdink built with IMMERDINK_PROFILE)
@@ -63,8 +69,10 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <atomic>
 #include <stdexcept>
@@ -91,6 +99,14 @@ struct Failure : std::runtime_error {
     imd_status_t s_ = (x);                                                                   \
     if (s_ != IMD_STATUS_SUCCESS) throw Failure(std::string(#x) + ": " + imd_status_string(s_)); \
   } while (0)
+
+#ifdef IMD_BENCH_CUTENSOR
+#define CT(x)                                                                                \
+  do {                                                                                       \
+    cutensorStatus_t s_ = (x);                                                               \
+    if (s_ != CUTENSOR_STATUS_SUCCESS) throw Failure(std::string(#x) + ": " + cutensorGetErrorString(s_)); \
+  } while (0)
+#endif
 
 // ----------------------------------------------------------------------- device buffer ---
 struct DevBuf {
@@ -517,6 +533,10 @@ struct Options {
   double sustain_trace_s = 0;
   uint64_t seed = 1;
   std::string out;
+  // method energy (see Bench::method_energy)
+  double energy_warmup = 3, energy_seconds = 10, energy_max_seconds = 30, energy_idle = 3;
+  double energy_step_ms = 0;  // the energy counter's step period; 0 = measure it at idle (>= 30 steps)
+  int energy_min_calls = 50;
 };
 
 // A5 diagnostic (IMD_BENCH_CLOCK=1): the SM clock right after each timed call, measured by
@@ -679,6 +699,179 @@ __global__ void k_count_diff(const unsigned long long* x, const unsigned long lo
   if (local) atomicAdd(count, local);
 }
 
+// ---------------------------------------------------------------------- NVML sampler ---
+// dlopen'ed (no nvml.h needed; the ABI below is NVML's stable C ABI). Samples every 10 ms
+// between start() and stop(): SM clock (MHz), power (mW), temperature (C) and the
+// clock-event-reason bitmask (OR over the window; 0x4 = SW power cap, 0x1 = GPU idle,
+// 0x2 = applications clocks setting (an -lgc lock), 0x20/0x40/0x80 = thermal / HW slowdown).
+struct NvmlE {
+  using dev_t = void*;
+  int (*init)() = nullptr;
+  int (*handle)(unsigned, dev_t*) = nullptr;
+  int (*clock)(dev_t, int, unsigned*) = nullptr;
+  int (*power)(dev_t, unsigned*) = nullptr;
+  int (*temp)(dev_t, int, unsigned*) = nullptr;
+  int (*reasons)(dev_t, unsigned long long*) = nullptr;
+  // the cumulative board-energy counter (mJ since driver load) and field values (instant
+  // power, NVML_FI_DEV_POWER_INSTANT = 186, in mW)
+  int (*energy)(dev_t, unsigned long long*) = nullptr;
+  struct FieldValue {  // nvmlFieldValue_t
+    unsigned fieldId, scopeId;
+    long long timestamp, latencyUsec;
+    int valueType, nvmlReturn;
+    unsigned long long value;
+  };
+  int (*fields)(dev_t, int, FieldValue*) = nullptr;
+  dev_t dev = nullptr;
+  bool ok = false;
+  // instant board power in W (NaN if unavailable): unlike nvmlDeviceGetPowerUsage (a ~1 s
+  // moving average on Ada) this is the latest sensor sample
+  double power_instant_w() {
+    if (!fields) return NAN;
+    FieldValue f{};
+    f.fieldId = 186;
+    if (fields(dev, 1, &f) != 0 || f.nvmlReturn != 0) return NAN;
+    return double(f.value) * 1e-3;
+  }
+  NvmlE() {
+    void* h = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!h) return;
+    init = reinterpret_cast<int (*)()>(dlsym(h, "nvmlInit_v2"));
+    handle = reinterpret_cast<int (*)(unsigned, dev_t*)>(dlsym(h, "nvmlDeviceGetHandleByIndex_v2"));
+    clock = reinterpret_cast<int (*)(dev_t, int, unsigned*)>(dlsym(h, "nvmlDeviceGetClockInfo"));
+    power = reinterpret_cast<int (*)(dev_t, unsigned*)>(dlsym(h, "nvmlDeviceGetPowerUsage"));
+    temp = reinterpret_cast<int (*)(dev_t, int, unsigned*)>(dlsym(h, "nvmlDeviceGetTemperature"));
+    reasons = reinterpret_cast<int (*)(dev_t, unsigned long long*)>(
+        dlsym(h, "nvmlDeviceGetCurrentClocksEventReasons"));
+    if (!reasons)
+      reasons = reinterpret_cast<int (*)(dev_t, unsigned long long*)>(
+          dlsym(h, "nvmlDeviceGetCurrentClocksThrottleReasons"));
+    energy = reinterpret_cast<int (*)(dev_t, unsigned long long*)>(
+        dlsym(h, "nvmlDeviceGetTotalEnergyConsumption"));
+    fields = reinterpret_cast<int (*)(dev_t, int, FieldValue*)>(dlsym(h, "nvmlDeviceGetFieldValues"));
+    ok = init && handle && clock && power && temp && reasons && init() == 0 && handle(0, &dev) == 0;
+  }
+};
+double now_s() {  // host monotonic time, seconds
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+NvmlE& nvml_e() {
+  static NvmlE n;
+  return n;
+}
+struct Sampler {
+  std::vector<unsigned> mhz, mw, tc;
+  std::vector<double> wi;  // instant power (W), when available
+  unsigned long long reasons = 0;
+  std::atomic<bool> run{false};
+  std::thread th;
+  std::mutex mu;
+  void start() {
+    mhz.clear(); mw.clear(); tc.clear(); wi.clear(); reasons = 0;
+    if (!nvml_e().ok) return;
+    run = true;
+    th = std::thread([this] {
+      NvmlE& n = nvml_e();
+      while (run) {
+        unsigned c = 0, p = 0, t = 0;
+        unsigned long long r = 0;
+        n.clock(n.dev, 1 /*NVML_CLOCK_SM*/, &c);
+        n.power(n.dev, &p);
+        n.temp(n.dev, 0 /*NVML_TEMPERATURE_GPU*/, &t);
+        n.reasons(n.dev, &r);
+        const double pi = n.power_instant_w();
+        {
+          std::lock_guard<std::mutex> g(mu);
+          mhz.push_back(c); mw.push_back(p); tc.push_back(t); reasons |= r;
+          if (std::isfinite(pi)) wi.push_back(pi);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    });
+  }
+  // JSON summary of the window ("nvml" field of a record)
+  std::string stop() {
+    if (th.joinable()) { run = false; th.join(); }
+    if (mhz.empty()) return "null";
+    auto q = [](std::vector<unsigned> v, double f) {
+      std::sort(v.begin(), v.end());
+      return double(v[size_t(f * double(v.size() - 1))]);
+    };
+    double pmean = 0;
+    for (auto p : mw) pmean += p;
+    pmean /= double(mw.size()) * 1000.0;
+    double wimean = 0, wimax = 0;
+    for (auto p : wi) { wimean += p; wimax = std::max(wimax, p); }
+    if (!wi.empty()) wimean /= double(wi.size());
+    char b[640];
+    snprintf(b, sizeof b,
+             "{\"samples\": %zu, \"sm_mhz_min\": %.0f, \"sm_mhz_med\": %.0f, \"sm_mhz_max\": %.0f, "
+             "\"power_w_mean\": %.1f, \"power_w_max\": %.1f, \"power_inst_w_mean\": %s, "
+             "\"power_inst_w_max\": %s, \"temp_c_min\": %.0f, \"temp_c_max\": %.0f, \"reasons_or\": \"0x%llx\"}",
+             mhz.size(), q(mhz, 0), q(mhz, 0.5), q(mhz, 1), pmean, q(mw, 1) / 1000.0,
+             wi.empty() ? "null" : std::to_string(wimean).c_str(), wi.empty() ? "null" : std::to_string(wimax).c_str(),
+             q(tc, 0), q(tc, 1), reasons);
+    return b;
+  }
+};
+Sampler g_sampler;                 // NVML sampler of the current energy window
+std::string g_last_nvml = "null";  // its summary, attached to the energy record
+
+// Board-energy counter (method energy). nvmlDeviceGetTotalEnergyConsumption is the board's
+// cumulative energy in mJ. Measured on an RTX 4090 (evaluation workspace, energy findings):
+//   - it advances in STEPS every T ~ 99.97 ms (a firmware timer), each step adding the energy of
+//     the period before it (~45 J at 450 W), so two plain reads are off by up to one step
+//     (+-1 % of a 10 s window at full load);
+//   - every READ COSTS ENERGY: the period in which a read is serviced loses about the read's
+//     latency worth of energy (2 ms at idle, ~14 ms at load, ~5 J at 450 W); reads in a tight
+//     loop make the counter report a small fraction of the true energy. Reads of other NVML
+//     values (power usage, instant power, clocks) do not disturb it.
+// So a window is measured over WHOLE STEPS with exactly two counter reads: energy_step() reads
+// back to back (outside the window) until the counter steps, giving step time sA and value EA;
+// nothing reads the counter inside the window; energy_read_at(sB + 50 ms) reads EB once, sB =
+// sA + k T the first step after the window. Energy over [sA, sB] = EB - EA (exact k steps; the
+// only bias is the loss of the read that captured EA, ~-0.1 % of a 10 s window), power = (EB -
+// EA) / (k T). T is measured at idle at the start of the run (calibrate_step: >= 30 steps; this
+// matters on other GPUs, whose counter may step differently or not at all) unless
+// --energy-step-ms sets it; each record checks it: the step after the window must fall on
+// sA + m T ("next_step_resid_ms").
+struct ERead {
+  double mj = NAN, a = NAN, b = NAN;  // value; host times before / after the read
+  double mid() const { return 0.5 * (a + b); }
+};
+ERead energy_read() {
+  ERead r;
+  unsigned long long e = 0;
+  r.a = now_s();
+  const int rc = nvml_e().energy(nvml_e().dev, &e);
+  r.b = now_s();
+  if (rc == 0) r.mj = double(e);
+  return r;
+}
+ERead energy_read_at(double t) {  // one read at host time t (sleep, then spin the last 2 ms)
+  const double d = t - now_s() - 0.002;
+  if (d > 0) std::this_thread::sleep_for(std::chrono::duration<double>(d));
+  while (now_s() < t) {}
+  return energy_read();
+}
+struct EStep {
+  double t = NAN, mj = NAN;   // step time (between the midpoints of the last two reads), value after it
+  double unc_ms = NAN;        // +- uncertainty of t
+  double read_ms = NAN;       // latency of the read that saw the step
+};
+EStep energy_step(double max_s = 0.5) {  // back-to-back reads until the counter steps
+  ERead p = energy_read();
+  const double t_end = p.b + max_s;
+  for (;;) {
+    ERead q = energy_read();
+    if (std::isfinite(p.mj) && std::isfinite(q.mj) && q.mj != p.mj)
+      return {0.5 * (p.mid() + q.mid()), q.mj, 0.5e3 * (q.mid() - p.mid()), 1e3 * (q.b - q.a)};
+    if (q.b > t_end) return {};
+    p = q;
+  }
+}
+
+
 // --------------------------------------------------------------------- the bench context ---
 struct Bench {
   Case c;
@@ -830,6 +1023,9 @@ struct Bench {
     meta.integer("l2_bytes", (long long)p.l2CacheSize);
     meta.str("driver", sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null"));
     meta.integer("cuda_driver_api", drv).integer("cuda_runtime", rt);
+#ifdef IMD_BENCH_CUTENSOR
+    meta.integer("cutensor", (long long)cutensorGetVersion());
+#endif
     meta.str("gpu_max_clocks", sh("nvidia-smi --query-gpu=clocks.max.sm,clocks.max.mem "
                                   "--format=csv,noheader 2>/dev/null"));
     meta.str("commit", getenv_or("BENCH_COMMIT", "unknown"));
@@ -837,6 +1033,368 @@ struct Bench {
     const char* ql = std::getenv("QUIET_LOG");
     meta.str("conditions", ql ? read_file(ql) : "not recorded (not run via tools/run_bench.sh)");
   }
+
+  // ------------------------------------------------------------------ method energy ---
+  // Board energy per call of immerdink at each N (--methods energy --N 8,14), one N at a time:
+  //   0. once per case (idle_baseline): the counter's step period (calibrate_step, or
+  //      --energy-step-ms) and the board power with the GPU idle (CUDA context open) over
+  //      ~--energy-idle s after 1 s of settling (record method "idle"; idle_power_w in every
+  //      record). "Idle" is the awake state a running application sits in between calls
+  //      (clocks up); the GPU drops to a deep idle state only after ~10-20 s idle;
+  //   1. accuracy (one call, the same check as method imd);
+  //   2. back to back for --energy-warmup s (default 3): power, clock, temperature settle; at
+  //      its end the counter's next step sA (energy_step, see ERead above);
+  //   3. back to back for n counted calls, n = ceil(--energy-seconds / t_call) (default 10 s),
+  //      raised to --energy-min-calls (default 50) while that fits in --energy-max-seconds
+  //      (default 30). Calls are queued ~0.1 s ahead (no host round trip between calls; calls
+  //      > 0.5 s one at a time), with an event after each call, or after each group of
+  //      event_group calls when calls are < 0.1 ms (per-call times -> median_s; mean_s =
+  //      elapsed_s / calls is the sustained back-to-back time, gaps included);
+  //   4. the same configuration keeps running until one counter read just after the first step
+  //      sB = sA + k T past the last counted call.
+  // avg_power_w = (EB - EA) / (k T) over [sA, sB] (whole steps, no reads inside, the GPU busy
+  // with this configuration throughout); energy_j_per_call = avg_power_w * mean_s;
+  // gflops_per_w = 2·m·n·k·b / energy_j_per_call / 1e9 (GFLOP-eq per joule = TFLOPS-eq per kW).
+  // Cross-check: instant power (NVML field 186, sampled every 10 ms, does not disturb the
+  // counter) over the counted calls, "avg_power_w_inst" (also in "nvml").
+  double idle_power_w = NAN, step_T = 0.099974;
+  bool step_calibrated = false;
+  static int energy_depth(double t) {
+    return t > 0.5 ? 1 : std::clamp(int(std::ceil(0.1 / std::max(t, 1e-7))), 2, 1024);
+  }
+  template <class F>
+  static bool ready(const std::future<F>& f) {
+    return f.valid() && f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+  }
+  // The counter's step period, measured at idle over 30 consecutive steps. Fails (throws) if the
+  // counter does not step, steps faster than 10 ms or slower than 1 s, or any interval deviates
+  // from the mean by more than the timing uncertainty: the whole-step window method (above) is
+  // only valid for a counter that steps on a regular timer.
+  Json calibrate_step() {
+    const int n = 30;
+    std::vector<EStep> st;
+    for (int i = 0; i <= n; ++i) {
+      EStep e = energy_step(1.0);
+      if (!std::isfinite(e.t)) throw Failure("energy counter did not step within 1 s (step " + std::to_string(i) + ")");
+      st.push_back(e);
+    }
+    const double T = (st.back().t - st.front().t) / n;
+    double worst = 0, tol = 0;
+    for (int i = 1; i <= n; ++i) {
+      const double d = st[i].t - st[i - 1].t;
+      const double unc = (st[i].unc_ms + st[i - 1].unc_ms) * 1e-3;
+      if (std::fabs(d - T) > worst) { worst = std::fabs(d - T); tol = std::max(0.002, 3 * unc); }
+    }
+    Json c;
+    c.num("period_ms", T * 1e3).integer("steps", n).num("worst_interval_dev_ms", worst * 1e3).num("tolerance_ms", tol * 1e3);
+    const bool regular = T >= 0.01 && T <= 1.0 && worst <= tol;
+    c.raw("regular", regular ? "true" : "false");
+    if (!regular)
+      throw Failure("energy counter does not step regularly: mean period " + std::to_string(T * 1e3) +
+                    " ms, worst interval deviation " + std::to_string(worst * 1e3) + " ms (tolerance " +
+                    std::to_string(tol * 1e3) + " ms); pass --energy-step-ms to override");
+    step_T = T;
+    step_calibrated = true;
+    return c;
+  }
+  void idle_baseline() {
+    if (!nvml_e().ok || !nvml_e().energy) throw Failure("NVML energy counter unavailable");
+    CU(cudaDeviceSynchronize());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    Json cal;
+    if (o.energy_step_ms > 0) {
+      step_T = o.energy_step_ms * 1e-3;
+      step_calibrated = false;
+    } else {
+      cal = calibrate_step();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+    g_sampler.start();
+    const EStep A = energy_step(0.5);
+    if (!std::isfinite(A.t)) { g_sampler.stop(); throw Failure("energy counter did not step within 0.5 s"); }
+    const long long k = std::max<long long>(10, std::llround(o.energy_idle / step_T));
+    const ERead B = energy_read_at(A.t + double(k) * step_T + 0.05);
+    const std::string nv = g_sampler.stop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    const EStep C = energy_step(0.5);
+    idle_power_w = (B.mj - A.mj) * 1e-3 / (double(k) * step_T);
+    Json c;
+    c.integer("steps", k).num("step_period_ms", step_T * 1e3).raw("step_period_calibrated", step_calibrated ? "true" : "false");
+    if (!cal.kv.empty()) c.raw("calibration", cal.dump());
+    c.num("next_step_resid_ms", std::isfinite(C.t) ? std::remainder(C.t - A.t, step_T) * 1e3 : NAN);
+    c.num("read_B_after_step_ms", (B.a - (A.t + double(k) * step_T)) * 1e3);
+    c.num("energy_j", (B.mj - A.mj) * 1e-3).num("sA_unc_ms", A.unc_ms).num("read_ms", A.read_ms);
+    Json j;
+    j.str("method", "idle").str("variant", "GPU idle (CUDA context open)").integer("N", 0);
+    j.str("bench_mode", "energy").num("idle_power_w", idle_power_w).raw("energy_counter", c.dump());
+    j.raw("nvml", nv).str("gpu_after", gpu_state()).str("status", "ok");
+    emit(j);
+  }
+  Json energy_run(const std::function<void()>& run, double t_est, Timing& T) {
+    // tiny calls: one event per group of G calls (>= ~0.1 ms of work), so the harness adds
+    // little host work per call; the loop below counts units of G calls
+    const int G = t_est < 1e-4 ? std::clamp(int(std::ceil(1e-4 / std::max(t_est, 1e-7))), 1, 64) : 1;
+    const double tu = t_est * G;
+    int D = energy_depth(tu);
+    const int RING = 1026;  // > max depth + 1: an event slot is reused only after it is read
+    std::vector<cudaEvent_t> ev(RING);
+    for (auto& e : ev) CU(cudaEventCreate(&e));
+    cudaEvent_t pre, evA, evB;
+    CU(cudaEventCreate(&pre));
+    CU(cudaEventCreate(&evA));
+    CU(cudaEventCreate(&evB));
+    long long enq = 0, done = 0, c_first = -1, n = 0, k = 0;
+    std::vector<double> warm_t;
+    double t0 = NAN, t1 = NAN, tc = tu;
+    bool finished = false, a_started = false;
+    std::future<EStep> fA;
+    std::future<ERead> fB;
+    EStep A;
+    ERead B;
+    const bool slow = tu > 2e-3;  // poll with short sleeps instead of spinning
+    CU(cudaEventRecord(pre, s));
+    const double tw0 = now_s();
+    for (;;) {
+      bool progressed = false;
+      while (done < enq) {  // completions, in order
+        const cudaError_t q = cudaEventQuery(ev[done % RING]);
+        if (q == cudaErrorNotReady) break;
+        CU(q);
+        const double tobs = now_s();
+        float ms = 0;
+        CU(cudaEventElapsedTime(&ms, done == 0 ? pre : ev[(done - 1) % RING], ev[done % RING]));
+        if (c_first < 0 || done < c_first) warm_t.push_back(ms * 1e-3);
+        else if (done < c_first + n) T.t.push_back(ms * 1e-3 / G);  // per call (mean over the unit)
+        if (c_first >= 0 && done == c_first - 1) { t0 = tobs; g_sampler.start(); }
+        if (c_first >= 0 && done == c_first + n - 1) {
+          t1 = tobs;
+          g_last_nvml = g_sampler.stop();
+          finished = true;
+          k = (long long)std::ceil((t1 - A.t) / step_T + 1e-9);
+          fB = std::async(std::launch::async, energy_read_at, A.t + double(k) * step_T + 0.05);
+        }
+        ++done;
+        progressed = true;
+      }
+      if (finished && ready(fB)) break;
+      if (enq - done < D) {
+        if (!a_started && now_s() - tw0 >= o.energy_warmup) {
+          fA = std::async(std::launch::async, energy_step, 0.5);
+          a_started = true;
+        }
+        if (c_first < 0 && ready(fA)) {  // end of the warm-up: the counted calls start here
+          A = fA.get();
+          if (!std::isfinite(A.mj)) throw Failure("energy counter did not step within 0.5 s");
+          if (!warm_t.empty()) {
+            auto v = warm_t;
+            std::sort(v.begin(), v.end());
+            tc = v[v.size() / 2];
+          }
+          D = energy_depth(tc);
+          const long long by_time = (long long)std::ceil(o.energy_seconds / tc);
+          const long long by_count =
+              std::min<long long>((o.energy_min_calls + G - 1) / G, (long long)(o.energy_max_seconds / tc));
+          n = std::max<long long>({by_time, by_count, 1});
+          c_first = enq;
+          CU(cudaEventRecord(evA, s));
+          if (done == enq) { t0 = now_s(); g_sampler.start(); }  // the queue had drained (host-bound calls)
+        }
+        for (int g = 0; g < G; ++g) run();
+        if (c_first >= 0 && enq == c_first + n - 1) CU(cudaEventRecord(evB, s));
+        CU(cudaEventRecord(ev[enq % RING], s));
+        ++enq;
+        continue;
+      }
+      if (!progressed && slow) std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    B = fB.get();
+    CU(cudaStreamSynchronize(s));
+    // the step after B, to check that B was read in the period right after sB
+    const EStep C = energy_step(0.5);
+    float gms = 0;
+    CU(cudaEventElapsedTime(&gms, evA, evB));
+    for (auto& e : ev) cudaEventDestroy(e);
+    cudaEventDestroy(pre);
+    cudaEventDestroy(evA);
+    cudaEventDestroy(evB);
+    const double span = double(k) * step_T, P = (B.mj - A.mj) * 1e-3 / span;
+    const long long calls = n * G;
+    const double gpu_s = gms * 1e-3, mean = gpu_s / double(calls), ejc = P * mean, fl = flops();
+    const double phase = (B.a - (A.t + span)) * 1e3;  // read start after the step it should follow
+    const double c_resid = std::isfinite(C.t) ? std::remainder(C.t - A.t, step_T) * 1e3 : NAN;
+    double pin = 0;
+    {
+      // instant-power mean over the counted calls, from the sampler summary
+      const std::string& nv = g_last_nvml;
+      const auto pos = nv.find("\"power_inst_w_mean\": ");
+      pin = pos == std::string::npos ? NAN : std::atof(nv.c_str() + pos + 21);
+      if (pin == 0) pin = NAN;
+    }
+    Json e;
+    e.str("bench_mode", "energy").integer("calls", calls).integer("warm_calls", c_first * G).integer("event_group", G);
+    e.num("warm_s", t0 - tw0).integer("queue_depth", D);
+    e.num("elapsed_s", gpu_s).num("window_s", t1 - t0).num("mean_s", mean);
+    e.num("tflops_eq_mean", fl / mean / 1e12);
+    e.num("avg_power_w", P).num("energy_j_per_call", ejc).num("energy_j", P * gpu_s);
+    e.num("gflops_per_w", fl / ejc / 1e9);
+    e.num("idle_power_w", idle_power_w);
+    e.num("energy_above_idle_j_per_call", (P - idle_power_w) * mean);
+    e.num("gflops_per_w_above_idle", fl / ((P - idle_power_w) * mean) / 1e9);
+    e.num("avg_power_w_inst", pin);
+    Json c;
+    c.integer("steps", k).num("span_s", span).num("step_period_ms", step_T * 1e3).num("energy_j", (B.mj - A.mj) * 1e-3);
+    c.raw("step_period_calibrated", step_calibrated ? "true" : "false");
+    c.num("sA_to_t0_s", t0 - A.t).num("t1_to_sB_s", A.t + span - t1);
+    c.num("sA_unc_ms", A.unc_ms).num("sA_read_ms", A.read_ms).num("read_B_ms", (B.b - B.a) * 1e3);
+    c.num("read_B_after_step_ms", phase).num("next_step_resid_ms", c_resid);
+    e.raw("energy_counter", c.dump());
+    return e;
+  }
+  // The measurement shared by every method: `run` is one call (already planned), accuracy of its
+  // first result against the shared reference, then energy_run and the record.
+  void energy_measure(const std::function<void()>& run, const std::string& method,
+                      const std::string& variant, int N, size_t wsb, Json extra) {
+    poison_C();
+    run();  // accuracy on the shared inputs (the first call includes the plan's first-call setup)
+    CU(cudaStreamSynchronize(s));
+    Accuracy acc = result_accuracy();
+    double t_est = 0;
+    {  // timed calls
+      cudaEvent_t e0, e1;
+      CU(cudaEventCreate(&e0));
+      CU(cudaEventCreate(&e1));
+      for (int i = 0; i < 2; ++i) {
+        CU(cudaEventRecord(e0, s));
+        run();
+        CU(cudaEventRecord(e1, s));
+        CU(cudaEventSynchronize(e1));
+        float ms = 0;
+        CU(cudaEventElapsedTime(&ms, e0, e1));
+        t_est = ms * 1e-3;
+      }
+      cudaEventDestroy(e0);
+      cudaEventDestroy(e1);
+    }
+    Timing T;
+    Json e;
+    try {
+      e = energy_run(run, t_est, T);
+    } catch (...) {
+      g_sampler.stop();
+      throw;
+    }
+    for (auto& kv : extra.kv) e.kv.push_back(kv);
+    record(method, variant, N, T, &acc, flops(), wsb, e);
+  }
+  void method_energy(int N) {
+    if (!nvml_e().ok || !nvml_e().energy) throw Failure("NVML energy counter unavailable");
+    auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
+      lab.assign(x.labels.begin(), x.labels.end());
+      return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
+    };
+    std::vector<int32_t> la, lb, lc;
+    imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
+    imd_options_t opt{N, 0, IMD_RN, o.mode, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    size_t wsb = 0;
+    CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
+    imd_plan_t plan = nullptr;
+    CI(imd_plan_create(imd, &A, &B, &C, &opt, &plan));
+    auto destroy = [](imd_plan_t p) { cudaDeviceSynchronize(); imd_plan_destroy(p); };
+    std::unique_ptr<imd_plan_st, decltype(destroy)> guard(plan, destroy);
+    DevBuf ws(wsb);
+    auto run = [&] {
+      CI(imd_contract(plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, dC.as<double>(), ws.p, wsb, s));
+    };
+    Json extra;
+    extra.integer("g", N);
+    energy_measure(run, "imd", "RN g=N", N, wsb, extra);
+  }
+
+  // ------------------------------------------------------- cuTENSOR baselines (optional) ---
+  // `cutensor`: the contraction on the original layouts with CUTENSOR_COMPUTE_DESC_64F (native
+  // FP64). `cutensor-emu`: the same with CUTENSOR_COMPUTE_DESC_8XINT8, cuTENSOR's INT8-based FP64
+  // emulation (cuTENSOR >= 2.4; the header lists it as Hopper+; since 2.6 it falls back to native
+  // FP64 where it does not apply, silently: the record cannot tell, so compare its time and error
+  // with the native record of the same case: bench/summarize.py flags "not engaged"). A plan that
+  // cuTENSOR refuses is recorded as an error, never fatal. Same inputs, same reference, same timing
+  // code as method imd; `energy-cutensor[-emu]` use the energy protocol of method energy.
+#ifdef IMD_BENCH_CUTENSOR
+  cutensorHandle_t tens = nullptr;
+  struct CtPlan {
+    cutensorPlan_t plan = nullptr;
+    uint64_t wsb = 0;
+    CtPlan() = default;
+    CtPlan(const CtPlan&) = delete;
+    CtPlan& operator=(const CtPlan&) = delete;
+    ~CtPlan() {
+      cudaDeviceSynchronize();
+      if (plan) cutensorDestroyPlan(plan);
+    }
+  };
+  void make_ct(CtPlan& P, bool emu) {
+    if (!tens) CT(cutensorCreate(&tens));
+    cutensorTensorDescriptor_t d[3] = {nullptr, nullptr, nullptr};
+    cutensorOperationDescriptor_t op = nullptr;
+    cutensorPlanPreference_t pref = nullptr;
+    const Operand* X[3] = {&c.A, &c.B, &c.C};
+    std::vector<int32_t> m[3];
+    auto cleanup = [&] {
+      for (auto x : d) if (x) cutensorDestroyTensorDescriptor(x);
+      if (op) cutensorDestroyOperationDescriptor(op);
+      if (pref) cutensorDestroyPlanPreference(pref);
+    };
+    try {
+      for (int i = 0; i < 3; ++i) {
+        m[i].assign(X[i]->labels.begin(), X[i]->labels.end());
+        CT(cutensorCreateTensorDescriptor(tens, &d[i], uint32_t(X[i]->labels.size()), X[i]->extent.data(),
+                                          X[i]->stride.data(), CUTENSOR_R_64F, 256));
+      }
+      CT(cutensorCreateContraction(tens, &op, d[0], m[0].data(), CUTENSOR_OP_IDENTITY, d[1], m[1].data(),
+                                   CUTENSOR_OP_IDENTITY, d[2], m[2].data(), CUTENSOR_OP_IDENTITY, d[2],
+                                   m[2].data(), emu ? CUTENSOR_COMPUTE_DESC_8XINT8 : CUTENSOR_COMPUTE_DESC_64F));
+      CT(cutensorCreatePlanPreference(tens, &pref, CUTENSOR_ALGO_DEFAULT, CUTENSOR_JIT_MODE_NONE));
+      CT(cutensorEstimateWorkspaceSize(tens, op, pref, CUTENSOR_WORKSPACE_DEFAULT, &P.wsb));
+      CT(cutensorCreatePlan(tens, &P.plan, op, pref, P.wsb));
+    } catch (...) {
+      cleanup();
+      throw;
+    }
+    cleanup();
+  }
+  Json ct_extra(bool emu) {
+    Json e;
+    e.str("compute_desc", emu ? "CUTENSOR_COMPUTE_DESC_8XINT8" : "CUTENSOR_COMPUTE_DESC_64F");
+    e.integer("cutensor_version", (long long)cutensorGetVersion());
+    e.raw("emulated_requested", emu ? "true" : "false");
+    if (emu) e.str("note", "emulation may fall back to native FP64 silently (cuTENSOR >= 2.6): compare with the cutensor record");
+    return e;
+  }
+  void method_cutensor(bool emu, bool energy) {
+    if (energy && (!nvml_e().ok || !nvml_e().energy)) throw Failure("NVML energy counter unavailable");
+    CtPlan P;
+    make_ct(P, emu);
+    DevBuf ws(P.wsb);
+    const double one = 1.0, zero = 0.0;
+    auto run = [&] {
+      CT(cutensorContract(tens, P.plan, &one, dA.p, dB.p, &zero, dC.p, dC.p, ws.p, P.wsb, s));
+    };
+    const std::string name = emu ? "cutensor-emu" : "cutensor";
+    const std::string variant = emu ? "CUTENSOR_COMPUTE_DESC_8XINT8" : "CUTENSOR_COMPUTE_DESC_64F";
+    if (energy) {
+      energy_measure(run, name, variant, 0, P.wsb, ct_extra(emu));
+      return;
+    }
+    poison_C();
+    Timing T = time_it(run, s, o);
+    Accuracy acc = result_accuracy();
+    record(name, variant, 0, T, &acc, flops(), P.wsb, ct_extra(emu));
+  }
+#else
+  void method_cutensor(bool, bool) {
+    throw Failure("built without cuTENSOR: module load cutensor / set CUTENSOR_ROOT, then rebuild "
+                  "(bench/build.sh, fresh build directory)");
+  }
+#endif
 
   // k4: -1 the plan-time rule, -2 the k4_tune plan option, >= 0 a forced configuration
   // (benchmark hook; needs the profiling build).
@@ -1586,7 +2144,11 @@ void usage() {
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
           "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"
           "  [--k-align auto|16|64] (v1.13 §4b: force the K alignment of every plan / pack)\n"
-          "  methods: imd,packed,duel,bw,occupancy,sustained,pair (default imd)\n"
+          "  methods: imd,packed,duel,bw,occupancy,sustained,pair,energy (default imd);\n"
+          "      optional baselines (built with cuTENSOR): cutensor, cutensor-emu (CUTENSOR_COMPUTE_DESC_8XINT8),\n"
+          "      energy-cutensor, energy-cutensor-emu\n"
+          "  [--energy-warmup 3] [--energy-seconds 10] [--energy-min-calls 50] [--energy-max-seconds 30]\n"
+          "  [--energy-idle 3] [--energy-step-ms <counter step period; default: measured>] (method energy)\n"
           "  [--out file.jsonl]\n");
 }
 
@@ -1601,7 +2163,9 @@ int main(int argc, char** argv) {
                                       "max-seconds", "samples", "phi", "seed", "phase-reps",
                                       "vec", "g", "k4", "pack", "reuse", "duel-a", "duel-b", "out",
                                       "mode", "data", "clock-probe", "l2", "sustain-s",
-                                      "sustain-warm-s", "sustain-trace-s", "k-align"};
+                                      "sustain-warm-s", "sustain-trace-s", "k-align",
+                                      "energy-warmup", "energy-seconds", "energy-max-seconds",
+                                      "energy-idle", "energy-min-calls", "energy-step-ms"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -1615,9 +2179,10 @@ int main(int argc, char** argv) {
   }
   for (auto& m : split(a["methods"], ','))
     if (m != "imd" && m != "packed" && m != "duel" && m != "bw" && m != "occupancy" &&
-        m != "sustained" && m != "pair") {
-      fprintf(stderr, "unknown method %s (immerdink only: imd, packed, duel, bw, occupancy, "
-                      "sustained, pair)\n", m.c_str());
+        m != "sustained" && m != "pair" && m != "energy" && m != "cutensor" && m != "cutensor-emu" &&
+        m != "energy-cutensor" && m != "energy-cutensor-emu") {
+      fprintf(stderr, "unknown method %s (imd, packed, duel, bw, occupancy, sustained, pair, energy; "
+                      "baselines: cutensor, cutensor-emu, energy-cutensor, energy-cutensor-emu)\n", m.c_str());
       return 2;
     }
   if (!a.count("name") || !a.count("spec") || !a.count("ext")) { usage(); return 2; }
@@ -1653,6 +2218,12 @@ int main(int argc, char** argv) {
       B.o.dominant = a["data"] == "dominant";
       B.o.decay_opp = a["data"] == "decay_opp";
     }
+    if (a.count("energy-warmup")) B.o.energy_warmup = std::stod(a["energy-warmup"]);
+    if (a.count("energy-seconds")) B.o.energy_seconds = std::stod(a["energy-seconds"]);
+    if (a.count("energy-max-seconds")) B.o.energy_max_seconds = std::stod(a["energy-max-seconds"]);
+    if (a.count("energy-idle")) B.o.energy_idle = std::stod(a["energy-idle"]);
+    if (a.count("energy-min-calls")) B.o.energy_min_calls = std::stoi(a["energy-min-calls"]);
+    if (a.count("energy-step-ms")) B.o.energy_step_ms = std::stod(a["energy-step-ms"]);
     if (a.count("phi")) B.o.phi = std::stod(a["phi"]);
     if (a.count("clock-probe")) B.o.clock_probe = a["clock-probe"] == "1";
     if (a.count("l2")) {
@@ -1686,6 +2257,7 @@ int main(int argc, char** argv) {
   }
   std::vector<int> Ns;
   for (auto& x : split(a["N"], ',')) Ns.push_back(std::stoi(x));
+  bool idle_done = false, idle_ok = true;
   for (auto& m : split(a["methods"], ',')) {
     auto guarded = [&](const std::string& name, const std::string& variant, int N, auto&& fn) {
       try {
@@ -1702,6 +2274,23 @@ int main(int argc, char** argv) {
           for (int g : B.o.groups)
             for (int k4 : B.o.k4)
               if (g <= N) guarded(m, "", N, [&] { B.method_imd(N, v, g, k4); });
+    } else if (m == "cutensor" || m == "cutensor-emu") {  // optional baselines (docs/BENCHMARKING.md)
+      guarded(m, "", 0, [&] { B.method_cutensor(m == "cutensor-emu", false); });
+    } else if (m == "energy" || m == "energy-cutensor" || m == "energy-cutensor-emu") {
+      // board energy per call (idle baseline first, once per process): immerdink at each N, or
+      // cuTENSOR native / emulated
+      if (!idle_done) {
+        idle_done = true;
+        guarded("idle", "GPU idle (CUDA context open)", 0, [&] {
+          try { B.idle_baseline(); } catch (...) { idle_ok = false; throw; }
+        });
+      }
+      if (idle_ok) {
+        if (m == "energy")
+          for (int N : Ns) guarded(m, "", N, [&] { B.method_energy(N); });
+        else
+          guarded(m.substr(7), "", 0, [&] { B.method_cutensor(m == "energy-cutensor-emu", true); });
+      }
     } else if (m == "bw") guarded(m, "", 0, [&] { B.method_bw(); });
     else if (m == "occupancy") guarded(m, "", 0, [&] { B.method_occupancy(); });
     else if (m == "sustained") {
