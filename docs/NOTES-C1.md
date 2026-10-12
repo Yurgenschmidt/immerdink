@@ -5799,6 +5799,16 @@ Candidate: `kl.chain` 320.5 ns per unit, kept by the leave-one-shape-out rule (1
   0.6957 / 0.6915 (+3.2 / +2.5 %; shipped +3.4 / +2.8 %), Jacobi view (reported) 0.8088 against 0.8290 / 0.8278 (+2.5 %; shipped 0.7865: +5.4 %); BURST / REPEAT 0.7634 (shipped 0.728).
   All inside the registered bands. This re-scores nothing: M-d2's pass stays what §5.12 says, on the shipped calibration, and these systems are not a hold-out of the candidate.
 
+**Decision (Eric, 2026-10-12): P1's bias clause is waived and the candidate is shipped.** The bias (−6.9 % overall, −9.2 % at nc ≥ 5, against ±5 %) is
+recorded as a P1 failure and kept on the record; the grounds are the other bars (P2–P5), the two checks above and that the shipped model was −41.7 % on the same rows.
+The shipped file `src/host/calib/rtx4090_sm89.calib` is the candidate's fit (same data and flags as `candidate_chain.calib`: calibration, cache, Q24, `klb_calib`,
+sustained; `--kl-chain`; version `immerdink 09d7156`) with the bands and the rank tie ratio from the v1.18 hold-out (`perf_validate --bands`; the `klb` hold-out
+is not in the bands), sha256 `67791a4a…`. It is a whole refit, not a one-key change: besides `kl.*` and `kl.chain` (320.5 ns per unit), the effective L2 (30.2 → 22.6 MB),
+`pack.chain` (0.85 → 0), `pack.op`, `power.clock_eff_mhz` (2479 → 2519), `power.tc_pj`, `power.alu_pj`, `power.act_w` moved; the warm.* keys are unchanged. Consequences:
+the registered calibration of the M-d2 driver (`bench/accuracy/md2_time.py`, REGISTERED_CALIB) is no longer the shipped one, so a new M-d2 run needs a re-registration
+(the recorded M-d2 pass of §5.12 stands on its calibration); the marks `[M, model-only, outside hold-out]` are unchanged; COLD predictions of small warm calls are about 20 %
+high (see above), which is the end of the KL A / K4 cancellation, not a new error source.
+
 The two-locked-clock pass needs the sudo clock lock (docs/BENCHMARKING.md): Eric's call, not run by an agent.
 
 ---

@@ -499,7 +499,8 @@ int main(void) {
       size_t n0 = 0, n1 = 0;
       int32_t el = -1;
       kc = cal;
-      CHECK(kc.param[cslot] == 0); /* the shipped calibration has no kl.chain */
+      CHECK(kc.param[cslot] > 0); /* the shipped calibration has kl.chain (v1.20); absent = 0 below */
+      kc.param[cslot] = 0;
       CHECK(imd_perf_calib_format(&kc, t0, sizeof t0, &n0) == IMD_STATUS_SUCCESS &&
             strstr(t0, "kl.chain") == NULL);
       kc.param[cslot] = 0.25;

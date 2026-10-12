@@ -1804,9 +1804,9 @@ def suite_perf_v120(cal):
                 for rg in ("BURST", "SUSTAINED") for cc in caches]
 
     # (1) absent == explicit 0 == the calibration without the key, bit for bit, and x[4] = 0
-    if key in cal.extra or cal.params[key] != 0:
-        raise Fail("the shipped calibration has kl.chain")
-    base = host.Calibration.from_values(cal.meta, cal.params, extra=cal.extra or None)
+    # the shipped calibration has kl.chain (v1.20): the baseline is the same file with it absent
+    base = host.Calibration.from_values(cal.meta, dict(cal.params, **{key: 0.0}),
+                                        extra=cal.extra or None)
     tb = base.format()
     if "kl.chain" in tb:
         raise Fail("kl.chain written although 0")
@@ -2262,7 +2262,7 @@ def suite_perf(args):
                         continue
                     want = spec_phases(lw, vec, along, cal.meta["l2_bytes"], occ=occ,
                                        tail_mod=64 if cal.file_format == 1 else 32, l_hit=lh,
-                                       planes=pl)
+                                       planes=pl, kl_chain=cal.params.get("kl.chain", 0) > 0)
                     for q in p.phases:
                         if q.cls == "pack":
                             n_hit[q.x[3] < q.x[1]] += 1
@@ -2374,7 +2374,8 @@ def suite_perf(args):
                         if p.eps_s != 0 or p.eps_fraction != 0:
                             raise Fail(f"eps retired: eps_s {p.eps_s} / eps_fraction {p.eps_fraction}")
                         for q in p.phases:
-                            if q.cls == "kl" and q.x[4] != 0:
+                            if q.cls == "kl" and q.x[4] != 0 and not (
+                                    (cb or cal).params.get("kl.chain", 0) > 0):  # v1.20: s
                                 raise Fail(f"eps retired: kl slot 4 feature {q.x[4]}")
                         n_eps += 1
             pk = host.pack_desc_for("ik,jk->ij", ext, operand=0, N=N)

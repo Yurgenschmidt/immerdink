@@ -6,6 +6,11 @@ first.
 
 ## Where things stand
 
+- **Update 2026-10-12 (issue #7, DESIGN v1.20 §6c.10, NOTES-C1 §5.13):** the shipped calibration is refitted with the optional
+  key `kl.chain` (KL B / narrow multi-pass packs: a busiest-SM chain arm against the byte arm). Narrow multi-pass KL B on a fresh hold-out
+  41.7 % → 6.9 % median error; P1's bias clause failed and was waived by Eric. The M-d2 driver's registered calibration (REGISTERED_CALIB) is
+  the old file: re-register before any new M-d2 run. Records and fits: immerdink-eval `results/c1/klb/`. `perf_fit --kl-chain` is opt-in.
+
 - **Branches:** all work is on `dev` (pushed). `main` = PR #1 (v1.3 state); later work reaches
   main by another PR from dev. Never push to main directly.
 - **DESIGN v1.12** (v1.10 §6c performance-model follow-up, v1.11 §6e planner, v1.12 §6f accuracy-aware planning) (docs/DESIGN.md): v1.4 KF fused small path, v1.5 K4 configs and rule, v1.6
