@@ -185,6 +185,16 @@ std::string jnum(double v) {
   snprintf(b, sizeof b, "%.6g", v);
   return b;
 }
+std::string jarr(const std::vector<double>& v) {
+  std::string o = "[";
+  char b[40];
+  for (size_t i = 0; i < v.size(); ++i) {
+    snprintf(b, sizeof b, "%.9g", v[i]);
+    o += (i ? ", " : "");
+    o += b;
+  }
+  return o + "]";
+}
 struct Json {
   std::vector<std::pair<std::string, std::string>> kv;
   Json& raw(const std::string& k, const std::string& v) { kv.emplace_back(k, v); return *this; }
@@ -601,6 +611,10 @@ struct Options {
   bool clock_probe = false;
   int k_align_hook = 0;  // v1.13 §4b: --k-align (0 = auto) / IMD_BENCH_K_ALIGN
   bool l2_flush = false;
+  // Campaign kit: --keep-samples 1 adds the raw per-repetition times to the timed records ("samples_s", seconds), and to
+  // method duel's duel-b record both sides' times of every interleaved pair ("pair_t_a", "pair_t_b"), so the analyzer can
+  // compute a paired interval (bench/campaign/stats.py) instead of trusting a median.
+  bool keep_samples = false;
   double sustain_s = 8, sustain_warm_s = 3;
   // Follow-up (hot clock, NOTES-B2 §9): --sustain-trace-s T adds a time series to method
   // sustained's record, one point per T seconds of the window: mean s per call, board power,
@@ -1014,6 +1028,7 @@ struct Bench {
       j.num("sm_mhz_median", v[v.size() / 2]).num("sm_mhz_min", v.front()).num("sm_mhz_max", v.back());
     }
     j.num("tflops_eq", flops / T.median() / 1e12);
+    if (o.keep_samples && method.rfind("duel", 0) != 0) j.raw("samples_s", jarr(T.t));
     j.integer("ws_bytes", (long long)ws_bytes);
     if (acc) {
       j.num("max_relerr", acc->max_rel).num("max_normerr", acc->max_norm);
@@ -2040,6 +2055,7 @@ struct Bench {
     };
     Json ea = side_extra(*pa, "a"), eb = side_extra(*pb, "b");
     eb.str("duel_vs", pa->cfg.describe());
+    if (o.keep_samples) eb.raw("pair_t_a", jarr(TA.t)).raw("pair_t_b", jarr(TB.t));
     eb.num("ratio_median", rmed).num("ratio_p10", ratio[n / 10]).num("ratio_p90", ratio[(9 * n) / 10]);
     eb.raw("bit_identical", differ == 0 ? "true" : "false").integer("elements_differing", (long long)differ);
     record("duel-a", pa->cfg.describe() + ", interleaved", pa->cfg.N, TA, &acc_a, flops(), pa->wsb, ea);
@@ -2554,6 +2570,7 @@ void usage() {
           "      or --g8fast-N / --g8accu-N for one mode)\n"
           "  [--gemm-view 0|1] (dgemm, emu, gemmul8 on a case not in the GEMM view: 1 also records the bare GEMM;\n"
           "      the perm+<method> record, with the cuTENSOR permutations timed, is always written)\n"
+          "  [--keep-samples 0|1] (add the raw per-repetition times: samples_s; duel-b: pair_t_a, pair_t_b)\n"
           "  [--energy-warmup 3] [--energy-seconds 10] [--energy-min-calls 50] [--energy-max-seconds 30]\n"
           "  [--energy-idle 3] [--energy-step-ms <counter step period; default: measured>] (method energy)\n"
           "  [--out file.jsonl]\n");
@@ -2573,7 +2590,7 @@ int main(int argc, char** argv) {
                                       "sustain-warm-s", "sustain-trace-s", "k-align",
                                       "energy-warmup", "energy-seconds", "energy-max-seconds",
                                       "energy-idle", "energy-min-calls", "energy-step-ms",
-                                      "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
+                                      "keep-samples", "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -2603,6 +2620,7 @@ int main(int argc, char** argv) {
     if (a.count("warmup")) B.o.warmup = std::stoi(a["warmup"]);
     if (a.count("max-seconds")) B.o.max_seconds = std::stod(a["max-seconds"]);
     if (a.count("samples")) B.o.samples = std::stoll(a["samples"]);
+    if (a.count("keep-samples")) B.o.keep_samples = a["keep-samples"] != "0";
     if (a.count("phase-reps")) B.o.phase_reps = std::stoi(a["phase-reps"]);
     if (a.count("vec")) {
       B.o.vec_modes.clear();

@@ -102,6 +102,14 @@ if(Python3_FOUND)
   # not change the driver's sha256. CPU only, standard library, under a second.
   add_test(NAME md2_time_selftest
            COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/md2_time.py" selftest)
+  # Campaign kit (issue 15; bench/campaign, docs/CAMPAIGN.md): the statistics (paired interval, tie rule, regression
+  # guard), the manifest lint (gate G1), the resumable runner (kill -9, resume, time limits, copy-back) and the analyzer
+  # (a damaged folder gives INVALID; the issue-11 folders reproduce their tables when they are on this machine).
+  # CPU only, standard library, about 25 s in all.
+  foreach(t stats manifest runner analyze)
+    add_test(NAME campaign_${t}_selftest
+             COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/campaign/test_${t}.py")
+  endforeach()
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
