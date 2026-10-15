@@ -226,6 +226,92 @@ class Decisions(unittest.TestCase):
         self.assertEqual(v["verdict"], "PASS")
 
 
+def cmp_rec(case, method, tf, N=14, err=1e-16, spread=1.0, **kw):
+    r = {"case": case, "method": method, "N": N, "variant": "", "tflops_eq": tf, "median_s": 1.0 / tf, "spread_pct": spread,
+         "max_normerr": err, "nonfinite": 0, "status": "ok", "m": 8, "n": 8, "k": 8, "b": 1}
+    r.update(kw)
+    return r
+
+
+def parity_case(case, ratio, spread=1.0):
+    """One case's comparison records: DGEMM at error 1e-15, immerdink (N=14) and GEMMul8 fast (N=14) below it."""
+    return [cmp_rec(case, "dgemm", 1.0, err=1e-15), cmp_rec(case, "imd", ratio * 10.0, spread=spread),
+            cmp_rec(case, "gemmul8", 10.0, spread=spread, g8_mode="fast")]
+
+
+PARITY = {"id": "parity", "kind": "parity", "requires": ["c"], "exp": "c", "file": "compare.jsonl",
+          "geomean_at_least": 1.0, "case_floor": 0.9, "exclude": ["s_batch"]}
+
+
+class Parity(unittest.TestCase):
+    def verdict(self, ratios, spread=1.0, dec=PARITY):
+        recs = [r for c, x in ratios.items() for r in parity_case(c, x, spread)]
+        return dc.evaluate(dec, FakeCtx(recs))
+
+    def test_pass_fail_and_floor(self):
+        v = self.verdict({"a": 1.2, "b": 1.0, "c": 1.0})
+        self.assertEqual(v["verdict"], "PASS", v)
+        v = self.verdict({"a": 1.3, "b": 1.3, "c": 0.85})              # geomean ok, one case below the 0.9 floor
+        self.assertEqual(v["verdict"], "FAIL")
+        self.assertEqual(v["details"]["below_floor"], ["c"])
+        v = self.verdict({"a": 0.95, "b": 0.95})                       # geomean below 1
+        self.assertEqual(v["verdict"], "FAIL")
+
+    def test_spread_is_added_before_the_floor(self):
+        v = self.verdict({"a": 1.5, "b": 1.5, "c": 0.85}, spread=10.0)  # 0.85 x 1.10 = 0.935
+        self.assertEqual(v["verdict"], "PASS", v)
+
+    def test_excluded_case_is_out_of_the_mean_but_reported(self):
+        v = self.verdict({"a": 1.0, "b": 1.0, "s_batch": 70.0})
+        self.assertAlmostEqual(v["details"]["geomean"], 1.0)
+        self.assertGreater(v["details"]["geomean_all_cases"], 1.5)
+        self.assertEqual(v["verdict"], "PASS")
+
+    def test_missing_family_is_inconclusive(self):
+        recs = parity_case("a", 1.1) + [r for r in parity_case("b", 1.1) if r["method"] != "gemmul8"]
+        v = dc.evaluate(PARITY, FakeCtx(recs))
+        self.assertEqual(v["verdict"], "INCONCLUSIVE")
+        self.assertIn("b", v["reason"])
+
+    def test_needs_dgemm_level_accuracy(self):
+        recs = parity_case("a", 1.1)
+        for r in recs:
+            if r["method"] == "imd":
+                r["max_normerr"] = 1e-9                                  # worse than DGEMM: not a DGEMM-level record
+        self.assertEqual(dc.evaluate(PARITY, FakeCtx(recs))["verdict"], "INCONCLUSIVE")
+
+    def test_xduel_records_feed_the_paired_decision(self):
+        rng = random.Random(5)
+        tb = [1e-3 * (1.0 + rng.gauss(0.0, 0.004)) for _ in range(200)]
+        ti = [x / 1.3 for x in tb]
+        rec = {"case": "a", "method": "xduel-imd", "status": "ok", "pair_t_a": tb, "pair_t_b": ti, "spread_pct": 1.0}
+        d = {"id": "x", "kind": "paired", "requires": ["k"], "exp": "k", "file": "f", "method": "xduel-imd"}
+        self.assertEqual(dc.evaluate(d, FakeCtx([rec]))["verdict"], "ADOPT")
+
+
+@unittest.skipUnless(os.path.isdir(GOLDEN), "the issue-11 result folders are not on this machine")
+class ParityGolden(unittest.TestCase):
+    """The parity gate on the issue-11 comparison records gives the numbers of the tracking issue: geometric mean over 16
+    cases (s_batch out) 0.84 on H100 and 0.78 on H200, 1.09 and 1.01 with s_batch in; s_batch 70x; Blackwell passes."""
+
+    def run_gate(self, suffix):
+        job = [d for d in os.listdir(GOLDEN) if d.endswith(suffix)][0]
+        recs = rs.read_jsonl(os.path.join(GOLDEN, job, "compare.jsonl"))
+        return dc.evaluate(PARITY, FakeCtx(recs))["details"], dc.evaluate(PARITY, FakeCtx(recs))
+
+    def test_h100_h200_blackwell(self):
+        d, v = self.run_gate("h100")
+        self.assertEqual(len([c for c in d["cases"] if not c["excluded"]]), 16)
+        self.assertAlmostEqual(d["geomean"], 0.84, delta=0.005)
+        self.assertAlmostEqual(d["geomean_all_cases"], 1.09, delta=0.005)
+        self.assertAlmostEqual(next(c["ratio"] for c in d["cases"] if c["case"] == "s_batch"), 70.0, delta=1.0)
+        self.assertEqual(v["verdict"], "FAIL")
+        d, v = self.run_gate("h200")
+        self.assertAlmostEqual(d["geomean"], 0.78, delta=0.005)
+        self.assertAlmostEqual(d["geomean_all_cases"], 1.01, delta=0.005)
+        self.assertEqual(self.run_gate("blackwell")[1]["verdict"], "PASS")
+
+
 class GuardWithSamples(unittest.TestCase):
     """A record that carries its repetitions is judged by the robust spread (a range of 12 % would hide a 10 % slowdown)."""
 

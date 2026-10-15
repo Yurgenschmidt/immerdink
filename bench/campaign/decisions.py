@@ -9,8 +9,13 @@ A decisions file (TOML, pinned by sha256 in the manifest) has one [[decision]] t
 
 Kinds (each a pure function of the records; a verdict is one of VERDICTS):
   threshold  one number from the records against two limits: GO / NO-GO / INCONCLUSIVE
-  paired     interleaved A/B records (duel-b rows with pair_t_a / pair_t_b arrays): per case a
+  paired     interleaved A/B records (duel-b rows, or `method` = xduel-imd for immerdink against a baseline, with pair_t_a /
+             pair_t_b arrays; a = reference, b = variant, ratio > 1: b faster): per case a
              faster / tie / slower class by the tie rule (stats.py); ADOPT / KEEP / INCONCLUSIVE
+  parity     the parity gate over comparison records (bench sweep_compare): per case the ratio of the best DGEMM-level
+             configuration of two families (default immerdink / GEMMul8 fast, TFLOPS-eq), PASS when the geometric mean
+             over the cases (some excluded, e.g. the one-call-per-slice batch case) reaches the limit and no case is
+             below the floor once its measured spread is added; else FAIL
   guard      records against a stored baseline file: PASS / FLAGGED by the regression guard (field: a time, e.g. median_s;
              a slowdown is new / base - 1; records with samples_s use the robust spread)
 
@@ -30,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # also under pyt
 
 import stats
 
-VERDICTS = ("ADOPT", "KEEP", "GO", "NO-GO", "PASS", "FLAGGED", "INCONCLUSIVE", "INVALID")
+VERDICTS = ("ADOPT", "KEEP", "GO", "NO-GO", "PASS", "FAIL", "FLAGGED", "INCONCLUSIVE", "INVALID")
 AGGREGATES = ("max", "min", "median", "geomean", "mean")
 PLACEHOLDER = re.compile(r"\b(TBD|TODO|FIXME|XXX)\b|\?\?")
 
@@ -40,13 +45,15 @@ REQUIRED = {
                   "go_at_least": (int, float), "nogo_below": (int, float)},
     "paired": {"exp": str, "file": str},
     "guard": {"exp": str, "file": str, "baseline": str, "baseline_sha256": str, "key": list, "field": str},
+    "parity": {"exp": str, "file": str, "geomean_at_least": (int, float), "case_floor": (int, float)},
 }
 OPTIONAL = {
     "threshold": {"where": dict, "classes": list},
-    "paired": {"where": dict, "min_faster": int, "noisy_spread_pct": (int, float),
+    "paired": {"where": dict, "method": str, "min_faster": int, "noisy_spread_pct": (int, float),
                "noisy_min_effect": (int, float), "conf": (int, float), "classes": list},
     "guard": {"where": dict, "floor": (int, float), "k": (int, float), "classes": list,
               "spread_field": str},
+    "parity": {"a_family": str, "b_family": str, "exclude": list, "classes": list},
 }
 
 
@@ -167,7 +174,7 @@ def _threshold(dec, ctx):
 
 def _paired(dec, ctx):
     recs = select(ctx.jsonl(dec["exp"], dec["file"]), dec.get("where"))
-    rows = [r for r in recs if r.get("method") == "duel-b" and r.get("status", "ok") == "ok"]
+    rows = [r for r in recs if r.get("method") == dec.get("method", "duel-b") and r.get("status", "ok") == "ok"]
     if not rows:
         return {"verdict": "INCONCLUSIVE", "reason": "no duel-b record", "details": {}}
     per = []
@@ -230,4 +237,54 @@ def _guard(dec, ctx):
     return {"verdict": "PASS", "reason": f"{checked} compared, none beyond the guard", "details": det}
 
 
-_EVAL = {"threshold": _threshold, "paired": _paired, "guard": _guard}
+CASE_CLASS = {"s256": "small", "s512": "small", "s_cc16": "small", "s_batch": "small", "sq1024": "mid squares",
+              "sq2048": "mid squares", "sq4096": "large squares", "sq8192": "large squares", "r_lowk": "rectangular",
+              "r_bigk": "rectangular", "r_skinny": "rectangular", "r_mm": "rectangular", "t_df": "tensor contractions",
+              "t_cc": "tensor contractions", "t_permout": "tensor contractions", "t_batch": "tensor contractions",
+              "t_ikl": "tensor contractions"}
+
+
+def _geomean(xs):
+    return math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else None
+
+
+def _parity(dec, ctx):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # bench/summarize.py
+    import summarize as sm
+    recs = [r for r in select(ctx.jsonl(dec["exp"], dec["file"]), dec.get("where")) if r.get("bench_mode") != "energy"]
+    fa, fb = dec.get("a_family", "imd"), dec.get("b_family", "gemmul8-fast")
+    excl = set(dec.get("exclude", []))
+    rows = []
+    for name, rs_ in sm.cases(recs).items():
+        fams = sm.case_families(rs_)
+        _, _, best = sm.dgemm_level(fams, "tflops_eq")
+        ra, rb = best.get(fa), best.get(fb)
+        row = {"case": name, "class": CASE_CLASS.get(name, "other"), "excluded": name in excl}
+        if ra is None or rb is None:
+            row["note"] = f"no DGEMM-level record for {fa if ra is None else fb}"
+        else:
+            spread = max(_num(ra.get("spread_pct")) or 0.0, _num(rb.get("spread_pct")) or 0.0)
+            ratio = ra["tflops_eq"] / rb["tflops_eq"]
+            row.update(ratio=ratio, spread_pct=spread, ratio_plus_spread=ratio * (1.0 + spread / 100.0),
+                       a=ra["tflops_eq"], b=rb["tflops_eq"], a_cfg=ra.get("N"), b_cfg=rb.get("N"))
+        rows.append(row)
+    counted = [r for r in rows if not r["excluded"]]
+    missing = [r["case"] for r in counted if "ratio" not in r]
+    if not counted or missing:
+        return {"verdict": "INCONCLUSIVE", "reason": "no comparison for: " + ", ".join(missing or ["any case"]), "details": {"cases": rows}}
+    gm = _geomean([r["ratio"] for r in counted])
+    gm_all = _geomean([r["ratio"] for r in rows if "ratio" in r])
+    by_class = {}
+    for r in counted:
+        by_class.setdefault(r["class"], []).append(r["ratio"])
+    low = [r["case"] for r in counted if r["ratio_plus_spread"] < dec["case_floor"]]
+    det = {"cases": rows, "geomean": gm, "geomean_all_cases": gm_all, "below_floor": low,
+           "class_geomean": {k: _geomean(v) for k, v in by_class.items()}}
+    ok = gm >= dec["geomean_at_least"] and not low
+    why = f"geomean {gm:.3f} over {len(counted)} cases (limit {dec['geomean_at_least']:g})"
+    if low:
+        why += f"; below {dec['case_floor']:g} even with spread: {', '.join(low)}"
+    return {"verdict": "PASS" if ok else "FAIL", "reason": why, "details": det}
+
+
+_EVAL = {"threshold": _threshold, "paired": _paired, "guard": _guard, "parity": _parity}
