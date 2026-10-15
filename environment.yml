@@ -14,3 +14,6 @@ dependencies:
   - cuda-cudart-dev
   - openjdk=25           # TLC without depending on the VS Code extension
   - nsight-compute       # ncu kernel profiling (needs GPU counters: see docs/BENCHMARKING.md)
+  - cuda-cuobjdump       # SASS of built binaries (campaign kit, docs/CAMPAIGN.md)
+  - cuda-nvdisasm
+  - cuda-sanitizer-api   # compute-sanitizer
