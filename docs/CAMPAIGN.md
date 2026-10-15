@@ -45,7 +45,7 @@ overrides keys for `--smoke` runs. The order of execution is: priority, then non
 
 ### Decisions
 
-Three kinds, each a pure function of the records (`decisions.py`):
+Four kinds, each a pure function of the records (`decisions.py`):
 
 - `threshold`: one number (an aggregate of a field) against two limits: GO, NO-GO, or INCONCLUSIVE in between.
 - `paired`: interleaved A/B records. Per case, the median of the per-pair ratios t_A / t_B and a 95 % interval
@@ -53,13 +53,29 @@ Three kinds, each a pure function of the records (`decisions.py`):
   statistics; applied to log ratios). *Tie rule:* a case is a tie when 1 lies inside the interval, or when the case is noisy
   (range spread above 5 %) and the median ratio is within 10 % of 1. Verdict: ADOPT (enough cases faster, none slower),
   KEEP (none faster, or the variant is not bit-identical to its reference), INCONCLUSIVE (mixed, or too few pairs).
+- `parity`: the parity gate of the tracking issue over comparison records (`sweep_compare`). Per case, the best configuration of each
+  of two families at DGEMM-level accuracy (accuracy at or below cuBLAS DGEMM's on the same inputs), ratio A / B of TFLOPS-eq
+  (default immerdink / GEMMul8 fast). PASS when the geometric mean over the cases (listed ones such as `s_batch` excluded) reaches
+  `geomean_at_least` and no case is below `case_floor` once its larger spread is added; FAIL otherwise; INCONCLUSIVE when a case lacks
+  a record. The report prints the per-case table, the class geometric means and the mean with every case. On the issue-11 folders
+  it gives 0.84 (H100), 0.78 (H200), 1.35 (RTX PRO 6000) without `s_batch` and 1.09 / 1.01 with it, the numbers of the tracking issue.
 - `guard`: records against a stored baseline. A slowdown beyond `max(2 %, 2 x spread)` is flagged. With the raw repetitions the
   spread is the *robust* one, the noise of the median (half the width of its interval); the bench's range spread is dominated by
   one outlier (8 to 12 % on a quiet RTX 4090 in the rehearsal) and would hide a 10 % slowdown. Without repetitions the range spread is used, which is
   more lenient.
 
-New kinds (for example the parity gate of the tracking issue, a geometric mean over cases) are added as functions in `decisions.py`
+New kinds are added as functions in `decisions.py`
 and described in `REQUIRED` / `OPTIONAL`; the lint rejects any parameter it does not know.
+
+### Interleaving different methods: `xduel`
+
+`imd_bench --methods xduel --xduel-b dgemm,emu:fix55,gemmul8:fast:14` times immerdink (the `--duel-a` side) and each baseline
+alternately, call by call, in one process (same protocol as `duel`, which only compares two immerdink configurations). The
+baseline's record carries `xduel_ratio_median` (baseline time / immerdink time) and immerdink gets the record `xduel-imd`; with
+`--keep-samples 1` it holds the paired times (`pair_t_a` baseline, `pair_t_b` immerdink), and a `paired` decision with
+`method = "xduel-imd"` turns them into a verdict. This is how "alternate the compared methods" is met for the parity gate,
+where sequential timing on a cluster node mixes clock and node drift into the ratio. (4090 check: immerdink / GEMMul8 fast N = 14
+at 2048³ = 1.35, interval 1.351 to 1.355.)
 
 ### Runner and result folder
 
@@ -110,7 +126,9 @@ The G8 gate of the tracking issue (new sm_90a kernels) has nothing to check yet;
 ## What a run looks like
 
 1. The assistant builds the manifest for the run and passes the gates.
-2. The owner runs, on the PACE login node: `git -C ~/repos/generalWork pull && IMMERDINK_SRC=<an immerdink clone> bash ~/repos/generalWork/phoenix/immerdink/submit_campaign.sh campaigns/R<n>.toml` (add `DRY_RUN=1` first). The wrapper
+2. Before the first real submission of a manifest, `PREPARE_ONLY=1 IMMERDINK_SRC=<clone> bash submit_campaign.sh campaigns/R<n>.toml` does the clone, the
+   checkout of the pinned commit, the CUTLASS fetch and the lint for real, checks that the pinned commit's runner and analyzer start under the env's Python, and
+   stops: no job, no GPU time. The owner then runs, on the PACE login node: `git -C ~/repos/generalWork pull && IMMERDINK_SRC=<an immerdink clone> bash ~/repos/generalWork/phoenix/immerdink/submit_campaign.sh campaigns/R<n>.toml` (add `DRY_RUN=1` first). The wrapper
    fetches the pinned commit into its own clone, lints the manifest with that commit's own tools, copies manifest and decisions next to the frozen sources and
    hands over to `submit_immerdink_metrics.sh`; each job then runs `runner.py` from the pinned commit (`pace_immerdink_metrics.sbatch`, campaign mode).
 3. The owner downloads the result folder and names the run. The analysis is the assistant's.
@@ -129,6 +147,7 @@ The PACE env check (`hpc_env_check`) only warns about the new tools, so an exist
 ## Limits of this version
 
 - The kit contains no R1 experiments. R1's content (baselines, INT8 ceilings, tile table, pack/CRT diagnosis) is defined by the issues that use it; they add experiments and decisions.
-  Kinds still missing: the parity gate over cases and the K4 tile-table fit (R2/R3).
-- G7 and the PACE side of `submit_campaign.sh` could only be syntax-checked off the cluster.
+  A decision kind for the K4 tile-table fit belongs to the tile issue; the others (threshold, paired, guard, parity) are general.
+- The GPU-side steps of a real submission (the sbatch campaign mode, the runner inside a job) are untested on PACE; the login-node dry run (G7) and `PREPARE_ONLY` pass.
+- `xduel` against GEMMul8 was tested on the RTX 4090 only (sm_89).
 - The runner protocol has no TLA+ model; the kill -9 test is the check.
