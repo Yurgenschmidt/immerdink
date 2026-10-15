@@ -34,6 +34,8 @@
 //             configuration (k4_config in both records) the run is an A/A resolution check.
 //             Records duel-a and duel-b; duel-b carries ratio_median = median over pairs of
 //             t_a / t_b (> 1: B faster), its p10 / p90, and whether the two C are bit-identical
+//   xduel     immerdink (a --duel-a side) against baselines (--xduel-b: dgemm, emu:fixN, gemmul8:fast:N) timed
+//             INTERLEAVED like duel; the ratio of each pair is in xduel_ratio_median (baseline time / immerdink time)
 //   energy    board energy per call (NVML total-energy counter, whole counter steps, idle
 //             baseline) of imd at each --N: avg_power_w, energy_j_per_call, gflops_per_w
 //             (GFLOPS-eq per watt), sustained tflops_eq_mean; see Bench::method_energy
@@ -698,6 +700,45 @@ Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& 
     cudaFreeHost(clk_buf);
   }
   return T;
+}
+
+// Two callables timed INTERLEAVED, call by call, each with its own event pair, alternating which goes first (the same
+// protocol as method duel, for callables that are not both immerdink plans). Returns (times of a, times of b).
+std::pair<Timing, Timing> time_pair(const std::function<void()>& a, const std::function<void()>& b, cudaStream_t s,
+                                    const Options& o) {
+  for (int w = 0; w < std::max(o.warmup, 10); ++w) {
+    a();
+    b();
+  }
+  CU(cudaStreamSynchronize(s));
+  CU(cudaGetLastError());
+  cudaEvent_t e0, e1;
+  CU(cudaEventCreate(&e0));
+  CU(cudaEventCreate(&e1));
+  auto once = [&](const std::function<void()>& f) {
+    CU(cudaEventRecord(e0, s));
+    f();
+    CU(cudaEventRecord(e1, s));
+    CU(cudaEventSynchronize(e1));
+    float ms = 0;
+    CU(cudaEventElapsedTime(&ms, e0, e1));
+    return double(ms) * 1e-3;
+  };
+  Timing TA, TB;
+  double total = 0;
+  for (int r = 0; r < o.reps; ++r) {
+    double ta, tb;
+    if (r % 2 == 0) { ta = once(a); tb = once(b); }
+    else { tb = once(b); ta = once(a); }
+    TA.t.push_back(ta);
+    TB.t.push_back(tb);
+    total += ta + tb;
+    if (r + 1 >= o.min_reps && total > o.max_seconds) break;
+  }
+  CU(cudaGetLastError());
+  cudaEventDestroy(e0);
+  cudaEventDestroy(e1);
+  return {TA, TB};
 }
 
 // A side of method duel: one immerdink configuration. k4: -1 the plan-time rule, -2 the
@@ -1678,6 +1719,46 @@ struct Bench {
     g.sc = c.m * c.n;
     return g;
   }
+  // Method xduel (campaign kit): immerdink and a baseline timed INTERLEAVED. While `xd` is set, run_matrix_family times the
+  // baseline against the immerdink call in `imd_run` (writes a second C) and also writes the record "xduel-imd".
+  struct XDuel {
+    std::function<void()> imd_run;
+    double* C2 = nullptr;
+    std::string imd_desc;
+    int N = 0;
+    size_t wsb = 0;
+    Timing TA;  // immerdink times of the last paired measurement
+  };
+  XDuel* xd = nullptr;
+  Timing timed(const std::function<void()>& run) {
+    if (!xd) return time_it(run, s, o);
+    auto pr = time_pair(xd->imd_run, run, s, o);
+    xd->TA = pr.first;
+    return pr.second;
+  }
+  // the baseline record gets the interleaved ratio; the immerdink side gets its own record afterwards
+  void xd_annotate(Json& extra, const Timing& TB) {
+    if (!xd) return;
+    std::vector<double> r;
+    for (size_t i = 0; i < TB.t.size(); ++i) r.push_back(TB.t[i] / xd->TA.t[i]);
+    std::sort(r.begin(), r.end());
+    const size_t n = r.size();
+    extra.str("xduel_vs", xd->imd_desc).integer("xduel_pairs", (long long)n);
+    extra.num("xduel_ratio_median", n % 2 ? r[n / 2] : 0.5 * (r[n / 2 - 1] + r[n / 2]))
+        .num("xduel_ratio_p10", r[n / 10]).num("xduel_ratio_p90", r[(9 * n) / 10]);  // baseline time / immerdink time
+  }
+  void xd_emit(const Timing& TB) {
+    if (!xd) return;
+    CU(cudaMemsetAsync(xd->C2, 0xff, dC.bytes, s));
+    xd->imd_run();
+    CU(cudaStreamSynchronize(s));
+    const Accuracy acc = check(R, xd->C2, s);
+    Json e;
+    e.str("xduel_vs", "baseline").integer("xduel_pairs", (long long)TB.t.size());
+    if (o.keep_samples) e.raw("pair_t_a", jarr(TB.t)).raw("pair_t_b", jarr(xd->TA.t));  // a = baseline, b = immerdink
+    record("xduel-imd", xd->imd_desc, xd->N, xd->TA, &acc, flops(), xd->wsb, e);
+  }
+
   using GemmFn = std::function<void(const double*, const double*, double*)>;
   GemmFn cublas_gemm(cublasHandle_t h, cublasComputeType_t ct) {
     const BlasArgs g = blas_args();
@@ -1718,9 +1799,11 @@ struct Bench {
     }
     if (!perm) {
       poison_C();
-      Timing T = time_it(run, s, o);
+      Timing T = timed(run);
       Accuracy acc = result_accuracy();
+      xd_annotate(extra, T);
       record(method, variant, N, T, &acc, flops(), wsb, extra);
+      xd_emit(T);
       return;
     }
     if (o.gemm_view) {  // the bare GEMM on pre-permuted operands (the permutations not timed)
@@ -1734,10 +1817,12 @@ struct Bench {
       record(method, variant, N, T, &acc, flops(), wsb, e1);
     }
     poison_C();
-    Timing T = time_it(run, s, o);
+    Timing T = timed(run);
     Accuracy acc = result_accuracy();
     extra.str("layout", "original (explicit cuTENSOR permutations + GEMM, timed together)");
+    xd_annotate(extra, T);
     record(full, variant, N, T, &acc, flops(), wsb, extra);
+    xd_emit(T);
   }
 
   void method_dgemm(bool energy) {
@@ -1902,6 +1987,36 @@ struct Bench {
     else if (k4 >= 0) vs += " k4=" + std::to_string(k4);
     if (o.l2_flush) vs += " l2=flush";
     record("imd", vs, N, T, &acc, flops(), wsb, extra);
+  }
+
+  // Method xduel: immerdink (a --duel-a side) against one baseline, interleaved call by call. `base` is dgemm, emu:<dyn|fixN> or
+  // gemmul8:<fast|accu>:<N>. The baseline's usual record gets xduel_ratio_median (baseline time / immerdink time, > 1:
+  // immerdink faster) and the immerdink side the record "xduel-imd" (with --keep-samples: pair_t_a = baseline, pair_t_b =
+  // immerdink, the input of a paired decision).
+  void method_xduel(int N, const std::string& imd_spec, const std::string& base) {
+    auto pa = make_duel_plan(parse_duel_side(imd_spec, N));
+    DevBuf dC2(dC.bytes);
+    XDuel st;
+    st.C2 = dC2.as<double>();
+    st.imd_desc = pa->cfg.describe();
+    st.N = pa->cfg.N;
+    st.wsb = pa->wsb;
+    st.imd_run = [&] {
+      CI(imd_contract(pa->plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, st.C2, pa->ws.p, pa->wsb, s));
+    };
+    struct Reset {
+      Bench* b;
+      ~Reset() { b->xd = nullptr; }
+    } reset{this};
+    xd = &st;
+    auto parts = split(base, ':');
+    if (parts.empty()) throw Failure("--xduel-b: empty baseline");
+    if (parts[0] == "dgemm") method_dgemm(false);
+    else if (parts[0] == "emu" && parts.size() == 2) method_emu(parts[1], false);
+    else if (parts[0] == "gemmul8" && parts.size() == 3 && (parts[1] == "fast" || parts[1] == "accu"))
+      method_gemmul8(std::stoi(parts[2]), parts[1] == "fast", false);
+    else throw Failure("--xduel-b entry '" + base + "' (dgemm | emu:dyn | emu:fix55 | gemmul8:fast:14 | gemmul8:accu:14)");
+    CU(cudaStreamSynchronize(s));
   }
 
   // Method duel: two immerdink configurations timed INTERLEAVED in one process, call by
@@ -2570,6 +2685,8 @@ void usage() {
           "      or --g8fast-N / --g8accu-N for one mode)\n"
           "  [--gemm-view 0|1] (dgemm, emu, gemmul8 on a case not in the GEMM view: 1 also records the bare GEMM;\n"
           "      the perm+<method> record, with the cuTENSOR permutations timed, is always written)\n"
+          "  [--xduel-b dgemm,emu:fix55,gemmul8:fast:14] (method xduel: immerdink, side --duel-a, against each baseline\n"
+          "      INTERLEAVED; records the baseline with xduel_ratio_median and the immerdink side as xduel-imd)\n"
           "  [--keep-samples 0|1] (add the raw per-repetition times: samples_s; duel-b: pair_t_a, pair_t_b)\n"
           "  [--energy-warmup 3] [--energy-seconds 10] [--energy-min-calls 50] [--energy-max-seconds 30]\n"
           "  [--energy-idle 3] [--energy-step-ms <counter step period; default: measured>] (method energy)\n"
@@ -2582,7 +2699,8 @@ int main(int argc, char** argv) {
   std::map<std::string, std::string> a{{"methods", "imd"},
                                        {"N", "14"},
                                        {"duel-a", "default"},
-                                       {"duel-b", "k4=tune"}};
+                                       {"duel-b", "k4=tune"},
+                                       {"xduel-b", "dgemm"}};
   static const char* const kKeys[] = {"name", "spec", "ext", "methods", "N", "reps", "warmup",
                                       "max-seconds", "samples", "phi", "seed", "phase-reps",
                                       "vec", "g", "k4", "pack", "reuse", "duel-a", "duel-b", "out",
@@ -2590,7 +2708,7 @@ int main(int argc, char** argv) {
                                       "sustain-warm-s", "sustain-trace-s", "k-align",
                                       "energy-warmup", "energy-seconds", "energy-max-seconds",
                                       "energy-idle", "energy-min-calls", "energy-step-ms",
-                                      "keep-samples", "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
+                                      "keep-samples", "xduel-b", "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -2603,7 +2721,7 @@ int main(int argc, char** argv) {
     a[k] = argv[++i];
   }
   static const char* const kMethods[] = {"imd", "packed", "duel", "bw", "occupancy", "sustained", "pair",
-                                         "energy", "cutensor", "cutensor-emu", "dgemm", "emu", "gemmul8",
+                                         "energy", "xduel", "cutensor", "cutensor-emu", "dgemm", "emu", "gemmul8",
                                          "energy-cutensor", "energy-cutensor-emu", "energy-dgemm",
                                          "energy-emu", "energy-gemmul8"};
   for (auto& m : split(a["methods"], ','))
@@ -2765,7 +2883,11 @@ int main(int argc, char** argv) {
             if (g <= N) guarded(m, "", N, [&] { B.method_sustained(N, v, g); });
     } else if (m == "pair")
       for (int N : Ns) guarded(m, "", N, [&] { B.method_pair(N); });
-    else if (m == "duel")
+    else if (m == "xduel") {  // campaign kit: immerdink (--duel-a) against each --xduel-b baseline, interleaved
+      for (int N : Ns)
+        for (auto& bs : split(a["xduel-b"], ','))
+          guarded(m, bs, N, [&] { B.method_xduel(N, a["duel-a"], bs); });
+    } else if (m == "duel")
       for (int N : Ns) guarded(m, "", N, [&] { B.method_duel(N, a["duel-a"], a["duel-b"]); });
     else if (m == "packed") {  // v1.7 (D1): --pack A,B --reuse 1,4,16
       std::vector<int> reuse;

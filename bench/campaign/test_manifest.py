@@ -97,6 +97,7 @@ class Lint(unittest.TestCase):
             "TBD limit": fx.DECISIONS.replace('field = "tops"', 'field = "TBD"'),
             "unknown parameter": fx.DECISIONS + 'colour = "red"\n',
             "missing limit": fx.DECISIONS.replace("go_at_least = 1000.0\n", ""),
+            "parity without floor": '[[decision]]\nid = "p"\nkind = "parity"\nrequires = ["{exp}"]\nexp = "{exp}"\nfile = "c.jsonl"\ngeomean_at_least = 1.0\n',
         }
         for name, text in bad.items():
             with self.subTest(name):

@@ -191,6 +191,19 @@ def render(vs, info):
     lines += ["| decision | verdict | reason |", "|---|---|---|"]
     for v in vs:
         lines.append(f"| {v['id']} | **{v['verdict']}** | {v['reason']} |")
+    for v in vs:
+        d = v.get("details") or {}
+        if v.get("kind") == "parity" and d.get("cases"):
+            lines += ["", f"### {v['id']}: ratio per case (TFLOPS-eq, DGEMM-level configurations)", "",
+                      "| case | class | A | B | A / B | + spread | note |", "|---|---|---|---|---|---|---|"]
+            for r in d["cases"]:
+                if "ratio" in r:
+                    lines.append(f"| {r['case']} | {r['class']} | {r['a']:.3g} | {r['b']:.3g} | {r['ratio']:.3f} | {r['ratio_plus_spread']:.3f} | "
+                                 f"{'excluded from the mean' if r['excluded'] else ('below floor' if r['case'] in d.get('below_floor', []) else '')} |")
+                else:
+                    lines.append(f"| {r['case']} | {r['class']} | | | | | {r.get('note', '')} |")
+            lines += ["", f"Geometric mean {d['geomean']:.3f}; with every case {d['geomean_all_cases']:.3f}. By class: " +
+                      ", ".join(f"{k} {x:.3f}" for k, x in d["class_geomean"].items())]
     return "\n".join(lines) + "\n"
 
 
