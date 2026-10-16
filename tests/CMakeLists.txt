@@ -167,6 +167,23 @@ target_include_directories(test_cutlass_mod_epilogue PRIVATE "${PROJECT_SOURCE_D
 target_link_libraries(test_cutlass_mod_epilogue PRIVATE imd_constants imd_cutlass)
 add_test(NAME cutlass_mod_epilogue COMMAND test_cutlass_mod_epilogue)
 
+# Issue 17 (docs/NOTES-17.md): the Hopper K4 epilogue candidate on accumulators placed in wgmma order, against
+# K4's own epilogue and a host reference. Runs on any sm_80+ GPU.
+add_executable(test_hopper_epilogue test_hopper_epilogue.cu)
+target_include_directories(test_hopper_epilogue PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(test_hopper_epilogue PRIVATE imd_constants imd_cutlass)
+add_test(NAME hopper_epilogue COMMAND test_hopper_epilogue)
+set_tests_properties(hopper_epilogue PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+
+# The register order the Hopper fast epilogue assumes, against CuTe's partition_C of the real TiledMma of every variant. Host code only
+# (no GPU), but built for sm_90a because the variants are.
+add_executable(test_hopper_partition test_hopper_partition.cu)
+target_include_directories(test_hopper_partition PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(test_hopper_partition PRIVATE imd_constants imd_cutlass)
+set_target_properties(test_hopper_partition PROPERTIES CUDA_ARCHITECTURES "90a-real")
+target_compile_options(test_hopper_partition PRIVATE --expt-relaxed-constexpr)
+add_test(NAME hopper_partition COMMAND test_hopper_partition)
+
 # PLAN M1: exhaustive CPU check of the §3.5 / §3.6 modular reductions (the kernels' code).
 find_package(Threads REQUIRED)
 add_executable(test_mod_exhaustive test_mod_exhaustive.cpp)
@@ -294,6 +311,12 @@ if(Python3_FOUND)
                    --suite plan -v)
   set_tests_properties(host_vs_plan PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
 
+  # Issue 17 (docs/NOTES-17.md): the layouts the Hopper K4 design depends on, read from CUTLASS's CuTe tables
+  # (compiles tests/wgmma_layout_dump.cpp with the host compiler; no GPU).
+  add_test(NAME wgmma_layout
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_wgmma_layout.py"
+                   --cutlass "${IMMERDINK_CUTLASS_DIR}" --cxx "${CMAKE_CXX_COMPILER}"
+                   --include "${CUDAToolkit_INCLUDE_DIRS}")
   add_test(NAME python_harness
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/harness.py"
                    --lib "$<TARGET_FILE:immerdink>")
