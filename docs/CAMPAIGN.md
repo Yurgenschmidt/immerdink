@@ -45,7 +45,7 @@ overrides keys for `--smoke` runs. The order of execution is: priority, then non
 
 ### Decisions
 
-Four kinds, each a pure function of the records (`decisions.py`):
+Five kinds, each a pure function of the records (`decisions.py`):
 
 - `threshold`: one number (an aggregate of a field) against two limits: GO, NO-GO, or INCONCLUSIVE in between.
 - `paired`: interleaved A/B records. Per case, the median of the per-pair ratios t_A / t_B and a 95 % interval
@@ -59,6 +59,9 @@ Four kinds, each a pure function of the records (`decisions.py`):
   `geomean_at_least` and no case is below `case_floor` once its larger spread is added; FAIL otherwise; INCONCLUSIVE when a case lacks
   a record. The report prints the per-case table, the class geometric means and the mean with every case. On the issue-11 folders
   it gives 0.84 (H100), 0.78 (H200), 1.35 (RTX PRO 6000) without `s_batch` and 1.09 / 1.01 with it, the numbers of the tracking issue.
+- `rate_projection`: the go / no-go for a Hopper wgmma K4 (issue 16). From K4's measured rate, the best bit-exact stock INT8 GEMM rate on K4's launch
+  shape (`bench/ceiling`), and the interleaved GEMMul8 time, it projects immerdink's time with a faster K4 and faster pack/CRT and compares it with GEMMul8:
+  GO / NO-GO / INCONCLUSIVE (a `confirm` role gives PASS / FAIL on the rate gain, for the second GPU). The rule, its thresholds and the reasons are in `docs/NOTES-16.md`.
 - `guard`: records against a stored baseline. A slowdown beyond `max(2 %, 2 x spread)` is flagged. With the raw repetitions the
   spread is the *robust* one, the noise of the median (half the width of its interval); the bench's range spread is dominated by
   one outlier (8 to 12 % on a quiet RTX 4090 in the rehearsal) and would hide a 10 % slowdown. Without repetitions the range spread is used, which is
@@ -138,6 +141,14 @@ The G8 gate of the tracking issue (new sm_90a kernels) has nothing to check yet;
 `campaigns/R0-rehearsal.toml` (generalWork) exercises everything on this machine in about a minute of GPU: four probes, a three-case sweep
 with raw repetitions, an A/A duel (must be a tie), a g=1 against g=0 duel (bit-identical, about 2.9 x), kill -9 and resume. Expected verdicts: sweep-sanity GO,
 aa-resolution KEEP, g-grouping ADOPT. `bench/imd_bench --keep-samples 1` adds the raw repetition times (`samples_s`; duel-b: `pair_t_a`, `pair_t_b`) that the paired and guard computations need.
+
+## INT8 ceilings and traces (issue 16)
+
+`bench/ceiling/int8_ceiling.cu` (`imd_ceiling`, built with `WITH_CEILING=1 bench/build.sh`) measures the synthetic `mma.sync` peak, cuBLASLt INT8 and stock CUTLASS
+GEMMs (sm80, and on an sm_90a build the Hopper wgmma + TMA kernels) with the same inputs, timing and a CPU exactness check; `--batch N` runs N problems in one launch
+and `--out-type i8` stores 8-bit results, as K4 does. `bench/campaign/required_rate.py` prints the K4 rate parity needs (from the issue-11 folders or any run),
+`probe_profilers.py` records which of nsys, ncu, compute-sanitizer, cuobjdump, nvdisasm really work on a node, and `profile_report.py` turns an nsys profile folder into
+"INT8 GEMM / conversion / other" shares and INT8 launches per call. The architecture gate (G2) covers the ceiling program too (Hopper build: IGMMA and TMA instructions present, no spills).
 
 ## Environments
 
