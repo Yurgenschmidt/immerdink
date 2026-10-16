@@ -333,7 +333,7 @@ def _rate_projection(dec, ctx):
         rows.append(row)
         rec = next((r for r in sweep if r.get("case") == case and r.get("method") == "imd" and r.get("N") == n_mod
                     and r.get("phases") and r.get("status", "ok") == "ok"), None)
-        g8 = next((r for r in xd if r.get("case") == case and r.get("method") == "gemmul8" and r.get("g8_mode") == "fast"
+        g8 = next((r for r in xd if r.get("case") == case and r.get("method") in ("gemmul8", "perm+gemmul8") and r.get("g8_mode") == "fast"
                    and r.get("N") == dec.get("g8_n", 14) and r.get("status", "ok") == "ok" and _num(r.get("median_s"))), None)
         im = next((r for r in xd if r.get("case") == case and r.get("method") == "xduel-imd" and r.get("status", "ok") == "ok"
                    and _num(r.get("median_s"))), None)

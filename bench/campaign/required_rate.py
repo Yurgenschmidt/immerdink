@@ -3,6 +3,7 @@
 GEMMul8 fast, if the pack/CRT kernels around it take 1.0, 0.67 or 0.5 times today's time?
 
     required_rate.py JOBFOLDER [--factors 1,0.67,0.5] [--n 14] [--csv OUT]
+    required_rate.py CAMPAIGN_RESULT_FOLDER --campaign [--g8-n r_mm=15,s_cc16=15,t_batch=15]
 
 JOBFOLDER holds sweep_imd.jsonl (immerdink records with measured phases) and compare.jsonl (the comparison sweep). Per case:
 
@@ -69,6 +70,37 @@ def rows(job, factors=(1.0, 0.67, 0.5), n=14):
     return out
 
 
+def rows_campaign(folder, factors=(1.0, 0.67, 0.5), n=14, g8_n=None):
+    """Same table from a campaign result folder: exp/imd.phases/sweep.jsonl (phases) and exp/xduel.g8/xduel.jsonl (T* = the GEMMul8 fast record
+    at g8_n[case], default 14; the interleaved run has no DGEMM record, so the DGEMM-level N per case is given, e.g. {"r_mm": 15})."""
+    g8_n = g8_n or {}
+    sweep = [r for r in sm.load(os.path.join(folder, "exp", "imd.phases", "sweep.jsonl")) if r.get("method") == "imd" and r.get("status") == "ok"]
+    xd = sm.load(os.path.join(folder, "exp", "xduel.g8", "xduel.jsonl"))
+    out = []
+    for case in CASES:
+        row = {"case": case}
+        rec = next((r for r in sweep if r["case"] == case and r.get("N") == n and r.get("phases")), None)
+        g8 = next((r for r in xd if r.get("case") == case and r.get("method") in ("gemmul8", "perm+gemmul8") and r.get("g8_mode") == "fast"
+                   and r.get("N") == g8_n.get(case, 14) and r.get("status") == "ok"), None)
+        if rec is None or g8 is None:
+            row["note"] = "no immerdink phases" if rec is None else "no GEMMul8 fast xduel record"
+            out.append(row)
+            continue
+        ph = rec["phases"]
+        k4_ms = sum(v["ms"] for k, v in ph.items() if k.startswith("K4"))
+        p_ms = sum(v["ms"] for k, v in ph.items() if not k.startswith("K4"))
+        ops = sm.phases(rec["m"], rec["n"], rec["k"], rec.get("b", 1), n, rec.get("k_align"), rec.get("k_hat"))["K4 GEMM"][1]
+        t_star = g8["median_s"] * 1e3
+        row.update(tstar_ms=t_star, p_ms=p_ms, k4_ms=k4_ms, k4_ops=ops, r_today=ops / (k4_ms * 1e-3) / 1e12, g8_N=g8.get("N"))
+        if case == "s_batch":
+            row["note"] = "excluded from parity: GEMMul8 makes one call per batch slice"
+        for f in factors:
+            budget = t_star - f * p_ms
+            row[f"r_req_{f:g}"] = ops / (budget * 1e-3) / 1e12 if budget > 0 else None
+        out.append(row)
+    return out
+
+
 def markdown(rs, factors):
     head = "| case | T* GEMMul8 fast (ms) | pack/CRT P (ms) | K4 (ms) | K4 today (TOPS) | " + " | ".join(
         f"R* at {f:g} P (TOPS)" for f in factors) + " | R*/today at 0.67 P | note |"
@@ -91,9 +123,14 @@ def main(argv=None):
     p.add_argument("--factors", default="1,0.67,0.5")
     p.add_argument("--n", type=int, default=14)
     p.add_argument("--csv")
+    p.add_argument("--campaign", action="store_true", help="JOBFOLDER is a campaign result folder (exp/imd.phases, exp/xduel.g8)")
+    p.add_argument("--g8-n", default="", help="DGEMM-level GEMMul8 N per case for --campaign, e.g. r_mm=15,s_cc16=15,t_batch=15")
     a = p.parse_args(argv)
     factors = [float(x) for x in a.factors.split(",")]
-    rs = rows(a.job, factors, a.n)
+    if a.campaign:
+        rs = rows_campaign(a.job, factors, a.n, {k: int(v) for k, v in (x.split("=") for x in a.g8_n.split(",") if x)})
+    else:
+        rs = rows(a.job, factors, a.n)
     print(markdown(rs, factors))
     if a.csv:
         keys = sorted({k for r in rs for k in r})
