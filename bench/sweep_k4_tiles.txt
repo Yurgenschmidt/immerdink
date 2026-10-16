@@ -3,38 +3,38 @@
 # (sq8192, t_cc, t_permout, t_batch), so that the planner's pick can be compared with the per-tile times on every case. The K4
 # phase mark ("K4 gemm", the whole K4 phase of one call: one launch) is the per-tile time bench/k4_fit.py fits and judges.
 # Format as sweep_m4.txt. About 8 minutes on an H100 (estimate: the 4090 A3 sweep took 11 min with 5 / 10 reps).
-s128     | ik,jk->ij | i=128,j=128,k=128      | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-s256     | ik,jk->ij | i=256,j=256,k=256      | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-s512     | ik,jk->ij | i=512,j=512,k=512      | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-s_lowk   | ik,jk->ij | i=2048,j=2048,k=64     | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-s_batch  | lik,ljk->lij | i=64,j=64,k=64,l=256 | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-s_df     | acQ,bdQ->acbd | a=32,b=32,c=32,d=32,Q=256 | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-x384     | ik,jk->ij | i=384,j=384,k=384      | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-x768     | ik,jk->ij | i=768,j=768,k=768      | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-sq1024   | ik,jk->ij | i=1024,j=1024,k=1024   | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-s_cc16   | kjbc,kiac->abij | i=16,j=16,k=16,a=96,b=96,c=96 | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-sq2048   | ik,jk->ij | i=2048,j=2048,k=2048   | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-sq4096   | ik,jk->ij | i=4096,j=4096,k=4096   | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-x1k_256  | ik,jk->ij | i=1024,j=1024,k=256    | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-x1k_4k   | ik,jk->ij | i=1024,j=1024,k=4096   | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-x1k_16k  | ik,jk->ij | i=1024,j=1024,k=16384  | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-x512_32k | ik,jk->ij | i=512,j=512,k=32768    | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-x256_64k | ik,jk->ij | i=256,j=256,k=65536    | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-x2k_1k   | ik,jk->ij | i=2048,j=2048,k=1024   | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-x3k_1k   | ik,jk->ij | i=3072,j=3072,k=1024   | imd | 8,14 | | --k4 0,1,2,3 --reps 10 --max-seconds 2
-r_lowk   | ik,jk->ij | i=8192,j=8192,k=1024   | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-t_ikl    | ikl,kjl->ijl | i=1024,j=1024,k=1024,l=16 | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-t_df     | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-r_bigk   | ik,jk->ij | i=2048,j=2048,k=32768  | imd | 8,14 | | --k4 0,1,2,3 --reps 3 --max-seconds 2
-r_skinny | ik,jk->ij | i=16384,j=512,k=4096   | imd | 8,14 | | --k4 0,1,2,3 --reps 3 --max-seconds 2
-r_mm     | ik,jk->ij | i=1000,j=64,k=50000    | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-x8k_64   | ik,jk->ij | i=8192,j=64,k=4096     | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-x4k_128  | ik,jk->ij | i=4096,j=128,k=4096    | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-x2k_192  | ik,jk->ij | i=2048,j=192,k=8192    | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-x64_8k   | ik,jk->ij | i=64,j=8192,k=4096     | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-x16k_256 | ik,jk->ij | i=16384,j=256,k=1024   | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-x8k_512  | ik,jk->ij | i=8192,j=512,k=512     | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-sq8192   | ik,jk->ij | i=8192,j=8192,k=8192   | imd | 8,14 | | --k4 0,1,2,3 --reps 3 --max-seconds 6
-t_cc     | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-t_permout | abk,kcd->cadb | a=64,b=64,c=64,d=64,k=4096 | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
-t_batch  | lik,ljk->lij | i=1024,j=1024,k=1024,l=16 | imd | 8,14 | | --k4 0,1,2,3 --reps 5 --max-seconds 2
+s128     | ik,jk->ij | i=128,j=128,k=128      | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+s256     | ik,jk->ij | i=256,j=256,k=256      | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+s512     | ik,jk->ij | i=512,j=512,k=512      | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+s_lowk   | ik,jk->ij | i=2048,j=2048,k=64     | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+s_batch  | lik,ljk->lij | i=64,j=64,k=64,l=256 | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+s_df     | acQ,bdQ->acbd | a=32,b=32,c=32,d=32,Q=256 | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+x384     | ik,jk->ij | i=384,j=384,k=384      | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+x768     | ik,jk->ij | i=768,j=768,k=768      | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+sq1024   | ik,jk->ij | i=1024,j=1024,k=1024   | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+s_cc16   | kjbc,kiac->abij | i=16,j=16,k=16,a=96,b=96,c=96 | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+sq2048   | ik,jk->ij | i=2048,j=2048,k=2048   | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+sq4096   | ik,jk->ij | i=4096,j=4096,k=4096   | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+x1k_256  | ik,jk->ij | i=1024,j=1024,k=256    | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+x1k_4k   | ik,jk->ij | i=1024,j=1024,k=4096   | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+x1k_16k  | ik,jk->ij | i=1024,j=1024,k=16384  | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+x512_32k | ik,jk->ij | i=512,j=512,k=32768    | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+x256_64k | ik,jk->ij | i=256,j=256,k=65536    | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+x2k_1k   | ik,jk->ij | i=2048,j=2048,k=1024   | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+x3k_1k   | ik,jk->ij | i=3072,j=3072,k=1024   | imd | 8,14 | --k4 0,1,2,3 --reps 10 --max-seconds 2
+r_lowk   | ik,jk->ij | i=8192,j=8192,k=1024   | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+t_ikl    | ikl,kjl->ijl | i=1024,j=1024,k=1024,l=16 | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+t_df     | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+r_bigk   | ik,jk->ij | i=2048,j=2048,k=32768  | imd | 8,14 | --k4 0,1,2,3 --reps 3 --max-seconds 2
+r_skinny | ik,jk->ij | i=16384,j=512,k=4096   | imd | 8,14 | --k4 0,1,2,3 --reps 3 --max-seconds 2
+r_mm     | ik,jk->ij | i=1000,j=64,k=50000    | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+x8k_64   | ik,jk->ij | i=8192,j=64,k=4096     | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+x4k_128  | ik,jk->ij | i=4096,j=128,k=4096    | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+x2k_192  | ik,jk->ij | i=2048,j=192,k=8192    | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+x64_8k   | ik,jk->ij | i=64,j=8192,k=4096     | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+x16k_256 | ik,jk->ij | i=16384,j=256,k=1024   | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+x8k_512  | ik,jk->ij | i=8192,j=512,k=512     | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+sq8192   | ik,jk->ij | i=8192,j=8192,k=8192   | imd | 8,14 | --k4 0,1,2,3 --reps 3 --max-seconds 6
+t_cc     | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+t_permout | abk,kcd->cadb | a=64,b=64,c=64,d=64,k=4096 | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
+t_batch  | lik,ljk->lij | i=1024,j=1024,k=1024,l=16 | imd | 8,14 | --k4 0,1,2,3 --reps 5 --max-seconds 2
