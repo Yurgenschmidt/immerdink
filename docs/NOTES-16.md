@@ -17,8 +17,9 @@ GO, NO-GO or INCONCLUSIVE. The reference to match is GEMMul8 fast, the best othe
 `required_rate.py` computes how fast K4 must run for parity if pack/CRT keeps today's time P, or takes 0.67 P or 0.5 P:
 at 4096³ today's K4 is 952 TOPS and parity needs 1913 / 1364 / 1189 TOPS (1.43× today at 0.67 P); at 8192³ today 995 and parity needs
 1497 / 1305 / 1225 (1.31× at 0.67 P). Some cases cannot be reached by K4 speed alone (r_mm: pack/CRT alone is slower than GEMMul8's whole call).
-Pack/CRT at 0.67 P is below the lower bound the phase marks give for its memory traffic at some shapes: it needs a traffic-reducing change
-(issue 21), not tuning. A 1.3× faster K4 alone is not enough at 4096³ (projected 1.067× GEMMul8's time).
+Whether pack/CRT can reach 0.67 P is open and belongs to issue 21: GEMMul8's own trace (R1) is the existence evidence. (The "lower bound" columns in the
+old phase records come from the performance model's RTX 4090 constants, so they say nothing about H100 bandwidth; do not read them as an H100 limit.)
+With K4 1.3× faster and pack/CRT at 0.67 P the projected 4096³ time is still about 1.07× GEMMul8's: the gain test alone is not enough there.
 
 ## The rule
 
