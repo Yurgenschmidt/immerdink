@@ -24,6 +24,19 @@ extern "C" {
 typedef struct imd_handle_st* imd_handle_t;
 typedef struct imd_plan_st* imd_plan_t;
 
+/* Device status (issue 18, docs/NOTES-18.md). imd_device_info classifies the CURRENT device (the one
+ * cudaGetDevice reports, as imd_plan_create does): the device class, which table set it gets and how
+ * well it matches (imd_device_select), and what kind of code every kernel of the library runs as
+ * there (cudaFuncGetAttributes on each: this loads them all, once per device, and the answer is
+ * cached). info->status says whether plans can be made (IMD_PLAN_UNSUPPORTED: no) and how (NATIVE,
+ * APPROXIMATE, RECOMPILED); failing_kernel and cuda_error say why not. SUCCESS, INVALID_VALUE
+ * (NULL, or info->struct_size < sizeof(imd_device_info_t)), CUDA_ERROR (the device could not be
+ * examined). The handle is only checked for NULL. */
+IMD_API imd_status_t imd_device_info(imd_handle_t handle, imd_device_info_t* info);
+/* The same for a plan: the device and table set it was made with, plus its K4 configuration
+ * (info->k4_config). A plan is never UNSUPPORTED (imd_plan_create returns NOT_SUPPORTED instead). */
+IMD_API imd_status_t imd_plan_info(imd_plan_t plan, imd_device_info_t* info);
+
 /* Library context (DESIGN §6 lifecycle). */
 IMD_API imd_status_t imd_create(imd_handle_t* handle);
 IMD_API imd_status_t imd_destroy(imd_handle_t handle);

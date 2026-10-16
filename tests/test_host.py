@@ -85,9 +85,9 @@ LOWERING_FIELDS = ["status", "lowered", "dispatch", "swapped", "num_moduli", "re
                    "k_chunks", "gemm_launches", "kappa", "workspace_bytes",
                    "plan_device_bytes", "plan_host_bytes", "fused", "kernel_launches",
                    "sm_count", "k4_config", "k4_tune_bytes", "fused_large", "packed",
-                   "pack_mismatch", "k_align"]
+                   "pack_mismatch", "k_align", "table_id"]
 # sizeof(imd_lowering_t) per host API version (DESIGN §6a; v5: §6b; v6: v1.13 §4b)
-V1, V2, V3, V4, V5, V6 = 136, 152, 168, 176, 184, 192
+V1, V2, V3, V4, V5, V6, V7 = 136, 152, 168, 176, 184, 192, 200
 
 
 class CPD(C.Structure):
@@ -170,15 +170,17 @@ class Direct:
         del keep
         return st, tot.value, [(buf[2 * r], buf[2 * r + 1]) for r in range(8)]
 
-    def lowering(self, descs, opts, size=V6, sm_count=0, packing=None):
+    def lowering(self, descs, opts, size=V7, sm_count=0, packing=None, table_id=0):
         """imd_lowering (imd_lowering_packed with `packing`) into a raw struct of `size`
-        bytes (192: version 6; 184 / 176 / 168 / 152 / 136: a version-5 / -4 / -3 / -2 / -1 caller,
+        bytes (200: version 7; 192: version 6; 184 / 176 / 168 / 152 / 136: a version-5 / -4 / -3 / -2 / -1 caller,
         whose struct must come back with its fields only). sm_count: the v3 input field
         (written only into a struct of version 3 or later)."""
         raw = (C.c_uint8 * (size + 16))(*([0xEE] * (size + 16)))
         C.c_uint32.from_buffer(raw, 0).value = size
         if size >= V3:
             C.c_int32.from_buffer(raw, V2).value = sm_count
+        if size >= V7:
+            C.c_int32.from_buffer(raw, V6).value = table_id
         if packing is None:
             st = self.lib.imd_lowering(*self._args(descs, opts), raw)
         else:
@@ -190,7 +192,7 @@ class Direct:
         i32 = [C.c_int32.from_buffer(raw, 4 * i).value for i in range(8)]
         i64 = [C.c_int64.from_buffer(raw, 32 + 8 * i).value for i in range(9)]
         u64 = [C.c_uint64.from_buffer(raw, 104 + 8 * i).value for i in range(4)]
-        v2, v3, v4, v5, v6 = [], [], [], [], []
+        v2, v3, v4, v5, v6, v7 = [], [], [], [], [], []
         if size >= V2:
             v2 = [C.c_int32.from_buffer(raw, 136).value, C.c_int64.from_buffer(raw, 144).value]
         if size >= V3:
@@ -206,7 +208,11 @@ class Direct:
             v6 = [C.c_int32.from_buffer(raw, 184).value]
             if C.c_int32.from_buffer(raw, 188).value != 0:
                 raise Fail("imd_lowering: reserved6 != 0")
-        return st, dict(zip(LOWERING_FIELDS, i32[1:] + i64 + u64 + v2 + v3 + v4 + v5 + v6))
+        if size >= V7:
+            v7 = [C.c_int32.from_buffer(raw, 192).value]
+            if C.c_int32.from_buffer(raw, 196).value != 0:
+                raise Fail("imd_lowering: reserved7 != 0")
+        return st, dict(zip(LOWERING_FIELDS, i32[1:] + i64 + u64 + v2 + v3 + v4 + v5 + v6 + v7))
 
 
 # ---------------------------------------------------------------------------------------
@@ -278,7 +284,7 @@ def spec_expect(descs, N, g, rnd, mode, vec):
     # v1.5 (DESIGN §4, §6 k4_tune, §6a): the K4 rule for the reference 128 SMs and the
     # autotuning scratch bytes (both only with the emulated GEMM).
     emu = dispatch == "EMULATE"
-    exp.update(sm_count=128,
+    exp.update(sm_count=128, table_id=0,
                k4_config=spec_k4_config(m, n_hat, k_hat, b, N, gg, 128) if emu else 0,
                k4_tune_bytes=spec_k4_tune_bytes(m, n_hat, k_hat, b, gg) if emu else 0)
     return status, exp
@@ -771,7 +777,7 @@ def suite_k_align(direct, rng, n_random):
     counts = {}
     co = lambda o: c_opts(*o)  # noqa: E731
     if (host._Lowering.k_align.offset, host._Lowering.reserved6.offset,
-            C.sizeof(host._Lowering)) != (184, 188, V6):
+            C.sizeof(host._Lowering)) != (184, 188, V7):
         raise Fail("host.py imd_lowering_t v6 mirror")
     if (host.PACK_FORMAT_A16, host.PACK_FORMAT_A64, host.PACK_FORMAT) != (1, 2, 2) or \
             params.PACK_FORMAT != 2 or oracle.PACK_FORMAT != 2:

@@ -45,6 +45,15 @@ cudaError_t kernel_occupancy(int32_t kernel, int32_t* out);
 // constrained W: fewest CTAs per SM, then most registers). cudaErrorInvalidValue otherwise.
 cudaError_t kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out);
 
+// Issue 18 (docs/NOTES-18.md D4): the binaryVersion / ptxVersion cudaFuncGetAttributes reports for
+// kernel IMD_PERF_KERNEL_* (K4 excepted, see k4_ops.hpp K4Ops::versions); w as in kernel_occupancy_w (a pack
+// kernel is looked at for one W instantiation; 0 for the others). The error of the CUDA call, else success.
+cudaError_t kernel_versions(int32_t kernel, int32_t w, int32_t* binary, int32_t* ptx);
+// The same for the launches without an IMD_PERF_KERNEL_* id (index 0 .. kExtraKernels - 1; cudaErrorInvalidValue
+// beyond). Their failing_kernel id in imd_device_info_t is IMD_PERF_KERNEL_COUNT + index.
+constexpr int32_t kExtraKernels = 11;
+cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx);
+
 // K0 (contract.cu): write the p.vec_count scatter vectors to `vec` from p.vec_desc, on
 // `stream`. Also builds the resident copy at plan creation. SUCCESS or CUDA_ERROR.
 imd_status_t k0_generate(const ExecPlan& p, int64_t* vec, cudaStream_t stream);

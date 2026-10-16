@@ -24,7 +24,7 @@ import ctypes as ct
 from . import _arrays, _capi, host
 from ._arrays import DeviceArray, get_cai_stream_policy, set_cai_stream_policy, stream_handle
 
-__all__ = ["Handle", "Plan", "Pack", "PackedBuffer", "PackRecord", "PlanCache", "Layout",
+__all__ = ["DeviceInfo", "device_info", "Handle", "Plan", "Pack", "PackedBuffer", "PackRecord", "PlanCache", "Layout",
            "DeviceArray", "contract", "workspace_size", "pack_spec", "default_handle",
            "default_plan_cache", "load_library", "ImmerdinkError", "InvalidValueError",
            "NotSupportedError", "AliasingError", "InsufficientWorkspaceError", "MisalignedError",
@@ -268,6 +268,44 @@ class Handle:
 
 _handles = {}
 _handles_lock = threading.Lock()
+
+
+class DeviceInfo(namedtuple("DeviceInfo", "name cc sm_count l2_bytes smem_optin_bytes match table_id "
+                                          "approximate code_kind status failing_kernel cuda_error "
+                                          "kernels_checked k4_config")):
+    """imd_device_info_t (issue 18, docs/NOTES-18.md): the device class (name, cc = (major, minor),
+    SMs, L2, shared-memory limit), the table-set selection (match: "exact", "arch", "generation",
+    "default" or "unsupported"; table_id; approximate), the worst kind of code over the library's
+    kernels (code_kind: "native", "compatible", "recompiled", "unusable"), the plan status
+    ("native", "approximate", "recompiled", "unsupported") and, when unusable, the failing kernel id
+    and CUDA error (209: no kernel image for the device, 222: PTX newer than the driver).
+    k4_config: -1 for a device query, the plan's IMD_K4_* for Plan.info."""
+    __slots__ = ()
+
+
+def _info(lib, c):
+    L = lib.lib
+    name = lambda f, v: getattr(L, f)(v).decode()  # noqa: E731
+    d, s = c.device, c.selection
+    return DeviceInfo(d.name.decode(), (d.cc_major, d.cc_minor), d.sm_count, d.l2_bytes,
+                      d.smem_optin_bytes, name("imd_match_name", s.match), s.table_id,
+                      bool(s.approximate), name("imd_code_kind_name", c.code_kind),
+                      name("imd_plan_status_name", c.status), c.failing_kernel, c.cuda_error,
+                      c.kernels_checked, c.k4_config)
+
+
+def device_info(handle=None, lib=None):
+    """DeviceInfo of the current device (imd_device_info): what the library found out about the
+    card and the code it runs there. The first call on a device loads every kernel (about 0.1 s)
+    and the answer is cached."""
+    lib = load_library(lib)
+    handle = handle or default_handle(lib)
+    c = _capi.DeviceInfo()
+    c.struct_size = ct.sizeof(c)
+    st = lib.lib.imd_device_info(handle._h, ct.byref(c))
+    if st:
+        raise _error(st, "imd_device_info")
+    return _info(lib, c)
 
 
 def default_handle(lib=None):
@@ -608,10 +646,22 @@ class Plan:
 
     # -- queries ----------------------------------------------------------------------------
 
-    def _lowering(self, sm_count=0):
+    @property
+    def info(self):
+        """DeviceInfo of the device and table set this plan was made with (imd_plan_info), including
+        k4_config, the K4 configuration it runs."""
+        c = _capi.DeviceInfo()
+        c.struct_size = ct.sizeof(c)
+        st = self.lib.lib.imd_plan_info(self._h, ct.byref(c))
+        if st:
+            raise _error(st, "imd_plan_info")
+        return _info(self.lib, c)
+
+    def _lowering(self, sm_count=0, table_id=0):
         o = self.options
         return host.lowering(self.descs, N=o["N"], g=o["g"], rounding=o["rounding"],
                              mode=o["mode"], vec_mode=o["vec_mode"], sm_count=sm_count,
+                             table_id=table_id,
                              packing=_pack_specs(self.packs), lib=self.lib.host)
 
     @property
@@ -620,7 +670,8 @@ class Plan:
         device. Its k4_config is the plan-time rule's choice; a k4_tune plan may run another
         (bit-identical) configuration."""
         if self._lw is None:
-            self._lw = self._lowering(self.lib.sm_count(self.device))
+            i = self.info
+            self._lw = self._lowering(i.sm_count, i.table_id)
         return self._lw
 
     @property

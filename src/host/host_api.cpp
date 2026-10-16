@@ -55,12 +55,14 @@ constexpr uint32_t kLoweringV3Size = 168;  // + sm_count, k4_config, k4_tune_byt
 constexpr uint32_t kLoweringV4Size = 176;  // + fused_large, reserved4 (v1.6)
 constexpr uint32_t kLoweringV5Size = 184;  // + packed, pack_mismatch (v1.7)
 constexpr uint32_t kLoweringV6Size = 192;  // + k_align, reserved6 (v1.13 §4b, host API 9)
+constexpr uint32_t kLoweringV7Size = 200;  // + table_id, reserved7 (host API 14, issue 18)
 static_assert(offsetof(imd_lowering_t, fused) == kLoweringV1Size, "imd_lowering_t v1 layout changed");
 static_assert(offsetof(imd_lowering_t, sm_count) == kLoweringV2Size, "imd_lowering_t v2 layout changed");
 static_assert(offsetof(imd_lowering_t, fused_large) == kLoweringV3Size, "imd_lowering_t v3 layout changed");
 static_assert(offsetof(imd_lowering_t, packed) == kLoweringV4Size, "imd_lowering_t v4 layout changed");
 static_assert(offsetof(imd_lowering_t, k_align) == kLoweringV5Size, "imd_lowering_t v5 layout changed");
-static_assert(sizeof(imd_lowering_t) == kLoweringV6Size, "imd_lowering_t v6 layout changed");
+static_assert(offsetof(imd_lowering_t, table_id) == kLoweringV6Size, "imd_lowering_t v6 layout changed");
+static_assert(sizeof(imd_lowering_t) == kLoweringV7Size, "imd_lowering_t v7 layout changed");
 static_assert(sizeof(imd_options_t) == 24, "imd_options_t layout changed");
 static_assert(sizeof(imd_region_t) == 16, "imd_region_t layout changed");
 // v1.7 (§6b.5): the version-1 pack structs (64-bit ABI).
@@ -144,6 +146,9 @@ imd_status_t lowering_impl(const imd_tensor_t* A, const imd_tensor_t* B, const i
   const int32_t sms_in = out->struct_size >= kLoweringV3Size ? out->sm_count : 0;
   if (sms_in < 0) return IMD_STATUS_INVALID_VALUE;
   const int32_t sms = sms_in > 0 ? sms_in : imd::detail::kK4ReferenceSms;
+  // v7: table_id is an input as well (host API < 14 callers: the reference table set).
+  const int32_t table = out->struct_size >= kLoweringV7Size ? out->table_id : IMD_TABLE_SM89;
+  if (table < 0 || table >= IMD_TABLE_COUNT) return IMD_STATUS_INVALID_VALUE;
   r.status = guarded([&] {
     Analysis an;
     const imd_status_t ast =
@@ -191,7 +196,8 @@ imd_status_t lowering_impl(const imd_tensor_t* A, const imd_tensor_t* B, const i
     // v1.5: the K4 configuration of the plan-time rule (api.cpp uses the same function with
     // the device's SM count) and the autotuning scratch bytes.
     r.sm_count = sms;
-    r.k4_config = imd::detail::k4_select(e, sms);
+    r.k4_config = imd::detail::k4_select(e, sms, table);
+    r.table_id = table;
     r.k4_tune_bytes = imd::detail::k4_tune_bytes(e);
     if (plan_st != IMD_STATUS_SUCCESS) return plan_st;
     r.plan_device_bytes = e.device_bytes;

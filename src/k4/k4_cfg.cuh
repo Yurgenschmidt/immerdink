@@ -90,6 +90,19 @@ cudaError_t setup(int* occ_store, int* occ_add) {
   return e != cudaSuccess ? e : setup_one<true>(occ_add);
 }
 
+cudaError_t versions(int* binary_store, int* ptx_store, int* binary_add, int* ptx_add) {
+  cudaFuncAttributes a{};
+  void (*store)(Params) = imd::kernels::k4_kernel<G, false>;
+  void (*add)(Params) = imd::kernels::k4_kernel<G, true>;
+  cudaError_t e = cudaFuncGetAttributes(&a, store);
+  if (e != cudaSuccess) return e;
+  *binary_store = a.binaryVersion, *ptx_store = a.ptxVersion;
+  e = cudaFuncGetAttributes(&a, add);
+  if (e != cudaSuccess) return e;
+  *binary_add = a.binaryVersion, *ptx_add = a.ptxVersion;
+  return cudaSuccess;
+}
+
 void make(K4Blob* out, int m, int n, int k, int64_t lda, int64_t ldb, int64_t ldw,
           int64_t batches, int64_t resident) {
   const Params p = G::make_params(m, n, k, lda, ldb, ldw, batches, resident);
@@ -113,7 +126,7 @@ bool launch(const K4Blob& blob, bool add, const K4Call& c, cudaStream_t stream) 
 #define IMD_K4_CAT2(a, b) a##b
 #define IMD_K4_CAT(a, b) IMD_K4_CAT2(a, b)
 const K4Ops& IMD_K4_CAT(k4_ops_cfg, IMD_K4_CFG)() {
-  static const K4Ops ops{G::kThreads, G::kSmemBytes, &setup, &make, &launch};
+  static const K4Ops ops{G::kThreads, G::kSmemBytes, &setup, &versions, &make, &launch};
   return ops;
 }
 
