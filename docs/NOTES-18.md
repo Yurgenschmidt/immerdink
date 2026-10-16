@@ -256,6 +256,9 @@ Defects found, with the fix:
   on a driver as new as the toolkit it would be `recompiled`, which this machine cannot show); foreign
   architecture (`90-real`) `unsupported`, CUDA error 209. In both, `imd_plan_create` returns `NOT_SUPPORTED`
   and `Plan(...)` raises `NotSupportedError`; `imd_device_info` names the failing kernel and the error.
+* **Campaign.** Every `imd_bench` record now carries `device_match`, `device_code`, `device_status`, `device_cc` and
+  `device_kernels`, so R1 and R3 print each card's table match, code kind and status in every record (checked on
+  the 4090: exact / native / native / 89 / 110).
 * **Not shown here.** A real `recompiled` status on a card (needs a driver newer than the toolkit; the
   driver-API probe above gives binary 89, ptx 80 for hand-lowered PTX and the classification test covers that
   row), and anything on Hopper or Blackwell (R1 prints each card's status; the cluster build recipe is in the
