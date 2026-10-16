@@ -60,7 +60,7 @@ OPTIONAL = {
     "guard": {"where": dict, "floor": (int, float), "k": (int, float), "classes": list,
               "spread_field": str},
     "parity": {"a_family": str, "b_family": str, "exclude": list, "classes": list},
-    "rate_projection": {"n": int, "role": str, "confirm_gain": (int, float), "s_min": (int, float), "s_max": (int, float),
+    "rate_projection": {"n": int, "g8_n": int, "role": str, "confirm_gain": (int, float), "s_min": (int, float), "s_max": (int, float),
                         "u_floor": (int, float), "u_noisy": (int, float), "noisy_spread_pct": (int, float), "classes": list},
 }
 
@@ -334,7 +334,7 @@ def _rate_projection(dec, ctx):
         rec = next((r for r in sweep if r.get("case") == case and r.get("method") == "imd" and r.get("N") == n_mod
                     and r.get("phases") and r.get("status", "ok") == "ok"), None)
         g8 = next((r for r in xd if r.get("case") == case and r.get("method") == "gemmul8" and r.get("g8_mode") == "fast"
-                   and r.get("status", "ok") == "ok" and _num(r.get("median_s"))), None)
+                   and r.get("N") == dec.get("g8_n", 14) and r.get("status", "ok") == "ok" and _num(r.get("median_s"))), None)
         im = next((r for r in xd if r.get("case") == case and r.get("method") == "xduel-imd" and r.get("status", "ok") == "ok"
                    and _num(r.get("median_s"))), None)
         if rec is None or g8 is None or im is None:

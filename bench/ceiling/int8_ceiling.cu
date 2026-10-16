@@ -267,8 +267,20 @@ struct Rec {
 static FILE* g_out = stdout;
 static std::string g_gpu;
 static int g_sms = 0;
+static std::string gpu_state() {  // clock, power, temperature and the clock-event reasons right after the timed block (as imd_bench's gpu_after)
+  std::string out;
+  if (FILE* f = popen("nvidia-smi --query-gpu=clocks.sm,clocks.mem,temperature.gpu,power.draw,pstate,clocks_event_reasons.active "
+                      "--format=csv,noheader 2>/dev/null", "r")) {
+    char b[256];
+    while (fgets(b, sizeof b, f)) out += b;
+    pclose(f);
+  }
+  while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
+  return out;
+}
 static void emit(Rec r) {
   r.s("gpu", g_gpu).i("sm_count", g_sms);
+  if (r.kv.size() > 3 && r.kv.back().first == "status") r.s("gpu_after", gpu_state());
   if (const char* c = std::getenv("BENCH_COMMIT")) r.s("commit", c);
   std::string line = r.dump();
   fprintf(g_out, "%s\n", line.c_str());
