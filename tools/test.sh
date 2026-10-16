@@ -98,7 +98,7 @@ gpu_lock="${IMMERDINK_GPU_LOCK:-/home/ef/repos/ehrenfest-ipdps/_wip/gpu.lock}"
 # Without a caller's selection option: CPU-only tests never touch the GPU, so they run first
 # without the lock; only the GPU tests wait for it. With one (has_selection), the caller's
 # selection runs in ONE pass under the lock, so no GPU test ever runs unlocked.
-cpu_only='^(calib_strings_shipped|calib_strings_too_long|tools_test_sh_selftest|host_c_api|host_k_align|host_python|host_devices|device_kernel_sites|host_perf|host_planner|host_accuracy|host_cuda_free|host_footprint_monotone|host_precision|c2_engine_selftest|sweep_disjoint_selftest|md2_time_selftest|campaign_[a-z]+_selftest|workspace_vs_params|params_check|constants_header_current)$'
+cpu_only='^(calib_strings_shipped|calib_strings_too_long|tools_test_sh_selftest|host_c_api|host_k_align|host_l2_knobs|bench_membw_selftest|host_python|host_devices|device_kernel_sites|host_perf|host_planner|host_accuracy|host_cuda_free|host_footprint_monotone|host_precision|c2_engine_selftest|sweep_disjoint_selftest|md2_time_selftest|campaign_[a-z]+_selftest|workspace_vs_params|params_check|constants_header_current)$'
 rc=0
 if [ "$gpu_lock" = none ]; then ctest --test-dir "$build" --output-on-failure "$@" || rc=$?
 elif has_selection "$@"; then

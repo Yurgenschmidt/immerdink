@@ -48,6 +48,11 @@ if(Python3_FOUND)
   target_link_libraries(test_k_align PRIVATE imd_host_internal imd_warnings)
   add_test(NAME host_k_align COMMAND test_k_align)
 
+  # Issue 21: K1's L2 budgets as fractions of the card's L2 (the 4090's values exactly). CPU only.
+  add_executable(test_l2_knobs test_l2_knobs.cpp)
+  target_link_libraries(test_l2_knobs PRIVATE imd_host_internal imd_warnings)
+  add_test(NAME host_l2_knobs COMMAND test_l2_knobs)
+
   # The Python wrapper (python/immerdink/host.py) over libimmerdink_host vs the C ABI and
   # vs spec/params.py and spec/oracle.py (lowering summary, sizes, g sweep). CPU only.
   add_test(NAME host_python
@@ -111,6 +116,9 @@ if(Python3_FOUND)
              COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/campaign/test_${t}.py")
   endforeach()
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
+  # Issue 21 (docs/NOTES-21.md): the analysis of the bandwidth microbenchmark (names the limiter of the pack / CRT phases). CPU only.
+  add_test(NAME bench_membw_selftest
+           COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/membw/test_analyze.py")
   # Issue 18 (docs/NOTES-18.md): the device-class rules (libimmerdink_host against spec/devices.py) and the
   # coverage of every kernel launch site by the device-status check, with the K4 limits. CPU only.
   add_test(NAME host_devices

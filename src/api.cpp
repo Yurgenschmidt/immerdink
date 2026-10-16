@@ -185,6 +185,7 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
       }
       if (p->info.status == IMD_PLAN_UNSUPPORTED) return IMD_STATUS_NOT_SUPPORTED;
       e.sms = p->info.device.sm_count;
+      e.l2_bytes = static_cast<int64_t>(p->info.device.l2_bytes);
     }
     if (emulated) {  // §4 / §6 v1.2: every K4 launch shape's parameters, built here once
       // v1.5: the K4 configuration. libimmerdink_host's rule for this device's SM count (what
