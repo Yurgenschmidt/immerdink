@@ -111,6 +111,10 @@ if(Python3_FOUND)
              COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/campaign/test_${t}.py")
   endforeach()
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
+  # Issue 20 (docs/NOTES-20.md): the K4 tile-table fit and its adoption rule (reproduces the shipped 4090 constants
+  # from the A3 data where they are on this machine). CPU only.
+  add_test(NAME bench_k4_fit_selftest
+           COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/test_k4_fit.py")
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
                    "${IMD_GENERATED_INCLUDE}/immerdink/detail/constants.hpp"

@@ -16,6 +16,10 @@ Kinds (each a pure function of the records; a verdict is one of VERDICTS):
              configuration of two families (default immerdink / GEMMul8 fast, TFLOPS-eq), PASS when the geometric mean
              over the cases (some excluded, e.g. the one-call-per-slice batch case) reaches the limit and no case is
              below the floor once its measured spread is added; else FAIL
+  tile_refit forced-tile sweep records (imd_bench --k4 0,1,2,3, the K4 phase mark): refit the planner's K4 tile cost table
+             (bench/k4_fit.py) and decide by the rule fixed for issue 20 whether the card adopts it: ADOPT / KEEP /
+             INCONCLUSIVE (held-out gain >= 1.5%, nothing > 3% slower, leave-one-out regret <= 2%). The card's SM count is
+             read from the records. The refitted table is in the details.
   guard      records against a stored baseline file: PASS / FLAGGED by the regression guard (field: a time, e.g. median_s;
              a slowdown is new / base - 1; records with samples_s use the robust spread)
 
@@ -46,6 +50,7 @@ REQUIRED = {
     "paired": {"exp": str, "file": str},
     "guard": {"exp": str, "file": str, "baseline": str, "baseline_sha256": str, "key": list, "field": str},
     "parity": {"exp": str, "file": str, "geomean_at_least": (int, float), "case_floor": (int, float)},
+    "tile_refit": {"exp": str, "file": str},
 }
 OPTIONAL = {
     "threshold": {"where": dict, "classes": list},
@@ -54,6 +59,7 @@ OPTIONAL = {
     "guard": {"where": dict, "floor": (int, float), "k": (int, float), "classes": list,
               "spread_field": str},
     "parity": {"a_family": str, "b_family": str, "exclude": list, "classes": list},
+    "tile_refit": {"where": dict, "classes": list, "exclude": list},
 }
 
 
@@ -287,4 +293,15 @@ def _parity(dec, ctx):
     return {"verdict": "PASS" if ok else "FAIL", "reason": why, "details": det}
 
 
-_EVAL = {"threshold": _threshold, "paired": _paired, "guard": _guard, "parity": _parity}
+def _tile_refit(dec, ctx):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # bench/k4_fit.py
+    import k4_fit
+    recs = [r for r in select(ctx.jsonl(dec["exp"], dec["file"]), dec.get("where")) if r.get("case") not in dec.get("exclude", [])]
+    sms = {int(r["sm_count"]) for r in recs if r.get("sm_count")}
+    if len(sms) != 1:
+        return {"verdict": "INCONCLUSIVE", "reason": f"records from {len(sms)} SM counts (need exactly one card)", "details": {}}
+    d = k4_fit.decide(k4_fit.obs_from_dicts(recs), sms.pop())
+    return {"verdict": d["verdict"], "reason": d["reason"], "details": {k: v for k, v in d.items() if k not in ("verdict", "reason")}}
+
+
+_EVAL = {"threshold": _threshold, "paired": _paired, "guard": _guard, "parity": _parity, "tile_refit": _tile_refit}
