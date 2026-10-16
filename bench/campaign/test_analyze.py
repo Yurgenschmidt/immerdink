@@ -289,6 +289,88 @@ class Parity(unittest.TestCase):
         self.assertEqual(dc.evaluate(d, FakeCtx([rec]))["verdict"], "ADOPT")
 
 
+SHAPES = {  # case: (m=n=k, K4 ms, P ms, T* ms) from the H100 run of issue 11
+    "sq4096": (4096, 2.02, 1.23, 2.23), "sq8192": (8192, 15.5, 4.57, 14.9)}
+
+
+def rp_inputs(stock, lt=None, mma=1200.0, s=0.99, exact=True, spread=1.0, g8_spread=1.0, drop=()):
+    """Records for the rate_projection decision from the H100 numbers; stock/lt are TOPS per case."""
+    sweep, xd, ce = [], [], []
+    for case, (d, k4, pk, ts) in SHAPES.items():
+        if case in drop:
+            continue
+        sweep.append({"case": case, "method": "imd", "N": 14, "status": "ok", "m": d, "n": d, "k": d, "b": 1, "k_hat": d,
+                      "spread_pct": spread, "phases": {"K4 gemm": {"ms": k4}, "KL A": {"ms": pk / 2}, "K5 crt": {"ms": pk / 2}}})
+        xd.append({"case": case, "method": "gemmul8", "g8_mode": "fast", "N": 14, "status": "ok", "median_s": ts * 1e-3, "spread_pct": g8_spread})
+        xd.append({"case": case, "method": "xduel-imd", "N": 14, "status": "ok", "median_s": s * (k4 + pk) * 1e-3, "spread_pct": spread})
+        ce.append({"variant": "hopper:128x256x128:1x2x1:coop", "status": "ok", "m": d, "n": d, "k": d, "batch": 14, "out": "i8",
+                   "tops": stock[case], "exact": exact, "spread_pct": spread})
+        if lt:
+            ce.append({"variant": "cublaslt", "status": "ok", "m": d, "n": d, "k": d, "batch": 1, "out": "i32", "tops": lt[case],
+                       "exact": True, "spread_pct": 1.0})
+    ce.append({"variant": "mma_peak", "status": "ok", "tops": mma, "exact": None})
+    return sweep, xd, ce
+
+
+class RpCtx:
+    def __init__(self, sweep, xd, ce):
+        self.d = {"s.jsonl": sweep, "x.jsonl": xd, "c.jsonl": ce}
+        self.base_dir = "."
+
+    def jsonl(self, exp, file):
+        return self.d[file]
+
+
+RP = {"id": "wgmma", "kind": "rate_projection", "requires": ["s", "x", "c"], "exp": "s", "file": "s.jsonl", "xduel_exp": "x",
+      "xduel_file": "x.jsonl", "ceiling_exp": "c", "ceiling_file": "c.jsonl", "cases": ["sq4096", "sq8192"], "gain_go": 1.3,
+      "pack_factor_go": 0.67, "pack_factor_opt": 0.5, "window": 1.05, "mma_margin": 0.9}
+
+
+class RateProjection(unittest.TestCase):
+    def verdict(self, *a, dec=RP, **kw):
+        return dc.evaluate(dec, RpCtx(*rp_inputs(*a, **kw)))
+
+    def test_go_inconclusive_nogo(self):
+        v = self.verdict({"sq4096": 2000.0, "sq8192": 2000.0})
+        self.assertEqual(v["verdict"], "GO", v)
+        self.assertAlmostEqual(v["details"]["cases"][0]["r_k4"], 952, delta=5)
+        v = self.verdict({"sq4096": 1100.0, "sq8192": 1100.0})             # gain 1.15 / 1.11: below the GO gain, optimistic case holds
+        self.assertEqual(v["verdict"], "INCONCLUSIVE", v)
+        v = self.verdict({"sq4096": 800.0, "sq8192": 800.0}, lt={"sq4096": 850.0, "sq8192": 850.0})
+        self.assertEqual(v["verdict"], "NO-GO", v)
+
+    def test_projection_not_gain_decides_at_4096(self):
+        v = self.verdict({"sq4096": 1300.0, "sq8192": 2000.0})            # gain 1.37 at 4096 but the 5 % window is missed (B)
+        c = v["details"]["cases"][0]
+        self.assertTrue(c["A"] and not c["B"], c)
+        self.assertEqual(v["verdict"], "INCONCLUSIVE")
+
+    def test_mma_peak_high_means_tuning_may_suffice(self):
+        v = self.verdict({"sq4096": 2000.0, "sq8192": 2000.0}, mma=1900.0)  # mma.sync alone could reach the needed rate: C fails
+        self.assertEqual(v["verdict"], "INCONCLUSIVE", v)
+        self.assertFalse(v["details"]["cases"][0]["C"])
+
+    def test_noise_haircut(self):
+        v = self.verdict({"sq4096": 1500.0, "sq8192": 1500.0}, spread=1.0)
+        noisy = self.verdict({"sq4096": 1500.0, "sq8192": 1500.0}, spread=30.0)
+        self.assertLess(v["details"]["cases"][0]["u"], noisy["details"]["cases"][0]["u"])
+        self.assertGreaterEqual(noisy["details"]["cases"][0]["u"], 0.30)
+
+    def test_invalid_inputs_never_go(self):
+        self.assertEqual(self.verdict({"sq4096": 2000.0, "sq8192": 2000.0}, exact=False)["verdict"], "INCONCLUSIVE")   # no exact stock rate
+        self.assertEqual(self.verdict({"sq4096": 2000.0, "sq8192": 2000.0}, s=1.3)["verdict"], "INCONCLUSIVE")        # anchor off
+        self.assertEqual(self.verdict({"sq4096": 2000.0, "sq8192": 2000.0}, drop=("sq8192",))["verdict"], "INCONCLUSIVE")
+        # a missing shape does not hide a NO-GO at the other one
+        v = self.verdict({"sq4096": 700.0, "sq8192": 700.0}, lt={"sq4096": 700.0, "sq8192": 700.0}, drop=("sq8192",))
+        self.assertEqual(v["verdict"], "NO-GO", v)
+
+    def test_confirm_role(self):
+        d = dict(RP, role="confirm", confirm_gain=1.2)
+        self.assertEqual(self.verdict({"sq4096": 1300.0, "sq8192": 1300.0}, dec=d)["verdict"], "PASS")
+        self.assertEqual(self.verdict({"sq4096": 1000.0, "sq8192": 1300.0}, dec=d)["verdict"], "FAIL")
+        self.assertEqual(self.verdict({"sq4096": 1300.0, "sq8192": 1300.0}, drop=("sq8192",), dec=d)["verdict"], "INCONCLUSIVE")
+
+
 @unittest.skipUnless(os.path.isdir(GOLDEN), "the issue-11 result folders are not on this machine")
 class ParityGolden(unittest.TestCase):
     """The parity gate on the issue-11 comparison records gives the numbers of the tracking issue: geometric mean over 16

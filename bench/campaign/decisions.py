@@ -16,6 +16,9 @@ Kinds (each a pure function of the records; a verdict is one of VERDICTS):
              configuration of two families (default immerdink / GEMMul8 fast, TFLOPS-eq), PASS when the geometric mean
              over the cases (some excluded, e.g. the one-call-per-slice batch case) reaches the limit and no case is
              below the floor once its measured spread is added; else FAIL
+  rate_projection  the wgmma go / no-go of issue 16 (NOTES-16, docs/CAMPAIGN.md): from K4's measured rate, the best stock INT8 GEMM
+             rate on K4's launch shape and the interleaved GEMMul8 time, project the immerdink time with faster K4 and
+             pack/CRT and compare it with GEMMul8; GO / NO-GO / INCONCLUSIVE (role confirm: PASS / FAIL on the rate gain)
   guard      records against a stored baseline file: PASS / FLAGGED by the regression guard (field: a time, e.g. median_s;
              a slowdown is new / base - 1; records with samples_s use the robust spread)
 
@@ -35,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # also under pyt
 
 import stats
 
-VERDICTS = ("ADOPT", "KEEP", "GO", "NO-GO", "PASS", "FAIL", "FLAGGED", "INCONCLUSIVE", "INVALID")
+VERDICTS = ("ADOPT", "KEEP", "GO", "NO-GO", "PASS", "FAIL", "FLAGGED", "INCONCLUSIVE", "INVALID")   # rate_projection: GO / NO-GO / INCONCLUSIVE, or PASS / FAIL in its confirm role
 AGGREGATES = ("max", "min", "median", "geomean", "mean")
 PLACEHOLDER = re.compile(r"\b(TBD|TODO|FIXME|XXX)\b|\?\?")
 
@@ -46,6 +49,9 @@ REQUIRED = {
     "paired": {"exp": str, "file": str},
     "guard": {"exp": str, "file": str, "baseline": str, "baseline_sha256": str, "key": list, "field": str},
     "parity": {"exp": str, "file": str, "geomean_at_least": (int, float), "case_floor": (int, float)},
+    "rate_projection": {"exp": str, "file": str, "xduel_exp": str, "xduel_file": str, "ceiling_exp": str, "ceiling_file": str,
+                        "cases": list, "gain_go": (int, float), "pack_factor_go": (int, float), "pack_factor_opt": (int, float),
+                        "window": (int, float), "mma_margin": (int, float)},
 }
 OPTIONAL = {
     "threshold": {"where": dict, "classes": list},
@@ -54,6 +60,8 @@ OPTIONAL = {
     "guard": {"where": dict, "floor": (int, float), "k": (int, float), "classes": list,
               "spread_field": str},
     "parity": {"a_family": str, "b_family": str, "exclude": list, "classes": list},
+    "rate_projection": {"n": int, "role": str, "confirm_gain": (int, float), "s_min": (int, float), "s_max": (int, float),
+                        "u_floor": (int, float), "u_noisy": (int, float), "noisy_spread_pct": (int, float), "classes": list},
 }
 
 
@@ -113,6 +121,19 @@ def lint(path, experiments):
             if isinstance(d.get("go_at_least"), (int, float)) and isinstance(d.get("nogo_below"), (int, float)) \
                     and d["nogo_below"] > d["go_at_least"]:
                 F.append(Finding("error", w, "nogo_below must not exceed go_at_least"))
+        if kind == "rate_projection":
+            for key in ("xduel_exp", "ceiling_exp"):
+                if d.get(key) not in experiments:
+                    F.append(Finding("error", w, f"{key} {d.get(key)!r} is not in the manifest"))
+                elif isinstance(req, list) and d.get(key) not in req:
+                    F.append(Finding("error", w, f"{key} must be listed in requires"))
+            if d.get("role", "binding") not in ("binding", "confirm"):
+                F.append(Finding("error", w, "role must be binding or confirm"))
+            if d.get("role") == "confirm" and "confirm_gain" not in d:
+                F.append(Finding("error", w, "role confirm needs confirm_gain"))
+            if isinstance(d.get("pack_factor_opt"), (int, float)) and isinstance(d.get("pack_factor_go"), (int, float)) \
+                    and d["pack_factor_opt"] > d["pack_factor_go"]:
+                F.append(Finding("error", w, "pack_factor_opt must not exceed pack_factor_go"))
         if kind == "guard" and isinstance(d.get("baseline"), str):
             bp = os.path.join(os.path.dirname(os.path.abspath(path)), d["baseline"])
             if not os.path.exists(bp):
@@ -287,4 +308,113 @@ def _parity(dec, ctx):
     return {"verdict": "PASS" if ok else "FAIL", "reason": why, "details": det}
 
 
-_EVAL = {"threshold": _threshold, "paired": _paired, "guard": _guard, "parity": _parity}
+def _rate_projection(dec, ctx):
+    """The wgmma go / no-go rule (issue 16, reviewed by the independent reviewer 2026-10-15). Per case (sq4096, sq8192), N = 14:
+         ops = 2 N b m n_hat k_hat, K4 and P (= all other phases) from the immerdink phase marks, R_K4 = ops / K4
+         s = T_imd / (P + K4) (the whole-call anchor; outside [s_min, s_max] the measurement is not trusted)
+         Q(R, f) = s (f P + ops / R) / T*      (> window: the projected immerdink is slower than GEMMul8 fast by more than the window)
+       T_imd and T* come from the interleaved xduel records (immerdink and GEMMul8 fast), R_stock is the best bit-exact stock
+       CUTLASS Hopper rate on K4's launch shape (m, n_hat, k_hat, batch N b; int8 output preferred), R_ref = max(R_stock, cuBLASLt),
+       u the noise haircut: max(u_floor, the spreads), or max(u_noisy, the spreads) if any spread is above noisy_spread_pct.
+         A  R_stock / R_K4 >= gain_go                       B  Q(R_stock (1 - u), pack_factor_go) <= window
+         C  mma_margin R_mma_peak < the rate at which Q(R, pack_factor_go) = window (mma.sync tuning alone cannot reach it)
+         O  Q(R_ref (1 + u), pack_factor_opt) <= window     (the optimistic case: if even this fails, wgmma cannot help)
+       GO: A, B, C at every case with all inputs valid. NO-GO: O fails at some case. Else INCONCLUSIVE.
+       role confirm (H200): PASS if R_stock / R_K4 >= confirm_gain at every case, FAIL if below, INCONCLUSIVE if data are missing."""
+    n_mod = dec.get("n", 14)
+    sweep = ctx.jsonl(dec["exp"], dec["file"])
+    xd = ctx.jsonl(dec["xduel_exp"], dec["xduel_file"])
+    ce = ctx.jsonl(dec["ceiling_exp"], dec["ceiling_file"])
+    role = dec.get("role", "binding")
+    s_lo, s_hi = dec.get("s_min", 0.95), dec.get("s_max", 1.08)
+    rows, why_inconclusive = [], []
+    for case in dec["cases"]:
+        row = {"case": case}
+        rows.append(row)
+        rec = next((r for r in sweep if r.get("case") == case and r.get("method") == "imd" and r.get("N") == n_mod
+                    and r.get("phases") and r.get("status", "ok") == "ok"), None)
+        g8 = next((r for r in xd if r.get("case") == case and r.get("method") == "gemmul8" and r.get("g8_mode") == "fast"
+                   and r.get("status", "ok") == "ok" and _num(r.get("median_s"))), None)
+        im = next((r for r in xd if r.get("case") == case and r.get("method") == "xduel-imd" and r.get("status", "ok") == "ok"
+                   and _num(r.get("median_s"))), None)
+        if rec is None or g8 is None or im is None:
+            row["note"] = "missing: " + ", ".join(n for n, x in (("immerdink phase record", rec), ("GEMMul8 fast xduel record", g8),
+                                                                   ("xduel-imd record", im)) if x is None)
+            why_inconclusive.append(f"{case}: {row['note']}")
+            continue
+        ph = rec["phases"]
+        k4 = sum(v["ms"] for k, v in ph.items() if k.startswith("K4")) * 1e-3
+        pk = sum(v["ms"] for k, v in ph.items() if not k.startswith("K4")) * 1e-3
+        m, n, k, b = rec["m"], rec["n"], rec["k"], rec.get("b", 1)
+        nh, kh = -(-n // 16) * 16, rec.get("k_hat") or k
+        ops = 2.0 * n_mod * b * m * nh * kh
+        scale = (im.get("N") or n_mod) / n_mod         # immerdink at another N for DGEMM-level accuracy: ops, P, K4 scale
+        ops, k4, pk = ops * scale, k4 * scale, pk * scale
+        r_k4 = ops / k4 / 1e12
+        t_imd, t_star = im["median_s"], g8["median_s"]
+        s_ = t_imd / (pk + k4)
+        spreads = [x for x in (_num(g8.get("spread_pct")), _num(im.get("spread_pct")), _num(rec.get("spread_pct"))) if x is not None]
+        shape = (m, nh, kh, int(n_mod * b))
+        match = [r for r in ce if r.get("status") == "ok" and (r.get("m"), r.get("n"), r.get("k"), r.get("batch", 1)) == shape
+                 and r.get("exact") is True and _num(r.get("tops"))]
+        stock = [r for r in match if str(r.get("variant", "")).startswith("hopper:")]
+        pref = [r for r in stock if r.get("out") == "i8"] or stock
+        r_stock = max((r["tops"] for r in pref), default=None)
+        lt = [r for r in ce if r.get("status") == "ok" and r.get("variant") == "cublaslt" and (r.get("m"), r.get("n"), r.get("k")) == shape[:3]
+              and r.get("exact") is True and _num(r.get("tops"))]
+        r_lt = max((r["tops"] for r in lt), default=None)
+        r_mma = max((r["tops"] for r in ce if r.get("variant") == "mma_peak" and r.get("status") == "ok" and _num(r.get("tops"))), default=None)
+        spreads += [x for r in pref for x in [_num(r.get("spread_pct"))] if x is not None and r["tops"] == r_stock]
+        noisy = any(x > dec.get("noisy_spread_pct", 5.0) for x in spreads)
+        u = max([dec.get("u_noisy", 0.10) if noisy else dec.get("u_floor", 0.05)] + [x / 100.0 for x in spreads])
+        row.update(ops=ops, k4_ms=k4 * 1e3, p_ms=pk * 1e3, r_k4=r_k4, t_imd_ms=t_imd * 1e3, tstar_ms=t_star * 1e3, s=s_, u=u,
+                   r_stock=r_stock, r_cublaslt=r_lt, r_mma=r_mma, stock_out="i8" if pref and pref[0].get("out") == "i8" else "i32",
+                   stock_configs=len(stock))
+        if not (s_lo <= s_ <= s_hi):
+            row["note"] = f"whole-call anchor s = {s_:.3f} outside [{s_lo}, {s_hi}]: phase marks and call disagree"
+            why_inconclusive.append(f"{case}: {row['note']}")
+            continue
+        Q = lambda R, f: s_ * (f * pk + ops / (R * 1e12)) / t_star
+        w = dec["window"]
+        pg, po = dec["pack_factor_go"], dec["pack_factor_opt"]
+        if r_stock is not None:
+            row["gain"] = r_stock / r_k4
+            row["A"] = row["gain"] >= dec["gain_go"]
+            row["q_go"] = Q(r_stock * (1 - u), pg)
+            row["B"] = row["q_go"] <= w
+        den = w * t_star / s_ - pg * pk
+        row["r_needed"] = ops / den / 1e12 if den > 0 else None      # None: no K4 rate reaches the window with this pack/CRT time
+        if r_mma is not None:
+            row["C"] = row["r_needed"] is None or dec["mma_margin"] * r_mma < row["r_needed"]
+        r_ref = max([x for x in (r_stock, r_lt) if x is not None], default=None)
+        if r_ref is not None:
+            row["q_opt"] = Q(r_ref * (1 + u), po)
+            row["O"] = row["q_opt"] <= w
+    det = {"cases": rows}
+    if role == "confirm":
+        g = [r.get("gain") for r in rows]
+        if why_inconclusive or any(x is None for x in g):
+            return {"verdict": "INCONCLUSIVE", "reason": "; ".join(why_inconclusive) or "no stock rate", "details": det}
+        low = [r["case"] for r in rows if r["gain"] < dec["confirm_gain"]]
+        return {"verdict": "FAIL" if low else "PASS", "details": det,
+                "reason": ("gain below %g at %s" % (dec["confirm_gain"], ", ".join(low))) if low else
+                          "stock / K4 gain " + ", ".join(f"{r['case']} {r['gain']:.2f}" for r in rows)}
+    # a case whose optimistic projection fails decides NO-GO even if the other case is missing
+    failing_o = [r["case"] for r in rows if r.get("O") is False]
+    if failing_o:
+        return {"verdict": "NO-GO", "details": det,
+                "reason": "even the best demonstrated rate with pack/CRT at %g of today's time misses the %g window at %s" %
+                          (dec["pack_factor_opt"], dec["window"], ", ".join(failing_o))}
+    if why_inconclusive:
+        return {"verdict": "INCONCLUSIVE", "reason": "; ".join(why_inconclusive), "details": det}
+    if any(r.get(k) is None for r in rows for k in ("A", "B", "C", "O")):
+        return {"verdict": "INCONCLUSIVE", "reason": "a stock Hopper rate, cuBLASLt or the mma.sync peak is missing", "details": det}
+    if all(r["A"] and r["B"] and r["C"] for r in rows):
+        return {"verdict": "GO", "details": det,
+                "reason": "gain %s; projected within %g of GEMMul8 fast with pack/CRT at %g" %
+                          (", ".join(f"{r['case']} {r['gain']:.2f}" for r in rows), dec["window"], dec["pack_factor_go"])}
+    why = [f"{r['case']}: " + ", ".join(k for k in ("A", "B", "C") if not r[k]) + " fail" for r in rows if not (r["A"] and r["B"] and r["C"])]
+    return {"verdict": "INCONCLUSIVE", "reason": "O holds, GO conditions do not: " + "; ".join(why), "details": det}
+
+
+_EVAL = {"threshold": _threshold, "paired": _paired, "guard": _guard, "parity": _parity, "rate_projection": _rate_projection}
