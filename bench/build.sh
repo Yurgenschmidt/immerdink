@@ -72,7 +72,7 @@ exec 9>"${TLC_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/immerdink-tlc.lock}"
 flock 9
 cmake "${cfg[@]}"
 targets=(--target imd_bench)
-[ "${WITH_CEILING:-0}" = 1 ] && targets+=(--target imd_ceiling)    # issue 16: the INT8 ceilings (bench/ceiling)
+if [ "${WITH_CEILING:-0}" = 1 ]; then targets+=(--target imd_ceiling); fi    # issue 16: the INT8 ceilings (bench/ceiling)
 nice -n 19 "$root/tools/memcap.sh" cmake --build "$build" "${targets[@]}" -j "$(( ${JOBS:-4} < 4 ? ${JOBS:-4} : 4 ))"
 echo "built: $build/imd_bench"
-[ "${WITH_CEILING:-0}" = 1 ] && echo "built: $build/imd_ceiling"
+if [ "${WITH_CEILING:-0}" = 1 ]; then echo "built: $build/imd_ceiling"; fi
