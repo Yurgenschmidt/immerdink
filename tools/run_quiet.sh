@@ -51,6 +51,6 @@ if [ -z "$gpu_lock" ]; then
   [ -d "$(dirname "$gpu_lock")" ] || gpu_lock="${XDG_RUNTIME_DIR:-/tmp}/gpu.lock"
 fi
 if [ "$gpu_lock" != none ] && [ "${QUIET_GATE:-0}" = 1 ]; then
-  IMMERDINK_GPU_LOCK_HELD=1 exec flock "$gpu_lock" "$here/memcap.sh" "$@"   # a tool started below must not take the lock again (flock would wait for itself)
+  IMMERDINK_GPU_LOCK_HELD="$gpu_lock" exec flock "$gpu_lock" "$here/memcap.sh" "$@"   # a tool started below must not take the lock again (flock would wait for itself)
 fi
 "$here/memcap.sh" "$@"
