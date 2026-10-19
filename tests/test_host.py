@@ -460,7 +460,7 @@ def check_case(direct, descs, opts, what):
         if low_c[f] != exp[f]:
             raise Fail(f"{what}: {f} = {low_c[f]}, spec {exp[f]}")
     if exp["dispatch"] == "EMULATE":   # the rule for other devices (sm_count is an input)
-        for sms in (16, 46, 82, 132, 170):
+        for sms in (16, 46, 82, 132, 170, 188):
             st_s, low_s = direct.lowering(descs, co, sm_count=sms)
             want = spec_k4_config(exp["m"], exp["n_hat"], exp["k_hat"], exp["b"], N,
                                   exp["residue_group"], sms)

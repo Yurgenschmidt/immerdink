@@ -19,6 +19,7 @@
 #                          bench/GEMMUL8_PIN); without it that method is compiled out
 #   (cuBLAS is always linked: methods dgemm and, with a CUDA 13 cuBLAS, emu)
 #   IMMERDINK_LIBRARY      link this prebuilt libimmerdink.so instead of building one
+#   WITH_CEILING=1         also build imd_ceiling (INT8 ceilings, bench/ceiling; a Hopper build compiles it for sm_90a)
 # The build is CPU-heavy: it runs under nice and takes the machine-wide benchmark lock,
 # so it never overlaps a gated timing run; it runs inside tools/memcap.sh with at most 4 jobs.
 set -euo pipefail
@@ -70,5 +71,8 @@ fi
 exec 9>"${TLC_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/immerdink-tlc.lock}"
 flock 9
 cmake "${cfg[@]}"
-nice -n 19 "$root/tools/memcap.sh" cmake --build "$build" --target imd_bench -j "$(( ${JOBS:-4} < 4 ? ${JOBS:-4} : 4 ))"
+targets=(--target imd_bench)
+if [ "${WITH_CEILING:-0}" = 1 ]; then targets+=(--target imd_ceiling); fi    # issue 16: the INT8 ceilings (bench/ceiling)
+nice -n 19 "$root/tools/memcap.sh" cmake --build "$build" "${targets[@]}" -j "$(( ${JOBS:-4} < 4 ? ${JOBS:-4} : 4 ))"
 echo "built: $build/imd_bench"
+if [ "${WITH_CEILING:-0}" = 1 ]; then echo "built: $build/imd_ceiling"; fi

@@ -384,13 +384,24 @@ class Library:
         return v[38], v[39], v[40]
 
 
+def load_cudart():
+    """libcudart of the toolkit the library was built with: 13, then 12, then the unversioned name (a CUDA 12 node has no .so.13)."""
+    last = None
+    for name in ("libcudart.so.13", "libcudart.so.12", "libcudart.so"):
+        try:
+            return C.CDLL(name)
+        except OSError as e:
+            last = e
+    raise last
+
+
 class Cuda:
     """The few CUDA runtime calls the tests need (same libcudart as libimmerdink)."""
 
     H2D, D2H = 1, 2
 
     def __init__(self):
-        self.rt = C.CDLL("libcudart.so.13")
+        self.rt = load_cudart()
         self.rt.cudaMalloc.argtypes = [C.POINTER(C.c_void_p), C.c_size_t]
         self.rt.cudaFree.argtypes = [C.c_void_p]
         self.rt.cudaMemcpy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int]
