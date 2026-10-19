@@ -171,8 +171,8 @@ inline int kl_tile_lg_k(bool along_rows, int64_t k_hat) {
 // K1 (the row-scaling kernel) reads a row twice; the second pass hits L2 only while the rows in flight fit there. Two byte budgets
 // decide how many rows it keeps in flight: the grid cap of a two-pass kernel (about 40 MiB of the RTX 4090's 72 MiB L2: 5/9) and
 // the budget of the long-row variants (64 MiB: 8/9, "the L2 less what the rest of the GPU keeps there"). They were constants;
-// they are now these fractions of the device's L2, which gives exactly the old values on the 4090 and 44.4 / 26.7 MiB (H100, 50 MiB),
-// 53.3 / 33.3 MiB (H200, 60 MiB) and 113.8 / 71.1 MiB (RTX PRO 6000, 128 MiB). l2_bytes <= 0: the reference 72 MiB.
+// they are now these fractions of the device's L2, which gives exactly the old values on the 4090 and 44.4 / 27.8 MiB (H100 and H200, 50 MiB: one GH100 die; R1 records
+// the value the driver reports) and 113.8 / 71.1 MiB (RTX PRO 6000, 128 MiB). l2_bytes <= 0: the reference 72 MiB.
 constexpr int64_t kReferenceL2Bytes = int64_t{72} << 20;
 inline double k1_l2_budget_bytes(int64_t l2_bytes) {
   return static_cast<double>(l2_bytes > 0 ? l2_bytes : kReferenceL2Bytes) * 8.0 / 9.0;

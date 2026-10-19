@@ -29,7 +29,7 @@ int main() {
   // the other cards (L2 sizes of issue 21): proportional
   struct Card { const char* name; int64_t l2; double budget_mib, fit_mib; } cards[] = {
       {"H100", int64_t{50} << 20, 50.0 * 8 / 9, 50.0 * 5 / 9},
-      {"H200", int64_t{60} << 20, 60.0 * 8 / 9, 60.0 * 5 / 9},
+      {"H200", int64_t{50} << 20, 50.0 * 8 / 9, 50.0 * 5 / 9},   // the same GH100 die as the H100
       {"RTX PRO 6000", int64_t{128} << 20, 128.0 * 8 / 9, 128.0 * 5 / 9}};
   for (const Card& c : cards) {
     CHECK(std::fabs(k1_l2_budget_bytes(c.l2) / MiB - c.budget_mib) < 1e-9);

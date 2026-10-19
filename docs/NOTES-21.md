@@ -36,17 +36,23 @@ not cover H100's latency), (b) a per-launch or per-tile fixed cost, (c) the inst
 ## `bench/membw/imd_membw.cu` (R1) and its analysis
 
 Patterns shaped like the library's kernels, on buffers far larger than L2: `rd`, `wr`, `cp`, `fan` (read 16 B, write 2 B into each of 14 planes: the
-pack) and `fanin` (read 2 B from each of 14 planes, write 16 B: the CRT), swept over blocks per SM {1..16}, threads {128..1024}, loads in flight per
+pack) and `fanin` (read 2 B from each of 14 planes, write 16 B: the CRT), `fan16` / `fanin16` (the same bytes with 16-byte stores / loads per plane, the library's shape), swept over blocks per SM {1..16}, threads {128..1024}, loads in flight per
 thread {1..8}; plus `rd_small`, a read of L2/4 … 8 × L2 (the L2 cliff). One JSON line per shape with GB/s and % of the datasheet-derived peak
 (memory clock × bus width × 2). `tools/build_membw.sh OUT run` builds it with one nvcc call.
 
 `bench/membw/analyze.py MEMBW.jsonl BENCH.jsonl` takes the pack / CRT phase times of `imd_bench` records, converts them to bandwidth with the bytes the phase
-must move, and compares with the best the card delivers for the pattern (or for a plain copy, if higher): **BANDWIDTH-BOUND** (≥ 85% of it; only fewer
-bytes help), **SHAPE-BOUND** (< 85% and the card does ≥ 1.15× more: the kernel's launch shape leaves bandwidth unused), SMALL (< 32 MiB: latency, not judged).
+must move (beta = 0; KL's operand counted once, valid while K1's second pass hits L2, which the K1 budgets below are for; KF records are not judged), and compares with the
+best this program's kernels deliver: the pattern's own shape, the library-shaped variant (`fan16` / `fanin16`: 16-byte stores / loads per plane), a plain copy, a pure read
+and a pure write. **BANDWIDTH-BOUND** (≥ 85% of that best; only fewer bytes help), **SHAPE-BOUND** (< 85% and the best does ≥ 1.15× more: the launch shape leaves
+bandwidth unused), SMALL (< max(32 MiB, 2 × L2): partly L2-resident, latency, not judged). The reference is made of this program's kernels: the percentages say
+"relative to these kernels", not "relative to the hardware"; `pct_of_peak` (memory clock × bus width × 2, unreliable for GDDR6X / GDDR7) and `pct_of_rd` are printed beside it.
 
-On the RTX 4090 (full sweep, 68 shapes per pattern): rd 953 GB/s (94.6% of the 1008 GB/s peak), wr 923, cp 894, fan 819, fanin 885; the launch shape matters by
-up to 20% (fanin 623–885). The library's phases at 4096³: KL A 867 GB/s, KL B 876, K5 922, i.e. **97–103% of the best of the microbenchmark: bandwidth-bound**.
-L2-resident reads run at 3.0–3.6 TB/s up to 72 MiB and fall to 0.94 TB/s at 144 MiB.
+On the RTX 4090 (full sweep, 68 shapes per pattern, run 2026-10-19 on a box whose CPUs were busy with other jobs; raw lines in `immerdink-eval/results/20261019-membw-4090/membw.jsonl`):
+rd 956 GB/s (94.8% of the 1008 GB/s peak), wr 947, cp 907, fan 821, fan16 887, fanin 880, fanin16 929; the launch shape matters by up to 30% (fanin 631–880).
+Narrow 2-byte accesses lose 7–8% against 16-byte ones at the same traffic. The library's phases at 4096³ (earlier run): KL A 867 GB/s, KL B 876, K5 922, i.e. 91–96% of the best
+read (956) and 98–99% of the library-shaped kernels (887, 929): **bandwidth-bound** (ncu agrees: 85–87% of the DRAM peak). Writes are not flushed at the end of a timed kernel
+(up to one L2 of dirty data is left), the clocks are not locked, and the library phases have the same biases.
+L2-resident reads run at 3.0–4.3 TB/s up to 72 MiB and fall to 0.94 TB/s at 144 MiB (8 × L2: 0.95).
 
 ## K1's L2 budgets are now derived from the card's L2
 
@@ -58,7 +64,7 @@ They are now **5/9 and 8/9 of the device's L2** (`host/analysis.hpp` `k1_l2_fit_
 |---|---|---|---|
 | RTX 4090 | 72 MiB | 40.0 MiB | 64.0 MiB, exactly the old values (`test_l2_knobs`), so every 4090 launch is unchanged |
 | H100 | 50 MiB | 27.8 | 44.4 |
-| H200 | 60 MiB | 33.3 | 53.3 |
+| H200 | 50 MiB (the H100's die; not read from a card yet) | 27.8 | 44.4 |
 | RTX PRO 6000 | 128 MiB | 71.1 | 113.8 |
 
 The change affects only the schedule of K1, never its result (S and γ are exact and order-independent), so output hashes are unchanged by construction. The 8/9 and 5/9

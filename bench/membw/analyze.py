@@ -10,9 +10,13 @@ access pattern (fan-out for packs, fan-in for the CRT). The verdict per phase:
   BANDWIDTH-BOUND   achieved >= 85% of the best bandwidth of its pattern (or of a plain copy, if higher): only fewer bytes can make it faster
   SHAPE-BOUND       achieved < 85% but the best shape of the pattern delivers >= 1.15x more: the kernel's launch shape leaves bandwidth unused
   SMALL             the phase moves < 32 MiB: launch latency, not bandwidth, dominates; not judged
-Bytes moved (the FP64 operand is read once from DRAM by the fused pack; planes are 1 byte per element):
+Bytes moved (planes are 1 byte per element); valid for beta = 0 (imd_bench records no beta) and for the KL / K2 / K3 packs and K5:
   pack of an operand with R rows (b * m, or b * n), k contracted, k_hat padded, N moduli:  8 R k  +  N R k_hat  (+ 3 R for sigma, flags)
-  CRT: N b m n_hat  +  8 b m n   (+ 8 b m n when beta reads C)
+  CRT: N b m n_hat  +  8 b m n
+KL reads the operand twice (K1's scaling pass, then the pack); the model counts it once, which holds while K1's second pass hits L2: that is what
+the K1 L2 budgets guarantee (docs/NOTES-21.md). KF (fused) records are not judged. The reference is the best of this program's patterns, so the
+percentages say "relative to these kernels", not "relative to the hardware"; pct_of_peak (datasheet-derived, unreliable on GDDR6X / GDDR7) and
+pct_of_rd (the best read bandwidth measured) are printed beside it.
 """
 import argparse
 import json
@@ -21,7 +25,11 @@ import sys
 LIB_SHAPES = {"fan": (1, 256), "fanin": (1, 256)}   # (blocks per SM, threads): not tuned; the library's kernels differ (see NOTES-21)
 FRACTION = 0.85
 HEADROOM = 1.15
-SMALL_BYTES = 32 << 20
+SMALL_BYTES = 32 << 20          # floor of the "not judged" size; with the device's L2 known it is max(this, 2 x L2) (see small_bytes)
+# the patterns each phase is compared with: the best of all of them (a reference made of this program's own kernels is not a hardware bound, so
+# the library's wide-store shape, the plain copy and the one-way patterns all count)
+PACK_REFS = ("fan", "fan16", "cp", "rd", "wr")
+CRT_REFS = ("fanin", "fanin16", "cp", "rd", "wr")
 
 
 def load(paths):
@@ -48,6 +56,11 @@ def membw_summary(recs):
             if pat not in lib or r["gbs"] > lib[pat]["gbs"]:
                 lib[pat] = r
     return dev, best, lib
+
+
+def small_bytes(dev):
+    """Phases below this size are not judged: a phase of a few L2s is largely L2-resident and its bandwidth is not DRAM bandwidth."""
+    return max(SMALL_BYTES, 2 * int(dev["l2_bytes"])) if dev and dev.get("l2_bytes") else SMALL_BYTES
 
 
 def phase_bytes(rec, name):
@@ -78,14 +91,19 @@ def judge(membw_recs, bench_recs):
             pattern = "fanin" if name == "K5 crt" else "fan"
             gbs = by / (ph["ms"] * 1e6)
             row = {"case": r["case"], "N": r["N"], "phase": name, "bytes": by, "ms": ph["ms"], "gbs": gbs, "pattern": pattern}
-            if by < SMALL_BYTES:
+            if by < small_bytes(dev):
                 row["verdict"] = "SMALL"
             elif pattern in best:
-                # the card's best for this access pattern, or for a plain copy (mixed read / write traffic) if that is higher: the library's
-                # kernels are tuned and can beat this program's simple fan-out / fan-in kernels
-                ref = max(best[pattern]["gbs"], best.get("cp", {"gbs": 0.0})["gbs"])
+                # the best of this program's kernels for the access pattern (own shape and the library's wide-store shape), a plain copy, a pure
+                # read and a pure write: the library's kernels are tuned and can beat any one of them
+                refs = PACK_REFS if pattern == "fan" else CRT_REFS
+                ref = max(best[x]["gbs"] for x in refs if x in best)
                 row["best_gbs"] = ref
                 row["pct_of_best"] = 100.0 * gbs / ref
+                if "rd" in best:
+                    row["pct_of_rd"] = 100.0 * gbs / best["rd"]["gbs"]
+                if dev and dev.get("peak_gbs"):
+                    row["pct_of_peak"] = 100.0 * gbs / dev["peak_gbs"]
                 if gbs >= FRACTION * ref:
                     row["verdict"] = "BANDWIDTH-BOUND"
                 elif ref >= HEADROOM * gbs:
@@ -115,8 +133,9 @@ def main(argv=None):
     for pat, r in sorted(best.items()):
         print(f"  best {pat:8s} {r['gbs']:8.1f} GB/s ({r['pct_of_peak']:5.1f}% of peak) at {r['blocks_per_sm']} blocks/SM x {r['threads']} threads, {r['ilp']} loads in flight")
     for r in rows:
-        extra = f"{r['pct_of_best']:5.1f}% of best {r['pattern']}/cp" if "pct_of_best" in r else ""
-        print(f"  {r['case']:10s} N={r['N']:2d} {r['phase']:10s} {r['ms']:8.3f} ms {r['gbs']:8.1f} GB/s {extra:28s} {r['verdict']}")
+        extra = (f"{r['pct_of_best']:5.1f}% of best, {r.get('pct_of_rd', 0):5.1f}% of rd, {r.get('pct_of_peak', 0):5.1f}% of peak"
+                 if "pct_of_best" in r else "")
+        print(f"  {r['case']:10s} N={r['N']:2d} {r['phase']:10s} {r['ms']:8.3f} ms {r['gbs']:8.1f} GB/s {extra:56s} {r['verdict']}")
     return 0
 
 
