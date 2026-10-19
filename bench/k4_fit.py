@@ -367,9 +367,13 @@ def decide(obs, sms=128, ctas=None, old=SHIPPED_TABLE):
     if unusable:
         reason += "; the fit has a constant that is not positive (not identified by this data): " + repr(final)
     verdict = ("INCONCLUSIVE" if unusable else "ADOPT") if ok else "KEEP"
+    unidentified = final.as_dict() if unusable else None      # never offered as "table": a consumer that skips the verdict must not ship it
+    if unusable:
+        final = None
     return {"verdict": verdict, "reason": reason, "gain": gain, "worst_slowdown": worst - 1.0,
             "regret": regret, "held_out_views": sorted(held_views), "held_out_cases": sorted(held), "held_out_rows": rows,
-            "old_table_regret": old_regret, "table": final.as_dict(), "validated_on_training_split": new.as_dict()}
+            "old_table_regret": old_regret, "table": final.as_dict() if final is not None else None, "unidentified_fit": unidentified,
+            "validated_on_training_split": new.as_dict()}
 
 
 # ------------------------------------------------------------------------------- occupancy of each tile on a card

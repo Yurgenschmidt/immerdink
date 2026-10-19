@@ -15,6 +15,8 @@ def fma(a, b, c):
             return math.nan
         if (math.isinf(a) and b == 0.0) or (math.isinf(b) and a == 0.0):
             raise ValueError("invalid operation in fma(): 0 * inf")
+        if math.isfinite(a) and math.isfinite(b):
+            return c             # the exact product is finite (even if a * b overflows in double), c is an infinity
         r = a * b + c            # one rounding is irrelevant here: an infinity or a NaN
         if math.isnan(r):
             raise ValueError("invalid operation in fma(): inf - inf")
@@ -31,5 +33,7 @@ def fma(a, b, c):
         raise OverflowError("overflow in fma()") from None
 
 
+# Importing this module installs the function as math.fma where Python has none (spec/test_oracle.py relies on it); a program that tests hasattr(math, "fma")
+# afterwards sees it, which is the point.
 if not hasattr(math, "fma"):
     math.fma = fma
