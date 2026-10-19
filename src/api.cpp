@@ -124,14 +124,18 @@ imd_status_t imd_device_info(imd_handle_t handle, imd_device_info_t* info) {
     cudaGetLastError();
     return IMD_STATUS_CUDA_ERROR;
   }
+  const auto caller_size = info->struct_size;   // a caller built against a later header keeps its own size field
   std::memcpy(info, &r, sizeof r);
+  info->struct_size = caller_size;
   return IMD_STATUS_SUCCESS;
 }
 
 imd_status_t imd_plan_info(imd_plan_t plan, imd_device_info_t* info) {
   if (plan == nullptr || info == nullptr || info->struct_size < sizeof(imd_device_info_t))
     return IMD_STATUS_INVALID_VALUE;
+  const auto caller_size = info->struct_size;
   std::memcpy(info, &plan->info, sizeof plan->info);
+  info->struct_size = caller_size;
   return IMD_STATUS_SUCCESS;
 }
 
@@ -173,7 +177,8 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
     e = std::move(pd);
     // Issue 18: the device class and the kind of code the library's kernels run as on it. An
     // unusable device fails here, at plan creation, with NOT_SUPPORTED (info: imd_device_info).
-    {
+    // A plan of an empty GEMM touches no CUDA (imd_contract returns SUCCESS without a device): no device query, no probe, info stays zero.
+    if (e.path != imd::detail::Path::kNoop) {
       int device = 0;
       if (cudaGetDevice(&device) != cudaSuccess) {
         cudaGetLastError();
@@ -186,6 +191,8 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
       if (p->info.status == IMD_PLAN_UNSUPPORTED) return IMD_STATUS_NOT_SUPPORTED;
       e.sms = p->info.device.sm_count;
       e.l2_bytes = static_cast<int64_t>(p->info.device.l2_bytes);
+    } else {
+      p->info.struct_size = sizeof p->info;
     }
     if (emulated) {  // §4 / §6 v1.2: every K4 launch shape's parameters, built here once
       // v1.5: the K4 configuration. libimmerdink_host's rule for this device's SM count (what

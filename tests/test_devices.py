@@ -233,6 +233,12 @@ def check_mutants():
         if mut in ("compat_any_major",):
             differs = any(ref.code_kind(0, b, b, a, mn) != ref.code_kind(0, b, b, a, mn, mut)
                           for b in (80, 86, 89) for a, mn in [(9, 0), (12, 0)])
+        elif mut == "recompiled_any_binary":
+            vs = (80, 86, 89, 90, 100, 120)
+            differs = any(ref.code_kind(0, bn, pt, a, mn) != ref.code_kind(0, bn, pt, a, mn, mut)
+                          for bn in vs for pt in vs for a, mn in [(8, 9), (9, 0), (10, 0), (12, 0)])
+        elif mut == "recompiled_before_unsupported":
+            differs = any(ref.plan_status(m, ref.RECOMPILED) != ref.plan_status(m, ref.RECOMPILED, mut) for m in range(5))
         elif mut == "approx_over_recompiled":
             differs = any(ref.plan_status(m, ref.RECOMPILED) != ref.plan_status(m, ref.RECOMPILED, mut)
                           for m in range(5))

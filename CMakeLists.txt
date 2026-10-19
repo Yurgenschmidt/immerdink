@@ -20,7 +20,11 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     endforeach()
     set(CMAKE_CUDA_ARCHITECTURES "${_imd_archs}")
   else()
-    set(CMAKE_CUDA_ARCHITECTURES 89)  # RTX 4090 (sm_89) first: DESIGN §4
+    if(IMMERDINK_EMBED_PTX)
+      set(CMAKE_CUDA_ARCHITECTURES 89)       # RTX 4090 (sm_89) first: DESIGN §4; machine code and PTX
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES 89-real)  # machine code only
+    endif()
   endif()
 endif()
 

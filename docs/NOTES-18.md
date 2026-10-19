@@ -229,8 +229,8 @@ Defects found, with the fix:
 * **Struct hygiene.** Explicit sizes and `offsetof` `static_assert`s as in host_api.cpp:53-59; bump
   `IMD_HOST_API_VERSION`; Python binding rows; `imd_plan_info` and `imd_device_info` live in immerdink.h
   because they need a handle or plan.
-* **D7.** `89` already embeds SASS and PTX. The release recipe `89-real;90-real;120-real` plus PTX of the
-  lowest architecture still makes sm_86 run recompiled code unless sm_80 SASS is added. Documented. Build
+* **D7.** `89` already embeds SASS and PTX, but PTX of architecture 89 cannot be compiled for an older card: the default build is `unsupported` on sm_80 / sm_86 (the
+  probe returns "invalid device function"). Those cards need sm_80 SASS (`compatible` on sm_86) or PTX of architecture 80 (`recompiled`): the release recipe has `80-real`. Documented. Build
   time and size grow by about three times for the four CUTLASS configurations.
 * **D8.** Cards with no measurement get the cell "not measured", never an extrapolation.
 * **`ctas_per_sm` in `K4ConfigDesc` is a 4090 assumption.** The table (`K4Table`) a registry row points
