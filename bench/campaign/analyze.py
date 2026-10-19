@@ -177,6 +177,11 @@ def bitcheck(folder):
                     if r.get("bit_identical") is not True or r.get("elements_differing", 0):
                         bad.append(f"{eid}/{fn}: case {r.get('case')} {r.get('variant', r.get('method'))}: "
                                    f"bit_identical={r.get('bit_identical')} elements_differing={r.get('elements_differing')}")
+                if "exact" in r and r.get("exact") is not None:      # imd_ceiling: the result equals the CPU reference
+                    n += 1
+                    if r["exact"] is not True:
+                        bad.append(f"{eid}/{fn}: {r.get('variant')} {r.get('m')}x{r.get('n')}x{r.get('k')} batch {r.get('batch')}: "
+                                   f"NOT EXACT ({r.get('check_mismatches')} of {r.get('check_elements')} elements differ)")
     return n, bad
 
 
