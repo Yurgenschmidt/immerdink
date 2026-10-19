@@ -38,7 +38,15 @@ class Cuda:
     H2D, D2H = 1, 2
 
     def __init__(self):
-        rt = self.rt = C.CDLL("libcudart.so.13")
+        rt = self.rt = None
+        for name in ("libcudart.so.13", "libcudart.so.12", "libcudart.so"):     # a CUDA 12 node has no .so.13
+            try:
+                rt = self.rt = C.CDLL(name)
+                break
+            except OSError:
+                continue
+        if rt is None:
+            raise OSError("no libcudart on the library path")
         for name, args in {
             "cudaMalloc": [C.POINTER(C.c_void_p), C.c_size_t], "cudaFree": [C.c_void_p],
             "cudaMemcpy": [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int],

@@ -24,6 +24,10 @@ set_tests_properties(calib_strings_too_long PROPERTIES PASS_REGULAR_EXPRESSION
 # option must put the whole run under the GPU lock (CPU-only; no build, no GPU).
 add_test(NAME tools_test_sh_selftest
          COMMAND bash "${PROJECT_SOURCE_DIR}/tools/test.sh" --self-test)
+# The memory-budget wrapper must not make tools/test.sh relaunch itself forever when there is no
+# systemd user manager (systemctl stubbed to fail). CPU-only.
+add_test(NAME tools_memcap_loop_check
+         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/memcap_loop_check.sh" "${PROJECT_SOURCE_DIR}")
 
 if(Python3_FOUND)
   # The host library and its C++ lowering vs spec/params.py on generated descriptors: the
@@ -106,7 +110,7 @@ if(Python3_FOUND)
   # guard), the manifest lint (gate G1), the resumable runner (kill -9, resume, time limits, copy-back) and the analyzer
   # (a damaged folder gives INVALID; the issue-11 folders reproduce their tables when they are on this machine).
   # CPU only, standard library, about 25 s in all.
-  foreach(t stats manifest runner analyze archgate)
+  foreach(t stats manifest runner analyze archgate summarize_tests)
     add_test(NAME campaign_${t}_selftest
              COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/campaign/test_${t}.py")
   endforeach()
@@ -208,6 +212,20 @@ if(Python3_FOUND)
     set_tests_properties(contract_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
+  # Committed output hashes (tests/data/output_hashes.json): the library's C on this GPU against
+  # hashes from the CPU oracle (small shapes) and from the RTX 4090 (large ones). The same file
+  # is checked on every shipped GPU. output_hashes_oracle recomputes the CPU hashes.
+  add_test(NAME output_hashes
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+  add_test(NAME output_hashes_oracle
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid --oracle)
+  add_test(NAME output_hashes_large
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags large)
+  set_tests_properties(output_hashes output_hashes_oracle output_hashes_large PROPERTIES
+                       RESOURCE_LOCK gpu TIMEOUT 900)
   foreach(suite lowering legality random fixtures robust highrank)
     add_test(NAME contract_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_frontend.py"
