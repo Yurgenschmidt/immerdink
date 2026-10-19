@@ -15,7 +15,8 @@ NATIVE, COMPATIBLE, RECOMPILED, UNUSABLE = range(4)
 P_NATIVE, P_APPROXIMATE, P_RECOMPILED, P_UNSUPPORTED = range(4)
 
 # The built-in rows (src/host/device_class.cpp kRows).
-ROWS = [dict(table_id=0, cc_major=8, cc_minor=9, sm_count=128, name_prefix="NVIDIA GeForce RTX 4090")]
+ROWS = [dict(table_id=0, cc_major=8, cc_minor=9, sm_count=128, name_prefix="NVIDIA GeForce RTX 4090"),
+        dict(table_id=1, cc_major=9, cc_minor=0, sm_count=132, name_prefix="NVIDIA H100")]
 
 
 def select(d, rows=ROWS, mutant=None):

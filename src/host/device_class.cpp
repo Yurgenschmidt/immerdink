@@ -10,6 +10,7 @@ namespace {
 // the data that fitted it (docs/NOTES-18.md D2).
 constexpr imd_table_row_t kRows[] = {
     {IMD_TABLE_SM89, 8, 9, 128, "NVIDIA GeForce RTX 4090"},
+    {IMD_TABLE_SM90, 9, 0, 132, "NVIDIA H100"},
 };
 constexpr int32_t kRowCount = static_cast<int32_t>(sizeof kRows / sizeof kRows[0]);
 

@@ -945,7 +945,8 @@ typedef struct {
 
 /* Table sets. A set is added together with the data that fitted it (docs/NOTES-18.md D2). */
 enum { IMD_TABLE_SM89 = 0, /* fitted on the RTX 4090 (docs/NOTES-A3.md, the shipped calibration) */
-       IMD_TABLE_COUNT = 1 };
+       IMD_TABLE_SM90 = 1, /* fitted on an H100 (R1 tile sweep 2026-10-19, docs/NOTES-20.md); also used for the H200 */
+       IMD_TABLE_COUNT = 2 };
 
 /* How well the card matches a registry row, best first. */
 enum { IMD_MATCH_EXACT = 0,      /* same compute capability, SM count and name prefix: tuned     */

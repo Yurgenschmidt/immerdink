@@ -54,6 +54,15 @@ constexpr K4Cost kK4Costs[kK4ConfigCount] = {
     {1424, {0, 505, 612, 0}},     // 64x128
     {1333, {0, 944, 1088, 802}},  // 64x64
 };
+// The H100 table (issue 20, docs/NOTES-20.md): the fit of bench/k4_fit.py on the R1 tile sweep of 2026-10-19 on an H100 (132 SMs; all four tiles timed on 35 views at N = 8 and 14,
+// K4 phase marks of at least 0.1 ms), under the same concurrency assumption as the 4090's (ctas_per_sm 1, 2, 2, 3). It changes two picks against the 4090 table (r_mm N=14 and x512_32k N=8)
+// and was validated on an H200 (same picks, mean regret 2.20% to 0.80%).
+constexpr K4Cost kK4CostsSm90[kK4ConfigCount] = {
+    {3383, {0, 265, 0, 0}},       // 128x256
+    {2838, {0, 464, 281, 0}},     // 128x128
+    {737, {0, 584, 414, 0}},      // 64x128
+    {363, {0, 949, 685, 505}},    // 64x64
+};
 // A configuration other than IMD_K4_128x256 is chosen only if its estimate is below
 // (1000 - margin) / 1000 of 128x256's (model error and measurement noise).
 constexpr int64_t kK4MarginPermille = 50;
@@ -68,6 +77,10 @@ struct K4Table {
 };
 constexpr K4Table kK4Tables[IMD_TABLE_COUNT] = {
     {{kK4Costs[0], kK4Costs[1], kK4Costs[2], kK4Costs[3]},
+     {kK4Configs[0].ctas_per_sm, kK4Configs[1].ctas_per_sm, kK4Configs[2].ctas_per_sm,
+      kK4Configs[3].ctas_per_sm},
+     kK4MarginPermille},
+    {{kK4CostsSm90[0], kK4CostsSm90[1], kK4CostsSm90[2], kK4CostsSm90[3]},
      {kK4Configs[0].ctas_per_sm, kK4Configs[1].ctas_per_sm, kK4Configs[2].ctas_per_sm,
       kK4Configs[3].ctas_per_sm},
      kK4MarginPermille},

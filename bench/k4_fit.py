@@ -63,6 +63,9 @@ class Table:
 
 
 SHIPPED_TABLE = Table(SHIPPED)
+# the H100 table (src/host/k4_config.hpp kK4CostsSm90; `decide` on the R1 sweep of 2026-10-19), IMD_TABLE_SM90
+SM90 = [(3383, (265,)), (2838, (464, 281)), (737, (584, 414)), (363, (949, 685, 505))]
+SM90_TABLE = Table(SM90)
 
 
 # ----------------------------------------------------------------------------------------------- the model, exactly
