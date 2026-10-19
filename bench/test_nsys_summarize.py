@@ -32,6 +32,8 @@ NAMES = {
         "sm80_xmma_gemm_s8s8_s8s32_tn_n_tilesize128x128x64_stage3_warpsize2x2x1_tensor16x8x32_kernel",
         "ampere_i8816gemm_int8_128x128_ldg16_stages_64x3_tn",
         "turing_imma_s8_gemm_128x128",
+        # GEMMul8's INT8 GEMM on H100 (cuBLAS wgmma kernel, R1 profile): was classified "other"
+        "sm90_xmma_gemm_i8i32_i8i32_i32_tn_n_tilesize128x128x128_warpgroupsize1",
         "cutlass3x_sm90_tensorop_s64x128x32gemm_s8_s8_s32_s32_s32_128x128x128_0_tnn_align16_warpspecialized",
     ],
     "fp64_gemm": [

@@ -61,6 +61,7 @@ import time
 from fractions import Fraction
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fma_compat  # noqa: E402,F401  (math.fma before Python 3.13)
 import oracle as o  # noqa: E402
 
 U = Fraction(1, 2**53)          # unit roundoff of binary64
