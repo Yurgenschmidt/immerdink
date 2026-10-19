@@ -47,6 +47,20 @@ def sources(build_dir):
         f = os.path.realpath(e["file"])
         if f.startswith(src_root) and f.endswith(".cu") and "/src/host/" not in f:
             out[os.path.relpath(f, ROOT)] = (shlex.split(e["command"]), e.get("directory", build_dir))
+    # the INT8 ceiling bench is a bench target, which compile_commands.json does not list: take the flags of a library source
+    # (same toolchain, includes and CUTLASS), with C++20 and the ceiling source swapped in
+    ceiling = os.path.join(ROOT, "bench", "ceiling", "int8_ceiling.cu")
+    base = out.get("src/contract.cu")
+    if base and os.path.exists(ceiling):
+        words = []
+        it = iter(base[0])
+        for x in it:
+            if x in ("-Dimmerdink_EXPORTS", "-DIMMERDINK_PROFILE=1"):
+                continue
+            words.append("-std=c++20" if x == "-std=c++17" else x)
+        words[words.index("-c") + 1] = ceiling
+        words += ["--expt-relaxed-constexpr"] if "--expt-relaxed-constexpr" not in words else []
+        out["bench/ceiling/int8_ceiling.cu"] = (words, base[1])
     return out
 
 
@@ -56,8 +70,12 @@ def compile_one(rel, words_dir, arch, tmp, nvcc_wrap):
     cubin = os.path.join(tmp, f"{rel.replace('/', '_')}.{arch}.cubin")
     while i < len(words):
         x = words[i]
-        if x.startswith("--generate-code="):
+        if x == "-DIMD_CEIL_HOPPER":
+            pass                                   # re-added below for sm_90a only (wgmma exists nowhere else)
+        elif x.startswith("--generate-code="):
             out.append(gencode(arch))
+            if rel.startswith("bench/ceiling/") and arch == "sm_90a":
+                out.append("-DIMD_CEIL_HOPPER")
         elif x == "-c":
             out.append("-cubin")
         elif x == "-o":
@@ -121,8 +139,9 @@ def collect(build_dir, archs, jobs):
 
 DEFAULT_RULES = {
     # family -> {arch -> [source globs that must / must not contain it]}; extended when a wgmma source exists
-    "must_contain": {"sm_89": {"src/k4/k4_cfg0.cu": ["IMMA"]}, "sm_90a": {"src/k4/k4_cfg0.cu": ["IMMA"]},
-                     "sm_120a": {"src/k4/k4_cfg0.cu": ["IMMA"]}},
+    "must_contain": {"sm_89": {"src/k4/k4_cfg0.cu": ["IMMA"], "bench/ceiling/int8_ceiling.cu": ["IMMA"]},
+                     "sm_90a": {"src/k4/k4_cfg0.cu": ["IMMA"], "bench/ceiling/int8_ceiling.cu": ["IGMMA", "UTMALDG", "IMMA"]},
+                     "sm_120a": {"src/k4/k4_cfg0.cu": ["IMMA"], "bench/ceiling/int8_ceiling.cu": ["IMMA"]}},
     "must_not_contain": {"sm_89": ["HGMMA", "IGMMA", "QGMMA", "UTMALDG"], "sm_120a": ["HGMMA", "IGMMA", "QGMMA"]},
 }
 

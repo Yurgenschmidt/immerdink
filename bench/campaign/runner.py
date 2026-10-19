@@ -310,9 +310,8 @@ class Run:
             argv = self.argv_of(e)
             env = dict(os.environ)
             env.update({k: self.sub(str(v), e) for k, v in e.get("env", {}).items()})
+            env["IMMERDINK_BENCH_BUILD"] = self.a.build          # bench/build.sh, run_sweep.sh, profile_nsys.sh build / find imd_bench here
             if e["kind"] == "sweep":
-                env["IMMERDINK_BENCH_BUILD"] = self.a.build
-                env.setdefault("QUIET_MODE", "record")
                 if e.get("cases"):
                     env["CASES"] = e["cases"]
             limit_min = min(e.get("timeout_min", 2.0 * e["est_min"]), max(self.remaining_min(), 0.05))

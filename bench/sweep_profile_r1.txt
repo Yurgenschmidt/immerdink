@@ -1,0 +1,23 @@
+# nsys profile list of the R1 measurement run (issue 16; PROFILE_LIST for bench/profile_nsys.sh): where GEMMul8 and cuBLAS FP64
+# emulation spend their GPU time (INT8 GEMM, conversion, other), next to immerdink, at five shapes.
+#   case | method | argument     (specs from bench/sweep_compare.txt; gemmul8 argument mode:N, emu argument dyn | fixNN)
+# GEMMul8 fast at its DGEMM-level N, cuBLAS emulation dyn and fix55 (the DGEMM-level fixed setting of the issue-11 run).
+# The number of INT8 GEMM launches per call against N / the slice count, and the conversion kernels, answer whether cuBLAS emulation
+# is Ozaki scheme II (read by bench/campaign/profile_report.py).
+sq4096 | imd     | 14
+sq4096 | gemmul8 | fast:14
+sq4096 | emu     | fix55
+sq4096 | emu     | dyn
+sq8192 | imd     | 14
+sq8192 | gemmul8 | fast:14
+sq8192 | emu     | fix55
+sq8192 | emu     | dyn
+r_lowk | imd     | 14
+r_lowk | gemmul8 | fast:14
+r_lowk | emu     | fix55
+r_skinny | imd     | 14
+r_skinny | gemmul8 | fast:14
+r_skinny | emu     | fix55
+t_cc   | imd     | 14
+t_cc   | gemmul8 | fast:14
+t_cc   | emu     | fix55
