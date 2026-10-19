@@ -78,12 +78,17 @@ RTX PRO 6000).
 
 ## R1 results (2026-10-19, folder `20261019-132130`, commit 05247d9)
 
-* **H100: ADOPT** (held-out gain 2.12%, worst held-out slowdown 0.00%, leave-one-out regret 1.23%; the shipped table's own regret on the same rows is 2.21%). **H200: ADOPT** (2.98%, 0.80%; shipped 2.20%). **RTX PRO 6000: KEEP** (0.75%, 1.44%;
-  its refit leaves one constant at zero, which a table cannot have).
-* The refit changes only two picks (rows timed in all four tiles): r_mm N=14 from 128x128 to 64x64 (24% faster on H100, 32% on H200) and x512_32k N=8 from 128x128 to 64x128 (11% faster); every large case (sq4096, sq8192, t_cc,
-  t_permout, s_cc16) keeps 128x256. The rule's power is low (a geometric mean over 13 held-out rows), so this is a small, solid gain, not a large one.
-* The H100 table, fitted on H100 data and applied unchanged to the H200's data, gives the same two picks and lowers the mean regret from 2.20% to 0.80%: one table serves both. It is `kK4CostsSm90` in `src/host/k4_config.hpp`
-  (round_ns | mac_fs): 128x256 3383|265, 128x128 2838|464/281, 64x128 737|584/414, 64x64 363|949/685/505, with the 4090's concurrency assumption (1, 2, 2, 3 CTAs per SM). `bench/test_k4_fit.py` checks the Python mirror
-  of this table against the library's own pick on 150 random shapes.
-* Not done: the real concurrency of the small tiles on Hopper is 3 and 6 CTAs per SM (the model absorbs it into the constants); an sm_120 table (its small-tile constants were not identified); the 0.1 ms cut removes about a third of the marks (186 of 280 usable on H100),
-  so `round_ns` of the small tiles is the least certain constant.
+* **What the pre-registered rule said.** H100: ADOPT (held-out gain 2.12%, worst held-out slowdown 0.00%, leave-one-out regret 1.23%; the shipped table's own regret on the same rows is 2.21%). H200: ADOPT (2.98%, 0.80%; shipped
+  2.20%). RTX PRO 6000: KEEP (0.75%, 1.44%; its refit leaves one constant at zero, which a table cannot have). On the rows the rule judges (K4 phase mark of at least 0.1 ms) only two picks change: r_mm N=14 from 128x128 to 64x64
+  (24% faster on H100, 32% on H200) and x512_32k N=8 from 128x128 to 64x128 (11% faster); every large case keeps 128x256.
+* **What the independent review of the shipped table found.** The table the rule judged was fitted without the marks under 0.1 ms. That left `round_ns` of the small tiles unidentified (737 and 363 ns against 2487 and 2064 when all marks are used),
+  and the planner extrapolates it to exactly the small views the rule never saw: on 25 views with K4 under 0.1 ms the mean regret rose from 0.84% to 5.45% on the H100, 7 of them got slower by 5 to 28% (a few microseconds each, up to 14 µs), and over all 70
+  (view, N) groups the rule's table was worse than the 4090 table (2.80% against 1.69%). The pre-registered rule did not look at those views; this is a gap in the rule, not in the data.
+* **What is shipped (post hoc, stated as such).** The fit on all marks (`kK4CostsSm90`: 128x256 4393|263, 128x128 4554|497/264, 64x128 2487|626/377, 64x64 2064|1100/726/432 as round_ns | mac_fs, concurrency 1, 2, 2, 3). Same regret as the rule's table on the judged rows
+  (1.23% H100, 0.80% H200), 1.39% / 1.23% on the small views, and 1.29% / 0.97% over all groups against 1.69% / 1.61% for the 4090 table. It changes 7 picks against the 4090 table: the two above and five views of 0.01 to 0.03 ms (s256 N=14, s512 N=8,
+  s_df N=14, x1k_256 N=14, x768 N=8; microseconds either way, x768 N=8 is 16% slower, 3 µs, which is below the resolution of the marks). Run through the rule with no cut the verdict would be KEEP (gain 0.84% H100, 0.81% H200): the evidence for a table is the two large-view
+  picks and the lower regret overall, not a large gain. The table is validated on the H200 only in the sense that the H100 sweep's picks hold on the H200's data (same 25 judged cases the fit saw; not independent). The H200's own fit has different small-tile constants.
+  Revert path: delete the registry row in `src/host/device_class.cpp`; Hopper then falls back to the 4090 table.
+* `bench/test_k4_fit.py` checks the Python mirror of this table against the library's own pick on 150 random shapes; `imd_bench` records now carry `device_table`, so later runs say which table they used.
+* Not done: the real concurrency of the small tiles on Hopper is 3 and 6 CTAs per SM (the model absorbs it into the constants); an sm_120 table (its small-tile constants were not identified); a Hopper rerun of the small views with kernel timings (nsys) instead of
+  event marks, which is what would make the small-tile constants trustworthy; the table-specific estimate tests in `tests/test_host.py` cover table 0 only.

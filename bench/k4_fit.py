@@ -63,8 +63,9 @@ class Table:
 
 
 SHIPPED_TABLE = Table(SHIPPED)
-# the H100 table (src/host/k4_config.hpp kK4CostsSm90; `decide` on the R1 sweep of 2026-10-19), IMD_TABLE_SM90
-SM90 = [(3383, (265,)), (2838, (464, 281)), (737, (584, 414)), (363, (949, 685, 505))]
+# the H100 table (src/host/k4_config.hpp kK4CostsSm90), IMD_TABLE_SM90: `fit` on ALL marks (no 0.1 ms cut) of the R1 sweep of 2026-10-19, run folder
+# 20261019-132130 job 14183396-immerdink-h100, immerdink commit 05247d9: fit_table over the (case, N) groups that have all four tiles
+SM90 = [(4393, (263,)), (4554, (497, 264)), (2487, (626, 377)), (2064, (1100, 726, 432))]
 SM90_TABLE = Table(SM90)
 
 

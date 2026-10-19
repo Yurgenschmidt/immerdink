@@ -54,14 +54,16 @@ constexpr K4Cost kK4Costs[kK4ConfigCount] = {
     {1424, {0, 505, 612, 0}},     // 64x128
     {1333, {0, 944, 1088, 802}},  // 64x64
 };
-// The H100 table (issue 20, docs/NOTES-20.md): the fit of bench/k4_fit.py on the R1 tile sweep of 2026-10-19 on an H100 (132 SMs; all four tiles timed on 35 views at N = 8 and 14,
-// K4 phase marks of at least 0.1 ms), under the same concurrency assumption as the 4090's (ctas_per_sm 1, 2, 2, 3). It changes two picks against the 4090 table (r_mm N=14 and x512_32k N=8)
-// and was validated on an H200 (same picks, mean regret 2.20% to 0.80%).
+// The H100 table (issue 20, docs/NOTES-20.md): the fit of bench/k4_fit.py on ALL the K4 phase marks of the R1 tile sweep of 2026-10-19 on an H100 (132 SMs; every (view, N) timed in all four
+// tiles, 70 of them, including the marks under 0.1 ms), under the same concurrency assumption as the 4090's (ctas_per_sm 1, 2, 2, 3). The table the pre-registered rule judged (marks under 0.1 ms
+// dropped) left the small tiles' round_ns unidentified and made 7 of 25 small views slower; this one does not (mean regret over all 70 groups 1.29% against 1.69% for the 4090 table on the
+// H100, 0.97% against 1.61% on the H200). It changes 7 picks against the 4090 table: r_mm N=14 (24 to 32% faster) and x512_32k N=8 (11% faster) are the ones that matter; the other five are
+// views of 0.01 to 0.03 ms (a few microseconds either way).
 constexpr K4Cost kK4CostsSm90[kK4ConfigCount] = {
-    {3383, {0, 265, 0, 0}},       // 128x256
-    {2838, {0, 464, 281, 0}},     // 128x128
-    {737, {0, 584, 414, 0}},      // 64x128
-    {363, {0, 949, 685, 505}},    // 64x64
+    {4393, {0, 263, 0, 0}},       // 128x256
+    {4554, {0, 497, 264, 0}},     // 128x128
+    {2487, {0, 626, 377, 0}},     // 64x128
+    {2064, {0, 1100, 726, 432}},  // 64x64
 };
 // A configuration other than IMD_K4_128x256 is chosen only if its estimate is below
 // (1000 - margin) / 1000 of 128x256's (model error and measurement noise).
