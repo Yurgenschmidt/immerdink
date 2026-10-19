@@ -16,6 +16,10 @@ Kinds (each a pure function of the records; a verdict is one of VERDICTS):
              configuration of two families (default immerdink / GEMMul8 fast, TFLOPS-eq), PASS when the geometric mean
              over the cases (some excluded, e.g. the one-call-per-slice batch case) reaches the limit and no case is
              below the floor once its measured spread is added; else FAIL
+  tile_refit forced-tile sweep records (imd_bench --k4 0,1,2,3, the K4 phase mark): refit the planner's K4 tile cost table
+             (bench/k4_fit.py) and decide by the rule fixed for issue 20 whether the card adopts it: ADOPT / KEEP /
+             INCONCLUSIVE (held-out gain >= 1.5%, nothing > 3% slower, leave-one-out regret <= 2%). The card's SM count is
+             read from the records. The refitted table is in the details.
   rate_projection  the wgmma go / no-go of issue 16 (NOTES-16, docs/CAMPAIGN.md): from K4's measured rate, the best stock INT8 GEMM
              rate on K4's launch shape and the interleaved GEMMul8 time, project the immerdink time with faster K4 and
              pack/CRT and compare it with GEMMul8; GO / NO-GO / INCONCLUSIVE (role confirm: PASS / FAIL on the rate gain)
@@ -49,6 +53,7 @@ REQUIRED = {
     "paired": {"exp": str, "file": str},
     "guard": {"exp": str, "file": str, "baseline": str, "baseline_sha256": str, "key": list, "field": str},
     "parity": {"exp": str, "file": str, "geomean_at_least": (int, float), "case_floor": (int, float)},
+    "tile_refit": {"exp": str, "file": str},
     "rate_projection": {"exp": str, "file": str, "xduel_exp": str, "xduel_file": str, "ceiling_exp": str, "ceiling_file": str,
                         "cases": list, "gain_go": (int, float), "pack_factor_go": (int, float), "pack_factor_opt": (int, float),
                         "window": (int, float), "mma_margin": (int, float),
@@ -64,6 +69,7 @@ OPTIONAL = {
     "guard": {"where": dict, "floor": (int, float), "k": (int, float), "classes": list,
               "spread_field": str},
     "parity": {"a_family": str, "b_family": str, "exclude": list, "classes": list},
+    "tile_refit": {"where": dict, "classes": list, "exclude": list},
     "rate_projection": {"role": str, "confirm_gain": (int, float), "classes": list},
 }
 
@@ -313,6 +319,20 @@ def _parity(dec, ctx):
     return {"verdict": "PASS" if ok else "FAIL", "reason": why, "details": det}
 
 
+def _tile_refit(dec, ctx):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # bench/k4_fit.py
+    try:
+        import k4_fit
+    except ImportError as e:     # numpy missing on the analysis machine
+        return {"verdict": "INCONCLUSIVE", "reason": f"the tile fit needs numpy: {e}", "details": {}}
+    recs = [r for r in select(ctx.jsonl(dec["exp"], dec["file"]), dec.get("where")) if r.get("case") not in dec.get("exclude", [])]
+    sms = {int(r["sm_count"]) for r in recs if r.get("sm_count")}
+    if len(sms) != 1:
+        return {"verdict": "INCONCLUSIVE", "reason": f"records from {len(sms)} SM counts (need exactly one card)", "details": {}}
+    d = k4_fit.decide(k4_fit.obs_from_dicts(recs), sms.pop())
+    return {"verdict": d["verdict"], "reason": d["reason"], "details": {k: v for k, v in d.items() if k not in ("verdict", "reason")}}
+
+
 def _rate_projection(dec, ctx):
     """The wgmma go / no-go rule (issue 16, reviewed by the independent reviewer 2026-10-15). Per case (sq4096, sq8192), N = 14:
          ops = 2 N b m n_hat k_hat, K4 and P (= all other phases) from the immerdink phase marks, R_K4 = ops / K4
@@ -457,4 +477,5 @@ def _rate_projection(dec, ctx):
     return {"verdict": "INCONCLUSIVE", "reason": "O holds, GO conditions do not: " + "; ".join(why), "details": det}
 
 
-_EVAL = {"threshold": _threshold, "paired": _paired, "guard": _guard, "parity": _parity, "rate_projection": _rate_projection}
+_EVAL = {"threshold": _threshold, "paired": _paired, "guard": _guard, "parity": _parity, "rate_projection": _rate_projection,
+         "tile_refit": _tile_refit}

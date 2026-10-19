@@ -289,6 +289,51 @@ class Parity(unittest.TestCase):
         self.assertEqual(dc.evaluate(d, FakeCtx([rec]))["verdict"], "ADOPT")
 
 
+try:
+    import numpy  # noqa: F401
+    HAVE_NUMPY = True
+except ImportError:
+    HAVE_NUMPY = False
+
+
+@unittest.skipUnless(HAVE_NUMPY, "the tile fit needs numpy (an environment without it gets INCONCLUSIVE, not an error)")
+class TileRefit(unittest.TestCase):
+    """The tile_refit decision (issue 20): bench/k4_fit.py on imd_bench-style records of a forced-tile sweep."""
+
+    DEC = {"id": "k4-tiles", "kind": "tile_refit", "requires": ["tiles"], "exp": "tiles", "file": "sweep.jsonl"}
+
+    @staticmethod
+    def records(truth, sms=132, noise=0.01, seed=1):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        import k4_fit as K
+        import test_k4_fit as T
+        out = []
+        for o in T.synth(truth, sms, noise, seed):
+            out.append({"case": o.case, "N": o.N, "k4_config": o.cfg, "sm_count": sms, "status": "ok",
+                        "phase_view": f"{o.m}x{o.nh}x{o.kh} b={o.b} n_hat={o.nh} k_hat={o.kh}",
+                        "phases": {"K4 gemm": {"ms": o.ms}}})
+        return out
+
+    def test_shipped_constants_keep(self):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import k4_fit as K
+        v = dc.evaluate(self.DEC, FakeCtx(self.records(K.SHIPPED_TABLE)))
+        self.assertEqual(v["verdict"], "KEEP", v)
+
+    def test_a_card_with_cheap_small_tiles_adopts(self):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import k4_fit as K
+        truth = K.Table([(2716, (418,)), (1500, (300, 300)), (700, (350, 400)), (500, (500, 560, 450))])
+        v = dc.evaluate(self.DEC, FakeCtx(self.records(truth)))
+        self.assertEqual(v["verdict"], "ADOPT", v)
+        self.assertIn("table", v["details"])
+
+    def test_two_cards_in_one_file_are_inconclusive(self):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import k4_fit as K
+        recs = self.records(K.SHIPPED_TABLE)
+        recs[0]["sm_count"] = 188
+        self.assertEqual(dc.evaluate(self.DEC, FakeCtx(recs))["verdict"], "INCONCLUSIVE")
 SHAPES = {  # case: (m=n=k, K4 ms, P ms, T* ms) from the H100 run of issue 11
     "sq4096": (4096, 2.02, 1.23, 2.23), "sq8192": (8192, 15.5, 4.57, 14.9)}
 
