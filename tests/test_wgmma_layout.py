@@ -24,8 +24,9 @@ shared-memory swizzles), then checks:
         lin = r W + b;  offset(r, b) = lin xor ((((lin >> 7) mod (W / 16))) << 4)     (W = 128, 64, 32 bytes;
     CuTe's Swizzle<log2(W/16), 4, 3>: the 16-byte chunk index is xor-ed with the next bits of the address),
     bijections of the atom. For SW128 (K tile = 128 bytes: one atom wide), the eight rows of an atom put the
-    same 16-byte chunk in eight different 16-byte bank groups (conflict-free column access), which is what
-    TMA's SWIZZLE_128B writes and the wgmma descriptor expects.
+    same 16-byte chunk in eight different 16-byte bank groups (conflict-free column access), which is the property
+    of CuTe's table that TMA's SWIZZLE_128B and the wgmma descriptor are built to match (this test checks the table against the formula; that the builder
+    picks SW128 for a 128-byte K tile is a static_assert in k4_hopper.cuh).
 """
 import argparse
 import os

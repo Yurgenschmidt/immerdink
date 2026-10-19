@@ -13,6 +13,7 @@ root="$(dirname "$here")"
 env_dir="${IMMERDINK_ENV:-$HOME/miniforge3/envs/immerdink}"
 [ -x "$env_dir/bin/nvcc" ] && export PATH="$env_dir/bin:$PATH"
 command -v nvcc >/dev/null || { echo "no nvcc (set IMMERDINK_ENV)" >&2; exit 2; }
+command -v cuobjdump >/dev/null || { echo "no cuobjdump: the SASS check (IGMMA, UTMALDG) cannot run" >&2; exit 2; }
 cutlass="${IMMERDINK_CUTLASS_DIR:-$root/third_party/cutlass}"
 out="${OUT:-$root/build-hopper-variants}"
 mkdir -p "$out"
@@ -23,7 +24,7 @@ filter="${1:-}"
 one() {  # index name
   local i="$1" name="$2" o="$out/$2"
   nvcc -std=c++17 -arch=sm_90a -c -DK4H_SELECT="$i" --expt-relaxed-constexpr -Xptxas -v \
-       -I "$root/src" -I "$cutlass/include" -I "$cutlass/tools/util/include" -I "${IMD_GENERATED_INCLUDE:-$root/build/generated/include}" \
+       -I "$root/src" -I "$cutlass/include" -I "$cutlass/tools/util/include" -I "${IMD_GENERATED_INCLUDE:-$root/build/generated/include}" -I "$root/include" \
        -o "$o.o" "$root/src/k4/hopper/k4_hopper_proto.cu" > "$o.log" 2>&1 || { echo "FAIL $name: compile error (see $o.log)"; return; }
   local regs spills igmma tma
   regs=$(grep -o 'Used [0-9]* registers' "$o.log" | head -1 | grep -o '[0-9]*')
@@ -48,5 +49,6 @@ for n in "${names[@]}"; do
   [ -z "$filter" ] || [[ "$n" == *"$filter"* ]] || { idx=$((idx + 1)); continue; }
   list+=("$idx $n"); idx=$((idx + 1))
 done
+[ "${#list[@]}" -gt 0 ] || { echo "no variant matches '$filter'" >&2; exit 2; }
 printf '%s\n' "${list[@]}" | xargs -P "${JOBS:-4}" -L 1 bash -c 'one "$0" "$1"' | sort -k2 | tee "$out/summary.txt"
 ! grep -qv '^ok' "$out/summary.txt"   # ok* = a stock spill (see above)

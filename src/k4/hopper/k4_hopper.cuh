@@ -151,6 +151,10 @@ struct Variant {
       cutlass::layout::ColumnMajor, 16, int32_t, Tile, Cluster,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epi::SharedStorage))>,
       Sched>::CollectiveOp;
+  // a K tile of 128 int8 = 128 bytes is one SW128 atom wide: the layout the TMA writes (SWIZZLE_128B) and the wgmma descriptor reads
+  static_assert(cute::size<2>(Tile{}) != 128 || (cute::is_same_v<typename Main::SmemLayoutAtomA, cute::GMMA::Layout_K_SW128_Atom<int8_t>> &&
+                                                  cute::is_same_v<typename Main::SmemLayoutAtomB, cute::GMMA::Layout_K_SW128_Atom<int8_t>>),
+                "a 128-wide K tile must use the 128-byte swizzle");
   using Kernel = cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, Main, Epi>;
 };
 

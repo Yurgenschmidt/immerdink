@@ -27,7 +27,7 @@ same 8 bytes**, so it is a property of that tile in CUTLASS 4.8 / ptxas 13.4, no
 
 **D2. Epilogue: ours, through CUTLASS's own extension point.** `K4ModEpilogue` (`src/k4/hopper/k4_hopper.cuh`) has the shape
 of CUTLASS's `DefaultEpilogue` and is wrapped in `Sm90TmaWarpSpecializedAdapter`. It receives the accumulators in
-registers and the tile's coordinate (the batch coordinate z selects the modulus, `l = slot0 + z / b`, as in the sm80
+registers and the tile's coordinate (the batch coordinate z selects the modulus, `l = slot0 + (batch0 + z) / b`, as in the sm80
 K4) and writes the u8 residues of W to global memory from registers. It uses **no shared memory**, so the stages left for the main loop are the same as with no epilogue, and the producer warp keeps
 loading while the consumers run the epilogue: in the cooperative kernel the stages are released before the epilogue, so the producer
 prefetches up to S stages of the next tile (the same prefetch as the sm80 A2 kernel). That is **not** the same as hiding the epilogue:
@@ -209,7 +209,11 @@ Verdict: approve the path (CUTLASS main loop plus our register epilogue), with t
 * **PDL.** CUTLASS's cooperative kernel calls `launch_dependent_grids` before the epilogue and its consumers never wait on the previous grid. Safe with
   plain launches; if programmatic dependent launch is ever used between K chunks, add-mode reads of W need an explicit wait.
 * **Model**: scope widened (three-round positives). Known abstractions: multicast is symmetric for both operands (really one operand), release is atomic
-  per warpgroup (really one thread per destination CTA), the ping-pong order barrier is weaker than CUTLASS's (it also orders the epilogues), so the
-  positive results are conservative there. `held` is redundant with `rd` outside the two mutants.
+  per warpgroup (really one thread per destination CTA), the ping-pong order barrier is weaker than CUTLASS's (it also orders the epilogues): the positive results are conservative for
+  *safety* only; dropping a constraint can hide a deadlock, so ping-pong liveness with an odd number of tiles per CTA (one warpgroup gets none) is **not** verified by the model; rung 0 runs it (2 to 4 SMs). `held` is redundant with `rd` outside the two mutants.
+* **ptxas C7510** ("wgmma.mma_async instructions are serialized due to wgmma pipeline crossing function boundary at a function call") is printed for the
+  variants (all five checked on 2026-10-19 at 128x128x128, fast and generic) and also for 12 of the 20 stock CUTLASS 4.8 kernels of the ceiling program, so it is not
+  specific to this epilogue. ptxas says it may cost performance; whether it does is unknown until a Hopper run (R1 measures the stock kernels as built, issue 16, so the
+  comparison is like for like). Issue 22 should find the call (compare the SASS with and without the epilogue) before tuning.
 * **The compile check is weak by itself.** IGMMA and UTMALDG present says the instructions exist, not that the code is right; correctness comes from rung 0 and
   the ladder.

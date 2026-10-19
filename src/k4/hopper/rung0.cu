@@ -82,6 +82,10 @@ Problem make_problem(uint64_t seed) {
 
 int mod_of(int64_t v, int p) { return int(((v % p) + p) % p); }
 
+// 0: the card's SM count; > 0: the persistent scheduler is told there are this many SMs, so every CTA works through several tiles
+// (the pipeline position carries over between tiles; with ping-pong, both warpgroups alternate, an odd number of tiles leaves one with fewer)
+int g_sms = 0;
+
 // Run one variant: store chunk 0, then (add = true) add chunk 1; compare with the CPU. Returns the number of wrong bytes.
 template <class V>
 long long run(const char* name, const Problem& P, int slot0, int batch0, bool add, int fill = 0xEE) {
@@ -100,7 +104,7 @@ long long run(const char* name, const Problem& P, int slot0, int batch0, bool ad
   CK(cudaMemset(dW, fill, wbytes));
   cutlass::KernelHardwareInfo hw;
   hw.device_id = 0;
-  hw.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+  hw.sm_count = g_sms ? g_sms : cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
   // strides by hand (this tree may lack cutlass/util): A (M, K, L) row-major, B (N, K, L) with K contiguous
   const auto sA = cute::make_stride(int64_t(kK), cute::Int<1>{}, int64_t(kM) * kK);
   const auto sB = cute::make_stride(int64_t(kK), cute::Int<1>{}, int64_t(kN) * kK);
@@ -155,9 +159,9 @@ long long run(const char* name, const Problem& P, int slot0, int batch0, bool ad
           }
         }
     }
-  std::printf("{\"rung\": 0, \"variant\": \"%s\", \"mode\": \"%s\", \"slot0\": %d, \"batch0\": %d, \"fill\": %d, \"wrong_bytes\": %lld, \"total_bytes\": %zu"
+  std::printf("{\"rung\": 0, \"variant\": \"%s\", \"mode\": \"%s\", \"sms\": %d, \"slot0\": %d, \"batch0\": %d, \"fill\": %d, \"wrong_bytes\": %lld, \"total_bytes\": %zu"
               ", \"first\": [%lld, %lld, %lld, %lld, %lld]}\n",
-              name, add ? "add" : "store", slot0, batch0, fill, bad, wbytes, first_z, first_i, first_j, first_want, first_got);
+              name, add ? "add" : "store", g_sms, slot0, batch0, fill, bad, wbytes, first_z, first_i, first_j, first_want, first_got);
   cudaFree(dA);
   cudaFree(dB);
   cudaFree(dW);
@@ -175,7 +179,8 @@ struct VT {
 }  // namespace
 
 // The extreme case: A = B = -128 over a whole K chunk of 131008 (the largest the library issues): every sum is
-// 131008 x 16384 = 2146435072, just inside int32, and with W added 2146435327. Store and add, 128 x 256 x 1.
+// 131008 x 16384 = 2146435072, just inside int32 (the modulus index 3, p = 251, is past that modulus's certified range, epi_vmax[3] = 2047000250: this case is
+// out of contract for it, kept because the Barrett reduction is exact there too, sampled offline), and with W added 2146435327. Store and add, 128 x 256 x 1.
 template <class V>
 long long run_extreme(const char* name, bool add) {
   constexpr int M = 128, N = 256, K = 131008;
@@ -190,7 +195,7 @@ long long run_extreme(const char* name, bool add) {
   CK(cudaMemset(dW, 0xEE, size_t(M) * N));
   cutlass::KernelHardwareInfo hw;
   hw.device_id = 0;
-  hw.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+  hw.sm_count = g_sms ? g_sms : cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
   const auto sA = cute::make_stride(int64_t(K), cute::Int<1>{}, int64_t(M) * K);
   const auto sB = cute::make_stride(int64_t(K), cute::Int<1>{}, int64_t(N) * K);
   K4Args ea{};
@@ -262,10 +267,25 @@ int main() {
       bad += run<VT<T128x256, Shape<_1, _2, _1>, Coop, true>>("f_128x256x128_1x2_coop", P, slot0, batch0, add, fill);
       bad += run<VT<T128x128, Shape<_2, _1, _1>, Coop, false>>("g_128x128x128_2x1_coop", P, slot0, batch0, add, fill);
       bad += run<VT<T128x128, Shape<_2, _1, _1>, Coop, true>>("f_128x128x128_2x1_coop", P, slot0, batch0, add, fill);
-      bad += run<VT<T256x128, Shape<_2, _1, _1>, Coop, true>>("f_256x128x128_2x1_coop", P, slot0, batch0, add, fill);
       bad += run<VT<T128x128, Shape<_1, _1, _1>, Ping, false>>("g_128x128x128_1x1_ping", P, slot0, batch0, add, fill);
       bad += run<VT<T128x128, Shape<_1, _1, _1>, Ping, true>>("f_128x128x128_1x1_ping", P, slot0, batch0, add, fill);
     }
+  // persistent loop: fewer SMs than tiles (16 to 32 tiles; 2 and 4 SMs keep the 2-CTA clusters whole, 3 gives odd tile counts per CTA)
+  for (int sms : {2, 3, 4}) {
+    g_sms = sms;
+    for (bool add : {false, true}) {
+      const int slot0 = slot0s[0], batch0 = batch0s[1];
+      bad += run<VT<T128x256, Shape<_1, _1, _1>, Coop, true>>("f_128x256x128_1x1_coop", P, slot0, batch0, add);
+      bad += run<VT<T128x128, Shape<_1, _1, _1>, Ping, true>>("f_128x128x128_1x1_ping", P, slot0, batch0, add);
+      bad += run<VT<T128x128, Shape<_1, _1, _1>, Ping, false>>("g_128x128x128_1x1_ping", P, slot0, batch0, add);
+      if (sms != 3) bad += run<VT<T128x128, Shape<_2, _1, _1>, Coop, true>>("f_128x128x128_2x1_coop", P, slot0, batch0, add);
+    }
+  }
+  g_sms = 0;
+  // the padded cluster grid (one M tile for a 2-CTA M cluster) comes last: if it hangs, everything above has reported
+  for (int si = 0; si < 3; ++si)
+    for (bool add : {false, true})
+      bad += run<VT<T256x128, Shape<_2, _1, _1>, Coop, true>>("f_256x128x128_2x1_coop", P, slot0s[si], batch0s[si], add, si == 1 ? 0x11 : 0xEE);
   for (bool add : {false, true}) {
     bad += run_extreme<VT<T128x256, Shape<_1, _1, _1>, Coop, true>>("f_128x256x128_1x1_coop", add);
     bad += run_extreme<VT<T128x128, Shape<_1, _1, _1>, Ping, true>>("f_128x128x128_1x1_ping", add);

@@ -177,12 +177,14 @@ set_tests_properties(hopper_epilogue PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
 
 # The register order the Hopper fast epilogue assumes, against CuTe's partition_C of the real TiledMma of every variant. Host code only
 # (no GPU), but built for sm_90a because the variants are.
-add_executable(test_hopper_partition test_hopper_partition.cu)
-target_include_directories(test_hopper_partition PRIVATE "${PROJECT_SOURCE_DIR}/src")
-target_link_libraries(test_hopper_partition PRIVATE imd_constants imd_cutlass)
-set_target_properties(test_hopper_partition PROPERTIES CUDA_ARCHITECTURES "90a-real")
-target_compile_options(test_hopper_partition PRIVATE --expt-relaxed-constexpr)
-add_test(NAME hopper_partition COMMAND test_hopper_partition)
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)   # sm_90a needs nvcc 12+; the target adds a heavy CUTLASS compile
+  add_executable(test_hopper_partition test_hopper_partition.cu)
+  target_include_directories(test_hopper_partition PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(test_hopper_partition PRIVATE imd_constants imd_cutlass)
+  set_target_properties(test_hopper_partition PROPERTIES CUDA_ARCHITECTURES "90a-real")
+  target_compile_options(test_hopper_partition PRIVATE --expt-relaxed-constexpr)
+  add_test(NAME hopper_partition COMMAND test_hopper_partition)
+endif()
 
 # PLAN M1: exhaustive CPU check of the §3.5 / §3.6 modular reductions (the kernels' code).
 find_package(Threads REQUIRED)
