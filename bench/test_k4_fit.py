@@ -113,7 +113,7 @@ class Decide(unittest.TestCase):
         self.assertGreater(d["gain"], K.GAIN_MIN)
 
     def test_noise_keeps_the_table(self):
-        # the shipped table is right; 25% noise must not make a refit look better by luck on the held-out cases
+        # the shipped table is right; 25% noise must not make a refit look adoptable (rule (c), the leave-one-out regret, is what stops it here)
         obs = synth(K.SHIPPED_TABLE, 128, 0.25, 6)
         d = K.decide(obs, 128)
         self.assertEqual(d["verdict"], "KEEP", d["reason"])
@@ -121,6 +121,39 @@ class Decide(unittest.TestCase):
     def test_too_few_cases_is_inconclusive(self):
         obs = synth(K.SHIPPED_TABLE, 128, 0.01, 2, dict(list(SHAPES.items())[:5]))
         self.assertEqual(K.decide(obs, 128)["verdict"], "INCONCLUSIVE")
+
+    def test_the_adopted_table_is_the_one_fit_prints(self):
+        truth = K.Table([(2716, (418,)), (1500, (300, 300)), (700, (350, 400)), (500, (500, 560, 450))])
+        obs = synth(truth, 132, 0.01, 4)
+        d = K.decide(obs, 132)
+        self.assertEqual(d["verdict"], "ADOPT", d["reason"])
+        t, _ = K.fit_table(K.usable(obs), 132)
+        self.assertEqual(d["table"], t.as_dict())
+        self.assertIn("validated_on_training_split", d)
+
+    def test_marks_below_the_cut_are_dropped_by_fit_and_decide_alike(self):
+        short = K.Obs("a", 8, 0, K.MIN_MS_MARKS / 2, 64, 64, 64, 1, "marks")
+        long_ = K.Obs("a", 8, 1, 5.0, 64, 64, 64, 1, "marks")
+        self.assertEqual(K.usable([short, long_]), [long_])
+        self.assertEqual(len(K.usable([K.Obs("a", 8, 0, K.MIN_MS_MARKS / 2, 64, 64, 64, 1, "nsys")])), 1)   # kernel medians are not cut
+
+    def test_a_zero_constant_is_not_a_table(self):
+        self.assertTrue(K.table_ok(K.SHIPPED_TABLE, K.SHIPPED_TABLE.ctas))
+        bad = K.Table([(2716, (418,)), (0, (453, 456)), (1424, (505, 612)), (1333, (944, 1088, 802))])
+        self.assertFalse(K.table_ok(bad, bad.ctas))
+        bad = K.Table([(2716, (418,)), (2550, (0, 456)), (1424, (505, 612)), (1333, (944, 1088, 802))])
+        self.assertFalse(K.table_ok(bad, bad.ctas))
+        self.assertFalse(K.table_ok(K.SHIPPED_TABLE, (1, 2, 2, 4)))                 # K4Cost holds at most three concurrent CTAs
+
+    def test_the_split_is_by_view_not_by_name(self):
+        shapes = dict(list(SHAPES.items())[:16])
+        shapes["twin"] = shapes["c03"]                                              # the same view under another name
+        obs = synth(K.SHIPPED_TABLE, 128, 0.01, 2, shapes)
+        views = {K.view_of(o) for o in obs}
+        held = K.holdout_views(views)
+        self.assertEqual(len(held), len(views) // 4)
+        d = K.decide(obs, 128)
+        self.assertIn(("c03" in d["held_out_cases"]), (("twin" in d["held_out_cases"]),))   # both or neither
 
     def test_holdout_is_every_fourth_by_name(self):
         self.assertEqual(K.holdout_cases(["d", "a", "c", "b", "h", "e", "g", "f"]), {"d", "h"})
@@ -147,6 +180,12 @@ class Identify(unittest.TestCase):
         sd = K.identify(list(SHAPES.values()), 132)
         for row in sd:
             self.assertTrue(all(x < 0.10 for x in row), sd)
+
+    def test_rows_below_the_mark_cut_do_not_count(self):
+        tiny = [(64, 64, 64, 1)] * 3
+        sd = K.identify(tiny + list(SHAPES.values()), 132)
+        sd2 = K.identify(list(SHAPES.values()), 132)
+        self.assertEqual(sd, sd2)                                                   # 64^3 phases are shorter than the cut
 
 
 if __name__ == "__main__":

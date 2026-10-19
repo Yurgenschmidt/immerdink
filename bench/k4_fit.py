@@ -99,7 +99,7 @@ def pick(table, m, nh, kh, gb, sms):
 
 
 # ----------------------------------------------------------------------------------------------------- the data
-MIN_MS_MARKS = 0.05   # a phase mark (CUDA events around the K4 launch) shorter than this is too coarse to fit or judge on (A3: ~0.1 ms)
+MIN_MS_MARKS = 0.10   # a phase mark (CUDA events around the K4 launch) shorter than this is too coarse to fit or judge on (jitter of a few us is 5% of 0.1 ms)
 
 
 class Obs:
@@ -180,7 +180,7 @@ def _nnls(A, y, iters=200):
                 x = s
                 break
             neg = [i for i in P if s[i] <= 0]
-            alpha = min(x[i] / (x[i] - s[i]) for i in neg if x[i] != s[i])
+            alpha = min((x[i] / (x[i] - s[i]) for i in neg if x[i] != s[i]), default=1.0)
             x = x + alpha * (s - x)
             P = [i for i in P if x[i] > 1e-12]
         w = A.T @ (y - A @ x)
@@ -243,7 +243,12 @@ def identify(shapes, sms=128, ctas=None, noise=0.03, Ns=(8, 14), table=SHIPPED_T
                 if rest:
                     feat[rest] += rest * macs
                 t = float(feat @ (p0 * sc))
+                if t * 1e3 < MIN_MS_MARKS:       # decide() drops a mark this short: it cannot help identify a constant
+                    continue
                 A.append(feat * sc / t)
+        if not A:                       # every row is below the mark cut: nothing identifies anything
+            out.append([math.inf] * (1 + ctas[c]))
+            continue
         A = np.array(A)
         exercised = (A != 0).any(axis=0)
         sd = []
@@ -264,6 +269,23 @@ def identify(shapes, sms=128, ctas=None, noise=0.03, Ns=(8, 14), table=SHIPPED_T
 
 
 # ------------------------------------------------------------------------------------ the adoption rule (issue 20)
+def usable(obs):
+    """The observations every command fits and judges on: phase marks shorter than MIN_MS_MARKS are dropped."""
+    return [o for o in obs if o.src != "marks" or o.ms >= MIN_MS_MARKS]
+
+
+def view_of(o):
+    return (o.m, o.nh, o.kh, o.b)
+
+
+def table_ok(t, ctas):
+    """A fitted table is usable only if every constant is positive (a zero would make that tile look free) and no tile needs more
+    concurrent CTAs than K4Cost holds (3)."""
+    if any(n > 3 or n < 1 for n in ctas):
+        return False
+    return all(r > 0 and len(m) == ctas[c] and all(x > 0 for x in m) for c, (r, m) in enumerate(t.costs))
+
+
 def by_case(obs):
     d = {}
     for o in obs:
@@ -276,27 +298,38 @@ def holdout_cases(cases):
     return {n for i, n in enumerate(names) if i % HOLDOUT_EVERY == HOLDOUT_EVERY - 1}
 
 
+def holdout_views(views):
+    """Every 4th distinct GEMM view (m, n_hat, k_hat, b) in sorted order: cases that are the same view under different names
+    (s_df and x1k_256, t_ikl and t_batch) fall on the same side."""
+    vs = sorted(set(views))
+    return {v for i, v in enumerate(vs) if i % HOLDOUT_EVERY == HOLDOUT_EVERY - 1}
+
+
 def decide(obs, sms=128, ctas=None, old=SHIPPED_TABLE):
     """The adoption verdict: {"verdict": "ADOPT" | "KEEP" | "INCONCLUSIVE", "reason", numbers, "table"}. Phase marks below
     MIN_MS_MARKS are not used (too coarse); a (case, N) with any tile missing is not used."""
-    obs = [o for o in obs if o.src != "marks" or o.ms >= MIN_MS_MARKS]
+    obs = usable(obs)
     groups = by_case(obs)
     cases = {k[0] for k in groups}
+    views = {view_of(g[0]) for g in groups.values()}
     if len(cases) < 8:
         return {"verdict": "INCONCLUSIVE", "reason": f"only {len(cases)} cases with all four tiles (need 8)", "table": None}
-    held = holdout_cases(cases)
-    train = [o for o in obs if o.case not in held and (o.case, o.N) in groups]
+    held_views = holdout_views(views)
+    held = {k[0] for k, g in groups.items() if view_of(g[0]) in held_views}     # cases on a held-out view
+    train = [o for o in obs if view_of(o) not in held_views and (o.case, o.N) in groups]
     new, rel = fit_table(train, sms, ctas)
     if new is None:
         return {"verdict": "INCONCLUSIVE", "reason": "too few training observations to fit every constant", "table": None}
     ctas = new.ctas
+    if not table_ok(new, ctas):
+        return {"verdict": "INCONCLUSIVE", "reason": f"the training fit has a constant that is not positive: {new!r}", "table": None}
 
     def t_of(g, c):
         return g[c].ms
 
     ratios, worst, rows = [], 1.0, []
     for (case, N), g in sorted(groups.items()):
-        if case not in held:
+        if view_of(g[0]) not in held_views:
             continue
         o0 = g[0]
         c_old = pick(old, o0.m, o0.nh, o0.kh, o0.gb, sms)
@@ -308,24 +341,31 @@ def decide(obs, sms=128, ctas=None, old=SHIPPED_TABLE):
     gm = math.exp(sum(math.log(r) for r in ratios) / len(ratios)) if ratios else 1.0
     # leave-one-case-out regret over all cases
     regrets = []
-    for case in sorted(cases):
-        tr = [o for o in obs if o.case != case and (o.case, o.N) in groups]
+    for view in sorted(views):
+        tr = [o for o in obs if view_of(o) != view and (o.case, o.N) in groups]
         t, _ = fit_table(tr, sms, ctas)
-        if t is None:
+        if t is None or not table_ok(t, ctas):
             continue
         for (cs, N), g in groups.items():
-            if cs != case:
+            if view_of(g[0]) != view:
                 continue
             o0 = g[0]
             c = pick(t, o0.m, o0.nh, o0.kh, o0.gb, sms)
             regrets.append(t_of(g, c) / min(t_of(g, k) for k in range(4)) - 1.0)
     regret = sum(regrets) / len(regrets) if regrets else math.inf
+    old_regret = sum((g[pick(old, g[0].m, g[0].nh, g[0].kh, g[0].gb, sms)].ms / min(g[k].ms for k in range(4)) - 1.0)
+                     for g in groups.values()) / len(groups)
     gain = 1.0 / gm - 1.0
+    # what the adopted table is: the fit on every usable observation (the training split only validated the procedure)
+    final, _ = fit_table([o for o in obs if (o.case, o.N) in groups], sms, ctas)
+    if final is None or not table_ok(final, ctas):
+        return {"verdict": "INCONCLUSIVE", "reason": f"the fit on all data has a constant that is not positive: {final!r}", "table": None}
     ok = gain >= GAIN_MIN and worst - 1.0 <= SLOWER_MAX and regret <= REGRET_MAX
     reason = (f"held-out gain {100 * gain:.2f}% (need {100 * GAIN_MIN:g}), worst held-out slowdown {100 * (worst - 1):.2f}% "
               f"(at most {100 * SLOWER_MAX:g}), leave-one-out regret {100 * regret:.2f}% (at most {100 * REGRET_MAX:g})")
     return {"verdict": "ADOPT" if ok else "KEEP", "reason": reason, "gain": gain, "worst_slowdown": worst - 1.0,
-            "regret": regret, "held_out_cases": sorted(held), "held_out_rows": rows, "table": new.as_dict()}
+            "regret": regret, "held_out_views": sorted(held_views), "held_out_cases": sorted(held), "held_out_rows": rows,
+            "old_table_regret": old_regret, "table": final.as_dict(), "validated_on_training_split": new.as_dict()}
 
 
 # ------------------------------------------------------------------------------- occupancy of each tile on a card
@@ -396,7 +436,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     if a.cmd in ("fit", "decide"):
-        obs = [o for o in load_records(a.records) if o.case not in a.exclude]
+        obs = usable([o for o in load_records(a.records) if o.case not in a.exclude])
         ctas = [int(x) for x in a.ctas.split(",")] if a.ctas else None
         if a.cmd == "fit":
             t, rel = fit_table(obs, a.sms, ctas)

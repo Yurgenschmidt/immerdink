@@ -295,7 +295,10 @@ def _parity(dec, ctx):
 
 def _tile_refit(dec, ctx):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # bench/k4_fit.py
-    import k4_fit
+    try:
+        import k4_fit
+    except ImportError as e:     # numpy missing on the analysis machine
+        return {"verdict": "INCONCLUSIVE", "reason": f"the tile fit needs numpy: {e}", "details": {}}
     recs = [r for r in select(ctx.jsonl(dec["exp"], dec["file"]), dec.get("where")) if r.get("case") not in dec.get("exclude", [])]
     sms = {int(r["sm_count"]) for r in recs if r.get("sm_count")}
     if len(sms) != 1:
