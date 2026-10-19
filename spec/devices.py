@@ -67,10 +67,14 @@ def code_kind(err, binary, ptx, major, minor, mutant=None):
         if mutant == "compat_any_major" and binary < dev:
             return COMPATIBLE
         return UNUSABLE
+    if mutant == "recompiled_any_binary":
+        return RECOMPILED if ptx < dev else UNUSABLE
     return RECOMPILED if binary == dev and ptx < dev else UNUSABLE
 
 
 def plan_status(match, code, mutant=None):
+    if mutant == "recompiled_before_unsupported" and code == RECOMPILED:
+        return P_RECOMPILED
     if match == UNSUPPORTED or code == UNUSABLE:
         return P_UNSUPPORTED
     if mutant == "approx_over_recompiled" and (match != EXACT):
@@ -83,4 +87,4 @@ def plan_status(match, code, mutant=None):
 
 
 MUTANTS = ("min_cc_90", "ignore_name", "ignore_sms", "arch_before_exact", "generation_any_major",
-           "ties_upward", "compat_any_major", "approx_over_recompiled")
+           "ties_upward", "compat_any_major", "approx_over_recompiled", "recompiled_any_binary", "recompiled_before_unsupported")

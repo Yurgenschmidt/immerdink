@@ -77,7 +77,7 @@ def main():
                 str(info.cuda_error) not in args.expect_error.split(","):
             raise Fail(f"CUDA error {info.cuda_error}, expected {args.expect_error}")
         if not args.expect and info.name.startswith("NVIDIA GeForce RTX 4090") and info.sm_count == 128 \
-                and info.status not in ("native", "unsupported"):
+                and info.status != "native":
             raise Fail(f"an RTX 4090 gets status {info.status}")
         if info.status == "unsupported":
             # plans must refuse, with NOT_SUPPORTED, and say why

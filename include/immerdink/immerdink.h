@@ -34,7 +34,10 @@ typedef struct imd_plan_st* imd_plan_t;
  * examined). The handle is only checked for NULL. */
 IMD_API imd_status_t imd_device_info(imd_handle_t handle, imd_device_info_t* info);
 /* The same for a plan: the device and table set it was made with, plus its K4 configuration
- * (info->k4_config). A plan is never UNSUPPORTED (imd_plan_create returns NOT_SUPPORTED instead). */
+ * (info->k4_config). A plan is never UNSUPPORTED (imd_plan_create returns NOT_SUPPORTED instead).
+ * A plan of an empty GEMM touches no CUDA: its info is zero (only struct_size set). Only imd_plan_create
+ * checks the device: imd_pack_create and imd_contract_packed on an unusable device fail at launch with
+ * the raw CUDA error. Both functions keep the caller's struct_size field. */
 IMD_API imd_status_t imd_plan_info(imd_plan_t plan, imd_device_info_t* info);
 
 /* Library context (DESIGN §6 lifecycle). */
