@@ -19,3 +19,4 @@ bench/results/
 bench/accuracy/results/
 __pycache__/
 bench/campaign/__pycache__/
+build-status/
