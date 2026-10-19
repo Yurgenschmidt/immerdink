@@ -85,6 +85,37 @@ here as a formula because R_K4 comes from issue 16's verdict; R2 fixes the numbe
   named cases and none is more than 2% slower. If R1 does not name the limiter, a repair needs the spare run R4 (issue 14).
 * The emulation-versus-native crossover per card for issue 18 is in `docs/SUPPORT.md`.
 
+## R1 result (2026-10-19): on Hopper the pack and CRT are limited by instruction issue, not by memory
+
+**What R1 measured.** On H100 and H200 the library's pack (KL) and CRT (K5) phases run at 0.8 to 1.1 TB/s, while the microbenchmark's best for the same traffic is 2.5 to 2.9 TB/s on H100
+(3.2 to 3.8 on H200): 25 to 34% of the best on H100, 18 to 25% on H200. H100 and H200 take the same time although the H200 has 43% more bandwidth. A simple fan-out kernel with 16-byte stores per plane, one block of 256 threads per SM
+and one load in flight (a shape the pack could use) reaches 2767 GB/s on H100, so the launch shape and the memory-level parallelism of that pattern do not explain it. On the RTX PRO 6000 the phases run at 76 to 89% of the peak:
+bandwidth-bound there. (Candidates (a) launch shape and (d) L2 effects of the list above are out; (b) per-launch cost is out because 8192³ takes the same per-byte time as 4096³.)
+
+**What limits them: the number of instructions.** There are no Hopper counters (the PACE environment has no `ncu`), so this is derived. `ncu` on the RTX 4090 (`immerdink-eval/results/20261019-ncu-pack-4090/`, sq4096 N = 14) gives
+the executed warp instructions of the two kernels, which are the same program on Hopper (static SASS of the sm_90 build: 6192 instructions for `kl_scale_pack<8,2>` against 5920 for sm_89, 3832 against 3744 for `k5_crt_n<14,4>`):
+
+| kernel (sq4096, N = 14) | warp instructions | thread instructions per output element | 4090: time, issue active, ALU pipe | H100: instructions / (528 issue slots per clock at 1.98 GHz) | H100 measured | implied H100 issue utilization |
+|---|---|---|---|---|---|---|
+| KL A (pack) | 230.5 M | 417 | 0.405 ms, 45%, 40% (DRAM-bound at 85%) | 0.220 ms | 0.378 ms | 58% |
+| K5 (CRT) | 346.2 M | 650 | 0.397 ms, 70%, 72% | 0.331 ms | 0.459 ms | 72% |
+
+The CRT kernel is not DRAM-bound on the 4090 (it issues 70% of the time and keeps the ALU pipe 72% busy), and on the H100 it reaches 72% of the issue rate. The 4090 clocks 2.7 GHz and has 128 SMs, the H100 clocks 1.98 GHz and has 132, with the
+same 4 issue slots and 16 integer lanes per SM sub-partition: the same instruction stream is about 1.5 times slower per SM on the H100 and cannot be faster because of the wider memory. That is what R1 shows (the same 1.2 ms of pack and CRT).
+The sq4096 pack takes 30 integer instructions per (element, modulus) and the CRT 46 per (element, modulus term).
+
+**Consequence.** Neither wider loads nor more bytes in flight will speed them up on Hopper; fewer instructions will. Design directions, none of them implemented or measured, each needing an exactness argument checked offline first
+(the existing oracle and exhaustive tests are the gate):
+
+1. **CRT in FP64 limbs on devices where FP64 is fast.** The H100 FP64 pipe issues 64 lanes per SM per clock, as many as the integer pipe (the 4090 has 1/64 of that). A residue r (|r| at most 128) times a 26-bit limb of the constant of its modulus
+   is below 2^34, and 14 such terms sum below 2^38 in a double exactly; three limbs per term replace the multi-word integer multiply-add, and the carries and the final reduction modulo the product of the moduli run once per element instead of once
+   per term. It would be a device-class choice (table sets from issue 18 already select per card).
+2. **Residue emission**: the 30 instructions per (element, modulus) are `dp4a` on the words of X, one `umulhi` for the quotient and the symmetric-range correction; measuring where the other ~20 go (the SASS shows 356 branches and 159 BSSY/BSYNC pairs in
+   `kl_scale_pack<8,2>`, which a branch-free emitter should not have) is the first step.
+3. Do both in one pass with the FP64 pipe doing part of the residues, so that the integer and FP64 pipes issue together.
+
+Expected size if the instruction count halves at the same issue utilization: pack and CRT of sq4096 on H100 from 1.22 ms to about 0.65 ms (call 3.2 to 2.6 ms); with a wgmma K4 at 1.4 POPS the call would pass GEMMul8's 2.23 ms.
+
 ## Not done here
 
-Everything on Hopper. The microbenchmark has run only on the RTX 4090. Whether Hopper's limiter is (a)–(d) is open until R1.
+The instruction-issue explanation is derived from 4090 counters and public H100 figures, not measured on Hopper: a Hopper `ncu` run (a module on PACE, if one exists) would confirm or refute it. None of the three directions is implemented.
