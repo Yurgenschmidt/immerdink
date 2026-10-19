@@ -55,6 +55,15 @@ class Summ(unittest.TestCase):
             self.assertEqual((r["hash_cases"], r["hash_mismatch"], r["hash_mismatched"]), (2, 1, ["y"]))
             self.assertAlmostEqual(r["hash_match_fraction"], 0.5)
 
+    def test_a_suite_that_died_halfway_cannot_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            j = self.write(d, "a.xml", '<testsuite><testcase name="a"/></testsuite>')
+            h = self.write(d, "h.jsonl", "\n".join(json.dumps({"name": n, "match": True}) for n in "abc") + "\n")
+            r = st.summarize([j], h, 0, expect_hashes=19)
+            self.assertAlmostEqual(r["hash_match_fraction"], 3 / 19)
+            self.assertIn("19 expected", r["hash_note"])
+            self.assertEqual(st.summarize([j], h, 0)["hash_match_fraction"], 1.0)           # without an expectation: as before
+
     def test_damaged_input_is_an_error(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(st.summarize([os.path.join(d, "none.xml")], None, 0)["status"], "error")

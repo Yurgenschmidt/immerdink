@@ -5,20 +5,22 @@
 #   tools/rerun_failed.sh BUILD_DIR [LOGFILE_PREFIX]
 # Output goes to stdout; with a prefix, also to <prefix>.rerun.log and <prefix>.sanitizer.log.
 # Environment: IMMERDINK_COMPUTE_SANITIZER (default: compute-sanitizer on PATH, or next to nvcc).
-# Exit status: 0 when every failed test passed on the plain rerun (a flaky test), else ctest's nonzero status.
+# Exit status: 0 when every failed test passed on the plain rerun (a flaky test), else ctest's nonzero status. tools/test.sh ignores it
+# and keeps the failing status of the original run: a flaky test still fails the run.
 # Tests that preload tests/alloc_shim.c (the contract_* suites) are not run under the sanitizer: the
 # interposer and the sanitizer both hook the CUDA runtime. Their plain rerun is still done.
 set -uo pipefail
 build="${1:?usage: rerun_failed.sh BUILD_DIR [LOGFILE_PREFIX]}"
 prefix="${2:-}"
-failed="$build/Testing/Temporary/LastTestsFailed.log"
-[ -s "$failed" ] || { echo "rerun_failed: no failed tests recorded in $failed"; exit 0; }
-names=$(sed 's/^[0-9]*://' "$failed" | paste -sd'|')
+tmp="$build/Testing/Temporary"
+# failures of the last ctest pass and (tools/test.sh) of the CPU pass before it
+names=$(cat "$tmp/LastTestsFailed.log" "$tmp/failed_cpu.log" 2>/dev/null | sed 's/^[0-9]*://' | sort -u | paste -sd'|')
+[ -n "$names" ] || { echo "rerun_failed: no failed tests recorded in $tmp"; exit 0; }
 echo "rerun_failed: failed tests: $(echo "$names" | tr '|' ' ')"
 
 tee_to() { if [ -n "$prefix" ]; then tee "$1"; else cat; fi; }
 echo "=== rerun with full output"
-ctest --test-dir "$build" --rerun-failed -V 2>&1 | tee_to "${prefix}.rerun.log"
+ctest --test-dir "$build" -R "^(${names})\$" -V 2>&1 | tee_to "${prefix}.rerun.log"
 rc=${PIPESTATUS[0]}
 
 san="${IMMERDINK_COMPUTE_SANITIZER:-$(command -v compute-sanitizer || true)}"
@@ -36,7 +38,9 @@ for t in $(echo "$names" | tr '|' ' '); do
   [ -n "$cmd" ] || { echo "--- $t: no command found"; continue; }
   if echo "$cmd" | grep -q "alloc_shim"; then echo "--- $t: uses the allocation shim; not run under the sanitizer"; continue; fi
   echo "--- $t"
-  # shellcheck disable=SC2086
-  eval "$san --tool memcheck --error-exitcode 99 $cmd" 2>&1 | tail -40 | tee_to "${prefix}.sanitizer.$t.log"
+  # the command as ctest prints it; the test's ENVIRONMENT and WORKING_DIRECTORY properties are not applied (a test that needs them can fail here
+  # for the wrong reason: read the plain rerun first)
+  read -ra argv <<< "$cmd"
+  "$san" --tool memcheck --error-exitcode 99 "${argv[@]}" 2>&1 | tail -40 | tee_to "${prefix}.sanitizer.$t.log"
 done
 exit "$rc"

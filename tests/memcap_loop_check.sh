@@ -22,4 +22,19 @@ for s in test.sh check_proofs.sh; do
     fail=1
   fi
 done
+# a stale IMMERDINK_MEMCAP=0 (inherited from some parent shell) must not switch the budget off: only 1 counts
+out="$(IMMERDINK_MEMCAP=0 IMMERDINK_CGROUP_FILE=/dev/null PATH="$work/bin:$PATH" timeout 20 "$root/tools/test.sh" --budget-probe 2>&1)"; rc=$?
+if [ "$rc" = 0 ] && [ "$(printf '%s\n' "$out" | grep -c 'memcap: no systemd user manager')" = 1 ]; then
+  echo "memcap_loop_check: IMMERDINK_MEMCAP=0 does not disable the budget"
+else
+  echo "memcap_loop_check: IMMERDINK_MEMCAP=0 FAILED (exit $rc)" >&2; fail=1
+fi
+# the two spec scripts use the same guard (no probe mode of their own: a source-level check)
+for s in spec/check.sh spec/apalache/check.sh; do
+  if grep -q 'tools/budget.sh' "$root/$s" && grep -q 'immerdink_in_budget' "$root/$s"; then
+    echo "memcap_loop_check: $s uses the shared guard"
+  else
+    echo "memcap_loop_check: $s does not use tools/budget.sh" >&2; fail=1
+  fi
+done
 exit $fail

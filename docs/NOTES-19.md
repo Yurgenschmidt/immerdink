@@ -10,7 +10,7 @@ immerdink emulates 64-bit floating-point matrix products with 8-bit integer tens
 of the inputs and the options alone: the same on an RTX 4090, an H100, an H200 and an RTX PRO 6000.
 If two GPUs disagree by even one bit, something is wrong. That is not noise.
 
-Before issue 19, the 58 tests (40 of them use a GPU) had only run on the RTX 4090. The cluster runs
+Before issue 19 the suite (63 tests on the feature branch) had only run on the RTX 4090. With this issue it registers 68 tests: 25 that never touch the GPU and 43 that do (67 when no compute-sanitizer is found, which drops `contract_initcheck_pad`). The cluster runs
 checked a sampled error and one output fingerprint (a hash) per benchmark case. This issue adds the
 whole suite on the other GPUs, plus a committed list of output hashes.
 
@@ -26,10 +26,10 @@ whole suite on the other GPUs, plus a committed list of output hashes.
 2. **The suite runs on a cluster GPU.** `IMMERDINK_ENV=none` uses the `cmake`, `nvcc`, `g++` and
    `python3` on `PATH`; `IMMERDINK_CUDA_ARCH` (or the `CMAKE_CUDA_ARCHITECTURES` the cluster jobs
    export) picks the architecture (90 for H100 and H200, 120 for the RTX PRO 6000; the default is
-   89). `IMMERDINK_GPU_LOCK=none` skips the lock that protects the shared desktop GPU. Both `90` and
+   89). `IMMERDINK_GPU_LOCK=none` skips the lock that protects the shared desktop GPU (**cluster jobs must set it**: the default path is this desktop's `ehrenfest-ipdps/_wip/gpu.lock`, with `$XDG_RUNTIME_DIR` or `/tmp` as the fallback). Both `90` and
    `120` build the library and all tests on the 4090 machine (checked on 2026-10-15).
-3. **Host-only tests simulate the cluster cards.** The planner rules are checked with 132 SMs (H100,
-   H200) and 188 SMs (RTX PRO 6000) as well as the 4090's 128.
+3. **Host-only tests simulate the cluster cards.** The planner rules were already checked with 132 SMs (H100,
+   H200); 188 (RTX PRO 6000) is added to the host tests (`test_host_python`), alongside 16, 46, 82 and 170.
 4. **Committed output hashes** (`tests/data/output_hashes.json`, `tests/test_output_hashes.py`).
 5. **A failed test leaves its evidence.** After a failed run `tools/rerun_failed.sh` reruns each failed
    test with full output and then under `compute-sanitizer`, in the same job (a rerun costs no queue
@@ -61,7 +61,7 @@ Tags select cases: `small` and `mid` run in the normal suite (about a second on 
 | ctest | cases | note |
 |---|---|---|
 | `output_hashes` | small, mid | GPU result against the committed hash |
-| `output_hashes_oracle` | small | also recomputes the CPU hashes with the oracle |
+| `output_hashes_oracle` | small, mid | also recomputes the CPU hashes with the oracle (`sq256`, the one CPU-source case tagged mid, included) |
 | `output_hashes_large` | large | GPU result against the committed hash |
 
 To change or add a case: edit the case list in `tests/data/output_hashes.json` (leave `c_hash`
@@ -74,7 +74,7 @@ only when the arithmetic changes. Say why in the commit message.
 These are written into `R1-measure.decisions.toml` (generalWork) before any cluster data exist.
 
 * `tests-pass`: every test passes. A test that was skipped, or missing (the suite runs fewer than the
-  67 expected, the count without the sanitizer test), counts as failed. GO means all passed; anything else is NO-GO and the analyst classes
+  67 expected, the count without the sanitizer test; 68 with it), counts as failed. GO means all passed; anything else is NO-GO and the analyst classes
   each failure as a *test assumption* (the test expects 4090 behaviour) or a *library bug*.
 * `hashes-match`: every committed hash is reproduced. A mismatch is a bug, never noise.
 * H200 runs a smoke subset (`output_hashes`, three contract suites, two host suites): `smoke-pass` and
@@ -84,6 +84,16 @@ The experiment `tests.suite` builds the library in a scratch directory of the jo
 runs `tools/test.sh` with JUnit output, and `bench/campaign/summarize_tests.py` turns the JUnit files
 and the hash results into the record the decisions read. Rerun logs (full output and sanitizer) are
 copied back when something failed.
+
+## Limits of the hash gate (from the independent review)
+
+* A hash whose `source` is `rtx4090` is the 4090 library's own output, tied to the oracle only through the small shapes: a bug that was already in the 4090 library when the hash was taken is baked
+  in. No independent accuracy bound is checked on the mid and large cases yet (a follow-up: an error bound against an FP64 GEMM).
+* The cases use finite inputs, one seed and one truncation case. NaN, Inf, subnormals, zero rows and the flagged-output (K5 native) paths are not covered.
+* A deliberate change of the arithmetic needs the hashes regenerated on the 4090 (`--regen`), which is awkward for Hopper-only work: say so in the pull request.
+* A mismatch of a large hash on Hopper or Blackwell fails `output_hashes_large`; the failure message says how to tell a library bug from a bad baseline (compare with the 4090 library run and the oracle on a small shape).
+* `tests.suite` expects every hash case: `summarize_tests.py --expect-hashes N` makes a suite that died halfway, or a case that raised, count as a mismatch, not as a smaller denominator.
+* The harness loads libcudart 13, then 12, then the unversioned name (a CUDA 12 node has no `.so.13`); the allocation shim takes its soname from the toolkit CMake found.
 
 ## Not done here
 

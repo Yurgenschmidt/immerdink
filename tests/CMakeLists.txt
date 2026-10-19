@@ -220,7 +220,7 @@ if(Python3_FOUND)
                    --lib "$<TARGET_FILE:immerdink>" --tags small mid)
   add_test(NAME output_hashes_oracle
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
-                   --lib "$<TARGET_FILE:immerdink>" --tags small --oracle)
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid --oracle)
   add_test(NAME output_hashes_large
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
                    --lib "$<TARGET_FILE:immerdink>" --tags large)

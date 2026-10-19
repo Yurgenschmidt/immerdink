@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Turn a test-suite run (ctest JUnit files + committed-hash results) into one campaign record.
 
-    summarize_tests.py OUT.jsonl [--junit FILE ...] [--hashes FILE] [--expect-tests N]
+    summarize_tests.py OUT.jsonl [--junit FILE ...] [--hashes FILE] [--expect-tests N] [--expect-hashes N]
 
 The record (one JSON line, status "ok") carries what the decisions file reads:
   tests_total, tests_failed, tests_skipped, pass_fraction   from the JUnit files (a test that is
@@ -10,7 +10,7 @@ The record (one JSON line, status "ok") carries what the decisions file reads:
   hash_cases, hash_mismatch, hash_match_fraction            from the hashes file written by
                                                              tests/test_output_hashes.py (IMD_HASH_JSON)
   hash_mismatched                                           the names of the cases that differ
-With --expect-tests N the pass fraction is passed / max(N, total): a suite that lost tests cannot pass.
+With --expect-tests N the pass fraction is passed / max(N, total): a suite that lost tests cannot pass; --expect-hashes N does the same for the hash cases.
 A missing or unreadable JUnit file makes the record status "error" (the analyzer reads that as damaged).
 Standard library only.
 """
@@ -60,7 +60,7 @@ def read_hashes(path):
     return cases, mism, names
 
 
-def summarize(junit, hashes, expect):
+def summarize(junit, hashes, expect, expect_hashes=0):
     rec = {"status": "ok", "method": "tests"}
     try:
         total, failed, skipped, names = read_junit(junit)
@@ -75,7 +75,9 @@ def summarize(junit, hashes, expect):
         try:
             cases, mism, hn = read_hashes(hashes)
             rec.update(hash_cases=cases, hash_mismatch=mism, hash_mismatched=hn,
-                       hash_match_fraction=(cases - mism) / cases if cases else 0.0)
+                       hash_match_fraction=(cases - mism) / max(expect_hashes or 0, cases) if cases else 0.0)
+            if expect_hashes and cases < expect_hashes:
+                rec["hash_note"] = f"{cases} hash cases ran, {expect_hashes} expected"
         except (OSError, ValueError, KeyError) as e:
             rec.update(status="error", error=f"hashes: {e}")
     return rec
@@ -87,8 +89,9 @@ def main(argv=None):
     ap.add_argument("--junit", nargs="+", default=[])
     ap.add_argument("--hashes")
     ap.add_argument("--expect-tests", type=int, default=0)
+    ap.add_argument("--expect-hashes", type=int, default=0, help="hash cases the run must have recorded (a suite that died halfway cannot match)")
     a = ap.parse_args(argv)
-    rec = summarize(a.junit, a.hashes, a.expect_tests)
+    rec = summarize(a.junit, a.hashes, a.expect_tests, a.expect_hashes)
     with open(a.out, "a") as f:
         f.write(json.dumps(rec, sort_keys=True) + "\n")
     print(json.dumps(rec, sort_keys=True))

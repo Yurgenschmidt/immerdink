@@ -162,6 +162,10 @@ def main():
         for c in cases:
             print(f"{c['name']:24s} {c['source']:8s} {','.join(c['tags'])}")
         return 0
+    expected = [c for c in cases if set(c["tags"]) & set(args.tags)]
+    if args.regen is None and not expected:      # a selection that matches nothing must not read as a pass
+        print(f"FAIL  no case carries the tags {args.tags}")
+        return 1
     lib, cuda = hz.Library(args.lib), hz.Cuda()
     t0 = time.time()
     if args.regen is not None:
@@ -172,7 +176,7 @@ def main():
             if c["source"] == "cpu":
                 want = hash_c(run_oracle(c))
                 if want != got:
-                    print(f"FAIL  {c['name']}: GPU {got} != oracle {want}")
+                    print(f"FAIL  {c['name']}: GPU {got} != oracle {want} (a mismatch against the oracle is a library bug)")
                     return 1
             print(json.dumps({"name": c["name"], "c_hash": got}), flush=True)
             if args.write:
@@ -186,7 +190,16 @@ def main():
         if not set(c["tags"]) & set(args.tags):
             continue
         t1 = time.time()
-        got = hash_c(run_gpu(lib, cuda, c))
+        try:
+            got = hash_c(run_gpu(lib, cuda, c))
+        except Exception as e:      # a case that did not run is a failure with a record, not a missing line
+            bad.append(f"{c['name']}: did not run: {type(e).__name__}: {e}")
+            print(f"{c['name']:24s} {c['source']:8s} DID NOT RUN: {type(e).__name__}: {e}", flush=True)
+            if os.environ.get("IMD_HASH_JSON"):
+                with open(os.environ["IMD_HASH_JSON"], "a") as jf:
+                    jf.write(json.dumps({"name": c["name"], "source": c["source"], "c_hash": None,
+                                         "committed": c["c_hash"], "match": False}) + "\n")
+            continue
         line = f"{c['name']:24s} {c['source']:8s} gpu {got}"
         if got != c["c_hash"]:
             bad.append(f"{c['name']}: GPU {got} != committed {c['c_hash']} ({c['source']})")
@@ -208,6 +221,12 @@ def main():
         print("FAIL")
         for b in bad:
             print("  " + b)
+        if any("committed" in b and "GPU" in b for b in bad):
+            print("  A source rtx4090 hash is the 4090 library's own output: to tell a library bug from a bad baseline, compare with the 4090 library run and with the\n"
+                  "  oracle on a small shape (--tags small --oracle).")
+        return 1
+    if ran != len(expected):
+        print(f"FAIL  ran {ran} of {len(expected)} cases")
         return 1
     print(f"PASS  {ran} output hashes match ({time.time() - t0:.1f}s)")
     return 0

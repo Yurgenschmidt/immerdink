@@ -4,5 +4,5 @@
 # (IMMERDINK_MEMCAP=1: without a systemd user manager there is no slice to be inside of, and the
 # scripts re-launched themselves forever). IMMERDINK_CGROUP_FILE replaces /proc/self/cgroup (tests).
 immerdink_in_budget() {
-  [ -n "${IMMERDINK_MEMCAP:-}" ] || grep -q "/immerdink.slice/" "${IMMERDINK_CGROUP_FILE:-/proc/self/cgroup}" 2>/dev/null
+  [ "${IMMERDINK_MEMCAP:-}" = 1 ] || grep -q "/immerdink.slice/" "${IMMERDINK_CGROUP_FILE:-/proc/self/cgroup}" 2>/dev/null
 }

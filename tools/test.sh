@@ -136,6 +136,8 @@ elif has_selection "$@"; then
   flock "$gpu_lock" ctest --test-dir "$build" --output-on-failure "${junit_gpu[@]}" "$@" || rc=$?
 else
   ctest --test-dir "$build" --output-on-failure "${junit_cpu[@]}" -R "$cpu_only" "$@" || rc=$?
+  # the second pass rewrites LastTestsFailed.log: keep the first pass's failures for tools/rerun_failed.sh
+  cp "$build/Testing/Temporary/LastTestsFailed.log" "$build/Testing/Temporary/failed_cpu.log" 2>/dev/null || true
   flock "$gpu_lock" ctest --test-dir "$build" --output-on-failure "${junit_gpu[@]}" -E "$cpu_only" "$@" || rc=$?
 fi
 # A failed run leaves the evidence for classing each failure (cluster jobs: one queue wait only).
