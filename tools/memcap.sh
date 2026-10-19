@@ -11,7 +11,10 @@
 # the machine.) The cap is a runtime property; nothing persists past reboot.
 #
 # Already inside the slice (nested call): runs the command directly.
-# No systemd user manager: warns and runs uncapped.
+# No systemd user manager: warns and runs uncapped. Either way the command runs with
+# IMMERDINK_MEMCAP=1 in its environment: scripts that re-launch themselves through this one
+# (tools/test.sh, tools/check_proofs.sh) treat that as "already handled", so without a
+# systemd user manager they do not re-launch themselves in a loop (about 200 times in 6 s).
 #
 # A time limit goes INSIDE: `tools/memcap.sh timeout 600 cmd ...`. The command runs in a
 # systemd scope, and `timeout 600 tools/memcap.sh cmd ...` did not stop it (2026-10-07: a
@@ -20,7 +23,8 @@ set -u
 [ $# -ge 1 ] || { echo "usage: $0 command [args...]" >&2; exit 2; }
 
 slice=immerdink.slice
-if grep -q "/$slice/" /proc/self/cgroup 2>/dev/null; then exec "$@"; fi
+export IMMERDINK_MEMCAP=1
+if grep -q "/$slice/" "${IMMERDINK_CGROUP_FILE:-/proc/self/cgroup}" 2>/dev/null; then exec "$@"; fi
 
 mem_total_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
 cap="${IMMERDINK_MEM_MAX:-$((mem_total_kb / 2 / 1024 / 1024))G}"

@@ -1,7 +1,31 @@
 cmake_minimum_required(VERSION 3.28)
 
+# GPU architectures to build for (issue 18, docs/NOTES-18.md D7). CMAKE_CUDA_ARCHITECTURES, when given,
+# wins. Else IMMERDINK_CUDA_ARCHS (a list in CMake's own notation: "89" = SASS + PTX, "90-real" = SASS
+# only), else 89, the RTX 4090 the library is tuned on (DESIGN §4). With IMMERDINK_EMBED_PTX=OFF an entry
+# without a suffix means SASS only: a GPU the build has no SASS for then fails at plan creation
+# (NOT_SUPPORTED) instead of running recompiled code. The release recipe, every shipped card native:
+#   -DIMMERDINK_CUDA_ARCHS="80-real;89;90-real;120-real"   (sm_80 SASS also runs on sm_86 cards)
+set(IMMERDINK_CUDA_ARCHS "" CACHE STRING "CUDA architectures (CMake list); empty: 89")
+option(IMMERDINK_EMBED_PTX "Embed PTX for the architectures given without -real / -virtual" ON)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 89)  # RTX 4090 (sm_89) first: DESIGN §4
+  if(IMMERDINK_CUDA_ARCHS)
+    set(_imd_archs "")
+    foreach(_a IN LISTS IMMERDINK_CUDA_ARCHS)
+      if(NOT IMMERDINK_EMBED_PTX AND _a MATCHES "^[0-9]+[a-z]?$")
+        list(APPEND _imd_archs "${_a}-real")
+      else()
+        list(APPEND _imd_archs "${_a}")
+      endif()
+    endforeach()
+    set(CMAKE_CUDA_ARCHITECTURES "${_imd_archs}")
+  else()
+    if(IMMERDINK_EMBED_PTX)
+      set(CMAKE_CUDA_ARCHITECTURES 89)       # RTX 4090 (sm_89) first: DESIGN §4; machine code and PTX
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES 89-real)  # machine code only
+    endif()
+  endif()
 endif()
 
 # IMMERDINK_HOST_ONLY: build only libimmerdink_host (DESIGN §6a: lowering, legality and the
@@ -83,7 +107,7 @@ target_include_directories(imd_constants INTERFACE "${PROJECT_SOURCE_DIR}/includ
 add_library(immerdink_host SHARED
   src/host/index_map.cpp src/host/workspace.cpp src/host/analysis.cpp src/host/k4_config.cpp
   src/host/pack.cpp src/host/host_api.cpp src/host/perf.cpp src/host/accuracy.cpp
-  src/host/k_hat.cpp)
+  src/host/k_hat.cpp src/host/device_class.cpp)
 target_include_directories(immerdink_host PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 # DESIGN §6c.2: the shipped calibration file is embedded as a raw string literal (the file is
@@ -133,7 +157,7 @@ target_compile_options(imd_cutlass INTERFACE
 # Test-only hooks (src/test_hooks.cpp: launch-limit override, lowering dump) are built only
 # with IMMERDINK_BUILD_TESTS=ON, and the benchmark phase marks (src/profile.cpp) only with
 # IMMERDINK_PROFILE=ON; a production build exports neither.
-add_library(immerdink SHARED src/api.cpp src/contract.cu src/gemm_k4.cu
+add_library(immerdink SHARED src/api.cpp src/device_state.cpp src/contract.cu src/gemm_k4.cu
   src/k4/k4_cfg0.cu src/k4/k4_cfg1.cu src/k4/k4_cfg2.cu src/k4/k4_cfg3.cu)
 if(IMMERDINK_BUILD_TESTS)
   target_sources(immerdink PRIVATE src/test_hooks.cpp)

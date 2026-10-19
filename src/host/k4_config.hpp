@@ -58,6 +58,21 @@ constexpr K4Cost kK4Costs[kK4ConfigCount] = {
 // (1000 - margin) / 1000 of 128x256's (model error and measurement noise).
 constexpr int64_t kK4MarginPermille = 50;
 
+// One fitted set of K4 constants per IMD_TABLE_* (issue 18, docs/NOTES-18.md D2). A table also owns
+// the CTAs per SM the cost model assumes for each configuration: kK4Configs' value is a 4090 figure
+// (the plan itself uses the measured occupancy), and another architecture may differ.
+struct K4Table {
+  K4Cost costs[kK4ConfigCount];
+  int32_t ctas_per_sm[kK4ConfigCount];
+  int64_t margin_permille;
+};
+constexpr K4Table kK4Tables[IMD_TABLE_COUNT] = {
+    {{kK4Costs[0], kK4Costs[1], kK4Costs[2], kK4Costs[3]},
+     {kK4Configs[0].ctas_per_sm, kK4Configs[1].ctas_per_sm, kK4Configs[2].ctas_per_sm,
+      kK4Configs[3].ctas_per_sm},
+     kK4MarginPermille},
+};
+
 // The round decomposition of the model above for one launch of configuration c over gb = g b
 // batches: the busiest SM runs `full` rounds of ctas_per_sm concurrent CTAs, then (rest > 0)
 // one round of `rest` CTAs; every CTA does tile_macs = tile_m tile_n k_hat MACs. Saturating
@@ -69,18 +84,18 @@ struct K4Rounds {
   u128 tile_macs = 0;
 };
 IMD_HOST_INTERNAL K4Rounds k4_rounds(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb,
-                                     int32_t sms);
+                                     int32_t sms, int32_t table = IMD_TABLE_SM89);
 
 // The estimate above in femtoseconds, computed in saturating unsigned 128-bit integers
 // (clamped at 2^127 - 1 after every operation). gb = g b.
 IMD_HOST_INTERNAL u128 k4_estimate_fs(int c, int64_t m, int64_t n_hat, int64_t k_hat,
-                                      int64_t gb, int32_t sms);
+                                      int64_t gb, int32_t sms, int32_t table = IMD_TABLE_SM89);
 
 // The K4 configuration of a plan with the emulated GEMM (DESIGN §4): a deterministic
 // function of the GEMM view (m, n_hat, k_hat, b), N, g and the device's SM count: the
 // smallest estimate, where a configuration other than 128x256 must beat 128x256's by the
 // margin. Returns IMD_K4_128x256 when the emulated GEMM does not run.
-IMD_HOST_INTERNAL int32_t k4_select(const ExecPlan& e, int32_t sms);
+IMD_HOST_INTERNAL int32_t k4_select(const ExecPlan& e, int32_t sms, int32_t table = IMD_TABLE_SM89);
 
 // Plan-time autotuning (imd_options_t.k4_tune, DESIGN §6): the device bytes imd_plan_create
 // allocates temporarily to time the candidates on group 1's K4 launches (RA, RB and group

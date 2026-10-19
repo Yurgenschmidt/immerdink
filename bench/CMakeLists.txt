@@ -140,3 +140,30 @@ endif()
 target_link_libraries(imd_bench PRIVATE CUDA::cublas)
 # v1.10: method sustained samples NVML (dlopen) in a host thread.
 target_link_libraries(imd_bench PRIVATE immerdink CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+
+# INT8 ceilings (issue 16): imd_ceiling measures mma.sync, cuBLASLt and stock CUTLASS (sm80, and on a Hopper build the CUTLASS
+# Hopper GEMMs with wgmma). Not built by default (bench/build.sh builds imd_bench only; WITH_CEILING=1 adds it).
+# Needs CUTLASS (the submodule or IMMERDINK_CUTLASS_DIR, as the library) and cuBLASLt. A build whose architectures include 90
+# compiles this one target for sm_90a (wgmma exists only there) and defines IMD_CEIL_HOPPER.
+find_path(IMD_CUTLASS_INCLUDE cutlass/cutlass.h HINTS "${IMMERDINK_CUTLASS_DIR}" "$ENV{IMMERDINK_CUTLASS_DIR}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cutlass" PATH_SUFFIXES include NO_DEFAULT_PATH)
+if(IMD_CUTLASS_INCLUDE)
+  add_executable(imd_ceiling ceiling/int8_ceiling.cu)
+  set_target_properties(imd_ceiling PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+  target_include_directories(imd_ceiling SYSTEM PRIVATE "${IMD_CUTLASS_INCLUDE}")
+  target_compile_options(imd_ceiling PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -diag-suppress=20012>)
+  target_link_libraries(imd_ceiling PRIVATE CUDA::cublasLt CUDA::cudart)
+  set(_imd_has90 FALSE)
+  foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
+    if(_a MATCHES "^90")    # 90, 90a, 90-real, 90a-real
+      set(_imd_has90 TRUE)
+    endif()
+  endforeach()
+  if(_imd_has90)
+    set_target_properties(imd_ceiling PROPERTIES CUDA_ARCHITECTURES "90a-real")
+    target_compile_definitions(imd_ceiling PRIVATE IMD_CEIL_HOPPER)
+    message(STATUS "imd_ceiling: Hopper (sm_90a) variants enabled")
+  endif()
+else()
+  message(STATUS "imd_ceiling: no CUTLASS include dir found (third_party/cutlass or IMMERDINK_CUTLASS_DIR): not built")
+endif()

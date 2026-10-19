@@ -27,7 +27,7 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 13 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 14 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
@@ -60,7 +60,11 @@ extern "C" {
                                       clock_boost_mhz, power_act_w, power_act_gap_us,
                                       energy_dram_pj, warm_call_ns, warm_clean_byte_ns,
                                       pack_l2_planes (optional keys), IMD_PERF_CACHE_CLEAN;
-                                      clock_mhz out up to the boost clock */
+                                      clock_mhz out up to the boost clock;
+                                  14: device classes and per-GPU table sets (issue 18, docs/NOTES-18.md):
+                                      imd_device_class_t, imd_device_select, imd_device_select_rows,
+                                      imd_kernel_code_kind, imd_plan_status_of, *_name functions,
+                                      IMD_TABLE_*, imd_lowering_t table_id (v7) */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -245,13 +249,18 @@ typedef struct {
                               tensors (§6b.4 word 1); compare a pack's format with
                               imd_pack_layout_t.format, never with this field             */
   int32_t reserved6;       /* 0                                                           */
+  /* Version 7 (200 bytes; host API 14, issue 18). Valid when lowered = 1. */
+  int32_t table_id;        /* IN as well as out: the table set (IMD_TABLE_*) of the K4 rule;
+                              out of range as input: INVALID_VALUE. 0 = IMD_TABLE_SM89     */
+  int32_t reserved7;       /* 0                                                           */
 } imd_lowering_t;
 enum { IMD_FUSED_LARGE_A = 1, IMD_FUSED_LARGE_B = 2 };
 
 /* Fills *out and returns the plan-time status (as imd_plan_bytes). INVALID_VALUE without
  * writing anything if out is NULL or out->struct_size < 136 (the version-1 size). With
  * lowered = 0 only struct_size, status and lowered are meaningful; the others are 0.
- * out->sm_count is read (as an input) only when out->struct_size >= 168. */
+ * out->sm_count is read (as an input) only when out->struct_size >= 168, out->table_id only
+ * when out->struct_size >= 200. */
 IMD_API imd_status_t imd_lowering(const imd_tensor_t* A, const imd_tensor_t* B,
                                   const imd_tensor_t* C, const imd_options_t* options,
                                   imd_lowering_t* out);
@@ -916,6 +925,104 @@ IMD_API imd_status_t imd_err_min_moduli(const imd_tensor_t* A, const imd_tensor_
                                         const imd_tensor_t* C, const imd_options_t* options,
                                         int32_t n_lo, int32_t n_hi,
                                         const imd_err_request_t* request, imd_err_t* out);
+
+/* ---- Device classes, table sets and plan status (host API version 14; docs/NOTES-18.md) -----
+ *
+ * What the library knows about a GPU, and which fitted constants (a "table set": the K4 tile
+ * cost table, later the performance calibration) it uses for it. Everything here is CUDA-free
+ * and a pure function of its arguments, so any card can be simulated. The device API
+ * (immerdink.h imd_device_info, imd_plan_info) fills the class from the CUDA runtime and
+ * applies these functions. */
+typedef struct {
+  uint32_t struct_size;      /* in: sizeof(imd_device_class_t)                              */
+  int32_t cc_major, cc_minor; /* compute capability                                         */
+  int32_t sm_count;
+  int32_t reserved;          /* 0                                                           */
+  uint64_t l2_bytes;
+  uint64_t smem_optin_bytes; /* largest dynamic shared memory per block (informational)     */
+  char name[64];             /* NUL-terminated                                              */
+} imd_device_class_t;
+
+/* Table sets. A set is added together with the data that fitted it (docs/NOTES-18.md D2). */
+enum { IMD_TABLE_SM89 = 0, /* fitted on the RTX 4090 (docs/NOTES-A3.md, the shipped calibration) */
+       IMD_TABLE_COUNT = 1 };
+
+/* How well the card matches a registry row, best first. */
+enum { IMD_MATCH_EXACT = 0,      /* same compute capability, SM count and name prefix: tuned     */
+       IMD_MATCH_ARCH = 1,       /* same compute capability, another card                        */
+       IMD_MATCH_GENERATION = 2, /* same major version: the row with the nearest minor           */
+       IMD_MATCH_DEFAULT = 3,    /* nothing related: the sm_89 row                               */
+       IMD_MATCH_UNSUPPORTED = 4 /* compute capability below 8.0, or no row at all               */ };
+
+/* One registry row: the cards a table set was fitted on. */
+typedef struct {
+  int32_t table_id;          /* IMD_TABLE_*                                                   */
+  int32_t cc_major, cc_minor;
+  int32_t sm_count;          /* 0: any                                                        */
+  char name_prefix[64];      /* the card's name must start with it; "": any                   */
+} imd_table_row_t;
+
+typedef struct {
+  uint32_t struct_size;      /* in: sizeof(imd_device_selection_t)                            */
+  int32_t match;             /* IMD_MATCH_*                                                   */
+  int32_t table_id;          /* the table set to use; -1 when UNSUPPORTED                     */
+  int32_t row_index;         /* index of the chosen row; -1 when UNSUPPORTED                  */
+  int32_t approximate;       /* 1 unless match is EXACT: the constants were not fitted here   */
+  int32_t reserved;          /* 0                                                             */
+} imd_device_selection_t;
+
+/* The selection rule (docs/NOTES-18.md D3), in order, first match wins: cc < 8.0 or no rows:
+ * UNSUPPORTED; a row with the same cc, the same SM count (or 0) and a matching name prefix:
+ * EXACT; a row with the same cc: ARCH; a row with the same cc_major: GENERATION (nearest
+ * minor, ties to the lower one, then the earlier row); else DEFAULT, the first row with cc 8.9
+ * (else the first row). INVALID_VALUE for NULL pointers, a wrong struct_size, a negative field,
+ * or a name without a NUL. imd_device_select uses the built-in rows. */
+IMD_API imd_status_t imd_device_select(const imd_device_class_t* device,
+                                       imd_device_selection_t* out);
+IMD_API imd_status_t imd_device_select_rows(const imd_device_class_t* device,
+                                            const imd_table_row_t* rows, int32_t num_rows,
+                                            imd_device_selection_t* out);
+/* The number of built-in rows and row i (INVALID_VALUE outside the range). */
+IMD_API int32_t imd_device_row_count(void);
+IMD_API imd_status_t imd_device_row(int32_t index, imd_table_row_t* out);
+
+/* The kind of code a kernel runs as on this device, from what the CUDA runtime reports
+ * (cudaFuncGetAttributes: error, binaryVersion, ptxVersion; version = 10 major + minor). */
+enum { IMD_CODE_NATIVE = 0,      /* binary == ptx == the device's version                       */
+       IMD_CODE_COMPATIBLE = 1,  /* binary == ptx < device, same major: older minor's SASS      */
+       IMD_CODE_RECOMPILED = 2,  /* binary != ptx: the driver compiled the PTX at first use     */
+       IMD_CODE_UNUSABLE = 3     /* the call failed, or the code cannot be the device's         */ };
+IMD_API int32_t imd_kernel_code_kind(int32_t cuda_error, int32_t binary_version,
+                                     int32_t ptx_version, int32_t cc_major, int32_t cc_minor);
+
+/* What the device API found out about the device (and, for imd_plan_info, the plan made on it).
+ * Filled by imd_device_info / imd_plan_info (immerdink.h); defined here because it is plain data. */
+typedef struct {
+  uint32_t struct_size;            /* in: sizeof(imd_device_info_t)                              */
+  imd_device_class_t device;
+  imd_device_selection_t selection;
+  int32_t code_kind;               /* IMD_CODE_*: the worst over every kernel checked            */
+  int32_t status;                  /* IMD_PLAN_*                                                 */
+  int32_t failing_kernel;          /* IMD_PERF_KERNEL_* id (K4 configuration c: IMD_PERF_KERNEL_K4 + c) of the
+                                      first unusable kernel, else -1                             */
+  int32_t cuda_error;              /* the CUDA error of that check (209 no kernel image, 222 PTX
+                                      newer than the driver, ...), else 0                        */
+  int32_t kernels_checked;
+  int32_t k4_config;               /* imd_plan_info: the plan's IMD_K4_*; imd_device_info: -1    */
+  int32_t table_id;                /* the table set in use (the selection's, or IMD_TABLE_SM89
+                                      for an unsupported device)                                 */
+  int32_t reserved;                /* 0                                                          */
+} imd_device_info_t;
+
+/* The plan status: the summary of the table match and the worst code kind. */
+enum { IMD_PLAN_NATIVE = 0,      /* EXACT tables and NATIVE code                                */
+       IMD_PLAN_APPROXIMATE = 1, /* borrowed tables, or COMPATIBLE code                         */
+       IMD_PLAN_RECOMPILED = 2,  /* some kernel was compiled from PTX at plan creation          */
+       IMD_PLAN_UNSUPPORTED = 3  /* UNSUPPORTED match, or unusable code: no plan is created     */ };
+IMD_API int32_t imd_plan_status_of(int32_t match, int32_t code_kind);
+IMD_API const char* imd_match_name(int32_t match);
+IMD_API const char* imd_code_kind_name(int32_t code_kind);
+IMD_API const char* imd_plan_status_name(int32_t status);
 
 #ifdef __cplusplus
 } /* extern "C" */

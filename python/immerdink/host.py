@@ -38,9 +38,9 @@ __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "work
            "predict_pack", "rank", "param_names", "PERF_CLASSES", "PERF_PHASES", "Accuracy",
            "ErrEstimate", "err_estimate", "min_moduli", "ERR_METRICS", "ERR_BASES",
            "ERR_STATUS", "INFEASIBLE", "PACK_FORMAT", "PACK_FORMAT_A16", "PACK_FORMAT_A64",
-           "test_set_k_align", "CalibrationError", "CALIB_ERRORS", "CALIB_STRING_FIELDS"]
+           "test_set_k_align", "device_select", "DeviceSelection", "CalibrationError", "CALIB_ERRORS", "CALIB_STRING_FIELDS"]
 
-API_VERSION = 13  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+API_VERSION = 14  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
 # Pack formats (DESIGN v1.13 §4b, host API 9): the format of a pack is that of its k (2 iff
 # k > 96); PACK_FORMAT is the newest format the library writes.
 PACK_FORMAT_A16, PACK_FORMAT_A64 = 1, 2
@@ -140,7 +140,24 @@ class _Lowering(C.Structure):
                 ("sm_count", C.c_int32), ("k4_config", C.c_int32), ("k4_tune_bytes", C.c_uint64),
                 ("fused_large", C.c_int32), ("reserved4", C.c_int32),
                 ("packed", C.c_int32), ("pack_mismatch", C.c_int32),
-                ("k_align", C.c_int32), ("reserved6", C.c_int32)]   # v6 (DESIGN v1.13 §4b)
+                ("k_align", C.c_int32), ("reserved6", C.c_int32),   # v6 (DESIGN v1.13 §4b)
+                ("table_id", C.c_int32), ("reserved7", C.c_int32)]   # v7 (host API 14, issue 18)
+
+
+class _DeviceClass(C.Structure):
+    _fields_ = [("struct_size", C.c_uint32), ("cc_major", C.c_int32), ("cc_minor", C.c_int32),
+                ("sm_count", C.c_int32), ("reserved", C.c_int32), ("l2_bytes", C.c_uint64),
+                ("smem_optin_bytes", C.c_uint64), ("name", C.c_char * 64)]
+
+
+class _TableRow(C.Structure):
+    _fields_ = [("table_id", C.c_int32), ("cc_major", C.c_int32), ("cc_minor", C.c_int32),
+                ("sm_count", C.c_int32), ("name_prefix", C.c_char * 64)]
+
+
+class _DeviceSel(C.Structure):
+    _fields_ = [("struct_size", C.c_uint32), ("match", C.c_int32), ("table_id", C.c_int32),
+                ("row_index", C.c_int32), ("approximate", C.c_int32), ("reserved", C.c_int32)]
 
 
 class _PackDesc(C.Structure):
@@ -279,8 +296,8 @@ class _Candidate(C.Structure):
                 ("err_status", C.c_int32), ("infeasible", C.c_int32)]
 
 
-assert C.sizeof(_Lowering) == 192  # version 6 (DESIGN v1.13 §4b; v5 = 184)
-assert _Lowering.k_align.offset == 184
+assert C.sizeof(_Lowering) == 200  # version 7 (issue 18; v6 = 192, DESIGN v1.13 §4b; v5 = 184)
+assert _Lowering.k_align.offset == 184 and _Lowering.table_id.offset == 192
 assert C.sizeof(_Options) == 24
 assert C.sizeof(_PackDesc) == 72 and C.sizeof(_PackLayout) == 136
 assert C.sizeof(_PerfCalib) == 3744 and _PerfCalib.energy_byte_f_pj.offset == 3672 and \
@@ -334,6 +351,11 @@ class HostLibrary:
                                          C.POINTER(C.c_size_t)]),
             "imd_lowering": (C.c_int, [T, T, T, O, C.POINTER(_Lowering)]),
             "imd_status_string": (C.c_char_p, [C.c_int]),
+            # v14 (issue 18): device classes and table sets
+            "imd_device_select": (C.c_int, [C.POINTER(_DeviceClass), C.POINTER(_DeviceSel)]),
+            "imd_device_select_rows": (C.c_int, [C.POINTER(_DeviceClass), C.POINTER(_TableRow),
+                                                 C.c_int32, C.POINTER(_DeviceSel)]),
+            "imd_match_name": (C.c_char_p, [C.c_int32]),
             # v5 (DESIGN §6b): packed operands
             "imd_pack_layout": (C.c_int, [C.POINTER(_PackDesc), C.POINTER(_PackLayout)]),
             "imd_pack_desc_for": (C.c_int, [T, T, T, O, C.c_int32, C.POINTER(_PackDesc),
@@ -644,18 +666,22 @@ class Lowering:
     pack_mismatch: str     # v5: the PACK_MISMATCH reason ("NONE" otherwise)
     k_align: int           # v6: the plan's K alignment A (16 / 64), k_hat = ceil(k)_A
     reserved6: int
+    table_id: int          # v7: the table set (IMD_TABLE_*) the K4 rule was evaluated with
+    reserved7: int
 
 
 def lowering(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",
-             vec_mode="GENERATE", sm_count=0, packing=None, lib=None):
+             vec_mode="GENERATE", sm_count=0, table_id=0, packing=None, lib=None):
     """imd_lowering: the lowering summary. Never raises for a plan-time status: check
     .status ("SUCCESS", "NOT_SUPPORTED", "PACK_MISMATCH", ...) and .lowered. sm_count: the
-    target device's SMs for the K4 configuration rule (0: the 128 of the RTX 4090).
+    target device's SMs for the K4 configuration rule (0: the 128 of the RTX 4090); table_id: the
+    fitted table set (IMD_TABLE_*; 0: the RTX 4090's).
     packing = (PackSpec or None, PackSpec or None): imd_lowering_packed (DESIGN §6b)."""
     h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing)
     r = _Lowering()
     r.struct_size = C.sizeof(_Lowering)
     r.sm_count = int(sm_count)
+    r.table_id = int(table_id)
     if packing is None:
         st = h.lib.imd_lowering(*call.args(), C.byref(r))
     else:
@@ -664,6 +690,39 @@ def lowering(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="E
     vals.update(status=STATUS[st], lowered=bool(r.lowered), swapped=bool(r.swapped), fused=bool(r.fused),
                 dispatch=DISPATCH[r.dispatch], pack_mismatch=PACK_MISMATCH[r.pack_mismatch])
     return Lowering(**vals)
+
+
+@dataclass(frozen=True)
+class DeviceSelection:
+    """imd_device_select: which table set a card gets. match: "exact" (tuned), "arch" (same compute
+    capability, another card), "generation" (same major version, nearest minor), "default" (the sm_89
+    set) or "unsupported" (compute capability below 8.0); approximate: the constants were not fitted
+    on this card; row_index: the registry row that matched (-1 when unsupported)."""
+    match: str
+    table_id: int
+    row_index: int
+    approximate: bool
+
+
+def device_select(cc, sm_count, name, *, rows=None, lib=None):
+    """Select the table set of a (possibly synthetic) card with the library's rule (CUDA-free).
+    cc = (major, minor); rows: None for the built-in registry, else a list of dicts / tuples
+    (table_id, cc_major, cc_minor, sm_count, name_prefix) to test a registry that has more rows."""
+    h = load(lib)
+    d = _DeviceClass(C.sizeof(_DeviceClass), int(cc[0]), int(cc[1]), int(sm_count), 0, 0, 0,
+                     name.encode())
+    out = _DeviceSel(C.sizeof(_DeviceSel))
+    if rows is None:
+        st = h.lib.imd_device_select(C.byref(d), C.byref(out))
+    else:
+        rr = [r if not isinstance(r, dict) else (r["table_id"], r["cc_major"], r["cc_minor"],
+                                                 r["sm_count"], r["name_prefix"]) for r in rows]
+        arr = (_TableRow * max(len(rr), 1))(*[_TableRow(t, a, b, n, p.encode()) for t, a, b, n, p in rr])
+        st = h.lib.imd_device_select_rows(C.byref(d), arr, len(rr), C.byref(out))
+    if st:
+        raise ImmerdinkError(st, "imd_device_select")
+    return DeviceSelection(h.lib.imd_match_name(out.match).decode(), out.table_id, out.row_index,
+                           bool(out.approximate))
 
 
 @dataclass(frozen=True)

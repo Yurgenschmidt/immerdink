@@ -24,6 +24,10 @@ set_tests_properties(calib_strings_too_long PROPERTIES PASS_REGULAR_EXPRESSION
 # option must put the whole run under the GPU lock (CPU-only; no build, no GPU).
 add_test(NAME tools_test_sh_selftest
          COMMAND bash "${PROJECT_SOURCE_DIR}/tools/test.sh" --self-test)
+# The memory-budget wrapper must not make tools/test.sh relaunch itself forever when there is no
+# systemd user manager (systemctl stubbed to fail). CPU-only.
+add_test(NAME tools_memcap_loop_check
+         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/memcap_loop_check.sh" "${PROJECT_SOURCE_DIR}")
 
 if(Python3_FOUND)
   # The host library and its C++ lowering vs spec/params.py on generated descriptors: the
@@ -106,7 +110,7 @@ if(Python3_FOUND)
   # guard), the manifest lint (gate G1), the resumable runner (kill -9, resume, time limits, copy-back) and the analyzer
   # (a damaged folder gives INVALID; the issue-11 folders reproduce their tables when they are on this machine).
   # CPU only, standard library, about 25 s in all.
-  foreach(t stats manifest runner analyze archgate)
+  foreach(t stats manifest runner analyze archgate summarize_tests)
     add_test(NAME campaign_${t}_selftest
              COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/campaign/test_${t}.py")
   endforeach()
@@ -115,6 +119,13 @@ if(Python3_FOUND)
   # from the A3 data where they are on this machine). CPU only.
   add_test(NAME bench_k4_fit_selftest
            COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/test_k4_fit.py")
+  # Issue 18 (docs/NOTES-18.md): the device-class rules (libimmerdink_host against spec/devices.py) and the
+  # coverage of every kernel launch site by the device-status check, with the K4 limits. CPU only.
+  add_test(NAME host_devices
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_devices.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>")
+  add_test(NAME device_kernel_sites
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/check_kernel_sites.py" "${PROJECT_SOURCE_DIR}")
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
                    "${IMD_GENERATED_INCLUDE}/immerdink/detail/constants.hpp"
@@ -212,6 +223,20 @@ if(Python3_FOUND)
     set_tests_properties(contract_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
+  # Committed output hashes (tests/data/output_hashes.json): the library's C on this GPU against
+  # hashes from the CPU oracle (small shapes) and from the RTX 4090 (large ones). The same file
+  # is checked on every shipped GPU. output_hashes_oracle recomputes the CPU hashes.
+  add_test(NAME output_hashes
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+  add_test(NAME output_hashes_oracle
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid --oracle)
+  add_test(NAME output_hashes_large
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags large)
+  set_tests_properties(output_hashes output_hashes_oracle output_hashes_large PROPERTIES
+                       RESOURCE_LOCK gpu TIMEOUT 900)
   foreach(suite lowering legality random fixtures robust highrank)
     add_test(NAME contract_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_frontend.py"
@@ -298,6 +323,15 @@ if(Python3_FOUND)
                    --suite plan -v)
   set_tests_properties(host_vs_plan PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
 
+  # The status of this GPU (imd_device_info, imd_plan_info), with lazy and with eager module loading.
+  add_test(NAME device_status
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_device_status.py"
+                   --lib "$<TARGET_FILE:immerdink>")
+  add_test(NAME device_status_eager
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_device_status.py"
+                   --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(device_status device_status_eager PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+  set_tests_properties(device_status_eager PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=EAGER")
   add_test(NAME python_harness
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/harness.py"
                    --lib "$<TARGET_FILE:immerdink>")

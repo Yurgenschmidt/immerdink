@@ -1172,6 +1172,17 @@ struct Bench {
     meta.str("data", o.decay_opp ? "decay_opp" : o.dominant ? "dominant" : "normal");
     meta.str("gpu", p.name).integer("sm_count", p.multiProcessorCount);
     meta.integer("l2_bytes", (long long)p.l2CacheSize);
+    {  // issue 18: the table set the library picked for this card, and the code its kernels run as
+      imd_device_info_t di{};
+      di.struct_size = sizeof di;
+      if (imd_device_info(imd, &di) == IMD_STATUS_SUCCESS) {
+        meta.str("device_match", imd_match_name(di.selection.match))
+            .str("device_code", imd_code_kind_name(di.code_kind))
+            .str("device_status", imd_plan_status_name(di.status))
+            .integer("device_cc", 10 * di.device.cc_major + di.device.cc_minor)
+            .integer("device_kernels", di.kernels_checked);
+      }
+    }
     meta.str("driver", sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null"));
     meta.integer("cuda_driver_api", drv).integer("cuda_runtime", rt);
 #ifdef IMD_BENCH_CUTENSOR

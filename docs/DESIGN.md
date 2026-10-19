@@ -1,4 +1,4 @@
-# immerdink — design (v1.19)
+# immerdink — design (v1.20)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -101,6 +101,7 @@ point: `imd_perf_calib_t` keeps its layout and size, but `param[95]` (the last s
 before) is now the optional key `warm.kl_drop` (§6c.9), so a hand-built `imd_perf_calib_t` must
 zero `param`.
 The change lists are at the end.
+v1.20 (§6h, issue 18, docs/NOTES-18.md) adds the device class, the table-set selection rule and the plan status on host API 14: what the library knows about the GPU it runs on, which fitted constants it uses for it, and whether it can run there at all. No semantic, layout, launch, pack-format or TLA+ change; results are bit-identical on every card that runs. Changed text is marked **[v1.20]**.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -5742,6 +5743,52 @@ cond = rho_hat[certified].max()     # over the outputs that must meet the target
 
 ---
 
+## 6h. Device class, table sets and plan status [v1.20] (issue 18; docs/NOTES-18.md, docs/SUPPORT.md)
+
+**Purpose.** The library was fitted on one card. A *table set* is the data fitted per architecture:
+the K4 cost table and its margin (host/k4_config.hpp `K4Table`), later the performance calibration. This
+section fixes how a card is described, which table set it gets, and what is reported. It changes no result.
+
+**6h.1 Device class** `imd_device_class_t` (host API 14): compute capability, SM count, L2 bytes, the largest
+dynamic shared memory per block (informational), name (63 characters). The device API reads it with
+`cudaDeviceGetAttribute` for the *current* device at plan creation and caches it per device; the handle's
+own device is not used.
+
+**6h.2 Selection** `imd_device_select` is a pure function of the class and a registry of rows
+`{table_id, cc, sm_count (0 = any), name_prefix}` (the built-in registry has one row: the RTX 4090,
+`IMD_TABLE_SM89`; `imd_device_select_rows` takes another registry). First match wins:
+1. `cc < 8.0`, or no rows: `UNSUPPORTED` (the kernels need `cp.async` and INT8 `mma.sync`).
+2. a row with the same cc, an equal SM count (or 0) and a name prefix of the card's name: `EXACT`.
+3. a row with the same cc: `ARCH`.
+4. a row with the same major: `GENERATION`, the one with the nearest minor, ties to the lower minor, then the earlier row.
+5. otherwise `DEFAULT`: the first row with cc 8.9 (else the first row).
+`approximate` is set unless the match is `EXACT`. A row is added only together with the data that fitted
+its table set. `spec/devices.py` is the reference; `tests/test_devices.py` compares the two on 63 756 synthetic
+cards, injected registries, and kills eight mutants of the rule.
+
+**6h.3 Kernel code kind.** For every kernel of the library (the 99 with an `IMD_PERF_KERNEL_*` id and 11 more:
+the K1 kernels and the large-mode instantiations; `tests/check_kernel_sites.py` fails if a launch site is not
+listed) `imd_device_info` calls `cudaFuncGetAttributes` once per device and classifies
+(`imd_kernel_code_kind`, version = 10 major + minor): call failed `UNUSABLE`; `binary == ptx == device` `NATIVE`;
+`binary == ptx < device` with the same major `COMPATIBLE`; `binary != ptx`, `binary == device`, `ptx < device`
+`RECOMPILED` (the driver compiled PTX; measured: binary 89, ptx 80); anything else `UNUSABLE`.
+
+**6h.4 Plan status** `imd_plan_status_of(match, worst code kind)`: `UNSUPPORTED` if the match is `UNSUPPORTED` or
+the code `UNUSABLE`; else `RECOMPILED` if the code is; else `APPROXIMATE` if the match is not `EXACT` or the code
+is `COMPATIBLE`; else `NATIVE`. `imd_plan_create` on an `UNSUPPORTED` device returns `NOT_SUPPORTED` (before
+issue 18 a foreign architecture gave `CUDA_ERROR` from K4's setup for an emulated plan and failed at the first
+`imd_contract` for the others). `imd_device_info` / `imd_plan_info` (immerdink.h) return the class, the
+selection, the worst code kind, the status, the first failing kernel and its CUDA error (209: no kernel
+image, 222: PTX newer than the driver), and for a plan its K4 configuration.
+
+**6h.5 Table set in the planner.** `imd_lowering_t` v7 has an input `table_id` next to `sm_count`; `imd_plan_create`
+runs `k4_select` with the plan's table set and SM count, so `imd_lowering(sm_count, table_id)` from the plan's
+`imd_plan_info` is the plan's configuration. The performance model (§6c) keeps the SM count of its
+calibration, which is per card (issue 23); for a borrowed table set the plan is `APPROXIMATE`.
+
+**6h.6 Limits.** At most `IMD_K4_CONFIG_COUNT` = 4 K4 configurations, each with launch parameters within
+`kK4BlobBytes` = 256 bytes. **Build.** `IMMERDINK_CUDA_ARCHS`, `IMMERDINK_EMBED_PTX` (CMakeLists.txt).
+
 ## 7. What was considered and rejected
 
 | Option | Why not |
@@ -6724,3 +6771,13 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
     cost on the real operands is TFLOPS-eq first with time alongside, tagged [M, model-only,
     outside hold-out]; the K-segmentation row names R2b. `bench/first_call.py` records the
     host API.
+
+## v1.20 (§6h device class, table sets and plan status; host API 14; no semantic, layout, launch, pack-format or TLA+ change)
+
+- Host API 14: `imd_device_class_t`, `imd_device_select[_rows]`, `imd_kernel_code_kind`, `imd_plan_status_of`, the
+  name functions, `IMD_TABLE_*`, `imd_lowering_t` v7 (`table_id`), `imd_device_info_t`. Device API:
+  `imd_device_info`, `imd_plan_info`. Python: `immerdink.device_info()`, `Plan.info`, `host.device_select`.
+- Behaviour: the first plan on a device checks every kernel (about 0.1 s, cached); an unusable device fails at plan
+  creation with `NOT_SUPPORTED`; an emulated plan on a foreign architecture no longer reports `CUDA_ERROR`.
+- Tests: `host_devices`, `device_kernel_sites`, `device_status`, `device_status_eager`; `tools/device_status_check.sh`
+  (three builds on the 4090: native, PTX-only, foreign architecture).
