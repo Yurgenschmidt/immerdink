@@ -29,9 +29,11 @@ the other phases, from the phase marks of the immerdink record; `R_K4 = ops/K4`;
 disagree and the case is INCONCLUSIVE).
 
 - `R_stock` = the best rate among the stock CUTLASS Hopper kernels (several tile and cluster shapes, `bench/ceiling`) that are bit-exact against a CPU reference, run on K4's launch
-  shape: per modulus m × n̂ × k̂, batch N·b in one launch, int8 output preferred (K4 stores 8-bit residues; int32 output pays four times the store traffic).
-- `R_ref = max(R_stock, R_cuBLASLt)` (cuBLASLt is a yardstick, never a fallback). `R_mma` = the synthetic `mma.sync` peak loop.
-- Noise haircut `u = max(0.05, spreads)`; if any spread involved is above 5 %, `u = max(0.10, spreads)`.
+  shape: per modulus m × n̂ × k̂, batch N·b in one launch, int8 output preferred (K4 stores 8-bit residues; int32 output pays four times the store traffic). The int8 exactness check is weak (with random data almost every
+  output saturates at ±127), so an int8 rate counts only for a variant that also ran bit-exact with int32 output on the same shape; otherwise the int32 rate is used.
+- `R_ref = max(best exact stock rate of any output type, R_cuBLASLt)` for the optimistic case O (cuBLASLt is a yardstick, never a fallback). `R_mma` = the synthetic `mma.sync` peak loop.
+- Noise haircut `u = max(0.05, spreads)`; if any spread involved (GEMMul8, immerdink phase record, xduel-imd, the chosen stock record, cuBLASLt) is above 5 %, `u = max(0.10, spreads)`.
+  A missing spread, or `u >= 1`, makes the case INCONCLUSIVE (a haircut of 100 % would otherwise turn noise into a pass).
 - Projection `Q(R, f) = s·(f·P + ops/R) / T*`; parity within 5 % means `Q ≤ 1.05`.
 
 Tests: **A** `R_stock/R_K4 ≥ 1.30`. **B** `Q(R_stock·(1−u), 0.67) ≤ 1.05`. **C** `0.9·R_mma` is below the rate at which `Q(R, 0.67) = 1.05` (so tuning `mma.sync` alone cannot reach it).
@@ -47,7 +49,11 @@ Invalid inputs: a stock configuration that fails to build or run, or is not bit-
 still follow from cuBLASLt alone. A missing shape gives INCONCLUSIVE unless the other shape already gives NO-GO.
 
 **H200** confirms and never vetoes by itself: its decision (role `confirm`) is PASS when `R_stock/R_K4 ≥ 1.2` at both shapes, FAIL below, INCONCLUSIVE without data. H100 GO plus an H200 FAIL
-is read as INCONCLUSIVE (an anomaly to understand). The two verdicts come from two job folders, so this reading is the analyst's, stated in the report.
+is read as INCONCLUSIVE (an anomaly to understand). The two verdicts come from two job folders, so this reading is **manual** (the analyst's, stated in the report); no code combines them.
+
+**Frozen rule.** Every parameter of the rule (`n`, `g8_n`, `s_min`, `s_max`, `u_floor`, `u_noisy`, `noisy_spread_pct`, the thresholds and `cases`, which must be sq4096 and sq8192) is in the decisions file, whose
+sha256 the manifest pins; the evaluator has no defaults for them (lint rejects a file without them). The evaluator code itself is the pinned commit's `bench/campaign/decisions.py`;
+the analysis report quotes the commit.
 With the issue-11 H100 numbers the thresholds mean: B needs about 1335 TOPS at 4096³ (1.40×) and 1288 at 8192³ (1.29×); NO-GO means the best rate is below about 1061 TOPS at 4096³ (1.11×) or 1097 at 8192³.
 
 ## What R1 records for this rule

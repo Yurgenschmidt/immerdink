@@ -51,8 +51,12 @@ REQUIRED = {
     "parity": {"exp": str, "file": str, "geomean_at_least": (int, float), "case_floor": (int, float)},
     "rate_projection": {"exp": str, "file": str, "xduel_exp": str, "xduel_file": str, "ceiling_exp": str, "ceiling_file": str,
                         "cases": list, "gain_go": (int, float), "pack_factor_go": (int, float), "pack_factor_opt": (int, float),
-                        "window": (int, float), "mma_margin": (int, float)},
+                        "window": (int, float), "mma_margin": (int, float),
+                        # every parameter of the rule is in the (hash-pinned) decisions file: no default in this code can change it
+                        "n": int, "g8_n": int, "s_min": (int, float), "s_max": (int, float), "u_floor": (int, float),
+                        "u_noisy": (int, float), "noisy_spread_pct": (int, float)},
 }
+RATE_CASES = ("sq4096", "sq8192")   # the cases of the wgmma rule, registered in docs/NOTES-16.md
 OPTIONAL = {
     "threshold": {"where": dict, "classes": list},
     "paired": {"where": dict, "method": str, "min_faster": int, "noisy_spread_pct": (int, float),
@@ -60,8 +64,7 @@ OPTIONAL = {
     "guard": {"where": dict, "floor": (int, float), "k": (int, float), "classes": list,
               "spread_field": str},
     "parity": {"a_family": str, "b_family": str, "exclude": list, "classes": list},
-    "rate_projection": {"n": int, "g8_n": int, "role": str, "confirm_gain": (int, float), "s_min": (int, float), "s_max": (int, float),
-                        "u_floor": (int, float), "u_noisy": (int, float), "noisy_spread_pct": (int, float), "classes": list},
+    "rate_projection": {"role": str, "confirm_gain": (int, float), "classes": list},
 }
 
 
@@ -127,6 +130,8 @@ def lint(path, experiments):
                     F.append(Finding("error", w, f"{key} {d.get(key)!r} is not in the manifest"))
                 elif isinstance(req, list) and d.get(key) not in req:
                     F.append(Finding("error", w, f"{key} must be listed in requires"))
+            if isinstance(d.get("cases"), list) and sorted(d["cases"]) != sorted(RATE_CASES):
+                F.append(Finding("error", w, f"cases must be exactly {list(RATE_CASES)}, the registered ones"))
             if d.get("role", "binding") not in ("binding", "confirm"):
                 F.append(Finding("error", w, "role must be binding or confirm"))
             if d.get("role") == "confirm" and "confirm_gain" not in d:
@@ -314,19 +319,24 @@ def _rate_projection(dec, ctx):
          s = T_imd / (P + K4) (the whole-call anchor; outside [s_min, s_max] the measurement is not trusted)
          Q(R, f) = s (f P + ops / R) / T*      (> window: the projected immerdink is slower than GEMMul8 fast by more than the window)
        T_imd and T* come from the interleaved xduel records (immerdink and GEMMul8 fast), R_stock is the best bit-exact stock
-       CUTLASS Hopper rate on K4's launch shape (m, n_hat, k_hat, batch N b; int8 output preferred), R_ref = max(R_stock, cuBLASLt),
-       u the noise haircut: max(u_floor, the spreads), or max(u_noisy, the spreads) if any spread is above noisy_spread_pct.
+       CUTLASS Hopper rate on K4's launch shape (m, n_hat, k_hat, batch N b; int8 output preferred, but only for a variant that also ran
+       bit-exact with int32 output), R_ref = max(best exact stock rate of any output type, cuBLASLt),
+       u the noise haircut: max(u_floor, the spreads of GEMMul8, immerdink, the stock and cuBLASLt records), or max(u_noisy, ...) if any
+       spread is above noisy_spread_pct; a missing spread, or u >= 1, makes the case INCONCLUSIVE. The xduel-imd record is the one written
+       right after the GEMMul8 record it was paired with. Every parameter is in the decisions file; `cases` must be sq4096 and sq8192.
          A  R_stock / R_K4 >= gain_go                       B  Q(R_stock (1 - u), pack_factor_go) <= window
          C  mma_margin R_mma_peak < the rate at which Q(R, pack_factor_go) = window (mma.sync tuning alone cannot reach it)
          O  Q(R_ref (1 + u), pack_factor_opt) <= window     (the optimistic case: if even this fails, wgmma cannot help)
        GO: A, B, C at every case with all inputs valid. NO-GO: O fails at some case. Else INCONCLUSIVE.
        role confirm (H200): PASS if R_stock / R_K4 >= confirm_gain at every case, FAIL if below, INCONCLUSIVE if data are missing."""
-    n_mod = dec.get("n", 14)
+    n_mod = dec["n"]
+    if sorted(dec["cases"]) != sorted(RATE_CASES):
+        return {"verdict": "INCONCLUSIVE", "reason": f"cases are not the registered {list(RATE_CASES)}", "details": {"cases": []}}
     sweep = ctx.jsonl(dec["exp"], dec["file"])
     xd = ctx.jsonl(dec["xduel_exp"], dec["xduel_file"])
     ce = ctx.jsonl(dec["ceiling_exp"], dec["ceiling_file"])
     role = dec.get("role", "binding")
-    s_lo, s_hi = dec.get("s_min", 0.95), dec.get("s_max", 1.08)
+    s_lo, s_hi = dec["s_min"], dec["s_max"]
     rows, why_inconclusive = [], []
     for case in dec["cases"]:
         row = {"case": case}
@@ -334,15 +344,24 @@ def _rate_projection(dec, ctx):
         rec = next((r for r in sweep if r.get("case") == case and r.get("method") == "imd" and r.get("N") == n_mod
                     and r.get("phases") and r.get("status", "ok") == "ok"), None)
         g8 = next((r for r in xd if r.get("case") == case and r.get("method") in ("gemmul8", "perm+gemmul8") and r.get("g8_mode") == "fast"
-                   and r.get("N") == dec.get("g8_n", 14) and r.get("status", "ok") == "ok" and _num(r.get("median_s"))), None)
-        im = next((r for r in xd if r.get("case") == case and r.get("method") == "xduel-imd" and r.get("status", "ok") == "ok"
-                   and _num(r.get("median_s"))), None)
+                   and r.get("N") == dec["g8_n"] and r.get("status", "ok") == "ok" and _num(r.get("median_s"))), None)
+        # the xduel-imd record is written right after the baseline record it was paired with: take the one that follows this GEMMul8 record
+        im = None
+        if g8 is not None:
+            for r in xd[xd.index(g8) + 1:]:
+                if r.get("case") == case and r.get("method") == "xduel-imd":
+                    im = r if r.get("status", "ok") == "ok" and _num(r.get("median_s")) else None
+                    break
         if rec is None or g8 is None or im is None:
             row["note"] = "missing: " + ", ".join(n for n, x in (("immerdink phase record", rec), ("GEMMul8 fast xduel record", g8),
                                                                    ("xduel-imd record", im)) if x is None)
             why_inconclusive.append(f"{case}: {row['note']}")
             continue
         ph = rec["phases"]
+        if not all(_num(v.get("ms")) is not None for v in ph.values()):
+            row["note"] = "a phase mark is not a number"
+            why_inconclusive.append(f"{case}: {row['note']}")
+            continue
         k4 = sum(v["ms"] for k, v in ph.items() if k.startswith("K4")) * 1e-3
         pk = sum(v["ms"] for k, v in ph.items() if not k.startswith("K4")) * 1e-3
         m, n, k, b = rec["m"], rec["n"], rec["k"], rec.get("b", 1)
@@ -350,23 +369,44 @@ def _rate_projection(dec, ctx):
         ops = 2.0 * n_mod * b * m * nh * kh
         scale = (im.get("N") or n_mod) / n_mod         # immerdink at another N for DGEMM-level accuracy: ops, P, K4 scale
         ops, k4, pk = ops * scale, k4 * scale, pk * scale
-        r_k4 = ops / k4 / 1e12
         t_imd, t_star = im["median_s"], g8["median_s"]
+        if not (k4 > 0 and pk > 0 and ops > 0 and t_imd > 0 and t_star > 0):
+            row["note"] = "a time or an operation count is not positive"
+            why_inconclusive.append(f"{case}: {row['note']}")
+            continue
+        r_k4 = ops / k4 / 1e12
         s_ = t_imd / (pk + k4)
-        spreads = [x for x in (_num(g8.get("spread_pct")), _num(im.get("spread_pct")), _num(rec.get("spread_pct"))) if x is not None]
+        sp3 = [_num(g8.get("spread_pct")), _num(im.get("spread_pct")), _num(rec.get("spread_pct"))]
+        spreads = [x for x in sp3 if x is not None]
         shape = (m, nh, kh, int(n_mod * b))
         match = [r for r in ce if r.get("status") == "ok" and (r.get("m"), r.get("n"), r.get("k"), r.get("batch", 1)) == shape
                  and r.get("exact") is True and _num(r.get("tops"))]
         stock = [r for r in match if str(r.get("variant", "")).startswith("hopper:")]
-        pref = [r for r in stock if r.get("out") == "i8"] or stock
+        # int8 output is what K4 stores, but its exactness check is weak (almost every output saturates): an int8 rate counts only if the same
+        # variant and shape also ran bit-exact with int32 output
+        i32_variants = {r["variant"] for r in stock if r.get("out") != "i8"}
+        pref = [r for r in stock if r.get("out") == "i8" and r["variant"] in i32_variants] or [r for r in stock if r.get("out") != "i8"]
         r_stock = max((r["tops"] for r in pref), default=None)
+        r_stock_any = max((r["tops"] for r in stock), default=None)      # best exact stock rate of any output type: the optimistic case's reference
         lt = [r for r in ce if r.get("status") == "ok" and r.get("variant") == "cublaslt" and (r.get("m"), r.get("n"), r.get("k")) == shape[:3]
               and r.get("exact") is True and _num(r.get("tops"))]
         r_lt = max((r["tops"] for r in lt), default=None)
         r_mma = max((r["tops"] for r in ce if r.get("variant") == "mma_peak" and r.get("status") == "ok" and _num(r.get("tops"))), default=None)
-        spreads += [x for r in pref for x in [_num(r.get("spread_pct"))] if x is not None and r["tops"] == r_stock]
-        noisy = any(x > dec.get("noisy_spread_pct", 5.0) for x in spreads)
-        u = max([dec.get("u_noisy", 0.10) if noisy else dec.get("u_floor", 0.05)] + [x / 100.0 for x in spreads])
+        if any(r.get("variant") == "mma_peak_check" and r.get("exact") is False for r in ce):
+            r_mma = None                                                 # the closed-form check of the synthetic peak failed
+        sp_of = lambda recs, top: [_num(r.get("spread_pct")) for r in recs if r["tops"] == top][:1]
+        sp3 += sp_of(pref, r_stock) + sp_of(lt, r_lt)
+        if any(x is None for x in sp3):
+            row["note"] = "a spread is missing: the noise haircut cannot be computed"
+            why_inconclusive.append(f"{case}: {row['note']}")
+            continue
+        spreads = sp3
+        noisy = any(x > dec["noisy_spread_pct"] for x in spreads)
+        u = max([dec["u_noisy"] if noisy else dec["u_floor"]] + [x / 100.0 for x in spreads])
+        if u >= 1.0:
+            row["note"] = f"a spread of {100 * u:.0f}% or more: the haircut would make the rate zero or negative"
+            why_inconclusive.append(f"{case}: {row['note']}")
+            continue
         row.update(ops=ops, k4_ms=k4 * 1e3, p_ms=pk * 1e3, r_k4=r_k4, t_imd_ms=t_imd * 1e3, tstar_ms=t_star * 1e3, s=s_, u=u,
                    r_stock=r_stock, r_cublaslt=r_lt, r_mma=r_mma, stock_out="i8" if pref and pref[0].get("out") == "i8" else "i32",
                    stock_configs=len(stock))
@@ -386,7 +426,7 @@ def _rate_projection(dec, ctx):
         row["r_needed"] = ops / den / 1e12 if den > 0 else None      # None: no K4 rate reaches the window with this pack/CRT time
         if r_mma is not None:
             row["C"] = row["r_needed"] is None or dec["mma_margin"] * r_mma < row["r_needed"]
-        r_ref = max([x for x in (r_stock, r_lt) if x is not None], default=None)
+        r_ref = max([x for x in (r_stock_any, r_lt) if x is not None], default=None)
         if r_ref is not None:
             row["q_opt"] = Q(r_ref * (1 + u), po)
             row["O"] = row["q_opt"] <= w
