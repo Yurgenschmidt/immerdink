@@ -54,6 +54,17 @@ constexpr K4Cost kK4Costs[kK4ConfigCount] = {
     {1424, {0, 505, 612, 0}},     // 64x128
     {1333, {0, 944, 1088, 802}},  // 64x64
 };
+// The H100 table (issue 20, docs/NOTES-20.md): the fit of bench/k4_fit.py on ALL the K4 phase marks of the R1 tile sweep of 2026-10-19 on an H100 (132 SMs; every (view, N) timed in all four
+// tiles, 70 of them, including the marks under 0.1 ms), under the same concurrency assumption as the 4090's (ctas_per_sm 1, 2, 2, 3). The table the pre-registered rule judged (marks under 0.1 ms
+// dropped) left the small tiles' round_ns unidentified and made 7 of 25 small views slower; this one does not (mean regret over all 70 groups 1.29% against 1.69% for the 4090 table on the
+// H100, 0.97% against 1.61% on the H200). It changes 7 picks against the 4090 table: r_mm N=14 (24 to 32% faster) and x512_32k N=8 (11% faster) are the ones that matter; the other five are
+// views of 0.01 to 0.03 ms (a few microseconds either way).
+constexpr K4Cost kK4CostsSm90[kK4ConfigCount] = {
+    {4393, {0, 263, 0, 0}},       // 128x256
+    {4554, {0, 497, 264, 0}},     // 128x128
+    {2487, {0, 626, 377, 0}},     // 64x128
+    {2064, {0, 1100, 726, 432}},  // 64x64
+};
 // A configuration other than IMD_K4_128x256 is chosen only if its estimate is below
 // (1000 - margin) / 1000 of 128x256's (model error and measurement noise).
 constexpr int64_t kK4MarginPermille = 50;
@@ -68,6 +79,10 @@ struct K4Table {
 };
 constexpr K4Table kK4Tables[IMD_TABLE_COUNT] = {
     {{kK4Costs[0], kK4Costs[1], kK4Costs[2], kK4Costs[3]},
+     {kK4Configs[0].ctas_per_sm, kK4Configs[1].ctas_per_sm, kK4Configs[2].ctas_per_sm,
+      kK4Configs[3].ctas_per_sm},
+     kK4MarginPermille},
+    {{kK4CostsSm90[0], kK4CostsSm90[1], kK4CostsSm90[2], kK4CostsSm90[3]},
      {kK4Configs[0].ctas_per_sm, kK4Configs[1].ctas_per_sm, kK4Configs[2].ctas_per_sm,
       kK4Configs[3].ctas_per_sm},
      kK4MarginPermille},

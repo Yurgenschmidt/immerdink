@@ -1179,6 +1179,7 @@ struct Bench {
         meta.str("device_match", imd_match_name(di.selection.match))
             .str("device_code", imd_code_kind_name(di.code_kind))
             .str("device_status", imd_plan_status_name(di.status))
+            .integer("device_table", di.table_id)
             .integer("device_cc", 10 * di.device.cc_major + di.device.cc_minor)
             .integer("device_kernels", di.kernels_checked);
       }

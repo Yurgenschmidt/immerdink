@@ -72,8 +72,8 @@ calibration. A registry row says which cards a set was fitted on:
 
 `{ table_id, cc (major*10+minor), sm_count (0 = any), name_prefix, K4 costs, calibration }`.
 
-Today there is one row: `{sm89_4090, 89, 128, "NVIDIA GeForce RTX 4090"}`. The rows for sm_90 (#20, #23),
-sm_120 (#24) are added by those issues. Until then a Hopper or Blackwell card gets the sm89 set. No row
+There are two rows: `{sm89_4090, 89, 128, "NVIDIA GeForce RTX 4090"}` and, since 2026-10-19, `{sm90_h100, 90, 132, "NVIDIA H100"}` (K4 costs fitted on the R1 tile sweep, issue 20; the
+performance calibration of that set is still the sm89 one until issue 23). A row for sm_120 (#24) is added by that issue. Until then a Blackwell card gets the sm89 set; an H200 gets the sm90 set by architecture match. No row
 may be added without the data that fitted it (the row names its calibration file and run).
 
 ### D3. Selection rule (pure function `imd_device_select(class) -> selection`)

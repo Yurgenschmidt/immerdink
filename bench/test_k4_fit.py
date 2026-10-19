@@ -67,6 +67,8 @@ class Model(unittest.TestCase):
             want = lw.k4_config
             got = K.pick(K.SHIPPED_TABLE, lw.m, lw.n_hat, lw.k_hat, N * lw.b, sms)
             self.assertEqual(got, want, (m, nh, kh, N, b, sms))
+            lw90 = host.lowering("ikl,jkl->ijl", {"i": m, "j": nh, "k": kh, "l": b}, N=N, g=0, sm_count=sms, table_id=1)
+            self.assertEqual(K.pick(K.SM90_TABLE, lw90.m, lw90.n_hat, lw90.k_hat, N * lw90.b, sms), lw90.k4_config, ("sm90", m, nh, kh, N, b, sms))
             n += 1
         self.assertGreater(n, 50)
 

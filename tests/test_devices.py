@@ -7,7 +7,7 @@ CPU only. Checks: the selection on a grid of synthetic cards (every compute capa
 nine SM counts, the real names of the shipped cards and names that are not) against the reference,
 once with the built-in rows and once with injected rows (a synthetic sm_120 row, a second sm_89 card, a
 sm_80 row, a table with name and SM wildcards); the named cases of the issue (RTX 4090 exact, RTX 6000 Ada
-arch, A100 / RTX 3090 generation, H100 default, a synthetic RTX 5090 default without and arch / exact with
+arch, A100 / RTX 3090 generation, H100 exact and H200 arch (sm90 row), a synthetic RTX 5090 default without and arch / exact with
 a sm_120 row, cc 7.5 unsupported); the kernel code classification, exhaustively over observed and invented
 versions; the plan status table; invalid arguments; and that each mutant of the reference rule (spec/devices.py
 MUTANTS) is told apart from the real one by the grid (the grid can fail).
@@ -124,8 +124,10 @@ def check_named(lib):
         (dev(8, 9, 142, "NVIDIA RTX 6000 Ada Generation"), None, ref.ARCH),
         (dev(8, 0, 108, "NVIDIA A100-SXM4-80GB"), None, ref.GENERATION),
         (dev(8, 6, 82, "NVIDIA GeForce RTX 3090"), None, ref.GENERATION),
-        (dev(9, 0, 132, "NVIDIA H100 80GB HBM3"), None, ref.DEFAULT),
-        (dev(9, 0, 132, "NVIDIA H200"), None, ref.DEFAULT),
+        (dev(9, 0, 132, "NVIDIA H100 80GB HBM3"), None, ref.EXACT),
+        (dev(9, 0, 132, "NVIDIA H100 PCIe"), None, ref.EXACT),
+        (dev(9, 0, 114, "NVIDIA H100 PCIe"), None, ref.ARCH),
+        (dev(9, 0, 132, "NVIDIA H200"), None, ref.ARCH),
         (dev(12, 0, 188, "NVIDIA RTX PRO 6000 Blackwell Server Edition"), None, ref.DEFAULT),
         (dev(12, 0, 170, "NVIDIA GeForce RTX 5090"), None, ref.DEFAULT),
         (dev(7, 5, 68, "NVIDIA GeForce RTX 2080 Ti"), None, ref.UNSUPPORTED),
