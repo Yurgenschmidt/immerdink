@@ -289,6 +289,185 @@ class Parity(unittest.TestCase):
         self.assertEqual(dc.evaluate(d, FakeCtx([rec]))["verdict"], "ADOPT")
 
 
+try:
+    import numpy  # noqa: F401
+    HAVE_NUMPY = True
+except ImportError:
+    HAVE_NUMPY = False
+
+
+@unittest.skipUnless(HAVE_NUMPY, "the tile fit needs numpy (an environment without it gets INCONCLUSIVE, not an error)")
+class TileRefit(unittest.TestCase):
+    """The tile_refit decision (issue 20): bench/k4_fit.py on imd_bench-style records of a forced-tile sweep."""
+
+    DEC = {"id": "k4-tiles", "kind": "tile_refit", "requires": ["tiles"], "exp": "tiles", "file": "sweep.jsonl"}
+
+    @staticmethod
+    def records(truth, sms=132, noise=0.01, seed=1):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        import k4_fit as K
+        import test_k4_fit as T
+        out = []
+        for o in T.synth(truth, sms, noise, seed):
+            out.append({"case": o.case, "N": o.N, "k4_config": o.cfg, "sm_count": sms, "status": "ok",
+                        "phase_view": f"{o.m}x{o.nh}x{o.kh} b={o.b} n_hat={o.nh} k_hat={o.kh}",
+                        "phases": {"K4 gemm": {"ms": o.ms}}})
+        return out
+
+    def test_shipped_constants_keep(self):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import k4_fit as K
+        v = dc.evaluate(self.DEC, FakeCtx(self.records(K.SHIPPED_TABLE)))
+        self.assertEqual(v["verdict"], "KEEP", v)
+
+    def test_a_card_with_cheap_small_tiles_adopts(self):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import k4_fit as K
+        truth = K.Table([(2716, (418,)), (1500, (300, 300)), (700, (350, 400)), (500, (500, 560, 450))])
+        v = dc.evaluate(self.DEC, FakeCtx(self.records(truth)))
+        self.assertEqual(v["verdict"], "ADOPT", v)
+        self.assertIn("table", v["details"])
+
+    def test_two_cards_in_one_file_are_inconclusive(self):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import k4_fit as K
+        recs = self.records(K.SHIPPED_TABLE)
+        recs[0]["sm_count"] = 188
+        self.assertEqual(dc.evaluate(self.DEC, FakeCtx(recs))["verdict"], "INCONCLUSIVE")
+SHAPES = {  # case: (m=n=k, K4 ms, P ms, T* ms) from the H100 run of issue 11
+    "sq4096": (4096, 2.02, 1.23, 2.23), "sq8192": (8192, 15.5, 4.57, 14.9)}
+
+
+def rp_inputs(stock, lt=None, mma=1200.0, s=0.99, exact=True, spread=1.0, g8_spread=1.0, drop=(), i32=None):
+    """Records for the rate_projection decision from the H100 numbers; stock/lt are TOPS per case."""
+    sweep, xd, ce = [], [], []
+    for case, (d, k4, pk, ts) in SHAPES.items():
+        if case in drop:
+            continue
+        sweep.append({"case": case, "method": "imd", "N": 14, "status": "ok", "m": d, "n": d, "k": d, "b": 1, "k_hat": d,
+                      "spread_pct": spread, "phases": {"K4 gemm": {"ms": k4}, "KL A": {"ms": pk / 2}, "K5 crt": {"ms": pk / 2}}})
+        xd.append({"case": case, "method": "gemmul8", "g8_mode": "fast", "N": 14, "status": "ok", "median_s": ts * 1e-3, "spread_pct": g8_spread})
+        xd.append({"case": case, "method": "xduel-imd", "N": 14, "status": "ok", "median_s": s * (k4 + pk) * 1e-3, "spread_pct": spread})
+        ce.append({"variant": "hopper:128x256x128:1x2x1:coop", "status": "ok", "m": d, "n": d, "k": d, "batch": 14, "out": "i8",
+                   "tops": stock[case], "exact": exact, "spread_pct": spread})
+        if i32 is not False:
+            ce.append({"variant": "hopper:128x256x128:1x2x1:coop", "status": "ok", "m": d, "n": d, "k": d, "batch": 14, "out": "i32",
+                       "tops": stock[case] * 0.9 if i32 is None else i32[case], "exact": exact, "spread_pct": spread})
+        if lt:
+            ce.append({"variant": "cublaslt", "status": "ok", "m": d, "n": d, "k": d, "batch": 1, "out": "i32", "tops": lt[case],
+                       "exact": True, "spread_pct": 1.0})
+    ce.append({"variant": "mma_peak", "status": "ok", "tops": mma, "exact": None})
+    return sweep, xd, ce
+
+
+class RpCtx:
+    def __init__(self, sweep, xd, ce):
+        self.d = {"s.jsonl": sweep, "x.jsonl": xd, "c.jsonl": ce}
+        self.base_dir = "."
+
+    def jsonl(self, exp, file):
+        return self.d[file]
+
+
+RP = {"id": "wgmma", "kind": "rate_projection", "requires": ["s", "x", "c"], "exp": "s", "file": "s.jsonl", "xduel_exp": "x",
+      "xduel_file": "x.jsonl", "ceiling_exp": "c", "ceiling_file": "c.jsonl", "cases": ["sq4096", "sq8192"], "gain_go": 1.3,
+      "pack_factor_go": 0.67, "pack_factor_opt": 0.5, "window": 1.05, "mma_margin": 0.9, "n": 14, "g8_n": 14, "s_min": 0.95, "s_max": 1.08,
+      "u_floor": 0.05, "u_noisy": 0.10, "noisy_spread_pct": 5.0}
+
+
+def lint_rp(dec):
+    """Lint findings (errors) of a one-decision file."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "d.toml")
+        with open(path, "w") as f:
+            f.write("[[decision]]\n" + "".join(f"{k} = {json.dumps(v)}\n" for k, v in dec.items()))
+        return [x for x in dc.lint(path, {"s": {}, "x": {}, "c": {}}) if x.level == "error"]
+
+
+class RateProjection(unittest.TestCase):
+    def verdict(self, *a, dec=RP, **kw):
+        return dc.evaluate(dec, RpCtx(*rp_inputs(*a, **kw)))
+
+    def test_go_inconclusive_nogo(self):
+        v = self.verdict({"sq4096": 2000.0, "sq8192": 2000.0})
+        self.assertEqual(v["verdict"], "GO", v)
+        self.assertAlmostEqual(v["details"]["cases"][0]["r_k4"], 952, delta=5)
+        v = self.verdict({"sq4096": 1100.0, "sq8192": 1100.0})             # gain 1.15 / 1.11: below the GO gain, optimistic case holds
+        self.assertEqual(v["verdict"], "INCONCLUSIVE", v)
+        v = self.verdict({"sq4096": 800.0, "sq8192": 800.0}, lt={"sq4096": 850.0, "sq8192": 850.0})
+        self.assertEqual(v["verdict"], "NO-GO", v)
+
+    def test_projection_not_gain_decides_at_4096(self):
+        v = self.verdict({"sq4096": 1300.0, "sq8192": 2000.0})            # gain 1.37 at 4096 but the 5 % window is missed (B)
+        c = v["details"]["cases"][0]
+        self.assertTrue(c["A"] and not c["B"], c)
+        self.assertEqual(v["verdict"], "INCONCLUSIVE")
+
+    def test_mma_peak_high_means_tuning_may_suffice(self):
+        v = self.verdict({"sq4096": 2000.0, "sq8192": 2000.0}, mma=1900.0)  # mma.sync alone could reach the needed rate: C fails
+        self.assertEqual(v["verdict"], "INCONCLUSIVE", v)
+        self.assertFalse(v["details"]["cases"][0]["C"])
+
+    def test_noise_haircut(self):
+        v = self.verdict({"sq4096": 1500.0, "sq8192": 1500.0}, spread=1.0)
+        noisy = self.verdict({"sq4096": 1500.0, "sq8192": 1500.0}, spread=30.0)
+        self.assertLess(v["details"]["cases"][0]["u"], noisy["details"]["cases"][0]["u"])
+        self.assertGreaterEqual(noisy["details"]["cases"][0]["u"], 0.30)
+
+    def test_invalid_inputs_never_go(self):
+        self.assertEqual(self.verdict({"sq4096": 2000.0, "sq8192": 2000.0}, exact=False)["verdict"], "INCONCLUSIVE")   # no exact stock rate
+        self.assertEqual(self.verdict({"sq4096": 2000.0, "sq8192": 2000.0}, s=1.3)["verdict"], "INCONCLUSIVE")        # anchor off
+        self.assertEqual(self.verdict({"sq4096": 2000.0, "sq8192": 2000.0}, drop=("sq8192",))["verdict"], "INCONCLUSIVE")
+        # a missing shape does not hide a NO-GO at the other one
+        v = self.verdict({"sq4096": 700.0, "sq8192": 700.0}, lt={"sq4096": 700.0, "sq8192": 700.0}, drop=("sq8192",))
+        self.assertEqual(v["verdict"], "NO-GO", v)
+
+    def test_registered_cases_only(self):
+        for cases in ([], ["sq4096"], ["sq4096", "sq8192", "sq1024"]):
+            v = self.verdict({"sq4096": 2000.0, "sq8192": 2000.0}, dec=dict(RP, cases=cases))
+            self.assertEqual(v["verdict"], "INCONCLUSIVE", (cases, v))
+        self.assertTrue(any("registered" in str(f) for f in lint_rp(dict(RP, cases=[]))))
+
+    def test_huge_spread_is_not_a_pass(self):
+        # a spread of 100 % or more must not turn the haircut into a negative rate (and a GO)
+        v = self.verdict({"sq4096": 1500.0, "sq8192": 1500.0}, spread=130.0)
+        self.assertEqual(v["verdict"], "INCONCLUSIVE", v)
+        v = self.verdict({"sq4096": 2000.0, "sq8192": 2000.0}, g8_spread=100.0)
+        self.assertEqual(v["verdict"], "INCONCLUSIVE", v)
+
+    def test_missing_spread_is_not_zero(self):
+        sweep, xd, ce = rp_inputs({"sq4096": 2000.0, "sq8192": 2000.0})
+        for r in sweep:
+            r.pop("spread_pct")
+        self.assertEqual(dc.evaluate(RP, RpCtx(sweep, xd, ce))["verdict"], "INCONCLUSIVE")
+
+    def test_int8_rate_needs_an_exact_int32_twin(self):
+        # int8 only (no int32 run of the variant): the saturated int8 check alone is not trusted
+        v = self.verdict({"sq4096": 2000.0, "sq8192": 2000.0}, i32=False)
+        self.assertEqual(v["verdict"], "INCONCLUSIVE", v)
+        # the optimistic case uses the best exact stock rate of any output type: a fast int32 record prevents a false NO-GO
+        v = self.verdict({"sq4096": 800.0, "sq8192": 800.0}, i32={"sq4096": 2000.0, "sq8192": 2000.0})
+        self.assertNotEqual(v["verdict"], "NO-GO", v)
+
+    def test_xduel_imd_is_the_one_after_its_baseline(self):
+        sweep, xd, ce = rp_inputs({"sq4096": 2000.0, "sq8192": 2000.0})
+        other = dict(next(r for r in xd if r["method"] == "gemmul8" and r["case"] == "sq4096"), g8_mode="exact", median_s=1.0)
+        stray = dict(next(r for r in xd if r["method"] == "xduel-imd" and r["case"] == "sq4096"), median_s=9.0)
+        xd2 = [other, stray] + xd                      # a stray record of another pairing in front of the right pair
+        self.assertEqual(dc.evaluate(RP, RpCtx(sweep, xd2, ce))["verdict"], "GO")
+
+    def test_registered_parameters_are_required(self):
+        d = {k: v for k, v in RP.items() if k != "s_max"}
+        self.assertTrue(any("missing s_max" in str(f) for f in lint_rp(d)))
+
+    def test_confirm_role(self):
+        d = dict(RP, role="confirm", confirm_gain=1.2)
+        self.assertEqual(self.verdict({"sq4096": 1300.0, "sq8192": 1300.0}, dec=d)["verdict"], "PASS")
+        self.assertEqual(self.verdict({"sq4096": 1000.0, "sq8192": 1300.0}, dec=d)["verdict"], "FAIL")
+        self.assertEqual(self.verdict({"sq4096": 1300.0, "sq8192": 1300.0}, drop=("sq8192",), dec=d)["verdict"], "INCONCLUSIVE")
+
+
 @unittest.skipUnless(os.path.isdir(GOLDEN), "the issue-11 result folders are not on this machine")
 class ParityGolden(unittest.TestCase):
     """The parity gate on the issue-11 comparison records gives the numbers of the tracking issue: geometric mean over 16

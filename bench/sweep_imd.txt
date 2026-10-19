@@ -5,6 +5,7 @@ s256    | ik,jk->ij | i=256,j=256,k=256      | imd | 8,14 |
 s512    | ik,jk->ij | i=512,j=512,k=512      | imd | 8,14 |
 s_cc16  | kjbc,kiac->abij | i=16,j=16,k=16,a=96,b=96,c=96 | imd | 8,14 |
 sq1024  | ik,jk->ij | i=1024,j=1024,k=1024   | imd | 8,14 |
+sq2048  | ik,jk->ij | i=2048,j=2048,k=2048   | imd | 8,14 |
 sq4096  | ik,jk->ij | i=4096,j=4096,k=4096   | imd | 8,14 |
 sq8192  | ik,jk->ij | i=8192,j=8192,k=8192   | imd | 8,14 | --max-seconds 6
 r_lowk  | ik,jk->ij | i=8192,j=8192,k=1024   | imd | 8,14 |

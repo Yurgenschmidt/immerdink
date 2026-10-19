@@ -1577,10 +1577,15 @@ imd_status_t enqueue_pack(const ExecPlan& p, const PackLayout& pl, const double*
 // ---- v1.10 (DESIGN §6c.1): occupancy of every kernel for the performance-model calibration --
 namespace {
 
+// The code version of the kernel the last occupancy_of call on this thread looked at (issue 18:
+// kernel_versions); set whenever cudaFuncGetAttributes succeeded.
+thread_local int32_t g_last_binary = 0, g_last_ptx = 0;
+
 template <class Kernel>
 cudaError_t occupancy_of(Kernel kernel, int threads, int32_t* out) {
   cudaFuncAttributes a{};
   cudaError_t e = cudaFuncGetAttributes(&a, reinterpret_cast<const void*>(kernel));
+  if (e == cudaSuccess) g_last_binary = a.binaryVersion, g_last_ptx = a.ptxVersion;
   int r = 0;
   if (e == cudaSuccess) e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&r, kernel, threads, 0);
   if (e != cudaSuccess) return e;
@@ -1632,6 +1637,44 @@ cudaError_t kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out) {
     case 3: return pack_occupancy<3>(kernel, out);
     default: return cudaErrorInvalidValue;
   }
+}
+
+namespace {
+template <class Kernel>
+cudaError_t versions_of(Kernel kernel, int32_t* binary, int32_t* ptx) {
+  cudaFuncAttributes a{};
+  const cudaError_t e = cudaFuncGetAttributes(&a, reinterpret_cast<const void*>(kernel));
+  if (e == cudaSuccess) *binary = a.binaryVersion, *ptx = a.ptxVersion;
+  return e;
+}
+}  // namespace
+
+// The launches that have no IMD_PERF_KERNEL_* id: the K1 kernels and the instantiations for more
+// than kK0SmallModes modes (tests/check_kernel_sites.py keeps this list complete).
+cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) {
+  switch (index) {
+    case 0: return versions_of(k0_vec<kK0MaxModes>, binary, ptx);
+    case 1: return versions_of(kf_scale_pack<kK0MaxModes, 16, 2>, binary, ptx);
+    case 2: return versions_of(kf_scale_pack<kK0MaxModes, 16, 3>, binary, ptx);
+    case 3: return versions_of(kf_scale_pack<kK0MaxModes, 4, 2>, binary, ptx);
+    case 4: return versions_of(kf_scale_pack<kK0MaxModes, 4, 3>, binary, ptx);
+    case 5: return versions_of(kp_prep<kK0MaxModes>, binary, ptx);
+    case 6: return versions_of(k1_tiled<1024>, binary, ptx);
+    case 7: return versions_of(k1_tiled<kThreads>, binary, ptx);
+    case 8: return versions_of(k1_scale<512>, binary, ptx);
+    case 9: return versions_of(k1_scale<1024>, binary, ptx);
+    case 10: return versions_of(k1_scale<kThreads>, binary, ptx);
+    default: return cudaErrorInvalidValue;
+  }
+}
+
+cudaError_t kernel_versions(int32_t kernel, int32_t w, int32_t* binary, int32_t* ptx) {
+  int32_t row[4];
+  g_last_binary = g_last_ptx = 0;
+  const cudaError_t e = kernel_occupancy_w(kernel, w, row);
+  if (e != cudaSuccess) return e;
+  *binary = g_last_binary, *ptx = g_last_ptx;
+  return cudaSuccess;
 }
 
 cudaError_t kernel_occupancy(int32_t kernel, int32_t* out) {

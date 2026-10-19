@@ -170,7 +170,7 @@ def check_single(rng, lib, cals, cases, verbose):
         n_err += a[0] == "err"
         same(outcome(lambda: q.plan_bytes(N, g, vec, **fo)),
              outcome(lambda: host.plan_bytes(descs, **kw)), what + " plan_bytes")
-        sms = rng.choice((0, 0, 46, 128, 132))
+        sms = rng.choice((0, 0, 46, 128, 132, 188))
         lw = q.lowering(N, g, vec, sm_count=sms, **fo)
         hl = host.lowering(descs, sm_count=sms, **kw)
         same(lw.to_lowering(), hl, what + " lowering")
