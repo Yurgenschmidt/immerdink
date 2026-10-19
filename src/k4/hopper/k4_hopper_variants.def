@@ -1,0 +1,19 @@
+// The variants of src/k4/hopper/k4_hopper_proto.cu, one per line (X-macro):
+//   K4H_VARIANT(name, tile M, tile N, tile K, cluster M, cluster N, schedule, add-mod?, fast epilogue?)
+// "g_": the generic epilogue (any TiledMma); "f_": the fast epilogue (quad-transposed 128-bit stores, needs the
+// wgmma accumulator order). tools/check_hopper_variants.sh compiles each one on its own for sm_90a.
+K4H_VARIANT(g_128x256x128_1x2_coop_store, 128, 256, 128, 1, 2, Coop, false, false)
+K4H_VARIANT(g_128x256x128_1x2_coop_add, 128, 256, 128, 1, 2, Coop, true, false)
+K4H_VARIANT(g_128x256x128_1x1_coop_store, 128, 256, 128, 1, 1, Coop, false, false)
+K4H_VARIANT(g_128x128x128_2x1_coop_store, 128, 128, 128, 2, 1, Coop, false, false)
+K4H_VARIANT(g_128x128x128_1x1_ping_store, 128, 128, 128, 1, 1, Ping, false, false)
+K4H_VARIANT(g_128x256x64_1x2_coop_store, 128, 256, 64, 1, 2, Coop, false, false)
+K4H_VARIANT(g_256x128x128_2x1_coop_store, 256, 128, 128, 2, 1, Coop, false, false)
+K4H_VARIANT(f_128x256x128_1x2_coop_store, 128, 256, 128, 1, 2, Coop, false, true)
+K4H_VARIANT(f_128x256x128_1x2_coop_add, 128, 256, 128, 1, 2, Coop, true, true)
+K4H_VARIANT(f_128x256x128_1x1_coop_store, 128, 256, 128, 1, 1, Coop, false, true)
+K4H_VARIANT(f_128x128x128_2x1_coop_store, 128, 128, 128, 2, 1, Coop, false, true)
+K4H_VARIANT(f_128x128x128_2x1_coop_add, 128, 128, 128, 2, 1, Coop, true, true)
+K4H_VARIANT(f_128x128x128_1x1_ping_store, 128, 128, 128, 1, 1, Ping, false, true)
+K4H_VARIANT(f_128x256x64_1x2_coop_store, 128, 256, 64, 1, 2, Coop, false, true)
+K4H_VARIANT(f_256x128x128_2x1_coop_store, 256, 128, 128, 2, 1, Coop, false, true)
