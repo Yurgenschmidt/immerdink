@@ -115,6 +115,13 @@ if(Python3_FOUND)
              COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/campaign/test_${t}.py")
   endforeach()
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
+  # Issue 18 (docs/NOTES-18.md): the device-class rules (libimmerdink_host against spec/devices.py) and the
+  # coverage of every kernel launch site by the device-status check, with the K4 limits. CPU only.
+  add_test(NAME host_devices
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_devices.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>")
+  add_test(NAME device_kernel_sites
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/check_kernel_sites.py" "${PROJECT_SOURCE_DIR}")
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
                    "${IMD_GENERATED_INCLUDE}/immerdink/detail/constants.hpp"
@@ -312,6 +319,15 @@ if(Python3_FOUND)
                    --suite plan -v)
   set_tests_properties(host_vs_plan PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
 
+  # The status of this GPU (imd_device_info, imd_plan_info), with lazy and with eager module loading.
+  add_test(NAME device_status
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_device_status.py"
+                   --lib "$<TARGET_FILE:immerdink>")
+  add_test(NAME device_status_eager
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_device_status.py"
+                   --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(device_status device_status_eager PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+  set_tests_properties(device_status_eager PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=EAGER")
   add_test(NAME python_harness
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/harness.py"
                    --lib "$<TARGET_FILE:immerdink>")

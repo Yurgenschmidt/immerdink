@@ -11,7 +11,7 @@ import threading
 
 from . import host
 
-API_VERSION = 5  # IMD_HOST_API_VERSION needed: packed operands (§6b)
+API_VERSION = 14  # IMD_HOST_API_VERSION needed: packed operands (§6b)
 
 
 class Tensor(C.Structure):          # imd_tensor_t
@@ -42,7 +42,26 @@ class Operand(C.Structure):         # imd_operand_t
                 ("pack", C.c_void_p)]
 
 
+class DeviceClass(C.Structure):      # imd_device_class_t (host API 14)
+    _fields_ = [("struct_size", C.c_uint32), ("cc_major", C.c_int32), ("cc_minor", C.c_int32),
+                ("sm_count", C.c_int32), ("reserved", C.c_int32), ("l2_bytes", C.c_uint64),
+                ("smem_optin_bytes", C.c_uint64), ("name", C.c_char * 64)]
+
+
+class DeviceSelection(C.Structure):  # imd_device_selection_t
+    _fields_ = [("struct_size", C.c_uint32), ("match", C.c_int32), ("table_id", C.c_int32),
+                ("row_index", C.c_int32), ("approximate", C.c_int32), ("reserved", C.c_int32)]
+
+
+class DeviceInfo(C.Structure):       # imd_device_info_t
+    _fields_ = [("struct_size", C.c_uint32), ("device", DeviceClass), ("selection", DeviceSelection),
+                ("code_kind", C.c_int32), ("status", C.c_int32), ("failing_kernel", C.c_int32),
+                ("cuda_error", C.c_int32), ("kernels_checked", C.c_int32), ("k4_config", C.c_int32),
+                ("table_id", C.c_int32), ("reserved", C.c_int32)]
+
+
 assert C.sizeof(Tensor) == 32 and C.sizeof(Options) == 24
+assert C.sizeof(DeviceClass) == 104 and C.sizeof(DeviceSelection) == 24 and C.sizeof(DeviceInfo) == 168
 assert C.sizeof(PackDesc) == 72 and C.sizeof(Packing) == 16 and C.sizeof(Operand) == 32
 
 _T, _O, _P = C.POINTER(Tensor), C.POINTER(Options), C.c_void_p
@@ -54,6 +73,8 @@ SIGNATURES = {
     "imd_destroy": (C.c_int, [_P]),
     "imd_plan_create": (C.c_int, [_P, _T, _T, _T, _O, C.POINTER(C.c_void_p)]),
     "imd_plan_destroy": (C.c_int, [_P]),
+    "imd_device_info": (C.c_int, [_P, C.POINTER(DeviceInfo)]),
+    "imd_plan_info": (C.c_int, [_P, C.POINTER(DeviceInfo)]),
     "imd_plan_device_bytes": (C.c_int, [_P, _SZ]),
     "imd_contract": (C.c_int, [_P, C.c_double, _P, _P, C.c_double, _P, _P, C.c_size_t, _P]),
     "imd_pack_create": (C.c_int, [_P, C.POINTER(PackDesc), C.POINTER(C.c_void_p)]),
@@ -69,6 +90,9 @@ SIGNATURES = {
     "imd_workspace_size": (C.c_int, [_T, _T, _T, _O, _SZ]),
     "imd_workspace_size_packed": (C.c_int, [_T, _T, _T, _O, C.POINTER(Packing), _SZ]),
     "imd_plan_bytes": (C.c_int, [_T, _T, _T, _O, _SZ, _SZ]),
+    "imd_match_name": (C.c_char_p, [C.c_int32]),
+    "imd_code_kind_name": (C.c_char_p, [C.c_int32]),
+    "imd_plan_status_name": (C.c_char_p, [C.c_int32]),
 }
 
 

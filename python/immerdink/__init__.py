@@ -18,6 +18,6 @@ from .device import (  # noqa: F401
     AliasingError, AllocFailedError, CudaError, DeviceArray, Handle, ImmerdinkError,
     InsufficientWorkspaceError, InvalidValueError, Layout, MisalignedError, NotSupportedError,
     Pack, PackedBuffer, PackMismatchError, PackRecord, Plan, PlanCache, contract,
-    default_handle, default_plan_cache, get_cai_stream_policy, load_library, pack_spec,
+    DeviceInfo, default_handle, default_plan_cache, device_info, get_cai_stream_policy, load_library, pack_spec,
     set_cai_stream_policy, workspace_size)
 from .host import PackSpec  # noqa: F401

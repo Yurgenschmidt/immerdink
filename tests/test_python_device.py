@@ -291,7 +291,7 @@ def run_plan(cuda, shim, spec, ext, strides=None, kinds=("cai", "cai", "cai"), a
 def test_capi_declares_every_function():
     hdr = open(os.path.join(ROOT, "include", "immerdink", "immerdink.h")).read()
     names = set(re.findall(r"IMD_API\s+imd_status_t\s+(\w+)\s*\(", hdr))
-    assert len(names) == 12 and names <= set(_capi.SIGNATURES), names - set(_capi.SIGNATURES)
+    assert len(names) == 14 and names <= set(_capi.SIGNATURES), names - set(_capi.SIGNATURES)
     for n in ("imd_tensor_t", "imd_options_t", "imd_operand_t"):
         assert n in hdr or n in open(os.path.join(ROOT, "include", "immerdink",
                                                   "immerdink_host.h")).read()

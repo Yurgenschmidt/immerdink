@@ -141,6 +141,9 @@ struct imd_plan_st {
   // v1.7 (§6b): the compatibility key of the caller's A / B slot (empty: packed in-line),
   // copied at creation; imd_contract_packed compares the handle it is given with it.
   std::vector<int64_t> slot_key[2];
+  // Issue 18: the device the plan was made for, its table-set selection, the code kinds of the
+  // library's kernels there and the plan's K4 configuration (imd_plan_info).
+  imd_device_info_t info{};
 
   imd_plan_st(const imd_options_t& o, const imd::detail::Lowered& lw, const imd_tensor_t& a,
               const imd_tensor_t& b, const imd_tensor_t& c)

@@ -3,6 +3,7 @@
 // libimmerdink_host's (src/host/analysis.hpp, DESIGN §6a), the code behind
 // imd_workspace_size and the host queries; this file adds the device-side plan parts.
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <vector>
@@ -10,6 +11,7 @@
 #include <cuda_runtime_api.h>
 
 #include "host/analysis.hpp"
+#include "device_state.hpp"
 #include "host/checked.hpp"
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink.h"
@@ -112,6 +114,31 @@ imd_status_t imd_destroy(imd_handle_t handle) {
   return IMD_STATUS_SUCCESS;
 }
 
+imd_status_t imd_device_info(imd_handle_t handle, imd_device_info_t* info) {
+  if (handle == nullptr || info == nullptr || info->struct_size < sizeof(imd_device_info_t))
+    return IMD_STATUS_INVALID_VALUE;
+  int device = 0;
+  imd_device_info_t r;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      imd::detail::device_state(device, &r) != cudaSuccess) {
+    cudaGetLastError();
+    return IMD_STATUS_CUDA_ERROR;
+  }
+  const auto caller_size = info->struct_size;   // a caller built against a later header keeps its own size field
+  std::memcpy(info, &r, sizeof r);
+  info->struct_size = caller_size;
+  return IMD_STATUS_SUCCESS;
+}
+
+imd_status_t imd_plan_info(imd_plan_t plan, imd_device_info_t* info) {
+  if (plan == nullptr || info == nullptr || info->struct_size < sizeof(imd_device_info_t))
+    return IMD_STATUS_INVALID_VALUE;
+  const auto caller_size = info->struct_size;
+  std::memcpy(info, &plan->info, sizeof plan->info);
+  info->struct_size = caller_size;
+  return IMD_STATUS_SUCCESS;
+}
+
 }  // extern "C"
 
 namespace {
@@ -148,18 +175,28 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
     p->slot_key[1] = an.packed.key[1];
     imd::detail::ExecPlan& e = p->exec;
     e = std::move(pd);
+    // Issue 18: the device class and the kind of code the library's kernels run as on it. An
+    // unusable device fails here, at plan creation, with NOT_SUPPORTED (info: imd_device_info).
+    // A plan of an empty GEMM touches no CUDA (imd_contract returns SUCCESS without a device): no device query, no probe, info stays zero.
     if (e.path != imd::detail::Path::kNoop) {
       int device = 0;
-      if (cudaGetDevice(&device) != cudaSuccess ||
-          cudaDeviceGetAttribute(&e.sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+      if (cudaGetDevice(&device) != cudaSuccess) {
         cudaGetLastError();
         return IMD_STATUS_CUDA_ERROR;
       }
+      if (imd::detail::device_state(device, &p->info) != cudaSuccess) {
+        cudaGetLastError();
+        return IMD_STATUS_CUDA_ERROR;
+      }
+      if (p->info.status == IMD_PLAN_UNSUPPORTED) return IMD_STATUS_NOT_SUPPORTED;
+      e.sms = p->info.device.sm_count;
+    } else {
+      p->info.struct_size = sizeof p->info;
     }
     if (emulated) {  // §4 / §6 v1.2: every K4 launch shape's parameters, built here once
       // v1.5: the K4 configuration. libimmerdink_host's rule for this device's SM count (what
       // imd_lowering reports for sm_count = e.sms), or the fastest one timed (k4_tune).
-      e.k4_config = imd::detail::k4_select(e, e.sms);
+      e.k4_config = imd::detail::k4_select(e, e.sms, p->info.table_id);
       if (imd::detail::k4_config_override() >= 0) {
         e.k4_config = imd::detail::k4_config_override();  // test / benchmark hook only
       } else if (an.options.k4_tune == IMD_K4_TUNE_ON) {
@@ -170,6 +207,7 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
       if (const imd_status_t st = imd::detail::k4_prepare(e, e.k4_config, &e.k4);
           st != IMD_STATUS_SUCCESS)
         return st;
+      p->info.k4_config = e.k4_config;
     }
     if (e.path != imd::detail::Path::kNoop && an.options.vec_mode == IMD_VEC_RESIDENT) {
       // §4 K0 v1.2 IMD_VEC_RESIDENT: build the vectors once in plan-owned device memory
