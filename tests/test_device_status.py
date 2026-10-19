@@ -50,6 +50,10 @@ def main():
             raise Fail("device_info changed between two calls")
         if t_again > 0.01 and t_again > t_first / 5:
             raise Fail(f"the second call took {t_again:.4f} s (first {t_first:.4f} s): not cached")
+        # a plan of an empty GEMM touches no CUDA: it is created even on a device the library cannot use, and its info is zero
+        np_ = immerdink.Plan("ik,kj->ij", immerdink.Layout((0, 8)), immerdink.Layout((8, 8)), immerdink.Layout((0, 8)), N=8)
+        if np_.info.kernels_checked != 0 or np_.info.sm_count != 0:
+            raise Fail(f"an empty plan carries device info: {np_.info}")
         # the device class against the runtime
         lib = immerdink.load_library()
         dev = lib.current_device()
