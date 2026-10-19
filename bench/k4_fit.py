@@ -321,8 +321,6 @@ def decide(obs, sms=128, ctas=None, old=SHIPPED_TABLE):
     if new is None:
         return {"verdict": "INCONCLUSIVE", "reason": "too few training observations to fit every constant", "table": None}
     ctas = new.ctas
-    if not table_ok(new, ctas):
-        return {"verdict": "INCONCLUSIVE", "reason": f"the training fit has a constant that is not positive: {new!r}", "table": None}
 
     def t_of(g, c):
         return g[c].ms
@@ -344,7 +342,7 @@ def decide(obs, sms=128, ctas=None, old=SHIPPED_TABLE):
     for view in sorted(views):
         tr = [o for o in obs if view_of(o) != view and (o.case, o.N) in groups]
         t, _ = fit_table(tr, sms, ctas)
-        if t is None or not table_ok(t, ctas):
+        if t is None:
             continue
         for (cs, N), g in groups.items():
             if view_of(g[0]) != view:
@@ -358,12 +356,18 @@ def decide(obs, sms=128, ctas=None, old=SHIPPED_TABLE):
     gain = 1.0 / gm - 1.0
     # what the adopted table is: the fit on every usable observation (the training split only validated the procedure)
     final, _ = fit_table([o for o in obs if (o.case, o.N) in groups], sms, ctas)
-    if final is None or not table_ok(final, ctas):
-        return {"verdict": "INCONCLUSIVE", "reason": f"the fit on all data has a constant that is not positive: {final!r}", "table": None}
+    if final is None:
+        return {"verdict": "INCONCLUSIVE", "reason": "too few observations to fit every constant on all the data", "table": None}
     ok = gain >= GAIN_MIN and worst - 1.0 <= SLOWER_MAX and regret <= REGRET_MAX
     reason = (f"held-out gain {100 * gain:.2f}% (need {100 * GAIN_MIN:g}), worst held-out slowdown {100 * (worst - 1):.2f}% "
               f"(at most {100 * SLOWER_MAX:g}), leave-one-out regret {100 * regret:.2f}% (at most {100 * REGRET_MAX:g})")
-    return {"verdict": "ADOPT" if ok else "KEEP", "reason": reason, "gain": gain, "worst_slowdown": worst - 1.0,
+    # A refit that is not a usable table (a constant of zero: this data cannot identify it, typically because the short phase marks were cut) can never be
+    # adopted. If the rule would have adopted it the verdict is INCONCLUSIVE; if the rule says keep, the table is kept either way.
+    unusable = not (table_ok(new, ctas) and table_ok(final, ctas))
+    if unusable:
+        reason += "; the fit has a constant that is not positive (not identified by this data): " + repr(final)
+    verdict = ("INCONCLUSIVE" if unusable else "ADOPT") if ok else "KEEP"
+    return {"verdict": verdict, "reason": reason, "gain": gain, "worst_slowdown": worst - 1.0,
             "regret": regret, "held_out_views": sorted(held_views), "held_out_cases": sorted(held), "held_out_rows": rows,
             "old_table_regret": old_regret, "table": final.as_dict(), "validated_on_training_split": new.as_dict()}
 
