@@ -123,6 +123,9 @@ if(Python3_FOUND)
   # Issue 21 (docs/NOTES-21.md): the analysis of the bandwidth microbenchmark (names the limiter of the pack / CRT phases). CPU only.
   add_test(NAME bench_membw_selftest
            COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/membw/test_analyze.py")
+  # math.fma for Python before 3.13 (the PACE env), used by the oracle tests. CPU only.
+  add_test(NAME spec_fma_compat
+           COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/spec/test_fma_compat.py")
   # Issue 20 (docs/NOTES-20.md): the K4 tile-table fit and its adoption rule (reproduces the shipped 4090 constants
   # from the A3 data where they are on this machine). CPU only.
   add_test(NAME bench_k4_fit_selftest

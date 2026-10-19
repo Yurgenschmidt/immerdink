@@ -20,7 +20,8 @@ check_lib() {
   [ -f "$lib" ] || { echo "FAIL: no library at $lib"; return 1; }
   bad=$(readelf -d "$lib" | awk '/NEEDED/' | grep -Ei "$cuda_re" || true)
   [ -z "$bad" ] || { echo "FAIL: $lib needs a CUDA library:"; echo "$bad"; return 1; }
-  bad=$(ldd "$lib" | grep -Ei "$cuda_re" || true)
+  # the library names only (field 1): a conda env called immerdink-cuda13 puts "cuda" in the PATH of libstdc++ (found on PACE)
+  bad=$(ldd "$lib" | awk '{print $1}' | grep -Ei "$cuda_re" || true)
   [ -z "$bad" ] || { echo "FAIL: $lib resolves a CUDA library:"; echo "$bad"; return 1; }
   bad=$(nm -D "$lib" | grep -i cuda || true)
   [ -z "$bad" ] || { echo "FAIL: $lib has CUDA symbols:"; echo "$bad"; return 1; }

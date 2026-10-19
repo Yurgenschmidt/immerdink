@@ -58,7 +58,9 @@ __global__ void k_rd(const uint4* __restrict__ p, size_t n, unsigned* sink) {
 #pragma unroll
     for (int j = 0; j < kIlp; ++j) acc.x ^= v[j].x, acc.y ^= v[j].y, acc.z ^= v[j].z, acc.w ^= v[j].w;
   }
-  if ((acc.x ^ acc.y ^ acc.z ^ acc.w) == 0x9E3779B1u && threadIdx.x == 12345) *sink = 1;  // keeps the loads alive
+  // keeps the loads alive: the compiler cannot know that the xor of the data is not this value. (The old test `threadIdx.x == 12345` is false for every
+  // thread and ptxas for sm_120 removed the whole read: 510 TB/s on the RTX PRO 6000, R1.)
+  if ((acc.x ^ acc.y ^ acc.z ^ acc.w) == 0x9E3779B1u) *sink = 1;
 }
 template <int kIlp>
 __global__ void k_wr(uint4* __restrict__ p, size_t n) {

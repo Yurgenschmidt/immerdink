@@ -71,7 +71,7 @@ CATEGORY_RULES = [
     ("fp64_gemm", r"dgemm|dgett|d884|d8816|d16816|f64f64|f64_|_f64|fp64|gemm_d_|dtrsm|dsyrk"),
     # INT8 tensor-core GEMM of the libraries; nvjet kernels carry their type code in the 3rd token
     # (nvjet_sm89_biu_mma_...: an i in the code = int8; seen as the INT8 GEMM of the cuBLAS emulation)
-    ("int8_gemm", r"imma|i8816|i8832|i16832|i16864|igemm|s8s8|s8_s8|i8i8|s8_s32|_s8_|gemm_s8|s32_s8|int8|8xint8|"
+    ("int8_gemm", r"imma|i8816|i8832|i16832|i16864|igemm|s8s8|s8_s8|i8i8|i8i32|s8_s32|_s8_|gemm_s8|s32_s8|int8|8xint8|"
                   r"^nvjet_sm\d+[a-z]?_[a-z]*i[a-z]*_"),
     ("permute", r"permut|transpos|elementwise|tensor_copy|\bcopy_kernel|strided_copy"),
     ("conversion_pack_crt", r"gemmul8|ozaki|oz2|crt|residu|modul|scal(e|ing)|slice|extract|split|convert|pack|reduc|"
