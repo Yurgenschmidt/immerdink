@@ -289,6 +289,14 @@ class Parity(unittest.TestCase):
         self.assertEqual(dc.evaluate(d, FakeCtx([rec]))["verdict"], "ADOPT")
 
 
+try:
+    import numpy  # noqa: F401
+    HAVE_NUMPY = True
+except ImportError:
+    HAVE_NUMPY = False
+
+
+@unittest.skipUnless(HAVE_NUMPY, "the tile fit needs numpy (an environment without it gets INCONCLUSIVE, not an error)")
 class TileRefit(unittest.TestCase):
     """The tile_refit decision (issue 20): bench/k4_fit.py on imd_bench-style records of a forced-tile sweep."""
 
