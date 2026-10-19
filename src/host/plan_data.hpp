@@ -88,6 +88,7 @@ struct ExecPlan {
   int64_t* vec_dev = nullptr;
 
   int sms = 0;                         // SM count of the device at plan creation (K1 grids)
+  int64_t l2_bytes = 0;                // L2 bytes of the device at plan creation (K1 rows in flight, issue 21; 0: the reference 72 MiB)
   std::shared_ptr<const K4Plan> k4;    // kGemm only: every K4 launch shape's parameters
 
   // §3.2 step 4: u = largest integer with (S << lhs_shift) * 4^u <= rhs, where

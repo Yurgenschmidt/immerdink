@@ -290,10 +290,9 @@ __global__ void __launch_bounds__(T) k1_tiled(ScaleArgs a, int64_t radix, int lg
 // there), so that pass 2 re-reads from L2 (launch_k1, A3): the two-blocks-per-SM long-row
 // variant only while 2 x SMs rows fit (r_bigk's 256 x 256 KB do, r_mm's 256 x 400 KB do not);
 // beyond it, one 1024-thread block per SM walks pass 2 backwards.
-constexpr double kK1L2BudgetBytes = 64.0 * (1 << 20);
-
-unsigned k1_blocks(int64_t work_items, double bytes_per_block, int sms) {
-  const double fit = 40.0 * (1 << 20) / std::max(1.0, bytes_per_block);
+// Issue 21: both budgets are fractions of the card's L2 (host/analysis.hpp k1_l2_budget_bytes, k1_l2_fit_bytes: the old constants on the 4090).
+unsigned k1_blocks(int64_t work_items, double bytes_per_block, int sms, int64_t l2_bytes) {
+  const double fit = imd::detail::k1_l2_fit_bytes(l2_bytes) / std::max(1.0, bytes_per_block);
   int64_t cap = std::max<int64_t>(sms, static_cast<int64_t>(fit));
   if (work_items > cap && cap < 2 * int64_t{sms}) cap = cap / sms * sms;
   return blocks_for(std::min(work_items, cap), 1);
@@ -1249,15 +1248,15 @@ static void launch_k1(const ExecPlan& p, int x, const Operand& op, int16_t* sigm
     const int lg_th = 3;
     const int64_t tiles = radix * ((D + (int64_t{1} << lg_th) - 1) >> lg_th);
     const unsigned blocks =
-        k1_blocks(tiles, 8.0 * double(p.k) * double(int64_t{1} << lg_th), p.sms);
+        k1_blocks(tiles, 8.0 * double(p.k) * double(int64_t{1} << lg_th), p.sms, p.l2_bytes);
     if (int64_t{blocks} < 2 * int64_t{p.sms})
       k1_tiled<1024><<<blocks, 1024, 0, stream>>>(sa, radix, lg_th);
     else
       k1_tiled<kThreads><<<blocks, kThreads, 0, stream>>>(sa, radix, lg_th);
   } else {
-    const unsigned blocks = k1_blocks(rows, 8.0 * double(p.k), p.sms);
+    const unsigned blocks = k1_blocks(rows, 8.0 * double(p.k), p.sms, p.l2_bytes);
     if (int64_t{blocks} < 2 * int64_t{p.sms} && rows > int64_t{blocks} && blocks >= unsigned(p.sms) &&
-        2.0 * p.sms * 8.0 * double(p.k) <= kK1L2BudgetBytes)
+        2.0 * p.sms * 8.0 * double(p.k) <= k1_l2_budget_bytes(p.l2_bytes))
       // Long rows, capped grid: two 512-thread blocks per SM, so one block streams a row
       // while the other is in its reductions / sigma tail (A4, r_bigk). A3: only while the
       // 2 x SMs rows in flight fit the L2 budget; beyond it (r_mm: 400 KB rows, 102 MB in
@@ -1266,7 +1265,7 @@ static void launch_k1(const ExecPlan& p, int x, const Operand& op, int16_t* sigm
     else if (int64_t{blocks} < 2 * int64_t{p.sms}) {
       // A3: rows in flight beyond the L2 budget (x300_100k: 128 rows of 800 KB): walk
       // pass 2 backwards (NOTES-A3 §4; forward is faster while the rows fit: r_mm).
-      sa.reverse = double(std::min<int64_t>(blocks, rows)) * 8.0 * double(p.k) > kK1L2BudgetBytes;
+      sa.reverse = double(std::min<int64_t>(blocks, rows)) * 8.0 * double(p.k) > k1_l2_budget_bytes(p.l2_bytes);
       k1_scale<1024><<<blocks, 1024, 0, stream>>>(sa);
       sa.reverse = 0;
     }
