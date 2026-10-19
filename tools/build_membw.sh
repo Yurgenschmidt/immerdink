@@ -2,7 +2,8 @@
 # Build the bandwidth microbenchmark (bench/membw/imd_membw.cu) for this machine's GPU architecture and run it.
 #   tools/build_membw.sh OUTDIR [run [extra imd_membw args]]
 # One nvcc call, no CMake, no libraries. Output: OUTDIR/imd_membw and, with `run`, OUTDIR/membw.jsonl (rewritten by each run).
-# The run takes the shared GPU lock (IMMERDINK_GPU_LOCK, as tools/run_quiet.sh; "none" disables) when the lock's folder exists, as on the dev box;
+# The run takes the shared GPU lock (IMMERDINK_GPU_LOCK, as tools/run_quiet.sh; "none" disables) when the lock's folder exists, as on the dev box, unless a
+# caller (tools/run_bench.sh) already holds it (IMMERDINK_GPU_LOCK_HELD=1: taking it twice would block for ever);
 # on a cluster node there is none and it runs directly. It is a bandwidth measurement: run it on an otherwise idle GPU.
 # Architecture: $CMAKE_CUDA_ARCHITECTURES (the cluster jobs export it) or detected with nvidia-smi.
 set -euo pipefail
@@ -19,7 +20,7 @@ echo "built $out/imd_membw (sm_${arch%%-*})"
 if [ "${1:-}" = run ]; then
   shift
   gpu_lock="${IMMERDINK_GPU_LOCK:-/home/ef/repos/ehrenfest-ipdps/_wip/gpu.lock}"
-  if [ "$gpu_lock" != none ] && [ -d "$(dirname "$gpu_lock")" ]; then
+  if [ "$gpu_lock" != none ] && [ "${IMMERDINK_GPU_LOCK_HELD:-0}" != 1 ] && [ -d "$(dirname "$gpu_lock")" ]; then   # tools/run_bench.sh already holds it
     flock "$gpu_lock" "$out/imd_membw" --out "$out/membw.jsonl" "$@"
   else
     "$out/imd_membw" --out "$out/membw.jsonl" "$@"

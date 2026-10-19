@@ -131,6 +131,19 @@ class Decide(unittest.TestCase):
         self.assertEqual(d["table"], t.as_dict())
         self.assertIn("validated_on_training_split", d)
 
+    def test_an_unidentified_table_is_never_adopted_but_does_not_hide_a_keep(self):
+        real = K.table_ok
+        try:
+            K.table_ok = lambda t, c: False                                          # as if the data left a constant at zero
+            truth = K.Table([(2716, (418,)), (1500, (300, 300)), (700, (350, 400)), (500, (500, 560, 450))])
+            d = K.decide(synth(truth, 132, 0.01, 4), 132)
+            self.assertEqual(d["verdict"], "INCONCLUSIVE", d["reason"])              # the rule would adopt, the table cannot be shipped
+            d = K.decide(synth(K.SHIPPED_TABLE, 128, 0.01, 2), 128)
+            self.assertEqual(d["verdict"], "KEEP", d["reason"])                      # nothing to adopt: the table is kept
+            self.assertIn("not identified", d["reason"])
+        finally:
+            K.table_ok = real
+
     def test_marks_below_the_cut_are_dropped_by_fit_and_decide_alike(self):
         short = K.Obs("a", 8, 0, K.MIN_MS_MARKS / 2, 64, 64, 64, 1, "marks")
         long_ = K.Obs("a", 8, 1, 5.0, 64, 64, 64, 1, "marks")

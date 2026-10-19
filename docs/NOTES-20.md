@@ -32,7 +32,9 @@ A refit needs no new kernel.
    (c) the mean leave-one-view-out regret of the refit rule over all cases is at most 2% (absolute; the current table's own regret on the same cases is reported beside it).
    The refit is fitted on the training views; **if it is adopted, the table to ship is the fit on every usable observation** (`table`; the
    training-split fit that was validated is `validated_on_training_split`), which is also exactly what `k4_fit.py fit` prints (same filter, a test pins it).
-   A table with a constant that is not positive (a tile that looks free) or a tile with more than 3 concurrent CTAs is not a table: INCONCLUSIVE.
+   A table with a constant that is not positive (a tile that looks free: the data does not identify it, typically because the short marks were cut) or a tile with more than 3 concurrent CTAs is not a table:
+   if the rule would have adopted it the verdict is INCONCLUSIVE, if the rule says keep the table is kept (and the reason says which constants were not identified). On a rehearsal on the 4090 with the final sweep, 198 of 280 marks are
+   usable, the small tiles' `round_ns` comes out as 0, and the verdict is KEEP (held-out gain 0.00%, regret 0.38%).
    Otherwise the table is kept. INCONCLUSIVE with fewer than 8 cases that have all four tiles. Phase marks below 0.1 ms are not used by either command (CUDA-event jitter of a
    few microseconds is 5% there; A3 used nsys kernel medians for such views).
    **Power.** Rule (a) is a geometric mean over about 16 to 20 held-out rows, most of which have the same pick under both tables: a real 10% gain on three of 35 cases
