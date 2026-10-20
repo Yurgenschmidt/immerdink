@@ -66,4 +66,18 @@ pack/CRT time GEMMul8 achieves, an existence proof for the 0.67 factor). The syn
 ## Not covered
 
 The decision says whether to build the wgmma K4 for the INT8 product; it does not say how the K4 epilogue (the mod-p reduction) should look (issue 17). Stock kernels write plain int8/int32 output.
-Pack/CRT speed-ups are issue 21. The rule is tested on synthetic inputs and on the issue-11 numbers; it has not yet seen real Hopper stock-kernel rates.
+Pack/CRT speed-ups are issue 21.
+
+## Outcome (R1, R1b, R1c on 2026-10-19)
+
+The rule has now seen real Hopper stock-kernel rates. Data: `immerdink-eval/findings/r1-20261019.md`, run folders 20261019-132130 (R1), -181535 (R1b), -223127 (R1c).
+
+* **Pre-registered decision: INCONCLUSIVE on H100 and H200, not GO.** In R1b the whole-call anchor at sq8192 was outside [0.95, 1.08] (1.149 H100, 1.111 H200: inside the GEMMul8 duel the immerdink call is 14% slower than alone, the interleaved
+  GEMMul8 kernels change the clocks), so the formal verdict is INCONCLUSIVE for that reason. With the anchor ignored the rule still does not say GO: at sq4096 on H100 the gain A is 1.13 (needs 1.3) and the projected time ratio B is 1.32 (needs 1.05);
+  the optimistic case O holds (0.91), so NO-GO is not triggered. H200: A = 1.23, B = 1.36; at sq8192 the gain is 1.10 (H100) and 1.17 (H200).
+* **R1c (single GEMMs) did not change that.** The best stock CUTLASS Hopper rate is 1028 TOPS at 4096³ on H100 (NO-GO threshold 1150), 1243 at 8192³ (GO needs 1290), 1193 and 1280 on H200, against our K4's 959 to 992. Batching is not the cause (the stock kernels
+  get faster with the batch at 4096³). cuBLASLt reaches 1313 to 1544 on the same shapes, 14 to 28% above the best stock configuration.
+* **What this means.** A wgmma K4 built from stock CUTLASS configurations gains 1.06 to 1.33 times in the K4 phase (62% of an H100 call at 4096³), i.e. about 3 to 17% of the call, for a kernel that must also carry the modular epilogue (issue 17 showed it can be made exact).
+  Reaching the 1.4 to 1.5 times that cuBLAS achieves needs kernel engineering beyond the stock configurations, whose scope has not been estimated. Issue 22 as designed (stock CUTLASS wgmma mainloop + epilogue) is not supported by the numbers; the
+  larger and cheaper lever measured so far is the pack/CRT instruction count (issue 21: 38% of an H100 call at 4096³, instruction-issue bound).
+* The synthetic `mma.sync` peak is 1275 TOPS on H100 and H200, so our K4 (966 to 992) is at 76% of what `mma.sync` can do; on the RTX PRO 6000 it is 843 to 894 of 887 and nothing in the vendor stack is faster.
