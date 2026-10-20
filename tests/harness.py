@@ -141,6 +141,8 @@ class Library:
             self.lib.imd_test_set_k5_one_elem.restype = C.c_int
             self.lib.imd_test_set_k5_elems.argtypes = [C.c_int]
             self.lib.imd_test_set_k5_elems.restype = C.c_int
+            self.lib.imd_test_set_k5_crt.argtypes = [C.c_int]
+            self.lib.imd_test_set_k5_crt.restype = C.c_int
             self.lib.imd_test_plan_sizes.argtypes = [C.c_void_p, C.POINTER(C.c_int64), C.c_int64,
                                                      C.POINTER(C.c_int64)]
             self.lib.imd_test_plan_sizes.restype = C.c_int
@@ -189,6 +191,10 @@ class Library:
     def set_k5_elems(self, elems=0):
         """A5: K5 (j-bar fastest) with 1, 2 or 4 elements per thread; 0 the launch rule."""
         assert self.lib.imd_test_set_k5_elems(elems) == 0
+
+    def set_k5_crt(self, variant=0):
+        """Issue 21: K5's CRT with the sums in binary64 limbs (1) or the integer running CRT (0, default)."""
+        assert self.lib.imd_test_set_k5_crt(variant) == 0
 
     def set_k5_mapping(self, fmode):
         """The K5 mapping of a test run with fused mode `fmode` (test_contract, test_packed):

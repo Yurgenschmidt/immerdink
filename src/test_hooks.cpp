@@ -22,6 +22,7 @@
 //       (or k4_tune's; production); 0 .. IMD_K4_CONFIG_COUNT - 1: that configuration
 //       (DESIGN v1.5 §4). Results must not change. Returns 0, or 1 for another value.
 //
+//   imd_test_set_k5_crt(variant)
 //   imd_test_set_k5_one_elem(per_sm)
 //       K5 (j-bar fastest) takes one element per thread while b m n <= per_sm x SMs, else
 //       4 per thread with warp-transposed stores. per_sm -1 restores the production value;
@@ -135,6 +136,13 @@ IMD_API int imd_test_set_k5_one_elem(int64_t per_sm) {
 IMD_API int imd_test_set_k5_elems(int elems) {
   if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
   imd::detail::k5_elems_override() = elems;
+  return 0;
+}
+
+// Issue 21: K5's CRT with the sums in binary64 limbs (1) or the integer running CRT (0, the default).
+IMD_API int imd_test_set_k5_crt(int variant) {
+  if (variant != 0 && variant != 1) return 1;
+  imd::detail::k5_crt_override() = variant;
   return 0;
 }
 

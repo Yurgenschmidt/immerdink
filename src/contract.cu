@@ -466,6 +466,57 @@ __device__ __forceinline__ void crt_step_n(uint32_t (&x)[L], uint32_t Wl) {
   }
   crt_mac_sub<L>(x, M, y, P);
 }
+// Issue 21 (docs/NOTES-21.md, spec/crt_f64.py): the CRT of element e of the packed planes wv with the sums in binary64 limbs. The same integer x in [0, P) as crt_planes_n
+// (so crt_finish and round_scaled follow unchanged and the result is bit-identical): s_j = sum_l W_l k_lj by fma (exact), the quotient t = floor(fl(S) / P - 2^-30)
+// (never above the true quotient, at most one below), r_j = s_j - t P_j (exact), the limbs r_j carried into 32-bit words, one conditional subtraction of P.
+template <int N, int L>
+__device__ __forceinline__ void crt_f64_elem(const uint32_t (&wv)[N], int e, uint32_t (&x)[L]) {
+  constexpr int J = imd::constants::kF64Crt.J[N];
+  constexpr int Wb = imd::constants::kF64LimbBits;
+  double s[J];
+#pragma unroll
+  for (int j = 0; j < J; ++j) s[j] = 0.0;
+#pragma unroll
+  for (int l = 0; l < N; ++l) {
+    const double Wd = __uint2double_rn((wv[l] >> (8 * e)) & 255u);
+#pragma unroll
+    for (int j = 0; j < J; ++j) s[j] = __fma_rn(Wd, imd::device::c_f64crt.k[N][l][j], s[j]);
+  }
+  double Sd = s[J - 1];
+#pragma unroll
+  for (int j = J - 2; j >= 0; --j) Sd = __fma_rn(Sd, 1099511627776.0, s[j]);   // 2^40 = 2^kF64LimbBits
+  static_assert(Wb == 40, "the Horner base above is 2^40");
+  const int t = __double2int_rd(__fma_rn(Sd, imd::device::c_f64crt.Pinv[N], -0x1p-30));      // floor(fl(S) Pinv - 2^-30): the product is fused with the bias, one rounding fewer
+  const double td = static_cast<double>(t);
+  long long carry = 0;
+  uint64_t limb[J];
+#pragma unroll
+  for (int j = 0; j < J; ++j) {
+    const long long a = __double2ll_rn(__fma_rn(-td, imd::device::c_f64crt.Pj[N][j], s[j])) + carry;   // r_j: an exact integer below 2^53
+    limb[j] = static_cast<uint64_t>(a) & ((uint64_t{1} << Wb) - 1);
+    carry = a >> Wb;
+  }
+  // the carry out of the top limb is zero: R < P (1 + 2^-29) < 2^(40 J) (cert_crt_f64)
+#pragma unroll
+  for (int k = 0; k < L; ++k) {
+    const int bit = 32 * k, j0 = bit / Wb, off = bit % Wb;
+    uint64_t v = j0 < J ? limb[j0] >> off : 0;
+    if (j0 + 1 < J) v |= limb[j0 + 1] << (Wb - off);
+    x[k] = static_cast<uint32_t>(v);
+  }
+  // R in [0, P (1 + 2^-29)): subtract P once if R >= P
+  uint32_t d[L];
+  uint32_t borrow = 0;
+#pragma unroll
+  for (int k = 0; k < L; ++k) {
+    const uint64_t diff = static_cast<uint64_t>(x[k]) - c_tables.P[N][k] - borrow;
+    d[k] = static_cast<uint32_t>(diff);
+    borrow = static_cast<uint32_t>(diff >> 63);
+  }
+#pragma unroll
+  for (int k = 0; k < L; ++k) x[k] = borrow ? x[k] : d[k];
+}
+
 // Planes l .. N-1 for E elements (interleaved: E independent chains per step).
 template <int N, int L, int E, int l = 0>
 __device__ __forceinline__ void crt_planes_n(uint32_t (&x)[E][L], const uint32_t (&wv)[N]) {
@@ -480,7 +531,7 @@ __device__ __forceinline__ void crt_planes_n(uint32_t (&x)[E][L], const uint32_t
 // or 4. j0 is a multiple of E, so each plane's E bytes are one aligned load (n_hat is a
 // multiple of 16). Elements with j >= n are not computed (D[e] unspecified). Every index into
 // x / D / wv is static after unrolling (no local memory).
-template <int N, int E>
+template <int N, int E, bool F64 = false>
 __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_t i, int64_t j0,
                                            double (&D)[E]) {
   static_assert(E == 1 || E == 2 || E == 4, "K5 takes 1, 2 or 4 consecutive j-bar per thread");
@@ -499,7 +550,12 @@ __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_
   for (int e = 0; e < E; ++e)
 #pragma unroll
     for (int w = 0; w < L; ++w) x[e][w] = 0;
-  crt_planes_n<N, L, E>(x, wv);
+  if constexpr (F64) {
+#pragma unroll
+    for (int e = 0; e < E; ++e) crt_f64_elem<N, L>(wv, e, x[e]);
+  } else {
+    crt_planes_n<N, L, E>(x, wv);
+  }
   const bool fa = a.fA[row] != 0;
   const int sa = a.sA[row];
 #pragma unroll
@@ -528,7 +584,7 @@ __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_
 // E = 2: each thread stores its own two elements. Shared slot of result s (= 4 item + e of the warp's 32 items): s + s / 16, which makes
 // both the writes (stride 4 per lane) and the reads (stride 1) bank-conflict free.
 constexpr int kK5WarpSlots = 128 + 8;
-template <int N, int E>
+template <int N, int E, bool F64 = false>
 __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
   __shared__ double sD[E == 4 ? (kThreads / 32) * kK5WarpSlots : 1];
   const int64_t ng = (a.n + E - 1) / E, total = a.b * a.m * ng;
@@ -546,7 +602,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
       int64_t t, i, lam;
       divmod(idx, ng, &t, &jg);
       divmod(t, a.m, &lam, &i);
-      k5_elems_n<N, E>(a, lam, i, E * jg, D);
+      k5_elems_n<N, E, F64>(a, lam, i, E * jg, D);
       cbase = a.c_bat[lam] + a.c_row[i];
     }
     if constexpr (E != 4) {
@@ -579,7 +635,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
 // tile of TL lambda x TJ j-bar of one row i (TL * TJ = 1024). It computes with j-bar
 // fastest (coalesced W reads), stages D in shared memory and writes C with lambda fastest
 // (coalesced C writes). TL = 2^lg_tl in [2, 32].
-template <int N>
+template <int N, bool F64 = false>
 __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
   constexpr int kTile = 1024;
   __shared__ double sD[kTile + 32];
@@ -595,7 +651,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
       const int64_t lam = lam0 + ll, j0 = j00 + 4 * jq;
       if (lam < a.b && j0 < a.n) {
         double D[4] = {0, 0, 0, 0};
-        k5_elems_n<N, 4>(a, lam, i, j0, D);
+        k5_elems_n<N, 4, F64>(a, lam, i, j0, D);
 #pragma unroll
         for (int e = 0; e < 4; ++e) sD[ll * pitch + 4 * jq + e] = D[e];
       }
@@ -646,6 +702,17 @@ void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
   const K5Launch L = k5_launch(p.k5_batch_fast, p.b, p.m, p.n, p.sms, k5_one_elem_per_sm(),
                                k5_elems_override());
   const unsigned grid = static_cast<unsigned>(L.grid);
+  if (k5_crt_override() == 1) {  // issue 21: the sums in binary64 limbs (test and benchmark hooks only)
+    if (L.variant == 3)
+      k5_crt_bfast<N, true><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
+    else if (L.elems == 1)
+      k5_crt_n<N, 1, true><<<grid, kThreads, 0, stream>>>(out);
+    else if (L.elems == 2)
+      k5_crt_n<N, 2, true><<<grid, kThreads, 0, stream>>>(out);
+    else
+      k5_crt_n<N, 4, true><<<grid, kThreads, 0, stream>>>(out);
+    return;
+  }
   if (L.variant == 3)
     k5_crt_bfast<N><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
   else if (L.elems == 1)
@@ -1282,6 +1349,11 @@ int64_t& k5_one_elem_per_sm() {
 
 int& k5_elems_override() {
   static int v = 0;  // only the test and benchmark hooks change it
+  return v;
+}
+
+int& k5_crt_override() {
+  static int v = 0;  // 0: the integer running CRT (default), 1: the sums in binary64 limbs (issue 21); only the hooks change it
   return v;
 }
 

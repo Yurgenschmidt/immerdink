@@ -97,7 +97,7 @@ class F64Crt:
         Sd = s[self.J - 1]
         for j in range(self.J - 2, -1, -1):
             Sd = math.fma(Sd, float(self.B), s[j])          # Horner: one rounding per step
-        t = math.floor(Sd * self.Pinv - EPS_T)
+        t = math.floor(math.fma(Sd, self.Pinv, -EPS_T))     # fused with the bias, as the GPU does
         assert -1 <= t <= self.tmax
         r = [s[j] - t * float(self.Pj[j]) for j in range(self.J)]   # exact: integers below 2^53
         R = 0

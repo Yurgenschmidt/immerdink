@@ -126,6 +126,9 @@ if(Python3_FOUND)
   # math.fma for Python before 3.13 (the PACE env), used by the oracle tests. CPU only.
   add_test(NAME spec_fma_compat
            COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/spec/test_fma_compat.py")
+  # Issue 21: the CRT with the sums in binary64 limbs against the reference for every N (CPU only; the GPU kernel: crt_f64_gpu).
+  add_test(NAME spec_crt_f64
+           COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/spec/test_crt_f64.py")
   # Issue 20 (docs/NOTES-20.md): the K4 tile-table fit and its adoption rule (reproduces the shipped 4090 constants
   # from the A3 data where they are on this machine). CPU only.
   add_test(NAME bench_k4_fit_selftest
@@ -265,6 +268,11 @@ if(Python3_FOUND)
   add_test(NAME output_hashes_large
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
                    --lib "$<TARGET_FILE:immerdink>" --tags large)
+  # Issue 21: K5's CRT with the sums in binary64 limbs equals the integer CRT bit for bit (and reproduces the committed hashes).
+  add_test(NAME crt_f64_gpu
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_crt_f64_gpu.py"
+                   --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(crt_f64_gpu PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
   set_tests_properties(output_hashes output_hashes_oracle output_hashes_large PROPERTIES
                        RESOURCE_LOCK gpu TIMEOUT 900)
   foreach(suite lowering legality random fixtures robust highrank)

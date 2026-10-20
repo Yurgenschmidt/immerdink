@@ -78,6 +78,23 @@ X = T_target − N·2mnk / R_K4, with T_target the time at which immerdink match
 decision of issue 16 projects (`bench/campaign/required_rate.py`). With the 1.5× faster K4 of the issue text this gives about 0.9 ms at 4096³ (1.2 ms now). It is written
 here as a formula because R_K4 comes from issue 16's verdict; R2 fixes the number before its grid runs.
 
+## The CRT with the sums in binary64 limbs (implemented, off by default, not yet measured on Hopper)
+
+Design direction 1 above, built and checked offline.
+
+* **Algorithm** (`spec/crt_f64.py`, the exact model; `spec/params.py` certificate `cert_crt_f64` and the generated table `kF64Crt`; device code `crt_f64_elem` in `src/contract.cu`). The reference adds `M_l y_l` to a running word with a conditional subtraction of P at every one of the N
+  steps. Here `K_l = q_l M_l < P` is cut into J limbs of 40 bits (J = 3 up to N = 15, 4 up to N = 20), `S = sum_l K_l W_l` is the sum of the residues times these constants, congruent to the reference's value modulo P (`K_l W_l - M_l ((q_l W_l) mod p_l)` is a multiple of P),
+  and the J limb sums `s_j = sum_l W_l k_lj` are formed by one fused multiply-add per limb per term: they are integers below 2^53 whatever the order (every term is nonnegative), so they are exact. The quotient `t = floor(fl(S) / P - 2^-30)` comes from the Horner sum of the limbs and one fused
+  multiply-add with 1/P; it is never above the true quotient and at most one below (the error is below 2^-37, the bias 2^-30 absorbs it; without the bias the estimate overshoots, 13,248 cases found). `r_j = s_j - t P_j` is exact, the limbs are carried into 32-bit words and one conditional subtraction of P leaves the same `x` in [0, P) as the
+  reference; `crt_finish` and `round_scaled` follow unchanged, so the result is bit-identical by construction.
+* **Checks.** The model equals `oracle.crt` on 63,841 residue vectors (every N from 2 to 20, the boundaries of the range, random points); the certificate asserts every bound for every N; `crt_f64_gpu` runs the library with each CRT and compares the output hashes (the 13 small and mid committed cases and every
+  N from 2 to 20 in both input families, RN and TRUNC, batched, alpha and beta): identical. A deliberate error in the bias makes that test fail on every case. The kernel is chosen by a benchmark and test hook only (`imd_test_set_k5_crt`, `imd_prof_set_k5_crt`, the duel side key `crt=int|f64`); the default is the integer CRT.
+* **On the RTX 4090 it is slower** (2048³ N = 14, interleaved duel: 1.18 ms against 0.735 ms; FP64 runs at 1/64 of the FP32 rate there) and exact. It is meant for devices whose FP64 pipe matches the integer pipe (H100, H200).
+* **What it saves, from the SASS of the sm_90 build.** The summing part of the CRT is about 365 of the roughly 650 dynamic thread-instructions per output element of `k5_crt_n<14,4>` (14 terms of about 26 integer instructions); the rest is `crt_finish`, `round_scaled`, flag checks and the store. With the limbs the summing part is about 120
+  (14 byte extractions and conversions, 42 DFMA on the FP64 pipe, the reduction), so K5 falls from about 650 to about 400 thread-instructions per element, i.e. from 0.46 ms to about 0.28 ms on the H100 at the same issue utilization (derived, not measured), 5% of the call. Static counts of `k5_crt_n<14,4>` for sm_90: 3832 instructions with the integer CRT, 2848 with the limbs.
+  **The next target is the finish** (`round_scaled`: the top-limb scan, the 64-bit extraction with runtime shifts, the rounding and the exponent logic, about 285 dynamic instructions per element), and the pack (direction 2).
+* **To measure on Hopper (R2)**: `--methods duel --duel-a default --duel-b crt=f64` on sq4096, sq8192 and the other cases; adopt for a device class if the call improves by at least 3% on two cases and no case is slower by more than 2%, with the output hashes unchanged.
+
 ## R1 and R2
 
 * **R1**: `membw.main` (the microbenchmark, about 1 minute per card) and the phase marks already recorded by every sweep. `analyze.py` names the limiter per card.
