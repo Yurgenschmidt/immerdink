@@ -8,10 +8,12 @@
 # RUNG1_ALLOW_C7510=1 to run anyway), spills and the count of WARPGROUP.DEPBAR against IGMMA per kernel are printed (DEPBAR >= IGMMA in a wgmma kernel
 # means the wgmma are serialised: a warning; the synthetic peak kernels of the p_ rows are listed as "peak wgmma-nN wgW stagesS", and a CALL in one of them is
 # a warning too). The nvcc version goes to OUTDIR/nvcc_version.txt and, as IMD_NVCC_VERSION, into the program's meta record.
-# `run` is limited to RUNG1_TIMEOUT seconds (default 1800; `timeout -k 30`: TERM, then KILL 30 s later; exit 124/137) and passes RUNG1_ARGS (for example
-# "--quick") to the program. It needs a Hopper GPU; take the GPU lock yourself on a shared box. Without a Hopper the program exits 3 (message on stderr).
-# Output: OUTDIR/imd_rung1; with `run`, OUTDIR/rung1.jsonl (meta record first, then one JSON line per variant, shape, batch, scheduler and mode;
-# OUTDIR/rung1.err has the progress) and the exit status (program codes: header of rung1.cu; 5 = some error/skipped rows).
+# `run` runs two processes (the second after the first, whatever its exit code): the PRIMARY pass (m_/f_/g_ rows; limited to RUNG1_TIMEOUT seconds, default 1800;
+# `timeout -k 30`: TERM, then KILL 30 s later; exit 124/137; RUNG1_ARGS, for example "--quick", is passed to it) and the PEAK pass (the synthetic wgmma peak, `--variants p`;
+# RUNG1_PEAK_TIMEOUT, default 600; RUNG1_PEAK_ARGS, default "--sustain 8"; RUNG1_PEAK=0 skips it). The script's exit code is the primary pass's; the peak pass's is in rung1_status.json. It needs a Hopper GPU; take the GPU lock yourself on a shared box. Without a Hopper the program exits 3 (message on stderr).
+# Output: OUTDIR/imd_rung1; with `run`: rung1.jsonl + rung1.err (primary pass: meta record first, then one JSON line per variant, shape, batch, scheduler and mode;
+# .err = progress), rung1_peak.jsonl + rung1_peak.err (peak pass, same format), rung1_status.json {"primary_rc": N, "peak_rc": N or null}
+# (program codes: header of rung1.cu; 5 = some error/skipped rows).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
@@ -60,11 +62,27 @@ fi
 if [ "${2:-}" = run ]; then
   set +e
   export IMD_NVCC_VERSION="$nvcc_ver"
-  # a pipeline hang (these kernels have not run on a Hopper card before) must not hold the allocation: bounded; on a box without Hopper it exits 3
+  # TWO processes, so the never-run synthetic peak kernels (p_ rows) cannot cost the primary results: a sticky fault or a hang in one of them would end the
+  # process (exit 4) or eat the whole timeout. (1) the primary pass: m_/f_/g_ rows, sweep, reference batches, GEMM --sustain (the default selection has no p_ rows);
+  # (2) the peak pass: --variants p, with its own timeout, output files and exit code. Bounded: a pipeline hang must not hold the allocation; on a box without Hopper both exit 3.
   # shellcheck disable=SC2086
   timeout -k 30 "${RUNG1_TIMEOUT:-1800}" "$out/imd_rung1" ${RUNG1_ARGS:-} > "$out/rung1.jsonl" 2> "$out/rung1.err"
   rc=$?
   tail -3 "$out/rung1.err"
-  echo "imd_rung1 exit $rc"
-  exit $rc
+  echo "imd_rung1 primary pass exit $rc"
+  peak_rc=null
+  if [ "${RUNG1_PEAK:-1}" != 0 ]; then
+    peak_args="${RUNG1_PEAK_ARGS-}"
+    [ -n "${RUNG1_PEAK_ARGS+x}" ] || peak_args="--sustain 8"
+    # shellcheck disable=SC2086
+    timeout -k 30 "${RUNG1_PEAK_TIMEOUT:-600}" "$out/imd_rung1" $peak_args --variants p > "$out/rung1_peak.jsonl" 2> "$out/rung1_peak.err"
+    peak_rc=$?
+    tail -3 "$out/rung1_peak.err"
+    echo "imd_rung1 peak pass exit $peak_rc"
+    if [ "$peak_rc" != 0 ]; then
+      echo "build_rung1: !!! the synthetic-peak pass exited $peak_rc (3 = no Hopper, 1 = a row not exact, 4 = device error, 5 = error/skipped rows, 124/137 = timeout): see rung1_peak.err / rung1_peak.jsonl. The primary pass (exit $rc) is not affected." >&2
+    fi
+  fi
+  printf '{"primary_rc": %s, "peak_rc": %s}\n' "$rc" "$peak_rc" > "$out/rung1_status.json"
+  exit "$rc"   # the primary pass's code; the peak pass's is in rung1_status.json
 fi
