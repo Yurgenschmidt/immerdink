@@ -273,6 +273,11 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_crt_f64_gpu.py"
                    --lib "$<TARGET_FILE:immerdink>")
   set_tests_properties(crt_f64_gpu PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+  # Issue 21: the real device functions on the edge vectors (before round_scaled), with the mutation check.
+  add_test(NAME crt_f64_unit
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_crt_f64_unit.py"
+                   --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(crt_f64_unit PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
   set_tests_properties(output_hashes output_hashes_oracle output_hashes_large PROPERTIES
                        RESOURCE_LOCK gpu TIMEOUT 900)
   foreach(suite lowering legality random fixtures robust highrank)
