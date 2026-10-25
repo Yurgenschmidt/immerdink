@@ -6,7 +6,8 @@
 # product's mma.sync K4, the baseline row) are the two sources of that one call. Extra nvcc flags: IMD_NVCC_FLAGS. NVML is not linked (dlopen).
 # Checks after the build (OUTDIR/build.log = nvcc -Xptxas -v output; OUTDIR/sass_counts.txt): ptxas C7510 anywhere is FATAL (exit 6; set
 # RUNG1_ALLOW_C7510=1 to run anyway), spills and the count of WARPGROUP.DEPBAR against IGMMA per kernel are printed (DEPBAR >= IGMMA in a wgmma kernel
-# means the wgmma are serialised: a warning). The nvcc version goes to OUTDIR/nvcc_version.txt and, as IMD_NVCC_VERSION, into the program's meta record.
+# means the wgmma are serialised: a warning; the synthetic peak kernels of the p_ rows are listed as "peak wgmma-nN wgW stagesS", and a CALL in one of them is
+# a warning too). The nvcc version goes to OUTDIR/nvcc_version.txt and, as IMD_NVCC_VERSION, into the program's meta record.
 # `run` is limited to RUNG1_TIMEOUT seconds (default 1800; `timeout -k 30`: TERM, then KILL 30 s later; exit 124/137) and passes RUNG1_ARGS (for example
 # "--quick") to the program. It needs a Hopper GPU; take the GPU lock yourself on a shared box. Without a Hopper the program exits 3 (message on stderr).
 # Output: OUTDIR/imd_rung1; with `run`, OUTDIR/rung1.jsonl (meta record first, then one JSON line per variant, shape, batch, scheduler and mode;
@@ -39,11 +40,20 @@ if command -v cuobjdump >/dev/null; then
   cuobjdump -sass "$out/imd_rung1" 2>/dev/null | awk '
     /Function : / { if (name != "") report(); name = $3; ig = 0; dep = 0; call = 0 }
     /IGMMA/ { ig++ } /WARPGROUP\.DEPBAR/ { dep++ } /CALL\./ { call++ }
-    function report(  n, f, sc) { if (ig > 0) { match(name, /MMA_64x[0-9]+x32/); n = substr(name, RSTART + 4, RLENGTH - 7); match(name, /K4ModEpilogueILb0ELb[01]/); f = substr(name, RSTART + RLENGTH - 1, 1) == "1" ? "fast" : "generic"; sc = (name ~ /Pingpong/) ? "ping" : "coop"
-      printf "%-8s IGMMA %3d  WARPGROUP.DEPBAR %3d  CALL %d  %s wgmma-%s %s\n", (dep >= ig ? "SERIAL?" : "ok"), ig, dep, call, sc, n, f } }
+    function report(  n, f, sc, t, a, st, lab) { if (ig > 0) {
+      st = (dep >= ig ? "SERIAL?" : "ok")
+      if (name ~ /k_wgmma_peak/) {  # the synthetic peak kernels (p_ rows): k_wgmma_peak<N, warpgroups, stages>; any CALL in them is a failure (the loop must be straight-line)
+        match(name, /k_wgmma_peakILi[0-9]+ELi[0-9]+ELi[0-9]+E/); t = substr(name, RSTART, RLENGTH); gsub(/k_wgmma_peakILi|E$/, "", t); split(t, a, "ELi")
+        if (call > 0) st = "CALL?"
+        printf "%-8s IGMMA %3d  WARPGROUP.DEPBAR %3d  CALL %d  peak wgmma-n%s wg%s stages%s\n", st, ig, dep, call, a[1], a[2], a[3]
+      } else {
+        match(name, /MMA_64x[0-9]+x32/); n = substr(name, RSTART + 4, RLENGTH - 7); match(name, /K4ModEpilogueILb0ELb[01]/); f = substr(name, RSTART + RLENGTH - 1, 1) == "1" ? "fast" : "generic"; sc = (name ~ /Pingpong/) ? "ping" : "coop"
+        printf "%-8s IGMMA %3d  WARPGROUP.DEPBAR %3d  CALL %d  %s wgmma-%s %s\n", st, ig, dep, call, sc, n, f } } }
     END { if (name != "") report() }' > "$out/sass_counts.txt"
   cat "$out/sass_counts.txt"
   if grep -q '^SERIAL?' "$out/sass_counts.txt"; then echo "build_rung1: WARNING: a wgmma kernel has as many DEPBAR as IGMMA (serialised); see sass_counts.txt" >&2; fi
+  if grep -q '^CALL?' "$out/sass_counts.txt"; then echo "build_rung1: WARNING: a synthetic peak kernel (p_ rows) contains a CALL: its loop is not straight-line, its rate is not the instruction ceiling; see sass_counts.txt" >&2; fi
+  if ! grep -q 'peak wgmma' "$out/sass_counts.txt"; then echo "build_rung1: WARNING: no synthetic peak kernel (k_wgmma_peak) found in the SASS" >&2; fi
 else
   echo "build_rung1: no cuobjdump: the DEPBAR / IGMMA check was skipped" >&2
 fi
