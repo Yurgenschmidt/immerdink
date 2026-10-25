@@ -26,6 +26,8 @@ for d, _, files in os.walk(os.path.join(root, "src")):
     for fn in files:
         if fn.endswith((".cu", ".cuh", ".cpp")):
             rel = os.path.relpath(os.path.join(d, fn), root)
+            if re.fullmatch(r"src/k4/hopper/rung\d+\.cu", rel):
+                continue  # standalone Hopper study programs (tools/build_rung*.sh), not part of libimmerdink
             text = re.sub(r"//[^\n]*", "", read(rel))
             for m in re.finditer(r"([A-Za-z_][A-Za-z_0-9:]*)\s*(?:<[^<>;{}]*(?:<[^<>;{}]*>[^<>;{}]*)*>)?\s*<<<", text):
                 launched.setdefault(m.group(1).split("::")[-1], set()).add(rel)

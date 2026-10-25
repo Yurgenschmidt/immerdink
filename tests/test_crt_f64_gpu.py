@@ -5,7 +5,7 @@
 
 Every case of tests/data/output_hashes.json (the committed hashes, so the f64 variant also reproduces the contract), then every N = 2..20 on a mid-size GEMM of
 each input family, and batched / permuted-output shapes, are run with the integer CRT and with the binary64-limb CRT (imd_test_set_k5_crt); the output hashes must be
-equal. K5's element variants (1, 2, 4 per thread, batch fastest) are forced for N = 5, 8, 12, 16, 20, with the launch counter checked. The limb CRT uses the FP64 pipe: on an RTX 4090 it is slow but exact, which is what this checks. spec/test_crt_f64.py checks the algorithm against the oracle on the
+equal (also with the F1 finish, instruction-sequence bit 4). K5's element variants (1, 2, 4 per thread, batch fastest) are forced for N = 5, 8, 12, 16, 20, with the launch counter checked and F1 forced on each. The limb CRT uses the FP64 pipe: on an RTX 4090 it is slow but exact, which is what this checks. spec/test_crt_f64.py checks the algorithm against the oracle on the
 residue vectors directly; tests/test_crt_f64_unit.py runs the device functions on the edge vectors.
 """
 import argparse
@@ -27,6 +27,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--lib", default=hz.default_lib())
     ap.add_argument("--full", action="store_true", help="also the large committed cases (default: tags small and mid)")
+    ap.add_argument("--no-seq-twins", action="store_true", help="the library was built with IMMERDINK_SEQ_TWINS=OFF: no F1 / Q1 kernels")
     args = ap.parse_args()
     lib, cuda = hz.Library(args.lib), hz.Cuda()
     with open(T.DATA) as f:
@@ -41,19 +42,29 @@ def main():
     cases.append((case("alpha_beta", {"extent": [33, 70], "label": [1, 3]}, {"extent": [29, 70], "label": [2, 3]},
                        {"extent": [33, 29], "label": [1, 2]}, 12, "u", alpha=0.75, beta=-0.5), None))
     bad, n = [], 0
+    # (crt variant, instruction-sequence set): the integer CRT with the baseline finish is the reference; the limb CRT, F1 (the CRT finish
+    # through I2F.F64.U64, issue 21 sequence bit 4) and both together must give the same bits.
+    combos = [(1, 0)] if args.no_seq_twins else [(1, 0), (0, 4), (1, 4), (0, 7)]
     try:
         for c, committed_hash in cases:
             lib.set_k5_crt(0)
+            lib.set_seq(0)
             h0 = T.hash_c(T.run_gpu(lib, cuda, c))
-            lib.set_k5_crt(1)
-            h1 = T.hash_c(T.run_gpu(lib, cuda, c))
             n += 1
-            if h0 != h1 or (committed_hash is not None and h1 != committed_hash):
-                bad.append(f"{c['name']}: integer CRT {h0}, limb CRT {h1}, committed {committed_hash}")
+            if committed_hash is not None and h0 != committed_hash:
+                bad.append(f"{c['name']}: reference {h0}, committed {committed_hash}")
+            for crt, seq in combos:
+                lib.set_k5_crt(crt)
+                lib.set_seq(seq)
+                h1 = T.hash_c(T.run_gpu(lib, cuda, c))
+                if h0 != h1:
+                    bad.append(f"{c['name']}: integer CRT {h0}, crt={crt} seq={seq}: {h1}")
         # the K5 element variants, forced: 1, 2 and 4 elements per thread (j-bar fastest) and the batch-fastest kernel, for a few N, with tails (n and the
         # batch extent are not multiples of the per-thread element count / tile). The launch counter (imd_test_k5_launch_counts, recorded by launch_k5 at
-        # the branch that picks the kernel) shows that the intended variant, with the intended CRT, ran: exactly one K5 launch per run.
+        # the branch that picks the kernel) shows that the intended variant, with the intended CRT, ran: exactly one K5 launch per run. Every variant also
+        # runs with the F1 finish forced (seq 4 and 7), so F1 is exercised on all four K5 kernels with both CRTs, against the integer CRT with the baseline finish.
         names = {0: "E=1", 1: "E=2", 2: "E=4", 3: "bfast"}
+        vcombos = [(0, 0)] + combos + ([] if args.no_seq_twins else [(1, 7)])
         for N in (5, 8, 12, 16, 20):
             shapes = []
             for variant, elems in ((0, 1), (1, 2), (2, 4)):
@@ -65,26 +76,28 @@ def main():
                           )
             for variant, elems, c in shapes:
                 hs = []
-                for crt in (0, 1):
+                for crt, seq in vcombos:
                     lib.set_k5_crt(crt)
+                    lib.set_seq(seq)
                     lib.set_k5_elems(elems)
                     lib.k5_launch_counts(reset=True)
                     hs.append(T.hash_c(T.run_gpu(lib, cuda, c)))
                     seen = lib.k5_launch_counts(reset=True)
                     if seen != {(crt, variant): 1}:
-                        bad.append(f"{c['name']}: CRT {crt}: the K5 launches were {seen}, expected exactly one launch of variant {names[variant]} ({crt}, {variant})")
+                        bad.append(f"{c['name']}: CRT {crt} seq {seq}: the K5 launches were {seen}, expected exactly one launch of variant {names[variant]} ({crt}, {variant})")
                 n += 1
-                if hs[0] != hs[1]:
-                    bad.append(f"{c['name']}: integer CRT {hs[0]}, limb CRT {hs[1]}")
+                if len(set(hs)) != 1:
+                    bad.append(f"{c['name']}: hashes over (crt, seq) {vcombos}: {hs}")
     finally:
         lib.set_k5_crt(0)
         lib.set_k5_elems(0)
+        lib.set_seq(-1)
     if bad:
         print("FAIL")
         for b in bad:
             print("  " + b)
         return 1
-    print(f"PASS  {n} cases: the binary64-limb CRT is bit-identical to the integer CRT (N = 2..20, both input families, RN and TRUNC, batched, alpha and beta; K5 variants E = 1, 2, 4 and bfast forced and confirmed for N = 5, 8, 12, 16, 20)")
+    print(f"PASS  {n} cases: the binary64-limb CRT and the F1 finish, alone and together, are bit-identical to the integer CRT with the baseline finish (N = 2..20, both input families, RN and TRUNC, batched, alpha and beta; K5 variants E = 1, 2, 4 and bfast forced and confirmed, also with F1, for N = 5, 8, 12, 16, 20)")
     return 0
 
 

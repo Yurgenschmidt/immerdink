@@ -51,7 +51,7 @@ cudaError_t kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out);
 cudaError_t kernel_versions(int32_t kernel, int32_t w, int32_t* binary, int32_t* ptx);
 // The same for the launches without an IMD_PERF_KERNEL_* id (index 0 .. kExtraKernels - 1; cudaErrorInvalidValue
 // beyond). Their failing_kernel id in imd_device_info_t is IMD_PERF_KERNEL_COUNT + index.
-constexpr int32_t kExtraKernels = 11;
+constexpr int32_t kExtraKernels = 12;
 cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx);
 
 // K0 (contract.cu): write the p.vec_count scatter vectors to `vec` from p.vec_desc, on
@@ -131,6 +131,7 @@ int64_t& k5_one_elem_per_sm();
 // A5: K5's elements per thread forced to 1, 2 or 4 (0: the launch rule), read by
 // imd_contract; changed only by the hooks imd_test_set_k5_elems / imd_prof_set_k5_elems.
 int& k5_elems_override();
+std::atomic<int>& seq_override();      // issue 21: -1 the plan's set (host/seq_config.hpp), else a forced set of kSeq* bits for every plan (hooks only; relaxed)
 std::atomic<int>& k5_crt_override();   // issue 21: 0 integer CRT, 1 binary64-limb CRT (process-wide: all devices, streams and plans; a graph captures it at capture time)
 // v1.13 §4b (hygiene; contract.cu, test hook imd_test_set_pad_mutation): -1 (production) or
 // the post-swap operand x (0 = the GEMM's A, 1 = its B) whose K2 / K3 pack stores only k-bar

@@ -22,11 +22,13 @@
 #include <atomic>
 #include <climits>
 #include <cstdint>
+#include <type_traits>
 
 #include <cuda_runtime.h>
 
 #include "device/constants.cuh"
 #include "host/analysis.hpp"  // kFusedKHatMax
+#include "host/seq_config.hpp"
 #include "kernels/numerics.cuh"
 #include "kernels/pack_emitter.cuh"
 #include "plan.hpp"
@@ -311,13 +313,32 @@ struct PackArgs {
   int lg_th;          // tile height th = 2^lg_th rows, tk = kTileElems / th k-bar
 };
 
+// Issue 21 (host/seq_config.hpp): the instruction-sequence set of a launch (the plan's, or the hooks' override)
+// and the pack kernels' template value S for it. f(std::integral_constant<int, S>{}) launches the instance.
+inline int seq_bits(const ExecPlan& p) {
+  return seq_effective(p.seq, seq_override().load(std::memory_order_relaxed));
+}
+template <int W, class F>
+void with_pack_seq(const ExecPlan& p, F&& f) {
+  switch (seq_pack_s(seq_bits(p), W)) {
+    case 0: f(std::integral_constant<int, 0>{}); break;
+    case 1: f(std::integral_constant<int, 1>{}); break;
+    default:
+      if constexpr (W == 2 && (kSeqSupported & kSeqQuant) != 0) f(std::integral_constant<int, 3>{});
+      else f(std::integral_constant<int, 1>{});
+  }
+}
+
 // §3.3 + §3.4 for one row's E consecutive k-bar: quantize once, then residues per modulus:
 // PackEmitterT<E, W> (kernels/pack_emitter.cuh, v1.14 §3.4.1: |a'| as W = pack_words(N) u32
 // words, branch-free). Every pack kernel is instantiated for W = 2 and 3; the launch picks W
 // from the plan's N.
 
-template <int W>  // v1.14 §3.4.1: pack_words(N)
-__global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
+// k23_pack's body, shared by the kernels below. The baseline kernel keeps its original launch bounds; the E1 W = 2 instance is
+// held to 4 resident CTAs (64 registers) like the baseline, because left alone it takes 80 registers and so 3 CTAs per SM
+// (E1 + Q1: 94 registers, 2 CTAs; capping that one spills 128 B, so it is not capped; docs/NOTES-21.md).
+template <int W, int Seq>  // v1.14 §3.4.1: pack_words(N); Seq: the instruction-sequence set (kernels/pack_emitter.cuh)
+__device__ __forceinline__ void k23_pack_body(PackArgs a) {
   __shared__ uint64_t tile[kTileSmem];
   __shared__ int64_t s_base[kTileRowsMax];  // v_bat[lambda] + v_row[r]
   __shared__ int64_t s_out[kTileRowsMax];   // (lambda rows_pad + r) k_hat
@@ -368,18 +389,26 @@ __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
       const uint64_t* src = tile + dl * pitch + hl + hl / kVec;
 #pragma unroll
       for (int e = 0; e < kVec; ++e) bits[e] = src[e];
-      PackEmitterT<kVec, W> em;
+      PackEmitterT<kVec, W, Seq> em;
       em.load(bits, s_sigma[dl], a.trunc);
       int8_t* dst = a.R + s_out[dl] + h0 + hl;
       // Block row y of the grid emits the slots [y gsize / ny, (y + 1) gsize / ny): a small
       // operand is spread over more blocks (each re-reads its tile; same values).
       const int s_lo = int(blockIdx.y) * a.gsize / int(gridDim.y);
       const int s_hi = (int(blockIdx.y) + 1) * a.gsize / int(gridDim.y);
-      for (int s = s_lo; s < s_hi; ++s)
-        em.store(a.g0 + s, dst + s * plane);
+      store_slots(em, a.g0, s_lo, s_hi, dst, plane);
     }
     __syncthreads();  // shared arrays are reused by the next tile
   }
+}
+
+template <int W, int Seq = 0>
+__global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
+  k23_pack_body<W, Seq>(a);
+}
+template <int W, int Seq>
+__global__ void __launch_bounds__(kThreads, 4) k23_pack_cap(PackArgs a) {
+  k23_pack_body<W, Seq>(a);
 }
 
 // gridDim.y of a pack launch: with fewer tiles than 2 per SM, split the group's moduli over
@@ -549,7 +578,7 @@ __device__ __forceinline__ void crt_planes_n(uint32_t (&x)[E][L], const uint32_t
 // or 4. j0 is a multiple of E, so each plane's E bytes are one aligned load (n_hat is a
 // multiple of 16). Elements with j >= n are not computed (D[e] unspecified). Every index into
 // x / D / wv is static after unrolling (no local memory).
-template <int N, int E, bool F64 = false>
+template <int N, int E, bool F64 = false, bool F1 = false>
 __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_t i, int64_t j0,
                                            double (&D)[E]) {
   static_assert(E == 1 || E == 2 || E == 4, "K5 takes 1, 2 or 4 consecutive j-bar per thread");
@@ -583,10 +612,7 @@ __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_
       if (fa || a.fB[lam * a.n + j] != 0) {
         D[e] = native_dot(a, lam, i, j);
       } else {
-        uint32_t mag[L];
-        bool neg;
-        crt_finish<L>(x[e], N, mag, &neg);
-        D[e] = round_scaled<L>(mag, neg, -(sa + int{a.sB[lam * a.n + j]}));
+        D[e] = crt_round<L, N, F1>(x[e], -(sa + int{a.sB[lam * a.n + j]}));  // crt_finish + round_scaled, or F1
       }
     }
   }
@@ -602,7 +628,7 @@ __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_
 // E = 2: each thread stores its own two elements. Shared slot of result s (= 4 item + e of the warp's 32 items): s + s / 16, which makes
 // both the writes (stride 4 per lane) and the reads (stride 1) bank-conflict free.
 constexpr int kK5WarpSlots = 128 + 8;
-template <int N, int E, bool F64 = false>
+template <int N, int E, bool F64 = false, bool F1 = false>
 __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
   __shared__ double sD[E == 4 ? (kThreads / 32) * kK5WarpSlots : 1];
   const int64_t ng = (a.n + E - 1) / E, total = a.b * a.m * ng;
@@ -620,7 +646,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
       int64_t t, i, lam;
       divmod(idx, ng, &t, &jg);
       divmod(t, a.m, &lam, &i);
-      k5_elems_n<N, E, F64>(a, lam, i, E * jg, D);
+      k5_elems_n<N, E, F64, F1>(a, lam, i, E * jg, D);
       cbase = a.c_bat[lam] + a.c_row[i];
     }
     if constexpr (E != 4) {
@@ -653,7 +679,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
 // tile of TL lambda x TJ j-bar of one row i (TL * TJ = 1024). It computes with j-bar
 // fastest (coalesced W reads), stages D in shared memory and writes C with lambda fastest
 // (coalesced C writes). TL = 2^lg_tl in [2, 32].
-template <int N, bool F64 = false>
+template <int N, bool F64 = false, bool F1 = false>
 __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
   constexpr int kTile = 1024;
   __shared__ double sD[kTile + 32];
@@ -669,7 +695,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
       const int64_t lam = lam0 + ll, j0 = j00 + 4 * jq;
       if (lam < a.b && j0 < a.n) {
         double D[4] = {0, 0, 0, 0};
-        k5_elems_n<N, 4, F64>(a, lam, i, j0, D);
+        k5_elems_n<N, 4, F64, F1>(a, lam, i, j0, D);
 #pragma unroll
         for (int e = 0; e < 4; ++e) sD[ll * pitch + 4 * jq + e] = D[e];
       }
@@ -750,33 +776,39 @@ __global__ void __launch_bounds__(kThreads) test_crt_elem_kernel(const uint8_t* 
 
 // v1.10: the variant and grid are host/analysis.hpp k5_launch (shared with the performance
 // model), with this library's test hooks.
+template <int N, bool F64, bool F1>
+void launch_k5_v(const K5Launch& L, const OutArgs& out, cudaStream_t stream) {
+  const unsigned grid = static_cast<unsigned>(L.grid);
+  if (L.variant == 3)
+    k5_crt_bfast<N, F64, F1><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
+  else if (L.elems == 1)
+    k5_crt_n<N, 1, F64, F1><<<grid, kThreads, 0, stream>>>(out);
+  else if (L.elems == 2)
+    k5_crt_n<N, 2, F64, F1><<<grid, kThreads, 0, stream>>>(out);
+  else
+    k5_crt_n<N, 4, F64, F1><<<grid, kThreads, 0, stream>>>(out);
+}
+
 template <int N>
 void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
   const K5Launch L = k5_launch(p.k5_batch_fast, p.b, p.m, p.n, p.sms, k5_one_elem_per_sm(),
                                k5_elems_override());
-  const unsigned grid = static_cast<unsigned>(L.grid);
 #ifdef IMD_BUILD_TEST_HOOKS
   test_note_k5_launch(k5_crt_override() == 1, L.variant);   // host-side count for tests/test_crt_f64_gpu.py (no device code)
 #endif
-  if (k5_crt_override() == 1) {  // issue 21: the sums in binary64 limbs (test and benchmark hooks only)
-    if (L.variant == 3)
-      k5_crt_bfast<N, true><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
-    else if (L.elems == 1)
-      k5_crt_n<N, 1, true><<<grid, kThreads, 0, stream>>>(out);
-    else if (L.elems == 2)
-      k5_crt_n<N, 2, true><<<grid, kThreads, 0, stream>>>(out);
-    else
-      k5_crt_n<N, 4, true><<<grid, kThreads, 0, stream>>>(out);
-    return;
+  // issue 21: the sums in binary64 limbs (test and benchmark hooks only), and the F1 finish (host/seq_config.hpp)
+  const bool f64 = k5_crt_override() == 1, f1 = (seq_bits(p) & kSeqFinish) != 0;
+  if (f64) {
+    if constexpr ((kSeqSupported & kSeqFinish) != 0) {
+      if (f1) { launch_k5_v<N, true, true>(L, out, stream); return; }
+    }
+    launch_k5_v<N, true, false>(L, out, stream);
+  } else {
+    if constexpr ((kSeqSupported & kSeqFinish) != 0) {
+      if (f1) { launch_k5_v<N, false, true>(L, out, stream); return; }
+    }
+    launch_k5_v<N, false, false>(L, out, stream);
   }
-  if (L.variant == 3)
-    k5_crt_bfast<N><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
-  else if (L.elems == 1)
-    k5_crt_n<N, 1><<<grid, kThreads, 0, stream>>>(out);
-  else if (L.elems == 2)
-    k5_crt_n<N, 2><<<grid, kThreads, 0, stream>>>(out);
-  else
-    k5_crt_n<N, 4><<<grid, kThreads, 0, stream>>>(out);
 }
 
 // K5 for the plan's N: the run-time N picks its kernel (false: N outside [kNMin, kNMax]).
@@ -918,7 +950,7 @@ __device__ __forceinline__ u128 shfl_xor_u128(u128 v, int d) {
   return (static_cast<u128>(hi) << 64) | lo;
 }
 
-template <int Cap, int E, int W>  // W: v1.14 §3.4.1 pack_words(N)
+template <int Cap, int E, int W, int Seq = 0>  // W: v1.14 §3.4.1 pack_words(N); Seq: sequence set
 __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant__ FusedArgs<Cap> a) {
   constexpr int kLgE = E == 16 ? 4 : 2, kTE = kThreads * E, kLgTE = 8 + kLgE;
   constexpr int kRowsMax = kTE / 16;  // th for tk = 16
@@ -1023,13 +1055,13 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
     }
     // 5. residues of this part's slots (K padding h in [k, k_hat) is zero in the tile)
     if (valid && hl < a.k_hat) {
-      PackEmitterT<E, W> em;
+      PackEmitterT<E, W, Seq> em;
       em.load(bits, sigma, a.trunc != 0);
       const int64_t plane = a.b * a.rows_pad[x] * a.k_hat;
       int64_t lam, r;
       divmod(lo + radix * (d0 + dl), rows, &lam, &r);
       int8_t* dst = a.R[x] + (lam * a.rows_pad[x] + r) * a.k_hat + hl;
-      for (int s = s_lo; s < s_hi; ++s) em.store(s, dst + s * plane);  // group 1: modulus = slot
+      store_slots(em, 0, s_lo, s_hi, dst, plane);  // group 1: modulus = slot
     }
     __syncthreads();  // shared arrays are reused by the next tile
   }
@@ -1094,12 +1126,22 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   if (small) tiles = tiles_for(10);
   const dim3 grid(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms));
   const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1
+  const auto run = [&](auto E, auto W) {
+    with_pack_seq<decltype(W)::value>(p, [&](auto S) {
+      kf_scale_pack<Cap, decltype(E)::value, decltype(W)::value, decltype(S)::value>
+          <<<grid, kThreads, 0, stream>>>(a);
+    });
+  };
+  using I4 = std::integral_constant<int, 4>;
+  using I16 = std::integral_constant<int, 16>;
+  using I2 = std::integral_constant<int, 2>;
+  using I3 = std::integral_constant<int, 3>;
   if (small) {
-    if (w2) kf_scale_pack<Cap, 4, 2><<<grid, kThreads, 0, stream>>>(a);
-    else kf_scale_pack<Cap, 4, 3><<<grid, kThreads, 0, stream>>>(a);
+    if (w2) run(I4{}, I2{});
+    else run(I4{}, I3{});
   } else {
-    if (w2) kf_scale_pack<Cap, 16, 2><<<grid, kThreads, 0, stream>>>(a);
-    else kf_scale_pack<Cap, 16, 3><<<grid, kThreads, 0, stream>>>(a);
+    if (w2) run(I16{}, I2{});
+    else run(I16{}, I3{});
   }
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
@@ -1146,8 +1188,8 @@ __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl
   else if (finite_nonzero(bits)) gmax = max(gmax, ilogb_bits(bits));
 }
 
-template <int E, int W>  // values per thread: 8 (512 threads, 2 CTAs per SM) or 4 (1024
-                         // threads); W: v1.14 §3.4.1 pack_words(N)
+template <int E, int W, int Seq = 0>  // values per thread: 8 (512 threads, 2 CTAs per SM) or 4 (1024
+                         // threads); W: v1.14 §3.4.1 pack_words(N); Seq: sequence set
 __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     kl_scale_pack(const __grid_constant__ LargeArgs a) {
   constexpr int T = kTileElems / E, kLgE = E == 16 ? 4 : E == 8 ? 3 : 2;
@@ -1278,10 +1320,10 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     // pass 3: residues of every slot of group 1 (K padding h in [k, k_hat) is zero)
     const auto emit = [&](const uint64_t (&bits)[E], int64_t c) {
       if (valid && (c << lg_tk) + hl < a.k_hat) {  // k_hat is a multiple of 16
-        PackEmitterT<E, W> em;
+        PackEmitterT<E, W, Seq> em;
         em.load(bits, sigma, a.trunc != 0);
         int8_t* dst = a.R + dst_off + (c << lg_tk);
-        for (int s = 0; s < a.gsize; ++s) em.store(s, dst + s * plane);
+        store_slots(em, 0, 0, a.gsize, dst, plane);
       }
     };
     emit(r0, 0);
@@ -1342,12 +1384,20 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
   // (r_bigk 32 MB, r_mm 51 MB: inside the L2 budget of K1, A3).
   const unsigned grid = static_cast<unsigned>(L.grid);
   const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1 (imd_pack: the pack's N)
+  const auto run = [&](auto E, auto W) {
+    with_pack_seq<decltype(W)::value>(p, [&](auto S) {
+      kl_scale_pack<decltype(E)::value, decltype(W)::value, decltype(S)::value>
+          <<<grid, kTileElems / decltype(E)::value, 0, stream>>>(a);
+    });
+  };
+  using I2 = std::integral_constant<int, 2>;
+  using I3 = std::integral_constant<int, 3>;
   if (L.values == 4) {
-    if (w2) kl_scale_pack<4, 2><<<grid, kTileElems / 4, 0, stream>>>(a);
-    else kl_scale_pack<4, 3><<<grid, kTileElems / 4, 0, stream>>>(a);
+    if (w2) run(std::integral_constant<int, 4>{}, I2{});
+    else run(std::integral_constant<int, 4>{}, I3{});
   } else {
-    if (w2) kl_scale_pack<8, 2><<<grid, kTileElems / 8, 0, stream>>>(a);
-    else kl_scale_pack<8, 3><<<grid, kTileElems / 8, 0, stream>>>(a);
+    if (w2) run(std::integral_constant<int, 8>{}, I2{});
+    else run(std::integral_constant<int, 8>{}, I3{});
   }
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
@@ -1405,6 +1455,11 @@ int64_t& k5_one_elem_per_sm() {
 
 int& k5_elems_override() {
   static int v = 0;  // only the test and benchmark hooks change it
+  return v;
+}
+
+std::atomic<int>& seq_override() {
+  static std::atomic<int> v{-1};  // -1: the plan's set; only the hooks change it
   return v;
 }
 
@@ -1636,8 +1691,13 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
                                        p.sms);
       pa.lg_th = L.lg_th;
       const dim3 grid(static_cast<unsigned>(L.grid_x), static_cast<unsigned>(L.parts));
-      if (pack_words(p.N) == 2) k23_pack<2><<<grid, kThreads, 0, stream>>>(pa);  // v1.14 §3.4.1
-      else k23_pack<3><<<grid, kThreads, 0, stream>>>(pa);
+      if (pack_words(p.N) == 2)  // v1.14 §3.4.1
+        with_pack_seq<2>(p, [&](auto S) {
+          if constexpr (decltype(S)::value == 1) k23_pack_cap<2, 1><<<grid, kThreads, 0, stream>>>(pa);
+          else k23_pack<2, decltype(S)::value><<<grid, kThreads, 0, stream>>>(pa);
+        });
+      else
+        with_pack_seq<3>(p, [&](auto S) { k23_pack<3, decltype(S)::value><<<grid, kThreads, 0, stream>>>(pa); });
       if (pa.rows_pad > pa.op.rows)
         k23_zero_rows<<<blocks_for(gsize * p.b * (pa.rows_pad - pa.op.rows) * p.k_hat / kVec),
                         kThreads, 0, stream>>>(pa.R, pa.op.rows, pa.rows_pad, p.b, p.k_hat,
@@ -1838,6 +1898,7 @@ cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) 
     case 8: return versions_of(k1_scale<512>, binary, ptx);
     case 9: return versions_of(k1_scale<1024>, binary, ptx);
     case 10: return versions_of(k1_scale<kThreads>, binary, ptx);
+    case 11: return versions_of(k23_pack_cap<2, 1>, binary, ptx);  // issue 21: the E1 K2/K3 instance held to 4 CTAs per SM
     default: return cudaErrorInvalidValue;
   }
 }

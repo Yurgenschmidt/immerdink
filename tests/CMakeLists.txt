@@ -185,6 +185,11 @@ add_executable(test_pack_emitter test_pack_emitter.cu)
 target_include_directories(test_pack_emitter PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(test_pack_emitter PRIVATE imd_constants imd_warnings)
 add_test(NAME pack_emitter COMMAND test_pack_emitter)
+# Issue 21: sequence F1 (the CRT finish through a hardware u64 -> f64 conversion) against crt_finish + round_scaled, every N, with mutations.
+add_executable(test_finish_f1 test_finish_f1.cu)
+target_include_directories(test_finish_f1 PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(test_finish_f1 PRIVATE imd_constants imd_warnings)
+add_test(NAME finish_f1 COMMAND test_finish_f1)
 
 # CUTLASS de-risking for M1: int8 batched TN GEMM, and the mod-p -> u8 EVT epilogue.
 add_executable(test_cutlass_int8_gemm test_cutlass_int8_gemm.cu)
@@ -256,6 +261,56 @@ if(Python3_FOUND)
     set_tests_properties(contract_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
+  # Issue 21 (docs/NOTES-21.md "Pack emitter and finish"): the same oracle tests with the other instruction sequences forced
+  # for every plan (IMD_TEST_SEQ, tests/harness.py: the library must report that set back, or the run fails): 0 = the baseline
+  # sequences (the production path on every class without a default set, and the reference now that the sm_89 / sm_90
+  # default is E1), 1 = E1 emitter, 7 = E1 + Q1 quantize + F1 finish. The suites without a suffix run the class default.
+  foreach(seq 0 1 7)
+    if(seq EQUAL 7 AND NOT IMMERDINK_SEQ_TWINS)
+      continue()
+    endif()
+    foreach(suite e2e tensor every_n eps bigk)
+      if(NOT seq EQUAL 7 AND (suite STREQUAL "tensor" OR suite STREQUAL "every_n" OR suite STREQUAL "bigk"))
+        continue()
+      endif()
+      add_test(NAME contract_${suite}_seq${seq}
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                       --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+      set_tests_properties(contract_${suite}_seq${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                           ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=${seq}")
+    endforeach()
+    add_test(NAME output_hashes_seq${seq}
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                     --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+    set_tests_properties(output_hashes_seq${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                         ENVIRONMENT "IMD_TEST_SEQ=${seq}")
+  endforeach()
+  set(_seq_twin_arg "")
+  if(NOT IMMERDINK_SEQ_TWINS)
+    set(_seq_twin_arg --no-seq-twins)
+  endif()
+  add_test(NAME seq_select
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_seq_select.py" --lib "$<TARGET_FILE:immerdink>"
+                   ${_seq_twin_arg})
+  set_tests_properties(seq_select PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+  # imd_bench --seq / --crt (method imd): needs the profiling build of the bench (bench/build.sh), so only when
+  # IMMERDINK_BENCH_BIN names it (environment or cache variable); bench/test_seq_crt.py documents the checks.
+  if(NOT IMMERDINK_BENCH_BIN AND DEFINED ENV{IMMERDINK_BENCH_BIN})
+    set(IMMERDINK_BENCH_BIN "$ENV{IMMERDINK_BENCH_BIN}")
+  endif()
+  if(IMMERDINK_BENCH_BIN)
+    add_test(NAME bench_seq_crt
+             COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/test_seq_crt.py" --bench "${IMMERDINK_BENCH_BIN}"
+                     ${_seq_twin_arg})
+    set_tests_properties(bench_seq_crt PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
+  endif()
+  if(IMMERDINK_SEQ_TWINS)
+  add_test(NAME output_hashes_large_seq7
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags large)
+  set_tests_properties(output_hashes_large_seq7 PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                       ENVIRONMENT "IMD_TEST_SEQ=7")
+  endif()
   # Committed output hashes (tests/data/output_hashes.json): the library's C on this GPU against
   # hashes from the CPU oracle (small shapes) and from the RTX 4090 (large ones). The same file
   # is checked on every shipped GPU. output_hashes_oracle recomputes the CPU hashes.
@@ -271,7 +326,7 @@ if(Python3_FOUND)
   # Issue 21: K5's CRT with the sums in binary64 limbs equals the integer CRT bit for bit (and reproduces the committed hashes).
   add_test(NAME crt_f64_gpu
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_crt_f64_gpu.py"
-                   --lib "$<TARGET_FILE:immerdink>")
+                   --lib "$<TARGET_FILE:immerdink>" ${_seq_twin_arg})
   set_tests_properties(crt_f64_gpu PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
   # Issue 21: the real device functions on the edge vectors (before round_scaled), with the mutation check.
   add_test(NAME crt_f64_unit
@@ -400,5 +455,5 @@ if(Python3_FOUND)
 endif()
 
 # GPU tests share one device; run them one at a time.
-set_tests_properties(device_constants pack_emitter cutlass_int8_gemm cutlass_mod_epilogue
+set_tests_properties(device_constants pack_emitter finish_f1 cutlass_int8_gemm cutlass_mod_epilogue
                      PROPERTIES RESOURCE_LOCK gpu)

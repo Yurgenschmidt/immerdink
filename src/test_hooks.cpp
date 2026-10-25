@@ -23,6 +23,14 @@
 //       (DESIGN v1.5 §4). Results must not change. Returns 0, or 1 for another value.
 //
 //   imd_test_set_k5_crt(variant)
+//   imd_test_set_seq(bits)
+//       issue 21: every later imd_contract runs the instruction-sequence set `bits` (1 E1 emitter, 2 Q1 quantize, 4 F1 finish;
+//       host/seq_config.hpp), -1 the plan's (device class) set. Results must not change. Returns 0, or 1 for another value
+//       (also for the Q1 bit without the E1 bit).
+//   imd_test_get_seq()
+//       the forced set (-1: none).
+//   imd_test_plan_seq(plan)
+//       the set the plan's launches run now: the forced one, else the plan's device-class default; -1 for a null plan.
 //   imd_test_set_k5_one_elem(per_sm)
 //       K5 (j-bar fastest) takes one element per thread while b m n <= per_sm x SMs, else
 //       4 per thread with warp-transposed stores. per_sm -1 restores the production value;
@@ -105,6 +113,7 @@
 #include "immerdink/immerdink.h"
 #include "host/analysis.hpp"
 #include "host/index_map.hpp"
+#include "host/seq_config.hpp"
 #include "plan.hpp"
 
 extern "C" {
@@ -145,6 +154,19 @@ IMD_API int imd_test_set_k5_elems(int elems) {
   if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
   imd::detail::k5_elems_override() = elems;
   return 0;
+}
+
+// Issue 21: the instruction-sequence set of later calls (-1: the device class's).
+IMD_API int imd_test_set_seq(int bits) {
+  if (!imd::detail::seq_valid(bits)) return 1;
+  imd::detail::seq_override() = bits;
+  return 0;
+}
+
+IMD_API int imd_test_get_seq(void) { return imd::detail::seq_override().load(); }
+IMD_API int imd_test_plan_seq(imd_plan_t plan) {
+  const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
+  return e == nullptr ? -1 : imd::detail::seq_effective(e->seq, imd::detail::seq_override().load());
 }
 
 // Issue 21 device-level unit test of the binary64-limb CRT: see plan.hpp test_crt_elem. W: device bytes [N][count], out: device u32 [count][5].

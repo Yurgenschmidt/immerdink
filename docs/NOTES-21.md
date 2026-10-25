@@ -140,3 +140,108 @@ Expected size if the instruction count halves at the same issue utilization: pac
 ## Not done here
 
 The instruction-issue explanation is derived from 4090 counters and public H100 figures, not measured on Hopper: a Hopper `ncu` run (a module on PACE, if one exists) would confirm or refute it. None of the three directions is implemented.
+
+## Pack emitter and finish (E1, Q1, F1: leaner instruction sequences, one set per device class)
+
+Source: the offline study `immerdink-eval/findings/offline-theory-20261025.md` section 5 (models `analysis/20261025-offline/pack/`: `emit_model.py` E1, `quantize_model.py` Q1, `finish_model.py` F1; each asserts bit identity with `spec/oracle.py`, all three pass unchanged). Nothing here changes a result: the sequences compute the same bytes and the same doubles, and the baseline sequence of each stays in the code.
+
+### Step 0: what nvcc 13.4 emits (micro-check, `nvcc -cubin`, `cuobjdump -sass`)
+
+| question | sm_89 | sm_90 | sm_120 |
+|---|---|---|---|
+| `hi32(s * m32 + h)` with a 64-bit addend (`(uint64_t(s) * m32 + hm) >> 32`) | one `IMAD.HI.U32 Rd, Ra, Rb, Rc` where Rc is a **register pair** (the 64-bit addend); not `IMAD.WIDE.U32` | same | same |
+| `(double)uint64_t` | `I2F.F64.U64` (one native instruction) | same | same |
+| `(uint64_t)double`, `__double2ull_rn` / `__double2ull_rz` | `F2I.U64.F64` / `F2I.U64.F64.TRUNC` (native) | same | same |
+
+So the study's "IMAD.WIDE.U32 with a 64-bit addend" is `IMAD.HI.U32` with a pair; the instruction count is what the study assumed. Native does not mean full rate: the conversions and DMUL share the FP64 / XU pipes, which are 1/64 rate on GeForce-class parts (RTX 4090, sm_120 workstation cards) and full width on H100. On H100 the DMUL is full rate but the 64-bit conversions (`F2I.U64`, `I2F.F64.U64`) are probably a quarter of the integer rate (unmeasured). That is why Q1 and F1 are opt-in everywhere for now (below).
+
+### Selection: one set of sequences per device class
+
+* `src/host/seq_config.hpp` (CUDA-free): the bits `kSeqEmit` (E1), `kSeqQuant` (Q1), `kSeqFinish` (F1) and `kSeqClasses`, the default set per compute capability. `imd_plan_create` stores the device class's set in `ExecPlan::seq` (in the padding after `trunc`; `sizeof(ExecPlan)` is unchanged); the pack launches (`launch_kl`, `launch_kf`, K2/K3) and `launch_k5` read it. A class that is not listed, or not counted, gets 0 = the baseline. The hooks `imd_test_set_seq(bits)` / `imd_prof_set_seq(bits)` (and the harness env `IMD_TEST_SEQ`, the duel key `seq=default|0..7`) force a set for every plan; -1 restores the class's.
+* The kernels take the set as a template value (`kl_scale_pack<E, W, Seq>`, `kf_scale_pack<Cap, E, W, Seq>`, `k23_pack<W, Seq>`: 0 baseline, 1 E1, 3 E1 + Q1 (W = 2 only); `k5_crt_n<N, E, F64, F1>`, `k5_crt_bfast<N, F64, F1>`), so a set costs no instruction in the other sets. The baseline instances are the original source: the 14 pack kernels (KL, KF, K2/K3, both word counts) have the same SASS count as before to within 2 instructions on sm_89, sm_90 and sm_120. The K5 baseline instances (`k5_crt_n<N,E,F64>`, `k5_crt_bfast`) have identical source too, but their counts differ from the pre-change build by -27 to +33 instructions (45 to 69 of the 152 instances differ by more than 2, depending on the architecture): instruction-scheduling noise from the changed template parameter list, not a different sequence. The occupancy rows of the performance model (`imd_prof_kernel_occupancy`) describe the baseline instances; the E1 / Q1 instances have different register counts (not modelled).
+* Shared math in one place each: E1 `device/residue.hpp` (`PackEmit`, `kPackEmit`, `pack_emit_bounds_ok`) and `device/modp.hpp` (`pack_dot`, `pack_smod`; CPU and GPU run the same code); Q1 `kernels/numerics.cuh` (`quant_scale`, `quantize_cvt`, with the sigma bound as a `static_assert` against the certified `kSigmaMin`..`kSigmaMax`); F1 `kernels/numerics.cuh` (`finish_f1_try`, `crt_round`; its fallback is the existing `crt_finish` + `round_scaled`). A walk-back to a more general version is a change of `kSeqClasses` (or of one function); nothing else refers to the new sequences.
+
+### Hardware-specific assumptions (what must be re-checked for a new class)
+
+| sequence | math | assumes about the hardware |
+|---|---|---|
+| E1 | `d = sum dp4a`, `s' = sigma d + C` (C a multiple of p, `>= dmax`), `q = hi32(s' m32 + h m32)`, `u = s' - p q = SMod(sigma d, p)`; exact because `s' + h < 2^24` (A5) | `dp4a` is native (sm_61+). Integer pipe only. **Compiler dependence**: that the 64-bit addend fuses into one `IMAD.HI.U32` was measured with nvcc 13.4 only; the PACE modules use CUDA 12.9, whose ptxas may emit the longer `IMAD.WIDE` + `IADD3.X` form (a few instructions more per element-modulus; re-run `tools/sass_seq_counts.sh` with that toolchain before trusting the counts). **Registers**: KL is at 64 registers (the launch bound) with or without E1; `k23_pack<2>` is 64 baseline, 80 with E1 left alone (3 CTAs/SM instead of 4), so the E1 instance is held to 64 by its own launch bounds (`k23_pack_cap`, no spills). |
+| Q1 | `X = F2I.U64.{RNI,RZI}(\|x\| 2^s1 2^s2)`, `s1 = sigma >> 1`, `s2 = sigma - s1`; `X := 0` if `x` is Inf or NaN. W = 2 only (`X < 2^63`) | native `F2I.U64.F64` (step 0), 2 DMUL. 1/64 FP64 rate on the 4090 and sm_120 cards; on H100 DMUL is full rate but the 64-bit conversion is probably quarter rate (unmeasured). **Registers**: `k23_pack<2,3>` takes 94 registers (alloc 96) against 64, so 2 CTAs per SM instead of 4 on sm_90; capping it spills 128 B, so it is not capped. A weak-FP64 sm_90-class part (H20) would suffer from Q1 and F1 if they were defaults; the class table is keyed by compute capability only, which is one more reason they are not. |
+| F1 | `D = RN(t) 2^kk` from the top 64 bits plus a sticky bit; scaling is an exponent-field add | native `I2F.F64.U64`, same rate caveat. **Divergence**: a warp pays the fast path *and* the fallback if any lane has mag = 0, a subnormal or an overflowing result (zero outputs are common in sparse data), so F1 is worth less on such data than its count says. **Code size**: both paths are in the kernel (K5 static counts grow by ~200 per instance); the instruction cache is not modelled. |
+
+### Defaults and the SASS evidence per class
+
+Counts are `cuobjdump -sass` of `src/contract.cu` built for each architecture (`tools/sass_seq_counts.sh`; static instruction counts, NOPs excluded) and, for sm_89 only, executed thread-instructions from `ncu` (`smsp__thread_inst_executed.sum`, 4096^3 N = 14, RN, family u: deterministic counts, not timings; no Hopper counter run is possible here).
+
+Modulus loop of the KL pack (instructions per iteration; the iteration emits 8 or 4 elements of one modulus):
+
+| kernel | sm_89 base / E1 | sm_90 base / E1 | sm_120 base / E1 |
+|---|---|---|---|
+| `kl_scale_pack<8,2>` (8 elements) | 99 / 63 | 98 / 63 | 103 / 74 |
+| `kl_scale_pack<8,3>` | 109 / 74 | 110 / 72 | 112 / not measurable (the loop is replicated) |
+| `kl_scale_pack<4,2>` (4 elements) | 106 / 68 | 106 / 68 | 57 / 135 for 4 iterations (34 per iteration; unrolled) |
+| `kf_scale_pack<8,16,2>` (16 elements) | 220 / 106 | 220 / 106 | 203 / 149 |
+| `k23_pack<2>` (16 elements) | 207 / 107 | 207 / 107 | 202 / 151 |
+
+Whole-kernel static counts (the loop is a small part of them, so these move little): E1 is lower on sm_89 in all 10 pack kernels counted (the K2/K3, KF E = 16 and 4, KL E = 8 and 4 kernels, W = 2 and 3; -20 to -274), on sm_90 in 9 of 10 (the exception is `kf_scale_pack<8,16,2>`: 6799 -> 6827, +28 while its modulus loop falls 220 -> 106), and on sm_120 in 6 of 10: `kl_scale_pack<4,2>` 4082 -> 4510 and `<4,3>` 4220 -> 4730 grow because the compiler unrolls the modulus loop there (per iteration it is shorter), `kf_scale_pack<8,4,3>` is +57 and `k23_pack<2>` (capped, see below) is +48. The sm_89 range is -20 to -274 (`kl_scale_pack<4,2>`: -274 against the pre-change count, -272 against the same-source baseline instance; `k23_pack<2>` is -32 with the cap, -82 without). Executed thread-instructions per KL element on sm_89 (ncu): baseline 417.8, E1 356.3 (-61.5; predicted -72), E1 + Q1 311.4 (a further -44.9; predicted -45).
+
+| class | E1 | Q1 | F1 | reason |
+|---|---|---|---|---|
+| sm_89 (RTX 4090) | on | off | off | E1: fewer instructions everywhere counted, integer only. Q1, F1: FP64 at 1/64 rate. |
+| sm_90 (H100, H200) | on | off | off | E1 as on sm_89 (the review's register finding handled by `k23_pack_cap`). Q1 and F1 have fewer instructions but cost registers (Q1: `k23_pack<2,3>` 94 vs 64, 2 CTAs/SM instead of 4) and use conversions that are probably quarter rate on Hopper: opt-in (`seq=`, `imd_prof_set_seq`, `IMD_TEST_SEQ`) until R2 measures them. |
+| sm_120, anything else | off | off | off | counted (above): E1's loop is shorter per iteration but 4 of 10 kernels grow (compiler unrolling, the capped `k23_pack<2>`) and nothing was timed; a class without its own row in the K4 registry stays on the baseline. |
+
+Registers and spills (`ptxas -v`, same builds). sm_90: `k23_pack<2>` 64 baseline / 80 E1 uncapped / 64 `k23_pack_cap<2,1>` (no spills; 2597 instructions against 2680 baseline) / 94 E1 + Q1; `k23_pack<3>` 116 / 126 (2 CTAs per SM either way); `kf_scale_pack<8,16,2>` 128 / 126 / 112; every `kl_scale_pack` 64. sm_89: `k23_pack<2>` is 84 registers at baseline (3 CTAs/SM), so the capped E1 instance (64) is better than the baseline there. Spill bytes (stores/loads): `kl_scale_pack<4,3,1>` sm_90 28/36 (7 STL, 9 LDL) against 4/4 at baseline, sm_89 20/32 against 12/16. The SASS of the sm_90 instance puts every STL/LDL in the per-tile prologue (row set-up, `divmod`) and the chunk set-up, none inside the modulus loop (the IDP loop at 0xce20 has none), so they are executed once per tile and chunk, not per modulus; E1's `sg[E]` is not the cause (the baseline keeps `neg` as one word) but the extra live values around the setup are, and the 1024-thread KL<4> instance is at its 64-register cap.
+
+### Tests
+
+* `pack_emitter` (GPU unit test, `tests/test_pack_emitter.cu`): every N = 2..20, E = 16, 8, 4, RN and TRUNC, now through the baseline, the E1 and (W = 2) the E1 + Q1 instances, against an exact host reference (148 M residues), with a new input mode that covers the whole certified sigma range (`kSigmaMin`..`kSigmaMax`: Q1's two factors, subnormals, the largest double); **every reduced value** `d` in `[0, dmax]` for both signs, all 20 moduli and both word counts through `pack_smod` on the real `__constant__` table (11,442,942 values); ten **mutations** of that table (see below), each of which must be caught.
+* `contract_{e2e,eps}_seq0`, `contract_{e2e,tensor,every_n,eps,bigk}_seq7`, `contract_{e2e,eps}_seq1`, `output_hashes_seq{0,1,7}`, `output_hashes_large_seq7`: the existing oracle / committed-hash suites run with the baseline (seq0: the production path on every class without a default set, and the reference now that sm_89 and sm_90 default to E1), E1 and the full set forced for every plan (`IMD_TEST_SEQ`; the harness raises if the variable is set and the library has no test hooks or does not report that set back through `imd_test_get_seq`). `seq_select` pins the per-class default against this GPU's compute capability, reads the effective set of a plan back (`imd_test_plan_seq`) and checks that the invalid sets (Q1 without E1, out of range) are rejected. The committed hashes are unchanged.
+* **Mutants** (the compile-time `Mut` template value of the production templates, zero in every shipped instance; each must produce mismatches): E1 sign polarity (`sg`), the `byte_perm` assembly, `store_slots` not advancing to the start slot (the launches' addressing, now in `kernels/pack_emitter.cuh` and driven by the unit test in two parts), Q1 without the `f2` factor, Q1 with RN for TRUNC, Q1 without the Inf/NaN mask, Q1 `s2` off by one; two table mutants at p = 256 (`m32 - 1`, `C - p`, the low-byte path) beside the eight above; F1: `x == H` counted as negative, the 2-limb normalisation stage miscounted, the exponent taken without the `Dm = 2^64` carry, besides the five of `finish_f1`. Two review items are equivalent mutants and are not bugs: `sigma / 2` for `sigma >> 1` (any split with |s1|, |s2| <= 1022 is exact; the test asserts zero mismatches) and a missing 1-limb normalisation stage (the result falls back to the existing path).
+* The Python models (`nice -n 19 python3 -I`): `emit_model.py` (11.4 M + 0.97 M cases), `quantize_model.py` (787 k), `finish_model.py` (457 k): pass.
+
+### F1 (the CRT finish through `I2F.F64.U64`)
+
+`kernels/numerics.cuh` `finish_f1_try<L, N>` / `crt_round<L, N, F1>` replace `crt_finish` + `round_scaled` in `k5_elems_n` for both CRTs (the integer one and the binary64-limb one, `k5_crt_override()`): both leave `x` in `[0, P)` as `L` limbs. The model's sequence, with the two borrow chains as PTX `sub.cc` / `subc` carry chains (one `IADD3` per limb; the C++ 64-bit borrow compiled to three instructions per limb), 4 / 2 / 1-limb normalisation stages, `clz`, funnel shifts, a sticky bit, `I2F.F64.U64`, and an add of `kk` to the exponent field of the high word. Mag = 0, subnormal results, overflow and an exponent outside `1 <= 1086 + kk <= 2045` fall back to the existing path (`fast` fraction in the unit test: 78% of an adversarial set, 100% of typical exponents; the model's 457 k cases agree).
+
+* **Test** `finish_f1` (`tests/test_finish_f1.cu`): for every N = 2..20, 34,170 cases (649,230 in all) of x around 0, H, P - 1, all-ones, powers of two, exact ties and neighbours, random of every bit length, and exponents that put the leading bit at the subnormal and overflow edges, through the device `finish_f1_try` against `crt_finish` + `round_scaled` on the same limbs: 0 mismatches, fast and fallback both exercised for every N. Five **mutations** (`Mut` template value: sticky bit dropped, exponent +1, upper bound 2047, sign dropped, lower bound admitting field 0): all caught. `crt_f64_gpu` now also runs the limb CRT, F1, and both together (and F1 with all other sequences) against the integer CRT with the baseline finish, N = 2..20 in both families: identical to each other and to the committed hashes.
+* **Counts.** Static counts of K5 *grow* with F1 (the fast path and the fallback are both in the kernel: `k5_crt_n<14,4,false>` 3821 -> 4030 on sm_90, 3728 -> 3943 on sm_89), so only executed counts say anything. sm_89, `ncu`, 4096^3 N = 14: `k5_crt_n<14,4>` 651.2 thread-instructions per output element with the baseline finish, 554.5 with F1 (-96.7; the study predicted 650 -> ~495, -155). The shortfall is the estimate of the old finish: the typical `round_scaled` path executes about 150 instructions, not 200. The fast path alone is about 50 instructions (`k_f1` probe: 75 / 69 / 79 static including a 25-instruction harness on sm_90 / sm_89 / sm_120; the reference `crt_finish + round_scaled` probe is 264 / 253 / 210 static with both branch sides). H100 prediction at the same issue utilisation: 97 of 651 thread-instructions per element is 15% of K5 (0.07 ms of 0.46 ms), about 2% of the call; derived, not measured.
+
+### Predicted against achieved (executed thread-instructions per element, sm_89 `ncu`)
+
+| step | study prediction | achieved |
+|---|---|---|
+| E1 (KL) | -72 | -61.5 (417.8 -> 356.3); loop 98 -> 63 per 8 elements (predicted 96 -> ~55) |
+| Q1 (KL) | -45 | -44.9 (356.3 -> 311.4) |
+| F1 (K5) | -155 (650 -> ~495) | -96.7 (651.2 -> 554.5) |
+
+### Discrepancies and remaining risk
+
+* The study names `IMAD.WIDE.U32` for the 64-bit addend; the compiler emits `IMAD.HI.U32` with a register pair (same count).
+* The E1 loop keeps ~10 instructions of 64-bit pointer arithmetic per iteration (`dst += plane` is rematerialised from three kernel arguments because KL is at 64 registers); a precomputed `plane` in `LargeArgs` would remove about 8 of 63 (a quick win, not done).
+* Hopper is not measured. E1 is the sm_90 default on instruction counts and registers; Q1 and F1 (fewer instructions, more registers, probably quarter-rate conversions) are opt-in until R2 duels them (`--duel-a default --duel-b seq=7`, or `seq=1` against `seq=3` and `seq=1` against `seq=5` to separate them). `imd_pack` (a pack handle has no device class) and the performance model's occupancy rows use the baseline sequences.
+* A forced set that is not a set is rejected (`imd_test_set_seq`, `imd_prof_set_seq`, the duel key): the Q1 bit needs the E1 bit (`seq=2`, `seq=6` would silently have run the baseline). `quant_scale` asserts (debug builds) that sigma is inside the certified `kSigmaMin`..`kSigmaMax`, as the baseline clamps its shift. The `Mut` knobs of `finish_f1_try`, `quantize_cvt`, `quant_scale`, `PackEmitterT` and `store_slots` stay compile-time template values (every shipped instance is `Mut = 0` and contains none of them); moving them into test-only copies would duplicate the functions under test.
+* Not done (as asked): L1, P1, K1, E2.
+
+### Build cost and the twins
+
+The kernel count of `src/contract.cu` per architecture goes from 178 to 351 and its static SASS from 398,720 to 831,846 instructions on sm_89 (416,469 -> 867,207 on sm_90, 422,666 -> 886,317 on sm_120): every pack kernel exists for the baseline, E1 and (W = 2) E1 + Q1, every K5 kernel for F1 on and off, besides the F64 pair that already existed. No device class defaults to the Q1 / F1 twins, and the F64 twins are never a default, so those instances are compiled to be reachable by hooks only. `-DIMMERDINK_SEQ_TWINS=OFF` omits them (`IMD_NO_SEQ_TWINS`: the Q1 pack instances and the F1 K5 instances are not instantiated; the hooks then refuse any set but 0 and 1, the ctest `seq7` / F1 cases are not registered, `crt_f64_gpu` and `seq_select` drop them). With the option off the sm_90 object has 192 kernels and 490,853 instructions (checked by compiling `contract.cu` with `-DIMD_NO_SEQ_TWINS=1`; the rest of the library was not rebuilt that way). Default ON, so a normal build and the CI keep testing every sequence; a production build that does not want the twins turns it off. The F64 twins (issue 21, before this section) are not covered by the option.
+
+### Local regression check (4090, not a measurement)
+
+`imd_bench --methods duel --duel-a seq=0 --duel-b default --reps 200` (the class default on the 4090 is E1), interleaved, GPU lock held, load below 8, the desktop session active, so these numbers are **not decision-grade**; they only answer "is the default grossly slower?" (the stop rule was more than 3%). ratio_median = time(seq=0) / time(default), so above 1 means the default is faster:
+
+| case | ratio_median | p10 .. p90 | note |
+|---|---|---|---|
+| sq4096, N = 14 (KL for both operands) | 0.9998 | 0.9988 .. 1.0011 | 4.89 ms either way |
+| sq4096, N = 18 (W = 3) | 0.9998 | 0.9984 .. 1.0010 | 6.25 ms |
+| sq2048, N = 8 | 1.017 | 1.010 .. 1.023 | |
+| sq1024, N = 14 (KF) | 1.052 | 0.933 .. 1.113 | spread 10-12 %: noise |
+
+Every pair is bit-identical (`bit_identical: true`). The 4090 pack is DRAM-bound at these sizes (85%), so no change in the call is expected from fewer instructions; none was found and none was lost.
+
+### Running the normal `imd` method under a sequence set and CRT variant (campaign manifest)
+
+`imd_bench --methods imd ... --seq <default|0|1|3|4|5|7> --crt <int|f64>` (profiling build, which is what `bench/build.sh` makes) forces the sequence set (`imd_prof_set_seq`) and K5's CRT variant (`imd_prof_set_k5_crt`) for that method's plan and calls only: both are set before the plan is created and reset (-1 and 0) as soon as the record's fields are read, with a scope guard for the error paths, so later methods in the same process run the defaults. `--seq 2`, `6`, anything else out of range and a `--crt` other than `int`/`f64` are refused before any GPU work (the Q1 bit needs the E1 bit, as in the hooks). Omitting both options changes nothing (neither hook is called, the record has `seq_req: -1`, `crt_req: "int"`).
+
+The imd record gets `seq_req` (-1 = the device class's set) and `crt_req` (what was asked), `seq` and `crt` (what the plan read back: `imd_prof_plan_seq`, `imd_prof_get_k5_crt`), `phase_seq` and `phase_crt` (the same, beside `phases`, which are the per-phase times of that configuration), and `seq_after_reset` / `crt_after_reset` (the plan read back after the reset: the class's set and `int`, the guard that nothing leaks). The output hash is the record's existing `c_hash` (FNV-1a over C's bytes): all configurations of one case must give one `c_hash`. The variant string gets ` seq=N` / ` crt=f64` appended when forced. `bench/test_seq_crt.py` is the smoke test (usage text, refused values, sets default/0/1/7 x int/f64 on a tiny shape with one `c_hash` and the recorded fields, the reset); it is a ctest (`bench_seq_crt`, GPU lock) when `IMMERDINK_BENCH_BIN` names the profiling-build `imd_bench`.

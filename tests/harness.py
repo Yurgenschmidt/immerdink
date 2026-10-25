@@ -143,6 +143,12 @@ class Library:
             self.lib.imd_test_set_k5_elems.restype = C.c_int
             self.lib.imd_test_set_k5_crt.argtypes = [C.c_int]
             self.lib.imd_test_set_k5_crt.restype = C.c_int
+            self.lib.imd_test_set_seq.argtypes = [C.c_int]
+            self.lib.imd_test_set_seq.restype = C.c_int
+            self.lib.imd_test_get_seq.argtypes = []
+            self.lib.imd_test_get_seq.restype = C.c_int
+            self.lib.imd_test_plan_seq.argtypes = [C.c_void_p]
+            self.lib.imd_test_plan_seq.restype = C.c_int
             self.lib.imd_test_crt_elem.argtypes = [C.c_int, C.c_int, C.c_int, C.c_int64, C.c_void_p, C.c_void_p]
             self.lib.imd_test_crt_elem.restype = C.c_int
             self.lib.imd_test_k5_launch_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
@@ -165,6 +171,15 @@ class Library:
             self.lib.imd_test_kernel_occupancy_w.argtypes = [C.c_int32, C.c_int32,
                                                              C.POINTER(C.c_int32)]
             self.lib.imd_test_kernel_occupancy_w.restype = C.c_int
+        # Issue 21: IMD_TEST_SEQ=<bits> runs the whole process with that instruction-sequence set (1 E1, 2 Q1, 4 F1)
+        # instead of the device class's: the same tests, the same oracle, the other sequences. It fails loudly if it cannot
+        # take effect (no test hooks) or did not (the set read back differs): a seq run must never silently run the default.
+        env_seq = os.environ.get("IMD_TEST_SEQ")
+        if env_seq not in (None, ""):
+            if not self.has_test_hooks:
+                raise RuntimeError("IMD_TEST_SEQ is set but the library has no test hooks (imd_test_set_seq)")
+            if self.lib.imd_test_set_seq(int(env_seq)) != 0 or self.lib.imd_test_get_seq() != int(env_seq):
+                raise RuntimeError(f"IMD_TEST_SEQ={env_seq}: the library did not take that sequence set")
         self.shim = None
 
     def load_alloc_shim(self, path):
@@ -199,6 +214,18 @@ class Library:
     def set_k5_crt(self, variant=0):
         """Issue 21: K5's CRT with the sums in binary64 limbs (1) or the integer running CRT (0, default)."""
         assert self.lib.imd_test_set_k5_crt(variant) == 0
+
+    def get_seq(self):
+        """The forced instruction-sequence set (-1: none)."""
+        return self.lib.imd_test_get_seq()
+
+    def plan_seq(self, plan):
+        """The sequence set the plan's launches run now (the forced one, else the device class's)."""
+        return self.lib.imd_test_plan_seq(plan)
+
+    def set_seq(self, bits=-1):
+        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish; -1 the device class's)."""
+        assert self.lib.imd_test_set_seq(bits) == 0
 
     def crt_elem(self, N, variant, e, count, W_dev, out_dev):
         """Issue 21 device-level unit hook (src/test_hooks.cpp imd_test_crt_elem): the CRT word x in [0, P) of `count` residue vectors by the real
