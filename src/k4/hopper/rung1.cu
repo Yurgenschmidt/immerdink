@@ -12,17 +12,23 @@
 // the 8192^3 collapse of the stock kernels: max_swizzle_size (1, 2, 4, 8) and raster_order (AlongM / AlongN). The product's own mma.sync K4
 // (k4_ops_cfg0, the A2 kernel, 128x256 tile) is a row of the same table ("m_..."), measured in the same process, so the baseline is same-session.
 //
-//   imd_rung1 [--quick] [--list] [--variants A,B,..] [--shapes 4096,8192|MxNxK,..] [--batches 14,4,1] [--reps 12] [--warmup 3] [--loop 8]
+//   imd_rung1 [--quick] [--list] [--plan] [--variants A,B,..] [--shapes 4096,8192|MxNxK,..] [--batches 14,4,1] [--reps 12] [--warmup 3] [--loop 8]
 //             [--max-seconds 8] [--samples 384] [--sweep 8192|none|SHAPES] [--sweep-variants LIST] [--clusters queried|heuristic|both]
-//             [--sustain SECONDS] [--skip-last] [--no-nvml]
+//             [--sustain SECONDS] [--peak-seconds S] [--skip-last] [--no-nvml]
 //   env: IMD_RUNG1_QUICK=1 (= --quick), BENCH_COMMIT, IMD_NVCC_VERSION, SLURM_JOB_ID (copied into the meta record / every record)
-//   Unknown --keys are an error. --variants entries are the groups all / f / g / m / quick / sweep (exact words) or a name or substring of a
+//   Unknown --keys are an error. --variants entries are the groups all / f / g / m / p / quick / sweep (exact words) or a name or substring of a
 //   name (f_128x256 selects every f_ 128x256 row); default all. --sweep uses the selected rows flagged sweep unless --sweep-variants says otherwise.
 //   --quick: 4096 only, L = 14 only, the rows flagged quick in the table, 10 reps, 128 samples, no sweep (about a minute).
 //   The configurations (kEntries), the default shapes and batches and the sweep grid are data tables in one block ("DATA"); each row carries the
 //   compute capability it is for, every JSON record carries the card's name and compute capability (gpu, cc).
 //
-// Work order (so that a timeout or a hang keeps the most valuable lines, and the riskiest row is last): (1) default scheduler, first shape,
+// The p_ rows are NOT GEMMs: the SYNTHETIC wgmma INT8 PEAK (section "p_ rows" below; docs/NOTES-22.md "The synthetic peak"): wgmma issued back to back
+// from shared-memory tiles, no memory traffic, no epilogue, accumulators in registers. They say what the card can sustain at all, so the real rows
+// can be read against that instead of the 1979 TOPS datasheet figure. They take no shape or batch; --peak-seconds S sets the timed seconds per row
+// (default 1.25: five launches of about 0.25 s, after a 0.3 s warm-up); --sustain also runs a sustained block of the best full-range p_ row.
+//
+// Work order (so that a timeout or a hang keeps the most valuable lines, and the riskiest row is last): (0) the p_ rows (cheap, about 3 s each), then with
+// --sustain the sustained block of the best full-range one; (1) default scheduler, first shape,
 // L = first batch, every non-"last" f_ row and the m_ baseline, then the same at the other shapes; (2) the scheduler sweep (swizzle 1/2/4/8 x
 // AlongM/AlongN, rows whose resolved (raster, swizzle) equals the default's are skipped as duplicates); (3) with --sustain: a sustained block
 // for the best f_ row at the last shape; (4) the g_ rows; (5) the other batches (4, 1) for all of those; (6) the rows flagged "last" (cluster
@@ -39,6 +45,12 @@
 // Cluster rows: max_active_clusters_arg ("queried": hw_info.max_active_clusters from cudaOccupancyMaxActiveClusters with the kernel's real shared
 // memory; "heuristic": left 0 as the rung-0 and stock-ceiling runs did), max_active_clusters, max_active_clusters_cutlass (CUTLASS's own query,
 // which ignores dynamic shared memory), grid_x/y/z and ctas_launched (the persistent grid CUTLASS launches).
+// p_ records (op "peak", mode "peak" = --peak-seconds worth of launches of about 0.25 s each, mode "sustain" with --sustain): n_tile, wg_per_cta, stages,
+// ctas_per_sm, data (zero / small / full / full4), grid, iterations_blocks (loop count; 16 wgmma per block), wgmma_per_wg, ops_per_wgmma, tops = ops of one
+// launch / median launch time (all SMs, all warpgroups), ops_clk_sm_clock64 (ops per SM clock per SM from the kernel's own clock64, no sampling;
+// datasheet 8192), sm_mhz_clock64, tops_per_ghz_nvml / ops_clk_sm_nvml (from NVML's clock), datasheet_tops_at_nvml_clock, sms_used / placement_ok, the NVML
+// fields below, and "exact": EVERY accumulator of EVERY CTA and warpgroup equals iterations x (A.B^T of the tiles) mod 2^32 (int32 wraparound), after the
+// timed block (its last launch, output poisoned beforehand), after the sustained block, and after a fresh launch at the end, plus the loop counter of every warpgroup; exact_check_trivial for the zero data (all results 0).
 //
 // "exact" and how it is decided (independent checks, all reported):
 //   ref_mismatches   a sample of output bytes (--samples random ones plus corners and tile-edge positions) is compared with a HOST reference:
@@ -88,7 +100,9 @@
 
 #include <cuda_runtime.h>
 
+#include "cutlass/arch/barrier.h"
 #include "cutlass/kernel_hardware_info.h"
+#include "cute/atom/mma_traits_sm90_gmma.hpp"
 #include "k4/hopper/k4_hopper.cuh"
 #include "k4/k4_ops.hpp"
 
@@ -267,6 +281,7 @@ struct Opt {
   double max_seconds = 8.0, sustain = 0;
   long long samples = 384;
   bool quick = false, nvml = true, skip_last = false;
+  double peak_seconds = 1.25;  // p_ rows: total timed seconds per row (5 or more launches of about 0.25 s)
   std::string clusters = "queried";  // queried | heuristic | both
 };
 struct Fixture {
@@ -289,6 +304,7 @@ struct Task {
   int occ = 0;       // cluster rows: 0 = hw_info.max_active_clusters queried, 1 = left 0 (CUTLASS's heuristic grid)
   int slot0 = 0;     // the first modulus slot: batch z uses moduli[slot0 + z] (0 holds p = 256, an epilogue-trivial modulus)
   double sustain = 0;  // > 0: also run a sustained block of this many seconds
+  bool only_sustain = false;  // p_ rows: run the sustained block only (the work order's peak sustain item)
 };
 struct Ctx {
   Opt opt;
@@ -300,6 +316,7 @@ struct Ctx {
   struct First { unsigned long long hash; std::string name; };
   std::map<std::tuple<long long, long long, long long, int, int>, First> first_hash;  // (m, n, k, L, slot0) -> hash of the first row run
   std::map<std::pair<const Entry*, long long>, double> loop_tops;  // (row, m) -> loop-mode tops of its primary-batch default-scheduler record
+  std::map<const Entry*, double> peak_tops;                       // p_ row -> tops of its (exact) timed record
   long long n_rows = 0, n_inexact = 0, n_nonok = 0;
   Fixture& fixture(Dims d) {
     auto it = fx.find(d);
@@ -316,8 +333,10 @@ double median(std::vector<double> v) {
 int mod_of(int64_t v, int p) { return int(((v % p) + p) % p); }
 
 // ------------------------------------------------------------------ the rows
-enum class Kind { Fast, Generic, Mma };
-const char* kind_name(Kind k) { return k == Kind::Fast ? "fast_epilogue" : k == Kind::Generic ? "generic_epilogue" : "mma_sync_product"; }
+enum class Kind { Fast, Generic, Mma, Peak };
+const char* kind_name(Kind k) {
+  return k == Kind::Fast ? "fast_epilogue" : k == Kind::Generic ? "generic_epilogue" : k == Kind::Mma ? "mma_sync_product" : "wgmma_peak";
+}
 
 // One named configuration of the table kEntries (the only place that knows tile / cluster / schedule choices).
 struct Entry {
@@ -330,6 +349,7 @@ struct Entry {
   int tile_m, tile_n, cl_m, cl_n;  // CTA tile rows / columns and cluster shape (to resolve the scheduler's raster order and swizzle)
   long long smem_bytes;  // dynamic shared memory per CTA, known at compile time: --list prints it without a GPU
   void (*run)(Ctx&, const Entry&, const Task&);
+  int pk_data = -1;  // Kind::Peak rows: the operand data (0 zero, 1 small, 2 full range, 3 full range with 4 rotating stages), else -1
 };
 
 struct Prepared {  // what a kernel family supplies for one task
@@ -340,7 +360,7 @@ struct Prepared {  // what a kernel family supplies for one task
 
 struct Resolved { int raster; int swizzle; };  // raster 1 AlongM / 2 AlongN; swizzle = the max swizzle size the scheduler ends up using
 Resolved resolve(const Entry& e, const Task& t) {
-  if (e.kind == Kind::Mma) return {0, 0};
+  if (e.kind == Kind::Mma || e.kind == Kind::Peak) return {0, 0};
   auto up = [](long long x, long long y) { return (x + y - 1) / y * y; };
   const long long tm = up((t.d.m + e.tile_m - 1) / e.tile_m, e.cl_m), tn = up((t.d.n + e.tile_n - 1) / e.tile_n, e.cl_n);
   const int lg = SchedParams::get_log_swizzle_size(int(tm), int(tn), t.sc.swizzle);
@@ -686,6 +706,366 @@ void run_mma(Ctx& c, const Entry& e, const Task& t) {
   });
 }
 
+// ================================================================== p_ rows: the SYNTHETIC wgmma INT8 peak (no memory traffic, no epilogue)
+// What is the fastest INT8 rate this card sustains with wgmma when nothing but the tensor cores is working? The CTA copies a few operand tiles into
+// shared memory ONCE, then every consumer warpgroup issues wgmma m64nNk32 s32.s8.s8 (SS form: both operands from shared memory by descriptor, K-major,
+// 128-byte swizzle) back to back on registers, `kPeakWgmmaPerBlock` = 16 per commit group, one group always in flight (wait_group 1), for a fixed number
+// of blocks; the accumulators are written to global memory once at the end (so the loop cannot be removed, and so they can be checked). The shared
+// memory layouts, descriptors, fragments and the mma call are CuTe/CUTLASS's own (tile_to_shape of GMMA::Layout_K_SW128_Atom, make_fragment_A/B,
+// cute::gemm), the ones the stock sm90 TMA mainloop uses; there is no hand-written descriptor. docs/NOTES-22.md section "The synthetic peak".
+constexpr int kPeakKTile = 128;         // K per tile: 128 int8 = 128 bytes = one SW128 atom wide
+constexpr int kPeakTilesPerBlock = 4;   // K tiles per block (a block = one commit group)
+constexpr int kPeakWgmmaPerBlock = kPeakTilesPerBlock * (kPeakKTile / 32);  // 16
+constexpr int kDatasheetOpsClkSm = 8192;  // H100 SXM dense INT8: 4096 MAC = 8192 ops per clock per SM (1979 TOPS = 132 SMs x 8192 x 1.83 GHz)
+
+struct PeakStat {  // one per (CTA, warpgroup), written by thread 0 of the warpgroup
+  unsigned long long cycles;  // clock64 cycles of the wgmma loop (SM clock)
+  unsigned iters;             // the loop counter at exit (must equal the requested block count)
+  unsigned smid;              // %smid
+};
+
+template <int N> struct PeakAtom;
+template <> struct PeakAtom<256> { using type = cute::SM90_64x256x32_S32S8S8_SS_TN; };
+template <> struct PeakAtom<128> { using type = cute::SM90_64x128x32_S32S8S8_SS_TN; };
+
+template <int N, int NWG, int ST>
+struct PeakCfg {
+  using TiledMma = decltype(cute::make_tiled_mma(typename PeakAtom<N>::type{}));
+  using Atom = cute::GMMA::Layout_K_SW128_Atom<int8_t>;
+  using SmemA = decltype(cute::tile_to_shape(Atom{}, cute::make_shape(cute::Int<64>{}, cute::Int<kPeakKTile>{}, cute::Int<ST>{}), cute::Step<cute::_1, cute::_2, cute::_3>{}));
+  using SmemB = decltype(cute::tile_to_shape(Atom{}, cute::make_shape(cute::Int<N>{}, cute::Int<kPeakKTile>{}, cute::Int<ST>{}), cute::Step<cute::_1, cute::_2, cute::_3>{}));
+  static constexpr size_t kBytesB = size_t(ST) * N * kPeakKTile, kBytesAwg = size_t(ST) * 64 * kPeakKTile;
+  static constexpr size_t kNeed = kBytesB + NWG * kBytesAwg + 1024;  // + 1 KiB: the swizzle pattern repeats every 1024 bytes, the base is aligned by hand
+};
+// dynamic shared memory of a launch: a one-CTA-per-SM row asks for more than half of the 227 KiB so that no second CTA can share an SM
+template <int N, int NWG, int ST, int CTAS>
+constexpr long long peak_smem() { return CTAS == 1 ? (long long)(PeakCfg<N, NWG, ST>::kNeed > 116 * 1024 ? PeakCfg<N, NWG, ST>::kNeed : 116 * 1024) : (long long)PeakCfg<N, NWG, ST>::kNeed; }
+
+// gA: [NWG][ST][64][128] int8 (row-major, k contiguous), gB: [ST][N][128]; out: [cta][wg][N/2 registers][128 threads] int32
+template <int N, int NWG, int ST>
+__global__ void __launch_bounds__(128 * NWG, 1)
+    k_wgmma_peak(const int8_t* __restrict__ gA, const int8_t* __restrict__ gB, int nblk, int32_t* __restrict__ out, PeakStat* __restrict__ stat) {
+  using namespace cute;
+  using Cfg = PeakCfg<N, NWG, ST>;
+  extern __shared__ char peak_smem_raw[];
+  const uint32_t sbase = cast_smem_ptr_to_uint(peak_smem_raw);
+  char* const base = peak_smem_raw + ((1024u - (sbase & 1023u)) & 1023u);
+  const int tid = threadIdx.x, wg = tid / 128;
+  Tensor sB = make_tensor(make_smem_ptr(reinterpret_cast<int8_t*>(base)), typename Cfg::SmemB{});
+  // the operand tiles, once: logical (row, k, stage) -> swizzled address by CuTe's layout
+  for (int i = tid; i < ST * N * kPeakKTile; i += blockDim.x) {
+    const int k = i % kPeakKTile, r = (i / kPeakKTile) % N, s = i / (kPeakKTile * N);
+    sB(r, k, s) = gB[i];
+  }
+  for (int w = 0; w < NWG; ++w) {
+    Tensor sAw = make_tensor(make_smem_ptr(reinterpret_cast<int8_t*>(base + Cfg::kBytesB + w * Cfg::kBytesAwg)), typename Cfg::SmemA{});
+    for (int i = tid; i < ST * 64 * kPeakKTile; i += blockDim.x) {
+      const int k = i % kPeakKTile, r = (i / kPeakKTile) % 64, s = i / (kPeakKTile * 64);
+      sAw(r, k, s) = gA[(size_t(w) * ST * 64 + size_t(s) * 64 + r) * kPeakKTile + k];
+    }
+  }
+  cutlass::arch::fence_view_async_shared();  // generic-proxy writes -> visible to the async proxy (wgmma reads shared memory through it)
+  __syncthreads();
+
+  Tensor sA = make_tensor(make_smem_ptr(reinterpret_cast<int8_t*>(base + Cfg::kBytesB + wg * Cfg::kBytesAwg)), typename Cfg::SmemA{});
+  typename Cfg::TiledMma tiled_mma;
+  auto thr_mma = tiled_mma.get_thread_slice(tid % 128);
+  Tensor tCrA = thr_mma.make_fragment_A(thr_mma.partition_A(sA));  // (MMA, MMA_M, MMA_K, ST): descriptors
+  Tensor tCrB = thr_mma.make_fragment_B(thr_mma.partition_B(sB));  // (MMA, MMA_N, MMA_K, ST)
+  Tensor accum = partition_fragment_C(tiled_mma, Shape<Int<64>, Int<N>>{});
+  static_assert(size(accum) == N / 2, "64 x N int32 accumulators per warpgroup: N / 2 registers per thread");
+  static_assert(size<2>(tCrA) == kPeakKTile / 32, "four k32 instructions per 128-wide tile");
+  clear(accum);
+  tiled_mma.accumulate_ = GMMA::ScaleOut::One;  // the accumulators start at zero, every instruction adds
+  const long long t0 = clock64();
+  int b = 0;
+  for (; b < nblk; ++b) {
+    warpgroup_fence_operand(accum);
+    warpgroup_arrive();
+    CUTE_UNROLL
+    for (int j = 0; j < kPeakTilesPerBlock; ++j)  // tile j of the block lives in stage j % ST (ST = 1: the same tile four times; ST = 4: four different tiles)
+      CUTE_UNROLL
+      for (int k = 0; k < kPeakKTile / 32; ++k) cute::gemm(tiled_mma, tCrA(_, _, k, j % ST), tCrB(_, _, k, j % ST), accum);
+    warpgroup_commit_batch();
+    warpgroup_wait<1>();  // the previous group is done, this one is running while the next one is issued
+    warpgroup_fence_operand(accum);
+  }
+  warpgroup_wait<0>();
+  warpgroup_fence_operand(accum);
+  const long long t1 = clock64();
+  const int t = tid % 128;
+  int32_t* o = out + (size_t(blockIdx.x) * NWG + wg) * (N / 2) * 128 + t;
+  CUTE_UNROLL
+  for (int v = 0; v < N / 2; ++v) o[size_t(v) * 128] = accum(v);
+  if (t == 0) {
+    uint32_t smid;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+    stat[size_t(blockIdx.x) * NWG + wg] = {static_cast<unsigned long long>(t1 - t0), unsigned(b), smid};
+  }
+}
+
+int8_t peak_val(int data, uint64_t which, uint64_t row, uint64_t k) {
+  if (data == 0) return 0;
+  if (data == 1) return int8_t(int(mix((which << 56) ^ (row << 24) ^ k) % 7u) - 3);  // small random: -3 .. 3
+  return val(which, row, k);                                                            // full range: -127 .. 127
+}
+const char* peak_data_name(int d) { return d == 0 ? "zero" : d == 1 ? "small" : d == 2 ? "full" : "full4"; }
+
+struct PeakCheck {
+  long long checked = 0, bad = 0, iters_bad = 0, sms_used = 0;
+  long long cta = -1, wg = -1, thr = -1, reg = -1;
+  long long want = 0, got = 0;
+  double rate_mean = 0, rate_min = 0, cycles_min = 0, cycles_mean = 0, cycles_max = 0;  // rate: ops per clock per SM from clock64
+};
+
+template <int N, int NWG, int ST>
+void run_peak_impl(Ctx& c, const Entry& e, const Task& t, int ctas, int data) {
+  constexpr int NACC = N / 2;
+  const int grid = c.sms * ctas;
+  const long long smem = e.smem_bytes;
+  const double ops_wgmma = 2.0 * 64 * N * 32;
+  std::fprintf(stderr, "starting %s N=%d wg/cta=%d stages=%d ctas/sm=%d data=%s grid=%d smem=%lld%s\n", e.name, N, NWG, ST, ctas, peak_data_name(data), grid, smem,
+               t.only_sustain ? " sustain only" : "");
+  Rec base;
+  base.s("method", "rung1").s("variant", e.name).s("kind", kind_name(e.kind)).s("op", "peak");
+  base.i("n_tile", N).i("wg_per_cta", NWG).i("stages", ST).i("ctas_per_sm", ctas).s("data", peak_data_name(data)).i("grid", grid).i("block_threads", 128 * NWG);
+  base.s("gpu", c.gpu).s("cc", std::to_string(c.cc_major) + "." + std::to_string(c.cc_minor)).i("sm_count", c.sms);
+  base.i("clock_khz_max", c.clock_khz).i("mem_clock_khz", c.mem_clock_khz);
+  base.b("ndebug",
+#ifdef NDEBUG
+         true
+#else
+         false
+#endif
+  );
+  if (!c.commit.empty()) base.s("commit", c.commit);
+  ++c.n_rows;
+  auto emit_status = [&](const std::string& st) {
+    Rec r = base;
+    r.null("exact").s("status", st);
+    emit_line(r);
+    ++c.n_nonok;
+    std::fprintf(stderr, "  %s: %s\n", e.name, st.c_str());
+  };
+  try {
+    auto kernel = &k_wgmma_peak<N, NWG, ST>;
+    cudaDeviceProp prop{};
+    CU(cudaGetDeviceProperties(&prop, 0));
+    if (smem > (long long)prop.sharedMemPerBlockOptin) throw Skip("needs " + std::to_string(smem) + " bytes of shared memory, the device allows " + std::to_string(prop.sharedMemPerBlockOptin));
+    CU(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)));
+    cudaFuncAttributes fa{};
+    CU(cudaFuncGetAttributes(&fa, kernel));
+    int occ = 0;
+    CU(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kernel, 128 * NWG, size_t(smem)));
+    base.i("regs", fa.numRegs).i("local_bytes", (long long)fa.localSizeBytes).i("smem_dynamic_bytes", smem).i("max_blocks_per_sm", occ);
+    if (occ < ctas) throw Skip("occupancy " + std::to_string(occ) + " CTA(s) per SM, the row needs " + std::to_string(ctas));
+
+    // ---- data: tiles from the counter-based hash (or zeros / small values), the same bytes for every CTA
+    std::vector<int8_t> hA(size_t(NWG) * ST * 64 * kPeakKTile), hB(size_t(ST) * N * kPeakKTile);
+    for (int w = 0; w < NWG; ++w)
+      for (int s = 0; s < ST; ++s)
+        for (int r = 0; r < 64; ++r)
+          for (int k = 0; k < kPeakKTile; ++k) hA[((size_t(w) * ST + s) * 64 + r) * kPeakKTile + k] = peak_val(data, 100 + w * 8 + s, r, k);
+    for (int s = 0; s < ST; ++s)
+      for (int r = 0; r < N; ++r)
+        for (int k = 0; k < kPeakKTile; ++k) hB[(size_t(s) * N + r) * kPeakKTile + k] = peak_val(data, 200 + s, r, k);
+    Buf dA(hA.size()), dB(hB.size()), dOut(size_t(grid) * NWG * NACC * 128 * 4), dStat(size_t(grid) * NWG * sizeof(PeakStat));
+    CU(cudaMemcpy(dA.p, hA.data(), hA.size(), cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(dB.p, hB.data(), hB.size(), cudaMemcpyHostToDevice));
+    // expected accumulator per block: S[w][row][col] = sum over the block's four tiles (stage j % ST) of (A_tile B_tile^T); int32 wraparound is the
+    // hardware's (the non-saturating instruction wraps mod 2^32) and deterministic, so the check is exact: acc = nblk * S mod 2^32
+    std::vector<int32_t> S(size_t(NWG) * 64 * N, 0);
+    for (int w = 0; w < NWG; ++w)
+      for (int j = 0; j < kPeakTilesPerBlock; ++j) {
+        const int s = j % ST;
+        for (int r = 0; r < 64; ++r) {
+          const int8_t* a = &hA[((size_t(w) * ST + s) * 64 + r) * kPeakKTile];
+          for (int q = 0; q < N; ++q) {
+            const int8_t* b = &hB[(size_t(s) * N + q) * kPeakKTile];
+            int32_t acc = 0;
+            for (int k = 0; k < kPeakKTile; ++k) acc += int32_t(a[k]) * int32_t(b[k]);
+            S[(size_t(w) * 64 + r) * N + q] += acc;
+          }
+        }
+      }
+    auto launch = [&](int nblk) {
+      kernel<<<grid, 128 * NWG, size_t(smem)>>>(dA.as<int8_t>(), dB.as<int8_t>(), nblk, dOut.as<int32_t>(), dStat.as<PeakStat>());
+      CU(cudaGetLastError());
+    };
+    auto check = [&](int nblk) {  // a poisoned-output launch has run; compare every accumulator of every CTA and warpgroup
+      PeakCheck ck;
+      std::vector<int32_t> o(size_t(grid) * NWG * NACC * 128);
+      std::vector<PeakStat> st(size_t(grid) * NWG);
+      CU(cudaMemcpy(o.data(), dOut.p, o.size() * 4, cudaMemcpyDeviceToHost));
+      CU(cudaMemcpy(st.data(), dStat.p, st.size() * sizeof(PeakStat), cudaMemcpyDeviceToHost));
+      for (int cta = 0; cta < grid; ++cta)
+        for (int w = 0; w < NWG; ++w)
+          for (int v = 0; v < NACC; ++v)
+            for (int th = 0; th < 128; ++th) {
+              const int warp = th / 32, lane = th % 32;
+              const int row = 16 * warp + lane / 4 + 8 * ((v / 2) % 2), col = 8 * (v / 4) + 2 * (lane % 4) + (v % 2);  // the PTX wgmma D fragment
+              const uint32_t want = uint32_t(uint64_t(int64_t(S[(size_t(w) * 64 + row) * N + col])) * uint64_t(nblk));
+              const uint32_t got = uint32_t(o[((size_t(cta) * NWG + w) * NACC + v) * 128 + th]);
+              ++ck.checked;
+              if (got != want) {
+                if (ck.bad == 0) ck.cta = cta, ck.wg = w, ck.thr = th, ck.reg = v, ck.want = want, ck.got = got;
+                ++ck.bad;
+              }
+            }
+      std::map<unsigned, double> per_sm;
+      double cmin = 1e300, cmax = 0, csum = 0;
+      for (const PeakStat& x : st) {
+        if (x.iters != unsigned(nblk)) ++ck.iters_bad;
+        cmin = std::min(cmin, double(x.cycles)), cmax = std::max(cmax, double(x.cycles)), csum += double(x.cycles);
+        per_sm[x.smid] += double(nblk) * kPeakWgmmaPerBlock * ops_wgmma / double(std::max(1ull, x.cycles));  // this warpgroup's ops per clock
+      }
+      ck.sms_used = (long long)per_sm.size();
+      ck.rate_min = 1e300;
+      for (const auto& kv : per_sm) ck.rate_mean += kv.second / double(per_sm.size()), ck.rate_min = std::min(ck.rate_min, kv.second);
+      ck.cycles_min = cmin, ck.cycles_max = cmax, ck.cycles_mean = csum / double(st.size());
+      return ck;
+    };
+    auto poison_launch = [&](int nblk) {
+      CU(cudaMemset(dOut.p, 0xEE, dOut.bytes));
+      CU(cudaMemset(dStat.p, 0, dStat.bytes));
+      launch(nblk);
+      CU(cudaDeviceSynchronize());
+      CU(cudaGetLastError());
+    };
+    cudaEvent_t e0, e1;
+    CU(cudaEventCreate(&e0));
+    CU(cudaEventCreate(&e1));
+    struct Guard { cudaEvent_t a, b; ~Guard() { cudaEventDestroy(a); cudaEventDestroy(b); } } guard{e0, e1};
+    auto time_launches = [&](int nblk, int n) {  // seconds of n back-to-back launches; the outputs are poisoned first (outside the event pair), so a launch that wrote nothing shows
+      CU(cudaMemsetAsync(dOut.p, 0xEE, dOut.bytes, nullptr));
+      CU(cudaMemsetAsync(dStat.p, 0, dStat.bytes, nullptr));
+      CU(cudaEventRecord(e0, nullptr));
+      for (int i = 0; i < n; ++i) launch(nblk);
+      CU(cudaEventRecord(e1, nullptr));
+      CU(cudaEventSynchronize(e1));
+      float ms = 0;
+      CU(cudaEventElapsedTime(&ms, e0, e1));
+      return double(ms) * 1e-3;
+    };
+
+    // ---- warm-up: short launches for 0.3 s so the clocks are up, then the block count that makes one launch last about 0.25 s
+    const int nblk0 = 1000;
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      do { time_launches(nblk0, 8); } while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 0.3);
+    }
+    const double per_block = time_launches(nblk0, 8) / 8.0 / nblk0;
+    const int nblk = std::max(2000, int(0.25 / std::max(per_block, 1e-9)));
+    const double ops_launch = ops_wgmma * double(nblk) * kPeakWgmmaPerBlock * double(grid) * NWG;
+    base.i("iterations_blocks", nblk).i("wgmma_per_wg", (long long)nblk * kPeakWgmmaPerBlock).i("wgmma_total_per_launch", (long long)nblk * kPeakWgmmaPerBlock * grid * NWG);
+    base.n("ops_per_wgmma", ops_wgmma).n("ops_per_launch", ops_launch);
+    const int reps = std::max(5, int(std::ceil(c.opt.peak_seconds / 0.25)));
+
+    // ---- timing, straight after the warm-up (the clocks are up): `reps` launches of about 0.25 s each, an event pair around each
+    std::vector<Rec> recs;
+    std::vector<double> ts;
+    PeakCheck ck, cstat;  // cstat: clock64 statistics and a full comparison of the last launch of the timed block / of the sustained block; ck: the first of them
+    double med = 0, tops = 0;
+    if (!t.only_sustain) {
+      double total = 0;
+      Sampler sm;
+      sm.start(c.opt.nvml ? &c.nvml : nullptr);
+      for (int r = 0; r < reps; ++r) {
+        const double s = time_launches(nblk, 1);
+        ts.push_back(s);
+        total += s;
+      }
+      sm.end();
+      CU(cudaGetLastError());
+      cstat = check(nblk);
+      ck = cstat;
+      med = median(ts);
+      const double mn = *std::min_element(ts.begin(), ts.end()), mx = *std::max_element(ts.begin(), ts.end());
+      tops = ops_launch / med / 1e12;
+      Rec r = base;
+      r.s("mode", "peak").i("launches_per_rep", 1).i("reps", (long long)ts.size()).n("seconds", total);
+      r.n("tops", tops).n("tops_best", ops_launch / mn / 1e12).n("tops_worst", ops_launch / mx / 1e12);
+      r.n("median_s", med).n("min_s", mn).n("max_s", mx).n("median_ms", med * 1e3).n("min_ms", mn * 1e3).n("max_ms", mx * 1e3).n("spread_pct", 100.0 * (mx - mn) / med);
+      sm.put(r);
+      // clock-normalised: ops per clock per SM, from the SM's own clock64 (no sampling) and from NVML's clock; TOPS per GHz
+      r.n("ops_clk_sm_clock64", cstat.rate_mean).n("ops_clk_sm_clock64_min", cstat.rate_min).n("frac_of_datasheet_ops_clk", cstat.rate_mean / kDatasheetOpsClkSm);
+      r.n("sm_mhz_clock64", cstat.cycles_mean / med / 1e6).n("cycles_mean", cstat.cycles_mean).n("cycles_min", cstat.cycles_min).n("cycles_max", cstat.cycles_max);
+      if (sm.n > 0) {
+        const double mhz = sm.sum_mhz / double(sm.n);
+        r.n("tops_per_ghz_nvml", tops / (mhz / 1e3)).n("ops_clk_sm_nvml", tops * 1e12 / (double(cstat.sms_used) * mhz * 1e6));
+        r.n("datasheet_tops_at_nvml_clock", double(c.sms) * kDatasheetOpsClkSm * mhz * 1e6 / 1e12);
+      } else {
+        r.null("tops_per_ghz_nvml").null("ops_clk_sm_nvml").null("datasheet_tops_at_nvml_clock");
+      }
+      r.i("sms_used", cstat.sms_used).b("placement_ok", cstat.sms_used == c.sms).n("datasheet_tops_at_max_clock", double(c.sms) * kDatasheetOpsClkSm * c.clock_khz * 1e3 / 1e12);
+      recs.push_back(r);
+    }
+    // ---- sustained block (--sustain): single launches for the given seconds; tops over all of it and over its first and last second
+    if (t.sustain > 0) {
+      std::vector<double> dt;
+      double total = 0;
+      Sampler sm;
+      sm.start(c.opt.nvml ? &c.nvml : nullptr);
+      while (total < t.sustain) {
+        const double s = time_launches(nblk, 1);
+        dt.push_back(s);
+        total += s;
+      }
+      sm.end();
+      CU(cudaGetLastError());
+      cstat = check(nblk);
+      if (t.only_sustain) ck = cstat;
+      auto window = [&](bool first) {
+        double tt = 0;
+        long long n = 0;
+        if (first) for (size_t k = 0; k < dt.size() && tt < 1.0; ++k) tt += dt[k], ++n;
+        else for (size_t k = dt.size(); k-- > 0 && tt < 1.0;) tt += dt[k], ++n;
+        return ops_launch * double(n) / tt / 1e12;
+      };
+      Rec r = base;
+      const double stops = ops_launch * double(dt.size()) / total / 1e12;
+      r.s("mode", "sustain").i("launches_per_chunk", 1).i("chunks", (long long)dt.size()).n("seconds", total);
+      r.n("tops", stops).n("tops_first_1s", window(true)).n("tops_last_1s", window(false));
+      sm.put(r);
+      r.n("ops_clk_sm_clock64_last", cstat.rate_mean).n("ops_clk_sm_clock64_min_last", cstat.rate_min).n("sm_mhz_clock64_last", cstat.cycles_mean / dt.back() / 1e6);
+      if (sm.n > 0) r.n("tops_per_ghz_nvml", stops / (sm.sum_mhz / double(sm.n) / 1e3));
+      else r.null("tops_per_ghz_nvml");
+      recs.push_back(r);
+    }
+
+    // ---- exactness after everything: a fresh poisoned launch (the last launch of the timed and of the sustained block were compared above)
+    poison_launch(nblk);
+    const PeakCheck ck2 = check(nblk);
+    const bool before = ck.bad == 0 && ck.iters_bad == 0, after = ck2.bad == 0 && ck2.iters_bad == 0 && cstat.bad == 0 && cstat.iters_bad == 0;
+    const bool exact = before && after;  // timed block's last launch, sustained block's last launch, and a fresh launch afterwards: all exact
+    if (!exact) ++c.n_inexact;
+    for (Rec& r : recs) {
+      r.b("exact", exact).i("check_elements", ck.checked).i("ref_mismatches", ck.bad).i("iters_mismatches", ck.iters_bad);
+      r.b("exact_after_timing", after).i("ref_mismatches_after", ck2.bad).i("check_elements_after", ck2.checked);
+      r.b("exact_check_trivial", data == 0);  // zero operands: every accumulator must be 0; only the iteration counter and the write-out are then tested
+      r.s("exact_def", "accumulator[cta][wg][row][col] == nblk * sum_j (A_s(j) . B_s(j)^T) mod 2^32 (int32 wraparound), every element of every CTA and warpgroup");
+      if (ck.bad) r.i("first_bad_cta", ck.cta).i("first_bad_wg", ck.wg).i("first_bad_thread", ck.thr).i("first_bad_reg", ck.reg).i("first_bad_want", ck.want).i("first_bad_got", ck.got);
+      r.s("status", "ok");
+      emit_line(r);
+    }
+    if (!t.only_sustain && exact) c.peak_tops[&e] = tops;
+    if (cstat.sms_used != c.sms) std::fprintf(stderr, "  warning: %lld distinct SMs used, the card has %d: the rate is understated\n", cstat.sms_used, c.sms);
+    std::fprintf(stderr, "  %-26s exact=%d  %.0f TOPS  %.0f ops/clk/SM (datasheet %d)  %.0f MHz (clock64)  regs %d local %zu\n", e.name, int(exact), tops, cstat.rate_mean,
+                 kDatasheetOpsClkSm, cstat.cycles_mean / std::max(med, 1e-9) / 1e6, fa.numRegs, (size_t)fa.localSizeBytes);
+  } catch (const Skip& s) {
+    emit_status(std::string("skipped: ") + s.what());
+  } catch (const std::exception& ex) {
+    cudaGetLastError();
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+      emit_status(std::string("error (sticky): ") + ex.what());
+      throw Sticky(ex.what());
+    }
+    emit_status(std::string("error: ") + ex.what());
+  }
+}
+template <int N, int NWG, int ST, int CTAS, int DATA>
+void run_peak(Ctx& c, const Entry& e, const Task& t) { run_peak_impl<N, NWG, ST>(c, e, t, CTAS, DATA); }
+
 // ================================================================== DATA: the configuration table and the defaults
 // Everything that is a choice (which kernels, which shapes, which scheduler knobs) is here. To add an architecture (Blackwell sm_100 / sm_120
 // with tcgen05, another Hopper tile) add rows with its cc_major and a Variant-like type whose Kernel is a CUTLASS GemmUniversal with K4's epilogue,
@@ -704,7 +1084,32 @@ using C41 = Shape<_4, _1, _1>;
 #define IMD_ROW(NAME, CC, KIND, QUICK, SWEEP, LAST, T, C, S)                                                                  \
   {NAME, CC, KIND, QUICK, SWEEP, LAST, int(cute::get<0>(T{})), int(cute::get<1>(T{})), int(cute::get<0>(C{})), int(cute::get<1>(C{})), \
    smem_of<VT<T, C, S, (KIND == Kind::Fast)>>(), &run_variant<VT<T, C, S, (KIND == Kind::Fast)>>}
+// p_ rows (synthetic wgmma peak): N = instruction N (256 / 128), NWG = consumer warpgroups per CTA, ST = tile stages in shared memory, CTAS = CTAs per SM,
+// DATA = 0 zero / 1 small random / 2 full-range random / 3 full-range random with four different tiles rotating (ST = 4)
+#define IMD_PROW(NAME, N, NWG, ST, CTAS, DATA, QUICK)                                                                               \
+  {NAME, 9, Kind::Peak, QUICK, false, false, 64 * NWG, N, 1, 1, peak_smem<N, NWG, ST, CTAS>(), &run_peak<N, NWG, ST, CTAS, DATA>, DATA}
 const Entry kEntries[] = {
+    // the peaks come first in the work order (cheap, about 3 s each, and they say what the ceiling is)
+    IMD_PROW("p_n256_wg2_full", 256, 2, 1, 1, 2, true),   // the stock coop kernel's consumer structure: 2 warpgroups of 64 x 256 on one CTA per SM
+    IMD_PROW("p_n256_wg2_zero", 256, 2, 1, 1, 0, true),
+    IMD_PROW("p_n256_wg2_small", 256, 2, 1, 1, 1, false),
+    IMD_PROW("p_n256_wg2_full4", 256, 2, 4, 1, 3, false),
+    IMD_PROW("p_n256_wg3_full", 256, 3, 1, 1, 2, true),
+    IMD_PROW("p_n256_wg3_zero", 256, 3, 1, 1, 0, false),
+    IMD_PROW("p_n256_wg3_small", 256, 3, 1, 1, 1, false),
+    IMD_PROW("p_n256_wg1_full", 256, 1, 1, 1, 2, false),
+    IMD_PROW("p_n256_wg1_zero", 256, 1, 1, 1, 0, false),
+    IMD_PROW("p_n256_wg1_small", 256, 1, 1, 1, 1, false),
+    IMD_PROW("p_n256_wg1x2cta_full", 256, 1, 1, 2, 2, false),
+    IMD_PROW("p_n256_wg1x2cta_zero", 256, 1, 1, 2, 0, false),
+    IMD_PROW("p_n256_wg1x2cta_small", 256, 1, 1, 2, 1, false),
+    IMD_PROW("p_n128_wg4_full", 128, 4, 1, 1, 2, false),
+    IMD_PROW("p_n128_wg4_zero", 128, 4, 1, 1, 0, false),
+    IMD_PROW("p_n128_wg4_small", 128, 4, 1, 1, 1, false),
+    IMD_PROW("p_n128_wg4_full4", 128, 4, 4, 1, 3, false),
+    IMD_PROW("p_n128_wg2_full", 128, 2, 1, 1, 2, false),
+    IMD_PROW("p_n128_wg2_zero", 128, 2, 1, 1, 0, false),
+    IMD_PROW("p_n128_wg2_small", 128, 2, 1, 1, 1, false),
     {"m_128x256x64_mma_sync", 9, Kind::Mma, true, false, false, 128, 256, 1, 1, 72 * 1024, &run_mma},
     IMD_ROW("f_256x128x128_2x1_coop", 9, Kind::Fast, true, true, false, T256x128, C21, Coop),
     IMD_ROW("f_128x128x128_2x1_coop", 9, Kind::Fast, true, true, false, T128x128, C21, Coop),
@@ -721,6 +1126,7 @@ const Entry kEntries[] = {
     IMD_ROW("f_128x256x128_4x1_coop", 9, Kind::Fast, false, false, true, T128x256, C41, Coop),  // last: untested cluster shape
 };
 #undef IMD_ROW
+#undef IMD_PROW
 struct Defaults {
   const char* shapes;        // m = n = k, or MxNxK
   const char* batches;       // the first is the primary one (the N moduli of the emulation); the others are references
@@ -749,7 +1155,7 @@ bool parse_dims(const std::string& t, Dims* d) {
 }
 // entries of the device's architecture matching a spec: the groups all / f / g / m / quick / sweep (exact words), else a name or a substring of one
 std::vector<const Entry*> select(const std::string& spec, int cc_major, std::vector<std::string>* unmatched) {
-  static const std::set<std::string> groups = {"all", "f", "g", "m", "quick", "sweep"};
+  static const std::set<std::string> groups = {"all", "f", "g", "m", "p", "quick", "sweep"};
   std::vector<const Entry*> out;
   for (const std::string& tok : split(spec)) {
     bool any = false;
@@ -757,7 +1163,7 @@ std::vector<const Entry*> select(const std::string& spec, int cc_major, std::vec
       if (e.cc_major != cc_major) continue;
       bool hit;
       if (groups.count(tok))
-        hit = tok == "all" || (tok == "f" && e.kind == Kind::Fast) || (tok == "g" && e.kind == Kind::Generic) || (tok == "m" && e.kind == Kind::Mma) ||
+        hit = tok == "all" || (tok == "f" && e.kind == Kind::Fast) || (tok == "g" && e.kind == Kind::Generic) || (tok == "m" && e.kind == Kind::Mma) || (tok == "p" && e.kind == Kind::Peak) ||
               (tok == "quick" && e.quick) || (tok == "sweep" && e.sweep);
       else
         hit = std::string(e.name).find(tok) != std::string::npos;
@@ -778,7 +1184,7 @@ using namespace rung1;
 int main(int argc, char** argv) {
   static const std::set<std::string> flags = {"quick", "list", "plan", "no-nvml", "skip-last"};
   static const std::set<std::string> valued = {"variants", "shapes", "batches", "reps", "warmup", "loop", "max-seconds", "samples",
-                                               "sweep", "sweep-variants", "clusters", "sustain"};
+                                               "sweep", "sweep-variants", "clusters", "sustain", "peak-seconds"};
   std::map<std::string, std::string> a;
   for (int i = 1; i < argc; ++i) {
     if (std::strncmp(argv[i], "--", 2) != 0) { std::fprintf(stderr, "unexpected argument %s (usage: see the header of src/k4/hopper/rung1.cu)\n", argv[i]); return 2; }
@@ -801,6 +1207,7 @@ int main(int argc, char** argv) {
   if (a.count("max-seconds")) o.max_seconds = std::atof(a["max-seconds"].c_str());
   if (a.count("samples")) o.samples = std::atoll(a["samples"].c_str());
   if (a.count("sustain")) o.sustain = std::atof(a["sustain"].c_str());
+  if (a.count("peak-seconds")) o.peak_seconds = std::max(0.25, std::atof(a["peak-seconds"].c_str()));
   if (a.count("clusters")) o.clusters = a["clusters"];
   if (o.clusters != "queried" && o.clusters != "heuristic" && o.clusters != "both") { std::fprintf(stderr, "--clusters is queried, heuristic or both\n"); return 2; }
   if (a.count("list")) {
@@ -871,7 +1278,7 @@ int main(int argc, char** argv) {
   const int primary = batches[0];
   const bool cl_queried = o.clusters != "heuristic", cl_heur = o.clusters != "queried";
   auto is_cluster = [](const Entry* e) { return e->cl_m * e->cl_n > 1; };
-  struct Work { const Entry* e; Task t; };  // e == nullptr: the sustain item
+  struct Work { const Entry* e; Task t; bool peak_sustain = false; };  // e == nullptr: a sustain item (the GEMM one, or with peak_sustain the p_ one)
   std::vector<Work> work;
   auto add = [&](const Entry* e, Dims d, int L, Sched sc, int occ) {
     Task t{d, L, sc, occ, L < primary ? kRefSlot0 : 0, 0};
@@ -883,12 +1290,16 @@ int main(int argc, char** argv) {
     if (cl_queried) add(e, d, L, sc, 0);
     if (cl_heur) add(e, d, L, sc, 1);
   };
+  bool any_peak = false;
+  for (const Entry* e : vars)  // (0) the synthetic wgmma peak rows (no shape, no batch), then with --sustain the sustained block of the best full-range one
+    if (e->kind == Kind::Peak) { any_peak = true; work.push_back({e, Task{Dims{0, 0, 0}, 0, Sched{}, 0, 0, 0}}); }
+  if (any_peak && o.sustain > 0) work.push_back({nullptr, Task{Dims{0, 0, 0}, 0, Sched{}, 0, 0, o.sustain, true}, true});
   for (const Dims& d : shapes)  // (1) m_ and f_ rows, default scheduler, primary batch
     for (const Entry* e : vars)
-      if (e->kind != Kind::Generic && !e->last) pass(e, d, primary, Sched{});
+      if (e->kind != Kind::Generic && e->kind != Kind::Peak && !e->last) pass(e, d, primary, Sched{});
   for (const Dims& d : sweep_shapes)  // (2) the sweep, minus rows that resolve to the default's (raster, swizzle) or to an earlier sweep point
     for (const Entry* e : sweep_vars) {
-      if (e->kind == Kind::Mma || e->last) continue;
+      if (e->kind == Kind::Mma || e->kind == Kind::Peak || e->last) continue;
       const Resolved def = resolve(*e, Task{d, primary, Sched{}, 0, 0, 0});
       std::set<std::pair<int, int>> seen{{def.raster, def.swizzle}};
       for (int rst : kSweepRaster)
@@ -905,7 +1316,7 @@ int main(int argc, char** argv) {
   for (size_t bi = 1; bi < batches.size(); ++bi)  // (5) reference batches
     for (const Dims& d : shapes)
       for (const Entry* e : vars)
-        if (!e->last) pass(e, d, batches[bi], Sched{});
+        if (!e->last && e->kind != Kind::Peak) pass(e, d, batches[bi], Sched{});
   if (!o.skip_last)  // (6) the riskiest rows
     for (const Dims& d : shapes)
       for (const Entry* e : vars)
@@ -914,7 +1325,9 @@ int main(int argc, char** argv) {
   if (plan) {
     for (const Work& w : work) {
       const Entry* e = w.e;
+      if (!e && w.peak_sustain) { std::printf("sustain %gs on the best full-range p_ row\n", w.t.sustain); continue; }
       if (!e) { std::printf("sustain %gs on the best f_ row at %lldx%lldx%lld\n", w.t.sustain, w.t.d.m, w.t.d.n, w.t.d.k); continue; }
+      if (e->kind == Kind::Peak) { std::printf("%-26s synthetic wgmma peak: N=%d, %d warpgroup(s) per CTA, data %s, smem %lld\n", e->name, e->tile_n, e->tile_m / 64, peak_data_name(e->pk_data), e->smem_bytes); continue; }
       const Resolved r = resolve(*e, w.t);
       std::printf("%-26s %5lldx%lldx%lld L=%-2d slot0=%d sw=%d %-9s -> %s sw%d%s\n", e->name, w.t.d.m, w.t.d.n, w.t.d.k, w.t.L, w.t.slot0, w.t.sc.swizzle,
                   raster_name(w.t.sc.raster), raster_name(r.raster), r.swizzle, e->cl_m * e->cl_n > 1 ? (w.t.occ ? "  clusters=heuristic" : "  clusters=queried") : "");
@@ -969,7 +1382,16 @@ int main(int argc, char** argv) {
     for (const Work& w : work) {
       const Entry* e = w.e;
       Task t = w.t;
-      if (!e) {  // the sustain item: the best f_ row at the last shape by its loop-mode rate
+      if (!e && w.peak_sustain) {  // the peak sustain item: the best exact full-range p_ row by its timed rate
+        double best = 0;
+        for (const Entry* f : vars)
+          if (f->kind == Kind::Peak && f->pk_data >= 2) {
+            auto it = c.peak_tops.find(f);
+            if (it != c.peak_tops.end() && it->second > best) best = it->second, e = f;
+          }
+        if (!e) { std::fprintf(stderr, "peak sustain: no exact full-range p_ row measured, skipped\n"); continue; }
+        t.only_sustain = true;
+      } else if (!e) {  // the sustain item: the best f_ row at the last shape by its loop-mode rate
         double best = 0;
         for (const Entry* f : vars)
           if (f->kind == Kind::Fast && !f->last) {
