@@ -129,6 +129,10 @@ if(Python3_FOUND)
   # Issue 21: the CRT with the sums in binary64 limbs against the reference for every N (CPU only; the GPU kernel: crt_f64_gpu).
   add_test(NAME spec_crt_f64
            COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/spec/test_crt_f64.py")
+  # Issue 23 (known divergence): the decision logic of contract_api's per-W pack-occupancy check, on mocked tables (the Hopper pattern is
+  # accepted as known, everything else decides as before). CPU only.
+  add_test(NAME contract_occupancy_known
+           COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/test_occupancy_known.py")
   # Issue 20 (docs/NOTES-20.md): the K4 tile-table fit and its adoption rule (reproduces the shipped 4090 constants
   # from the A3 data where they are on this machine). CPU only.
   add_test(NAME bench_k4_fit_selftest
