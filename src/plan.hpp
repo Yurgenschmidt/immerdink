@@ -131,6 +131,7 @@ int64_t& k5_one_elem_per_sm();
 // A5: K5's elements per thread forced to 1, 2 or 4 (0: the launch rule), read by
 // imd_contract; changed only by the hooks imd_test_set_k5_elems / imd_prof_set_k5_elems.
 int& k5_elems_override();
+std::atomic<int>& seq_override();      // issue 21: -1 the plan's set (host/seq_config.hpp), else a forced set of kSeq* bits for every plan (hooks only; relaxed)
 std::atomic<int>& k5_crt_override();   // issue 21: 0 integer CRT, 1 binary64-limb CRT (process-wide: all devices, streams and plans; a graph captures it at capture time)
 // v1.13 §4b (hygiene; contract.cu, test hook imd_test_set_pad_mutation): -1 (production) or
 // the post-swap operand x (0 = the GEMM's A, 1 = its B) whose K2 / K3 pack stores only k-bar

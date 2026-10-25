@@ -143,6 +143,8 @@ class Library:
             self.lib.imd_test_set_k5_elems.restype = C.c_int
             self.lib.imd_test_set_k5_crt.argtypes = [C.c_int]
             self.lib.imd_test_set_k5_crt.restype = C.c_int
+            self.lib.imd_test_set_seq.argtypes = [C.c_int]
+            self.lib.imd_test_set_seq.restype = C.c_int
             self.lib.imd_test_plan_sizes.argtypes = [C.c_void_p, C.POINTER(C.c_int64), C.c_int64,
                                                      C.POINTER(C.c_int64)]
             self.lib.imd_test_plan_sizes.restype = C.c_int
@@ -161,6 +163,10 @@ class Library:
             self.lib.imd_test_kernel_occupancy_w.argtypes = [C.c_int32, C.c_int32,
                                                              C.POINTER(C.c_int32)]
             self.lib.imd_test_kernel_occupancy_w.restype = C.c_int
+            # Issue 21: IMD_TEST_SEQ=<bits> runs the whole process with that instruction-sequence set (1 E1, 2 Q1, 4 F1)
+            # instead of the device class's: the same tests, the same oracle, the other sequences.
+            if os.environ.get("IMD_TEST_SEQ") not in (None, ""):
+                assert self.lib.imd_test_set_seq(int(os.environ["IMD_TEST_SEQ"])) == 0
         self.shim = None
 
     def load_alloc_shim(self, path):
@@ -195,6 +201,10 @@ class Library:
     def set_k5_crt(self, variant=0):
         """Issue 21: K5's CRT with the sums in binary64 limbs (1) or the integer running CRT (0, default)."""
         assert self.lib.imd_test_set_k5_crt(variant) == 0
+
+    def set_seq(self, bits=-1):
+        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish; -1 the device class's)."""
+        assert self.lib.imd_test_set_seq(bits) == 0
 
     def set_k5_mapping(self, fmode):
         """The K5 mapping of a test run with fused mode `fmode` (test_contract, test_packed):

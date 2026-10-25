@@ -23,6 +23,10 @@
  *   imd_prof_set_k5_crt(variant)
  *                         issue 21: later calls run K5's CRT with the sums in binary64 limbs (1) or
  *                         the integer running CRT (0, default). Returns 0, 1 if invalid.
+ *   imd_prof_set_seq(bits)
+ *                         issue 21: later calls run the instruction-sequence set `bits` (1 E1 emitter, 2 Q1 quantize,
+ *                         4 F1 finish; host/seq_config.hpp) instead of the device class's; -1 restores it.
+ *                         Returns 0, 1 if invalid.
  *   imd_prof_kernel_occupancy(kernel, out[4])
  *                         v1.10: CTAs per SM, registers, shared memory bytes and threads of
  *                         kernel IMD_PERF_KERNEL_* (immerdink_host.h). Returns 0, 1 on error.
@@ -49,6 +53,7 @@ IMD_API int imd_prof_plan_k4(imd_plan_t plan, int32_t* config);
 IMD_API int imd_prof_set_k4_config(int32_t config);
 IMD_API int imd_prof_set_k5_elems(int32_t elems);
 IMD_API int imd_prof_set_k5_crt(int32_t variant);
+IMD_API int imd_prof_set_seq(int32_t bits);
 IMD_API int imd_prof_kernel_occupancy(int32_t kernel, int32_t* out);
 IMD_API int imd_prof_kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out);
 

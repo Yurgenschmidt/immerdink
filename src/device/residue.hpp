@@ -66,4 +66,60 @@ constexpr PackWeights make_pack_weights(const imd::constants::Tables& t) {
 }
 inline constexpr PackWeights kPackWeights = make_pack_weights(imd::constants::kTables);
 
+// ---- Sequence E1 (issue 21, docs/NOTES-21.md "Pack emitter and finish"): the fused residue emitter's
+// per-(W, modulus) constants, derived at compile time from the tables above. ONE place for the math:
+//   d  = sum_j dp4a(x_j, w_j) = X (mod p), 0 <= d <= dmax = 255 (sum of the weight lanes)
+//   s' = sigma d + C        sigma = +1 / -1, C = p ceil(dmax / p): a multiple of p >= dmax, so s' >= 0 and s' = sigma d (mod p)
+//   q  = hi32(s' m32 + h m32)   h = floor(p / 2): the 32-bit magic m32 = ceil(2^32 / p) (2^24 for p = 256) gives
+//                               floor((s' + h) / p) exactly for s' + h < 2^24 (A5: e = m32 p - 2^32 < p <= 256 so (s' + h) e < 2^32)
+//   u  = s' - p q = ((s' + h) mod p) - h = SMod(sigma d, p), the signed residue; its low byte is the int8.
+// Hardware-specific part (not the math): the 64-bit addend h m32 rides in the multiply-add (IMAD.HI.U32 with a register pair;
+// measured with nvcc 13.4 on sm_89, sm_90, sm_120, docs/NOTES-21.md). A walk-back to the plain sequence (q = umulhi(s, m32),
+// r = s - p q, the SMod compare, the sign select) is the baseline emitter in kernels/pack_emitter.cuh, which stays.
+struct PackEmit {            // 32 bytes: the emitter reads it with two 16-byte constant loads
+  uint32_t w[3];             // the pack weights (u8 lanes), w[2] = 0 for W = 2
+  uint32_t m32;              // Magic32
+  uint64_t hm;               // floor(p / 2) m32
+  uint32_t C;                // p ceil(dmax / p)
+  uint32_t negp;             // 2^32 - p, so s' + negp q = s' - p q
+};
+struct alignas(16) PackEmitTable {
+  PackEmit e[2][imd::constants::kNMax];  // [W - 2][l]
+};
+constexpr PackEmitTable make_pack_emit(const imd::constants::Tables& t) {
+  PackEmitTable r{};
+  for (int W = 2; W <= 3; ++W)
+    for (int l = 0; l < imd::constants::kNMax; ++l) {
+      PackEmit c{};
+      const uint32_t p = t.moduli[l];
+      uint32_t dmax = 0;
+      for (int j = 0; j < W; ++j) {
+        c.w[j] = kPackWeights.w[j][l];
+        for (int i = 0; i < 4; ++i) dmax += 255u * ((c.w[j] >> (8 * i)) & 255u);
+      }
+      c.m32 = kMagic32.m[l];
+      c.hm = uint64_t{p / 2} * c.m32;
+      c.C = p * ((dmax + p - 1) / p);
+      c.negp = 0u - p;
+      r.e[W - 2][l] = c;
+    }
+  return r;
+}
+inline constexpr PackEmitTable kPackEmit = make_pack_emit(imd::constants::kTables);
+// The bounds the math needs, checked at compile time for every W and modulus: s' + h < 2^24 (the A5 range; also
+// s' m32 + h m32 < 2^64, trivially), C >= dmax (s' >= 0).
+constexpr bool pack_emit_bounds_ok(const PackEmitTable& t) {
+  for (int W = 2; W <= 3; ++W)
+    for (int l = 0; l < imd::constants::kNMax; ++l) {
+      const PackEmit& c = t.e[W - 2][l];
+      const uint32_t p = 0u - c.negp;
+      uint32_t dmax = 0;
+      for (int j = 0; j < W; ++j)
+        for (int i = 0; i < 4; ++i) dmax += 255u * ((c.w[j] >> (8 * i)) & 255u);
+      if (c.C < dmax || c.C % p != 0 || c.C - dmax + 2 * dmax + p / 2 >= (1u << 24)) return false;
+    }
+  return true;
+}
+static_assert(pack_emit_bounds_ok(kPackEmit), "E1: C >= dmax, C multiple of p, C + dmax + h < 2^24");
+
 }  // namespace imd::device

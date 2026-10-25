@@ -256,6 +256,31 @@ if(Python3_FOUND)
     set_tests_properties(contract_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
+  # Issue 21 (docs/NOTES-21.md "Pack emitter and finish"): the same oracle tests with the other instruction sequences forced
+  # for every plan (IMD_TEST_SEQ, tests/harness.py): 1 = E1 emitter, 7 = E1 + Q1 quantize + F1 finish. The suites of
+  # the default sequences above are the baseline. These fail if any sequence changes one bit.
+  foreach(seq 1 7)
+    foreach(suite e2e tensor every_n eps bigk)
+      if(seq EQUAL 1 AND (suite STREQUAL "tensor" OR suite STREQUAL "every_n" OR suite STREQUAL "bigk"))
+        continue()
+      endif()
+      add_test(NAME contract_${suite}_seq${seq}
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                       --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+      set_tests_properties(contract_${suite}_seq${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                           ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=${seq}")
+    endforeach()
+    add_test(NAME output_hashes_seq${seq}
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                     --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+    set_tests_properties(output_hashes_seq${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                         ENVIRONMENT "IMD_TEST_SEQ=${seq}")
+  endforeach()
+  add_test(NAME output_hashes_large_seq7
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags large)
+  set_tests_properties(output_hashes_large_seq7 PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                       ENVIRONMENT "IMD_TEST_SEQ=7")
   # Committed output hashes (tests/data/output_hashes.json): the library's C on this GPU against
   # hashes from the CPU oracle (small shapes) and from the RTX 4090 (large ones). The same file
   # is checked on every shipped GPU. output_hashes_oracle recomputes the CPU hashes.

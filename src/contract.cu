@@ -22,11 +22,13 @@
 #include <atomic>
 #include <climits>
 #include <cstdint>
+#include <type_traits>
 
 #include <cuda_runtime.h>
 
 #include "device/constants.cuh"
 #include "host/analysis.hpp"  // kFusedKHatMax
+#include "host/seq_config.hpp"
 #include "kernels/numerics.cuh"
 #include "kernels/pack_emitter.cuh"
 #include "plan.hpp"
@@ -311,12 +313,41 @@ struct PackArgs {
   int lg_th;          // tile height th = 2^lg_th rows, tk = kTileElems / th k-bar
 };
 
+// Issue 21 (host/seq_config.hpp): the instruction-sequence set of a launch (the plan's, or the hooks' override)
+// and the pack kernels' template value S for it. f(std::integral_constant<int, S>{}) launches the instance.
+inline int seq_bits(const ExecPlan& p) {
+  return seq_effective(p.seq, seq_override().load(std::memory_order_relaxed));
+}
+template <int W, class F>
+void with_pack_seq(const ExecPlan& p, F&& f) {
+  switch (seq_pack_s(seq_bits(p), W)) {
+    case 0: f(std::integral_constant<int, 0>{}); break;
+    case 1: f(std::integral_constant<int, 1>{}); break;
+    default:
+      if constexpr (W == 2) f(std::integral_constant<int, 3>{});
+      else f(std::integral_constant<int, 1>{});
+  }
+}
+
+// The residues of the moduli l0 + s, s in [s_lo, s_hi), at dst + s * plane. E1 steps the 64-bit pointer by `plane` instead of
+// multiplying s * plane per modulus (the baseline sequence keeps its original addressing: its code is unchanged).
+template <class Em>
+__device__ __forceinline__ void store_slots(const Em& em, int l0, int s_lo, int s_hi, int8_t* dst,
+                                            int64_t plane) {
+  if constexpr (Em::kE1) {
+    dst += int64_t{s_lo} * plane;
+    for (int s = s_lo; s < s_hi; ++s, dst += plane) em.store(l0 + s, dst);
+  } else {
+    for (int s = s_lo; s < s_hi; ++s) em.store(l0 + s, dst + s * plane);
+  }
+}
+
 // §3.3 + §3.4 for one row's E consecutive k-bar: quantize once, then residues per modulus:
 // PackEmitterT<E, W> (kernels/pack_emitter.cuh, v1.14 §3.4.1: |a'| as W = pack_words(N) u32
 // words, branch-free). Every pack kernel is instantiated for W = 2 and 3; the launch picks W
 // from the plan's N.
 
-template <int W>  // v1.14 §3.4.1: pack_words(N)
+template <int W, int Seq = 0>  // v1.14 §3.4.1: pack_words(N); Seq: the instruction-sequence set (kernels/pack_emitter.cuh)
 __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
   __shared__ uint64_t tile[kTileSmem];
   __shared__ int64_t s_base[kTileRowsMax];  // v_bat[lambda] + v_row[r]
@@ -368,15 +399,14 @@ __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
       const uint64_t* src = tile + dl * pitch + hl + hl / kVec;
 #pragma unroll
       for (int e = 0; e < kVec; ++e) bits[e] = src[e];
-      PackEmitterT<kVec, W> em;
+      PackEmitterT<kVec, W, Seq> em;
       em.load(bits, s_sigma[dl], a.trunc);
       int8_t* dst = a.R + s_out[dl] + h0 + hl;
       // Block row y of the grid emits the slots [y gsize / ny, (y + 1) gsize / ny): a small
       // operand is spread over more blocks (each re-reads its tile; same values).
       const int s_lo = int(blockIdx.y) * a.gsize / int(gridDim.y);
       const int s_hi = (int(blockIdx.y) + 1) * a.gsize / int(gridDim.y);
-      for (int s = s_lo; s < s_hi; ++s)
-        em.store(a.g0 + s, dst + s * plane);
+      store_slots(em, a.g0, s_lo, s_hi, dst, plane);
     }
     __syncthreads();  // shared arrays are reused by the next tile
   }
@@ -862,7 +892,7 @@ __device__ __forceinline__ u128 shfl_xor_u128(u128 v, int d) {
   return (static_cast<u128>(hi) << 64) | lo;
 }
 
-template <int Cap, int E, int W>  // W: v1.14 §3.4.1 pack_words(N)
+template <int Cap, int E, int W, int Seq = 0>  // W: v1.14 §3.4.1 pack_words(N); Seq: sequence set
 __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant__ FusedArgs<Cap> a) {
   constexpr int kLgE = E == 16 ? 4 : 2, kTE = kThreads * E, kLgTE = 8 + kLgE;
   constexpr int kRowsMax = kTE / 16;  // th for tk = 16
@@ -967,13 +997,13 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
     }
     // 5. residues of this part's slots (K padding h in [k, k_hat) is zero in the tile)
     if (valid && hl < a.k_hat) {
-      PackEmitterT<E, W> em;
+      PackEmitterT<E, W, Seq> em;
       em.load(bits, sigma, a.trunc != 0);
       const int64_t plane = a.b * a.rows_pad[x] * a.k_hat;
       int64_t lam, r;
       divmod(lo + radix * (d0 + dl), rows, &lam, &r);
       int8_t* dst = a.R[x] + (lam * a.rows_pad[x] + r) * a.k_hat + hl;
-      for (int s = s_lo; s < s_hi; ++s) em.store(s, dst + s * plane);  // group 1: modulus = slot
+      store_slots(em, 0, s_lo, s_hi, dst, plane);  // group 1: modulus = slot
     }
     __syncthreads();  // shared arrays are reused by the next tile
   }
@@ -1038,12 +1068,22 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   if (small) tiles = tiles_for(10);
   const dim3 grid(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms));
   const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1
+  const auto run = [&](auto E, auto W) {
+    with_pack_seq<decltype(W)::value>(p, [&](auto S) {
+      kf_scale_pack<Cap, decltype(E)::value, decltype(W)::value, decltype(S)::value>
+          <<<grid, kThreads, 0, stream>>>(a);
+    });
+  };
+  using I4 = std::integral_constant<int, 4>;
+  using I16 = std::integral_constant<int, 16>;
+  using I2 = std::integral_constant<int, 2>;
+  using I3 = std::integral_constant<int, 3>;
   if (small) {
-    if (w2) kf_scale_pack<Cap, 4, 2><<<grid, kThreads, 0, stream>>>(a);
-    else kf_scale_pack<Cap, 4, 3><<<grid, kThreads, 0, stream>>>(a);
+    if (w2) run(I4{}, I2{});
+    else run(I4{}, I3{});
   } else {
-    if (w2) kf_scale_pack<Cap, 16, 2><<<grid, kThreads, 0, stream>>>(a);
-    else kf_scale_pack<Cap, 16, 3><<<grid, kThreads, 0, stream>>>(a);
+    if (w2) run(I16{}, I2{});
+    else run(I16{}, I3{});
   }
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
@@ -1090,8 +1130,8 @@ __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl
   else if (finite_nonzero(bits)) gmax = max(gmax, ilogb_bits(bits));
 }
 
-template <int E, int W>  // values per thread: 8 (512 threads, 2 CTAs per SM) or 4 (1024
-                         // threads); W: v1.14 §3.4.1 pack_words(N)
+template <int E, int W, int Seq = 0>  // values per thread: 8 (512 threads, 2 CTAs per SM) or 4 (1024
+                         // threads); W: v1.14 §3.4.1 pack_words(N); Seq: sequence set
 __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     kl_scale_pack(const __grid_constant__ LargeArgs a) {
   constexpr int T = kTileElems / E, kLgE = E == 16 ? 4 : E == 8 ? 3 : 2;
@@ -1222,10 +1262,10 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     // pass 3: residues of every slot of group 1 (K padding h in [k, k_hat) is zero)
     const auto emit = [&](const uint64_t (&bits)[E], int64_t c) {
       if (valid && (c << lg_tk) + hl < a.k_hat) {  // k_hat is a multiple of 16
-        PackEmitterT<E, W> em;
+        PackEmitterT<E, W, Seq> em;
         em.load(bits, sigma, a.trunc != 0);
         int8_t* dst = a.R + dst_off + (c << lg_tk);
-        for (int s = 0; s < a.gsize; ++s) em.store(s, dst + s * plane);
+        store_slots(em, 0, 0, a.gsize, dst, plane);
       }
     };
     emit(r0, 0);
@@ -1286,12 +1326,20 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
   // (r_bigk 32 MB, r_mm 51 MB: inside the L2 budget of K1, A3).
   const unsigned grid = static_cast<unsigned>(L.grid);
   const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1 (imd_pack: the pack's N)
+  const auto run = [&](auto E, auto W) {
+    with_pack_seq<decltype(W)::value>(p, [&](auto S) {
+      kl_scale_pack<decltype(E)::value, decltype(W)::value, decltype(S)::value>
+          <<<grid, kTileElems / decltype(E)::value, 0, stream>>>(a);
+    });
+  };
+  using I2 = std::integral_constant<int, 2>;
+  using I3 = std::integral_constant<int, 3>;
   if (L.values == 4) {
-    if (w2) kl_scale_pack<4, 2><<<grid, kTileElems / 4, 0, stream>>>(a);
-    else kl_scale_pack<4, 3><<<grid, kTileElems / 4, 0, stream>>>(a);
+    if (w2) run(std::integral_constant<int, 4>{}, I2{});
+    else run(std::integral_constant<int, 4>{}, I3{});
   } else {
-    if (w2) kl_scale_pack<8, 2><<<grid, kTileElems / 8, 0, stream>>>(a);
-    else kl_scale_pack<8, 3><<<grid, kTileElems / 8, 0, stream>>>(a);
+    if (w2) run(std::integral_constant<int, 8>{}, I2{});
+    else run(std::integral_constant<int, 8>{}, I3{});
   }
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
@@ -1349,6 +1397,11 @@ int64_t& k5_one_elem_per_sm() {
 
 int& k5_elems_override() {
   static int v = 0;  // only the test and benchmark hooks change it
+  return v;
+}
+
+std::atomic<int>& seq_override() {
+  static std::atomic<int> v{-1};  // -1: the plan's set; only the hooks change it
   return v;
 }
 
@@ -1533,8 +1586,10 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
                                        p.sms);
       pa.lg_th = L.lg_th;
       const dim3 grid(static_cast<unsigned>(L.grid_x), static_cast<unsigned>(L.parts));
-      if (pack_words(p.N) == 2) k23_pack<2><<<grid, kThreads, 0, stream>>>(pa);  // v1.14 §3.4.1
-      else k23_pack<3><<<grid, kThreads, 0, stream>>>(pa);
+      if (pack_words(p.N) == 2)  // v1.14 §3.4.1
+        with_pack_seq<2>(p, [&](auto S) { k23_pack<2, decltype(S)::value><<<grid, kThreads, 0, stream>>>(pa); });
+      else
+        with_pack_seq<3>(p, [&](auto S) { k23_pack<3, decltype(S)::value><<<grid, kThreads, 0, stream>>>(pa); });
       if (pa.rows_pad > pa.op.rows)
         k23_zero_rows<<<blocks_for(gsize * p.b * (pa.rows_pad - pa.op.rows) * p.k_hat / kVec),
                         kThreads, 0, stream>>>(pa.R, pa.op.rows, pa.rows_pad, p.b, p.k_hat,

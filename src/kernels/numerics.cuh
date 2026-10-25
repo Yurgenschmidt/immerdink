@@ -191,6 +191,30 @@ __device__ __forceinline__ void quantize(uint64_t b, int sigma, bool trunc, uint
   *mu = r;
 }
 
+// ---- Sequence Q1 (issue 21, docs/NOTES-21.md "Pack emitter and finish"): quantize by two multiplications by
+// powers of two and one hardware conversion. W = 2 only (|a'| <= T(N) < 2^63 for N <= 16, so X fits a u64).
+//   X = F2I.U64.{RNI|RZI}(|x| 2^s1 2^s2),  s1 = sigma >> 1, s2 = sigma - s1,  X := 0 for Inf / NaN (zero gives 0).
+// Exact: scaling by a power of two is exact unless the result underflows (< 2^-1022 < 1/2: the integer is 0 either way,
+// RN and TRUNC, so no double rounding can reach 1/2), and the conversion is the correctly rounded (ties to even, resp.
+// toward zero) integer of the real number |x| 2^sigma, which is the quantize() above (§3.3). Needs 2^s1 and 2^s2 to be
+// normal doubles: |s1|, |s2| <= 1022, true for every certified sigma (kSigmaMin..kSigmaMax). Hardware-specific part:
+// F2I.U64.F64 and the DMULs run on the FP64 / conversion pipes (full rate on H100, 1/64 on GeForce-class cards).
+static_assert(imd::constants::kSigmaMin >= -2044 && imd::constants::kSigmaMax <= 2044,
+              "Q1: 2^(sigma>>1) and 2^(sigma - (sigma>>1)) are normal doubles");
+struct QuantScale {
+  double f1, f2;  // 2^s1, 2^s2
+};
+__device__ __forceinline__ QuantScale quant_scale(int sigma) {
+  const int s1 = sigma >> 1, s2 = sigma - s1;
+  return {from_bits(static_cast<uint64_t>(s1 + 1023) << 52), from_bits(static_cast<uint64_t>(s2 + 1023) << 52)};
+}
+template <bool TRUNC>
+__device__ __forceinline__ uint64_t quantize_cvt(uint64_t b, const QuantScale& s) {
+  const double y = from_bits(b & ~kSignBit) * s.f1 * s.f2;
+  const uint64_t X = TRUNC ? static_cast<uint64_t>(__double2ull_rz(y)) : static_cast<uint64_t>(__double2ull_rn(y));
+  return non_finite(b) ? 0 : X;
+}
+
 // §3.4: SMod((mu mod p)(2^eps mod p), p) as int8 for a' = (neg ? -1 : 1) mu 2^eps.
 __device__ __forceinline__ int8_t residue(uint64_t mu, bool neg, int eps, int l) {
   using imd::device::c_tables;
@@ -361,5 +385,21 @@ __device__ __forceinline__ void crt_finish(const uint32_t (&x)[L], int N, uint32
     for (int w = 0; w < L; ++w) mag[w] = x[w];
   }
 }
+
+
+// ---- Sequence F1 (issue 21, docs/NOTES-21.md "Pack emitter and finish"): crt_finish + round_scaled through a hardware
+// u64 -> f64 conversion. D = RN(sign mag 2^e) for mag = |z|, z = x <= H ? x : x - P (x in [0, P), L limbs):
+//   1  neg = x > H (borrow of H - x);  mag = neg ? P - x : x          (P, H compile-time per N)
+//   2  normalise by 4 / 2 / 1-limb stages (a stage shifts the limbs up when its top limbs are zero), b = clz(top limb),
+//      funnel shifts: t = the top 64 bits of mag << (limbs shifted * 32 + b), sticky = any lower bit set; t |= sticky
+//   3  Dm = I2F.F64.U64.RN(t) = RN(t) (t has bit 63 set; sticky only sets bit 0, below the tie bit 10 of the 11 dropped bits,
+//      so the rounding is that of mag itself); the result is Dm 2^kk, kk = 32 Lp - 64 - n + e (n = the left shift of step 2)
+//   4  Dm is a double in [2^63, 2^64], scaling it by 2^kk is an add of kk to its exponent field, exact while the result is
+//      a normal double: 1 <= 1086 + kk <= 2045 (the upper bound leaves room for the carry Dm = 2^64). The sign goes into bit 31
+//      of the high word. Anything else (mag = 0, subnormal or overflowing results) takes the existing path
+//      (crt_finish + round_scaled) unchanged.
+// Hardware-specific part (not the math): I2F.F64.U64 is a native instruction on sm_89, sm_90 and sm_120 (checked with nvcc 13.4)
+// but runs at 1/64 of the integer rate on GeForce-class FP64 pipes; the default sets (host/seq_config.hpp) use F1 only
+// where that is not so. Mut != 0 plants a deliberate bug (tests/test_finish_f1.cu proves the test catches each).
 
 }  // namespace imd::kernels

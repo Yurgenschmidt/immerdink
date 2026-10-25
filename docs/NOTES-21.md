@@ -136,3 +136,59 @@ Expected size if the instruction count halves at the same issue utilization: pac
 ## Not done here
 
 The instruction-issue explanation is derived from 4090 counters and public H100 figures, not measured on Hopper: a Hopper `ncu` run (a module on PACE, if one exists) would confirm or refute it. None of the three directions is implemented.
+
+## Pack emitter and finish (E1, Q1, F1: leaner instruction sequences, one set per device class)
+
+Source: the offline study `immerdink-eval/findings/offline-theory-20261025.md` section 5 (models `analysis/20261025-offline/pack/`: `emit_model.py` E1, `quantize_model.py` Q1, `finish_model.py` F1; each asserts bit identity with `spec/oracle.py`, all three pass unchanged). Nothing here changes a result: the sequences compute the same bytes and the same doubles, and the baseline sequence of each stays in the code.
+
+### Step 0: what nvcc 13.4 emits (micro-check, `nvcc -cubin`, `cuobjdump -sass`)
+
+| question | sm_89 | sm_90 | sm_120 |
+|---|---|---|---|
+| `hi32(s * m32 + h)` with a 64-bit addend (`(uint64_t(s) * m32 + hm) >> 32`) | one `IMAD.HI.U32 Rd, Ra, Rb, Rc` where Rc is a **register pair** (the 64-bit addend); not `IMAD.WIDE.U32` | same | same |
+| `(double)uint64_t` | `I2F.F64.U64` (one native instruction) | same | same |
+| `(uint64_t)double`, `__double2ull_rn` / `__double2ull_rz` | `F2I.U64.F64` / `F2I.U64.F64.TRUNC` (native) | same | same |
+
+So the study's "IMAD.WIDE.U32 with a 64-bit addend" is `IMAD.HI.U32` with a pair; the instruction count is what the study assumed. Native does not mean full rate: the conversions and DMUL share the FP64 / XU pipes, which are 1/64 rate on GeForce-class parts (RTX 4090, sm_120 workstation cards) and full width on H100. That is why Q1 and F1 are Hopper-only defaults (below).
+
+### Selection: one set of sequences per device class
+
+* `src/host/seq_config.hpp` (CUDA-free): the bits `kSeqEmit` (E1), `kSeqQuant` (Q1), `kSeqFinish` (F1) and `kSeqClasses`, the default set per compute capability. `imd_plan_create` stores the device class's set in `ExecPlan::seq` (in the padding after `trunc`; `sizeof(ExecPlan)` is unchanged); the pack launches (`launch_kl`, `launch_kf`, K2/K3) and `launch_k5` read it. A class that is not listed, or not counted, gets 0 = the baseline. The hooks `imd_test_set_seq(bits)` / `imd_prof_set_seq(bits)` (and the harness env `IMD_TEST_SEQ`, the duel key `seq=default|0..7`) force a set for every plan; -1 restores the class's.
+* The kernels take the set as a template value (`kl_scale_pack<E, W, Seq>`, `kf_scale_pack<Cap, E, W, Seq>`, `k23_pack<W, Seq>`: 0 baseline, 1 E1, 3 E1 + Q1 (W = 2 only); `k5_crt_n<N, E, F64, F1>`, `k5_crt_bfast<N, F64, F1>`), so a set costs no instruction in the other sets. The baseline instances are the original code: their SASS counts equal the pre-change counts to within 2 instructions (table below). The occupancy rows of the performance model (`imd_prof_kernel_occupancy`) describe the baseline instances; the E1 / Q1 instances have different register counts (not modelled).
+* Shared math in one place each: E1 `device/residue.hpp` (`PackEmit`, `kPackEmit`, `pack_emit_bounds_ok`) and `device/modp.hpp` (`pack_dot`, `pack_smod`; CPU and GPU run the same code); Q1 `kernels/numerics.cuh` (`quant_scale`, `quantize_cvt`, with the sigma bound as a `static_assert` against the certified `kSigmaMin`..`kSigmaMax`); F1 `kernels/numerics.cuh` (`finish_f1_try`, `crt_round`; its fallback is the existing `crt_finish` + `round_scaled`). A walk-back to a more general version is a change of `kSeqClasses` (or of one function); nothing else refers to the new sequences.
+
+### Hardware-specific assumptions (what must be re-checked for a new class)
+
+| sequence | math | assumes about the hardware |
+|---|---|---|
+| E1 | `d = sum dp4a`, `s' = sigma d + C` (C a multiple of p, `>= dmax`), `q = hi32(s' m32 + h m32)`, `u = s' - p q = SMod(sigma d, p)`; exact because `s' + h < 2^24` (A5) | the compiler fuses the 64-bit addend into `IMAD.HI.U32` (step 0); `dp4a` is native (sm_61+). Integer pipe only. |
+| Q1 | `X = F2I.U64.{RNI,RZI}(\|x\| 2^s1 2^s2)`, `s1 = sigma >> 1`, `s2 = sigma - s1`; `X := 0` if `x` is Inf or NaN. W = 2 only (`X < 2^63`) | native `F2I.U64.F64` (step 0), DMUL at the integer rate. **1/64 FP64 rate on the 4090 and sm_120 cards: off there.** |
+| F1 | `D = RN(t) 2^kk` from the top 64 bits plus a sticky bit; scaling is an exponent-field add | native `I2F.F64.U64`; same FP64 / XU rate caveat. Off on the 4090 and sm_120. |
+
+### Defaults and the SASS evidence per class
+
+Counts are `cuobjdump -sass` of `src/contract.cu` built for each architecture (`tools/sass_seq_counts.sh`; static instruction counts, NOPs excluded) and, for sm_89 only, executed thread-instructions from `ncu` (`smsp__thread_inst_executed.sum`, 4096^3 N = 14, RN, family u: deterministic counts, not timings; no Hopper counter run is possible here).
+
+Modulus loop of the KL pack (instructions per iteration; the iteration emits 8 or 4 elements of one modulus):
+
+| kernel | sm_89 base / E1 | sm_90 base / E1 | sm_120 base / E1 |
+|---|---|---|---|
+| `kl_scale_pack<8,2>` (8 elements) | 99 / 63 | 98 / 63 | 103 / 74 |
+| `kl_scale_pack<8,3>` | 109 / 74 | 110 / 72 | 112 / not measurable (the loop is replicated) |
+| `kl_scale_pack<4,2>` (4 elements) | 106 / 68 | 106 / 68 | 57 / 135 for 4 iterations (34 per iteration; unrolled) |
+| `kf_scale_pack<8,16,2>` (16 elements) | 220 / 106 | 220 / 106 | 203 / 149 |
+| `k23_pack<2>` (16 elements) | 207 / 107 | 207 / 107 | 202 / 151 |
+
+Whole-kernel static counts (the loop is a small part of them, so these move little): E1 is lower on sm_89 in all 10 pack kernels counted (the K2/K3, KF E = 16 and 4, KL E = 8 and 4 kernels, W = 2 and 3; -20 to -274), on sm_90 in 9 of 10 (the exception is `kf_scale_pack<8,16,2>`: 6799 -> 6827, +28 while its modulus loop falls 220 -> 106), and on sm_120 in 8 of 10: `kl_scale_pack<4,2>` 4082 -> 4510 and `<4,3>` 4220 -> 4730 grow because the compiler unrolls the modulus loop there (per iteration it is shorter), and `kf_scale_pack<8,4,3>` is +57. Executed thread-instructions per KL element on sm_89 (ncu): baseline 417.8, E1 356.3 (-61.5; predicted -72), E1 + Q1 311.4 (a further -44.9; predicted -45).
+
+| class | E1 | Q1 | F1 | reason |
+|---|---|---|---|---|
+| sm_89 (RTX 4090) | on | off | off | E1: fewer instructions everywhere, integer only. Q1, F1: FP64 at 1/64 rate. |
+| sm_90 (H100, H200) | on | on | (F1 follows in the next commit) | fewer instructions in every pack kernel; FP64 pipe as wide as the integer pipe. **Not timed on Hopper**: the XU throughput of `F2I.U64` / `I2F.F64.U64` is unverified, R2 duels `seq=0` against `seq=default` decide whether it stays. |
+| sm_120, anything else | off | off | off | counted (table above): E1's loop is shorter per iteration but two kernels grow because of unrolling and nothing was timed; a class without its own row in the K4 registry stays on the baseline. |
+
+### Tests
+
+* `pack_emitter` (GPU unit test, `tests/test_pack_emitter.cu`): every N = 2..20, E = 16, 8, 4, RN and TRUNC, now through the baseline, the E1 and (W = 2) the E1 + Q1 instances, against an exact host reference (148 M residues), with a new input mode that covers the whole certified sigma range (`kSigmaMin`..`kSigmaMax`: Q1's two factors, subnormals, the largest double); **every reduced value** `d` in `[0, dmax]` for both signs, all 20 moduli and both word counts through `pack_smod` on the real `__constant__` table (11,442,942 values); eight **mutations** of that table (`hm - m32`, `m32 - 1`, `C - p`, `negp + 1`, a weight lane, `C + 1`, `hm + m32` at p = 256, a W = 2 weight lane), each of which must be caught.
+* `contract_{e2e,tensor,every_n,eps,bigk}_seq{1,7}`, `output_hashes_seq{1,7}`, `output_hashes_large_seq7`: the existing oracle / committed-hash suites run with the other sequences forced for every plan (`IMD_TEST_SEQ`). The committed hashes are unchanged.
+* The Python models (`nice -n 19 python3 -I`): `emit_model.py` (11.4 M + 0.97 M cases), `quantize_model.py` (787 k), `finish_model.py` (457 k): pass.

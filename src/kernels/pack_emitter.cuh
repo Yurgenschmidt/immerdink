@@ -31,14 +31,33 @@ __device__ __forceinline__ uint64_t shl_clamped(uint64_t x, uint32_t n) {
   return r;
 }
 
-template <int E, int W>  // E consecutive k-bar of one row: 16 (one uint4 per modulus), 8 or 4
+// Instruction sequences (issue 21, docs/NOTES-21.md "Pack emitter and finish"). S selects among
+// implementations of the same function; every S gives the same bytes. The launch picks S per device
+// class (host/seq_config.hpp); S = 0 is the baseline and stays the choice wherever a sequence is not
+// at least as fast.
+constexpr int kSeqE1 = 1;  // fused residue emitter (device/residue.hpp PackEmit, modp.hpp pack_smod)
+constexpr int kSeqQ1 = 2;  // quantize by DMUL, DMUL, F2I.U64 (numerics.cuh quantize_cvt); W = 2 only
+
+template <int E, int W, int S = 0>  // E consecutive k-bar of one row: 16 (one uint4 per modulus), 8 or 4
 struct PackEmitterT {
   static_assert(E == 16 || E == 8 || E == 4, "16, 8 or 4 values per emitter");
   static_assert(W == 2 || W == 3, "X = |a'| in 2 (N <= 16) or 3 (N <= 20) u32 words");
+  static_assert(S >= 0 && S <= 3 && ((S & kSeqQ1) == 0 || W == 2), "S: bit 0 E1, bit 1 Q1 (W = 2 only)");
+  static constexpr bool kE1 = (S & kSeqE1) != 0, kQ1 = (S & kSeqQ1) != 0;
   uint32_t x[W][E];  // X_e = |a'_e| = sum_j x[j][e] 2^(32 j)
-  uint32_t neg = 0;  // bit e: a'_e < 0
+  uint32_t neg = 0;  // bit e: a'_e < 0 (baseline emitter)
+  uint32_t sg[E];    // E1: sigma_e = +1 or -1 (two's complement) per element
 
   __device__ __forceinline__ void load(const uint64_t* bits, int sigma, bool trunc) {
+    if constexpr (kQ1) {
+      const QuantScale qs = quant_scale(sigma);
+      if (trunc) load_cvt<true>(bits, qs);
+      else load_cvt<false>(bits, qs);
+    } else {
+      load_int(bits, sigma, trunc);
+    }
+  }
+  __device__ __forceinline__ void load_int(const uint64_t* bits, int sigma, bool trunc) {
 #pragma unroll
     for (int e = 0; e < E; ++e) {
       uint64_t mu;  // <= 2^53
@@ -49,7 +68,7 @@ struct PackEmitterT {
       assert(mu == 0 || (64 - __clzll(static_cast<long long>(mu))) + eps <=
                             (W == 2 ? imd::constants::kPackXBits2 : imd::constants::kPackXBits3));
 #endif
-      neg |= static_cast<uint32_t>((bits[e] & kSignBit) != 0) << e;
+      set_sign(e, bits[e]);
       if constexpr (W == 2) {
         // eps <= 62 in the contract (|a'| <= T). v1.16: PTX shl, whose count is clamped at 64
         // (result 0), instead of the C++ shift, undefined for eps >= 64: a sigma bug cannot
@@ -72,12 +91,34 @@ struct PackEmitterT {
       }
     }
   }
+  __device__ __forceinline__ void set_sign(int e, uint64_t b) {
+    if constexpr (kE1) sg[e] = (b >> 63) != 0 ? 0xFFFFFFFFu : 1u;
+    else neg |= static_cast<uint32_t>((b & kSignBit) != 0) << e;
+  }
+  // Q1 (W = 2): X from the conversion of |x| 2^sigma.
+  template <bool TRUNC>
+  __device__ __forceinline__ void load_cvt(const uint64_t* bits, const QuantScale& qs) {
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
+      const uint64_t X = quantize_cvt<TRUNC>(bits[e], qs);
+#ifndef NDEBUG
+      assert(X >> imd::constants::kPackXBits2 == 0);
+#endif
+      set_sign(e, bits[e]);
+      x[0][e] = static_cast<uint32_t>(X);
+      x[1][e] = static_cast<uint32_t>(X >> 32);
+    }
+  }
   // The E int8 residues for modulus l, as E / 4 little-endian u32 words. Branch-free for
   // every modulus and every element (p = 256 included: its weights are 1, 0, ..., so s is the
   // low byte and the 2^24 magic gives quotient 0). The sign is applied after SMod (A5):
   // SMod(-r mod p) = -SMod(r) for odd p (symmetric range), and for p = 256 both give the byte
   // (-r) & 255 (the one asymmetric value, r = 128, is the byte 0x80 either way).
   __device__ __forceinline__ void emit(int l, uint32_t (&w)[E / 4]) const {
+    if constexpr (kE1) {
+      emit_e1(l, w);
+      return;
+    }
     using imd::device::c_tables;
     const uint32_t p = c_tables.moduli[l], half = (p + 1) / 2;
     const uint32_t m32 = imd::device::c_magic32.m[l];
@@ -100,6 +141,25 @@ struct PackEmitterT {
                                      : static_cast<int32_t>(r[e]);  // SMod(r)
       const int32_t sm = (neg >> e) & 1u ? -u : u;  // as an int8 bit pattern (low byte)
       w[e / 4] |= (static_cast<uint32_t>(sm) & 255u) << (8 * (e % 4));
+    }
+  }
+  // E1: d = dp4a chain, s' = sigma d + C, q = hi32(s' m32 + h m32), u = s' - p q = SMod(sigma d, p); the int8 is u's
+  // low byte, four of them per word by three byte permutes. No sign select, no SMod compare, no negation.
+  __device__ __forceinline__ void emit_e1(int l, uint32_t (&w)[E / 4]) const {
+    const imd::device::PackEmit& c = imd::device::c_pack_emit.e[W - 2][l];
+    uint32_t u[E];
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
+      uint32_t xe[W];
+#pragma unroll
+      for (int j = 0; j < W; ++j) xe[j] = x[j][e];
+      u[e] = static_cast<uint32_t>(imd::device::pack_smod(imd::device::pack_dot<W>(xe, c), sg[e], c));
+    }
+#pragma unroll
+    for (int q = 0; q < E / 4; ++q) {
+      const uint32_t lo = __byte_perm(u[4 * q], u[4 * q + 1], 0x0040u);      // bytes: u0.b0 u1.b0 0 0
+      const uint32_t hi = __byte_perm(u[4 * q + 2], u[4 * q + 3], 0x0040u);  // bytes: u2.b0 u3.b0 0 0
+      w[q] = __byte_perm(lo, hi, 0x5410u);
     }
   }
   // Store the residues for modulus l at dst (aligned to E bytes).

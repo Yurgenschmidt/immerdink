@@ -13,6 +13,7 @@
 #include "host/analysis.hpp"
 #include "device_state.hpp"
 #include "host/checked.hpp"
+#include "host/seq_config.hpp"
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink.h"
 #include "k4/k4_ops.hpp"
@@ -190,6 +191,7 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
       }
       if (p->info.status == IMD_PLAN_UNSUPPORTED) return IMD_STATUS_NOT_SUPPORTED;
       e.sms = p->info.device.sm_count;
+      e.seq = static_cast<uint8_t>(imd::detail::seq_default_for(p->info.device.cc_major, p->info.device.cc_minor));  // issue 21: this device class's instruction sequences
       e.l2_bytes = static_cast<int64_t>(p->info.device.l2_bytes);
     } else {
       p->info.struct_size = sizeof p->info;
@@ -457,6 +459,12 @@ IMD_API int imd_prof_set_k4_config(int32_t config) {
 IMD_API int imd_prof_set_k5_elems(int32_t elems) {
   if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
   imd::detail::k5_elems_override() = elems;
+  return 0;
+}
+// Benchmark-only (issue 21): the instruction-sequence set of every later call (kSeq* bits of host/seq_config.hpp: 1 E1, 2 Q1, 4 F1); -1 the device class's set.
+IMD_API int imd_prof_set_seq(int32_t bits) {
+  if (bits < -1 || bits > imd::detail::kSeqAll) return 1;
+  imd::detail::seq_override() = bits;
   return 0;
 }
 // Benchmark-only (issue 21): K5's CRT variant for later calls (0 integer running CRT, 1 binary64 limbs).

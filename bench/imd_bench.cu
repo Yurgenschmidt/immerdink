@@ -27,7 +27,7 @@
 //             call, in one process (docs/BENCHMARKING.md "Tiny shapes", NOTES-A5 §1.2): both
 //             sides see the same GPU clock / DVFS / host-core state. A side is "default" or
 //             a comma list of N=<n>, vec=generate|resident, g=<g> (0 = N),
-//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule), crt=int|f64 (issue 21), ka=auto|16|64 (v1.13 §4b:
+//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule), crt=int|f64 (issue 21), seq=default|0..7 (issue 21: the instruction-sequence set, bits 1 E1 emitter / 2 Q1 quantize / 4 F1 finish; default = the device class's), ka=auto|16|64 (v1.13 §4b:
 //             the side's K alignment, via the test hook at plan creation); unset keys keep the plan
 //             defaults, N defaults to the --N value. Defaults: A = default (the K4 rule),
 //             B = k4=tune (the plan-time K4 autotune); when both pick the same K4
@@ -747,6 +747,7 @@ std::pair<Timing, Timing> time_pair(const std::function<void()>& a, const std::f
 struct DuelSide {
   int N = 14, vec = IMD_VEC_GENERATE, g = 0, k4 = -1, k5 = 0;
   int crt = 0;  // issue 21: 0 the integer running CRT, 1 the sums in binary64 limbs (benchmark hook)
+  int seq = -1;  // issue 21: -1 the device class's instruction-sequence set, else forced bits (benchmark hook)
   int ka = -1;  // v1.13 §4b: -1 = the run's --k-align, 0 = AUTO, 16 / 64 = forced (plan-time hook)
   std::string describe() const {
     std::string d = "N=" + std::to_string(N) + " g=" + ((g == 0 || g >= N) ? "N" : std::to_string(g));
@@ -754,6 +755,7 @@ struct DuelSide {
     d += k4 == -1 ? " k4=rule" : k4 == -2 ? " k4=tune" : " k4=" + std::to_string(k4);
     d += k5 == 0 ? " k5=rule" : " k5=" + std::to_string(k5);
     if (crt != 0) d += " crt=f64";
+    if (seq >= 0) d += " seq=" + std::to_string(seq);
     if (ka >= 0) d += ka == 0 ? " ka=auto" : " ka=" + std::to_string(ka);
     return d;
   }
@@ -775,9 +777,10 @@ DuelSide parse_duel_side(const std::string& spec, int N) {
     else if (k == "k4") d.k4 = v == "rule" ? -1 : v == "tune" ? -2 : std::stoi(v);
     else if (k == "k5" && (v == "0" || v == "1" || v == "2" || v == "4")) d.k5 = std::stoi(v);
     else if (k == "crt" && (v == "int" || v == "f64")) d.crt = v == "f64";
+    else if (k == "seq" && (v == "default" || (v.size() == 1 && v[0] >= '0' && v[0] <= '7'))) d.seq = v == "default" ? -1 : std::stoi(v);
     else if (k == "ka" && (v == "auto" || v == "16" || v == "64")) d.ka = v == "auto" ? 0 : std::stoi(v);
     else throw Failure("bad duel side entry '" + kv + "' (N=, vec=generate|resident, g=, "
-                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=int|f64, ka=auto|16|64)");
+                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=int|f64, seq=default|0..7, ka=auto|16|64)");
   }
   return d;
 }
@@ -2061,7 +2064,7 @@ struct Bench {
     auto P = std::make_unique<DuelPlan>();
     P->cfg = d;
 #ifndef IMD_BENCH_PROFILE
-    if (d.k4 >= 0 || d.k5 != 0 || d.crt != 0) throw Failure("duel k4=<config> / k5=<elems> / crt=f64 need the profiling build");
+    if (d.k4 >= 0 || d.k5 != 0 || d.crt != 0 || d.seq >= 0) throw Failure("duel k4=<config> / k5=<elems> / crt=f64 / seq=<bits> need the profiling build");
 #endif
     auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
       lab.assign(x.labels.begin(), x.labels.end());
@@ -2102,11 +2105,12 @@ struct Bench {
     auto pa = make_duel_plan(parse_duel_side(spec_a, N));
     auto pb = make_duel_plan(parse_duel_side(spec_b, N));
     DevBuf dC2(dC.bytes);
-    const bool k5_hook = pa->cfg.k5 != 0 || pb->cfg.k5 != 0 || pa->cfg.crt != 0 || pb->cfg.crt != 0;
+    const bool k5_hook = pa->cfg.k5 != 0 || pb->cfg.k5 != 0 || pa->cfg.crt != 0 || pb->cfg.crt != 0 || pa->cfg.seq >= 0 || pb->cfg.seq >= 0;
     auto set_k5 = [&](const DuelPlan& p) {
 #ifdef IMD_BENCH_PROFILE
       if (k5_hook && imd_prof_set_k5_elems(p.cfg.k5) != 0) throw Failure("imd_prof_set_k5_elems");
       if (k5_hook && imd_prof_set_k5_crt(p.cfg.crt) != 0) throw Failure("imd_prof_set_k5_crt");
+      if (k5_hook && imd_prof_set_seq(p.cfg.seq) != 0) throw Failure("imd_prof_set_seq");
 #else
       (void)p;
 #endif
@@ -2160,7 +2164,7 @@ struct Bench {
     set_k5(*pa); call(*pa, Ca);
     set_k5(*pb); call(*pb, Cb);
 #ifdef IMD_BENCH_PROFILE
-    if (k5_hook) imd_prof_set_k5_elems(0), imd_prof_set_k5_crt(0);
+    if (k5_hook) imd_prof_set_k5_elems(0), imd_prof_set_k5_crt(0), imd_prof_set_seq(-1);
 #endif
     CU(cudaStreamSynchronize(s));
     const Accuracy acc_a = check(R, Ca, s), acc_b = check(R, Cb, s);
@@ -2687,7 +2691,7 @@ void usage() {
           "  [--mode emulate|direct] (method imd) [--data normal|dominant|decay_opp]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
-          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=int|f64, ka=auto|16|64)\n"
+          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=int|f64, seq=default|0..7, ka=auto|16|64)\n"
           "  [--clock-probe 0|1] [--l2 repeat|flush] (v1.10: per-call SM clock; L2 evicted\n"
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
           "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"
