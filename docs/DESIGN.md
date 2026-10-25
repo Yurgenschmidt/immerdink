@@ -363,6 +363,10 @@ and that the reported row is the most constrained one; if a later kernel change 
 CTAs per SM differ by W, it fails, and the model then needs per-W rows. Those are already
 measured: `imd_bench --methods occupancy` writes `kernels_w` (per pack kernel, the rows of
 W = 2, 3; benchmark hook `imd_prof_kernel_occupancy_w`) next to `kernels`.
+On Hopper (sm_90) the pack kernel is already known to differ (W = 2: 4 CTAs per SM at 64 registers; W = 3: 2 CTAs at 116 registers; both 40,768 B and 256 threads;
+seen on the H100 in R1b), so `contract_api` accepts exactly that recorded pattern, on compute capability 9 only, as a known divergence (it prints `known  occupancy pack: per-W
+difference on sm_90 (issue 23: the model needs per-W rows)`) until issue 23 gives the model per-W rows; any other device or other values fail as before (decision logic:
+`tests/occupancy_known.py`, checked on mocked tables by the CPU test `contract_occupancy_known`).
 
 **Per-residue cost.** W `dp4a`, one `umulhi`, one multiply-subtract, SMod and the sign: the
 same instruction stream for every element and every data. No ε registers (16 fewer live
