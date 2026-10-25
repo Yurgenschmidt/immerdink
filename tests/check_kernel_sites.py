@@ -36,7 +36,8 @@ checked = {m.group(1) for m in re.finditer(r"(?:occupancy_of|versions_of)\(\s*([
 checked |= {"k4_kernel"} if "k4_kernel<G, false>" in read("src/k4/k4_cfg.cuh") and \
     "cudaFuncGetAttributes(&a, store)" in read("src/k4/k4_cfg.cuh") else set()
 
-missing = {n: sorted(f) for n, f in launched.items() if n not in checked}
+# test-only kernels (names test_*, compiled under IMD_BUILD_TEST_HOOKS only, e.g. test_crt_elem_kernel) are not part of the shipped library
+missing = {n: sorted(f) for n, f in launched.items() if n not in checked and not n.startswith("test_")}
 fail = False
 if missing:
     fail = True

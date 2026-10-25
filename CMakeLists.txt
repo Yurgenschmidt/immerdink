@@ -161,6 +161,8 @@ add_library(immerdink SHARED src/api.cpp src/device_state.cpp src/contract.cu sr
   src/k4/k4_cfg0.cu src/k4/k4_cfg1.cu src/k4/k4_cfg2.cu src/k4/k4_cfg3.cu)
 if(IMMERDINK_BUILD_TESTS)
   target_sources(immerdink PRIVATE src/test_hooks.cpp)
+  # contract.cu's test-only kernels and counters (imd_test_crt_elem, imd_test_k5_launch_counts)
+  target_compile_definitions(immerdink PRIVATE IMD_BUILD_TEST_HOOKS=1)
 endif()
 if(IMMERDINK_PROFILE)
   target_sources(immerdink PRIVATE src/profile.cpp)

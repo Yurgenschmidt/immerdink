@@ -42,6 +42,14 @@
 //       The K alignment itself is forced by libimmerdink_host's
 //       imd_test_set_k_align (src/host/k_hat.cpp).
 //
+//   imd_test_crt_elem(N, variant, e, count, W, out)
+//   imd_test_k5_launch_counts(reset, out)
+//       Issue 21 (docs/NOTES-21.md): the first runs the real CRT device functions of contract.cu
+//       (variant 0 integer running CRT, 1 binary64-limb CRT, 2..9 its compile-time mutations) on
+//       `count` device residue vectors and writes x in [0, P) before crt_finish; the second
+//       copies (and optionally zeroes) the counts of K5 launches per [limb CRT?][variant].
+//       tests/test_crt_f64_unit.py, tests/test_crt_f64_gpu.py.
+//
 //   imd_test_set_pad_mutation(operand)
 //       v1.13 §4b (hygiene): operand 0 / 1 makes the K2 / K3 pack of the post-swap GEMM
 //       operand A / B store k-bar only below ceil(k)_16 (Pipeline neg_a64_pad_old_k3), so an
@@ -136,6 +144,20 @@ IMD_API int imd_test_set_k5_one_elem(int64_t per_sm) {
 IMD_API int imd_test_set_k5_elems(int elems) {
   if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
   imd::detail::k5_elems_override() = elems;
+  return 0;
+}
+
+// Issue 21 device-level unit test of the binary64-limb CRT: see plan.hpp test_crt_elem. W: device bytes [N][count], out: device u32 [count][5].
+// variant 0 integer running CRT, 1 limb CRT, 2..9 its mutations. Returns 0, or 1 for an invalid argument or a launch error. The caller synchronizes.
+IMD_API int imd_test_crt_elem(int N, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
+  if (count > 0 && (W == nullptr || out == nullptr)) return 1;
+  return imd::detail::test_crt_elem(N, variant, e, count, W, out) == cudaSuccess ? 0 : 1;
+}
+
+// K5 launches since the last reset, int64[8]: [limb CRT?][variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest]; reset != 0 zeroes them.
+IMD_API int imd_test_k5_launch_counts(int reset, int64_t* out) {
+  if (out == nullptr) return 1;
+  imd::detail::test_k5_launch_counts(reset != 0, out);
   return 0;
 }
 

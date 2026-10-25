@@ -143,6 +143,10 @@ class Library:
             self.lib.imd_test_set_k5_elems.restype = C.c_int
             self.lib.imd_test_set_k5_crt.argtypes = [C.c_int]
             self.lib.imd_test_set_k5_crt.restype = C.c_int
+            self.lib.imd_test_crt_elem.argtypes = [C.c_int, C.c_int, C.c_int, C.c_int64, C.c_void_p, C.c_void_p]
+            self.lib.imd_test_crt_elem.restype = C.c_int
+            self.lib.imd_test_k5_launch_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
+            self.lib.imd_test_k5_launch_counts.restype = C.c_int
             self.lib.imd_test_plan_sizes.argtypes = [C.c_void_p, C.POINTER(C.c_int64), C.c_int64,
                                                      C.POINTER(C.c_int64)]
             self.lib.imd_test_plan_sizes.restype = C.c_int
@@ -195,6 +199,19 @@ class Library:
     def set_k5_crt(self, variant=0):
         """Issue 21: K5's CRT with the sums in binary64 limbs (1) or the integer running CRT (0, default)."""
         assert self.lib.imd_test_set_k5_crt(variant) == 0
+
+    def crt_elem(self, N, variant, e, count, W_dev, out_dev):
+        """Issue 21 device-level unit hook (src/test_hooks.cpp imd_test_crt_elem): the CRT word x in [0, P) of `count` residue vectors by the real
+        device code, before round_scaled. W_dev: device uint8 [N][count] (the residue of plane l of vector i at l * count + i), out_dev: device uint32
+        [count][5]. variant 0 the integer running CRT, 1 the shipped binary64-limb CRT, 2..9 its mutations 1..8. The residue travels in byte e of its
+        plane's word. Asynchronous: the caller synchronizes (Cuda.sync)."""
+        assert self.lib.imd_test_crt_elem(N, variant, e, count, W_dev, out_dev) == 0
+
+    def k5_launch_counts(self, reset=False):
+        """K5 launches since the last reset as {(limb CRT?, variant): count}; variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest."""
+        out = (C.c_int64 * 8)()
+        assert self.lib.imd_test_k5_launch_counts(1 if reset else 0, out) == 0
+        return {(c, v): out[4 * c + v] for c in range(2) for v in range(4) if out[4 * c + v]}
 
     def set_k5_mapping(self, fmode):
         """The K5 mapping of a test run with fused mode `fmode` (test_contract, test_packed):
