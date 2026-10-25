@@ -1,7 +1,8 @@
 # Issue 22: the Hopper K4 ladder, rung 1 (timing)
 
 Status: harness written and cross-compiled 2026-10-25, revised the same day after an independent review (APPROVE-WITH-CHANGES, 12 points, all
-applied below); **never run on a Hopper card** (no Hopper on the dev box). Code: `src/k4/hopper/rung1.cu`, `tools/build_rung1.sh`. Rung 0
+applied below); **never run on a Hopper card** (no Hopper on the dev box). Later the same day: the synthetic wgmma peak (`p_` rows, section "The synthetic peak") was
+added; it is equally unrun. Code: `src/k4/hopper/rung1.cu`, `tools/build_rung1.sh`. Rung 0
 (`rung0.cu`, exactness at tiny size) is unchanged except that `tools/build_rung0.sh` now also builds with `-DNDEBUG`.
 
 ## Why this exists
@@ -29,7 +30,7 @@ timing code, in the same process. The `f_`/`m_` ratio therefore needs no cross-r
 and a 1.3x ratio against it inherits that noise). One launch over all 14 batches and the whole K per shape, not the library's chunked group launches.
 
 **Order** (a timeout or a hang keeps the valuable lines; `starting <row> <shape> L slot0 sw raster clusters` is printed to stderr BEFORE each row, so a hang
-names its row): (1) the `m_` baseline and every non-"last" `f_` row, default scheduler, first shape then the next, L = 14; (2) the scheduler sweep for the
+names its row): (0) the 20 synthetic-peak rows (`p_`, below; about 2-3 s each, no shape or batch) and, with `--sustain S`, a sustained block of the best full-range one; (1) the `m_` baseline and every non-"last" `f_` row, default scheduler, first shape then the next, L = 14; (2) the scheduler sweep for the
 six `sweep` rows at 8192^3: max_swizzle_size {1, 2, 4, 8} x raster {AlongM, AlongN} (CUTLASS `args.scheduler`; `VT<>` needed no change, the knobs are runtime
 arguments and rung 0 is untouched), skipping points that resolve to the same (raster, swizzle) as the default or as an earlier point (the heuristic picks
 AlongN for 128x256 and 128x128 tiles but AlongM for 256x128, so the duplicate differs per row); (3) with `--sustain S` a sustained block for the best `f_` row
@@ -55,7 +56,7 @@ scheduler actually uses), `mode` (single / loop / sustain), `launches_per_rep`, 
 `dlopen`ed (no link dependency, `--no-nvml` to skip) and polled every 5 ms by a host thread during each timed block: `sm_mhz_min`, `sm_mhz_mean`, `power_w_max`,
 `temp_c`, `throttle_reasons` (NVML clocks-event bits except 0x1 and 0x2: 0x4 SW power cap, 0x8 HW slowdown, 0x20 SW thermal, 0x40 HW thermal, 0x80 power brake)
 and `idle_app_flags` (0x1 idle, 0x2 application clocks: not throttling); all `null` without NVML. `nvmlDeviceGetPowerUsage` is an average over about a second, so a
-short block under-reports `power_w_max`; for a power-limited rate use `--sustain 4` (record `mode: "sustain"`: `tops` over the block and over its first and last
+short block under-reports `power_w_max`; for a power-limited rate use `--sustain 4` (8 for the peak rows) (record `mode: "sustain"`: `tops` over the block and over its first and last
 second, plus the clock and power over the whole block).
 
 **Exactness** (`exact` = all three): `ref_mismatches == 0`: about 390 sampled output bytes (random positions plus corners and tile edges) against a host reference
@@ -79,14 +80,14 @@ is the same in both. A rung-1 `exact: false` is a finding in its own right, what
 ```
 export IMMERDINK_CUTLASS_DIR=<cutlass checkout>          # default third_party/cutlass
 tools/build_rung0.sh $OUT run                             # exit 0 first (now -DNDEBUG too)
-BENCH_COMMIT=$(git rev-parse --short HEAD) RUNG1_TIMEOUT=1800 RUNG1_ARGS="--sustain 4 --clusters both" tools/build_rung1.sh $OUT run
+BENCH_COMMIT=$(git rev-parse --short HEAD) RUNG1_TIMEOUT=1800 RUNG1_ARGS="--sustain 8 --clusters both" tools/build_rung1.sh $OUT run
 #   $OUT/imd_rung1, build.log, sass_counts.txt, nvcc_version.txt, rung1.jsonl (stdout), rung1.err (progress)
 ```
 
 Quick (about a minute): `RUNG1_ARGS="--quick" tools/build_rung1.sh $OUT run`. Other knobs: `--variants` (groups all / f / g / m / quick / sweep as exact words, else a name or
 substring: `--variants g` is the generic rows only), `--shapes 4096,8192` (or MxNxK), `--batches 14,4,1`, `--sweep 8192|4096,8192|none` (uses the selected rows flagged
 sweep, or `--sweep-variants`), `--reps`, `--max-seconds`, `--samples`, `--skip-last`, `--list`, `--plan`.
-The default plan is 122 tasks (`--plan`); with `--clusters both` and `--sustain` more (unmeasured guess: tens of minutes; raise `RUNG1_TIMEOUT` for `both`). The build script checks CUTLASS
+The default plan is 142 tasks (`--plan`; 20 of them the `p_` rows); with `--clusters both` and `--sustain` more (unmeasured guess: tens of minutes; raise `RUNG1_TIMEOUT` for `both`). The build script checks CUTLASS
 and nvcc exist, builds with `-Xptxas -v` into `build.log`, **refuses to run if ptxas printed C7510** (exit 6; `RUNG1_ALLOW_C7510=1` overrides: the numbers would then be of
 serialised wgmma), prints spill bytes, and counts `WARPGROUP.DEPBAR` against `IGMMA` per kernel from `cuobjdump -sass` (`SERIAL?` if DEPBAR >= IGMMA). `-O2 -DNDEBUG`
 are mandatory (the program warns and records `"ndebug": false` otherwise).
@@ -131,8 +132,95 @@ Reference batches L = 4 and L = 1: they use `slot0 = 1` (recorded), because `mod
 (epilogue-trivial) case. L = 1 at 4096 is still partly L2-resident (A + B = 33 MB against a 50 MB L2) and has fewer tiles than SMs for the large tiles (4096^2 / (128x256) = 512
 tiles on 132 SMs: wave-quantised): these rows are context, not part of the decision.
 
+## The synthetic peak (`p_` rows)
+
+**Question.** The datasheet says 1979 INT8 TOPS dense (H100 SXM); cuBLASLt reaches 1313-1544 and the best stock wgmma kernels about 1150-1570. How much of the gap
+is the card (power, clock, instruction issue) and how much is software? A kernel that does nothing but wgmma, from shared memory, with no global traffic, no
+producer and no epilogue, is the best any software can do with this instruction, so its rate is the ceiling the real rows are read against (the same role
+`mma_peak` plays for `mma.sync`: 1275 TOPS on H100/H200 in `bench/ceiling`).
+
+**Design** (`k_wgmma_peak<N, NWG, ST>` in `rung1.cu`; the code comments repeat the reasons).
+* Persistent, one CTA per SM (`grid = SM count`), `NWG` consumer warpgroups per CTA (1, 2, 3 for N = 256, 2 and 4 for N = 128; the accumulator is 64 x N int32 =
+  N/2 registers per thread, so 3 x 128 threads x 154 registers still fits the 64K register file at N = 256). No producer warp: the operand tiles are copied into
+  shared memory once at the start (plain stores through CuTe's swizzled layout, then `fence.proxy.async` and `__syncthreads`; the wgmma reads shared memory
+  through the async proxy) and never change.
+* Descriptor-based SS wgmma `m64nNk32.s32.s8.s8`, K-major, 128-byte swizzle, built exactly as the stock sm90 TMA mainloop builds them: `tile_to_shape` of
+  `GMMA::Layout_K_SW128_Atom<int8_t>` (a 128-wide int8 K tile is one atom wide, the same layout `Variant` static-asserts), `make_tiled_mma(SM90_64xNx32_S32S8S8_SS_TN)`,
+  `make_fragment_A/B` (the descriptor tensors), `cute::gemm`, `warpgroup_arrive / commit_batch / wait<1>`, `warpgroup_fence_operand`. No hand-written descriptor and no
+  inline wgmma asm in this repo's code. CuTe's `make_gmma_desc` static-asserts the canonical layout at compile time, which it did.
+* Each warpgroup has its own A tile (64 x 128, different data per warpgroup); all warpgroups of a CTA share one B tile (N x 128), like the cooperative kernel's
+  128 x 256 tile. One loop iteration ("block") = 4 K tiles x 4 k32 instructions = **16 wgmma** in one commit group; then `wait_group 1`: the previous group has
+  finished, this one is running while the next one is issued, so the tensor pipes never drain except once at the end. 16 instructions per wait is within the
+  8-16 asked for, with one group always in flight.
+* The loop count (`iterations_blocks`) is chosen at run time so one launch lasts about 0.25 s (from a 0.3 s warm-up of short launches); the same count is used for
+  all timed and checked launches of the row. Accumulators start at zero, `ScaleOut::One` throughout, and are written to global memory once at the end.
+* Rows (`--list` / `--plan` print them, with their shared memory): `p_n256_wg{1,2,3}`, `p_n256_wg1x2cta` (two 1-warpgroup CTAs per SM, 41 984 B each; checked by the
+  occupancy API), `p_n128_wg{2,4}`; each with data `_zero`, `_small`, `_full`, and `_full4` for `n256_wg2`, `n128_wg4`. One-CTA-per-SM rows request 116 KiB of
+  dynamic shared memory (more than half of the 227 KiB) so that no second CTA can land on the same SM; `sms_used` (distinct `%smid` values) and `placement_ok` verify it.
+  `p_n256_wg2_*` is the structure of the stock cooperative 128 x 256 kernel (two consumer warpgroups); `wg3` and `n128_wg4` ask whether more resident warpgroups
+  issue closer to the limit; `wg1` and `wg1x2cta` ask whether one warpgroup suffices.
+* Data: `zero` (A = B = 0: issue-rate ceiling, the least toggling, the exactness check is trivial and marked `exact_check_trivial`), `small` (values -3..3), `full`
+  (counter-based hash, -127..127: the highest-power data of the three), `full4` (same hash, four different tiles rotating through the stages, so the operands change every
+  16 wgmma instead of every 4 k-slices: the closest to a real GEMM's operand traffic; needs 4 x the shared memory). The values are static in shared memory for
+  all iterations, so even `full4` has less operand toggling than a real GEMM streaming new tiles from L2: the `full` rows are a lower bound on power, which is the
+  direction that makes the clock-limited ceiling optimistic.
+* Not in the loop: no `mbarrier`, no TMA, no global load or store, no `bar.sync`, no epilogue.
+
+**Measurement.** Per row: 0.3 s of short launches (clock ramp), calibration, then `--peak-seconds` (default 1.25 s) of single launches of about 0.25 s, an event pair around
+each (at least 5), median / min / max, `spread_pct`; the NVML sampler (the harness's `Sampler`, 5 ms) runs over the timed block. With `--sustain S`: one more
+block (after all `p_` rows) of S seconds on the best exact `full`/`full4` row by its timed rate (`only_sustain`: no second timed block), with tops over the block and its first and
+last second, and `throttle_reasons` / `power_w_max` over it. Before every launch the output buffers are poisoned (outside the event pair).
+
+**Fields** (JSON line per row and mode `peak` / `sustain`; the common ones as for the other rows): `tops` = (2 x 64 x N x 32 ops per wgmma) x (wgmma per warpgroup =
+16 x `iterations_blocks`) x warpgroups x CTAs / launch time, int8 TOPS over all SMs and warpgroups (the convention of `bench/ceiling`: 2 ops per MAC, median);
+`ops_clk_sm_clock64` = ops per SM clock per SM from the kernel's own `clock64()` around the loop (no sampling; mean over the SMs used; `_min` the slowest SM;
+`frac_of_datasheet_ops_clk` against 8192 = 4096 MAC); `sm_mhz_clock64` = cycles / launch time; from NVML (null without it): `sm_mhz_min/mean`, `tops_per_ghz_nvml` (TOPS per GHz,
+the clock-normalised ceiling), `ops_clk_sm_nvml`, `datasheet_tops_at_nvml_clock` and `datasheet_tops_at_max_clock` (SMs x 8192 x clock), `power_w_max`, `temp_c`,
+`throttle_reasons`; `regs`, `local_bytes`, `max_blocks_per_sm`, `smem_dynamic_bytes`, `iterations_blocks`, `wgmma_per_wg`, `grid`, `sms_used`, `placement_ok`.
+
+**Exactness.** After R = `iterations_blocks` blocks every accumulator must equal R x S mod 2^32, where S[row][col] is the host-computed sum, over the four tiles of a
+block (stage j mod ST), of the int32 dot product A_tile . B_tile^T (so with ST = 1 it is 4 x the one product). The wgmma `.s32` form without `.satfinite` wraps,
+integer addition is associative and the host multiplies in uint64, so the wrapped result is deterministic and exact; for `full` data R x S overflows int32 many times and the
+check still has to match bit for bit. EVERY element of EVERY CTA and warpgroup is compared (up to 26 million int32), against the accumulator position of the PTX D fragment
+(row = 16 warp + lane/4 + 8 ((v/2) mod 2), col = 8 (v/4) + 2 (lane mod 4) + v mod 2, the order `layout_ok` in `k4_hopper.cuh` checks against CuTe at compile time); the loop counter of every warpgroup must
+equal R. It is checked on the last launch of the timed block, of the sustained block, and on a fresh launch after both (`ref_mismatches`, `ref_mismatches_after`,
+`iters_mismatches`); `exact` is all of them, and `exact: false` means do not use the row's rate. A failing row records the first bad (cta, wg, thread, register, want, got).
+The `zero` rows can only see that results were written and the loop ran R times.
+
+**SASS evidence** (cross-compile here, nvcc 13.4, CUTLASS 4.8.0, sm_90a, `-O2 -DNDEBUG`, `tools/build_rung1.sh`; it prints this table from `cuobjdump -sass` and warns on a `CALL` in a
+peak kernel): no ptxas C7510, no spills and no stack frame in any of the seven peak kernels (the first version had an 8-byte spill in `n256_wg3` with four stages at the 168-register cap
+of 384 threads; that instantiation, whose row added little, was dropped), registers 154 (`n256` 1 stage, any warpgroup count), 172 (`n256_wg2` 4 stages), 90 / 108 (`n128`). SASS per kernel:
+
+```
+ok  IGMMA 16  WARPGROUP.DEPBAR 2  CALL 0  peak wgmma-n256 wg1 stages1     (also wg2, wg3; n128 wg2, wg4; stages4 for n256 wg2 and n128 wg4)
+```
+
+i.e. one loop of exactly 16 `IGMMA.64x256x32.S8.S8` on the same accumulator registers (R24..R151) with one `WARPGROUP.DEPBAR.LE gsb0, 0x1` and the back branch, and
+one `DEPBAR.LE gsb0, 0x0` after the loop; before the first IGMMA of a block there are about twenty uniform-datapath instructions (descriptor arithmetic, `R2UR`, `UMOV`), which run while the
+previous group executes; no CALL, no `BAR`, no memory instruction in the loop.
+
+**Reading the result.** `ops_clk_sm_clock64` on the `zero` and `small` rows is the issue-rate ceiling per SM clock, 8192 being the architecture's dense INT8 rate; power does not enter it (a power cap
+lowers the clock, `sm_mhz_*`, not the ops per clock). TOPS = SMs x ops/clk/SM x clock. Then:
+* `zero`/`small` at or above ~0.95 x 8192 and `full` the same per clock: the datasheet instruction rate is reachable by wgmma from shared memory. Whether the TOPS reaches 1979 then depends only on the clock.
+* `full` (or `full4`) has the same ops/clk but its clock `sm_mhz_mean` (and `tops_last_1s` of the sustained block) is lower than for `zero`/`small`, `power_w_max` is near the card's limit and `throttle_reasons` has 0x4:
+  **power-limited**. The achievable ceiling for random data is the `full4`/`full` TOPS (sustained), not the datasheet; compare the real rows' `tops` and `sm_mhz_mean` with it.
+* `zero`/`small` ops/clk well below 8192 (say under ~0.85) in every configuration, clock at maximum, no throttle bit: the instruction does not issue at the datasheet rate in this form
+  (or the clock64 counter does not tick at the SM clock; compare `sm_mhz_clock64` with NVML's). Then the real kernels' gap to 1979 is not theirs to close; read them against the best `p_` TOPS.
+* `wg1` well below `wg2`/`wg3`: one warpgroup cannot keep the pipes full (the real kernel's two consumers are needed); `wg3` or `n128_wg4` above `wg2`: more resident warpgroups would help a real kernel;
+  `n128` below `n256`: the smaller instruction costs issue slots.
+* The headline for the decision rule above: `ceiling_tops` = the highest exact `full4` or `full` `tops` of the **sustained** block (sustain record, last second), and `real / ceiling` for the best `f_` row
+  (and for cuBLASLt's 1313-1544 from `bench/ceiling`, a different run, same card). The 1456 TOPS upper edge of the theory and the 1260 lower edge should be compared with this ceiling
+  before they are interpreted: if the ceiling itself is near 1500 (power-limited), 1456 is not "above the mainloop", it is at the card's limit.
+
 ## Not verified (no Hopper here)
 
+* The synthetic peak, all of it: it has been cross-compiled and its SASS read, nothing more. That the CuTe-built descriptors address the swizzled tiles my shared-memory fill wrote
+  (the fill and the descriptors both come from the same `tile_to_shape` layout, which is what the TMA-fed stock mainloop relies on; the 1024-byte base alignment is done by hand and the
+  `base_offset` field is 0), so an `exact: false` on the very first `p_` row would be this or the host's fragment-position formula, not a speed result; that `wait_group 1` (one group of 16 in flight)
+  is deep enough to saturate the pipes (a deeper variant is a one-line change); that one launch's `clock64` window is the whole loop; the occupancy / placement of the one-CTA-per-SM rows; the
+  runtime of a row (about 2 s of GPU time plus about a second of host checking per row is an estimate) and that the 26 MB accumulator write-out and the host comparison do not disturb the following row's clock;
+  that NVML's power reading lags (average over about a second): the `sustain` record is the one to trust for power.
+* Operand data are static in shared memory, so the toggling power of a real GEMM (new tiles every few instructions) is not reproduced; `full4` is closer than `full`, neither is an upper bound on power.
 * Everything dynamic on the Hopper rows: that the harness runs there, the numbers, the exactness of any variant on the card, that the 2x1 and 4x1 128x256 clusters launch, that
   the queried `max_active_clusters` gives a sensible grid, that NVML works in the allocation (it is optional), that the 0.3 s load and 12 repetitions give a stable clock
   (check `spread_pct` and `sm_mhz_min`), and the SASS gate on the cluster's own nvcc (the build script prints it).
