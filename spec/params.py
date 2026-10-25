@@ -1398,6 +1398,52 @@ def cert_crt_y_reduction():
     return "exhaustive over n in [0, 2^16) for all 20 moduli (19 umulhi64 + mask for 256)"
 
 
+F64_LIMB_BITS = 40                   # issue 21: the CRT sums in binary64 limbs (spec/crt_f64.py)
+F64_MAX_J = 4                        # limbs of K_l and P at N = kNMax (156 bits <= 4 * 40)
+F64_W_MAX = 255                      # W_l < p_l <= 256
+
+
+def f64_crt_constants(N):
+    """Per N: J limbs of 40 bits for K_l = q_l M_l (< P) and for P, and Pinv = fl(1 / P) as the exact double, for the CRT of spec/crt_f64.py."""
+    c = constants(N)
+    P = c["P"]
+    J = -(-P.bit_length() // F64_LIMB_BITS)
+    mask = (1 << F64_LIMB_BITS) - 1
+
+    def limbs(x):
+        out = [(x >> (F64_LIMB_BITS * j)) & mask for j in range(J)]
+        need(x >> (F64_LIMB_BITS * J) == 0, "limbs cover the value")
+        return out
+    K = [ql * Ml for ql, Ml in zip(c["q"], c["M"])]
+    return {"J": J, "k": [limbs(x) for x in K], "Pj": limbs(P), "Pinv": 1.0 / P, "P": P, "K": K}
+
+
+@check("§3.6 CRT sums in binary64 limbs are exact (issue 21)")
+def cert_crt_f64():
+    """The limb sums s_j = sum_l W_l k_lj are integers below 2^53 whatever the order of the fma chain (all terms nonnegative), t P_j < 2^53 for every quotient
+    t <= N * 255, the quotient estimate error N * 255 * (J + 1) 2^-52 is below the 2^-37 the downward bias 2^-30 absorbs, and the limbs reproduce K_l and P
+    (K_l W_l and M_l ((q_l W_l) mod p_l) differ by a multiple of P). The algorithm itself is tested against oracle.crt (spec/test_crt_f64.py)."""
+    for N in range(N_MIN, N_MAX + 1):
+        f = f64_crt_constants(N)
+        c = constants(N)
+        J, tmax = f["J"], N * F64_W_MAX
+        need(J <= F64_MAX_J, f"N={N} J={J}")
+        for j in range(J):
+            smax = sum(F64_W_MAX * f["k"][l][j] for l in range(N))
+            need(smax < 2**53, f"N={N} limb {j} sum")
+            need((tmax + 1) * f["Pj"][j] < 2**53, f"N={N} t P_{j}")
+            need(smax + f["Pj"][j] < 2**53, f"N={N} limb {j}: t = -1 (s_j + P_j) stays exact")
+        need(tmax * (J + 1) * 2.0**-52 < 2.0**-37, f"N={N} quotient estimate")
+        need(c["P"] + (c["P"] >> 29) + 1 < 2**(F64_LIMB_BITS * J), f"N={N} R < P (1 + 2^-29) fits the {J} limbs (no carry out of the top one)")
+        need(c["P"] + (c["P"] >> 29) + 1 < 2**(LIMB * c["L32"]), f"N={N} R < P (1 + 2^-29) fits the {c['L32']} words of the CRT accumulator")
+        for l, (Kl, Ml, ql, pl) in enumerate(zip(f["K"], c["M"], c["q"], c["moduli"])):
+            need(0 < Kl < c["P"] and sum(f["k"][l][j] << (F64_LIMB_BITS * j) for j in range(J)) == Kl, f"N={N} l={l} K")
+            for W in (1, pl - 1):
+                need((Kl * W - Ml * ((ql * W) % pl)) % c["P"] == 0, f"N={N} l={l} W={W} congruence")
+        need(sum(f["Pj"][j] << (F64_LIMB_BITS * j) for j in range(J)) == c["P"], f"N={N} P limbs")
+    return f"N={N_MIN}..{N_MAX}: {F64_LIMB_BITS}-bit limbs, J <= {F64_MAX_J}, sums < 2^53, quotient error < 2^-37"
+
+
 @check("§3.4 residues fit int8")
 def cert_residues():
     """smod(x, p) in [-floor(p/2), ceil(p/2)-1] subset of int8, congruent, for every class."""
@@ -3187,6 +3233,17 @@ def build_header():
     w("  uint32_t q[kNMax + 1][kNMax];")
     w("};")
     w("")
+    w("// Issue 21 (docs/NOTES-21.md, spec/crt_f64.py): the CRT with the sums in binary64 limbs. K_l = q_l M_l < P is cut into J limbs of kF64LimbBits bits,")
+    w("// s_j = sum_l W_l k_lj (exact in a double), t = floor(fl(S) Pinv - 2^-30), r_j = s_j - t P_j; every entry below is an exact integer except Pinv = fl(1/P).")
+    w(f"inline constexpr int kF64LimbBits = {F64_LIMB_BITS};")
+    w(f"inline constexpr int kF64MaxJ = {F64_MAX_J};")
+    w("struct F64Crt {")
+    w("  int32_t J[kNMax + 1];")
+    w("  double k[kNMax + 1][kNMax][kF64MaxJ];")
+    w("  double Pj[kNMax + 1][kF64MaxJ];")
+    w("  double Pinv[kNMax + 1];")
+    w("};")
+    w("")
     w("inline constexpr Tables kTables = {")
     w(f"    /* moduli */ {row(REAL_MODULI, u32, 10)},")
     w(f"    /* epi_bias */ {row([pl.get('bias', 0) for pl in plans], u32, 5)},")
@@ -3219,6 +3276,26 @@ def build_header():
         qs = per_n[N]["q"] if N in per_n else []
         w(f"      {row(qs + [0] * (N_MAX - len(qs)), u32, 20)},  // N = {N}")
     w("    },")
+    w("};")
+    w("")
+    f64 = {N: f64_crt_constants(N) for N in range(N_MIN, N_MAX + 1)}
+    pad4 = lambda xs: [float(x) for x in xs] + [0.0] * (F64_MAX_J - len(xs))
+    dbl = lambda x: x.hex() if x != 0 else "0.0"
+    w("inline constexpr F64Crt kF64Crt = {")
+    w(f"    /* J */ {row([f64[N]['J'] if N in f64 else 0 for N in range(N_MAX + 1)], str)},")
+    w("    /* k */ {")
+    for N in range(N_MAX + 1):
+        w(f"      {{  // N = {N}")
+        for l in range(N_MAX):
+            ks = f64[N]["k"][l] if N in f64 and l < N else []
+            w(f"        {row(pad4(ks), dbl)},")
+        w("      },")
+    w("    },")
+    w("    /* Pj */ {")
+    for N in range(N_MAX + 1):
+        w(f"      {row(pad4(f64[N]['Pj']) if N in f64 else pad4([]), dbl)},  // N = {N}")
+    w("    },")
+    w(f"    /* Pinv */ {row([f64[N]['Pinv'] if N in f64 else 0.0 for N in range(N_MAX + 1)], dbl)},")
     w("};")
     w("")
     w("}  // namespace imd::constants")

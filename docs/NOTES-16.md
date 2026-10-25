@@ -66,4 +66,27 @@ pack/CRT time GEMMul8 achieves, an existence proof for the 0.67 factor). The syn
 ## Not covered
 
 The decision says whether to build the wgmma K4 for the INT8 product; it does not say how the K4 epilogue (the mod-p reduction) should look (issue 17). Stock kernels write plain int8/int32 output.
-Pack/CRT speed-ups are issue 21. The rule is tested on synthetic inputs and on the issue-11 numbers; it has not yet seen real Hopper stock-kernel rates.
+Pack/CRT speed-ups are issue 21.
+
+## Outcome (R1, R1b, R1c on 2026-10-19)
+
+The rule has now seen real Hopper stock-kernel rates. Data: `immerdink-eval/findings/r1-20261019.md`, run folders 20261019-132130 (R1), -181535 (R1b), -223127 (R1c).
+
+* **Pre-registered decision (R1b rule): INCONCLUSIVE on H100 and H200, not GO.** In R1b the whole-call anchor at sq8192 was outside [0.95, 1.08] (1.149 H100, 1.111 H200: inside the GEMMul8 duel the immerdink call is 11 to 14% slower than alone;
+  probably the interleaved GEMMul8 kernels change the clocks, but the clock evidence was not examined, and 40 of 85 xduel records carry the `contaminated` flag, including the sq4096 ones the rule used), so the formal verdict is INCONCLUSIVE for that reason only.
+  With the anchor guard waived the rule still does not say GO: at sq4096 on H100 the gain A is 1.13 (needs 1.3) and the projected time ratio B is 1.32 (needs 1.05); the optimistic case O holds (0.91), so the O test does not trigger NO-GO. H200: A = 1.23, B = 1.36.
+  At sq8192 the gain is 1.10 (H100) and 1.17 (H200); with the guard waived the H200 confirm test (gain >= 1.2 at sq8192) would FAIL, and the noise haircut u there is 0.20 (H100) and 0.23 (H200), so B is out of reach at sq8192 either way.
+* **R1c (single GEMMs) is a second pre-registered rule with its own verdicts:** H100 4096³ NO-GO (best stock rate 1028 TOPS < 1150); H100 8192³ (1243), H200 4096³ (1193) and H200 8192³ (1280) INCONCLUSIVE (between the NO-GO and GO thresholds 1150 and 1290).
+  "Inconclusive, not GO" overall is the analyst's combination of the two rules. For this combination the R1b table prescribes repeating the ceiling block in R2; see "What this means".
+  Batching does not explain the gap to cuBLASLt: the best stock rate per batch size at 4096³ on H100 is 1028 (batch 1) to 1086 (batch 14), +5.6%, inside the 4 to 6% run spreads, and at 8192³ the batch is slower (1243 to 1093); on H200 at 4096³ it is unchanged (1193).
+  cuBLASLt reaches 1313 to 1544 on the same shapes, 14 to 28% above the best stock configuration (int32 output; our K4 writes int8).
+* **What this means.** Per cell, with the better of single and batched stock rates, a wgmma K4 built from stock CUTLASS configurations gains 1.12 (H100 4096³), 1.25 (H100 8192³), 1.24 (H200 4096³) and 1.33 (H200 8192³) in the K4 phase (62% of the phase sum of an H100 call at 4096³),
+  i.e. about 6 to 19% of the call (the 19% pairs the H200 ratio with the H100 K4 share), for a kernel that must also carry the modular epilogue (issue 17 showed it can be made exact). Reaching the 1.36 to 1.61 times that cuBLASLt achieves needs more than the stock configurations.
+  This is the analyst's recommendation, not a rule output: the rule prescribes repeating the ceiling block in R2, and R2 should do that with the changes below. Issue 22 as designed (stock CUTLASS wgmma mainloop + epilogue) is not supported by the numbers as they stand.
+  The pack/CRT instruction count (issue 21) is the largest remaining share of an H100 call (38% at 4096³); that it is instruction-issue bound is an inference (no Hopper counters), and the saving is not yet measured (PR 44 estimates about 5% of the call).
+* **Why the stock kernels may be the wrong yardstick (offline SASS study, 2026-10-25).** cuBLASLt 13.8 ships 132 sm_90 INT8 kernels (TN only, tiles 64/128/256 x 64/128/256 x K64/K128, cooperative 128x256 and 256x128, ping-pong 128x128, cluster multicast chosen at launch,
+  persistent with an atomic tile counter and a scheduler warp, stream-K variants, **TMA-store epilogue through shared memory**, wgmma commits every 2 k-steps). The stock CUTLASS kernels in `bench/ceiling` have the same tiles, stage counts and register split (40/232),
+  but use `EpilogueScheduleAuto`, which resolved to the direct-store epilogue (256 scalar `STG` per thread, no TMA store). The epilogue and the tile scheduler are therefore the first suspects for the gap; this is untested. Careful: a build WITHOUT `-DNDEBUG` serializes the wgmma (ptxas C7510: the `assert(k_tile_count >= 1)`
+  call; one K4 variant compiled both ways: 8 `WARPGROUP.DEPBAR` for 8 `IGMMA` without it, 2 with it). The PACE builds use CMake Release (`-O3 -DNDEBUG`) and so should not be affected, but the SASS of the cluster `imd_ceiling` was never inspected; `tools/check_hopper_variants.sh` and the earlier local SASS counts did lack `-DNDEBUG`
+  (the script is fixed). R2 should log `cuobjdump -sass imd_ceiling | grep -c WARPGROUP.DEPBAR` against the `IGMMA` count.
+* The synthetic `mma.sync` peak is 1275 TOPS on H100 and H200, so our K4 (959 to 992) is at 75 to 78% of what `mma.sync` can do; on the RTX PRO 6000 it is 843 to 894 against a synthetic 887 (so that peak is not a ceiling) and neither cuBLASLt nor stock sm80 CUTLASS is faster (no sm120-native kernel was tried).

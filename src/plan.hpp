@@ -131,12 +131,24 @@ int64_t& k5_one_elem_per_sm();
 // A5: K5's elements per thread forced to 1, 2 or 4 (0: the launch rule), read by
 // imd_contract; changed only by the hooks imd_test_set_k5_elems / imd_prof_set_k5_elems.
 int& k5_elems_override();
+std::atomic<int>& k5_crt_override();   // issue 21: 0 integer CRT, 1 binary64-limb CRT (process-wide: all devices, streams and plans; a graph captures it at capture time)
 // v1.13 §4b (hygiene; contract.cu, test hook imd_test_set_pad_mutation): -1 (production) or
 // the post-swap operand x (0 = the GEMM's A, 1 = its B) whose K2 / K3 pack stores only k-bar
 // < ceil(k)_16 (Pipeline neg_a64_pad_old_k3: [ceil(k)_16, k_hat) left unwritten on one side
 // only, which the bit-exact check cannot see; initcheck must). Read by imd_contract with a
 // relaxed load (an atomic so a hook call racing a contract on another thread is not a data race).
 std::atomic<int>& pad_mutation();
+
+#ifdef IMD_BUILD_TEST_HOOKS
+// Test builds only (contract.cu; hooks imd_test_crt_elem, imd_test_k5_launch_counts). test_crt_elem: the CRT word x in [0, P) (kTestCrtWords = 5 u32 per vector,
+// little-endian limbs, zero above L32(N)) of `count` residue vectors W[l * count + i] (device bytes) for N moduli, before crt_finish / round_scaled, with
+// variant 0 the integer running CRT, 1 the shipped binary64-limb CRT, 2..9 its mutations 1..8 (contract.cu crt_f64_elem); the residue sits in byte e of
+// its plane's word. Launches on the default stream and returns the launch error. test_note_k5_launch counts launch_k5's kernel choices
+// ([limb CRT?][variant]); test_k5_launch_counts copies them (and optionally zeroes them).
+cudaError_t test_crt_elem(int N, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out);
+void test_note_k5_launch(bool limb_crt, int variant);
+void test_k5_launch_counts(bool reset, int64_t* out);
+#endif
 
 // The execution data of a plan (api.cpp), for the test hooks; nullptr for a null plan.
 const ExecPlan* exec_of(imd_plan_t plan);
