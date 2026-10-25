@@ -41,23 +41,32 @@ def main():
     cases.append((case("alpha_beta", {"extent": [33, 70], "label": [1, 3]}, {"extent": [29, 70], "label": [2, 3]},
                        {"extent": [33, 29], "label": [1, 2]}, 12, "u", alpha=0.75, beta=-0.5), None))
     bad, n = [], 0
+    # (crt variant, instruction-sequence set): the integer CRT with the baseline finish is the reference; the limb CRT, F1 (the CRT finish
+    # through I2F.F64.U64, issue 21 sequence bit 4) and both together must give the same bits.
+    combos = [(1, 0), (0, 4), (1, 4), (0, 7)]
     try:
         for c, committed_hash in cases:
             lib.set_k5_crt(0)
+            lib.set_seq(0)
             h0 = T.hash_c(T.run_gpu(lib, cuda, c))
-            lib.set_k5_crt(1)
-            h1 = T.hash_c(T.run_gpu(lib, cuda, c))
             n += 1
-            if h0 != h1 or (committed_hash is not None and h1 != committed_hash):
-                bad.append(f"{c['name']}: integer CRT {h0}, limb CRT {h1}, committed {committed_hash}")
+            if committed_hash is not None and h0 != committed_hash:
+                bad.append(f"{c['name']}: reference {h0}, committed {committed_hash}")
+            for crt, seq in combos:
+                lib.set_k5_crt(crt)
+                lib.set_seq(seq)
+                h1 = T.hash_c(T.run_gpu(lib, cuda, c))
+                if h0 != h1:
+                    bad.append(f"{c['name']}: integer CRT {h0}, crt={crt} seq={seq}: {h1}")
     finally:
         lib.set_k5_crt(0)
+        lib.set_seq(-1)
     if bad:
         print("FAIL")
         for b in bad:
             print("  " + b)
         return 1
-    print(f"PASS  {n} cases: the binary64-limb CRT is bit-identical to the integer CRT (N = 2..20, both input families, RN and TRUNC, batched, alpha and beta)")
+    print(f"PASS  {n} cases: the binary64-limb CRT and the F1 finish, alone and together, are bit-identical to the integer CRT with the baseline finish (N = 2..20, both input families, RN and TRUNC, batched, alpha and beta)")
     return 0
 
 

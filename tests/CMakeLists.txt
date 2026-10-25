@@ -185,6 +185,11 @@ add_executable(test_pack_emitter test_pack_emitter.cu)
 target_include_directories(test_pack_emitter PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(test_pack_emitter PRIVATE imd_constants imd_warnings)
 add_test(NAME pack_emitter COMMAND test_pack_emitter)
+# Issue 21: sequence F1 (the CRT finish through a hardware u64 -> f64 conversion) against crt_finish + round_scaled, every N, with mutations.
+add_executable(test_finish_f1 test_finish_f1.cu)
+target_include_directories(test_finish_f1 PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(test_finish_f1 PRIVATE imd_constants imd_warnings)
+add_test(NAME finish_f1 COMMAND test_finish_f1)
 
 # CUTLASS de-risking for M1: int8 batched TN GEMM, and the mod-p -> u8 EVT epilogue.
 add_executable(test_cutlass_int8_gemm test_cutlass_int8_gemm.cu)
@@ -420,5 +425,5 @@ if(Python3_FOUND)
 endif()
 
 # GPU tests share one device; run them one at a time.
-set_tests_properties(device_constants pack_emitter cutlass_int8_gemm cutlass_mod_epilogue
+set_tests_properties(device_constants pack_emitter finish_f1 cutlass_int8_gemm cutlass_mod_epilogue
                      PROPERTIES RESOURCE_LOCK gpu)

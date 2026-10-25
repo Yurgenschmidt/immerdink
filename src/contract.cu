@@ -561,7 +561,7 @@ __device__ __forceinline__ void crt_planes_n(uint32_t (&x)[E][L], const uint32_t
 // or 4. j0 is a multiple of E, so each plane's E bytes are one aligned load (n_hat is a
 // multiple of 16). Elements with j >= n are not computed (D[e] unspecified). Every index into
 // x / D / wv is static after unrolling (no local memory).
-template <int N, int E, bool F64 = false>
+template <int N, int E, bool F64 = false, bool F1 = false>
 __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_t i, int64_t j0,
                                            double (&D)[E]) {
   static_assert(E == 1 || E == 2 || E == 4, "K5 takes 1, 2 or 4 consecutive j-bar per thread");
@@ -595,10 +595,7 @@ __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_
       if (fa || a.fB[lam * a.n + j] != 0) {
         D[e] = native_dot(a, lam, i, j);
       } else {
-        uint32_t mag[L];
-        bool neg;
-        crt_finish<L>(x[e], N, mag, &neg);
-        D[e] = round_scaled<L>(mag, neg, -(sa + int{a.sB[lam * a.n + j]}));
+        D[e] = crt_round<L, N, F1>(x[e], -(sa + int{a.sB[lam * a.n + j]}));  // crt_finish + round_scaled, or F1
       }
     }
   }
@@ -614,7 +611,7 @@ __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_
 // E = 2: each thread stores its own two elements. Shared slot of result s (= 4 item + e of the warp's 32 items): s + s / 16, which makes
 // both the writes (stride 4 per lane) and the reads (stride 1) bank-conflict free.
 constexpr int kK5WarpSlots = 128 + 8;
-template <int N, int E, bool F64 = false>
+template <int N, int E, bool F64 = false, bool F1 = false>
 __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
   __shared__ double sD[E == 4 ? (kThreads / 32) * kK5WarpSlots : 1];
   const int64_t ng = (a.n + E - 1) / E, total = a.b * a.m * ng;
@@ -632,7 +629,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
       int64_t t, i, lam;
       divmod(idx, ng, &t, &jg);
       divmod(t, a.m, &lam, &i);
-      k5_elems_n<N, E, F64>(a, lam, i, E * jg, D);
+      k5_elems_n<N, E, F64, F1>(a, lam, i, E * jg, D);
       cbase = a.c_bat[lam] + a.c_row[i];
     }
     if constexpr (E != 4) {
@@ -665,7 +662,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
 // tile of TL lambda x TJ j-bar of one row i (TL * TJ = 1024). It computes with j-bar
 // fastest (coalesced W reads), stages D in shared memory and writes C with lambda fastest
 // (coalesced C writes). TL = 2^lg_tl in [2, 32].
-template <int N, bool F64 = false>
+template <int N, bool F64 = false, bool F1 = false>
 __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
   constexpr int kTile = 1024;
   __shared__ double sD[kTile + 32];
@@ -681,7 +678,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
       const int64_t lam = lam0 + ll, j0 = j00 + 4 * jq;
       if (lam < a.b && j0 < a.n) {
         double D[4] = {0, 0, 0, 0};
-        k5_elems_n<N, 4, F64>(a, lam, i, j0, D);
+        k5_elems_n<N, 4, F64, F1>(a, lam, i, j0, D);
 #pragma unroll
         for (int e = 0; e < 4; ++e) sD[ll * pitch + 4 * jq + e] = D[e];
       }
@@ -727,30 +724,32 @@ __global__ void __launch_bounds__(kThreads) k5_beta_only(OutArgs a) {
 
 // v1.10: the variant and grid are host/analysis.hpp k5_launch (shared with the performance
 // model), with this library's test hooks.
+template <int N, bool F64, bool F1>
+void launch_k5_v(const K5Launch& L, const OutArgs& out, cudaStream_t stream) {
+  const unsigned grid = static_cast<unsigned>(L.grid);
+  if (L.variant == 3)
+    k5_crt_bfast<N, F64, F1><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
+  else if (L.elems == 1)
+    k5_crt_n<N, 1, F64, F1><<<grid, kThreads, 0, stream>>>(out);
+  else if (L.elems == 2)
+    k5_crt_n<N, 2, F64, F1><<<grid, kThreads, 0, stream>>>(out);
+  else
+    k5_crt_n<N, 4, F64, F1><<<grid, kThreads, 0, stream>>>(out);
+}
+
 template <int N>
 void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
   const K5Launch L = k5_launch(p.k5_batch_fast, p.b, p.m, p.n, p.sms, k5_one_elem_per_sm(),
                                k5_elems_override());
-  const unsigned grid = static_cast<unsigned>(L.grid);
-  if (k5_crt_override() == 1) {  // issue 21: the sums in binary64 limbs (test and benchmark hooks only)
-    if (L.variant == 3)
-      k5_crt_bfast<N, true><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
-    else if (L.elems == 1)
-      k5_crt_n<N, 1, true><<<grid, kThreads, 0, stream>>>(out);
-    else if (L.elems == 2)
-      k5_crt_n<N, 2, true><<<grid, kThreads, 0, stream>>>(out);
-    else
-      k5_crt_n<N, 4, true><<<grid, kThreads, 0, stream>>>(out);
-    return;
+  // issue 21: the sums in binary64 limbs (test and benchmark hooks only), and the F1 finish (host/seq_config.hpp)
+  const bool f64 = k5_crt_override() == 1, f1 = (seq_bits(p) & kSeqFinish) != 0;
+  if (f64) {
+    if (f1) launch_k5_v<N, true, true>(L, out, stream);
+    else launch_k5_v<N, true, false>(L, out, stream);
+  } else {
+    if (f1) launch_k5_v<N, false, true>(L, out, stream);
+    else launch_k5_v<N, false, false>(L, out, stream);
   }
-  if (L.variant == 3)
-    k5_crt_bfast<N><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
-  else if (L.elems == 1)
-    k5_crt_n<N, 1><<<grid, kThreads, 0, stream>>>(out);
-  else if (L.elems == 2)
-    k5_crt_n<N, 2><<<grid, kThreads, 0, stream>>>(out);
-  else
-    k5_crt_n<N, 4><<<grid, kThreads, 0, stream>>>(out);
 }
 
 // K5 for the plan's N: the run-time N picks its kernel (false: N outside [kNMin, kNMax]).

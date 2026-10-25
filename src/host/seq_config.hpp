@@ -28,7 +28,7 @@ struct SeqClass {
 };
 constexpr SeqClass kSeqClasses[] = {
     {8, 9, kSeqEmit},                 // RTX 4090: E1 (integer only; fewer instructions in every pack kernel). Not Q1 / F1: FP64 at 1/64 of the integer rate there, whatever the instruction count
-    {9, 0, kSeqEmit | kSeqQuant},     // H100, H200: E1 and Q1 (fewer instructions in every pack kernel; FP64 pipe as wide as the integer pipe; not timed on Hopper yet)
+    {9, 0, kSeqAll},                  // H100, H200: E1, Q1 and F1 (fewer instructions in every pack kernel and in K5; FP64 pipe as wide as the integer pipe; not timed on Hopper yet)
 };
 
 constexpr int seq_default_for(int32_t cc_major, int32_t cc_minor) {

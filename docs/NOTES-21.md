@@ -184,7 +184,7 @@ Whole-kernel static counts (the loop is a small part of them, so these move litt
 | class | E1 | Q1 | F1 | reason |
 |---|---|---|---|---|
 | sm_89 (RTX 4090) | on | off | off | E1: fewer instructions everywhere, integer only. Q1, F1: FP64 at 1/64 rate. |
-| sm_90 (H100, H200) | on | on | (F1 follows in the next commit) | fewer instructions in every pack kernel; FP64 pipe as wide as the integer pipe. **Not timed on Hopper**: the XU throughput of `F2I.U64` / `I2F.F64.U64` is unverified, R2 duels `seq=0` against `seq=default` decide whether it stays. |
+| sm_90 (H100, H200) | on | on | on | fewer instructions in every pack kernel; FP64 pipe as wide as the integer pipe. **Not timed on Hopper**: the XU throughput of `F2I.U64` / `I2F.F64.U64` is unverified, R2 duels `seq=0` against `seq=default` decide whether it stays. |
 | sm_120, anything else | off | off | off | counted (table above): E1's loop is shorter per iteration but two kernels grow because of unrolling and nothing was timed; a class without its own row in the K4 registry stays on the baseline. |
 
 ### Tests
@@ -192,3 +192,25 @@ Whole-kernel static counts (the loop is a small part of them, so these move litt
 * `pack_emitter` (GPU unit test, `tests/test_pack_emitter.cu`): every N = 2..20, E = 16, 8, 4, RN and TRUNC, now through the baseline, the E1 and (W = 2) the E1 + Q1 instances, against an exact host reference (148 M residues), with a new input mode that covers the whole certified sigma range (`kSigmaMin`..`kSigmaMax`: Q1's two factors, subnormals, the largest double); **every reduced value** `d` in `[0, dmax]` for both signs, all 20 moduli and both word counts through `pack_smod` on the real `__constant__` table (11,442,942 values); eight **mutations** of that table (`hm - m32`, `m32 - 1`, `C - p`, `negp + 1`, a weight lane, `C + 1`, `hm + m32` at p = 256, a W = 2 weight lane), each of which must be caught.
 * `contract_{e2e,tensor,every_n,eps,bigk}_seq{1,7}`, `output_hashes_seq{1,7}`, `output_hashes_large_seq7`: the existing oracle / committed-hash suites run with the other sequences forced for every plan (`IMD_TEST_SEQ`). The committed hashes are unchanged.
 * The Python models (`nice -n 19 python3 -I`): `emit_model.py` (11.4 M + 0.97 M cases), `quantize_model.py` (787 k), `finish_model.py` (457 k): pass.
+
+### F1 (the CRT finish through `I2F.F64.U64`)
+
+`kernels/numerics.cuh` `finish_f1_try<L, N>` / `crt_round<L, N, F1>` replace `crt_finish` + `round_scaled` in `k5_elems_n` for both CRTs (the integer one and the binary64-limb one, `k5_crt_override()`): both leave `x` in `[0, P)` as `L` limbs. The model's sequence, with the two borrow chains as PTX `sub.cc` / `subc` carry chains (one `IADD3` per limb; the C++ 64-bit borrow compiled to three instructions per limb), 4 / 2 / 1-limb normalisation stages, `clz`, funnel shifts, a sticky bit, `I2F.F64.U64`, and an add of `kk` to the exponent field of the high word. Mag = 0, subnormal results, overflow and an exponent outside `1 <= 1086 + kk <= 2045` fall back to the existing path (`fast` fraction in the unit test: 78% of an adversarial set, 100% of typical exponents; the model's 457 k cases agree).
+
+* **Test** `finish_f1` (`tests/test_finish_f1.cu`): for every N = 2..20, 34,170 cases (649,230 in all) of x around 0, H, P - 1, all-ones, powers of two, exact ties and neighbours, random of every bit length, and exponents that put the leading bit at the subnormal and overflow edges, through the device `finish_f1_try` against `crt_finish` + `round_scaled` on the same limbs: 0 mismatches, fast and fallback both exercised for every N. Five **mutations** (`Mut` template value: sticky bit dropped, exponent +1, upper bound 2047, sign dropped, lower bound admitting field 0): all caught. `crt_f64_gpu` now also runs the limb CRT, F1, and both together (and F1 with all other sequences) against the integer CRT with the baseline finish, N = 2..20 in both families: identical to each other and to the committed hashes.
+* **Counts.** Static counts of K5 *grow* with F1 (the fast path and the fallback are both in the kernel: `k5_crt_n<14,4,false>` 3821 -> 4030 on sm_90, 3728 -> 3943 on sm_89), so only executed counts say anything. sm_89, `ncu`, 4096^3 N = 14: `k5_crt_n<14,4>` 651.2 thread-instructions per output element with the baseline finish, 554.5 with F1 (-96.7; the study predicted 650 -> ~495, -155). The shortfall is the estimate of the old finish: the typical `round_scaled` path executes about 150 instructions, not 200. The fast path alone is about 50 instructions (`k_f1` probe: 75 / 69 / 79 static including a 25-instruction harness on sm_90 / sm_89 / sm_120; the reference `crt_finish + round_scaled` probe is 264 / 253 / 210 static with both branch sides). H100 prediction at the same issue utilisation: 97 of 651 thread-instructions per element is 15% of K5 (0.07 ms of 0.46 ms), about 2% of the call; derived, not measured.
+
+### Predicted against achieved (executed thread-instructions per element, sm_89 `ncu`)
+
+| step | study prediction | achieved |
+|---|---|---|
+| E1 (KL) | -72 | -61.5 (417.8 -> 356.3); loop 98 -> 63 per 8 elements (predicted 96 -> ~55) |
+| Q1 (KL) | -45 | -44.9 (356.3 -> 311.4) |
+| F1 (K5) | -155 (650 -> ~495) | -96.7 (651.2 -> 554.5) |
+
+### Discrepancies and remaining risk
+
+* The study names `IMAD.WIDE.U32` for the 64-bit addend; the compiler emits `IMAD.HI.U32` with a register pair (same count).
+* The E1 loop keeps ~10 instructions of 64-bit pointer arithmetic per iteration (`dst += plane` is rematerialised from three kernel arguments because KL is at 64 registers); a precomputed `plane` in `LargeArgs` would remove about 8 of 63 (a quick win, not done).
+* Hopper is not measured: Q1 and F1 are defaults for sm_90 on instruction counts and the FP64 rate argument only. `imd_pack` (a pack handle has no device class) and the performance model's occupancy rows use the baseline sequences.
+* Not done (as asked): L1, P1, K1, E2.

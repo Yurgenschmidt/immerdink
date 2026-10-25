@@ -401,5 +401,92 @@ __device__ __forceinline__ void crt_finish(const uint32_t (&x)[L], int N, uint32
 // Hardware-specific part (not the math): I2F.F64.U64 is a native instruction on sm_89, sm_90 and sm_120 (checked with nvcc 13.4)
 // but runs at 1/64 of the integer rate on GeForce-class FP64 pipes; the default sets (host/seq_config.hpp) use F1 only
 // where that is not so. Mut != 0 plants a deliberate bug (tests/test_finish_f1.cu proves the test catches each).
+// d = a - x on L limbs by one PTX carry chain (sub.cc / subc: one IADD3 per limb); returns the final borrow as 0 or 0xFFFFFFFF.
+template <int L>
+__device__ __forceinline__ uint32_t sub_limbs(uint32_t (&d)[L], const uint32_t (&a)[L], const uint32_t (&x)[L]);
+template <>
+__device__ __forceinline__ uint32_t sub_limbs<2>(uint32_t (&d)[2], const uint32_t (&a)[2], const uint32_t (&x)[2]) {
+  uint32_t bw;
+  asm("sub.cc.u32 %0, %3, %5;\n\tsubc.cc.u32 %1, %4, %6;\n\tsubc.u32 %2, 0, 0;" : "=r"(d[0]), "=r"(d[1]), "=r"(bw) : "r"(a[0]), "r"(a[1]), "r"(x[0]), "r"(x[1]));
+  return bw;  // 0 or 0xFFFFFFFF
+}
+template <>
+__device__ __forceinline__ uint32_t sub_limbs<3>(uint32_t (&d)[3], const uint32_t (&a)[3], const uint32_t (&x)[3]) {
+  uint32_t bw;
+  asm("sub.cc.u32 %0, %4, %7;\n\tsubc.cc.u32 %1, %5, %8;\n\tsubc.cc.u32 %2, %6, %9;\n\tsubc.u32 %3, 0, 0;" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(bw) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(x[0]), "r"(x[1]), "r"(x[2]));
+  return bw;  // 0 or 0xFFFFFFFF
+}
+template <>
+__device__ __forceinline__ uint32_t sub_limbs<4>(uint32_t (&d)[4], const uint32_t (&a)[4], const uint32_t (&x)[4]) {
+  uint32_t bw;
+  asm("sub.cc.u32 %0, %5, %9;\n\tsubc.cc.u32 %1, %6, %10;\n\tsubc.cc.u32 %2, %7, %11;\n\tsubc.cc.u32 %3, %8, %12;\n\tsubc.u32 %4, 0, 0;" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]), "=r"(bw) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(x[0]), "r"(x[1]), "r"(x[2]), "r"(x[3]));
+  return bw;  // 0 or 0xFFFFFFFF
+}
+template <>
+__device__ __forceinline__ uint32_t sub_limbs<5>(uint32_t (&d)[5], const uint32_t (&a)[5], const uint32_t (&x)[5]) {
+  uint32_t bw;
+  asm("sub.cc.u32 %0, %6, %11;\n\tsubc.cc.u32 %1, %7, %12;\n\tsubc.cc.u32 %2, %8, %13;\n\tsubc.cc.u32 %3, %9, %14;\n\tsubc.cc.u32 %4, %10, %15;\n\tsubc.u32 %5, 0, 0;" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]), "=r"(d[4]), "=r"(bw) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(x[0]), "r"(x[1]), "r"(x[2]), "r"(x[3]), "r"(x[4]));
+  return bw;  // 0 or 0xFFFFFFFF
+}
+
+template <int L, int N, int Mut = 0>
+__device__ __forceinline__ bool finish_f1_try(const uint32_t (&x)[L], int e, double* out) {
+  using imd::device::c_tables;
+  constexpr int Lp = L < 2 ? 2 : L;
+  uint32_t xv[Lp], mag[Lp];
+#pragma unroll
+  for (int w = 0; w < Lp; ++w) xv[w] = w < L ? x[w] : 0u;
+  uint32_t hl[Lp], pl[Lp], dh[Lp], pm[Lp];
+#pragma unroll
+  for (int w = 0; w < Lp; ++w) hl[w] = c_tables.H[N][w], pl[w] = c_tables.P[N][w];
+  const bool neg = sub_limbs<Lp>(dh, hl, xv) != 0;  // x > H: the borrow of H - x
+  sub_limbs<Lp>(pm, pl, xv);                        // P - x (used when neg)
+#pragma unroll
+  for (int w = 0; w < Lp; ++w) mag[w] = neg ? pm[w] : xv[w];
+  int shifted = 0;
+#pragma unroll
+  for (int step = 4; step >= 1; step /= 2) {
+    if (step < Lp) {
+      bool z = true;
+#pragma unroll
+      for (int w = Lp - step; w < Lp; ++w) z = z && mag[w] == 0;
+      uint32_t up[Lp];
+#pragma unroll
+      for (int w = 0; w < Lp; ++w) up[w] = w >= step ? mag[w - step] : 0u;
+#pragma unroll
+      for (int w = 0; w < Lp; ++w) mag[w] = z ? up[w] : mag[w];
+      shifted += z ? step : 0;
+    }
+  }
+  if (mag[Lp - 1] == 0) return false;  // mag = 0
+  const int b = __clz(static_cast<int>(mag[Lp - 1]));
+  uint32_t y[Lp];
+#pragma unroll
+  for (int j = 0; j < Lp; ++j) y[j] = __funnelshift_l(j > 0 ? mag[j - 1] : 0u, mag[j], b);
+  uint32_t st = 0;
+#pragma unroll
+  for (int j = 0; j < Lp - 2; ++j) st |= y[j];
+  const uint64_t t = (uint64_t{y[Lp - 1]} << 32 | y[Lp - 2]) | (Mut == 1 ? 0u : (st != 0 ? 1u : 0u));
+  const double dm = __ull2double_rn(t);
+  const int kk = 32 * Lp - 64 - (32 * shifted + b) + e + (Mut == 2 ? 1 : 0);
+  if (static_cast<uint32_t>((Mut == 5 ? 1086 : 1085) + kk) >= (Mut == 3 ? 2047u : 2045u)) return false;
+  const uint32_t hi = static_cast<uint32_t>(__double2hiint(dm)) + (static_cast<uint32_t>(kk) << 20) |
+                      (Mut == 4 ? 0u : (neg ? 0x80000000u : 0u));
+  *out = __hiloint2double(static_cast<int>(hi), __double2loint(dm));
+  return true;
+}
+
+// The finish of one K5 element: F1 where it applies, else (and when F1 is off) the existing crt_finish + round_scaled.
+template <int L, int N, bool F1>
+__device__ __forceinline__ double crt_round(const uint32_t (&x)[L], int e) {
+  if constexpr (F1) {
+    double d;
+    if (finish_f1_try<L, N>(x, e, &d)) return d;
+  }
+  uint32_t mag[L];
+  bool neg;
+  crt_finish<L>(x, N, mag, &neg);
+  return round_scaled<L>(mag, neg, e);
+}
 
 }  // namespace imd::kernels
