@@ -23,7 +23,7 @@ filter="${1:-}"
 
 one() {  # index name
   local i="$1" name="$2" o="$out/$2"
-  nvcc -std=c++17 -arch=sm_90a -c -DK4H_SELECT="$i" --expt-relaxed-constexpr -Xptxas -v \
+  nvcc -std=c++17 -arch=sm_90a -c -DNDEBUG -DK4H_SELECT="$i" --expt-relaxed-constexpr -Xptxas -v \
        -I "$root/src" -I "$cutlass/include" -I "$cutlass/tools/util/include" -I "${IMD_GENERATED_INCLUDE:-$root/build/generated/include}" -I "$root/include" \
        -o "$o.o" "$root/src/k4/hopper/k4_hopper_proto.cu" > "$o.log" 2>&1 || { echo "FAIL $name: compile error (see $o.log)"; return; }
   local regs spills igmma tma

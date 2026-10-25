@@ -1352,8 +1352,8 @@ int& k5_elems_override() {
   return v;
 }
 
-int& k5_crt_override() {
-  static int v = 0;  // 0: the integer running CRT (default), 1: the sums in binary64 limbs (issue 21); only the hooks change it
+std::atomic<int>& k5_crt_override() {
+  static std::atomic<int> v{0};  // 0: the integer running CRT (default), 1: the sums in binary64 limbs (issue 21); only the hooks change it, relaxed is enough
   return v;
 }
 

@@ -44,16 +44,25 @@ def main():
         total += 1
     print(f"ok  {total} residue vectors over N = {o.N_MIN}..{o.N_MAX}: crt_f64 equals oracle.crt")
 
-    # limb width: the largest feasible one is chosen, a larger one is refused
+    # limb width: the shipped one (params.F64_LIMB_BITS) is the default, a width beyond the exact limit is refused, the widest feasible width also reproduces the oracle
     for N in (2, 14, 20):
         c = C.F64Crt(N)
+        assert c.w == C.params.F64_LIMB_BITS and c.w <= c.wmax
         try:
-            C.F64Crt(N, w=c.w + 1)
+            C.F64Crt(N, w=c.wmax + 1)
         except AssertionError:
             pass
         else:
-            raise AssertionError(f"w = {c.w + 1} accepted for N = {N}")
-    print("ok  an inexact limb width is refused")
+            raise AssertionError(f"w = {c.wmax + 1} accepted for N = {N}")
+        cw = C.F64Crt(N, w=c.wmax)
+        for z in (0, 1, c.P - 1, c.P // 2, c.plan.H, c.plan.H + 1, rng.randrange(c.P), rng.randrange(c.P)):
+            assert cw.crt(residues(z, c.plan.p)) == z, (N, z)
+    # the tables the device uses are the ones the model uses
+    for N in range(o.N_MIN, o.N_MAX + 1):
+        f = C.params.f64_crt_constants(N)
+        c = C.F64Crt(N)
+        assert f["J"] == c.J and f["k"] == c.k and f["Pj"] == c.Pj and f["Pinv"] == c.Pinv, N
+    print("ok  the shipped limb width is tested; an inexact width is refused; the generated tables equal the model's")
 
     # the bias: without it the quotient estimate overshoots somewhere (z0 small, S / P just above an integer)
     saved = C.EPS_T

@@ -1432,8 +1432,10 @@ def cert_crt_f64():
             smax = sum(F64_W_MAX * f["k"][l][j] for l in range(N))
             need(smax < 2**53, f"N={N} limb {j} sum")
             need((tmax + 1) * f["Pj"][j] < 2**53, f"N={N} t P_{j}")
+            need(smax + f["Pj"][j] < 2**53, f"N={N} limb {j}: t = -1 (s_j + P_j) stays exact")
         need(tmax * (J + 1) * 2.0**-52 < 2.0**-37, f"N={N} quotient estimate")
         need(c["P"] + (c["P"] >> 29) + 1 < 2**(F64_LIMB_BITS * J), f"N={N} R < P (1 + 2^-29) fits the {J} limbs (no carry out of the top one)")
+        need(c["P"] + (c["P"] >> 29) + 1 < 2**(LIMB * c["L32"]), f"N={N} R < P (1 + 2^-29) fits the {c['L32']} words of the CRT accumulator")
         for l, (Kl, Ml, ql, pl) in enumerate(zip(f["K"], c["M"], c["q"], c["moduli"])):
             need(0 < Kl < c["P"] and sum(f["k"][l][j] << (F64_LIMB_BITS * j) for j in range(J)) == Kl, f"N={N} l={l} K")
             for W in (1, pl - 1):

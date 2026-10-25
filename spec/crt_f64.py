@@ -30,6 +30,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fma_compat  # noqa: E402,F401  (math.fma before Python 3.13)
 import oracle as o  # noqa: E402
+import params  # noqa: E402
 
 MAX_W = 255          # the residues W_l are u8 planes, W_l < p_l <= 256
 TWO53 = 1 << 53
@@ -47,7 +48,8 @@ class F64Crt:
         wmax = 1
         while N * MAX_W * ((1 << (wmax + 1)) - 1) < TWO53 and wmax < 52:
             wmax += 1
-        self.w = wmax if w is None else w
+        self.wmax = wmax
+        self.w = params.F64_LIMB_BITS if w is None else w      # the width the device and the generated tables use
         assert N * MAX_W * ((1 << self.w) - 1) < TWO53, "limb sums would not be exact"
         self.J = -(-bits // self.w)
         self.B = 1 << self.w
@@ -55,7 +57,7 @@ class F64Crt:
         assert all(0 < k < pl.P for k in self.K)
         self.k = [self._limbs(k) for k in self.K]            # k[l][j]
         self.Pj = self._limbs(pl.P)
-        self.Pinv = 1.0 / pl.P                               # correctly rounded (Python int / int is correctly rounded)
+        self.Pinv = 1.0 / pl.P                               # float(P) is rounded, then the division: up to two half-ulps (the budget below counts them)
         self.Bd = [float(self.B ** j) for j in range(self.J)]   # exact powers of two
         self.tmax = N * MAX_W                                # S / P < sum_l W_l K_l / P < sum_l W_l <= N * 255
         self._check_bounds()
@@ -74,14 +76,15 @@ class F64Crt:
         for j in range(J):
             assert sum(MAX_W * self.k[l][j] for l in range(N)) < TWO53
         # S / P < tmax; the quotient estimate: S is rounded J - 1 times (relative 2^-53 each, plus the cancellation-free sum of nonnegatives),
-        # Pinv once, the product once: the computed quotient differs from S / P by less than tmax (J + 1) 2^-52 < 2^-37
+        # Pinv twice (P to binary64, then the reciprocal), the product once: the computed quotient differs from S / P by less than tmax (J + 2) 2^-53 <= tmax (J + 1) 2^-52 < 2^-37
         assert self.tmax * (J + 1) * 2.0 ** -52 < 2.0 ** -37, "quotient estimate too coarse for the bias"
         # r_j = s_j - t P_j and t P_j stay below 2^53, so every r_j is an exact integer
         for j in range(J):
             smax = sum(MAX_W * self.k[l][j] for l in range(N))
             assert smax < TWO53 and (self.tmax + 1) * self.Pj[j] < TWO53 and abs(smax - (self.tmax + 1) * self.Pj[j]) < TWO53
         # R = S - tP < P (1 + 2^-30): a single conditional subtraction reduces it
-        assert 2.0 ** -30 * self.P < self.P
+        assert self.P + (self.P >> 29) + 1 < 1 << (self.w * J), "R < P (1 + 2^-29) must fit the limbs"
+        assert self.P + (self.P >> 29) + 1 < 1 << (32 * params.limbs_for(self.P)), "R must fit the 32-bit words"
 
     def sums(self, W):
         """s_j = sum_l W_l k_lj in binary64 (each fma exact)."""
