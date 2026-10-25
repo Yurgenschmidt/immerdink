@@ -612,6 +612,9 @@ struct Options {
   // sustained's measured window and warm-up.
   bool clock_probe = false;
   int k_align_hook = 0;  // v1.13 §4b: --k-align (0 = auto) / IMD_BENCH_K_ALIGN
+  // Issue 21 (method imd): --seq <0..7|default> forces the instruction-sequence set (bits 1 E1, 2 Q1, 4 F1; -1 = the device class's),
+  // --crt <int|f64> K5's CRT variant. Set for the method's plan and calls only, then reset.
+  int seq = -1, crt = 0;
   bool l2_flush = false;
   // Campaign kit: --keep-samples 1 adds the raw per-repetition times to the timed records ("samples_s", seconds), and to
   // method duel's duel-b record both sides' times of every interleaved pair ("pair_t_a", "pair_t_b"), so the analyzer can
@@ -1933,8 +1936,16 @@ struct Bench {
     imd_plan_t plan = nullptr;
 #ifdef IMD_BENCH_PROFILE
     if (imd_prof_set_k4_config(k4 >= 0 ? k4 : -1) != 0) throw Failure("imd_prof_set_k4_config");
+    // Issue 21: the sequence set and the CRT variant of this method, before the plan is created, reset when it ends.
+    struct SeqCrtScope {
+      bool on;
+      ~SeqCrtScope() { if (on) imd_prof_set_seq(-1), imd_prof_set_k5_crt(0); }
+    } seq_scope{o.seq >= 0 || o.crt != 0};
+    if (imd_prof_set_seq(o.seq) != 0) throw Failure("imd_prof_set_seq: not a valid sequence set (1 E1, 2 Q1, 4 F1; Q1 needs E1)");
+    if (imd_prof_set_k5_crt(o.crt) != 0) throw Failure("imd_prof_set_k5_crt");
 #else
     if (k4 >= 0) throw Failure("--k4 <config> needs the profiling build");
+    if (o.seq >= 0 || o.crt != 0) throw Failure("--seq / --crt need the profiling build");
 #endif
     const auto c0 = std::chrono::steady_clock::now();
     const imd_status_t pst = imd_plan_create(imd, &A, &B, &C, &opt, &plan);
@@ -1987,6 +1998,22 @@ struct Bench {
 #endif
     extra.integer("plan_device_bytes", (long long)plan_dev).num("plan_create_ms", 1e3 * create_s);
     extra.str("c_hash", c_hash);
+    {  // Issue 21: what was asked for and what the library ran ("seq_req": -1 = the device class's set), in the record (the phases belong to it)
+      int32_t seq_run = -1;
+      int crt_run = 0;
+#ifdef IMD_BENCH_PROFILE
+      imd_prof_plan_seq(plan, &seq_run);
+      crt_run = imd_prof_get_k5_crt();
+#endif
+      extra.integer("seq_req", o.seq).integer("seq", seq_run).str("crt_req", o.crt ? "f64" : "int").str("crt", crt_run ? "f64" : "int");
+#ifdef IMD_BENCH_PROFILE
+      // Back to the defaults now (the scope guard does it again on any exit), and the plan read back under them: the class's set.
+      imd_prof_set_seq(-1), imd_prof_set_k5_crt(0);
+      int32_t seq_after = -1;
+      imd_prof_plan_seq(plan, &seq_after);
+      extra.integer("seq_after_reset", seq_after).str("crt_after_reset", imd_prof_get_k5_crt() ? "f64" : "int");
+#endif
+    }
     extra.num("pred_ms", 1e3 * pred.time_s).num("pred_err_pct", 100.0 * (pred.time_s / T.median() - 1));
     const std::string gs = (g == 0 || g >= N) ? "RN g=N" : "RN g=" + std::to_string(g);
     extra.integer("g", (long long)((g == 0 || g >= N) ? N : g));
@@ -2004,6 +2031,8 @@ struct Bench {
     if (k4 == -2) vs += " k4=tune";
     else if (k4 >= 0) vs += " k4=" + std::to_string(k4);
     if (o.l2_flush) vs += " l2=flush";
+    if (o.seq >= 0) vs += " seq=" + std::to_string(o.seq);
+    if (o.crt != 0) vs += " crt=f64";
     record("imd", vs, N, T, &acc, flops(), wsb, extra);
   }
 
@@ -2414,6 +2443,11 @@ struct Bench {
     e.str("phase_view", std::to_string(d[0]) + "x" + std::to_string(d[1]) + "x" + std::to_string(d[2]) +
                             " b=" + std::to_string(d[3]) + " n_hat=" + std::to_string(d[4]) +
                             " k_hat=" + std::to_string(d[5]));
+    {  // issue 21: the sequence set and CRT variant these phase times were measured under (the plan's, read back)
+      int32_t seq_run = -1;
+      imd_prof_plan_seq(plan, &seq_run);
+      e.integer("phase_seq", seq_run).str("phase_crt", imd_prof_get_k5_crt() ? "f64" : "int");
+    }
     return e;
   }
 #endif
@@ -2696,6 +2730,9 @@ void usage() {
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
           "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"
           "  [--k-align auto|16|64] (v1.13 §4b: force the K alignment of every plan / pack)\n"
+          "  [--seq default|0..7] [--crt int|f64] (method imd, profiling build; issue 21: the instruction-sequence set, bits 1 E1 / 2 Q1 /\n"
+          "      4 F1 with Q1 needing E1, and K5's CRT variant, for this method's plan and calls; the record gets seq_req, seq (the set the\n"
+          "      plan ran), crt_req, crt, and c_hash, which must be equal across configurations)\n"
           "  methods: imd,packed,duel,bw,occupancy,sustained,pair,energy (default imd);\n"
           "      optional baselines (built with cuTENSOR): cutensor, cutensor-emu (CUTENSOR_COMPUTE_DESC_8XINT8),\n"
           "      energy-cutensor, energy-cutensor-emu; cuBLAS: dgemm, emu (FP64 fixed-point emulation, CUDA 13\n"
@@ -2728,7 +2765,7 @@ int main(int argc, char** argv) {
                                       "sustain-warm-s", "sustain-trace-s", "k-align",
                                       "energy-warmup", "energy-seconds", "energy-max-seconds",
                                       "energy-idle", "energy-min-calls", "energy-step-ms",
-                                      "keep-samples", "xduel-b", "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
+                                      "keep-samples", "seq", "crt", "xduel-b", "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -2819,6 +2856,16 @@ int main(int argc, char** argv) {
     if (a.count("sustain-warm-s")) B.o.sustain_warm_s = std::stod(a["sustain-warm-s"]);
     if (a.count("sustain-trace-s")) B.o.sustain_trace_s = std::stod(a["sustain-trace-s"]);
     if (a.count("seed")) B.o.seed = std::stoull(a["seed"]);
+    if (a.count("seq")) {
+      const std::string& v = a["seq"];
+      if (v == "default") B.o.seq = -1;
+      else if (v.size() == 1 && v[0] >= '0' && v[0] <= '7' && !(v[0] == '2' || v[0] == '6')) B.o.seq = v[0] - '0';
+      else throw Failure("--seq default|0|1|3|4|5|7 (Q1 needs E1: 2 and 6 are not sets)");
+    }
+    if (a.count("crt")) {
+      if (a["crt"] != "int" && a["crt"] != "f64") throw Failure("--crt int|f64");
+      B.o.crt = a["crt"] == "f64";
+    }
     // v1.13 §4b: --k-align, else IMD_BENCH_K_ALIGN (tools/calibrate.sh --k-align), set
     // before any plan or pack is created.
     if (!a.count("k-align") && getenv("IMD_BENCH_K_ALIGN")) a["k-align"] = getenv("IMD_BENCH_K_ALIGN");

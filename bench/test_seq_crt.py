@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Smoke test of imd_bench's --seq / --crt (method imd; issue 21; docs/NOTES-21.md "Pack emitter and finish").
+
+    python3 bench/test_seq_crt.py --bench build/bench/imd_bench [--no-seq-twins] [--keep]
+
+Checks, on a tiny shape (the GPU is used under the caller's GPU lock; tools/test.sh holds it):
+  * the usage text names --seq and --crt;
+  * invalid values are refused before any GPU work: --seq 2, 6, 8, x and --crt foo exit non-zero;
+  * for every sequence set in {default, 0, 1, 7} x CRT variant {int, f64}: one imd record whose c_hash is the same for
+    all of them (every configuration is bit-identical), whose requested values (seq_req, crt_req) are what was passed
+    and whose effective values (seq, crt, phase_seq, phase_crt) are what the library ran (a forced set is read back as
+    itself; "default" is read back as the device class's set);
+  * the settings end with the method: the record's seq_after_reset / crt_after_reset (the plan read back after the reset) are
+    the device class's set and int.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+CASE = ["--name", "smoke", "--spec", "ik,kj->ij", "--ext", "i=24,j=16,k=40"]
+FAST = ["--N", "8", "--reps", "2", "--warmup", "1", "--phase-reps", "2", "--max-seconds", "5"]
+
+
+def run(bench, extra, out):
+    cmd = [bench] + CASE + FAST + extra + ["--out", out]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+
+def records(path):
+    with open(path) as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--bench", required=True, help="the profiling-build imd_bench")
+    ap.add_argument("--no-seq-twins", action="store_true", help="built with IMMERDINK_SEQ_TWINS=OFF: only sets 0 and 1")
+    ap.add_argument("--keep", action="store_true", help="keep the JSONL files (printed)")
+    args = ap.parse_args()
+    bad = []
+    tmp = tempfile.mkdtemp(prefix="imd_seq_crt_")
+
+    u = subprocess.run([args.bench], capture_output=True, text=True, timeout=60)
+    if u.returncode == 0 or "--seq" not in u.stderr or "--crt" not in u.stderr:
+        bad.append("the usage text does not name --seq and --crt (or exits 0)")
+
+    for flag, val in (("--seq", "2"), ("--seq", "6"), ("--seq", "8"), ("--seq", "x"), ("--seq", "-1"), ("--crt", "foo"), ("--crt", "2")):
+        r = run(args.bench, [flag, val], os.path.join(tmp, "bad.jsonl"))
+        if r.returncode == 0:
+            bad.append(f"{flag} {val} was accepted")
+
+    sets = ("default", "0", "1") if args.no_seq_twins else ("default", "0", "1", "7")
+    hashes, default_set = {}, None
+    for crt in ("int", "f64"):
+        for seq in sets:
+            out = os.path.join(tmp, f"{seq}_{crt}.jsonl")
+            r = run(args.bench, ["--seq", seq, "--crt", crt], out)
+            tag = f"seq={seq} crt={crt}"
+            if r.returncode != 0:
+                bad.append(f"{tag}: exit {r.returncode}: {r.stderr[-400:]}")
+                continue
+            recs = [x for x in records(out) if x.get("method") == "imd"]
+            if len(recs) != 1:
+                bad.append(f"{tag}: {len(recs)} imd records")
+                continue
+            x = recs[0]
+            want_req = -1 if seq == "default" else int(seq)
+            if x.get("seq_req") != want_req or x.get("crt_req") != crt:
+                bad.append(f"{tag}: requested {x.get('seq_req')}/{x.get('crt_req')}")
+            if x.get("crt") != crt or x.get("phase_crt") != crt:
+                bad.append(f"{tag}: effective crt {x.get('crt')}/{x.get('phase_crt')}")
+            if x.get("phase_seq") != x.get("seq"):
+                bad.append(f"{tag}: phase_seq {x.get('phase_seq')} != seq {x.get('seq')}")
+            if seq == "default":
+                if default_set is None:
+                    default_set = x.get("seq")
+                elif x.get("seq") != default_set:
+                    bad.append(f"{tag}: class default {x.get('seq')} != {default_set}")
+            elif x.get("seq") != int(seq):
+                bad.append(f"{tag}: forced {seq} but the plan ran {x.get('seq')}")
+            if not x.get("phases"):
+                bad.append(f"{tag}: no phases")
+            hashes[tag] = x.get("c_hash")
+    if not hashes or len(set(hashes.values())) != 1 or None in hashes.values():
+        bad.append(f"c_hash differs across configurations: {hashes}")
+
+    # The settings end with the method: the record carries what the plan reads back once they are reset (the class's set,
+    # crt int), and a forced run's record must agree with the default run's.
+    out = os.path.join(tmp, "forced.jsonl")
+    r = run(args.bench, ["--seq", "0", "--crt", "f64"], out)
+    if r.returncode != 0:
+        bad.append(f"forced run: exit {r.returncode}: {r.stderr[-400:]}")
+    else:
+        x = [y for y in records(out) if y.get("method") == "imd"][0]
+        if x.get("seq") != 0 or x.get("seq_after_reset") != default_set or x.get("crt_after_reset") != "int":
+            bad.append(f"after a forced run the settings read back {x.get('seq_after_reset')}/{x.get('crt_after_reset')}, "
+                       f"expected {default_set}/int")
+
+    if args.keep:
+        print("records in", tmp)
+    if bad:
+        for b in bad:
+            print("FAIL ", b)
+        return 1
+    print(f"OK  {len(hashes)} configurations, one c_hash {next(iter(hashes.values()))}; class default set {default_set}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

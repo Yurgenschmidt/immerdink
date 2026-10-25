@@ -293,6 +293,17 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_seq_select.py" --lib "$<TARGET_FILE:immerdink>"
                    ${_seq_twin_arg})
   set_tests_properties(seq_select PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+  # imd_bench --seq / --crt (method imd): needs the profiling build of the bench (bench/build.sh), so only when
+  # IMMERDINK_BENCH_BIN names it (environment or cache variable); bench/test_seq_crt.py documents the checks.
+  if(NOT IMMERDINK_BENCH_BIN AND DEFINED ENV{IMMERDINK_BENCH_BIN})
+    set(IMMERDINK_BENCH_BIN "$ENV{IMMERDINK_BENCH_BIN}")
+  endif()
+  if(IMMERDINK_BENCH_BIN)
+    add_test(NAME bench_seq_crt
+             COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/test_seq_crt.py" --bench "${IMMERDINK_BENCH_BIN}"
+                     ${_seq_twin_arg})
+    set_tests_properties(bench_seq_crt PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
+  endif()
   if(IMMERDINK_SEQ_TWINS)
   add_test(NAME output_hashes_large_seq7
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"

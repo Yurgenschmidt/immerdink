@@ -467,6 +467,15 @@ IMD_API int imd_prof_set_seq(int32_t bits) {
   imd::detail::seq_override() = bits;
   return 0;
 }
+// Benchmark-only (issue 21): the set the plan's launches run now (the forced one, else its device class's); -1 for a null plan.
+IMD_API int imd_prof_plan_seq(imd_plan_t plan, int32_t* bits) {
+  const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
+  if (e == nullptr || bits == nullptr) return 1;
+  *bits = imd::detail::seq_effective(e->seq, imd::detail::seq_override().load());
+  return 0;
+}
+// Benchmark-only (issue 21): K5's CRT variant now in force (0 integer, 1 binary64 limbs).
+IMD_API int imd_prof_get_k5_crt(void) { return imd::detail::k5_crt_override().load(); }
 // Benchmark-only (issue 21): K5's CRT variant for later calls (0 integer running CRT, 1 binary64 limbs).
 IMD_API int imd_prof_set_k5_crt(int32_t variant) {
   if (variant != 0 && variant != 1) return 1;
