@@ -38,7 +38,7 @@ __device__ __forceinline__ uint64_t shl_clamped(uint64_t x, uint32_t n) {
 constexpr int kSeqE1 = 1;  // fused residue emitter (device/residue.hpp PackEmit, modp.hpp pack_smod)
 constexpr int kSeqQ1 = 2;  // quantize by DMUL, DMUL, F2I.U64 (numerics.cuh quantize_cvt); W = 2 only
 
-template <int E, int W, int S = 0>  // E consecutive k-bar of one row: 16 (one uint4 per modulus), 8 or 4
+template <int E, int W, int S = 0, int Mut = 0>  // E consecutive k-bar of one row: 16 (one uint4 per modulus), 8 or 4; Mut: planted bugs for the unit test
 struct PackEmitterT {
   static_assert(E == 16 || E == 8 || E == 4, "16, 8 or 4 values per emitter");
   static_assert(W == 2 || W == 3, "X = |a'| in 2 (N <= 16) or 3 (N <= 20) u32 words");
@@ -50,7 +50,7 @@ struct PackEmitterT {
 
   __device__ __forceinline__ void load(const uint64_t* bits, int sigma, bool trunc) {
     if constexpr (kQ1) {
-      const QuantScale qs = quant_scale(sigma);
+      const QuantScale qs = quant_scale<Mut>(sigma);
       if (trunc) load_cvt<true>(bits, qs);
       else load_cvt<false>(bits, qs);
     } else {
@@ -92,7 +92,7 @@ struct PackEmitterT {
     }
   }
   __device__ __forceinline__ void set_sign(int e, uint64_t b) {
-    if constexpr (kE1) sg[e] = (b >> 63) != 0 ? 0xFFFFFFFFu : 1u;
+    if constexpr (kE1) sg[e] = ((b >> 63) != 0) != (Mut == 11) ? 0xFFFFFFFFu : 1u;  // Mut 11: the sign inverted
     else neg |= static_cast<uint32_t>((b & kSignBit) != 0) << e;
   }
   // Q1 (W = 2): X from the conversion of |x| 2^sigma.
@@ -100,9 +100,9 @@ struct PackEmitterT {
   __device__ __forceinline__ void load_cvt(const uint64_t* bits, const QuantScale& qs) {
 #pragma unroll
     for (int e = 0; e < E; ++e) {
-      const uint64_t X = quantize_cvt<TRUNC>(bits[e], qs);
+      const uint64_t X = quantize_cvt<TRUNC, Mut>(bits[e], qs);
 #ifndef NDEBUG
-      assert(X >> imd::constants::kPackXBits2 == 0);
+      assert(Mut != 0 || X >> imd::constants::kPackXBits2 == 0);  // (a planted bug may break the bound)
 #endif
       set_sign(e, bits[e]);
       x[0][e] = static_cast<uint32_t>(X);
@@ -159,7 +159,7 @@ struct PackEmitterT {
     for (int q = 0; q < E / 4; ++q) {
       const uint32_t lo = __byte_perm(u[4 * q], u[4 * q + 1], 0x0040u);      // bytes: u0.b0 u1.b0 0 0
       const uint32_t hi = __byte_perm(u[4 * q + 2], u[4 * q + 3], 0x0040u);  // bytes: u2.b0 u3.b0 0 0
-      w[q] = __byte_perm(lo, hi, 0x5410u);
+      w[q] = __byte_perm(lo, hi, Mut == 12 ? 0x5140u : 0x5410u);  // Mut 12: two bytes swapped
     }
   }
   // Store the residues for modulus l at dst (aligned to E bytes).
@@ -174,5 +174,18 @@ struct PackEmitterT {
       *reinterpret_cast<uint32_t*>(dst) = w[0];
   }
 };
+
+// The residues of the moduli l0 + s, s in [s_lo, s_hi), at dst + s * plane. E1 steps the 64-bit pointer by `plane` instead of
+// multiplying s * plane per modulus (the baseline sequence keeps its original addressing: its code is unchanged). Mut 1 (unit
+// test): the pre-advance by s_lo planes is missing.
+template <class Em, int Mut = 0>
+__device__ __forceinline__ void store_slots(const Em& em, int l0, int s_lo, int s_hi, int8_t* dst, int64_t plane) {
+  if constexpr (Em::kE1) {
+    if (Mut != 1) dst += int64_t{s_lo} * plane;
+    for (int s = s_lo; s < s_hi; ++s, dst += plane) em.store(l0 + s, dst);
+  } else {
+    for (int s = s_lo; s < s_hi; ++s) em.store(l0 + s, dst + s * plane);
+  }
+}
 
 }  // namespace imd::kernels

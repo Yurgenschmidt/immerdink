@@ -324,21 +324,8 @@ void with_pack_seq(const ExecPlan& p, F&& f) {
     case 0: f(std::integral_constant<int, 0>{}); break;
     case 1: f(std::integral_constant<int, 1>{}); break;
     default:
-      if constexpr (W == 2) f(std::integral_constant<int, 3>{});
+      if constexpr (W == 2 && (kSeqSupported & kSeqQuant) != 0) f(std::integral_constant<int, 3>{});
       else f(std::integral_constant<int, 1>{});
-  }
-}
-
-// The residues of the moduli l0 + s, s in [s_lo, s_hi), at dst + s * plane. E1 steps the 64-bit pointer by `plane` instead of
-// multiplying s * plane per modulus (the baseline sequence keeps its original addressing: its code is unchanged).
-template <class Em>
-__device__ __forceinline__ void store_slots(const Em& em, int l0, int s_lo, int s_hi, int8_t* dst,
-                                            int64_t plane) {
-  if constexpr (Em::kE1) {
-    dst += int64_t{s_lo} * plane;
-    for (int s = s_lo; s < s_hi; ++s, dst += plane) em.store(l0 + s, dst);
-  } else {
-    for (int s = s_lo; s < s_hi; ++s) em.store(l0 + s, dst + s * plane);
   }
 }
 
@@ -347,8 +334,11 @@ __device__ __forceinline__ void store_slots(const Em& em, int l0, int s_lo, int 
 // words, branch-free). Every pack kernel is instantiated for W = 2 and 3; the launch picks W
 // from the plan's N.
 
-template <int W, int Seq = 0>  // v1.14 §3.4.1: pack_words(N); Seq: the instruction-sequence set (kernels/pack_emitter.cuh)
-__global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
+// k23_pack's body, shared by the kernels below. The baseline kernel keeps its original launch bounds; the E1 W = 2 instance is
+// held to 4 resident CTAs (64 registers) like the baseline, because left alone it takes 80 registers and so 3 CTAs per SM
+// (E1 + Q1: 94 registers, 2 CTAs; capping that one spills 128 B, so it is not capped; docs/NOTES-21.md).
+template <int W, int Seq>  // v1.14 §3.4.1: pack_words(N); Seq: the instruction-sequence set (kernels/pack_emitter.cuh)
+__device__ __forceinline__ void k23_pack_body(PackArgs a) {
   __shared__ uint64_t tile[kTileSmem];
   __shared__ int64_t s_base[kTileRowsMax];  // v_bat[lambda] + v_row[r]
   __shared__ int64_t s_out[kTileRowsMax];   // (lambda rows_pad + r) k_hat
@@ -410,6 +400,15 @@ __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
     }
     __syncthreads();  // shared arrays are reused by the next tile
   }
+}
+
+template <int W, int Seq = 0>
+__global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
+  k23_pack_body<W, Seq>(a);
+}
+template <int W, int Seq>
+__global__ void __launch_bounds__(kThreads, 4) k23_pack_cap(PackArgs a) {
+  k23_pack_body<W, Seq>(a);
 }
 
 // gridDim.y of a pack launch: with fewer tiles than 2 per SM, split the group's moduli over
@@ -744,11 +743,15 @@ void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
   // issue 21: the sums in binary64 limbs (test and benchmark hooks only), and the F1 finish (host/seq_config.hpp)
   const bool f64 = k5_crt_override() == 1, f1 = (seq_bits(p) & kSeqFinish) != 0;
   if (f64) {
-    if (f1) launch_k5_v<N, true, true>(L, out, stream);
-    else launch_k5_v<N, true, false>(L, out, stream);
+    if constexpr ((kSeqSupported & kSeqFinish) != 0) {
+      if (f1) { launch_k5_v<N, true, true>(L, out, stream); return; }
+    }
+    launch_k5_v<N, true, false>(L, out, stream);
   } else {
-    if (f1) launch_k5_v<N, false, true>(L, out, stream);
-    else launch_k5_v<N, false, false>(L, out, stream);
+    if constexpr ((kSeqSupported & kSeqFinish) != 0) {
+      if (f1) { launch_k5_v<N, false, true>(L, out, stream); return; }
+    }
+    launch_k5_v<N, false, false>(L, out, stream);
   }
 }
 
@@ -1586,7 +1589,10 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
       pa.lg_th = L.lg_th;
       const dim3 grid(static_cast<unsigned>(L.grid_x), static_cast<unsigned>(L.parts));
       if (pack_words(p.N) == 2)  // v1.14 §3.4.1
-        with_pack_seq<2>(p, [&](auto S) { k23_pack<2, decltype(S)::value><<<grid, kThreads, 0, stream>>>(pa); });
+        with_pack_seq<2>(p, [&](auto S) {
+          if constexpr (decltype(S)::value == 1) k23_pack_cap<2, 1><<<grid, kThreads, 0, stream>>>(pa);
+          else k23_pack<2, decltype(S)::value><<<grid, kThreads, 0, stream>>>(pa);
+        });
       else
         with_pack_seq<3>(p, [&](auto S) { k23_pack<3, decltype(S)::value><<<grid, kThreads, 0, stream>>>(pa); });
       if (pa.rows_pad > pa.op.rows)
@@ -1789,6 +1795,7 @@ cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) 
     case 8: return versions_of(k1_scale<512>, binary, ptx);
     case 9: return versions_of(k1_scale<1024>, binary, ptx);
     case 10: return versions_of(k1_scale<kThreads>, binary, ptx);
+    case 11: return versions_of(k23_pack_cap<2, 1>, binary, ptx);  // issue 21: the E1 K2/K3 instance held to 4 CTAs per SM
     default: return cudaErrorInvalidValue;
   }
 }

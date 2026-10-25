@@ -4,6 +4,7 @@
 // spec/oracle.py is the bit-level reference for every function here.
 #pragma once
 
+#include <cassert>
 #include <climits>
 #include <cstdint>
 
@@ -198,21 +199,29 @@ __device__ __forceinline__ void quantize(uint64_t b, int sigma, bool trunc, uint
 // RN and TRUNC, so no double rounding can reach 1/2), and the conversion is the correctly rounded (ties to even, resp.
 // toward zero) integer of the real number |x| 2^sigma, which is the quantize() above (§3.3). Needs 2^s1 and 2^s2 to be
 // normal doubles: |s1|, |s2| <= 1022, true for every certified sigma (kSigmaMin..kSigmaMax). Hardware-specific part:
-// F2I.U64.F64 and the DMULs run on the FP64 / conversion pipes (full rate on H100, 1/64 on GeForce-class cards).
+// F2I.U64.F64 and the DMULs run on the FP64 / conversion pipes: 1/64 of the integer rate on GeForce-class cards, and on H100 the
+// 64-bit conversions are probably a quarter of it (unmeasured; DMUL is full rate), so Q1 is opt-in until R2 measures it. Mut != 0
+// plants a deliberate bug for tests/test_pack_emitter.cu (compile-time; the production instances are Mut = 0).
 static_assert(imd::constants::kSigmaMin >= -2044 && imd::constants::kSigmaMax <= 2044,
               "Q1: 2^(sigma>>1) and 2^(sigma - (sigma>>1)) are normal doubles");
 struct QuantScale {
   double f1, f2;  // 2^s1, 2^s2
 };
+template <int Mut = 0>
 __device__ __forceinline__ QuantScale quant_scale(int sigma) {
-  const int s1 = sigma >> 1, s2 = sigma - s1;
+#ifndef NDEBUG
+  assert(sigma >= imd::constants::kSigmaMin && sigma <= imd::constants::kSigmaMax);  // the certified range; the baseline clamps its shift instead
+#endif
+  const int s1 = Mut == 4 ? sigma / 2 : sigma >> 1;  // any split with |s1|, |s2| <= 1022 is exact: Mut 4 (C division) is an equivalent mutant
+  const int s2 = sigma - s1 + (Mut == 5 ? 1 : 0);
   return {from_bits(static_cast<uint64_t>(s1 + 1023) << 52), from_bits(static_cast<uint64_t>(s2 + 1023) << 52)};
 }
-template <bool TRUNC>
+template <bool TRUNC, int Mut = 0>
 __device__ __forceinline__ uint64_t quantize_cvt(uint64_t b, const QuantScale& s) {
-  const double y = from_bits(b & ~kSignBit) * s.f1 * s.f2;
-  const uint64_t X = TRUNC ? static_cast<uint64_t>(__double2ull_rz(y)) : static_cast<uint64_t>(__double2ull_rn(y));
-  return non_finite(b) ? 0 : X;
+  const double y = from_bits(b & ~kSignBit) * s.f1 * (Mut == 1 ? 1.0 : s.f2);
+  const bool rz = TRUNC && Mut != 2;
+  const uint64_t X = rz ? static_cast<uint64_t>(__double2ull_rz(y)) : static_cast<uint64_t>(__double2ull_rn(y));
+  return Mut == 3 ? X : (non_finite(b) ? 0 : X);
 }
 
 // §3.4: SMod((mu mod p)(2^eps mod p), p) as int8 for a' = (neg ? -1 : 1) mu 2^eps.
@@ -399,8 +408,8 @@ __device__ __forceinline__ void crt_finish(const uint32_t (&x)[L], int N, uint32
 //      of the high word. Anything else (mag = 0, subnormal or overflowing results) takes the existing path
 //      (crt_finish + round_scaled) unchanged.
 // Hardware-specific part (not the math): I2F.F64.U64 is a native instruction on sm_89, sm_90 and sm_120 (checked with nvcc 13.4)
-// but runs at 1/64 of the integer rate on GeForce-class FP64 pipes; the default sets (host/seq_config.hpp) use F1 only
-// where that is not so. Mut != 0 plants a deliberate bug (tests/test_finish_f1.cu proves the test catches each).
+// but runs at 1/64 of the integer rate on GeForce-class FP64 pipes and probably at a quarter rate on Hopper; no default set
+// (host/seq_config.hpp) uses F1 until Hopper is measured. Mut != 0 plants a deliberate bug (tests/test_finish_f1.cu proves the test catches each).
 // d = a - x on L limbs by one PTX carry chain (sub.cc / subc: one IADD3 per limb); returns the final borrow as 0 or 0xFFFFFFFF.
 template <int L>
 __device__ __forceinline__ uint32_t sub_limbs(uint32_t (&d)[L], const uint32_t (&a)[L], const uint32_t (&x)[L]);
@@ -439,7 +448,13 @@ __device__ __forceinline__ bool finish_f1_try(const uint32_t (&x)[L], int e, dou
   uint32_t hl[Lp], pl[Lp], dh[Lp], pm[Lp];
 #pragma unroll
   for (int w = 0; w < Lp; ++w) hl[w] = c_tables.H[N][w], pl[w] = c_tables.P[N][w];
-  const bool neg = sub_limbs<Lp>(dh, hl, xv) != 0;  // x > H: the borrow of H - x
+  bool neg = sub_limbs<Lp>(dh, hl, xv) != 0;  // x > H: the borrow of H - x
+  if (Mut == 6) {  // planted bug: x == H counted as negative
+    uint32_t any = 0;
+#pragma unroll
+    for (int w = 0; w < Lp; ++w) any |= dh[w];
+    neg = neg || any == 0;
+  }
   sub_limbs<Lp>(pm, pl, xv);                        // P - x (used when neg)
 #pragma unroll
   for (int w = 0; w < Lp; ++w) mag[w] = neg ? pm[w] : xv[w];
@@ -455,7 +470,7 @@ __device__ __forceinline__ bool finish_f1_try(const uint32_t (&x)[L], int e, dou
       for (int w = 0; w < Lp; ++w) up[w] = w >= step ? mag[w - step] : 0u;
 #pragma unroll
       for (int w = 0; w < Lp; ++w) mag[w] = z ? up[w] : mag[w];
-      shifted += z ? step : 0;
+      shifted += z ? (Mut == 7 && step == 2 ? 1 : step) : 0;  // Mut 7: the 2-limb stage miscounted
     }
   }
   if (mag[Lp - 1] == 0) return false;  // mag = 0
@@ -470,7 +485,9 @@ __device__ __forceinline__ bool finish_f1_try(const uint32_t (&x)[L], int e, dou
   const double dm = __ull2double_rn(t);
   const int kk = 32 * Lp - 64 - (32 * shifted + b) + e + (Mut == 2 ? 1 : 0);
   if (static_cast<uint32_t>((Mut == 5 ? 1086 : 1085) + kk) >= (Mut == 3 ? 2047u : 2045u)) return false;
-  const uint32_t hi = static_cast<uint32_t>(__double2hiint(dm)) + (static_cast<uint32_t>(kk) << 20) |
+  // Mut 8: the exponent from 1086 + kk, ignoring that Dm may have rounded up to 2^64 (field 1087)
+  const uint32_t hi = (Mut == 8 ? (static_cast<uint32_t>(__double2hiint(dm)) & 0xFFFFFu) + (static_cast<uint32_t>(1086 + kk) << 20)
+                                : static_cast<uint32_t>(__double2hiint(dm)) + (static_cast<uint32_t>(kk) << 20)) |
                       (Mut == 4 ? 0u : (neg ? 0x80000000u : 0u));
   *out = __hiloint2double(static_cast<int>(hi), __double2loint(dm));
   return true;

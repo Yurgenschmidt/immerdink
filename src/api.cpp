@@ -463,7 +463,7 @@ IMD_API int imd_prof_set_k5_elems(int32_t elems) {
 }
 // Benchmark-only (issue 21): the instruction-sequence set of every later call (kSeq* bits of host/seq_config.hpp: 1 E1, 2 Q1, 4 F1); -1 the device class's set.
 IMD_API int imd_prof_set_seq(int32_t bits) {
-  if (bits < -1 || bits > imd::detail::kSeqAll) return 1;
+  if (!imd::detail::seq_valid(bits)) return 1;
   imd::detail::seq_override() = bits;
   return 0;
 }

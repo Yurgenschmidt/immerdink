@@ -55,6 +55,7 @@ endif()
 
 option(IMMERDINK_WERROR "Treat warnings in immerdink's own code as errors" OFF)
 option(IMMERDINK_BUILD_TESTS "Build the tests (and the test-only hooks of src/test_hooks.cpp)" ON)
+option(IMMERDINK_SEQ_TWINS "Compile the Q1 / F1 kernel twins of the pack and K5 kernels (issue 21: reachable by the hooks only, no device class defaults to them); OFF omits them: about half the kernel instances and SASS" ON)
 option(IMMERDINK_PROFILE "Benchmark-only per-phase event timing hooks (src/profile.hpp)" OFF)
 set(IMMERDINK_CUTLASS_DIR "${PROJECT_SOURCE_DIR}/third_party/cutlass"
     CACHE PATH "CUTLASS v4.8.0 source tree (default: the git submodule)")
@@ -161,6 +162,9 @@ add_library(immerdink SHARED src/api.cpp src/device_state.cpp src/contract.cu sr
   src/k4/k4_cfg0.cu src/k4/k4_cfg1.cu src/k4/k4_cfg2.cu src/k4/k4_cfg3.cu)
 if(IMMERDINK_BUILD_TESTS)
   target_sources(immerdink PRIVATE src/test_hooks.cpp)
+endif()
+if(NOT IMMERDINK_SEQ_TWINS)
+  target_compile_definitions(immerdink PRIVATE IMD_NO_SEQ_TWINS=1)
 endif()
 if(IMMERDINK_PROFILE)
   target_sources(immerdink PRIVATE src/profile.cpp)
