@@ -5,8 +5,8 @@
 
 Every case of tests/data/output_hashes.json (the committed hashes, so the f64 variant also reproduces the contract), then every N = 2..20 on a mid-size GEMM of
 each input family, and batched / permuted-output shapes, are run with the integer CRT and with the binary64-limb CRT (imd_test_set_k5_crt); the output hashes must be
-equal. The limb CRT uses the FP64 pipe: on an RTX 4090 it is slow but exact, which is what this checks. spec/test_crt_f64.py checks the algorithm against the oracle on the
-residue vectors directly.
+equal (also with the F1 finish, instruction-sequence bit 4). K5's element variants (1, 2, 4 per thread, batch fastest) are forced for N = 5, 8, 12, 16, 20, with the launch counter checked and F1 forced on each. The limb CRT uses the FP64 pipe: on an RTX 4090 it is slow but exact, which is what this checks. spec/test_crt_f64.py checks the algorithm against the oracle on the
+residue vectors directly; tests/test_crt_f64_unit.py runs the device functions on the edge vectors.
 """
 import argparse
 import json
@@ -59,15 +59,45 @@ def main():
                 h1 = T.hash_c(T.run_gpu(lib, cuda, c))
                 if h0 != h1:
                     bad.append(f"{c['name']}: integer CRT {h0}, crt={crt} seq={seq}: {h1}")
+        # the K5 element variants, forced: 1, 2 and 4 elements per thread (j-bar fastest) and the batch-fastest kernel, for a few N, with tails (n and the
+        # batch extent are not multiples of the per-thread element count / tile). The launch counter (imd_test_k5_launch_counts, recorded by launch_k5 at
+        # the branch that picks the kernel) shows that the intended variant, with the intended CRT, ran: exactly one K5 launch per run. Every variant also
+        # runs with the F1 finish forced (seq 4 and 7), so F1 is exercised on all four K5 kernels with both CRTs, against the integer CRT with the baseline finish.
+        names = {0: "E=1", 1: "E=2", 2: "E=4", 3: "bfast"}
+        vcombos = [(0, 0)] + combos + ([] if args.no_seq_twins else [(1, 7)])
+        for N in (5, 8, 12, 16, 20):
+            shapes = []
+            for variant, elems in ((0, 1), (1, 2), (2, 4)):
+                shapes.append((variant, elems, case(f"var_{names[variant]}_n{N}", {"extent": [37, 130], "label": [1, 3]}, {"extent": [53, 130], "label": [2, 3]},
+                                                    {"extent": [37, 53], "label": [1, 2]}, N, "pow2" if N % 2 else "u", "TRUNC" if N % 3 == 0 else "RN")))
+            for bt in (6, 40):
+                shapes.append((3, 0, case(f"var_bfast_b{bt}_n{N}", {"extent": [9, 33, bt], "label": [1, 3, 4]}, {"extent": [11, 33, bt], "label": [2, 3, 4]},
+                                          {"extent": [9, 11, bt], "label": [1, 2, 4]}, N, "pow2" if N % 2 else "u"))
+                          )
+            for variant, elems, c in shapes:
+                hs = []
+                for crt, seq in vcombos:
+                    lib.set_k5_crt(crt)
+                    lib.set_seq(seq)
+                    lib.set_k5_elems(elems)
+                    lib.k5_launch_counts(reset=True)
+                    hs.append(T.hash_c(T.run_gpu(lib, cuda, c)))
+                    seen = lib.k5_launch_counts(reset=True)
+                    if seen != {(crt, variant): 1}:
+                        bad.append(f"{c['name']}: CRT {crt} seq {seq}: the K5 launches were {seen}, expected exactly one launch of variant {names[variant]} ({crt}, {variant})")
+                n += 1
+                if len(set(hs)) != 1:
+                    bad.append(f"{c['name']}: hashes over (crt, seq) {vcombos}: {hs}")
     finally:
         lib.set_k5_crt(0)
+        lib.set_k5_elems(0)
         lib.set_seq(-1)
     if bad:
         print("FAIL")
         for b in bad:
             print("  " + b)
         return 1
-    print(f"PASS  {n} cases: the binary64-limb CRT and the F1 finish, alone and together, are bit-identical to the integer CRT with the baseline finish (N = 2..20, both input families, RN and TRUNC, batched, alpha and beta)")
+    print(f"PASS  {n} cases: the binary64-limb CRT and the F1 finish, alone and together, are bit-identical to the integer CRT with the baseline finish (N = 2..20, both input families, RN and TRUNC, batched, alpha and beta; K5 variants E = 1, 2, 4 and bfast forced and confirmed, also with F1, for N = 5, 8, 12, 16, 20)")
     return 0
 
 

@@ -498,7 +498,10 @@ __device__ __forceinline__ void crt_step_n(uint32_t (&x)[L], uint32_t Wl) {
 // Issue 21 (docs/NOTES-21.md, spec/crt_f64.py): the CRT of element e of the packed planes wv with the sums in binary64 limbs. The same integer x in [0, P) as crt_planes_n
 // (so crt_finish and round_scaled follow unchanged and the result is bit-identical): s_j = sum_l W_l k_lj by fma (exact), the quotient t = floor(fl(S) / P - 2^-30)
 // (never above the true quotient, at most one below), r_j = s_j - t P_j (exact), the limbs r_j carried into 32-bit words, one conditional subtraction of P.
-template <int N, int L>
+// Mut is a compile-time test knob (default 0 = the shipped code, no other value is instantiated outside IMD_BUILD_TEST_HOOKS builds): tests/test_crt_f64_unit.py
+// instantiates the mutations to show that the device-level test sees them: 1 bias 0, 2 bias 2^-40, 3 limb constant k[N][N-1][0] + 1, 4 Pj[0] + 1,
+// 5 the carry out of the bottom limb dropped, 6 the bottom limb's carry by a logical shift (wrong for a negative r_0), 7 R == P not reduced, 8 bias 2^-46.
+template <int N, int L, int Mut = 0>
 __device__ __forceinline__ void crt_f64_elem(const uint32_t (&wv)[N], int e, uint32_t (&x)[L]) {
   constexpr int J = imd::constants::kF64Crt.J[N];
   constexpr int Wb = imd::constants::kF64LimbBits;
@@ -509,21 +512,30 @@ __device__ __forceinline__ void crt_f64_elem(const uint32_t (&wv)[N], int e, uin
   for (int l = 0; l < N; ++l) {
     const double Wd = __uint2double_rn((wv[l] >> (8 * e)) & 255u);
 #pragma unroll
-    for (int j = 0; j < J; ++j) s[j] = __fma_rn(Wd, imd::device::c_f64crt.k[N][l][j], s[j]);
+    for (int j = 0; j < J; ++j) {
+      double kc = imd::device::c_f64crt.k[N][l][j];
+      if constexpr (Mut == 3) kc += (l == N - 1 && j == 0) ? 1.0 : 0.0;
+      s[j] = __fma_rn(Wd, kc, s[j]);
+    }
   }
   double Sd = s[J - 1];
 #pragma unroll
   for (int j = J - 2; j >= 0; --j) Sd = __fma_rn(Sd, 1099511627776.0, s[j]);   // 2^40 = 2^kF64LimbBits
   static_assert(Wb == 40, "the Horner base above is 2^40");
-  const int t = __double2int_rd(__fma_rn(Sd, imd::device::c_f64crt.Pinv[N], -0x1p-30));      // floor(fl(S) Pinv - 2^-30): the product is fused with the bias, one rounding fewer
+  constexpr double bias = Mut == 1 ? 0.0 : Mut == 2 ? 0x1p-40 : Mut == 8 ? 0x1p-46 : 0x1p-30;
+  const int t = __double2int_rd(__fma_rn(Sd, imd::device::c_f64crt.Pinv[N], -bias));      // floor(fl(S) Pinv - 2^-30): the product is fused with the bias, one rounding fewer
   const double td = static_cast<double>(t);
   long long carry = 0;
   uint64_t limb[J];
 #pragma unroll
   for (int j = 0; j < J; ++j) {
-    const long long a = __double2ll_rn(__fma_rn(-td, imd::device::c_f64crt.Pj[N][j], s[j])) + carry;   // r_j: an exact integer below 2^53
+    double Pjd = imd::device::c_f64crt.Pj[N][j];
+    if constexpr (Mut == 4) Pjd += (j == 0) ? 1.0 : 0.0;
+    const long long a = __double2ll_rn(__fma_rn(-td, Pjd, s[j])) + carry;   // r_j: an exact integer below 2^53
     limb[j] = static_cast<uint64_t>(a) & ((uint64_t{1} << Wb) - 1);
     carry = a >> Wb;
+    if constexpr (Mut == 5) { if (j == 0) carry = 0; }
+    if constexpr (Mut == 6) { if (j == 0) carry = static_cast<long long>(static_cast<uint64_t>(a) >> Wb); }
   }
   // the carry out of the top limb is zero: R < P (1 + 2^-29) < 2^(40 J) (cert_crt_f64)
 #pragma unroll
@@ -541,6 +553,12 @@ __device__ __forceinline__ void crt_f64_elem(const uint32_t (&wv)[N], int e, uin
     const uint64_t diff = static_cast<uint64_t>(x[k]) - c_tables.P[N][k] - borrow;
     d[k] = static_cast<uint32_t>(diff);
     borrow = static_cast<uint32_t>(diff >> 63);
+  }
+  if constexpr (Mut == 7) {   // R == P (d == 0) is left as it is
+    uint32_t any = 0;
+#pragma unroll
+    for (int k = 0; k < L; ++k) any |= d[k];
+    if (any == 0) borrow = 1;
   }
 #pragma unroll
   for (int k = 0; k < L; ++k) x[k] = borrow ? x[k] : d[k];
@@ -714,6 +732,41 @@ __global__ void __launch_bounds__(kThreads) k5_beta_only(OutArgs a) {
   }
 }
 
+#ifdef IMD_BUILD_TEST_HOOKS
+// Test only (tests/test_crt_f64_unit.py, hook imd_test_crt_elem): the CRT word x in [0, P) of one residue vector per thread, before crt_finish and round_scaled, by
+// the REAL crt_f64_elem<N, L, Mut> (F64) or the REAL integer running CRT (crt_planes_n) of this file. The residue of plane l sits in byte e of the plane's
+// 32-bit word, the other three bytes hold unrelated data (the f64 CRT and the integer CRT must both ignore them, as K5 does for E = 4).
+constexpr int kTestCrtWords = 5;   // the largest L32 (N = 17..20)
+template <int N, int Mut, bool F64>
+__global__ void __launch_bounds__(kThreads) test_crt_elem_kernel(const uint8_t* W, uint32_t* out, int64_t count, int e) {
+  const int64_t idx = blockIdx.x * int64_t{blockDim.x} + threadIdx.x;
+  if (idx >= count) return;
+  constexpr int L = imd::constants::kTables.L32[N];
+  uint32_t wv[N];
+#pragma unroll
+  for (int l = 0; l < N; ++l) {
+    uint32_t g = static_cast<uint32_t>(idx) * 2654435761u + static_cast<uint32_t>(l) * 40503u + 12345u;
+    g ^= g >> 15;
+    g *= 2246822519u;
+    g ^= g >> 13;
+    g &= ~(255u << (8 * e));
+    wv[l] = g | (uint32_t{W[l * count + idx]} << (8 * e));
+  }
+  uint32_t x[1][L];
+#pragma unroll
+  for (int w = 0; w < L; ++w) x[0][w] = 0;
+  if constexpr (F64) {
+    crt_f64_elem<N, L, Mut>(wv, e, x[0]);
+  } else {
+#pragma unroll
+    for (int l = 0; l < N; ++l) wv[l] >>= 8 * e;   // crt_planes_n reads byte 0 of element 0
+    crt_planes_n<N, L, 1>(x, wv);
+  }
+#pragma unroll
+  for (int w = 0; w < kTestCrtWords; ++w) out[idx * kTestCrtWords + w] = w < L ? x[0][w] : 0u;
+}
+#endif
+
 // K5 j-bar fastest, elements per thread (a launch choice; the results do not depend on it):
 // 1 while b m n <= k5_one_elem_per_sm() / 2 per SM, 2 while b m n <= 8 k5_one_elem_per_sm()
 // per SM, else 4 (A5, NOTES-A5 §2: nsys K5 times, 1 / 2 / 4 per thread, 16 K to 16 M
@@ -740,6 +793,9 @@ template <int N>
 void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
   const K5Launch L = k5_launch(p.k5_batch_fast, p.b, p.m, p.n, p.sms, k5_one_elem_per_sm(),
                                k5_elems_override());
+#ifdef IMD_BUILD_TEST_HOOKS
+  test_note_k5_launch(k5_crt_override() == 1, L.variant);   // host-side count for tests/test_crt_f64_gpu.py (no device code)
+#endif
   // issue 21: the sums in binary64 limbs (test and benchmark hooks only), and the F1 finish (host/seq_config.hpp)
   const bool f64 = k5_crt_override() == 1, f1 = (seq_bits(p) & kSeqFinish) != 0;
   if (f64) {
@@ -1411,6 +1467,53 @@ std::atomic<int>& k5_crt_override() {
   static std::atomic<int> v{0};  // 0: the integer running CRT (default), 1: the sums in binary64 limbs (issue 21); only the hooks change it, relaxed is enough
   return v;
 }
+
+#ifdef IMD_BUILD_TEST_HOOKS
+namespace {
+std::atomic<int64_t> g_k5_launches[2][4];   // [limb CRT?][variant: 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest]
+template <int N, int Mut>
+cudaError_t test_crt_launch(int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
+  const unsigned grid = static_cast<unsigned>((count + kThreads - 1) / kThreads);
+  if (variant == 0) test_crt_elem_kernel<N, 0, false><<<grid, kThreads>>>(W, out, count, e);
+  else test_crt_elem_kernel<N, Mut, true><<<grid, kThreads>>>(W, out, count, e);
+  return cudaGetLastError();
+}
+template <int N>
+cudaError_t test_crt_dispatch(int n, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
+  if (n == N) {
+    switch (variant) {
+      case 0: case 1: return test_crt_launch<N, 0>(variant, e, count, W, out);
+      case 2: return test_crt_launch<N, 1>(variant, e, count, W, out);
+      case 3: return test_crt_launch<N, 2>(variant, e, count, W, out);
+      case 4: return test_crt_launch<N, 3>(variant, e, count, W, out);
+      case 5: return test_crt_launch<N, 4>(variant, e, count, W, out);
+      case 6: return test_crt_launch<N, 5>(variant, e, count, W, out);
+      case 7: return test_crt_launch<N, 6>(variant, e, count, W, out);
+      case 8: return test_crt_launch<N, 7>(variant, e, count, W, out);
+      default: return test_crt_launch<N, 8>(variant, e, count, W, out);
+    }
+  }
+  if constexpr (N < imd::constants::kNMax) return test_crt_dispatch<N + 1>(n, variant, e, count, W, out);
+  else return cudaErrorInvalidValue;
+}
+}  // namespace
+
+cudaError_t test_crt_elem(int N, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
+  if (N < imd::constants::kNMin || N > imd::constants::kNMax || variant < 0 || variant > 9 || e < 0 || e > 3 || count < 0)
+    return cudaErrorInvalidValue;
+  if (count == 0) return cudaSuccess;
+  return test_crt_dispatch<imd::constants::kNMin>(N, variant, e, count, W, out);
+}
+
+void test_note_k5_launch(bool limb_crt, int variant) {
+  g_k5_launches[limb_crt ? 1 : 0][variant].fetch_add(1, std::memory_order_relaxed);
+}
+
+void test_k5_launch_counts(bool reset, int64_t* out) {
+  for (int c = 0; c < 2; ++c)
+    for (int v = 0; v < 4; ++v) out[4 * c + v] = reset ? g_k5_launches[c][v].exchange(0) : g_k5_launches[c][v].load();
+}
+#endif
 
 std::atomic<int>& pad_mutation() {
   static std::atomic<int> v{-1};  // only the test hook imd_test_set_pad_mutation changes it

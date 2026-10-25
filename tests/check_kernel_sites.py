@@ -26,6 +26,8 @@ for d, _, files in os.walk(os.path.join(root, "src")):
     for fn in files:
         if fn.endswith((".cu", ".cuh", ".cpp")):
             rel = os.path.relpath(os.path.join(d, fn), root)
+            if re.fullmatch(r"src/k4/hopper/rung\d+\.cu", rel):
+                continue  # standalone Hopper study programs (tools/build_rung*.sh), not part of libimmerdink
             text = re.sub(r"//[^\n]*", "", read(rel))
             for m in re.finditer(r"([A-Za-z_][A-Za-z_0-9:]*)\s*(?:<[^<>;{}]*(?:<[^<>;{}]*>[^<>;{}]*)*>)?\s*<<<", text):
                 launched.setdefault(m.group(1).split("::")[-1], set()).add(rel)
@@ -36,7 +38,8 @@ checked = {m.group(1) for m in re.finditer(r"(?:occupancy_of|versions_of)\(\s*([
 checked |= {"k4_kernel"} if "k4_kernel<G, false>" in read("src/k4/k4_cfg.cuh") and \
     "cudaFuncGetAttributes(&a, store)" in read("src/k4/k4_cfg.cuh") else set()
 
-missing = {n: sorted(f) for n, f in launched.items() if n not in checked}
+# test-only kernels (names test_*, compiled under IMD_BUILD_TEST_HOOKS only, e.g. test_crt_elem_kernel) are not part of the shipped library
+missing = {n: sorted(f) for n, f in launched.items() if n not in checked and not n.startswith("test_")}
 fail = False
 if missing:
     fail = True
