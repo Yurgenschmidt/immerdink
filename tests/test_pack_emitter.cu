@@ -45,7 +45,7 @@ __extension__ typedef unsigned __int128 u128;
     }                                                                              \
   } while (0)
 
-template <int E, int W, int S>
+template <int E, int W, int S, int Mut, int StMut>
 __global__ void emit_kernel(const uint64_t* bits, const int* sigma, int threads, int N, bool trunc,
                             int8_t* out) {
   const int t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -53,10 +53,13 @@ __global__ void emit_kernel(const uint64_t* bits, const int* sigma, int threads,
   uint64_t b[E];
 #pragma unroll
   for (int e = 0; e < E; ++e) b[e] = bits[int64_t{t} * E + e];
-  imd::kernels::PackEmitterT<E, W, S> em;
+  imd::kernels::PackEmitterT<E, W, S, Mut> em;
   em.load(b, sigma[t], trunc);
   const int64_t plane = int64_t{threads} * E;
-  for (int l = 0; l < N; ++l) em.store(l, out + l * plane + int64_t{t} * E);
+  // store_slots (the launches' addressing) in two parts, so that a start slot other than 0 is exercised too
+  const int split = N / 3;
+  imd::kernels::store_slots<decltype(em), StMut>(em, 0, split, N, out + int64_t{t} * E, plane);
+  imd::kernels::store_slots<decltype(em), StMut>(em, 0, 0, split, out + int64_t{t} * E, plane);
 }
 
 uint64_t xs(uint64_t& x) {
@@ -234,7 +237,7 @@ void gen_thread(int N, int mode, int E, bool trunc, uint64_t& rng, int* sigma,
 bool g_quiet = false;  // the mutation checks expect mismatches
 Coverage g_scratch;  // coverage of the non-baseline sequences is not asserted (their inputs are the baseline's)
 
-template <int E, int W, int S>
+template <int E, int W, int S, int Mut = 0, int StMut = 0>
 long run(int N, bool trunc, int threads, uint64_t seed, Coverage& cov, long* checked) {
   uint64_t rng = seed;
   std::vector<uint64_t> bits;
@@ -252,7 +255,7 @@ long run(int N, bool trunc, int threads, uint64_t seed, Coverage& cov, long* che
   CUDA_CHECK(cudaMemcpy(d_bits, bits.data(), bits.size() * 8, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_sig, sig.data(), sig.size() * sizeof(int), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemset(d_out, 0x5A, plane * N));
-  emit_kernel<E, W, S><<<(threads + 127) / 128, 128>>>(d_bits, d_sig, threads, N, trunc, d_out);
+  emit_kernel<E, W, S, Mut, StMut><<<(threads + 127) / 128, 128>>>(d_bits, d_sig, threads, N, trunc, d_out);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());  // a device assert surfaces here
   std::vector<int8_t> out(plane * N);
@@ -359,7 +362,9 @@ int mutation_checks() {
                       {"C - p (C < dmax)", kCMinusP, 3, 3}, {"negp + 1", kNegpPlus, 2, 0},
                       {"weight lane +1", kWeightPlus, 3, 7}, {"C + 1 (not a multiple of p)", kCPlus, 2, 12},
                       {"hm + m32 (h one too large), p = 256", kHmPlus, 3, 19},
-                      {"weight lane +1, W = 2", kWeightPlus, 2, 10}};
+                      {"weight lane +1, W = 2", kWeightPlus, 2, 10},
+                      {"m32 - 1, p = 256 (the low-byte path)", kM32Minus, 3, 19},
+                      {"C - p, p = 256", kCMinusP, 3, 19}};
   int fails = 0;
   g_quiet = true;
   int8_t* d_out;
@@ -389,6 +394,26 @@ int mutation_checks() {
   }
   CUDA_CHECK(cudaMemcpyToSymbol(imd::device::c_pack_emit, &good, sizeof good));
   CUDA_CHECK(cudaFree(d_out));
+  // Mutants of the sequences' code (the Mut template values: tests of the test, planted in the production templates at compile
+  // time): every one must produce mismatches, except the one marked equivalent, which must produce none.
+  Coverage cv;
+  cv.eps.assign(c::kEpsMax + 1, 0);
+  const auto go = [&](const char* what, bool expect_caught, const auto& f) {
+    long checked = 0, bad = 0;
+    for (int tr = 0; tr < 2; ++tr) bad += f(tr == 1, &checked);
+    const bool ok = expect_caught ? bad != 0 : bad == 0;
+    std::printf("mutant \"%s\": %s (%ld mismatches)\n", what, ok ? (expect_caught ? "caught" : "equivalent, as expected") : "WRONG", bad);
+    fails += !ok;
+  };
+  const int U = 4 * 1024;
+  go("E1 sign polarity (sg inverted)", true, [&](bool t, long* c_) { return run<16, 2, 1, 11>(16, t, U, 5, cv, c_); });
+  go("E1 byte_perm assembly (two bytes swapped)", true, [&](bool t, long* c_) { return run<8, 3, 1, 12>(20, t, U, 6, cv, c_); });
+  go("store_slots start slot not advanced", true, [&](bool t, long* c_) { return run<16, 2, 1, 0, 1>(16, t, U, 7, cv, c_); });
+  go("Q1 without the f2 factor", true, [&](bool t, long* c_) { return run<16, 2, 3, 1>(16, t, U, 8, cv, c_); });
+  go("Q1 RN for TRUNC", true, [&](bool t, long* c_) { return t ? run<16, 2, 3, 2>(16, t, U, 9, cv, c_) : 0L; });
+  go("Q1 without the Inf/NaN mask", true, [&](bool t, long* c_) { return run<16, 2, 3, 3>(16, t, U, 10, cv, c_); });
+  go("Q1 s2 one too large", true, [&](bool t, long* c_) { return run<16, 2, 3, 5>(16, t, U, 11, cv, c_); });
+  go("Q1 sigma / 2 instead of sigma >> 1 (an equivalent split)", false, [&](bool t, long* c_) { return run<16, 2, 3, 4>(16, t, U, 12, cv, c_); });
   g_quiet = false;
   return fails;
 }

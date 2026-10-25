@@ -262,11 +262,15 @@ if(Python3_FOUND)
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
   # Issue 21 (docs/NOTES-21.md "Pack emitter and finish"): the same oracle tests with the other instruction sequences forced
-  # for every plan (IMD_TEST_SEQ, tests/harness.py): 1 = E1 emitter, 7 = E1 + Q1 quantize + F1 finish. The suites of
-  # the default sequences above are the baseline. These fail if any sequence changes one bit.
-  foreach(seq 1 7)
+  # for every plan (IMD_TEST_SEQ, tests/harness.py: the library must report that set back, or the run fails): 0 = the baseline
+  # sequences (the production path on every class without a default set, and the reference now that the sm_89 / sm_90
+  # default is E1), 1 = E1 emitter, 7 = E1 + Q1 quantize + F1 finish. The suites without a suffix run the class default.
+  foreach(seq 0 1 7)
+    if(seq EQUAL 7 AND NOT IMMERDINK_SEQ_TWINS)
+      continue()
+    endif()
     foreach(suite e2e tensor every_n eps bigk)
-      if(seq EQUAL 1 AND (suite STREQUAL "tensor" OR suite STREQUAL "every_n" OR suite STREQUAL "bigk"))
+      if(NOT seq EQUAL 7 AND (suite STREQUAL "tensor" OR suite STREQUAL "every_n" OR suite STREQUAL "bigk"))
         continue()
       endif()
       add_test(NAME contract_${suite}_seq${seq}
@@ -281,11 +285,21 @@ if(Python3_FOUND)
     set_tests_properties(output_hashes_seq${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
                          ENVIRONMENT "IMD_TEST_SEQ=${seq}")
   endforeach()
+  set(_seq_twin_arg "")
+  if(NOT IMMERDINK_SEQ_TWINS)
+    set(_seq_twin_arg --no-seq-twins)
+  endif()
+  add_test(NAME seq_select
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_seq_select.py" --lib "$<TARGET_FILE:immerdink>"
+                   ${_seq_twin_arg})
+  set_tests_properties(seq_select PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+  if(IMMERDINK_SEQ_TWINS)
   add_test(NAME output_hashes_large_seq7
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
                    --lib "$<TARGET_FILE:immerdink>" --tags large)
   set_tests_properties(output_hashes_large_seq7 PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
                        ENVIRONMENT "IMD_TEST_SEQ=7")
+  endif()
   # Committed output hashes (tests/data/output_hashes.json): the library's C on this GPU against
   # hashes from the CPU oracle (small shapes) and from the RTX 4090 (large ones). The same file
   # is checked on every shipped GPU. output_hashes_oracle recomputes the CPU hashes.
@@ -301,7 +315,7 @@ if(Python3_FOUND)
   # Issue 21: K5's CRT with the sums in binary64 limbs equals the integer CRT bit for bit (and reproduces the committed hashes).
   add_test(NAME crt_f64_gpu
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_crt_f64_gpu.py"
-                   --lib "$<TARGET_FILE:immerdink>")
+                   --lib "$<TARGET_FILE:immerdink>" ${_seq_twin_arg})
   set_tests_properties(crt_f64_gpu PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
   set_tests_properties(output_hashes output_hashes_oracle output_hashes_large PROPERTIES
                        RESOURCE_LOCK gpu TIMEOUT 900)

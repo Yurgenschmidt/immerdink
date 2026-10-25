@@ -27,6 +27,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--lib", default=hz.default_lib())
     ap.add_argument("--full", action="store_true", help="also the large committed cases (default: tags small and mid)")
+    ap.add_argument("--no-seq-twins", action="store_true", help="the library was built with IMMERDINK_SEQ_TWINS=OFF: no F1 / Q1 kernels")
     args = ap.parse_args()
     lib, cuda = hz.Library(args.lib), hz.Cuda()
     with open(T.DATA) as f:
@@ -43,7 +44,7 @@ def main():
     bad, n = [], 0
     # (crt variant, instruction-sequence set): the integer CRT with the baseline finish is the reference; the limb CRT, F1 (the CRT finish
     # through I2F.F64.U64, issue 21 sequence bit 4) and both together must give the same bits.
-    combos = [(1, 0), (0, 4), (1, 4), (0, 7)]
+    combos = [(1, 0)] if args.no_seq_twins else [(1, 0), (0, 4), (1, 4), (0, 7)]
     try:
         for c, committed_hash in cases:
             lib.set_k5_crt(0)

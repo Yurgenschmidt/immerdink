@@ -257,15 +257,19 @@ int main() {
   std::printf("F1 finish: %ld cases, %ld on the fast path, %ld mismatches against crt_finish + round_scaled\n", total, fast, bad);
   int fails = bad != 0;
   // mutations: each must be caught
-  const char* names[] = {"sticky dropped", "exponent +1", "upper bound 2047", "sign dropped", "lower bound allows field 0"};
-  long mb[5];
+  const char* names[] = {"sticky dropped", "exponent +1", "upper bound 2047", "sign dropped", "lower bound allows field 0",
+                         "x == H counted as negative", "2-limb normalisation stage miscounted", "Dm = 2^64 carry ignored in the exponent"};
+  long mb[8];
   long t2 = 0, f2 = 0;
   mb[0] = run_all<1>(&t2, &f2, false);
   mb[1] = run_all<2>(&t2, &f2, false);
   mb[2] = run_all<3>(&t2, &f2, false);
   mb[3] = run_all<4>(&t2, &f2, false);
   mb[4] = run_all<5>(&t2, &f2, false);
-  for (int i = 0; i < 5; ++i) {
+  mb[5] = run_all<6>(&t2, &f2, false);
+  mb[6] = run_all<7>(&t2, &f2, false);
+  mb[7] = run_all<8>(&t2, &f2, false);
+  for (int i = 0; i < 8; ++i) {
     std::printf("mutation \"%s\": %s (%ld mismatches)\n", names[i], mb[i] ? "caught" : "NOT CAUGHT", mb[i]);
     fails += mb[i] == 0;
   }
