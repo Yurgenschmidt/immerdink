@@ -20,6 +20,9 @@
  *   imd_prof_set_k5_elems(elems)
  *                         later calls run K5 (j-bar fastest) with 1, 2 or 4 elements per
  *                         thread; 0 restores the launch rule (A5). Returns 0, 1 if invalid.
+ *   imd_prof_set_k5_crt(variant)
+ *                         issue 21: later calls run K5's CRT with the sums in binary64 limbs (1) or
+ *                         the integer running CRT (0, default). Returns 0, 1 if invalid.
  *   imd_prof_kernel_occupancy(kernel, out[4])
  *                         v1.10: CTAs per SM, registers, shared memory bytes and threads of
  *                         kernel IMD_PERF_KERNEL_* (immerdink_host.h). Returns 0, 1 on error.
@@ -45,6 +48,7 @@ IMD_API int imd_prof_plan_dims(imd_plan_t plan, int64_t* out);
 IMD_API int imd_prof_plan_k4(imd_plan_t plan, int32_t* config);
 IMD_API int imd_prof_set_k4_config(int32_t config);
 IMD_API int imd_prof_set_k5_elems(int32_t elems);
+IMD_API int imd_prof_set_k5_crt(int32_t variant);
 IMD_API int imd_prof_kernel_occupancy(int32_t kernel, int32_t* out);
 IMD_API int imd_prof_kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out);
 

@@ -22,6 +22,7 @@
 //       (or k4_tune's; production); 0 .. IMD_K4_CONFIG_COUNT - 1: that configuration
 //       (DESIGN v1.5 §4). Results must not change. Returns 0, or 1 for another value.
 //
+//   imd_test_set_k5_crt(variant)
 //   imd_test_set_k5_one_elem(per_sm)
 //       K5 (j-bar fastest) takes one element per thread while b m n <= per_sm x SMs, else
 //       4 per thread with warp-transposed stores. per_sm -1 restores the production value;
@@ -40,6 +41,14 @@
 //       by default, and a violation also fails the call, checked before anything is queued).
 //       The K alignment itself is forced by libimmerdink_host's
 //       imd_test_set_k_align (src/host/k_hat.cpp).
+//
+//   imd_test_crt_elem(N, variant, e, count, W, out)
+//   imd_test_k5_launch_counts(reset, out)
+//       Issue 21 (docs/NOTES-21.md): the first runs the real CRT device functions of contract.cu
+//       (variant 0 integer running CRT, 1 binary64-limb CRT, 2..9 its compile-time mutations) on
+//       `count` device residue vectors and writes x in [0, P) before crt_finish; the second
+//       copies (and optionally zeroes) the counts of K5 launches per [limb CRT?][variant].
+//       tests/test_crt_f64_unit.py, tests/test_crt_f64_gpu.py.
 //
 //   imd_test_set_pad_mutation(operand)
 //       v1.13 §4b (hygiene): operand 0 / 1 makes the K2 / K3 pack of the post-swap GEMM
@@ -135,6 +144,27 @@ IMD_API int imd_test_set_k5_one_elem(int64_t per_sm) {
 IMD_API int imd_test_set_k5_elems(int elems) {
   if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
   imd::detail::k5_elems_override() = elems;
+  return 0;
+}
+
+// Issue 21 device-level unit test of the binary64-limb CRT: see plan.hpp test_crt_elem. W: device bytes [N][count], out: device u32 [count][5].
+// variant 0 integer running CRT, 1 limb CRT, 2..9 its mutations. Returns 0, or 1 for an invalid argument or a launch error. The caller synchronizes.
+IMD_API int imd_test_crt_elem(int N, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
+  if (count > 0 && (W == nullptr || out == nullptr)) return 1;
+  return imd::detail::test_crt_elem(N, variant, e, count, W, out) == cudaSuccess ? 0 : 1;
+}
+
+// K5 launches since the last reset, int64[8]: [limb CRT?][variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest]; reset != 0 zeroes them.
+IMD_API int imd_test_k5_launch_counts(int reset, int64_t* out) {
+  if (out == nullptr) return 1;
+  imd::detail::test_k5_launch_counts(reset != 0, out);
+  return 0;
+}
+
+// Issue 21: K5's CRT with the sums in binary64 limbs (1) or the integer running CRT (0, the default).
+IMD_API int imd_test_set_k5_crt(int variant) {
+  if (variant != 0 && variant != 1) return 1;
+  imd::detail::k5_crt_override() = variant;
   return 0;
 }
 

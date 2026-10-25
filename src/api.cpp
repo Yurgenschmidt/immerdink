@@ -459,6 +459,12 @@ IMD_API int imd_prof_set_k5_elems(int32_t elems) {
   imd::detail::k5_elems_override() = elems;
   return 0;
 }
+// Benchmark-only (issue 21): K5's CRT variant for later calls (0 integer running CRT, 1 binary64 limbs).
+IMD_API int imd_prof_set_k5_crt(int32_t variant) {
+  if (variant != 0 && variant != 1) return 1;
+  imd::detail::k5_crt_override() = variant;
+  return 0;
+}
 // Benchmark-only (v1.10, DESIGN §6c.1): the measured occupancy of kernel IMD_PERF_KERNEL_*:
 // out[0..3] = CTAs per SM, registers per thread, shared memory per CTA (static + dynamic),
 // threads. K4: the store-mod kernel of the configuration (its occupancy from plan setup).
