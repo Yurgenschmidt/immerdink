@@ -49,12 +49,12 @@ def main():
     if u.returncode == 0 or "--seq" not in u.stderr or "--crt" not in u.stderr:
         bad.append("the usage text does not name --seq and --crt (or exits 0)")
 
-    for flag, val in (("--seq", "2"), ("--seq", "6"), ("--seq", "8"), ("--seq", "x"), ("--seq", "-1"), ("--crt", "foo"), ("--crt", "2"), ("--crt", "-1")):
+    for flag, val in (("--seq", "2"), ("--seq", "6"), ("--seq", "8"), ("--seq", "24"), ("--seq", "x"), ("--seq", "-1"), ("--crt", "foo"), ("--crt", "2"), ("--crt", "-1")):
         r = run(args.bench, [flag, val], os.path.join(tmp, "bad.jsonl"))
         if r.returncode == 0:
             bad.append(f"{flag} {val} was accepted")
 
-    sets = ("default", "0", "1") if args.no_seq_twins else ("default", "0", "1", "7")
+    sets = ("default", "0", "1") if args.no_seq_twins else ("default", "0", "1", "7", "17", "113")   # 17 = E1 + klwarp, 113 = E1 + the three KL cuts (issue 23)
     hashes, default_set, default_crt = {}, None, None
     for crt in ("default", "int", "f64"):
         for seq in sets:

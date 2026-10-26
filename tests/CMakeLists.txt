@@ -302,10 +302,45 @@ if(Python3_FOUND)
     set_tests_properties(output_hashes_seq${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
                          ENVIRONMENT "IMD_TEST_SEQ=${seq}")
   endforeach()
+  # Issue 23 (docs/NOTES-23.md): the KL fixed-part cuts (bits 16 klwarp, 32 klload, 64 klshape) forced for every plan on top of E1 (17, 33, 65, 113) and on top of
+  # the baseline emitter (112): the same oracle suites and the committed hashes. They are kernel twins like Q1 / F1 (not built with IMMERDINK_SEQ_TWINS=OFF).
+  if(IMMERDINK_SEQ_TWINS)
+    foreach(seq 17 33 65 113 112)
+      foreach(suite e2e tensor eps)
+        add_test(NAME contract_${suite}_kl${seq}
+                 COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                         --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+        set_tests_properties(contract_${suite}_kl${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                             ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=${seq}")
+      endforeach()
+      add_test(NAME output_hashes_kl${seq}
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                       --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+      set_tests_properties(output_hashes_kl${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                           ENVIRONMENT "IMD_TEST_SEQ=${seq}")
+    endforeach()
+    foreach(seq 17 113)
+      add_test(NAME contract_bigk_kl${seq}
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                       --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite bigk -v)
+      set_tests_properties(contract_bigk_kl${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                           ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=${seq}")
+      add_test(NAME output_hashes_large_kl${seq}
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                       --lib "$<TARGET_FILE:immerdink>" --tags large)
+      set_tests_properties(output_hashes_large_kl${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                           ENVIRONMENT "IMD_TEST_SEQ=${seq}")
+    endforeach()
+  endif()
   set(_seq_twin_arg "")
   if(NOT IMMERDINK_SEQ_TWINS)
     set(_seq_twin_arg --no-seq-twins)
   endif()
+  # Issue 23: every combination of the KL bits over four emitter sets, bit-identical, with the KL launch counter showing which kernel each operand ran.
+  add_test(NAME kl_bits
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_kl_bits.py" --lib "$<TARGET_FILE:immerdink>"
+                   ${_seq_twin_arg})
+  set_tests_properties(kl_bits PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800)
   add_test(NAME seq_select
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_seq_select.py" --lib "$<TARGET_FILE:immerdink>"
                    ${_seq_twin_arg})

@@ -172,6 +172,10 @@ class Library:
             self.lib.imd_test_crt_elem.restype = C.c_int
             self.lib.imd_test_k5_launch_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
             self.lib.imd_test_k5_launch_counts.restype = C.c_int
+            self.lib.imd_test_kl_launch_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
+            self.lib.imd_test_kl_launch_counts.restype = C.c_int
+            self.lib.imd_test_kl_timers.argtypes = [C.c_int, C.POINTER(C.c_uint64), C.c_int]
+            self.lib.imd_test_kl_timers.restype = C.c_int
             self.lib.imd_test_plan_sizes.argtypes = [C.c_void_p, C.POINTER(C.c_int64), C.c_int64,
                                                      C.POINTER(C.c_int64)]
             self.lib.imd_test_plan_sizes.restype = C.c_int
@@ -190,7 +194,7 @@ class Library:
             self.lib.imd_test_kernel_occupancy_w.argtypes = [C.c_int32, C.c_int32,
                                                              C.POINTER(C.c_int32)]
             self.lib.imd_test_kernel_occupancy_w.restype = C.c_int
-        # Issue 21: IMD_TEST_SEQ=<bits> runs the whole process with that instruction-sequence set (1 E1, 2 Q1, 4 F1)
+        # Issue 21: IMD_TEST_SEQ=<bits> runs the whole process with that instruction-sequence set (1 E1, 2 Q1, 4 F1, 16/32/64 the KL cuts of issue 23)
         # instead of the device class's: the same tests, the same oracle, the other sequences. It fails loudly if it cannot
         # take effect (no test hooks) or did not (the set read back differs): a seq run must never silently run the default.
         env_seq = os.environ.get("IMD_TEST_SEQ")
@@ -278,7 +282,7 @@ class Library:
         return self.lib.imd_test_plan_seq(plan)
 
     def set_seq(self, bits=-1):
-        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish; -1 the device class's)."""
+        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape; -1 the device class's)."""
         assert self.lib.imd_test_set_seq(bits) == 0
 
     def crt_elem(self, N, variant, e, count, W_dev, out_dev):
@@ -293,6 +297,18 @@ class Library:
         out = (C.c_int64 * 8)()
         assert self.lib.imd_test_k5_launch_counts(1 if reset else 0, out) == 0
         return {(c, v): out[4 * c + v] for c in range(2) for v in range(4) if out[4 * c + v]}
+
+    def kl_launch_counts(self, reset=False):
+        """Issue 23: KL kernel launches since the last reset as {(E, Kb): count}; E = 4 / 8 / 16 values per thread, Kb bit 0 klwarp, bit 1 klload."""
+        out = (C.c_int64 * 12)()
+        assert self.lib.imd_test_kl_launch_counts(1 if reset else 0, out) == 0
+        return {((4, 8, 16)[e], k): out[4 * e + k] for e in range(3) for k in range(4) if out[4 * e + k]}
+
+    def kl_timers(self, reset=False):
+        """Issue 23: the KL section timers as a list of 16 sums (None in a build without IMMERDINK_KL_TIMERS); see tools/kl_timers.py."""
+        out = (C.c_uint64 * 16)()
+        n = self.lib.imd_test_kl_timers(1 if reset else 0, out, 16)
+        return list(out) if n == 16 else None
 
     def set_k5_mapping(self, fmode):
         """The K5 mapping of a test run with fused mode `fmode` (test_contract, test_packed):
