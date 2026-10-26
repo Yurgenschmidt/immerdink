@@ -172,6 +172,8 @@ class Library:
             self.lib.imd_test_crt_elem.restype = C.c_int
             self.lib.imd_test_k5_launch_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
             self.lib.imd_test_k5_launch_counts.restype = C.c_int
+            self.lib.imd_test_k5_fin_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
+            self.lib.imd_test_k5_fin_counts.restype = C.c_int
             self.lib.imd_test_plan_sizes.argtypes = [C.c_void_p, C.POINTER(C.c_int64), C.c_int64,
                                                      C.POINTER(C.c_int64)]
             self.lib.imd_test_plan_sizes.restype = C.c_int
@@ -199,6 +201,14 @@ class Library:
                 raise RuntimeError("IMD_TEST_SEQ is set but the library has no test hooks (imd_test_set_seq)")
             if self.lib.imd_test_set_seq(int(env_seq)) != 0 or self.lib.imd_test_get_seq() != int(env_seq):
                 raise RuntimeError(f"IMD_TEST_SEQ={env_seq}: the library did not take that sequence set")
+        # Issue 23: IMD_TEST_K5_CRT=0|1 runs the whole process with K5's CRT forced (0 integer, 1 binary64 limbs; unset: the plan's set decides), which is how the
+        # k5fin kernels (IMD_TEST_SEQ=133: E1 + F1 + bit 128) are run by the oracle suites: a forced set has no limb-CRT bit. The state must read back.
+        env_crt = os.environ.get("IMD_TEST_K5_CRT")
+        if env_crt not in (None, ""):
+            if not self.has_test_hooks:
+                raise RuntimeError("IMD_TEST_K5_CRT is set but the library has no test hooks (imd_test_set_k5_crt)")
+            if self.lib.imd_test_set_k5_crt(int(env_crt)) != 0 or self.lib.imd_test_get_k5_crt() != int(env_crt):
+                raise RuntimeError(f"IMD_TEST_K5_CRT={env_crt}: the library did not take that CRT variant")
         # Issue 22: IMD_TEST_K4=mma|wgmma|auto runs the whole process with the K4 backend forced (wgmma: every legal launch, the profitability
         # floor lifted) instead of the device class's rule. On a device or build without the backend a forced wgmma is mma.sync (the plan
         # reports it: plan_k4_backend); the override itself must read back, or the run fails.
@@ -293,6 +303,12 @@ class Library:
         out = (C.c_int64 * 8)()
         assert self.lib.imd_test_k5_launch_counts(1 if reset else 0, out) == 0
         return {(c, v): out[4 * c + v] for c in range(2) for v in range(4) if out[4 * c + v]}
+
+    def k5_fin_counts(self, reset=False):
+        """Issue 23: launches of the k5fin K5 kernels (seq bit 128) since the last reset as {variant: count}; variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest."""
+        out = (C.c_int64 * 4)()
+        assert self.lib.imd_test_k5_fin_counts(1 if reset else 0, out) == 0
+        return {v: out[v] for v in range(4) if out[v]}
 
     def set_k5_mapping(self, fmode):
         """The K5 mapping of a test run with fused mode `fmode` (test_contract, test_packed):

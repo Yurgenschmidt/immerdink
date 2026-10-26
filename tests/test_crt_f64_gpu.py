@@ -54,7 +54,9 @@ def main():
     bad, n = [], 0
     # (crt variant, instruction-sequence set): the integer CRT with the baseline finish is the reference; the limb CRT, F1 (the CRT finish
     # through I2F.F64.U64, issue 21 sequence bit 4) and both together must give the same bits.
-    combos = [(1, 0)] if args.no_seq_twins else [(1, 0), (0, 4), (1, 4), (0, 7)]
+    # Issue 23: bit 128 (k5fin, the limb CRT + F1 kernels with fewer instructions) is added: (1, 132) is the kernel it replaces' combination (limb CRT, F1, bit 128), (1, 135) the whole stack,
+    # (0, 132) the integer CRT with the bit set, where it must do nothing (the shipped K5 runs).
+    combos = [(1, 0)] if args.no_seq_twins else [(1, 0), (0, 4), (1, 4), (0, 7), (1, 132), (1, 135), (0, 132)]
     try:
         for c, committed_hash in cases:
             lib.set_k5_crt(0)
@@ -69,7 +71,7 @@ def main():
                 h1 = T.hash_c(T.run_gpu(lib, cuda, c))
                 if h0 != h1:
                     bad.append(f"{c['name']}: integer CRT {h0}, crt={crt} seq={seq}: {h1}")
-            for crt, seq in ((-1, -1), (0, -1), (-1, 5 if not args.no_seq_twins else 1)):   # the class default, seq default + crt int, a forced seq with the CRT following the set
+            for crt, seq in ((-1, -1), (0, -1), (-1, 5 if not args.no_seq_twins else 1)) + (() if args.no_seq_twins else ((-1, 133), (1, 133))):   # the class default, seq default + crt int, a forced seq with the CRT following the set
                 lib.set_k5_crt(crt)
                 lib.set_seq(seq)
                 h1 = T.hash_c(T.run_gpu(lib, cuda, c))
@@ -80,7 +82,7 @@ def main():
         # the branch that picks the kernel) shows that the intended variant, with the intended CRT, ran: exactly one K5 launch per run. Every variant also
         # runs with the F1 finish forced (seq 4 and 7), so F1 is exercised on all four K5 kernels with both CRTs, against the integer CRT with the baseline finish.
         names = {0: "E=1", 1: "E=2", 2: "E=4", 3: "bfast"}
-        vcombos = [(0, 0)] + combos + ([] if args.no_seq_twins else [(1, 7)])
+        vcombos = [(0, 0)] + combos + ([] if args.no_seq_twins else [(1, 7)])   # (the seq-set combos include the k5fin ones: 132, 135)
         # (crt hook, seq hook) -> the CRT the launch must take: forced values are themselves; -1 follows the class default's limb-CRT bit when the seq is not forced, and a forced seq has none (integer)
         dcombos = [(-1, -1), (0, -1), (-1, 0 if args.no_seq_twins else 5)]
         want = lambda crt, seq: default_limb if (crt == -1 and seq == -1) else (0 if crt == -1 else crt)
@@ -93,6 +95,15 @@ def main():
                 shapes.append((3, 0, case(f"var_bfast_b{bt}_n{N}", {"extent": [9, 33, bt], "label": [1, 3, 4]}, {"extent": [11, 33, bt], "label": [2, 3, 4]},
                                           {"extent": [9, 11, bt], "label": [1, 2, 4]}, N, "pow2" if N % 2 else "u"))
                           )
+            # issue 23 (k5fin): n % 4 == 0 (the vector metadata loads), and rows of 32 / 33 / 128 j-bar groups of 4 (a warp inside one row, a warp across two rows), n % 4 != 0 with long rows
+            for nn_, mm_ in ((64, 5), (132, 3), (512, 2), (130, 3)):
+                shapes.append((2, 4, case(f"var_E=4_m{mm_}_n{nn_}_N{N}", {"extent": [mm_, 70], "label": [1, 3]}, {"extent": [nn_, 70], "label": [2, 3]},
+                                          {"extent": [mm_, nn_], "label": [1, 2]}, N, "pow2" if N % 2 else "u", "TRUNC" if N % 3 == 0 else "RN")))
+            for variant, elems, bt_, nn_ in ((0, 1, 1, 64), (1, 2, 1, 132)):
+                shapes.append((variant, elems, case(f"var_{names[variant]}_n{nn_}_N{N}", {"extent": [6, 33], "label": [1, 3]}, {"extent": [nn_, 33], "label": [2, 3]},
+                                                    {"extent": [6, nn_], "label": [1, 2]}, N, "u")))
+            shapes.append((3, 0, case(f"var_bfast_b6_n64_N{N}", {"extent": [9, 33, 6], "label": [1, 3, 4]}, {"extent": [64, 33, 6], "label": [2, 3, 4]},
+                                      {"extent": [9, 64, 6], "label": [1, 2, 4]}, N, "u")))
             for variant, elems, c in shapes:
                 hs = []
                 for crt, seq in vcombos:
@@ -100,17 +111,25 @@ def main():
                     lib.set_seq(seq)
                     lib.set_k5_elems(elems)
                     lib.k5_launch_counts(reset=True)
+                    lib.k5_fin_counts(reset=True)
                     hs.append(T.hash_c(T.run_gpu(lib, cuda, c)))
                     seen = lib.k5_launch_counts(reset=True)
                     if seen != {(crt, variant): 1}:
                         bad.append(f"{c['name']}: CRT {crt} seq {seq}: the K5 launches were {seen}, expected exactly one launch of variant {names[variant]} ({crt}, {variant})")
+                    fin = lib.k5_fin_counts(reset=True)   # k5fin (bit 128) runs for the limb CRT + F1 + bit 128, nowhere else
+                    want_fin = {variant: 1} if (crt == 1 and (seq & 132) == 132) else {}
+                    if fin != want_fin:
+                        bad.append(f"{c['name']}: CRT {crt} seq {seq}: the k5fin launches were {fin}, expected {want_fin}")
                 for crt, seq in dcombos:
                     lib.set_k5_crt(crt)
                     lib.set_seq(seq)
                     lib.set_k5_elems(elems)
                     lib.k5_launch_counts(reset=True)
+                    lib.k5_fin_counts(reset=True)
                     hs.append(T.hash_c(T.run_gpu(lib, cuda, c)))
                     seen = lib.k5_launch_counts(reset=True)
+                    if lib.k5_fin_counts(reset=True):
+                        bad.append(f"{c['name']}: crt hook {crt} seq hook {seq}: a k5fin kernel ran, but no class default has bit 128")
                     if seen != {(want(crt, seq), variant): 1}:
                         bad.append(f"{c['name']}: crt hook {crt} seq hook {seq}: the K5 launches were {seen}, expected exactly one launch of variant {names[variant]} ({want(crt, seq)}, {variant})")
                 n += 1

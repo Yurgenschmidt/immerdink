@@ -350,6 +350,23 @@ if(Python3_FOUND)
     set_tests_properties(bench_seq_crt PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
   endif()
   if(IMMERDINK_SEQ_TWINS)
+  # Issue 23 (docs/NOTES-23-k5.md): the k5fin kernels (bit 128: set 133 = E1 + F1 + 128 with the limb CRT forced, IMD_TEST_K5_CRT=1) against the oracle and the committed hashes.
+  # (On an RTX 4090 the limb CRT is slow but exact; tests/test_crt_f64_gpu.py compares them with the shipped kernels and checks that they ran.)
+  foreach(suite e2e eps tensor every_n bigk)
+    add_test(NAME contract_${suite}_k5fin
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                     --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+    set_tests_properties(contract_${suite}_k5fin PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800
+                         ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=133;IMD_TEST_K5_CRT=1")
+  endforeach()
+  add_test(NAME output_hashes_k5fin
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+  set_tests_properties(output_hashes_k5fin PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800 ENVIRONMENT "IMD_TEST_SEQ=133;IMD_TEST_K5_CRT=1")
+  add_test(NAME output_hashes_large_k5fin
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags large)
+  set_tests_properties(output_hashes_large_k5fin PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800 ENVIRONMENT "IMD_TEST_SEQ=133;IMD_TEST_K5_CRT=1")
   add_test(NAME output_hashes_large_seq7
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
                    --lib "$<TARGET_FILE:immerdink>" --tags large)

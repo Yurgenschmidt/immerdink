@@ -43,7 +43,7 @@ import crt_f64 as C  # noqa: E402
 import harness as hz  # noqa: E402
 
 WORDS = 5   # src/contract.cu kTestCrtWords
-INT, LIMB = 0, 1
+INT, LIMB, FINK = 0, 1, 10   # FINK: the limb CRT of the k5fin kernels (issue 23: the final subtraction of P as one carry chain), checked against the same integers
 # Mutation 2, the bias 2^-40, is reported but not required to be caught: the worst-case error of the quotient estimate (spec/crt_f64.py bound 2^-37) does not
 # exclude it from being a defect, but the observed overshoot of the estimate with no bias at all is at most about 2^-43 in every search (the real error is a few
 # ulps of a quotient below 2^11, ulp 2^-42 and below), so 2^-40 works on every vector found; it is a defect only for a vector of quotient above 2^11 with a
@@ -269,13 +269,13 @@ def main():
                 zc = z if z <= c.plan.H else z - P
                 assert c.crt(W) == z and o.crt(W, c.plan) == zc, (N, z)
             for e in range(4):
-                for variant in (INT, LIMB):
+                for variant in (INT, LIMB, FINK):
                     got = run(lib, cuda, N, variant, e, Wmat, d_W, d_out)
                     total += count
                     bad = [(zs[i], got[i]) for i in range(count) if got[i] != zs[i]]
                     if bad:
                         z, g = bad[0]
-                        fails.append(f"N={N} e={e} {'limb' if variant else 'integer'} CRT: {len(bad)} of {count} wrong, first z={z:#x} got {g:#x} (xor {z ^ g:#x})")
+                        fails.append(f"N={N} e={e} {'integer' if variant == INT else 'limb' if variant == LIMB else 'k5fin limb'} CRT: {len(bad)} of {count} wrong, first z={z:#x} got {g:#x} (xor {z ^ g:#x})")
                     # the shipped model is bit-exact too (also checks the model_device code against the device for mut 0)
                 if e == 0 or e == 3:
                     for variant, name in MUTS.items():
