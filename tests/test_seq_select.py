@@ -5,7 +5,7 @@
 
 Pins the per-class defaults against this GPU's compute capability (sm_89: E1 = 1; sm_90: E1 + F1 + limb CRT = 13 (R2); anything
 else, sm_120 included: 0), checks that a forced set (imd_test_set_seq) is what a plan reports, that -1 restores the class default, and that the
-invalid sets (the Q1 bit without the E1 bit, bit 8 (the limb CRT is a class default only) and out of range) are rejected. The K5 CRT hook is tri-state (-1 follow
+invalid sets (the Q1 bit without the E1 bit, bit 128 (k5fin) without F1, bit 8 (the limb CRT is a class default only) and out of range) are rejected. The K5 CRT hook is tri-state (-1 follow
 the plan's set, 0 integer, 1 limbs): what the plan's K5 runs (imd_test_plan_crt) is pinned for the default, each forced value, and a forced set 0..7 (integer unless the hook forces limbs). A seq run that silently ran the default would
 pass every bit-identity test without testing anything; this and the harness's IMD_TEST_SEQ read-back are the guard.
 """
@@ -38,7 +38,7 @@ def main():
     cuda.check(cuda.rt.cudaDeviceGetAttribute(C.byref(minor), 76, dev), "cc minor")
     want_default = DEFAULTS.get((major.value, minor.value), 0)
     if args.no_seq_twins:
-        want_default &= ~(2 | 4)   # the F1 / Q1 kernels are not compiled: the class default is masked
+        want_default &= ~(2 | 4 | 128)   # the F1 / Q1 / k5fin kernels are not compiled: the class default is masked
     T = {X: hz.make_tensor(e, hz.dense(e), l) for X, e, l in
          (("A", [16, 32], [1, 3]), ("B", [24, 32], [2, 3]), ("C", [16, 24], [1, 2]))}
     st, plan = lib.plan_create(T["A"], T["B"], T["C"], 8)
@@ -49,13 +49,13 @@ def main():
         if os.environ.get("IMD_TEST_SEQ") in (None, ""):
             if lib.plan_seq(plan) != want_default:
                 bad.append(f"default set {lib.plan_seq(plan)}, expected {want_default} on sm_{major.value}{minor.value}")
-        for bits in ((0, 1) if args.no_seq_twins else (0, 1, 3, 4, 5, 7)):
+        for bits in ((0, 1) if args.no_seq_twins else (0, 1, 3, 4, 5, 7, 132, 133, 135)):   # 132..135: issue 23, k5fin (bit 128) with F1
             lib.set_seq(bits)
             if lib.plan_seq(plan) != bits or lib.get_seq() != bits:
                 bad.append(f"forced {bits}: the plan reports {lib.plan_seq(plan)}, the hook {lib.get_seq()}")
-        for bits in ((2, 3, 4, 8, 9, 13, -2) if args.no_seq_twins else (2, 6, 8, 9, 13, 15, 16, -2)):
+        for bits in ((2, 3, 4, 8, 9, 13, 128, 129, -2) if args.no_seq_twins else (2, 6, 8, 9, 13, 15, 16, 128, 129, 130, 136, 140, 256, -2)):   # 128 / 129 / 130: k5fin without F1
             if lib.lib.imd_test_set_seq(bits) == 0:
-                bad.append(f"set {bits} (Q1 without E1, or out of range) was accepted")
+                bad.append(f"set {bits} (Q1 without E1, k5fin without F1, or out of range) was accepted")
         lib.set_seq(-1)
         if lib.get_seq() != -1:
             bad.append("-1 did not restore the class default")
@@ -78,7 +78,7 @@ def main():
             lib.set_k5_crt(1)
             if lib.plan_crt(plan) != 1:
                 bad.append("crt f64 with the class default set did not run the limb CRT")
-        for bits in ((0, 1) if args.no_seq_twins else (0, 1, 5, 7)):   # forced sets 0..7: integer CRT unless the hook forces limbs
+        for bits in ((0, 1) if args.no_seq_twins else (0, 1, 5, 7, 133)):   # forced sets 0..7 and 128 + ...: integer CRT unless the hook forces limbs
             lib.set_seq(bits)
             lib.set_k5_crt(-1)
             if lib.plan_crt(plan) != 0:

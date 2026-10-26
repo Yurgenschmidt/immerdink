@@ -175,6 +175,9 @@ std::atomic<int>& pad_mutation();
 cudaError_t test_crt_elem(int N, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out);
 void test_note_k5_launch(bool limb_crt, int variant);
 void test_k5_launch_counts(bool reset, int64_t* out);
+// Issue 23: launches of the k5fin kernels (seq bit 128) since the last reset, [variant 0 / 1 / 2 / 3 as above]; test_note_k5_fin_launch is called by launch_k5 only when one runs.
+void test_note_k5_fin_launch(int variant);
+void test_k5_fin_counts(bool reset, int64_t* out);
 #endif
 
 // The execution data of a plan (api.cpp), for the test hooks; nullptr for a null plan.
