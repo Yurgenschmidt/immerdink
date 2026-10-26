@@ -2084,6 +2084,7 @@ struct Bench {
     DevBuf ws;
     imd_lowering_t low{};
     int32_t k4_run = -1;
+    int32_t seq_eff = -1, crt_eff = -1;  // issue 21: the set and CRT the side ran (-1: not read back, non-profiling build), read after its hooks are set
     double create_ms = 0;
     ~DuelPlan() {
       if (plan) { cudaDeviceSynchronize(); imd_plan_destroy(plan); }  // a resident plan outlives its work
@@ -2145,6 +2146,18 @@ struct Bench {
       (void)p;
 #endif
     };
+    // issue 21: the EFFECTIVE sequence set and CRT of a side (duel_config only records what was asked: "default" is the class's set), read back
+    // from the plan with the side's hooks set, i.e. what its launches run.
+    auto read_eff = [&](DuelPlan& p) {
+#ifdef IMD_BENCH_PROFILE
+      int32_t sq = -1, cr = 0;
+      if (imd_prof_plan_seq(p.plan, &sq) != 0 || imd_prof_plan_crt(p.plan, &cr) != 0) throw Failure("imd_prof_plan_seq / imd_prof_plan_crt");
+      p.seq_eff = sq;
+      p.crt_eff = cr;
+#else
+      (void)p;
+#endif
+    };
     auto call = [&](const DuelPlan& p, double* C) {
       CI(imd_contract(p.plan, 1.0, dA.as<double>(), dB.as<double>(), 0.0, C, p.ws.p, p.wsb, s));
     };
@@ -2191,8 +2204,8 @@ struct Bench {
     // Accuracy of each side from one fresh call into a poisoned C, then bit identity.
     CU(cudaMemset(Ca, 0xff, dC.bytes));
     CU(cudaMemset(Cb, 0xff, dC2.bytes));
-    set_k5(*pa); call(*pa, Ca);
-    set_k5(*pb); call(*pb, Cb);
+    set_k5(*pa); read_eff(*pa); call(*pa, Ca);
+    set_k5(*pb); read_eff(*pb); call(*pb, Cb);
 #ifdef IMD_BENCH_PROFILE
     if (k5_hook) imd_prof_set_k5_elems(0), imd_prof_set_k5_crt(-1), imd_prof_set_seq(-1);
 #endif
@@ -2214,6 +2227,7 @@ struct Bench {
       e.integer("g", (long long)((p.cfg.g == 0 || p.cfg.g >= p.cfg.N) ? p.cfg.N : p.cfg.g));
       e.integer("k4_rule", p.low.k4_config).integer("k4_config", p.k4_run);
       e.integer("kernel_launches", p.low.kernel_launches);
+      if (p.seq_eff >= 0) e.integer("seq_eff", p.seq_eff).str("crt_eff", p.crt_eff ? "f64" : "int");
       e.integer("fused", p.low.fused).integer("fused_large", p.low.fused_large);
       e.integer("k_align", p.low.k_align).integer("k_hat", (long long)p.low.k_hat);
       return e;

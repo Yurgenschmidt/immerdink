@@ -47,7 +47,7 @@ struct SeqClass {
 };
 constexpr SeqClass kSeqClasses[] = {
     {8, 9, kSeqEmit},  // RTX 4090: E1 (integer only; fewer instructions in every pack kernel counted). Q1 / F1 / the limb CRT would sit on a 1/64-rate FP64 pipe
-    {9, 0, kSeqEmit | kSeqFinish | kSeqLimbCrt},  // H100, H200 (R2): E1 + F1 + limb CRT = 13 (whole call +3..8% at N = 14 squares, up to +18% r_lowk, no case slower, bit-identical). Q1 stays opt-in: alone it ties and is 0.98x at g = 7
+    {9, 0, kSeqEmit | kSeqFinish | kSeqLimbCrt},  // H100, H200 (R2): E1 + F1 + limb CRT = 13 (bit-identical). The measured gain is the limb CRT's given E1 + F1 (the crtf1 duels: +4..7% at N = 14 squares, 1.041 / 1.058 / 1.074 at 8192 / 4096 / 2048, r_lowk 1.183); the adopted set was not measured against the old default directly, chaining f1 x crtf1 gives about +6..10% at the same cases. Q1 stays opt-in: alone it ties and is 0.98x at g = 7
 };
 
 constexpr int seq_default_for(int32_t cc_major, int32_t cc_minor) {
