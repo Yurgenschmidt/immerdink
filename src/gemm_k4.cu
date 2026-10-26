@@ -225,7 +225,7 @@ bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, 
           return;
         }
       }
-      g_wgmma_declined.fetch_add(1, std::memory_order_relaxed);  // not served (illegal, below the floor, or refused): mma.sync runs it
+      g_wgmma_declined.fetch_add(1, std::memory_order_relaxed);  // not served (illegal, unprofitable by the class rule, or refused): mma.sync runs it
     }
     ok = it != map.end() && ops.launch(it->second, L.k0 != 0, call, stream);
     if (prof) IMD_PROF(stream, L.k0 == 0 ? "K4 gemm store" : "K4 gemm add");

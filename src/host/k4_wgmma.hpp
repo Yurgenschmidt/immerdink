@@ -100,35 +100,89 @@ constexpr const char* k4_wgmma_illegal(const K4WgmmaLaunch& L) {
   return nullptr;
 }
 
-// PROFITABILITY (the default; a forced backend skips it): serve only where the evidence is. R2 timed m = n = k in {4096, 8192}, batch
-// 14, 4 and 1 (and nothing smaller); the kernel was 1.47-1.56x the mma.sync K4 there. The floor below is a placeholder just inside
-// the measured region, to be replaced by the R3 shape sweep (docs/NOTES-22.md): at least 1024 in each of m, n-part and K chunk (8 k
-// tiles of 128) and at least two waves of tiles.
-constexpr int64_t kK4WgmmaAutoMinMN = 1024, kK4WgmmaAutoMinK = 1024;
-constexpr int kK4WgmmaAutoMinWaves = 2;
+// PROFITABILITY (the default; a forced backend skips it): serve a launch where the estimated wgmma time beats the mma.sync K4's with a
+// margin, per device class (docs/NOTES-22.md "Profitability rule": data, fit, validation, limits, how to re-fit; the constants are the
+// R3 floor sweep of H100 and H200, tools/fit_k4_wgmma_profit.py re-derives them). For a launch of T = tm * tn * zc output tiles (the 128 x 256
+// CTA tile; the mma.sync K4 has the same tile) on a device of S SMs, kt = ceil(kc / 128) k steps, w = T / S (waves, fractional):
+//     delta_us = launch_us + w * (wave_us + wave_k_us * kt)        wgmma minus mma.sync (negative: wgmma faster)
+//     mma_us   = mma_wave_k_us * w * kt                            lower estimate of the mma.sync K4 time (no per-wave fixed cost)
+// served iff  m, nc >= min_mn  and  kc >= min_kc  and  T >= min_fill * S  and  -delta_us >= max(min_gain_us, min_gain_rel * mma_us).
+// The two margins are the conservatism: an absolute one (the model's launch-level residual, about a microsecond on the shapes at the
+// boundary) and one relative to the K4 time (a K4 gain of 10 % is about 2 % of a call whose K4 share is 20 %, the smallest share measured).
+// min_mn / min_kc are the measured envelope (smallest m and n-part 512, smallest K chunk 256): the linear model is not extrapolated below it.
+// min_fill is a prior and not a fit: a launch with fewer tiles than half the SMs leaves most of the persistent 2x1-cluster grid idle; the
+// one loser measured (1024^3, one modulus per launch, 32 tiles = 0.24 of the SMs) lies below it, the nearest winner (72 tiles) above.
+struct K4WgmmaProfit {
+  bool enabled;            // false: the class has no evidence (nothing is served by default)
+  double launch_us;        // per-launch cost of the wgmma kernel over the mma.sync kernel
+  double wave_us;          // per wave, tile-fixed part (negative: faster epilogue)
+  double wave_k_us;        // per wave and k step of 128 (negative: faster mainloop)
+  double mma_wave_k_us;    // mma.sync K4 per wave and k step (R3 K4 phase 965 / 995 TOPS-eq on H100 -> 1.11-1.15)
+  double min_gain_us;      // absolute margin per launch
+  double min_gain_rel;     // margin relative to mma_us
+  double min_fill;         // fewest tiles per launch, as a fraction of the SMs
+  int64_t min_mn;          // fewest rows m and columns of the n-part (the measured envelope)
+  int64_t min_kc;          // shortest K chunk (the measured envelope)
+};
+// One row per table set, like kK4WgmmaTable; the sm_89 row has no backend and so no rule. H100 and H200 share the sm_90 row (fit on both).
+constexpr K4WgmmaProfit kK4WgmmaProfit[IMD_TABLE_COUNT] = {
+    {false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0},                    // IMD_TABLE_SM89
+    {true, 2.40, -0.57, -0.51, 1.13, 0.75, 0.10, 0.5, 512, 256},        // IMD_TABLE_SM90 (R3, 19 shapes x 2 cards, N = 14)
+};
+constexpr int kK4WgmmaDefaultSms = 132;  // used when the plan does not know the SM count
+
+struct K4WgmmaEstimate {
+  double delta_us;  // wgmma minus mma.sync, estimated
+  double mma_us;    // the mma.sync K4 time estimate the relative margin uses
+  bool serve;       // the rule's verdict (envelope, fill and gain)
+  bool envelope_ok; // m, nc, kc inside the measured envelope
+  bool fill_ok;
+};
+constexpr K4WgmmaEstimate k4_wgmma_estimate(const K4WgmmaLaunch& L, const K4WgmmaProfit& P) {
+  const int64_t tm = (L.m + kK4WgmmaTileM - 1) / kK4WgmmaTileM, tn = (L.nc + kK4WgmmaTileN - 1) / kK4WgmmaTileN;
+  const double tiles = static_cast<double>(tm * tn * L.zc), sms = L.sms > 0 ? L.sms : kK4WgmmaDefaultSms;
+  const double kt = static_cast<double>((L.kc + kK4WgmmaTileK - 1) / kK4WgmmaTileK), w = tiles / sms;
+  K4WgmmaEstimate e{};
+  e.delta_us = P.launch_us + w * (P.wave_us + P.wave_k_us * kt);
+  e.mma_us = P.mma_wave_k_us * w * kt;
+  e.envelope_ok = L.m >= P.min_mn && L.nc >= P.min_mn && L.kc >= P.min_kc;
+  e.fill_ok = tiles >= P.min_fill * sms;
+  const double need = P.min_gain_us > P.min_gain_rel * e.mma_us ? P.min_gain_us : P.min_gain_rel * e.mma_us;
+  e.serve = P.enabled && e.envelope_ok && e.fill_ok && -e.delta_us >= need;
+  return e;
+}
 
 // The tile / scheduler choice. Scheduler arguments are set explicitly (R2: at 8192^3 the default scheduler cost the 128x256 kernels 27 %
 // on H100): tiles per batch >= 1024 (8192^2 has 2048, 4096^2 has 512) -> swizzle 8, raster AlongN; below -> CUTLASS's default (swizzle 1,
 // heuristic), which R2 measured at 4096^3. 2x1 cluster, queried persistent grid.
 constexpr int64_t kK4WgmmaSwizzleTiles = 1024;
-constexpr K4WgmmaPick k4_wgmma_pick(const K4WgmmaLaunch& L, bool force) {
+constexpr K4WgmmaPick k4_wgmma_pick(const K4WgmmaLaunch& L, bool force, int32_t table_id = IMD_TABLE_SM90) {
   K4WgmmaPick p;
   if (const char* bad = k4_wgmma_illegal(L)) {
     p.why = bad;
     return p;
   }
-  const int64_t tm = (L.m + kK4WgmmaTileM - 1) / kK4WgmmaTileM, tn = (L.nc + kK4WgmmaTileN - 1) / kK4WgmmaTileN;
   if (!force) {
-    if (L.m < kK4WgmmaAutoMinMN || L.nc < kK4WgmmaAutoMinMN || L.kc < kK4WgmmaAutoMinK) {
-      p.why = "below the profitability floor (size)";
+    if (table_id < 0 || table_id >= IMD_TABLE_COUNT || !kK4WgmmaProfit[table_id].enabled) {
+      p.why = "no profitability rule for this device class";
       return p;
     }
-    if (tm * tn * L.zc < int64_t{kK4WgmmaAutoMinWaves} * (L.sms > 0 ? L.sms : 132)) {
-      p.why = "below the profitability floor (waves)";
+    const K4WgmmaEstimate e = k4_wgmma_estimate(L, kK4WgmmaProfit[table_id]);
+    if (!e.envelope_ok) {
+      p.why = "below the profitability rule (outside the measured envelope)";
+      return p;
+    }
+    if (!e.fill_ok) {
+      p.why = "below the profitability rule (fill)";
+      return p;
+    }
+    if (!e.serve) {
+      p.why = "below the profitability rule (estimated gain)";
       return p;
     }
   }
   p.variant = 0;
+  const int64_t tm = (L.m + kK4WgmmaTileM - 1) / kK4WgmmaTileM, tn = (L.nc + kK4WgmmaTileN - 1) / kK4WgmmaTileN;
   if (tm * tn >= kK4WgmmaSwizzleTiles) p.swizzle = 8, p.raster = kRasterAlongN;
   p.why = force ? "forced" : "served";
   return p;
