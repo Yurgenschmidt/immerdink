@@ -129,6 +129,12 @@ FP64-bound anyway. Each class may adopt the bit later only with its own duel (`s
   limb CRT + F1 + 128 and nowhere else. `tests/test_crt_f64_unit.py` also runs the limb CRT of the k5fin kernels (variant 10: the carry-chain subtraction) against the exact
   integers on the edge vectors (the mutation checks target the shipped limb CRT; the carry chain is one expression whose only failure mode is a wrong select, which
   the edge vectors z = P - 1, P - 2, H, H + 1, 0, 1 and the random vectors of that test cover).
+* **Graph capture / replay**: `graph_capture_k5fin` runs the existing `test_graph` (global-mode capture, replay, bit-exact vs the eager call, both vec modes, packed operands, g > 1, a
+  batched tensor, alpha = 0) with `IMD_TEST_SEQ=133;IMD_TEST_K5_CRT=1` and requires k5fin launches (28 on the 4090; the K5 launch is a plain kernel launch on the caller's stream).
+* **Full `tools/test.sh`** (4090, sm_89, memcap, GPU lock): host-only pass 34 / 34 and GPU pass 80 / 80, including `contract_{e2e,eps,tensor,every_n,bigk}_k5fin`,
+  `output_hashes_k5fin` (the 19 committed hashes reproduced; k5fin ran in all 19 cases: 11 x E = 1, 1 x E = 2, 6 x E = 4, 1 x batch fastest) and `output_hashes_large_k5fin`;
+  after the last edits (`IMD_NO_SEQ_TWINS` guards, graph test) the k5fin / seq / crt_f64 / device_status / graph subset was rerun (31 / 31 and 2 / 2). With
+  `IMMERDINK_SEQ_TWINS=OFF` `contract.cu` compiles clean under `-Werror=all-warnings` with no k5f kernel.
 * **Device-status coverage**: `tests/check_kernel_sites.py` (the `device_kernel_sites` test) requires every launched kernel name to be in the device-status list; `extra_kernel_versions`
   gained two entries (12: a `k5f_crt_n` instance, 13: a `k5f_crt_bfast` instance; without the sequence twins they stand in with the shipped K5), `kExtraKernels` 12 -> 14.
   Host-side only: the SASS table above was rebuilt and re-compared after that change (identical).

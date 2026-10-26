@@ -359,6 +359,10 @@ if(Python3_FOUND)
     set_tests_properties(contract_${suite}_k5fin PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800
                          ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=133;IMD_TEST_K5_CRT=1")
   endforeach()
+  # graph capture and replay of the k5fin kernels (test_graph reads the same two variables and requires at least one k5fin launch)
+  add_test(NAME graph_capture_k5fin COMMAND test_graph)
+  set_tests_properties(graph_capture_k5fin PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600
+                       ENVIRONMENT "IMD_TEST_SEQ=133;IMD_TEST_K5_CRT=1;IMD_TEST_REQUIRE_K5FIN=1")
   add_test(NAME output_hashes_k5fin
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
                    --lib "$<TARGET_FILE:immerdink>" --tags small mid)
