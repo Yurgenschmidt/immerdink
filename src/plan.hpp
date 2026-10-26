@@ -12,6 +12,7 @@
 #include "host/k4_launches.hpp"
 #include "host/pack.hpp"
 #include "host/plan_data.hpp"
+#include "host/seq_config.hpp"
 #include "immerdink/immerdink.h"
 
 namespace imd::detail {
@@ -132,7 +133,11 @@ int64_t& k5_one_elem_per_sm();
 // imd_contract; changed only by the hooks imd_test_set_k5_elems / imd_prof_set_k5_elems.
 int& k5_elems_override();
 std::atomic<int>& seq_override();      // issue 21: -1 the plan's set (host/seq_config.hpp), else a forced set of kSeq* bits for every plan (hooks only; relaxed)
-std::atomic<int>& k5_crt_override();   // issue 21: 0 integer CRT, 1 binary64-limb CRT (process-wide: all devices, streams and plans; a graph captures it at capture time)
+std::atomic<int>& k5_crt_override();   // issue 21: -1 follow the plan's set (kSeqLimbCrt), 0 force the integer CRT, 1 force the binary64-limb CRT (process-wide: all devices, streams and plans; a graph captures it at capture time)
+// The CRT variant K5 runs for a plan now: the limb CRT when the set the plan runs carries kSeqLimbCrt (a forced set 0..7 never does), unless the K5 hook forces one.
+inline bool k5_limb_crt(const ExecPlan& p) {
+  return seq_limb_crt(seq_effective(p.seq, seq_override().load(std::memory_order_relaxed)), k5_crt_override().load(std::memory_order_relaxed));
+}
 // v1.13 §4b (hygiene; contract.cu, test hook imd_test_set_pad_mutation): -1 (production) or
 // the post-swap operand x (0 = the GEMM's A, 1 = its B) whose K2 / K3 pack stores only k-bar
 // < ceil(k)_16 (Pipeline neg_a64_pad_old_k3: [ceil(k)_16, k_hat) left unwritten on one side

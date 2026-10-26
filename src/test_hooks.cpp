@@ -23,14 +23,22 @@
 //       (DESIGN v1.5 §4). Results must not change. Returns 0, or 1 for another value.
 //
 //   imd_test_set_k5_crt(variant)
+//       issue 21: every later imd_contract runs K5's CRT with the sums in binary64 limbs (1) or the integer running CRT (0); -1
+//       (default) the plan's set decides (the device class's kSeqLimbCrt bit; a forced set 0..7 has none = integer).
+//       Results must not change. Returns 0, or 1 for another value.
+//   imd_test_get_k5_crt()
+//       the hook's state (-1, 0, 1).
+//   imd_test_plan_crt(plan)
+//       the CRT variant the plan's K5 runs now, whatever decided it (0 integer, 1 limbs); -1 for a null plan.
 //   imd_test_set_seq(bits)
 //       issue 21: every later imd_contract runs the instruction-sequence set `bits` (1 E1 emitter, 2 Q1 quantize, 4 F1 finish;
 //       host/seq_config.hpp), -1 the plan's (device class) set. Results must not change. Returns 0, or 1 for another value
-//       (also for the Q1 bit without the E1 bit).
+//       (also for the Q1 bit without the E1 bit, and for 8..15: the limb-CRT bit 8 is a class default only, see imd_test_set_k5_crt).
 //   imd_test_get_seq()
 //       the forced set (-1: none).
 //   imd_test_plan_seq(plan)
-//       the set the plan's launches run now: the forced one, else the plan's device-class default; -1 for a null plan.
+//       the set the plan's launches run now: the forced one, else the plan's device-class default (which may carry bit 8,
+//       the limb CRT: sm_90 = 13); -1 for a null plan.
 //   imd_test_set_k5_one_elem(per_sm)
 //       K5 (j-bar fastest) takes one element per thread while b m n <= per_sm x SMs, else
 //       4 per thread with warp-transposed stores. per_sm -1 restores the production value;
@@ -183,11 +191,17 @@ IMD_API int imd_test_k5_launch_counts(int reset, int64_t* out) {
   return 0;
 }
 
-// Issue 21: K5's CRT with the sums in binary64 limbs (1) or the integer running CRT (0, the default).
+// Issue 21: K5's CRT: the sums in binary64 limbs (1), the integer running CRT (0), or -1 (the default) the plan's set decides (kSeqLimbCrt of the device class).
 IMD_API int imd_test_set_k5_crt(int variant) {
-  if (variant != 0 && variant != 1) return 1;
+  if (variant < -1 || variant > 1) return 1;
   imd::detail::k5_crt_override() = variant;
   return 0;
+}
+IMD_API int imd_test_get_k5_crt(void) { return imd::detail::k5_crt_override().load(); }
+// The CRT variant the plan's K5 runs now (0 integer, 1 limbs), whatever decided it; -1 for a null plan.
+IMD_API int imd_test_plan_crt(imd_plan_t plan) {
+  const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
+  return e == nullptr ? -1 : (imd::detail::k5_limb_crt(*e) ? 1 : 0);
 }
 
 IMD_API int imd_test_set_pad_mutation(int operand) {
