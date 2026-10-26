@@ -62,6 +62,14 @@ if(Python3_FOUND)
   target_link_libraries(test_l2_knobs PRIVATE imd_host_internal imd_warnings)
   add_test(NAME host_l2_knobs COMMAND test_l2_knobs)
 
+  # Issue 21 / R2: the per-device-class sequence defaults (sm_90 = E1 + F1 + limb CRT = 13, sm_89 = 1, sm_120 = 0) and the forcing rules. CPU only, CUDA-free.
+  add_executable(test_seq_table test_seq_table.cpp)
+  target_link_libraries(test_seq_table PRIVATE imd_host_internal imd_warnings)
+  if(NOT IMMERDINK_SEQ_TWINS)
+    target_compile_definitions(test_seq_table PRIVATE IMD_NO_SEQ_TWINS=1)
+  endif()
+  add_test(NAME host_seq_table COMMAND test_seq_table)
+
   # The Python wrapper (python/immerdink/host.py) over libimmerdink_host vs the C ABI and
   # vs spec/params.py and spec/oracle.py (lowering summary, sizes, g sweep). CPU only.
   add_test(NAME host_python

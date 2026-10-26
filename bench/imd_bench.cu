@@ -27,7 +27,7 @@
 //             call, in one process (docs/BENCHMARKING.md "Tiny shapes", NOTES-A5 §1.2): both
 //             sides see the same GPU clock / DVFS / host-core state. A side is "default" or
 //             a comma list of N=<n>, vec=generate|resident, g=<g> (0 = N),
-//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule), crt=int|f64 (issue 21), seq=default|0..7 (issue 21: the instruction-sequence set, bits 1 E1 emitter / 2 Q1 quantize / 4 F1 finish; default = the device class's), k4b=default|mma|wgmma (issue 22: the K4 backend of the side's plan; wgmma = every legal launch on a Hopper, the profitability floor lifted; a device without the backend runs mma.sync, see k4b_run in the record), ka=auto|16|64 (v1.13 §4b:
+//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule), crt=default|int|f64 (issue 21: K5's CRT; default = the device class's set decides, sm_90: limbs), seq=default|0..7 (issue 21: the instruction-sequence set, bits 1 E1 emitter / 2 Q1 quantize / 4 F1 finish; default = the device class's, sm_90: 13 = E1 + F1 + the limb CRT; a forced 0..7 runs the integer CRT unless crt=f64), k4b=default|mma|wgmma (issue 22: the K4 backend of the side's plan; wgmma = every legal launch on a Hopper, the profitability floor lifted; a device without the backend runs mma.sync, see k4b_run in the record), ka=auto|16|64 (v1.13 §4b:
 //             the side's K alignment, via the test hook at plan creation); unset keys keep the plan
 //             defaults, N defaults to the --N value. Defaults: A = default (the K4 rule),
 //             B = k4=tune (the plan-time K4 autotune); when both pick the same K4
@@ -613,11 +613,11 @@ struct Options {
   bool clock_probe = false;
   int k_align_hook = 0;  // v1.13 §4b: --k-align (0 = auto) / IMD_BENCH_K_ALIGN
   // Issue 21 (method imd): --seq <0..7|default> forces the instruction-sequence set (bits 1 E1, 2 Q1, 4 F1; -1 = the device class's),
-  // --crt <int|f64> K5's CRT variant. Set for the method's plan and calls only, then reset.
-  int seq = -1, crt = 0;
+  // --crt <default|int|f64> K5's CRT variant (-1 default: the class's set decides, 0 int, 1 f64). Set for the method's plan and calls only, then reset.
   // Issue 22 (method imd): --k4b <default|mma|wgmma> the K4 backend of the plan (-1 the device class's rule; wgmma forces every legal launch onto the
   // Hopper kernel, lifting its profitability floor; unavailable on a device without it: the plan then runs mma.sync and the record says so).
   int k4b = -1;
+  int seq = -1, crt = -1;
   bool l2_flush = false;
   // Campaign kit: --keep-samples 1 adds the raw per-repetition times to the timed records ("samples_s", seconds), and to
   // method duel's duel-b record both sides' times of every interleaved pair ("pair_t_a", "pair_t_b"), so the analyzer can
@@ -752,7 +752,7 @@ std::pair<Timing, Timing> time_pair(const std::function<void()>& a, const std::f
 // elements per thread. Forced k4 / k5 go through the benchmark hooks (profiling build).
 struct DuelSide {
   int N = 14, vec = IMD_VEC_GENERATE, g = 0, k4 = -1, k5 = 0;
-  int crt = 0;  // issue 21: 0 the integer running CRT, 1 the sums in binary64 limbs (benchmark hook)
+  int crt = -1;  // issue 21: -1 the class set decides (sm_90: limbs), 0 the integer running CRT, 1 the sums in binary64 limbs (benchmark hook)
   int seq = -1;  // issue 21: -1 the device class's instruction-sequence set, else forced bits (benchmark hook)
   int k4b = -1;  // issue 22: the K4 backend of the plan: -1 the device class's rule, 0 mma.sync, 1 wgmma (plan-time benchmark hook)
   int ka = -1;  // v1.13 §4b: -1 = the run's --k-align, 0 = AUTO, 16 / 64 = forced (plan-time hook)
@@ -761,7 +761,7 @@ struct DuelSide {
     d += vec == IMD_VEC_RESIDENT ? " vec=resident" : " vec=generate";
     d += k4 == -1 ? " k4=rule" : k4 == -2 ? " k4=tune" : " k4=" + std::to_string(k4);
     d += k5 == 0 ? " k5=rule" : " k5=" + std::to_string(k5);
-    if (crt != 0) d += " crt=f64";
+    if (crt >= 0) d += crt == 1 ? " crt=f64" : " crt=int";
     if (seq >= 0) d += " seq=" + std::to_string(seq);
     if (k4b >= 0) d += k4b == 0 ? " k4b=mma" : " k4b=wgmma";
     if (ka >= 0) d += ka == 0 ? " ka=auto" : " ka=" + std::to_string(ka);
@@ -784,12 +784,12 @@ DuelSide parse_duel_side(const std::string& spec, int N) {
     else if (k == "g") d.g = std::stoi(v);
     else if (k == "k4") d.k4 = v == "rule" ? -1 : v == "tune" ? -2 : std::stoi(v);
     else if (k == "k5" && (v == "0" || v == "1" || v == "2" || v == "4")) d.k5 = std::stoi(v);
-    else if (k == "crt" && (v == "int" || v == "f64")) d.crt = v == "f64";
+    else if (k == "crt" && (v == "default" || v == "int" || v == "f64")) d.crt = v == "default" ? -1 : v == "f64";
     else if (k == "seq" && (v == "default" || (v.size() == 1 && v[0] >= '0' && v[0] <= '7'))) d.seq = v == "default" ? -1 : std::stoi(v);
     else if (k == "k4b" && (v == "default" || v == "mma" || v == "wgmma")) d.k4b = v == "default" ? -1 : v == "mma" ? 0 : 1;
     else if (k == "ka" && (v == "auto" || v == "16" || v == "64")) d.ka = v == "auto" ? 0 : std::stoi(v);
     else throw Failure("bad duel side entry '" + kv + "' (N=, vec=generate|resident, g=, "
-                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=int|f64, seq=default|0..7, k4b=default|mma|wgmma, ka=auto|16|64)");
+                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|0..7, k4b=default|mma|wgmma, ka=auto|16|64)");
   }
   return d;
 }
@@ -1945,15 +1945,15 @@ struct Bench {
     // Issue 21: the sequence set and the CRT variant of this method, before the plan is created, reset when it ends.
     struct SeqCrtScope {
       bool on;
-      ~SeqCrtScope() { if (on) imd_prof_set_seq(-1), imd_prof_set_k5_crt(0); }
-    } seq_scope{o.seq >= 0 || o.crt != 0};
+      ~SeqCrtScope() { if (on) imd_prof_set_seq(-1), imd_prof_set_k5_crt(-1); }
+    } seq_scope{o.seq >= 0 || o.crt >= 0};
     if (imd_prof_set_seq(o.seq) != 0) throw Failure("imd_prof_set_seq: not a valid sequence set (1 E1, 2 Q1, 4 F1; Q1 needs E1)");
     if (imd_prof_set_k5_crt(o.crt) != 0) throw Failure("imd_prof_set_k5_crt");
     // Issue 22: the K4 backend of this method's plan (a plan-time choice), reset when the plan exists.
     if (imd_prof_set_k4_backend(o.k4b) != 0) throw Failure("imd_prof_set_k4_backend");
 #else
     if (k4 >= 0) throw Failure("--k4 <config> needs the profiling build");
-    if (o.seq >= 0 || o.crt != 0) throw Failure("--seq / --crt need the profiling build");
+    if (o.seq >= 0 || o.crt >= 0) throw Failure("--seq / --crt need the profiling build");
     if (o.k4b >= 0) throw Failure("--k4b needs the profiling build");
 #endif
     const auto c0 = std::chrono::steady_clock::now();
@@ -2021,18 +2021,19 @@ struct Bench {
 #endif
     {  // Issue 21: what was asked for and what the library ran ("seq_req": -1 = the device class's set), in the record (the phases belong to it)
       int32_t seq_run = -1;
-      int crt_run = 0;
+      int32_t crt_run = 0;
 #ifdef IMD_BENCH_PROFILE
       imd_prof_plan_seq(plan, &seq_run);
-      crt_run = imd_prof_get_k5_crt();
+      imd_prof_plan_crt(plan, &crt_run);
 #endif
-      extra.integer("seq_req", o.seq).integer("seq", seq_run).str("crt_req", o.crt ? "f64" : "int").str("crt", crt_run ? "f64" : "int");
+      extra.integer("seq_req", o.seq).integer("seq", seq_run).str("crt_req", o.crt < 0 ? "default" : o.crt ? "f64" : "int").str("crt", crt_run ? "f64" : "int");
 #ifdef IMD_BENCH_PROFILE
       // Back to the defaults now (the scope guard does it again on any exit), and the plan read back under them: the class's set.
-      imd_prof_set_seq(-1), imd_prof_set_k5_crt(0);
-      int32_t seq_after = -1;
+      imd_prof_set_seq(-1), imd_prof_set_k5_crt(-1);
+      int32_t seq_after = -1, crt_after = 0;
       imd_prof_plan_seq(plan, &seq_after);
-      extra.integer("seq_after_reset", seq_after).str("crt_after_reset", imd_prof_get_k5_crt() ? "f64" : "int");
+      imd_prof_plan_crt(plan, &crt_after);
+      extra.integer("seq_after_reset", seq_after).str("crt_after_reset", crt_after ? "f64" : "int");
 #endif
     }
     extra.num("pred_ms", 1e3 * pred.time_s).num("pred_err_pct", 100.0 * (pred.time_s / T.median() - 1));
@@ -2053,7 +2054,7 @@ struct Bench {
     else if (k4 >= 0) vs += " k4=" + std::to_string(k4);
     if (o.l2_flush) vs += " l2=flush";
     if (o.seq >= 0) vs += " seq=" + std::to_string(o.seq);
-    if (o.crt != 0) vs += " crt=f64";
+    if (o.crt >= 0) vs += o.crt == 1 ? " crt=f64" : " crt=int";
     if (o.k4b >= 0) vs += o.k4b == 0 ? " k4b=mma" : " k4b=wgmma";
     record("imd", vs, N, T, &acc, flops(), wsb, extra);
   }
@@ -2107,6 +2108,7 @@ struct Bench {
     int32_t k4_run = -1;
     int32_t k4b_run = -1;  // issue 22: the K4 backend the plan tries first (0 mma.sync, 1 wgmma with the floor, 2 wgmma forced)
     mutable int64_t wg_served = 0, wg_declined = 0;  // issue 22: K4 launches this side's calls ran on the Hopper kernel / on mma.sync in its place
+    int32_t seq_eff = -1, crt_eff = -1;  // issue 21: the set and CRT the side ran (-1: not read back, non-profiling build), read after its hooks are set
     double create_ms = 0;
     ~DuelPlan() {
       if (plan) { cudaDeviceSynchronize(); imd_plan_destroy(plan); }  // a resident plan outlives its work
@@ -2117,7 +2119,7 @@ struct Bench {
     auto P = std::make_unique<DuelPlan>();
     P->cfg = d;
 #ifndef IMD_BENCH_PROFILE
-    if (d.k4 >= 0 || d.k5 != 0 || d.crt != 0 || d.seq >= 0 || d.k4b >= 0) throw Failure("duel k4=<config> / k5=<elems> / crt=f64 / seq=<bits> / k4b=<backend> need the profiling build");
+    if (d.k4 >= 0 || d.k5 != 0 || d.crt >= 0 || d.seq >= 0 || d.k4b >= 0) throw Failure("duel k4=<config> / k5=<elems> / crt=f64 / seq=<bits> / k4b=<backend> need the profiling build");
 #endif
     auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
       lab.assign(x.labels.begin(), x.labels.end());
@@ -2161,12 +2163,24 @@ struct Bench {
     auto pa = make_duel_plan(parse_duel_side(spec_a, N));
     auto pb = make_duel_plan(parse_duel_side(spec_b, N));
     DevBuf dC2(dC.bytes);
-    const bool k5_hook = pa->cfg.k5 != 0 || pb->cfg.k5 != 0 || pa->cfg.crt != 0 || pb->cfg.crt != 0 || pa->cfg.seq >= 0 || pb->cfg.seq >= 0;
+    const bool k5_hook = pa->cfg.k5 != 0 || pb->cfg.k5 != 0 || pa->cfg.crt >= 0 || pb->cfg.crt >= 0 || pa->cfg.seq >= 0 || pb->cfg.seq >= 0;
     auto set_k5 = [&](const DuelPlan& p) {
 #ifdef IMD_BENCH_PROFILE
       if (k5_hook && imd_prof_set_k5_elems(p.cfg.k5) != 0) throw Failure("imd_prof_set_k5_elems");
       if (k5_hook && imd_prof_set_k5_crt(p.cfg.crt) != 0) throw Failure("imd_prof_set_k5_crt");
       if (k5_hook && imd_prof_set_seq(p.cfg.seq) != 0) throw Failure("imd_prof_set_seq");
+#else
+      (void)p;
+#endif
+    };
+    // issue 21: the EFFECTIVE sequence set and CRT of a side (duel_config only records what was asked: "default" is the class's set), read back
+    // from the plan with the side's hooks set, i.e. what its launches run.
+    auto read_eff = [&](DuelPlan& p) {
+#ifdef IMD_BENCH_PROFILE
+      int32_t sq = -1, cr = 0;
+      if (imd_prof_plan_seq(p.plan, &sq) != 0 || imd_prof_plan_crt(p.plan, &cr) != 0) throw Failure("imd_prof_plan_seq / imd_prof_plan_crt");
+      p.seq_eff = sq;
+      p.crt_eff = cr;
 #else
       (void)p;
 #endif
@@ -2230,10 +2244,10 @@ struct Bench {
     // Accuracy of each side from one fresh call into a poisoned C, then bit identity.
     CU(cudaMemset(Ca, 0xff, dC.bytes));
     CU(cudaMemset(Cb, 0xff, dC2.bytes));
-    set_k5(*pa); call(*pa, Ca);
-    set_k5(*pb); call(*pb, Cb);
+    set_k5(*pa); read_eff(*pa); call(*pa, Ca);
+    set_k5(*pb); read_eff(*pb); call(*pb, Cb);
 #ifdef IMD_BENCH_PROFILE
-    if (k5_hook) imd_prof_set_k5_elems(0), imd_prof_set_k5_crt(0), imd_prof_set_seq(-1);
+    if (k5_hook) imd_prof_set_k5_elems(0), imd_prof_set_k5_crt(-1), imd_prof_set_seq(-1);
 #endif
     CU(cudaStreamSynchronize(s));
     const Accuracy acc_a = check(R, Ca, s), acc_b = check(R, Cb, s);
@@ -2254,6 +2268,7 @@ struct Bench {
       e.integer("k4_rule", p.low.k4_config).integer("k4_config", p.k4_run).integer("k4b_req", p.cfg.k4b).integer("k4b_run", p.k4b_run)
           .integer("k4_wgmma_served", p.wg_served).integer("k4_wgmma_declined", p.wg_declined);  // over the timed calls of this side
       e.integer("kernel_launches", p.low.kernel_launches);
+      if (p.seq_eff >= 0) e.integer("seq_eff", p.seq_eff).str("crt_eff", p.crt_eff ? "f64" : "int");
       e.integer("fused", p.low.fused).integer("fused_large", p.low.fused_large);
       e.integer("k_align", p.low.k_align).integer("k_hat", (long long)p.low.k_hat);
       return e;
@@ -2487,7 +2502,9 @@ struct Bench {
     {  // issue 21: the sequence set and CRT variant these phase times were measured under (the plan's, read back)
       int32_t seq_run = -1;
       imd_prof_plan_seq(plan, &seq_run);
-      e.integer("phase_seq", seq_run).str("phase_crt", imd_prof_get_k5_crt() ? "f64" : "int");
+      int32_t crt_run = 0;
+      imd_prof_plan_crt(plan, &crt_run);
+      e.integer("phase_seq", seq_run).str("phase_crt", crt_run ? "f64" : "int");
     }
     return e;
   }
@@ -2766,13 +2783,13 @@ void usage() {
           "  [--mode emulate|direct] (method imd) [--data normal|dominant|decay_opp]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
-          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=int|f64, seq=default|0..7, k4b=default|mma|wgmma, ka=auto|16|64)\n"
+          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|0..7, k4b=default|mma|wgmma, ka=auto|16|64)\n"
           "  [--clock-probe 0|1] [--l2 repeat|flush] (v1.10: per-call SM clock; L2 evicted\n"
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
           "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"
           "  [--k-align auto|16|64] (v1.13 §4b: force the K alignment of every plan / pack)\n"
-          "  [--seq default|0..7] [--crt int|f64] (method imd, profiling build; issue 21: the instruction-sequence set, bits 1 E1 / 2 Q1 /\n"
-          "      4 F1 with Q1 needing E1, and K5's CRT variant, for this method's plan and calls; the record gets seq_req, seq (the set the\n"
+          "  [--seq default|0..7] [--crt default|int|f64] (method imd, profiling build; issue 21: the instruction-sequence set, bits 1 E1 / 2 Q1 /\n"
+          "      4 F1 with Q1 needing E1 (a forced set 0..7 runs the integer CRT), and K5's CRT variant (default: the class's set decides), for this method's plan and calls; the record gets seq_req, seq (the set the\n"
           "      plan ran), crt_req, crt, and c_hash, which must be equal across configurations)\n"
           "  [--k4b default|mma|wgmma] (method imd, profiling build; issue 22: the K4 backend of the plan, wgmma = every legal launch on the Hopper\n"
           "      kernel, floor lifted; the record gets k4b_req, k4b_run (what the plan tries first: 0 mma.sync, 1 wgmma with the floor, 2 wgmma forced), k4_wgmma_served / _declined; a duel record carries them per side)\n"
@@ -2906,8 +2923,8 @@ int main(int argc, char** argv) {
       else throw Failure("--seq default|0|1|3|4|5|7 (Q1 needs E1: 2 and 6 are not sets)");
     }
     if (a.count("crt")) {
-      if (a["crt"] != "int" && a["crt"] != "f64") throw Failure("--crt int|f64");
-      B.o.crt = a["crt"] == "f64";
+      if (a["crt"] != "default" && a["crt"] != "int" && a["crt"] != "f64") throw Failure("--crt default|int|f64");
+      B.o.crt = a["crt"] == "default" ? -1 : a["crt"] == "f64";
     }
     if (a.count("k4b")) {
       if (a["k4b"] != "default" && a["k4b"] != "mma" && a["k4b"] != "wgmma") throw Failure("--k4b default|mma|wgmma");

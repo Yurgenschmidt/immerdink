@@ -499,11 +499,18 @@ IMD_API int imd_prof_plan_seq(imd_plan_t plan, int32_t* bits) {
   *bits = imd::detail::seq_effective(e->seq, imd::detail::seq_override().load());
   return 0;
 }
-// Benchmark-only (issue 21): K5's CRT variant now in force (0 integer, 1 binary64 limbs).
+// Benchmark-only (issue 21): the K5 hook's state: -1 follow the plan's set (the device class's kSeqLimbCrt bit; the default), 0 forced integer CRT, 1 forced binary64 limbs.
 IMD_API int imd_prof_get_k5_crt(void) { return imd::detail::k5_crt_override().load(); }
-// Benchmark-only (issue 21): K5's CRT variant for later calls (0 integer running CRT, 1 binary64 limbs).
+// Benchmark-only (issue 21): the CRT variant the plan's K5 runs now, whatever decided it (0 integer, 1 binary64 limbs); 1 for a null plan.
+IMD_API int imd_prof_plan_crt(imd_plan_t plan, int32_t* limb) {
+  const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
+  if (e == nullptr || limb == nullptr) return 1;
+  *limb = imd::detail::k5_limb_crt(*e) ? 1 : 0;
+  return 0;
+}
+// Benchmark-only (issue 21): K5's CRT variant for later calls (-1 the plan's set, 0 integer running CRT, 1 binary64 limbs).
 IMD_API int imd_prof_set_k5_crt(int32_t variant) {
-  if (variant != 0 && variant != 1) return 1;
+  if (variant < -1 || variant > 1) return 1;
   imd::detail::k5_crt_override() = variant;
   return 0;
 }

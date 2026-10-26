@@ -793,11 +793,13 @@ template <int N>
 void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
   const K5Launch L = k5_launch(p.k5_batch_fast, p.b, p.m, p.n, p.sms, k5_one_elem_per_sm(),
                                k5_elems_override());
+  const bool f64 = k5_limb_crt(p);   // read once: both re-read relaxed atomics (the hooks), and the counter must agree with the kernel launched
+  const int seq = seq_bits(p);
 #ifdef IMD_BUILD_TEST_HOOKS
-  test_note_k5_launch(k5_crt_override() == 1, L.variant);   // host-side count for tests/test_crt_f64_gpu.py (no device code)
+  test_note_k5_launch(f64, L.variant);   // host-side count for tests/test_crt_f64_gpu.py (no device code)
 #endif
-  // issue 21: the sums in binary64 limbs (test and benchmark hooks only), and the F1 finish (host/seq_config.hpp)
-  const bool f64 = k5_crt_override() == 1, f1 = (seq_bits(p) & kSeqFinish) != 0;
+  // issue 21: the sums in binary64 limbs (the class set's kSeqLimbCrt bit unless the K5 hook forces a CRT), and the F1 finish (host/seq_config.hpp)
+  const bool f1 = (seq & kSeqFinish) != 0;
   if (f64) {
     if constexpr ((kSeqSupported & kSeqFinish) != 0) {
       if (f1) { launch_k5_v<N, true, true>(L, out, stream); return; }
@@ -1464,7 +1466,7 @@ std::atomic<int>& seq_override() {
 }
 
 std::atomic<int>& k5_crt_override() {
-  static std::atomic<int> v{0};  // 0: the integer running CRT (default), 1: the sums in binary64 limbs (issue 21); only the hooks change it, relaxed is enough
+  static std::atomic<int> v{-1};  // -1: follow the plan's set (kSeqLimbCrt, host/seq_config.hpp; default), 0: force the integer running CRT, 1: force the sums in binary64 limbs (issue 21); only the hooks change it, relaxed is enough
   return v;
 }
 

@@ -6,12 +6,14 @@
 Checks, on a tiny shape (the GPU is used under the caller's GPU lock; tools/test.sh holds it):
   * the usage text names --seq and --crt;
   * invalid values are refused before any GPU work: --seq 2, 6, 8, x and --crt foo exit non-zero;
-  * for every sequence set in {default, 0, 1, 7} x CRT variant {int, f64}: one imd record whose c_hash is the same for
+  * for every sequence set in {default, 0, 1, 7} x CRT variant {default, int, f64}: one imd record whose c_hash is the same for
     all of them (every configuration is bit-identical), whose requested values (seq_req, crt_req) are what was passed
     and whose effective values (seq, crt, phase_seq, phase_crt) are what the library ran (a forced set is read back as
-    itself; "default" is read back as the device class's set);
+    itself; "default" is read back as the device class's set, which carries bit 8 = the limb CRT on sm_90; the CRT is
+    int / f64 as forced, and for crt=default it is the limb CRT exactly when the set the plan ran has bit 8: the class default
+    on sm_90, never a forced set 0..7);
   * the settings end with the method: the record's seq_after_reset / crt_after_reset (the plan read back after the reset) are
-    the device class's set and int.
+    the device class's set and its CRT (f64 on sm_90, int elsewhere).
 """
 import argparse
 import json
@@ -47,14 +49,14 @@ def main():
     if u.returncode == 0 or "--seq" not in u.stderr or "--crt" not in u.stderr:
         bad.append("the usage text does not name --seq and --crt (or exits 0)")
 
-    for flag, val in (("--seq", "2"), ("--seq", "6"), ("--seq", "8"), ("--seq", "x"), ("--seq", "-1"), ("--crt", "foo"), ("--crt", "2")):
+    for flag, val in (("--seq", "2"), ("--seq", "6"), ("--seq", "8"), ("--seq", "x"), ("--seq", "-1"), ("--crt", "foo"), ("--crt", "2"), ("--crt", "-1")):
         r = run(args.bench, [flag, val], os.path.join(tmp, "bad.jsonl"))
         if r.returncode == 0:
             bad.append(f"{flag} {val} was accepted")
 
     sets = ("default", "0", "1") if args.no_seq_twins else ("default", "0", "1", "7")
-    hashes, default_set = {}, None
-    for crt in ("int", "f64"):
+    hashes, default_set, default_crt = {}, None, None
+    for crt in ("default", "int", "f64"):
         for seq in sets:
             out = os.path.join(tmp, f"{seq}_{crt}.jsonl")
             r = run(args.bench, ["--seq", seq, "--crt", crt], out)
@@ -70,13 +72,17 @@ def main():
             want_req = -1 if seq == "default" else int(seq)
             if x.get("seq_req") != want_req or x.get("crt_req") != crt:
                 bad.append(f"{tag}: requested {x.get('seq_req')}/{x.get('crt_req')}")
-            if x.get("crt") != crt or x.get("phase_crt") != crt:
-                bad.append(f"{tag}: effective crt {x.get('crt')}/{x.get('phase_crt')}")
+            want_crt = crt if crt != "default" else ("f64" if (x.get("seq") or 0) & 8 else "int")
+            if x.get("crt_req") != crt or x.get("crt") != want_crt or x.get("phase_crt") != want_crt:
+                bad.append(f"{tag}: effective crt {x.get('crt')}/{x.get('phase_crt')}, expected {want_crt}")
+            if crt == "default" and seq != "default" and x.get("crt") != "int":
+                bad.append(f"{tag}: a forced set with the CRT following the set must run the integer CRT, ran {x.get('crt')}")
             if x.get("phase_seq") != x.get("seq"):
                 bad.append(f"{tag}: phase_seq {x.get('phase_seq')} != seq {x.get('seq')}")
             if seq == "default":
                 if default_set is None:
                     default_set = x.get("seq")
+                    default_crt = "f64" if (default_set & 8) else "int"
                 elif x.get("seq") != default_set:
                     bad.append(f"{tag}: class default {x.get('seq')} != {default_set}")
             elif x.get("seq") != int(seq):
@@ -95,9 +101,9 @@ def main():
         bad.append(f"forced run: exit {r.returncode}: {r.stderr[-400:]}")
     else:
         x = [y for y in records(out) if y.get("method") == "imd"][0]
-        if x.get("seq") != 0 or x.get("seq_after_reset") != default_set or x.get("crt_after_reset") != "int":
+        if x.get("seq") != 0 or x.get("seq_after_reset") != default_set or x.get("crt_after_reset") != default_crt:
             bad.append(f"after a forced run the settings read back {x.get('seq_after_reset')}/{x.get('crt_after_reset')}, "
-                       f"expected {default_set}/int")
+                       f"expected {default_set}/{default_crt}")
 
     if args.keep:
         print("records in", tmp)

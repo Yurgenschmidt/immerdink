@@ -55,7 +55,7 @@ endif()
 
 option(IMMERDINK_WERROR "Treat warnings in immerdink's own code as errors" OFF)
 option(IMMERDINK_BUILD_TESTS "Build the tests (and the test-only hooks of src/test_hooks.cpp)" ON)
-option(IMMERDINK_SEQ_TWINS "Compile the Q1 / F1 kernel twins of the pack and K5 kernels (issue 21: reachable by the hooks only, no device class defaults to them); OFF omits them: about half the kernel instances and SASS" ON)
+option(IMMERDINK_SEQ_TWINS "Compile the Q1 / F1 kernel twins of the pack and K5 kernels (issue 21: Q1 is reachable by the hooks only; F1 is the sm_90 default since R2, so OFF drops it there: the class default is masked to E1 + the limb CRT); OFF omits them: about half the kernel instances and SASS" ON)
 set(IMMERDINK_K4_WGMMA AUTO CACHE STRING "Hopper (wgmma) K4 backend (issue 22, docs/NOTES-22.md): AUTO = built when nvcc >= 12.0, CUTLASS >= 3 and the architectures include 90, ON = built whatever the architectures, OFF = not built. Its kernels are sm_90a-only SASS in their own object library; no other kernel changes")
 set_property(CACHE IMMERDINK_K4_WGMMA PROPERTY STRINGS AUTO ON OFF)
 option(IMMERDINK_PROFILE "Benchmark-only per-phase event timing hooks (src/profile.hpp)" OFF)

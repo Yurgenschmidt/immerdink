@@ -9,6 +9,7 @@
 #   IMMERDINK_ENV         conda env with the toolchain (default ~/miniforge3/envs/immerdink); "none", or an
 #                         env without nvcc, uses cmake/nvcc/g++/python3 from PATH (CC, CXX honoured)
 #   IMMERDINK_CUDA_ARCH   CMAKE_CUDA_ARCHITECTURES, e.g. 90 for H100 (default 89)
+#   IMMERDINK_K4_WGMMA    AUTO | ON | OFF: -DIMMERDINK_K4_WGMMA (the Hopper wgmma K4 backend, issue 22; default: the cache's, AUTO)
 #   IMMERDINK_JUNIT_DIR   also write ctest JUnit files there (cpu.xml, gpu.xml)
 #   IMMERDINK_RERUN_FAILED  1 (default): after failures, rerun them with full output and under
 #                         compute-sanitizer (tools/rerun_failed.sh); 0 skips that
@@ -93,6 +94,8 @@ cfg=(-S "$root" -B "$build" "${generator[@]}" "${toolchain[@]}"
 arch="${IMMERDINK_CUDA_ARCH:-${CMAKE_CUDA_ARCHITECTURES:-}}"
 [ -z "$arch" ] || cfg+=(-DCMAKE_CUDA_ARCHITECTURES="$arch")
 [ -n "${IMMERDINK_CUTLASS_DIR:-}" ] && cfg+=(-DIMMERDINK_CUTLASS_DIR="$IMMERDINK_CUTLASS_DIR")
+# issue 22: AUTO | ON | OFF of the Hopper wgmma K4 backend; a Hopper build says ON (AUTO can silently come out OFF), tests/test_k4_wgmma.py fails otherwise
+[ -n "${IMMERDINK_K4_WGMMA:-}" ] && cfg+=(-DIMMERDINK_K4_WGMMA="$IMMERDINK_K4_WGMMA")
 [ -n "${IMMERDINK_COMPUTE_SANITIZER:-}" ] && cfg+=(-DIMMERDINK_COMPUTE_SANITIZER="$IMMERDINK_COMPUTE_SANITIZER")
 
 cmake "${cfg[@]}"
@@ -123,7 +126,7 @@ gpu_lock="${IMMERDINK_GPU_LOCK:-/home/ef/repos/ehrenfest-ipdps/_wip/gpu.lock}"
 # Without a caller's selection option: CPU-only tests never touch the GPU, so they run first
 # without the lock; only the GPU tests wait for it. With one (has_selection), the caller's
 # selection runs in ONE pass under the lock, so no GPU test ever runs unlocked.
-cpu_only='^(calib_strings_shipped|calib_strings_too_long|tools_test_sh_selftest|tools_memcap_loop_check|host_c_api|host_k_align|host_l2_knobs|spec_fma_compat|spec_crt_f64|contract_occupancy_known|bench_membw_selftest|bench_k4_fit_selftest|host_python|host_devices|device_kernel_sites|host_perf|host_planner|host_accuracy|host_cuda_free|host_footprint_monotone|host_precision|c2_engine_selftest|sweep_disjoint_selftest|md2_time_selftest|campaign_[a-z_]+_selftest|workspace_vs_params|params_check|constants_header_current)$'
+cpu_only='^(calib_strings_shipped|calib_strings_too_long|tools_test_sh_selftest|tools_memcap_loop_check|host_c_api|host_k_align|host_l2_knobs|host_seq_table|spec_fma_compat|spec_crt_f64|contract_occupancy_known|bench_membw_selftest|bench_k4_fit_selftest|host_python|host_devices|device_kernel_sites|host_perf|host_planner|host_accuracy|host_cuda_free|host_footprint_monotone|host_precision|c2_engine_selftest|sweep_disjoint_selftest|md2_time_selftest|campaign_[a-z_]+_selftest|workspace_vs_params|params_check|constants_header_current)$'
 rc=0
 # IMMERDINK_JUNIT_DIR: ctest also writes JUnit files there (one per pass), for the campaign analyzer.
 junit_cpu=(); junit_gpu=()
