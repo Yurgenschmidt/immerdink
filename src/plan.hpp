@@ -175,6 +175,12 @@ std::atomic<int>& pad_mutation();
 cudaError_t test_crt_elem(int N, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out);
 void test_note_k5_launch(bool limb_crt, int variant);
 void test_k5_launch_counts(bool reset, int64_t* out);
+// Issue 23 (docs/NOTES-23.md): test_note_kl_launch counts the KL kernel instances launched, test_kl_launch_counts copies them (int64[12]: [E = 4 / 8 / 16][Kb: bit 0
+// klwarp, bit 1 klload]; optionally zeroes them); test_kl_timers copies the KL section timers (IMD_KL_TIMERS builds only; slots in contract.cu KlSec) and returns the
+// slot count, -1 in a build without the knob, -2 on a CUDA error.
+void test_note_kl_launch(int E, int kb);
+void test_kl_launch_counts(bool reset, int64_t* out);
+int test_kl_timers(bool reset, unsigned long long* out, int n);
 #endif
 
 // The execution data of a plan (api.cpp), for the test hooks; nullptr for a null plan.

@@ -1183,6 +1183,9 @@ struct LargeArgs {
   int8_t* R;                       // [s][lambda][rows_pad][k_hat], group 1: modulus = slot s
   uint64_t rhs[4];
   int rhs_bits, lhs_shift;
+  // Issue 23 (kSeqKlWarp): the launch-invariant 64-bit scalars the kernel derives from the arguments (host: kl_launch), appended so that no
+  // earlier field moves (the kernels without the bit ignore them). D = b rows / radix, n_d = ceil(D / th), tiles = radix n_d, nc = ceil(k_hat / tk).
+  int64_t D, n_d, tiles, nc;
 };
 
 __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl) {
@@ -1190,41 +1193,132 @@ __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl
   else if (finite_nonzero(bits)) gmax = max(gmax, ilogb_bits(bits));
 }
 
-template <int E, int W, int Seq = 0>  // values per thread: 8 (512 threads, 2 CTAs per SM) or 4 (1024
-                         // threads); W: v1.14 §3.4.1 pack_words(N); Seq: sequence set
+// ---- Issue 23: KL fixed-part variants (host/seq_config.hpp kSeqKlWarp / kSeqKlLoad / kSeqKlShape, docs/NOTES-23.md) ----
+// Kb (template value of kl_scale_pack): bit 0 klwarp, bit 1 klload; Kb = 0 is the original kernel (its SASS is unchanged:
+// tools/sass_ident.sh). klshape is the launch's E (16 values per thread).
+constexpr int kKlWarp = 1, kKlLoad = 2;
+
+// Section timers (compile-time knob IMD_KL_TIMERS = 1 / 2, CMake IMMERDINK_KL_TIMERS; OFF by default and then nothing below exists in any kernel).
+// Lane 0 of every warp stamps clock64() at the section boundaries and adds the elapsed cycles of the section to a shared counter; thread 0 adds a CTA's
+// counters to g_kl_timers at its end. The numbers are SUMS over warps (warp-cycles), so section / sum of sections is the split of a warp's
+// time (barrier waits are inside the section that ends at the barrier); kKltLife is the sum of the CTAs' lifetimes (thread 0).
+// Level 2 also times the modulus loop's emit and its store separately (two stamps per modulus: perturbs that loop).
+#ifdef IMD_KL_TIMERS
+enum KlSec { kKltSetup, kKltLoad, kKltRed1, kKltSsum, kKltRed2, kKltSigma, kKltReload, kKltQuant, kKltEmit, kKltStore, kKltTail,
+             kKltWarpTiles, kKltCtas, kKltLife, kKltSlots = 16 };
+__device__ unsigned long long g_kl_timers[kKltSlots];
+#define KLT_DECL() \
+  __shared__ unsigned long long s_tm[kKltSlots]; \
+  long long t_prev = 0, t_life = 0
+#define KLT_INIT() \
+  do { if (tid < kKltSlots) s_tm[tid] = 0; t_life = clock64(); __syncthreads(); } while (0)
+#define KLT_BEGIN() do { t_prev = clock64(); } while (0)
+#define KLT(sec) \
+  do { if (lane == 0) { const long long t_now = clock64(); atomicAdd(&s_tm[sec], static_cast<unsigned long long>(t_now - t_prev)); t_prev = t_now; } } while (0)
+#define KLT_TILE() do { if (lane == 0) atomicAdd(&s_tm[kKltWarpTiles], 1ull); } while (0)
+#define KLT_END() \
+  do { __syncthreads(); if (tid == 0) { s_tm[kKltCtas] = 1; s_tm[kKltLife] = static_cast<unsigned long long>(clock64() - t_life); } \
+       __syncthreads(); if (tid < kKltSlots) atomicAdd(&g_kl_timers[tid], s_tm[tid]); } while (0)
+#else
+#define KLT_DECL() static_assert(true, "")
+#define KLT_INIT() do {} while (0)
+#define KLT_BEGIN() do {} while (0)
+#define KLT(sec) do {} while (0)
+#define KLT_TILE() do {} while (0)
+#define KLT_END() do {} while (0)
+#endif
+
+template <int E, int W, int Seq = 0, int Kb = 0>  // values per thread: 8 (512 threads, 2 CTAs per SM) or 4 (1024
+                         // threads), or 16 (256 threads; klshape); W: v1.14 §3.4.1 pack_words(N); Seq: sequence set; Kb: the fixed-part cuts
 __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     kl_scale_pack(const __grid_constant__ LargeArgs a) {
   constexpr int T = kTileElems / E, kLgE = E == 16 ? 4 : E == 8 ? 3 : 2;
-  __shared__ uint64_t tile[kTileSmem];
+  constexpr bool kWarp = (Kb & kKlWarp) != 0, kDirect = (Kb & kKlLoad) != 0;
+  __shared__ uint64_t tile[kDirect ? 1 : kTileSmem];  // kDirect: no gather tile
   __shared__ int64_t s_base[kTileRowsMax];  // v_bat[lambda] + v_row[r]
   __shared__ bool s_valid[kTileRowsMax];
   __shared__ int s_wg[T / 32];
   __shared__ unsigned s_wf[T / 32];
   __shared__ u128 s_ws[T / 32];
+  __shared__ int64_t s_rho[kWarp ? kTileRowsMax : 1];  // kWarp: per row rho and the output offset of its first element, computed once per tile
+  __shared__ int64_t s_dst[kWarp ? kTileRowsMax : 1];
+  __shared__ int s_sigma[kWarp ? kTileRowsMax : 1];    // kWarp: sigma of the row, from one warp
+  KLT_DECL();
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  KLT_INIT();
   const int lg_th = a.lg_th, th = 1 << lg_th, lg_tk = 12 - lg_th, tk = 1 << lg_tk;
   const int pitch = tk + tk / kVec + 1;
   const int G = tk / E, Gw = G < 32 ? G : 32;  // threads per row; G | 32 or 32 | G
   const int nw = G > 32 ? G / 32 : 1, w0 = warp & ~(nw - 1);  // the row's warps (G > 32)
   const int dl = tid >> (lg_tk - kLgE), hl = (tid & (G - 1)) * E;  // this thread: row, k-bar
   const uint64_t* mine = tile + dl * pitch + hl + hl / kVec;
-  const int64_t rows = a.op.rows, D = a.b * rows / a.radix;
-  const int64_t n_d = (D + th - 1) >> lg_th, tiles = a.radix * n_d;
-  const int64_t nc = (a.k_hat + tk - 1) >> lg_tk;
+  int64_t rows = a.op.rows, D, n_d, tiles, nc;
+  if constexpr (kWarp) {  // from the host (LargeArgs): no per-thread 64-bit divisions
+    D = a.D, n_d = a.n_d, tiles = a.tiles, nc = a.nc;
+  } else {
+    D = a.b * rows / a.radix;
+    n_d = (D + th - 1) >> lg_th, tiles = a.radix * n_d;
+    nc = (a.k_hat + tk - 1) >> lg_tk;
+  }
   const int64_t plane = a.b * a.rows_pad * a.k_hat;
   for (int64_t t = blockIdx.x; t < tiles; t += gridDim.x) {  // block-uniform
-    const int64_t dt = t % n_d, lo = t / n_d, d0 = dt << lg_th;
+    KLT_BEGIN();
+    KLT_TILE();
+    [[maybe_unused]] int64_t lo = 0, d0 = 0;
+    if constexpr (!kWarp) {
+      const int64_t dt = t % n_d;
+      lo = t / n_d, d0 = dt << lg_th;
+    }
     if (tid < th) {
-      const int64_t d = d0 + tid;
-      const bool valid = d < D;
-      s_valid[tid] = valid;
-      if (valid) {
-        int64_t lam, r;
-        divmod(lo + a.radix * d, rows, &lam, &r);
-        s_base[tid] = a.op.v_bat[lam] + a.op.v_row[r];
+      if constexpr (kWarp) {  // the row info once per row (th threads), including everything the stores need
+        int64_t dt, lam, r;
+        divmod(t, n_d, &lo, &dt);
+        const int64_t d = (dt << lg_th) + tid;
+        const bool valid = d < D;
+        s_valid[tid] = valid;
+        if (valid) {
+          const int64_t rho = lo + a.radix * d;
+          divmod(rho, rows, &lam, &r);
+          s_base[tid] = a.op.v_bat[lam] + a.op.v_row[r];
+          s_rho[tid] = rho;
+          s_dst[tid] = (lam * a.rows_pad + r) * a.k_hat;
+        }
+      } else {
+        const int64_t d = d0 + tid;
+        const bool valid = d < D;
+        s_valid[tid] = valid;
+        if (valid) {
+          int64_t lam, r;
+          divmod(lo + a.radix * d, rows, &lam, &r);
+          s_base[tid] = a.op.v_bat[lam] + a.op.v_row[r];
+        }
       }
     }
     __syncthreads();
+    KLT(kKltSetup);
+    // kDirect (unit-stride k, host-checked): this thread's E consecutive k-bar of chunk c straight from global memory into registers,
+    // 16-byte loads when the address is aligned and the E values are inside the row, else per element (zero outside the operand as the gather)
+    [[maybe_unused]] const bool row_ok = s_valid[dl];
+    [[maybe_unused]] const double* const row_p = row_ok ? a.op.X + s_base[dl] : nullptr;
+    const auto fetch = [&](int64_t c, uint64_t (&bits)[E]) {
+      const int64_t h = (c << lg_tk) + hl;
+      if (!row_ok) {
+#pragma unroll
+        for (int e = 0; e < E; ++e) bits[e] = 0;
+        return;
+      }
+      const double* p = row_p + h;
+      if (h + E <= a.k && (reinterpret_cast<uintptr_t>(p) & 15) == 0) {
+#pragma unroll
+        for (int j = 0; j < E / 2; ++j) {
+          const double2 v = *reinterpret_cast<const double2*>(p + 2 * j);
+          bits[2 * j] = to_bits(v.x), bits[2 * j + 1] = to_bits(v.y);
+        }
+      } else {
+#pragma unroll
+        for (int e = 0; e < E; ++e) bits[e] = h + e < a.k ? to_bits(p[e]) : 0;
+      }
+    };
     // Gather chunk c into the tile (zero outside the operand), coalesced as in k23_pack.
     const auto load = [&](int64_t c) {
       const int64_t h0 = c << lg_tk, h_end = a.k - h0;
@@ -1242,22 +1336,34 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
       }
     };
     // pass 1: flag and gamma; chunk 0 into registers
-    load(0);
-    __syncthreads();
     uint64_t r0[E];
-#pragma unroll
-    for (int e = 0; e < E; ++e) r0[e] = mine[e];
     int gmax = INT_MIN;
     unsigned fl = 0;
+    if constexpr (kDirect) {
+      fetch(0, r0);
+    } else {
+      load(0);
+      __syncthreads();
+#pragma unroll
+      for (int e = 0; e < E; ++e) r0[e] = mine[e];
+    }
 #pragma unroll
     for (int e = 0; e < E; ++e) scan_bits(r0[e], gmax, fl);
     for (int64_t c = 1; c < nc; ++c) {
-      __syncthreads();  // every thread has taken chunk c - 1
-      load(c);
-      __syncthreads();
+      if constexpr (kDirect) {
+        uint64_t bits[E];
+        fetch(c, bits);
 #pragma unroll
-      for (int e = 0; e < E; ++e) scan_bits(mine[e], gmax, fl);
+        for (int e = 0; e < E; ++e) scan_bits(bits[e], gmax, fl);
+      } else {
+        __syncthreads();  // every thread has taken chunk c - 1
+        load(c);
+        __syncthreads();
+#pragma unroll
+        for (int e = 0; e < E; ++e) scan_bits(mine[e], gmax, fl);
+      }
     }
+    KLT(kKltLoad);
     for (int o = Gw / 2; o > 0; o /= 2) {
       gmax = max(gmax, __shfl_xor_sync(0xffffffffu, gmax, o));
       fl |= __shfl_xor_sync(0xffffffffu, fl, o);
@@ -1265,8 +1371,19 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     if (G > 32) {  // block-uniform
       if (lane == 0) s_wg[warp] = gmax, s_wf[warp] = fl;
       __syncthreads();
-      for (int w = w0; w < w0 + nw; ++w) gmax = max(gmax, s_wg[w]), fl |= s_wf[w];
+      if constexpr (kWarp) {  // lane l of every warp takes the row's warp l, then a shuffle reduction over the nw lanes
+        int g2 = lane < nw ? s_wg[w0 + lane] : INT_MIN;
+        unsigned f2 = lane < nw ? s_wf[w0 + lane] : 0u;
+        for (int o = nw >> 1; o > 0; o >>= 1) {
+          g2 = max(g2, __shfl_xor_sync(0xffffffffu, g2, o));
+          f2 |= __shfl_xor_sync(0xffffffffu, f2, o);
+        }
+        gmax = __shfl_sync(0xffffffffu, g2, 0), fl = __shfl_sync(0xffffffffu, f2, 0);
+      } else {
+        for (int w = w0; w < w0 + nw; ++w) gmax = max(gmax, s_wg[w]), fl |= s_wf[w];
+      }
     }
+    KLT(kKltRed1);
     // pass 2: S (exact, order-independent) from registers, shared memory, then L2
     const bool live = gmax != INT_MIN;  // the row has a finite nonzero entry
     u128 S = 0;
@@ -1276,72 +1393,143 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
         if (finite_nonzero(r0[e])) S += square_term_n(r0[e], gmax);
     }
     if (nc > 1) {
-      if (live) {  // chunk nc - 1, still in shared memory
+      if constexpr (kDirect) {  // chunks re-read from global memory (L1 / L2), the last one first
+        for (int64_t c = nc - 1; c >= 1; --c) {
+          uint64_t bits[E];
+          fetch(c, bits);
+          if (live) {
 #pragma unroll
-        for (int e = 0; e < E; ++e) {
-          const uint64_t bits = mine[e];
-          if (finite_nonzero(bits)) S += square_term_n(bits, gmax);
+            for (int e = 0; e < E; ++e)
+              if (finite_nonzero(bits[e])) S += square_term_n(bits[e], gmax);
+          }
         }
-      }
-      for (int64_t c = nc - 2; c >= 1; --c) {
-        __syncthreads();
-        load(c);
-        __syncthreads();
-        if (live) {
+      } else {
+        if (live) {  // chunk nc - 1, still in shared memory
 #pragma unroll
           for (int e = 0; e < E; ++e) {
             const uint64_t bits = mine[e];
             if (finite_nonzero(bits)) S += square_term_n(bits, gmax);
           }
         }
+        for (int64_t c = nc - 2; c >= 1; --c) {
+          __syncthreads();
+          load(c);
+          __syncthreads();
+          if (live) {
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+              const uint64_t bits = mine[e];
+              if (finite_nonzero(bits)) S += square_term_n(bits, gmax);
+            }
+          }
+        }
       }
     }
+    KLT(kKltSsum);
     for (int o = Gw / 2; o > 0; o /= 2) S += shfl_xor_u128(S, o);
-    if (G > 32) {
-      if (lane == 0) s_ws[warp] = S;
-      __syncthreads();
-      S = 0;
-      for (int w = w0; w < w0 + nw; ++w) S += s_ws[w];
-    }
-    // sigma by the first lane of the row's piece in this warp, broadcast within the warp
     int sigma = 0;  // zero row (all entries zero or non-finite): sigma := 0
-    if ((lane & (Gw - 1)) == 0 && live) sigma = largest_u(S, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
-    sigma = __shfl_sync(0xffffffffu, sigma, lane & ~(Gw - 1));
+    if constexpr (kWarp) {
+      if (G > 32) {
+        if (lane == 0) s_ws[warp] = S;
+        __syncthreads();
+        KLT(kKltRed2);
+        if (warp == w0) {  // the row's first warp: lane l takes warp l's S, shuffle reduction, ONE largest_u per row, to shared memory
+          u128 v = lane < nw ? s_ws[w0 + lane] : 0;
+          for (int o = nw >> 1; o > 0; o >>= 1) v += shfl_xor_u128(v, o);
+          if (lane == 0) s_sigma[dl] = live ? largest_u(v, a.lhs_shift, a.rhs, a.rhs_bits) - gmax : 0;
+        }
+        __syncthreads();
+        sigma = s_sigma[dl];
+      } else {
+        KLT(kKltRed2);
+        if ((lane & (Gw - 1)) == 0 && live) sigma = largest_u(S, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
+        sigma = __shfl_sync(0xffffffffu, sigma, lane & ~(Gw - 1));
+      }
+    } else {
+      if (G > 32) {
+        if (lane == 0) s_ws[warp] = S;
+        __syncthreads();
+        S = 0;
+        for (int w = w0; w < w0 + nw; ++w) S += s_ws[w];
+      }
+      KLT(kKltRed2);
+      // sigma by the first lane of the row's piece in this warp, broadcast within the warp
+      if ((lane & (Gw - 1)) == 0 && live) sigma = largest_u(S, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
+      sigma = __shfl_sync(0xffffffffu, sigma, lane & ~(Gw - 1));
+    }
     const bool valid = s_valid[dl];
     int64_t dst_off = 0;  // (lambda rows_pad + r) k_hat + hl
     if (valid) {
-      const int64_t rho = lo + a.radix * (d0 + dl);
-      if ((tid & (G - 1)) == 0) {  // range certified (cert_shift_range)
-        a.sigma[rho] = static_cast<int16_t>(sigma);
-        a.flag[rho] = static_cast<uint8_t>(fl);
+      if constexpr (kWarp) {
+        if ((tid & (G - 1)) == 0) {  // range certified (cert_shift_range)
+          const int64_t rho = s_rho[dl];
+          a.sigma[rho] = static_cast<int16_t>(sigma);
+          a.flag[rho] = static_cast<uint8_t>(fl);
+        }
+        dst_off = s_dst[dl] + hl;
+      } else {
+        const int64_t rho = lo + a.radix * (d0 + dl);
+        if ((tid & (G - 1)) == 0) {  // range certified (cert_shift_range)
+          a.sigma[rho] = static_cast<int16_t>(sigma);
+          a.flag[rho] = static_cast<uint8_t>(fl);
+        }
+        int64_t lam, r;
+        divmod(rho, rows, &lam, &r);
+        dst_off = (lam * a.rows_pad + r) * a.k_hat + hl;
       }
-      int64_t lam, r;
-      divmod(rho, rows, &lam, &r);
-      dst_off = (lam * a.rows_pad + r) * a.k_hat + hl;
     }
+    KLT(kKltSigma);
     // pass 3: residues of every slot of group 1 (K padding h in [k, k_hat) is zero)
     const auto emit = [&](const uint64_t (&bits)[E], int64_t c) {
+      KLT(kKltReload);
       if (valid && (c << lg_tk) + hl < a.k_hat) {  // k_hat is a multiple of 16
         PackEmitterT<E, W, Seq> em;
         em.load(bits, sigma, a.trunc != 0);
+        KLT(kKltQuant);
         int8_t* dst = a.R + dst_off + (c << lg_tk);
+#if defined(IMD_KL_TIMERS) && IMD_KL_TIMERS >= 2
+        {  // the loop of store_slots with a stamp between the emit and its store
+          int8_t* d = dst;
+          for (int s = 0; s < a.gsize; ++s, d += plane) {
+            uint32_t w[E / 4];
+            em.emit(s, w);
+            KLT(kKltEmit);
+            if constexpr (E == 16) *reinterpret_cast<uint4*>(d) = make_uint4(w[0], w[1], w[2], w[3]);
+            else if constexpr (E == 8) *reinterpret_cast<uint2*>(d) = make_uint2(w[0], w[1]);
+            else *reinterpret_cast<uint32_t*>(d) = w[0];
+            KLT(kKltStore);
+          }
+        }
+#else
         store_slots(em, 0, 0, a.gsize, dst, plane);
+        KLT(kKltEmit);
+#endif
       }
     };
     emit(r0, 0);
     for (int64_t c = 1; c < nc; ++c) {
-      if (c > 1) {  // chunk 1 is in shared memory after pass 2
-        __syncthreads();
-        load(c);
-        __syncthreads();
-      }
       uint64_t bits[E];
+      if constexpr (kDirect) {
+        fetch(c, bits);
+      } else {
+        if (c > 1) {  // chunk 1 is in shared memory after pass 2
+          __syncthreads();
+          load(c);
+          __syncthreads();
+        }
 #pragma unroll
-      for (int e = 0; e < E; ++e) bits[e] = mine[e];
+        for (int e = 0; e < E; ++e) bits[e] = mine[e];
+      }
       emit(bits, c);
     }
-    __syncthreads();  // the tile and the row info are reused by the next tile
+    if constexpr (kWarp) {
+      if (t + int64_t{gridDim.x} < tiles) __syncthreads();  // the tile and the row info are reused by the next tile (none after the last)
+    } else {
+      __syncthreads();  // the tile and the row info are reused by the next tile
+    }
+    KLT(kKltTail);
   }
+  KLT_END();
   // B rows n..n_hat-1 of every (slot, lambda) of group 1: zero (as k23_zero_rows)
   if (a.rows_pad > rows) {
     const int64_t gt = blockIdx.x * int64_t{T} + tid, gs = int64_t{gridDim.x} * T;
@@ -1352,6 +1540,27 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
           make_uint4(0, 0, 0, 0);
     }
   }
+}
+
+// kl_scale_pack's Kb for a launch (kb: bit 0 klwarp, bit 1 klload; E = 4 never takes klload: its rows are longer than two chunks, the host
+// has cleared the bit).
+template <int E, int W, int S>
+void launch_kl_kb(int kb, unsigned grid, cudaStream_t stream, const LargeArgs& a) {
+  constexpr unsigned T = kTileElems / E;
+  if constexpr (E == 4) kb &= ~kKlLoad;
+  if constexpr ((kSeqSupported & kSeqKl) == 0) kb = 0;
+#ifdef IMD_BUILD_TEST_HOOKS
+  test_note_kl_launch(E, kb);
+#endif
+  if constexpr ((kSeqSupported & kSeqKl) != 0) {
+    switch (kb) {
+      case 1: kl_scale_pack<E, W, S, 1><<<grid, T, 0, stream>>>(a); return;
+      case 2: if constexpr (E != 4) { kl_scale_pack<E, W, S, 2><<<grid, T, 0, stream>>>(a); return; } break;
+      case 3: if constexpr (E != 4) { kl_scale_pack<E, W, S, 3><<<grid, T, 0, stream>>>(a); return; } break;
+      default: break;
+    }
+  }
+  kl_scale_pack<E, W, S, 0><<<grid, T, 0, stream>>>(a);
 }
 
 // KL for operand x of the plan (DESIGN v1.6 §4): tile height and grid.
@@ -1386,10 +1595,24 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
   // (r_bigk 32 MB, r_mm 51 MB: inside the L2 budget of K1, A3).
   const unsigned grid = static_cast<unsigned>(L.grid);
   const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1 (imd_pack: the pack's N)
+  // Issue 23 (docs/NOTES-23.md): the fixed-part cuts of the plan's set. klwarp: the kernel takes the launch-invariant 64-bit scalars from here.
+  // klload: unit-stride k (one fused K mode of stride 1, read along k-bar), the rows held on chip (nc <= 2) and a 16-byte aligned operand base;
+  // the kernel still checks every thread's address (an odd row offset falls back to per-element loads). klshape: 16 values per thread (256 threads)
+  // for the rows held on chip. A bit that does not apply to this operand is simply not taken (the gather / 8 values per thread run).
+  int kb = 0;
+  bool shape16 = false;
+  if constexpr ((kSeqSupported & kSeqKl) != 0) {
+    const int sb = seq_bits(p);
+    kb = seq_kl_kb(sb);
+    if ((kb & kKlLoad) != 0 &&
+        !(a.along_rows == 0 && a.k_affine == 1 && a.k_stride == 1 && L.nc <= 2 && (reinterpret_cast<uintptr_t>(op.X) & 15) == 0))
+      kb &= ~kKlLoad;
+    shape16 = seq_kl_shape(sb) && L.values == 8;
+  }
+  a.D = p.b * op.rows / a.radix, a.nc = L.nc, a.tiles = L.tiles, a.n_d = L.tiles / a.radix;
   const auto run = [&](auto E, auto W) {
     with_pack_seq<decltype(W)::value>(p, [&](auto S) {
-      kl_scale_pack<decltype(E)::value, decltype(W)::value, decltype(S)::value>
-          <<<grid, kTileElems / decltype(E)::value, 0, stream>>>(a);
+      launch_kl_kb<decltype(E)::value, decltype(W)::value, decltype(S)::value>(kb, grid, stream, a);
     });
   };
   using I2 = std::integral_constant<int, 2>;
@@ -1397,6 +1620,9 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
   if (L.values == 4) {
     if (w2) run(std::integral_constant<int, 4>{}, I2{});
     else run(std::integral_constant<int, 4>{}, I3{});
+  } else if (shape16) {
+    if (w2) run(std::integral_constant<int, 16>{}, I2{});
+    else run(std::integral_constant<int, 16>{}, I3{});
   } else {
     if (w2) run(std::integral_constant<int, 8>{}, I2{});
     else run(std::integral_constant<int, 8>{}, I3{});
@@ -1514,6 +1740,32 @@ void test_note_k5_launch(bool limb_crt, int variant) {
 void test_k5_launch_counts(bool reset, int64_t* out) {
   for (int c = 0; c < 2; ++c)
     for (int v = 0; v < 4; ++v) out[4 * c + v] = reset ? g_k5_launches[c][v].exchange(0) : g_k5_launches[c][v].load();
+}
+
+// Issue 23: KL launches by [E = 4 / 8 / 16][Kb 0..3], counted in test builds (a forced bit that ran the baseline kernel must be visible).
+static std::atomic<int64_t> g_kl_launches[3][4];
+void test_note_kl_launch(int E, int kb) { g_kl_launches[E == 4 ? 0 : E == 8 ? 1 : 2][kb & 3].fetch_add(1, std::memory_order_relaxed); }
+void test_kl_launch_counts(bool reset, int64_t* out) {
+  for (int e = 0; e < 3; ++e)
+    for (int k = 0; k < 4; ++k) out[4 * e + k] = reset ? g_kl_launches[e][k].exchange(0) : g_kl_launches[e][k].load();
+}
+// The section timers (IMD_KL_TIMERS, see kl_scale_pack): copies the device sums to out[0..n) (n <= kKltSlots) and optionally zeroes them. Returns the slot count,
+// or -1 in a build without the knob.
+int test_kl_timers(bool reset, unsigned long long* out, int n) {
+#ifdef IMD_KL_TIMERS
+  if (cudaDeviceSynchronize() != cudaSuccess) return -2;
+  unsigned long long h[kKltSlots];
+  if (cudaMemcpyFromSymbol(h, g_kl_timers, sizeof(h)) != cudaSuccess) return -2;
+  for (int i = 0; i < n && i < kKltSlots; ++i) out[i] = h[i];
+  if (reset) {
+    unsigned long long z[kKltSlots] = {};
+    if (cudaMemcpyToSymbol(g_kl_timers, z, sizeof(z)) != cudaSuccess) return -2;
+  }
+  return kKltSlots;
+#else
+  (void)reset, (void)out, (void)n;
+  return -1;
+#endif
 }
 #endif
 

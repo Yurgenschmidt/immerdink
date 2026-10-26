@@ -65,6 +65,8 @@
 //
 //   imd_test_crt_elem(N, variant, e, count, W, out)
 //   imd_test_k5_launch_counts(reset, out)
+//   imd_test_kl_launch_counts(reset, out)   issue 23: KL kernel launches [E 4/8/16][klwarp, klload]
+//   imd_test_kl_timers(reset, out, n)       issue 23: KL section timers (IMMERDINK_KL_TIMERS builds)
 //       Issue 21 (docs/NOTES-21.md): the first runs the real CRT device functions of contract.cu
 //       (variant 0 integer running CRT, 1 binary64-limb CRT, 2..9 its compile-time mutations) on
 //       `count` device residue vectors and writes x in [0, P) before crt_finish; the second
@@ -233,6 +235,20 @@ IMD_API int imd_test_k5_launch_counts(int reset, int64_t* out) {
   if (out == nullptr) return 1;
   imd::detail::test_k5_launch_counts(reset != 0, out);
   return 0;
+}
+
+// Issue 23: KL kernel launches since the last reset, int64[12]: [E = 4 / 8 / 16 values per thread][Kb 0..3: bit 0 klwarp, bit 1 klload]; reset != 0 zeroes them.
+IMD_API int imd_test_kl_launch_counts(int reset, int64_t* out) {
+  if (out == nullptr) return 1;
+  imd::detail::test_kl_launch_counts(reset != 0, out);
+  return 0;
+}
+
+// Issue 23: the KL section timers (build with -DIMMERDINK_KL_TIMERS=1 or 2): copies up to n unsigned 64-bit sums (warp-cycles per section, then counters; docs/NOTES-23.md) to out,
+// zeroes them when reset != 0, returns the slot count (16), -1 in a build without the timers, -2 on a CUDA error. Synchronizes the device.
+IMD_API int imd_test_kl_timers(int reset, unsigned long long* out, int n) {
+  if (out == nullptr || n < 0) return -3;
+  return imd::detail::test_kl_timers(reset != 0, out, n);
 }
 
 // Issue 21: K5's CRT: the sums in binary64 limbs (1), the integer running CRT (0), or -1 (the default) the plan's set decides (kSeqLimbCrt of the device class).
