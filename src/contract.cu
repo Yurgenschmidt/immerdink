@@ -719,6 +719,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
   }
 }
 
+#ifndef IMD_NO_SEQ_TWINS   // the k5fin kernels exist only in a build with the sequence twins (the -Werror build would flag the unused helpers)
 // ---- K5 'k5fin' (seq-set bit 128, docs/NOTES-23-k5.md) ------------------------------------------
 // Instruction-count cuts of the limb-CRT + F1 K5 kernels (the sm_90 default set), same integers, same doubles, same stores as k5_crt_n / k5_crt_bfast
 // with F64 = F1 = true. They are separate kernels, so the shipped kernels are untouched (their SASS does not change with the bit off):
@@ -894,6 +895,7 @@ __global__ void __launch_bounds__(kThreads) k5f_crt_bfast(OutArgs a, int lg_tl) 
     __syncthreads();
   }
 }
+#endif  // IMD_NO_SEQ_TWINS
 
 __global__ void __launch_bounds__(kThreads) k_direct(OutArgs a) {
   const int64_t total = a.b * a.m * a.n;
@@ -972,6 +974,7 @@ void launch_k5_v(const K5Launch& L, const OutArgs& out, cudaStream_t stream) {
     k5_crt_n<N, 4, F64, F1><<<grid, kThreads, 0, stream>>>(out);
 }
 
+#ifndef IMD_NO_SEQ_TWINS
 template <int N>
 void launch_k5f_v(const K5Launch& L, const OutArgs& out, cudaStream_t stream) {
   const unsigned grid = static_cast<unsigned>(L.grid);
@@ -984,6 +987,7 @@ void launch_k5f_v(const K5Launch& L, const OutArgs& out, cudaStream_t stream) {
   else
     k5f_crt_n<N, 4><<<grid, kThreads, 0, stream>>>(out);
 }
+#endif  // IMD_NO_SEQ_TWINS
 
 template <int N>
 void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
@@ -997,6 +1001,7 @@ void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
   // issue 21: the sums in binary64 limbs (the class set's kSeqLimbCrt bit unless the K5 hook forces a CRT), and the F1 finish (host/seq_config.hpp)
   const bool f1 = (seq & kSeqFinish) != 0;
   // issue 23: k5fin (bit 128) is the limb CRT + F1 kernels with fewer instructions: only for that combination, and only when its 32-bit index arithmetic fits
+#ifndef IMD_NO_SEQ_TWINS
   if constexpr ((kSeqSupported & kSeqK5Fin) != 0) {
     if (f64 && f1 && (seq & kSeqK5Fin) != 0 && k5f_fits(L, out)) {
 #ifdef IMD_BUILD_TEST_HOOKS
@@ -1006,6 +1011,7 @@ void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
       return;
     }
   }
+#endif
   if (f64) {
     if constexpr ((kSeqSupported & kSeqFinish) != 0) {
       if (f1) { launch_k5_v<N, true, true>(L, out, stream); return; }
@@ -2103,13 +2109,13 @@ cudaError_t versions_of(Kernel kernel, int32_t* binary, int32_t* ptx) {
 template <bool Bfast>
 cudaError_t k5f_versions(int32_t* binary, int32_t* ptx) {
   constexpr int N = imd::constants::kNMin;
-  if constexpr ((kSeqSupported & kSeqK5Fin) != 0) {
-    if constexpr (Bfast) return versions_of(k5f_crt_bfast<N>, binary, ptx);
-    else return versions_of(k5f_crt_n<N, 4>, binary, ptx);
-  } else {
-    if constexpr (Bfast) return versions_of(k5_crt_bfast<N>, binary, ptx);
-    else return versions_of(k5_crt_n<N, 4>, binary, ptx);
-  }
+#ifndef IMD_NO_SEQ_TWINS
+  if constexpr (Bfast) return versions_of(k5f_crt_bfast<N>, binary, ptx);
+  else return versions_of(k5f_crt_n<N, 4>, binary, ptx);
+#else
+  if constexpr (Bfast) return versions_of(k5_crt_bfast<N>, binary, ptx);
+  else return versions_of(k5_crt_n<N, 4>, binary, ptx);
+#endif
 }
 
 // The launches that have no IMD_PERF_KERNEL_* id: the K1 kernels and the instantiations for more
