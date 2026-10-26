@@ -462,9 +462,9 @@ IMD_API int imd_prof_set_k4_config(int32_t config) {
   imd::detail::k4_config_override() = config;
   return 0;
 }
-// Benchmark-only (issue 22): the K4 backend a plan tries first (host/k4_wgmma.hpp K4Backend: 0 mma.sync, 1 Hopper wgmma; -1 without K4), the
-// backend every later plan takes (-1 the device class's rule, 0 mma.sync, 1 wgmma where the device has it; 1 also lifts the profitability floor of
-// every launch of plans created under it), and the launches the Hopper backend served / declined since the last reset (out[2]).
+// Benchmark-only (issue 22): the K4 backend a plan tries first (host/k4_wgmma.hpp K4Backend: 0 mma.sync, 1 Hopper wgmma with the profitability floor, 2 wgmma
+// forced; -1 without K4), the backend REQUEST every later plan takes (-1 the device class's rule, 0 mma.sync, 1 wgmma where the device has it: that plan
+// is then backend 2 and lifts the profitability floor for all its launches, also after the request is reset), and the launches the Hopper backend served / declined since the last reset (out[2]).
 IMD_API int imd_prof_plan_k4_backend(imd_plan_t plan, int32_t* backend) {
   if (plan == nullptr || backend == nullptr) return 1;
   *backend = plan->exec.k4 ? imd::detail::k4_backend_of(*plan->exec.k4) : -1;

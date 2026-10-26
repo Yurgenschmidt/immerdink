@@ -27,9 +27,11 @@ struct K4WgmmaOps {
   // version (cudaFuncGetAttributes binaryVersion must be 90: the sm_90a image), and the cluster count the persistent grid is sized
   // by (cudaOccupancyMaxActiveClusters, the minimum over the two kernels). Any CUDA error: the backend is unavailable.
   cudaError_t (*setup)(int* max_clusters, int* binary_version);
-  // Build the arguments (TMA descriptors included) on the stack, launch; false on a launch error. Never called for a launch
+  // Build the arguments (TMA descriptors included) on the stack and launch. kLaunchRefused: CUTLASS's can_implement said no, checked first,
+  // nothing was queued, the caller runs the launch on mma.sync; kLaunchError: the launch failed. Never called for a launch
   // host/k4_wgmma.hpp k4_wgmma_illegal rejects.
-  bool (*launch)(const K4WgmmaArgs& a, const K4Call& call, bool add, cudaStream_t stream);
+  enum LaunchResult : int { kLaunched = 0, kLaunchRefused = 1, kLaunchError = 2 };
+  int (*launch)(const K4WgmmaArgs& a, const K4Call& call, bool add, cudaStream_t stream);
   // Test only: everything `launch` does except the launch: can_implement and, if `encode`, to_underlying_arguments (the host-side TMA
   // encoding; cuTensorMapEncodeTiled is refused by the driver on a device below sm_90, so the caller passes encode only on one at or
   // above it) and the persistent grid (left 0 without encode). False if CUTLASS's can_implement refuses.

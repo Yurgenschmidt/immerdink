@@ -155,8 +155,10 @@ target_compile_options(imd_cutlass INTERFACE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -diag-suppress=20012>)
 
 # --- Hopper K4 (optional component, issue 22) ---------------------------------------------
-# AUTO: on when nvcc >= 12.0 (sm_90a), CUTLASS is 3.x or later and CMAKE_CUDA_ARCHITECTURES names 90 / 90a (any suffix). Off otherwise, and
-# then the library is built exactly as before (nothing below is evaluated, gemm_k4.cu compiles without IMD_K4_WGMMA).
+# AUTO: on when nvcc >= 12.0 (sm_90a), CUTLASS is 3.x or later and CMAKE_CUDA_ARCHITECTURES names 90 / 90a (any suffix) or all / all-major. Off
+# otherwise (NOT for "native": the detected GPU is not known at configure time), and then the library is built exactly as before (nothing below is
+# evaluated, gemm_k4.cu compiles without IMD_K4_WGMMA). A build meant for a Hopper configures with -DIMMERDINK_K4_WGMMA=ON (the cluster does),
+# so an AUTO that came out OFF cannot go unnoticed: tests/test_k4_wgmma.py fails on a cc 9.0 device whose library has no backend.
 set(IMD_K4_WGMMA_ENABLED OFF)
 if(NOT IMMERDINK_K4_WGMMA STREQUAL "OFF")
   set(_imd_cutlass_major 0)
@@ -166,7 +168,7 @@ if(NOT IMMERDINK_K4_WGMMA STREQUAL "OFF")
   endif()
   set(_imd_has90 OFF)
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
-    if(_a MATCHES "^90")
+    if(_a MATCHES "^90" OR _a MATCHES "^all")
       set(_imd_has90 ON)
     endif()
   endforeach()

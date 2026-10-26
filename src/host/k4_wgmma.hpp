@@ -15,8 +15,12 @@
 namespace imd::detail {
 
 // ---- backends -------------------------------------------------------------------------------------------------
-enum K4Backend : int32_t { kK4BackendMma = 0, kK4BackendWgmma = 1 };
-// The process-wide override (test / benchmark hooks only): kK4BackendAuto = the device class's rule.
+// The backend a PLAN tries first (K4Plan::backend). kK4BackendWgmmaForced is "wgmma, forced": the profitability floor is lifted for every
+// launch of the plan (legality never is). It is a property of the plan, fixed at plan creation, so a benchmark that resets the process-wide
+// override right after imd_plan_create still times the forced path.
+enum K4Backend : int32_t { kK4BackendMma = 0, kK4BackendWgmma = 1, kK4BackendWgmmaForced = 2 };
+// The process-wide override REQUEST (test / benchmark hooks only, read at plan creation): kK4BackendAuto = the device class's rule, kK4BackendMma,
+// kK4BackendWgmma = force the Hopper backend (the plan then gets kK4BackendWgmmaForced where the device has it).
 constexpr int32_t kK4BackendAuto = -1;
 constexpr bool k4_backend_valid(int32_t v) { return v >= kK4BackendAuto && v <= kK4BackendWgmma; }
 
@@ -33,12 +37,13 @@ constexpr bool k4_wgmma_device_ok(int32_t table_id, int32_t cc_major, int32_t cc
   return table_id >= 0 && table_id < IMD_TABLE_COUNT && kK4WgmmaTable[table_id] && cc_major == 9 && cc_minor == 0;
 }
 
-// The backend a plan runs: the override if it asks for one (a forced wgmma on a device without it is still mma:
-// `available` false), else the class's default. `available` = the class allows it, the build has it, the probe found its kernels.
+// The backend a plan runs: the override request if there is one (a forced wgmma on a device without it is still mma: `available` false;
+// where the device has it the plan is kK4BackendWgmmaForced), else the class's default (kK4BackendWgmma: floor applies). `available` = the
+// class allows it, the build has it, the probe found its kernels.
 constexpr int32_t k4_backend_resolve(int32_t override_backend, bool available, bool class_default) {
   if (!available) return kK4BackendMma;
   if (override_backend == kK4BackendAuto) return class_default ? kK4BackendWgmma : kK4BackendMma;
-  return override_backend == kK4BackendWgmma ? kK4BackendWgmma : kK4BackendMma;
+  return override_backend == kK4BackendWgmma ? kK4BackendWgmmaForced : kK4BackendMma;
 }
 
 // ---- tile / cluster / scheduler table -------------------------------------------------------------------------

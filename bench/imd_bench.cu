@@ -2105,7 +2105,8 @@ struct Bench {
     DevBuf ws;
     imd_lowering_t low{};
     int32_t k4_run = -1;
-    int32_t k4b_run = -1;  // issue 22: the K4 backend the plan tries first (0 mma.sync, 1 wgmma)
+    int32_t k4b_run = -1;  // issue 22: the K4 backend the plan tries first (0 mma.sync, 1 wgmma with the floor, 2 wgmma forced)
+    mutable int64_t wg_served = 0, wg_declined = 0;  // issue 22: K4 launches this side's calls ran on the Hopper kernel / on mma.sync in its place
     double create_ms = 0;
     ~DuelPlan() {
       if (plan) { cudaDeviceSynchronize(); imd_plan_destroy(plan); }  // a resident plan outlives its work
@@ -2192,8 +2193,21 @@ struct Bench {
       CU(cudaEventSynchronize(e1));
       float ms = 0;
       CU(cudaEventElapsedTime(&ms, e0, e1));
+#ifdef IMD_BENCH_PROFILE
+      {  // issue 22: the K4 launches this call ran on the Hopper kernel / declined to mma.sync (after the timed window; the counters are global)
+        int64_t w[2] = {0, 0};
+        imd_prof_k4_wgmma_counts(1, w);
+        p.wg_served += w[0], p.wg_declined += w[1];
+      }
+#endif
       return double(ms) * 1e-3;
     };
+#ifdef IMD_BENCH_PROFILE
+    {
+      int64_t w[2];
+      imd_prof_k4_wgmma_counts(1, w);  // the warm-up's launches are not the timed ones
+    }
+#endif
     Timing TA, TB;
     std::vector<double> ratio;
     double total = 0;
@@ -2237,7 +2251,8 @@ struct Bench {
       e.str("duel_side", which).str("duel_config", p.cfg.describe());
       e.integer("plan_device_bytes", (long long)p.plan_dev).num("plan_create_ms", p.create_ms);
       e.integer("g", (long long)((p.cfg.g == 0 || p.cfg.g >= p.cfg.N) ? p.cfg.N : p.cfg.g));
-      e.integer("k4_rule", p.low.k4_config).integer("k4_config", p.k4_run).integer("k4b_req", p.cfg.k4b).integer("k4b_run", p.k4b_run);
+      e.integer("k4_rule", p.low.k4_config).integer("k4_config", p.k4_run).integer("k4b_req", p.cfg.k4b).integer("k4b_run", p.k4b_run)
+          .integer("k4_wgmma_served", p.wg_served).integer("k4_wgmma_declined", p.wg_declined);  // over the timed calls of this side
       e.integer("kernel_launches", p.low.kernel_launches);
       e.integer("fused", p.low.fused).integer("fused_large", p.low.fused_large);
       e.integer("k_align", p.low.k_align).integer("k_hat", (long long)p.low.k_hat);
@@ -2760,7 +2775,7 @@ void usage() {
           "      4 F1 with Q1 needing E1, and K5's CRT variant, for this method's plan and calls; the record gets seq_req, seq (the set the\n"
           "      plan ran), crt_req, crt, and c_hash, which must be equal across configurations)\n"
           "  [--k4b default|mma|wgmma] (method imd, profiling build; issue 22: the K4 backend of the plan, wgmma = every legal launch on the Hopper\n"
-          "      kernel, floor lifted; the record gets k4b_req, k4b_run (what the plan tries first), k4_wgmma_served / _declined)\n"
+          "      kernel, floor lifted; the record gets k4b_req, k4b_run (what the plan tries first: 0 mma.sync, 1 wgmma with the floor, 2 wgmma forced), k4_wgmma_served / _declined; a duel record carries them per side)\n"
           "  methods: imd,packed,duel,bw,occupancy,sustained,pair,energy (default imd);\n"
           "      optional baselines (built with cuTENSOR): cutensor, cutensor-emu (CUTENSOR_COMPUTE_DESC_8XINT8),\n"
           "      energy-cutensor, energy-cutensor-emu; cuBLAS: dgemm, emu (FP64 fixed-point emulation, CUDA 13\n"

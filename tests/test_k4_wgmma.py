@@ -3,7 +3,7 @@
 
     python3 tests/test_k4_wgmma.py [--lib build/libimmerdink.so]
 
-What runs where (docs/NOTES-22.md "Library integration (design)", "Cluster test plan"):
+What runs where (docs/NOTES-22.md "Library integration (design)", "Test plan"):
 
   every device     the backend's status is what the device class and the build say: unavailable off sm_90 (or in a build without
                    IMMERDINK_K4_WGMMA), a forced wgmma plan then reports mma.sync and the launch counters stay 0 (a forced wgmma that
@@ -13,7 +13,11 @@ What runs where (docs/NOTES-22.md "Library integration (design)", "Cluster test 
                    wgmma. On a build with the backend the host half of a Hopper launch (tile choice, can_implement; the TMA descriptors from sm_90 up) is
                    also dry-run on edge shapes, on any device.
   Hopper (sm_90)   the same comparison is the exactness test of the Hopper path: the forced runs must serve launches with the wgmma
-                   kernel (counter > 0, plan backend 1) and produce the same C bit for bit as the mma.sync run (counter 0).
+                   kernel (counter > 0, plan backend 2 = wgmma forced) and produce the same C bit for bit as the mma.sync run (counter 0).
+                   A cc 9.0 device whose library was built WITHOUT the backend FAILS this test (a Hopper build that silently came out
+                   OFF must not pass), unless IMD_ALLOW_NO_WGMMA=1 says it is meant (e.g. a build of the baseline for an A/B).
+  Plan property    a plan created under a forced wgmma request keeps it (backend 2) after the request is reset: the floor is lifted for the
+                   plan's launches, not for whatever the process-wide override says at the time of the call (imd_bench resets it).
 """
 import argparse
 import ctypes as C
@@ -55,7 +59,11 @@ CASES = [
     (batched("bsplit", 130, 270, 520, 5, 14, limits=(0, 2, 0)), "batch part <= 2: batch0 offsets in the modulus (slot0 + (batch0 + z) / b)"),
     (gemm("nsplit", 130, 700, 520, 14, limits=(0, 0, 1)), "n-hat part of one 256-column tile: the gridDim.y split"),
     (batched("all_splits", 130, 600, 1100, 5, 8, limits=(512, 2, 1)), "K-chunk, batch and n-hat splits together"),
+    # 33 x 33 = 1089 tiles per batch: the swizzle-8 / AlongN scheduler path of the R2 table, with tails in m and n (4100 = 32 * 128 + 4,
+    # 8208 = 32 * 256 + 16); about 0.5 GB of W. Skipped (and said so) below BIG_FREE_BYTES of free device memory.
+    (dict(gemm("swizzle8_tails", 4100, 8200, 256, 14), big=True), "swizzle 8 / AlongN with tails (>= 1024 tiles per batch)"),
 ]
+BIG_FREE_BYTES = 3 << 30
 
 # Dry-run table of the host half (m, nc, kc, zc, k_hat, n_hat, force) -> (served?, swizzle, raster).
 SMS, CLUSTERS = 132, 66
@@ -63,6 +71,7 @@ DRY = [
     ((4096, 4096, 4096, 14, 4096, 4096, 0), (True, 1, 0), "R2 4096^3: 512 tiles per batch, swizzle 1 heuristic"),
     ((8192, 8192, 8192, 4, 8192, 8192, 0), (True, 8, 2), "R2 8192^3: 2048 tiles per batch, swizzle 8 AlongN"),
     ((8192, 8192, 8192, 1, 8192, 8192, 0), (True, 8, 2), "R2 8192^3 batch 1"),
+    ((4100, 8208, 256, 14, 256, 8208, 1), (True, 8, 2), "the swizzle8_tails case of CASES: 33 x 33 tiles per batch"),
     ((2048, 2048, 2048, 14, 2048, 2048, 0), (True, 1, 0), "inside the floor"),
     ((512, 512, 512, 14, 512, 512, 0), (False, 0, 0), "below the profitability floor: mma.sync"),
     ((512, 512, 512, 14, 512, 512, 1), (True, 1, 0), "forced: the floor is lifted"),
@@ -111,6 +120,9 @@ def main():
     available = lib.lib.imd_test_k4_wgmma_available(h)
     bad = []
     want_available = built and (major, minor) == (9, 0)
+    if (major, minor) == (9, 0) and not built and os.environ.get("IMD_ALLOW_NO_WGMMA") != "1":
+        bad.append("sm_90 device, but this library was built without the Hopper K4 backend (IMMERDINK_K4_WGMMA=OFF, or AUTO with architectures that do not name 90): "
+                   "configure with -DIMMERDINK_K4_WGMMA=ON; IMD_ALLOW_NO_WGMMA=1 if this is meant")
     if available not in (0, 1):
         bad.append(f"imd_test_k4_wgmma_available returned {available}")
     elif bool(available) != want_available:
@@ -130,8 +142,19 @@ def main():
         forced_wg = plan_backend(lib, probe)
         if forced_mma != 0:
             bad.append(f"forced mma.sync: the plan reports backend {forced_mma}")
-        if forced_wg != (1 if hopper else 0):
-            bad.append(f"forced wgmma on {'a Hopper' if hopper else 'a device without the backend'}: the plan reports backend {forced_wg}")
+        if forced_wg != (2 if hopper else 0):
+            bad.append(f"forced wgmma on {'a Hopper' if hopper else 'a device without the backend'}: the plan reports backend {forced_wg} (2 = forced)")
+        lib.set_k4_backend(-1)   # the request is reset after the plan exists, as imd_bench does: the plan keeps what it was created with
+        lib.set_k4_backend(1)
+        probe_plan_h = {X: hz.make_tensor(probe[X]["extent"], hz.dense(probe[X]["extent"]), probe[X]["label"]) for X in "ABC"}
+        st, kept = lib.plan_create(probe_plan_h["A"], probe_plan_h["B"], probe_plan_h["C"], probe["N"], 0, hz.RN)
+        assert st == "SUCCESS", st
+        lib.set_k4_backend(-1)
+        try:
+            if lib.plan_k4_backend(kept) != (2 if hopper else 0):
+                bad.append(f"a plan created under a forced wgmma request reports backend {lib.plan_k4_backend(kept)} after the request was reset (expected {2 if hopper else 0})")
+        finally:
+            lib.plan_destroy(kept)
         if auto != (1 if hopper else 0):
             bad.append(f"device-class default: the plan reports backend {auto} ({'Hopper' if hopper else 'no backend here'})")
         for v in (-2, 2):
@@ -139,6 +162,12 @@ def main():
                 bad.append(f"imd_test_set_k4_backend({v}) was accepted")
         # ---- bit identity of C, forced mma.sync vs forced wgmma, with the launch counters ----------------------------------------
         for c, what in CASES:
+            if c.get("big"):
+                free, total = C.c_size_t(), C.c_size_t()
+                cuda.check(cuda.rt.cudaMemGetInfo(C.byref(free), C.byref(total)), "cudaMemGetInfo")
+                if free.value < BIG_FREE_BYTES:
+                    print(f"note: {c['name']} skipped, {free.value >> 20} MiB free < {BIG_FREE_BYTES >> 20} MiB")
+                    continue
             hashes = {}
             for backend in (0, 1):
                 lib.set_k4_backend(backend)
@@ -187,7 +216,7 @@ def main():
         for b in bad:
             print("  " + b)
         return 1
-    where = (f"Hopper path served the forced runs (plan backend 1, launches counted, none declined)" if hopper else
+    where = (f"Hopper path served the forced runs (plan backend 2 = forced, launches counted, none declined)" if hopper else
              f"sm_{major}{minor}{'' if built else ', build without the backend'}: backend unavailable, a forced wgmma plan runs mma.sync, no launch counted")
     print(f"PASS  {n_cmp} cases bit-identical between forced mma.sync and forced wgmma; {where}; {n_dry} host dry runs of the Hopper launch")
     return 0

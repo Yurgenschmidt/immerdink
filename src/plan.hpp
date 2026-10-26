@@ -71,13 +71,13 @@ LaunchLimits default_launch_limits();
 // host state is built here, never in imd_contract. SUCCESS, CUDA_ERROR, INVALID_VALUE (no
 // such configuration), or NOT_SUPPORTED if a shape is out of K4's limits.
 //
-// Issue 22: `backend` is kK4BackendWgmma when the plan should try the Hopper backend first (the caller decided with
-// k4_wgmma_available and the override); the plan holds the mma.sync parameters either way (the fallback of every launch the
+// Issue 22: `backend` is kK4BackendWgmma / kK4BackendWgmmaForced when the plan should try the Hopper backend first (the caller decided with
+// k4_wgmma_available and the override; forced = the profitability floor is lifted for every launch of this plan); the plan holds the mma.sync parameters either way (the fallback of every launch the
 // Hopper backend does not serve), so the plan's host bytes and launch counts do not depend on it.
 imd_status_t k4_prepare(const ExecPlan& p, int cfg, std::shared_ptr<const K4Plan>* out, int32_t backend = 0);
 
 // Issue 22 (gemm_k4.cu; host/k4_wgmma.hpp): the process-wide backend override (-1 the device class's rule, 0 mma.sync, 1 wgmma; hooks only:
-// imd_test_set_k4_backend, imd_prof_set_k4_backend), read by imd_plan_create and, to lift the profitability floor, by every K4 launch.
+// imd_test_set_k4_backend, imd_prof_set_k4_backend), a REQUEST read by imd_plan_create only (k4_backend_resolve): launches never read it.
 std::atomic<int>& k4_backend_override();
 // Can the Hopper backend run on the current device? The device class's table (host/k4_wgmma.hpp kK4WgmmaTable) and compute
 // capability 9.0, this build having it (IMMERDINK_K4_WGMMA), and the first-use probe (the sm_90a image loads: binaryVersion 90,

@@ -82,14 +82,15 @@ struct W {
     return args;
   }
 
-  static bool launch(const K4WgmmaArgs& a, const K4Call& c, cudaStream_t stream) {
+  static int launch(const K4WgmmaArgs& a, const K4Call& c, cudaStream_t stream) {
     const auto args = arguments(a, c);
-    if (!Kernel::can_implement(args)) return false;
+    if (!Kernel::can_implement(args)) return K4WgmmaOps::kLaunchRefused;  // before anything is encoded or queued
     const typename Kernel::Params params = Kernel::to_underlying_arguments(args, nullptr);  // the TMA descriptors, on the stack
     cudaLaunchAttribute at{};
     const cudaLaunchConfig_t cfg = config(&at, Kernel::get_grid_shape(params), stream);
     void* kargs[] = {const_cast<typename Kernel::Params*>(&params)};
-    return cudaLaunchKernelExC(&cfg, fn(), kargs) == cudaSuccess && cudaPeekAtLastError() == cudaSuccess;
+    return cudaLaunchKernelExC(&cfg, fn(), kargs) == cudaSuccess && cudaPeekAtLastError() == cudaSuccess ? K4WgmmaOps::kLaunched
+                                                                                                          : K4WgmmaOps::kLaunchError;
   }
 
   static bool dry_run(const K4WgmmaArgs& a, const K4Call& c, bool encode, int* gx, int* gy, int* gz) {
@@ -113,7 +114,7 @@ cudaError_t setup(int* max_clusters, int* binary_version) {
   return cudaSuccess;
 }
 
-bool launch(const K4WgmmaArgs& a, const K4Call& c, bool add, cudaStream_t stream) {
+int launch(const K4WgmmaArgs& a, const K4Call& c, bool add, cudaStream_t stream) {
   return add ? W<true>::launch(a, c, stream) : W<false>::launch(a, c, stream);
 }
 

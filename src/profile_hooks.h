@@ -18,10 +18,12 @@
  *                         plans created afterwards run K4 configuration `config`; -1
  *                         restores the plan-time rule / k4_tune. Returns 0, 1 if invalid.
  *   imd_prof_plan_k4_backend(plan, &backend)
- *                         issue 22: the K4 backend the plan tries first (0 mma.sync, 1 Hopper wgmma), -1 without K4.
+ *                         issue 22: the K4 backend the plan tries first (0 mma.sync, 1 Hopper wgmma with its profitability floor, 2 Hopper
+ *                         wgmma forced: the floor lifted for the plan's life), -1 without K4.
  *   imd_prof_set_k4_backend(backend)
  *                         issue 22: plans created afterwards take backend 0 (mma.sync), 1 (wgmma, where the device class has it and
- *                         the build; 1 also lifts the profitability floor) or -1 (the device class's rule). Returns 0, 1 if invalid.
+ *                         the build: the plan is then backend 2, "forced", which lifts the profitability floor for every launch of that plan
+ *                         whatever the override is later) or -1 (the device class's rule). Read at plan creation. Returns 0, 1 if invalid.
  *   imd_prof_k4_wgmma_counts(reset, out[2])
  *                         issue 22: K4 launches the Hopper backend served / declined since the last reset.
  *   imd_prof_set_k5_elems(elems)

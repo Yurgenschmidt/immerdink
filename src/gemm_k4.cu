@@ -84,6 +84,12 @@ constexpr int kMaxWgmmaDevices = 64;
 std::mutex g_wgmma_mutex;
 WgmmaDevice g_wgmma_dev[kMaxWgmmaDevices];
 
+// A failed probe is "not available", not an error of the caller: clear the (non-sticky) error state only if nothing was pending before the
+// probe started (`had_pending`), so a pending error of the caller's own is not swallowed.
+void clear_own_error(bool had_pending) {
+  if (!had_pending) cudaGetLastError();
+}
+
 WgmmaDevice wgmma_probe(int device) {
   if (device < 0 || device >= kMaxWgmmaDevices) return {true, false, 0};
   std::lock_guard<std::mutex> lock(g_wgmma_mutex);
@@ -91,11 +97,12 @@ WgmmaDevice wgmma_probe(int device) {
   if (!d.probed) {
     d.probed = true;
     const K4WgmmaOps* ops = k4_wgmma_ops(0);
+    const bool had_pending = cudaPeekAtLastError() != cudaSuccess;
     int clusters = 0, binary = 0;
     // the sm_90a image must be the one the device runs (binaryVersion 90) and the persistent grid needs a cluster count
     if (ops != nullptr && ops->setup(&clusters, &binary) == cudaSuccess && binary == 90 && clusters >= 1 && clusters <= 255)
       d.ok = true, d.clusters = clusters;
-    cudaGetLastError();  // a failed probe is a "not available", not a sticky error
+    if (!d.ok) clear_own_error(had_pending);
   }
   return d;
 }
@@ -189,8 +196,8 @@ bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, 
                int gsize, cudaStream_t stream, bool prof, int64_t batch_a = 0,
                int64_t batch_b = 0) {
   const K4Ops& ops = k4_ops(k.config);
-  const bool try_wgmma = k.backend == kK4BackendWgmma;
-  const bool force = try_wgmma && g_backend_override.load(std::memory_order_relaxed) == kK4BackendWgmma;
+  const bool try_wgmma = k.backend != kK4BackendMma;
+  const bool force = k.backend == kK4BackendWgmmaForced;  // a property of the plan (fixed at creation), not of the process-wide override
   bool ok = true;
   k.for_each_launch(gsize, [&](const Launch& L) {
     if (!ok) return;
@@ -207,12 +214,18 @@ bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, 
       if (wops != nullptr) {
         const K4WgmmaArgs wa{static_cast<int>(k.m), static_cast<int>(L.nc), static_cast<int>(L.kc), static_cast<int>(L.zc),
                              k.k_hat, k.n_hat, call.plane_w, k.sms, k.wgmma_clusters, pick.swizzle, pick.raster};
-        g_wgmma_launched.fetch_add(1, std::memory_order_relaxed);
-        ok = wops->launch(wa, call, L.k0 != 0, stream);
-        if (prof) IMD_PROF(stream, L.k0 == 0 ? "K4 gemm store" : "K4 gemm add");
-        return;
+        const int r = wops->launch(wa, call, L.k0 != 0, stream);  // can_implement is its first step: a refusal queued nothing
+        if (r == K4WgmmaOps::kLaunched) {
+          g_wgmma_launched.fetch_add(1, std::memory_order_relaxed);
+          if (prof) IMD_PROF(stream, L.k0 == 0 ? "K4 gemm store" : "K4 gemm add");
+          return;
+        }
+        if (r == K4WgmmaOps::kLaunchError) {
+          ok = false;
+          return;
+        }
       }
-      g_wgmma_declined.fetch_add(1, std::memory_order_relaxed);
+      g_wgmma_declined.fetch_add(1, std::memory_order_relaxed);  // not served (illegal, below the floor, or refused): mma.sync runs it
     }
     ok = it != map.end() && ops.launch(it->second, L.k0 != 0, call, stream);
     if (prof) IMD_PROF(stream, L.k0 == 0 ? "K4 gemm store" : "K4 gemm add");
@@ -248,9 +261,10 @@ std::atomic<int>& k4_backend_override() { return g_backend_override; }
 bool k4_wgmma_available(int32_t table_id, int32_t cc_major, int32_t cc_minor) {
   // The device class first: no CUDA call at all on a device without the backend (RTX 4090, sm_120, anything but sm_90)
   if (!k4_wgmma_device_ok(table_id, cc_major, cc_minor) || k4_wgmma_ops(0) == nullptr) return false;
+  const bool had_pending = cudaPeekAtLastError() != cudaSuccess;
   int device = 0;
   if (cudaGetDevice(&device) != cudaSuccess) {
-    cudaGetLastError();
+    clear_own_error(had_pending);
     return false;
   }
   return wgmma_probe(device).ok;
@@ -299,13 +313,16 @@ imd_status_t k4_prepare(const ExecPlan& p, int cfg, std::shared_ptr<const K4Plan
   auto k = std::make_shared<K4Plan>();
   k->m = p.m, k->n_hat = p.n_hat, k->k_hat = p.k_hat, k->b = p.b;
   k->sms = static_cast<uint16_t>(p.sms > 0 && p.sms < 65536 ? p.sms : 0);
-  if (backend == kK4BackendWgmma && k->sms > 0) {  // issue 22: the caller decided (k4_wgmma_available); the probe is cached
+  if (backend != kK4BackendMma && k->sms > 0) {  // issue 22: the caller decided (k4_wgmma_available); the probe is cached
+    const bool had_pending = cudaPeekAtLastError() != cudaSuccess;
     int device = 0;
     if (cudaGetDevice(&device) == cudaSuccess) {
       const WgmmaDevice d = wgmma_probe(device);
-      if (d.ok) k->backend = kK4BackendWgmma, k->wgmma_clusters = static_cast<uint8_t>(d.clusters);
-    } else {
-      cudaGetLastError();
+      // Like the mma.sync setup below, the per-device function attributes (dynamic shared memory) are set on every plan creation
+      int clusters = 0, binary = 0;
+      const bool again = d.ok && k4_wgmma_ops(0)->setup(&clusters, &binary) == cudaSuccess && binary == 90 && clusters == d.clusters;
+      if (d.ok && !again) clear_own_error(had_pending);
+      if (again) k->backend = static_cast<uint8_t>(backend), k->wgmma_clusters = static_cast<uint8_t>(d.clusters);
     }
   }
   // The launch structure is the configuration's-independent host one (n-hat split in

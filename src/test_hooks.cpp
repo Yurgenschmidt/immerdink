@@ -149,15 +149,16 @@ IMD_API int imd_test_set_k4_config(int config) {
   return 0;
 }
 
-// Issue 22 (docs/NOTES-22.md "Library integration (design)"): the K4 backend of plans created afterwards (-1 the device class's rule, 0 mma.sync,
-// 1 wgmma: forced on every legal launch, the profitability floor lifted; a device without the backend runs mma.sync whatever is asked).
+// Issue 22 (docs/NOTES-22.md "Library integration (design)"): the K4 backend REQUEST of plans created afterwards (-1 the device class's rule, 0 mma.sync,
+// 1 wgmma: the plan is then "wgmma, forced" = backend 2: every legal launch of that plan, the profitability floor lifted, for the plan's life; a
+// device without the backend runs mma.sync whatever is asked). The request is read at plan creation only; resetting it later does not change plans.
 IMD_API int imd_test_set_k4_backend(int backend) {
   if (!imd::detail::k4_backend_valid(backend)) return 1;
   imd::detail::k4_backend_override() = backend;
   return 0;
 }
 IMD_API int imd_test_get_k4_backend(void) { return imd::detail::k4_backend_override().load(); }
-// The backend a plan tries first (0 mma.sync, 1 wgmma; -1 for a null plan or a plan without K4).
+// The backend a plan tries first (0 mma.sync, 1 wgmma with the profitability floor, 2 wgmma forced; -1 for a null plan or a plan without K4).
 IMD_API int imd_test_plan_k4_backend(imd_plan_t plan) {
   const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
   return e == nullptr || !e->k4 ? -1 : imd::detail::k4_backend_of(*e->k4);

@@ -59,7 +59,9 @@ int main() {
   CHECK(k4_backend_resolve(kK4BackendAuto, true, true) == kK4BackendWgmma);
   CHECK(k4_backend_resolve(kK4BackendAuto, true, false) == kK4BackendMma);
   CHECK(k4_backend_resolve(kK4BackendMma, true, true) == kK4BackendMma);
-  CHECK(k4_backend_resolve(kK4BackendWgmma, true, false) == kK4BackendWgmma);  // forced where the device has it
+  CHECK(k4_backend_resolve(kK4BackendWgmma, true, false) == kK4BackendWgmmaForced);  // forced where the device has it: a PLAN property (floor lifted)
+  CHECK(k4_backend_resolve(kK4BackendWgmma, true, true) == kK4BackendWgmmaForced);
+  CHECK(kK4BackendMma == 0 && kK4BackendWgmma == 1 && kK4BackendWgmmaForced == 2);  // the values the hooks and records report
   for (int o = -1; o <= 1; ++o)
     for (int c = 0; c < 2; ++c) CHECK(k4_backend_resolve(o, false, c != 0) == kK4BackendMma);  // unavailable: never wgmma
   CHECK(k4_backend_valid(-1) && k4_backend_valid(0) && k4_backend_valid(1) && !k4_backend_valid(2) && !k4_backend_valid(-2));
