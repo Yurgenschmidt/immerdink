@@ -2099,6 +2099,19 @@ cudaError_t versions_of(Kernel kernel, int32_t* binary, int32_t* ptx) {
 }
 }  // namespace
 
+// Issue 23: the k5fin kernels exist only in a build with the sequence twins; without them the shipped K5 stands in (same module, same code version).
+template <bool Bfast>
+cudaError_t k5f_versions(int32_t* binary, int32_t* ptx) {
+  constexpr int N = imd::constants::kNMin;
+  if constexpr ((kSeqSupported & kSeqK5Fin) != 0) {
+    if constexpr (Bfast) return versions_of(k5f_crt_bfast<N>, binary, ptx);
+    else return versions_of(k5f_crt_n<N, 4>, binary, ptx);
+  } else {
+    if constexpr (Bfast) return versions_of(k5_crt_bfast<N>, binary, ptx);
+    else return versions_of(k5_crt_n<N, 4>, binary, ptx);
+  }
+}
+
 // The launches that have no IMD_PERF_KERNEL_* id: the K1 kernels and the instantiations for more
 // than kK0SmallModes modes (tests/check_kernel_sites.py keeps this list complete).
 cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) {
@@ -2115,6 +2128,8 @@ cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) 
     case 9: return versions_of(k1_scale<1024>, binary, ptx);
     case 10: return versions_of(k1_scale<kThreads>, binary, ptx);
     case 11: return versions_of(k23_pack_cap<2, 1>, binary, ptx);  // issue 21: the E1 K2/K3 instance held to 4 CTAs per SM
+    case 12: return k5f_versions<true>(binary, ptx);   // issue 23: the k5fin K5 kernels (one n and one batch-fastest instance; same module as the shipped K5)
+    case 13: return k5f_versions<false>(binary, ptx);
     default: return cudaErrorInvalidValue;
   }
 }
