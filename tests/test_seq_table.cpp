@@ -50,6 +50,11 @@ int main() {
   CHECK(seq_kl_shape(kSeqKlShape) && !seq_kl_shape(kSeqKlWarp | kSeqKlLoad | 7) && !seq_kl_shape(13));
   CHECK(seq_pack_s(kSeqKlWarp | kSeqKlLoad | kSeqKlShape, 2) == 0 && seq_pack_s(kSeqEmit | kSeqKl, 2) == 1 && seq_pack_s(kSeqEmit | kSeqQuant | kSeqKl, 2) == 3);
   CHECK(seq_effective(13, 17) == 17 && seq_effective(13, 113) == 113 && seq_effective(13, -1) == 13 && (seq_effective(13, 125) & kSeqLimbCrt) == 0);
+#ifndef IMD_NO_SEQ_TWINS
+  // a class row MAY carry a KL bit later (per device class, with that class's own data): the default mask keeps it and the plan's set runs it
+  CHECK(((kSeqEmit | kSeqFinish | kSeqLimbCrt | kSeqKlWarp) & kSeqDefaultMask) == (kSeqEmit | kSeqFinish | kSeqLimbCrt | kSeqKlWarp));
+  CHECK(seq_effective(kSeqEmit | kSeqKlLoad, -1) == (kSeqEmit | kSeqKlLoad) && seq_kl_kb(seq_effective(13 | kSeqKlWarp | kSeqKlLoad, -1)) == 3);
+#endif
   CHECK(seq_limb_crt(seq_effective(13, 113), 1) && !seq_limb_crt(seq_effective(13, 113), -1));
   // forcing: the hooks accept -1 and 0..7 only; bit 8 is a class default
   CHECK(!seq_valid(kSeqLimbCrt) && !seq_valid(13) && !seq_valid(-2) && !seq_valid(128) && !seq_valid(256) && !seq_valid(24) && seq_valid(-1));
