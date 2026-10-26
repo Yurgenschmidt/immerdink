@@ -20,6 +20,11 @@ add_test(NAME calib_strings_too_long
 # a property value is a list.)
 set_tests_properties(calib_strings_too_long PROPERTIES PASS_REGULAR_EXPRESSION
   "too_long[.]calib:9:[ \n]+'notes'[ \n]+is[ \n]+128[ \n]+bytes.[ \n]+the[ \n]+calibration[ \n]+field[ \n]+holds[ \n]+127")
+# Issue 22 (docs/NOTES-22.md "Library integration (design)"): the Hopper K4 backend's host rules (device-class table, legality, the R2 tile /
+# scheduler table, the profitability floor), CUDA-free: runs on every machine, with the backend built in or not.
+add_executable(test_k4_wgmma_select test_k4_wgmma_select.cpp)
+target_link_libraries(test_k4_wgmma_select PRIVATE imd_host_internal imd_warnings)
+add_test(NAME k4_wgmma_select COMMAND test_k4_wgmma_select)
 # tools/test.sh's detection of a caller's ctest selection option (-R/-E/-L/...): any such
 # option must put the whole run under the GPU lock (CPU-only; no build, no GPU).
 add_test(NAME tools_test_sh_selftest
@@ -297,6 +302,34 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_seq_select.py" --lib "$<TARGET_FILE:immerdink>"
                    ${_seq_twin_arg})
   set_tests_properties(seq_select PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+  # Issue 22 (docs/NOTES-22.md "Library integration (design)"): the Hopper wgmma K4 backend. Registered on every build and device and
+  # passing on all of them (the campaign counts a skipped test as not passed): off sm_90 (or in a build without IMMERDINK_K4_WGMMA) the
+  # backend is unavailable, a forced wgmma plan reports and runs mma.sync, and the launch counters must stay 0; on a Hopper the forced
+  # runs must be served by the wgmma kernel and equal the mma.sync K4 bit for bit. IMD_TEST_K4 (tests/harness.py) forces the backend of
+  # every plan of the process and the library must report it back: wgmma = every legal launch, the profitability floor lifted.
+  add_test(NAME k4_wgmma_exact
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_k4_wgmma.py" --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(k4_wgmma_exact PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+  foreach(suite e2e every_n bigk)
+    add_test(NAME contract_${suite}_k4wgmma
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                     --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+    set_tests_properties(contract_${suite}_k4wgmma PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                         ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_K4=wgmma")
+  endforeach()
+  add_test(NAME output_hashes_k4wgmma
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+  set_tests_properties(output_hashes_k4wgmma PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900 ENVIRONMENT "IMD_TEST_K4=wgmma")
+  add_test(NAME output_hashes_large_k4wgmma
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags large)
+  set_tests_properties(output_hashes_large_k4wgmma PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900 ENVIRONMENT "IMD_TEST_K4=wgmma")
+  # the fallback on a Hopper: every plan forced to the mma.sync K4 reproduces the committed hashes
+  add_test(NAME output_hashes_k4mma
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+  set_tests_properties(output_hashes_k4mma PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900 ENVIRONMENT "IMD_TEST_K4=mma")
   # imd_bench --seq / --crt (method imd): needs the profiling build of the bench (bench/build.sh), so only when
   # IMMERDINK_BENCH_BIN names it (environment or cache variable); bench/test_seq_crt.py documents the checks.
   if(NOT IMMERDINK_BENCH_BIN AND DEFINED ENV{IMMERDINK_BENCH_BIN})

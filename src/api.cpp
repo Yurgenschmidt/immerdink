@@ -16,6 +16,7 @@
 #include "host/seq_config.hpp"
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink.h"
+#include "host/k4_wgmma.hpp"
 #include "k4/k4_ops.hpp"
 #include "plan.hpp"
 #if defined(IMMERDINK_PROFILE) && IMMERDINK_PROFILE
@@ -207,7 +208,13 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
             st != IMD_STATUS_SUCCESS)
           return st;
       }
-      if (const imd_status_t st = imd::detail::k4_prepare(e, e.k4_config, &e.k4);
+      // Issue 22: the Hopper backend, where the device class has it and this device passes its probe (never a CUDA call on another
+      // device); the override (hooks only) can force either backend. The plan keeps the mma.sync parameters of e.k4_config as the
+      // fallback of every launch the Hopper backend does not serve.
+      const bool wg_class = p->info.table_id >= 0 && p->info.table_id < IMD_TABLE_COUNT && imd::detail::kK4WgmmaTable[p->info.table_id];
+      const bool wg_avail = wg_class && imd::detail::k4_wgmma_available(p->info.table_id, p->info.device.cc_major, p->info.device.cc_minor);
+      const int32_t backend = imd::detail::k4_backend_resolve(imd::detail::k4_backend_override().load(), wg_avail, wg_class);
+      if (const imd_status_t st = imd::detail::k4_prepare(e, e.k4_config, &e.k4, backend);
           st != IMD_STATUS_SUCCESS)
         return st;
       p->info.k4_config = e.k4_config;
@@ -453,6 +460,24 @@ IMD_API int imd_prof_plan_k4(imd_plan_t plan, int32_t* config) {
 IMD_API int imd_prof_set_k4_config(int32_t config) {
   if (config < -1 || config >= IMD_K4_CONFIG_COUNT) return 1;
   imd::detail::k4_config_override() = config;
+  return 0;
+}
+// Benchmark-only (issue 22): the K4 backend a plan tries first (host/k4_wgmma.hpp K4Backend: 0 mma.sync, 1 Hopper wgmma; -1 without K4), the
+// backend every later plan takes (-1 the device class's rule, 0 mma.sync, 1 wgmma where the device has it; 1 also lifts the profitability floor of
+// every launch of plans created under it), and the launches the Hopper backend served / declined since the last reset (out[2]).
+IMD_API int imd_prof_plan_k4_backend(imd_plan_t plan, int32_t* backend) {
+  if (plan == nullptr || backend == nullptr) return 1;
+  *backend = plan->exec.k4 ? imd::detail::k4_backend_of(*plan->exec.k4) : -1;
+  return 0;
+}
+IMD_API int imd_prof_set_k4_backend(int32_t backend) {
+  if (!imd::detail::k4_backend_valid(backend)) return 1;
+  imd::detail::k4_backend_override() = backend;
+  return 0;
+}
+IMD_API int imd_prof_k4_wgmma_counts(int32_t reset, int64_t* out) {
+  if (out == nullptr) return 1;
+  imd::detail::k4_wgmma_counts(reset != 0, out);
   return 0;
 }
 // Benchmark-only (A5): K5's elements per thread for later calls (1, 2, 4; 0: the rule).

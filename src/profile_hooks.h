@@ -17,6 +17,13 @@
  *   imd_prof_set_k4_config(config)
  *                         plans created afterwards run K4 configuration `config`; -1
  *                         restores the plan-time rule / k4_tune. Returns 0, 1 if invalid.
+ *   imd_prof_plan_k4_backend(plan, &backend)
+ *                         issue 22: the K4 backend the plan tries first (0 mma.sync, 1 Hopper wgmma), -1 without K4.
+ *   imd_prof_set_k4_backend(backend)
+ *                         issue 22: plans created afterwards take backend 0 (mma.sync), 1 (wgmma, where the device class has it and
+ *                         the build; 1 also lifts the profitability floor) or -1 (the device class's rule). Returns 0, 1 if invalid.
+ *   imd_prof_k4_wgmma_counts(reset, out[2])
+ *                         issue 22: K4 launches the Hopper backend served / declined since the last reset.
  *   imd_prof_set_k5_elems(elems)
  *                         later calls run K5 (j-bar fastest) with 1, 2 or 4 elements per
  *                         thread; 0 restores the launch rule (A5). Returns 0, 1 if invalid.
@@ -56,6 +63,9 @@ IMD_API int imd_prof_read(int max, const char** tags, float* ms);
 IMD_API int imd_prof_plan_dims(imd_plan_t plan, int64_t* out);
 IMD_API int imd_prof_plan_k4(imd_plan_t plan, int32_t* config);
 IMD_API int imd_prof_set_k4_config(int32_t config);
+IMD_API int imd_prof_plan_k4_backend(imd_plan_t plan, int32_t* backend);
+IMD_API int imd_prof_set_k4_backend(int32_t backend);
+IMD_API int imd_prof_k4_wgmma_counts(int32_t reset, int64_t* out);
 IMD_API int imd_prof_set_k5_elems(int32_t elems);
 IMD_API int imd_prof_set_k5_crt(int32_t variant);
 IMD_API int imd_prof_set_seq(int32_t bits);

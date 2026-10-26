@@ -261,3 +261,119 @@ TOPS = SMs x ops/clk/SM x clock. First check each row: `exact` true, `placement_
 * Operands are random int8, not residues of a real matrix (tensor-core rates do not depend on the values; power does, a little).
 * Only store mode (no add mode) and only K = m (a single chunk, no chunking at 131008).
 * No L2 flush between launches (the loop mode runs them back to back, as K4 does).
+
+## Library integration (design)
+
+Rung 1 timed the Hopper kernels as a harness. This section is the design of the same kernel as the library's K4 on sm_90, written before the integration (step 1) and then kept as the reference for it (step 2 landed with it, see "What is implemented"). Goal: H100 / H200 run K4 on wgmma + TMA where the evidence says it wins, every other card is bit-for-bit and SASS-for-SASS what it was, and the mma.sync K4 stays the fallback of every launch the new kernel does not serve.
+
+### What the kernel is and what it replaces
+
+K4 is the batched INT8 GEMM of the emulation with the mod-p epilogue: for a plan (m, n-hat, k-hat, b) and the moduli of one g-group, `k4_for_each_launch` (host/k4_launches.hpp) cuts the work into launches by K chunk (K_c' = 131008: the first chunk stores W mod p, later chunks add mod p), by batch part (<= 65535) and by n-hat part (gridDim.y). A launch is the GEMM `W[l][z] = (A[z] * B[z]^T) mod p_l` with `l = slot0 + (batch0 + z) / b`. Today it is `K4Ops::launch` (src/k4/k4_cfg.cuh, one `K4Gemm` instantiation per configuration, parameters in a `K4Blob` per launch shape). The Hopper backend is a second implementation of that one launch: CUTLASS `Variant<Tile, Cluster, Sched, kAdd, kFast>` of src/k4/hopper/k4_hopper.cuh (TMA loads, two consumer warpgroups, `K4ModEpilogue` through `HopperEpilogue`'s quad-transposed 16-byte stores, no shared memory in the epilogue). Same launch structure, same launch count, same plan host bytes; a different kernel per launch.
+
+### Backend selection (K4Ops / device class)
+
+* **Backend** = `K4Backend {mma = 0, wgmma = 1}` (src/host/k4_wgmma.hpp, CUDA-free so the CPU tests include it). A plan stores the backend it tries first (`K4Plan::backend`, in the existing padding: `sizeof(K4Plan)` and the plan host bytes do not change) and keeps the mma.sync blobs it always had.
+* **Device class.** One row per K4 table set of the registry (`kK4WgmmaTable[IMD_TABLE_*]`): `IMD_TABLE_SM90` (H100 and H200 share it: R2 shows the same kernel best on both) is true, `IMD_TABLE_SM89` (RTX 4090, and sm_120 which the registry maps onto it) is false. `k4_wgmma_device_ok` adds the compute capability 9.0 test, so a generation match that lands on the sm_90 row from another capability never runs the backend. Blackwell data centre parts (sm_100) are not in scope: no table row, mma.sync.
+* **Availability** = class row AND the library has the backend (`IMMERDINK_K4_WGMMA`, below) AND a per-device probe at plan creation (the setup of both kernels succeeds, `cudaFuncGetAttributes.binaryVersion == 90` so the sm_90a image is what the device runs, and `cudaOccupancyMaxActiveClusters` gives 1..255 clusters). The probe is cached per device. A device without the backend never makes a CUDA call for it.
+* **Override** for A/B and tests: process-wide, plan-time (`imd_test_set_k4_backend` / `imd_prof_set_k4_backend`; the library reads no environment variables, the harness maps `IMD_TEST_K4=mma|wgmma|auto` to the hook and reads it back). `wgmma` = every LEGAL launch on the Hopper kernel, the profitability floor lifted; legality is never lifted. Forcing wgmma on an unavailable device gives an mma.sync plan (the plan reports its backend: `imd_test_plan_k4_backend`). `k4_backend_resolve(override, available, class_default)` is the whole rule and is tested exhaustively.
+* **Build.** CMake option `IMMERDINK_K4_WGMMA` = AUTO (default) | ON | OFF. AUTO is ON only if the architectures include sm_90 (matched by `^90`) AND CUTLASS >= 3 is found AND nvcc >= 12.0; otherwise OFF, and then the library is built exactly as before (nothing of the backend is compiled, the hooks report "not built"). wgmma needs sm_90a, while the cluster builds `CMAKE_CUDA_ARCHITECTURES=90`, so the Hopper translation unit is its own OBJECT library compiled for `90a-real` and linked into libimmerdink (an sm_90a-only object in a shared library loads and runs on sm_89 including `CUDA_MODULE_LOADING=EAGER`; only a launch of its kernel fails, and the host gate makes that unreachable; checked on the 4090).
+
+### Tile, cluster and scheduler choice (from R2)
+
+Source: `rung1.jsonl` of 14421919 (H100) and 14421920 (H200), exact rows, store mode, L = 14 unless stated. The choice is a pure function of the launch (`k4_wgmma_pick`) with the scheduler arguments set explicitly; CUTLASS's defaults are not relied on, because at 8192^3 they cost the 128x256 kernels about a quarter of their rate.
+
+| shape (m = n = k, batch 14) | mma.sync K4 (m_ row) | chosen: 128x256x128, 2x1 cluster, cooperative | swizzle / raster | notes |
+| --- | --- | --- | --- | --- |
+| 4096 | 922 H100 / 894 H200 | 1360 / 1357-1365 | 1, heuristic (CUTLASS default) | best on both; spread 5 / 8 % |
+| 8192 | about 880-895 | 1408-1414 / 1328-1332 | 8, AlongN | spread 6-9 %; the default scheduler (swizzle 1) gave 1035-1043 on H100 (1x1) |
+
+(TOPS-eq of the whole emulated GEMM, ops = 2 m n k L.) The rule: tiles per batch (`ceil(m/128) * ceil(nc/256)`) >= 1024 (8192^2 has 2048, 4096^2 has 512) -> swizzle 8 AlongN, else swizzle 1 heuristic. One variant, on purpose: the single best row at 8192^3 is 1x1 swizzle 8 AlongN (1427 H100, 1383 H200) but its H200 rows have a 26.5 % spread and it is only 1-2 % above the 2x1 rows on H100; the 2x1 cluster is the row that is good and stable on both cards at both sizes. The variant list is an array (`kK4WgmmaVariants`) so a later per-shape / per-card variant is a table row, not a redesign (memory: modular per hardware).
+
+Expected benefit. At 4096^3, L = 14 the K4 is 2 * 4096^3 * 14 = 1.92e12 integer ops. Today's mma.sync K4 on H100 takes 1.994 ms (the `m_` row). At the measured 1360 TOPS the wgmma K4 takes 1.41 ms (1.41x of today's K4); at the 1830 TOPS sustained synthetic ceiling of the same card it would take 1.05 ms (1.9x). The end-to-end gain is bounded by K4's share of the call (K0 / KF, K5 and the packs are unchanged) and is a cluster measurement (R3).
+
+### Small and odd shapes (no rung-1 data below 4096)
+
+Rung 1 timed m = n = k in {4096, 8192} only. Nothing below is measured, so the default path serves only the region of the evidence (the profitability floor, below) and falls back to mma.sync everywhere else; a forced run exercises everything legal so that exactness is tested on the odd shapes too.
+
+* **Floor (default only).** Serve a launch if m >= 1024, n-part >= 1024, K chunk >= 1024 AND tiles x batch >= 2 x SMs (two waves). The numbers are a placeholder just inside the measured region; the R3 shape sweep replaces them (see R3 below).
+* **k not a multiple of 128 (or of the 128-wide k tile).** The operand rows are `k_hat` long (a multiple of 16, of the plan's alignment A = 16 / 64 in fact) and the launch's K chunk `kc <= k_hat`. The TMA tensor extent of the launch is `kc`; the last k tile is zero-filled out of bounds (`oobFill 0` = zeros, which add nothing to the INT32 accumulator), so any `kc` that is a multiple of 16 is exact. `kc` itself is a multiple of 16 for every chunk (K_c' = 131008 = 16 * 8188; the test limits are multiples of 16).
+* **m / n not multiples of the tile (128 x 256).** Tensor extents are m and n-part, the partial tiles read zeros out of bounds, and the epilogue masks its stores by the same extents (K4ModEpilogue / HopperEpilogue are bounds-aware: rows < m, columns < nc; tested by `test_hopper_epilogue`).
+* **n-hat part not a multiple of 16** or n-hat not a multiple of 16: not served (the 128-bit stores need it; the plan already guarantees n-hat % 16 == 0 for every plan).
+* **Tiny shapes (m = 1, kc = 16)** are legal and exact when forced (one k tile of 16, rest zeros), never served by default.
+
+### TMA alignment and every legality rule
+
+`k4_wgmma_illegal` is the single place; a launch that fails it is served by mma.sync and counted as declined. CUTLASS's tensor-map encoder prints on failure and its `assert(false)` is a no-op under NDEBUG, so an illegal launch must never reach it:
+
+* global base address of A, B 16-byte aligned (the plan's alignment contract A = 16 / 64 makes `k0` offsets, row strides and the workspace plane offsets multiples of 16; checked per launch anyway, the pointers are caller / workspace pointers), W base and plane stride multiples of 16;
+* strides multiples of 16 bytes and < 2^40 (k_hat, batch strides of A and B), dims <= 2^32, m / nc / kc <= INT32_MAX, batch part <= 65535 (the existing split), tile count < 2^31;
+* the operand batch planes must not overlap (`batch_a >= m * k_hat`, `batch_b >= n_hat * k_hat`): an operand whose batch stride is smaller than the plane it is read with (a packed operand viewed through shorter blocks) is a legal strided view for the mma.sync K4 but not one I can show every driver's encoder accepts, so mma.sync serves it;
+* `kc <= k_hat` and `kc`, `nc`, `k_hat`, `n_hat` multiples of 16, W plane >= m * n-hat.
+
+TMA descriptors are encoded on the host per launch (a few microseconds) and passed by value as kernel parameters, so a launch is capture-safe exactly like the mma.sync one (no host callback, no allocation); the persistent-grid cluster count is queried once at plan creation (`hw_info.max_active_clusters`).
+
+### Add-mod, K-splits and group launches
+
+The same `K4Launch` drives both backends, so the backend sees exactly what the mma.sync K4 sees: store-mod for `k0 == 0`, add-mod for later chunks (`kAdd` template parameter of the epilogue: `W = (W + acc) mod p`), the modulus `l = slot0 + (batch0 + z) / b` computed in the epilogue from `K4Args{W, ldw, plane_w, slot0, b, batch0}`, `call_of`'s pointers (A + z0 * plane_a + k0, B + z0 * plane_b + j0 * k_hat + k0, W + (g0 * b + z0) * plane_w + j0), batch parts and n-hat parts as separate launches. What the design needs of `K4Call` / `K4Args` is therefore only what they already hold; no new field in the plan. Per-launch fallback means a mixed run (some launches wgmma, some mma.sync) is legal: both write the same W planes bit for bit, and a later add-mod launch of the other backend reads them.
+
+### Fallback rules (decided on the host, per launch, never silently wrong)
+
+1. Plan backend mma -> unchanged code path, no Hopper code reached.
+2. Plan backend wgmma: for each launch, build the `K4WgmmaLaunch` (shape, strides, the three base addresses, SMs); `k4_wgmma_pick` -> illegal (a reason) or unprofitable (default only) -> mma.sync blob of the plan; counted `declined`. Otherwise `can_implement` + `cudaLaunchKernelExC`; counted `launched`.
+3. If the Hopper launch itself errors, the call fails with the library's CUDA_ERROR status (no silent retry: a failed launch may already have queued earlier launches of the group).
+4. There is no run-time (device-side) selection and no data-dependent choice.
+
+The counters are process-wide atomics read through the hooks; tests and benchmark records show them (`k4_wgmma_served` / `_declined`, `k4b_run`), so a forced wgmma run that served nothing cannot pass for a wgmma run.
+
+### Why it is bit-identical
+
+K4 is exact integer arithmetic: for each output, the INT32 accumulation of int8 products over at most K_c' = 131008 terms (the section 3.5 bound; every partial sum fits), and the reduction mod p_l is a function of that integer. The order in which products are summed cannot change an integer sum, so mma.sync m16n8k32 and wgmma m64n256k32 accumulate to the same INT32 for the same operands; `K4ModEpilogue` is one code (the same `mod` device function, `test_cutlass_mod_epilogue`, `mod_exhaustive_cpu`) in both backends; add-mod adds the same stored residues; zero fill adds zeros. What changes is only which instructions run. Evidence on this machine is the CPU tests and the 4090's forced-fallback runs; evidence of the Hopper path itself is Hopper-only (below).
+
+### Test plan
+
+On the RTX 4090 (all offline, pass on every device; none may skip because the campaign harness counts a skipped test as not passed):
+
+* `k4_wgmma_select` (CPU, CUDA-free): class table, the registry rows through `imd_device_select`, the resolve matrix, the R2 table (4096 -> swizzle 1; 8192 -> swizzle 8 AlongN), the 1024-tile threshold, floor vs force, edge shapes (m = 1, kc = 16; 129 x 272 x 1040; 4097 x 4112 x 4112; K_c' = 131008 odd chunks), every illegal reason, a 200000-launch random property sweep (served launches are legal, tile arithmetic never overflows, force only lifts the floor).
+* `k4_wgmma_exact` (`tests/test_k4_wgmma.py`): status of the backend read back (unavailable off sm_90, plan reports mma.sync when forced, counters stay 0), 14 shapes with C hashes compared between forced mma.sync and forced wgmma (tails in m, n, k; k not a multiple of 128; k shorter than a tile; m = 1; n = 5; N = 2 and 20; alpha / beta; batch; K-chunk, batch and n-hat splits alone and together via `imd_test_set_limits`), and 28 host dry runs of the Hopper launch (`can_implement`, scheduler choice). **On a Hopper the same test is the exactness test of the real path**: the forced runs must serve launches (counter > 0, none declined) and equal the mma.sync C.
+* the existing oracle suites re-run with the backend forced (`contract_{e2e,every_n,bigk}_k4wgmma`), the 19 committed hashes with it forced (`output_hashes_k4wgmma`, `output_hashes_large_k4wgmma`) and with mma.sync forced (`output_hashes_k4mma`, the fallback on a Hopper).
+* SASS: `tools/check_k4_wgmma_sass.sh libimmerdink.so [build.log]`: IGMMA present, `WARPGROUP.DEPBAR` fewer than IGMMA (the C7510 serialisation signature), no local memory in the sm_90a kernels, no C7510 in the logs; SASS of the sm_89 image identical to the baseline with the option ON and OFF.
+* Cluster (R3, below): the same tests on H100 and H200, the duel `k4b=mma` vs `k4b=wgmma` of imd_bench.
+
+A/B duel key: `imd_bench --methods duel --duel-a k4b=mma --duel-b k4b=wgmma` (side keys `k4b=default|mma|wgmma`, and `--k4b` for method imd). The side's plan keeps its backend (a plan-time choice), so the two plans run interleaved with no per-call switching; the record carries `k4b_req`, `k4b_run`, `c_hash`, and (method imd) `k4_wgmma_served` / `_declined`.
+
+### What is implemented (step 2)
+
+* `src/host/k4_wgmma.hpp` (CUDA-free): backends, class table, resolve, legality, profitability, tile / scheduler pick.
+* `src/k4/hopper/k4_wgmma_{ops.hpp,impl.cuh,v0.cu}`: the backend (one variant today), its own OBJECT library compiled for `90a-real` when the option is ON.
+* `src/gemm_k4.cu`: per-launch dispatch with the mma.sync fallback, probe, counters; `src/api.cpp`: backend chosen at plan creation; `src/test_hooks.cpp`, `src/profile_hooks.h`: hooks (`imd_test_*` / `imd_prof_*`); `bench/imd_bench.cu`: `k4b`; `CMakeLists.txt`: the option; tests and `tools/check_k4_wgmma_sass.sh` as above.
+* New ctest tests: 8 (`k4_wgmma_select`, `k4_wgmma_exact`, `contract_{e2e,every_n,bigk}_k4wgmma`, `output_hashes_k4wgmma`, `output_hashes_large_k4wgmma`, `output_hashes_k4mma`): `ctest -N` of the standard configuration goes 98 -> **106** (the manifest's `--expect-tests 98` must become 106).
+
+### Checks and what they cannot see
+
+Checks done on the RTX 4090 are listed with results in the hand-off report of this change; what they cannot see: that the Hopper kernel runs and is exact on a Hopper (nothing here executes sm_90a), that the `K4Args` modulus mapping for batch parts, add-mod and slot offsets is right on the hardware (the cutlass-level epilogue tests cover the host half and the layout), that TMA accepts every descriptor the legality rule admits, the occupancy / cluster count on the real parts, and every timing.
+
+### Open questions (with a recommendation each)
+
+1. **Default on, or opt-in, on H100 / H200?** Recommend default on above the floor, after R3 passes the hash gate and the exactness test on both cards; until then the manifest runs `k4b=wgmma` explicitly. The override stays for A/B.
+2. **Floor values.** The 1024 / two-wave floor is a placeholder; replace with the crossover measured in the R3 shape sweep (m = n = k from 512 to 4096, batch 1 / 4 / 14, and varied m:n:k, wgmma vs mma.sync). Recommend a floor on estimated time, not on size, once the data exists.
+3. **One variant or several.** Recommend one (2x1 cooperative 128 x 256 x 128) until R3 shows a shape where another is > 5 % better on both cards; then add a table row (1x1 swizzle 8 at 8192 is the candidate: +1-2 % on H100, noisy on H200).
+4. **Add-mod and K-split on Hopper are not timed.** Rung 1 is store mode, one chunk. Recommend R3 times a K > 131008 shape; if add-mod is slower than mma.sync's, serve only chunk 0 by wgmma (the per-launch rule allows it: a floor row).
+5. **TMA descriptors per launch.** Encoded on the host every launch (microseconds). Recommend leave it; cache per plan only if R3 shows the planner-call overhead matters for small launches (they are below the floor anyway).
+6. **Persistent grid under concurrency.** The grid is sized by the cluster count the device could run alone; if ehrenfest runs other kernels on the same stream order nothing changes, on other streams the kernel is slower but correct. Recommend no change.
+7. **sm_100 / sm_120.** Out of scope (tcgen05 is a different kernel). sm_120 keeps mma.sync (its table row maps to sm_89's).
+8. **Toolchain.** The backend needs nvcc >= 12.0 for sm_90a and CUTLASS 3+; the cluster uses 13.x. Recommend keep AUTO as is.
+
+### Risks
+
+* Everything dynamic is unverified here (above); the first Hopper run of `k4_wgmma_exact` is the real test.
+* Rung-1 prototype assumptions that are NOT safe to integrate as they were: (a) `b = 1`, `batch0 = 0`, one K chunk, store mode only -> the library's modulus mapping, add-mod and chunking are new code paths on the hardware; (b) the harness's `Problem` used dense, 16-byte aligned operands it allocated itself -> the library's pointers come from the caller and the workspace, so alignment, strides and overlap are checked per launch (legality, above), never assumed; (c) m, n, k multiples of 128 / 256 -> tails are handled by TMA zero fill and a bounds-aware epilogue, but the tails were not run on a Hopper; (d) CUTLASS failing to encode a descriptor only prints (`assert` is compiled out): the reason legality is decided on the host before any CUTLASS call; (e) the scheduler default at 8192^3 (-27 % on H100): the choice sets swizzle / raster explicitly.
+* The per-launch counters are process-wide atomics (relaxed): negligible cost, but shared by all plans and threads.
+* A library built with the backend loads and runs on sm_89 / sm_120 (checked on sm_89); a launch of the sm_90a kernel there would fail, which the host gate makes unreachable (class row AND capability 9.0 AND probe).
+
+### R3 cluster block: proposal
+
+1. Build with arch 90 (AUTO -> ON), run `tools/check_k4_wgmma_sass.sh` on the library and the build log (gate), `ctest -N` = 106.
+2. Run the 8 new tests plus the full suite: all must PASS on H100 and H200; `k4_wgmma_exact` must report served launches > 0 and no declined launch (it prints PASS only then).
+3. `output_hashes_k4wgmma`, `output_hashes_large_k4wgmma`, `output_hashes_k4mma`: the 19 committed hashes under both forced backends.
+4. imd_bench duels (`--duel-a k4b=mma --duel-b k4b=wgmma`, `--keep-samples 1`, N = 14, 8, 20) at 4096^3, 8192^3 batch 1 / 4 / 14 and the shape sweep for the floor (512 .. 4096, m:n:k varied, one K > 131008 shape), recording TOPS-eq first and time alongside, `c_hash` equality, `k4b_run`, served / declined.
+5. imd_bench method imd of the default (no override) path on both cards, against cuTENSOR and the emulation baselines, to see the end-to-end effect.

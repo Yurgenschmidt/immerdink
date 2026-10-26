@@ -56,6 +56,8 @@ endif()
 option(IMMERDINK_WERROR "Treat warnings in immerdink's own code as errors" OFF)
 option(IMMERDINK_BUILD_TESTS "Build the tests (and the test-only hooks of src/test_hooks.cpp)" ON)
 option(IMMERDINK_SEQ_TWINS "Compile the Q1 / F1 kernel twins of the pack and K5 kernels (issue 21: reachable by the hooks only, no device class defaults to them); OFF omits them: about half the kernel instances and SASS" ON)
+set(IMMERDINK_K4_WGMMA AUTO CACHE STRING "Hopper (wgmma) K4 backend (issue 22, docs/NOTES-22.md): AUTO = built when nvcc >= 12.0, CUTLASS >= 3 and the architectures include 90, ON = built whatever the architectures, OFF = not built. Its kernels are sm_90a-only SASS in their own object library; no other kernel changes")
+set_property(CACHE IMMERDINK_K4_WGMMA PROPERTY STRINGS AUTO ON OFF)
 option(IMMERDINK_PROFILE "Benchmark-only per-phase event timing hooks (src/profile.hpp)" OFF)
 set(IMMERDINK_CUTLASS_DIR "${PROJECT_SOURCE_DIR}/third_party/cutlass"
     CACHE PATH "CUTLASS v4.8.0 source tree (default: the git submodule)")
@@ -152,6 +154,32 @@ target_include_directories(imd_cutlass SYSTEM INTERFACE "${IMMERDINK_CUTLASS_DIR
 target_compile_options(imd_cutlass INTERFACE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -diag-suppress=20012>)
 
+# --- Hopper K4 (optional component, issue 22) ---------------------------------------------
+# AUTO: on when nvcc >= 12.0 (sm_90a), CUTLASS is 3.x or later and CMAKE_CUDA_ARCHITECTURES names 90 / 90a (any suffix). Off otherwise, and
+# then the library is built exactly as before (nothing below is evaluated, gemm_k4.cu compiles without IMD_K4_WGMMA).
+set(IMD_K4_WGMMA_ENABLED OFF)
+if(NOT IMMERDINK_K4_WGMMA STREQUAL "OFF")
+  set(_imd_cutlass_major 0)
+  file(STRINGS "${IMMERDINK_CUTLASS_DIR}/include/cutlass/version.h" _imd_cutlass_ver REGEX "define CUTLASS_MAJOR")
+  if(_imd_cutlass_ver MATCHES "CUTLASS_MAJOR ([0-9]+)")
+    set(_imd_cutlass_major "${CMAKE_MATCH_1}")
+  endif()
+  set(_imd_has90 OFF)
+  foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
+    if(_a MATCHES "^90")
+      set(_imd_has90 ON)
+    endif()
+  endforeach()
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.0 OR _imd_cutlass_major LESS 3)
+    if(IMMERDINK_K4_WGMMA STREQUAL "ON")
+      message(FATAL_ERROR "IMMERDINK_K4_WGMMA=ON needs nvcc >= 12.0 (have ${CMAKE_CUDA_COMPILER_VERSION}) and CUTLASS >= 3 (have major ${_imd_cutlass_major})")
+    endif()
+  elseif(IMMERDINK_K4_WGMMA STREQUAL "ON" OR _imd_has90)
+    set(IMD_K4_WGMMA_ENABLED ON)
+  endif()
+endif()
+message(STATUS "Hopper wgmma K4 backend: ${IMD_K4_WGMMA_ENABLED} (IMMERDINK_K4_WGMMA=${IMMERDINK_K4_WGMMA}, architectures ${CMAKE_CUDA_ARCHITECTURES})")
+
 # --- Library -----------------------------------------------------------------------------
 # The library: C ABI (api.cpp), K0-K5 + DIRECT kernels (contract.cu), K4 CUTLASS GEMM
 # (gemm_k4.cu, one K4Gemm instantiation per configuration in src/k4/).
@@ -160,6 +188,19 @@ target_compile_options(imd_cutlass INTERFACE
 # IMMERDINK_PROFILE=ON; a production build exports neither.
 add_library(immerdink SHARED src/api.cpp src/device_state.cpp src/contract.cu src/gemm_k4.cu
   src/k4/k4_cfg0.cu src/k4/k4_cfg1.cu src/k4/k4_cfg2.cu src/k4/k4_cfg3.cu)
+if(IMD_K4_WGMMA_ENABLED)
+  # The wgmma instructions exist in sm_90a code only (not in "90"): the kernels are compiled for 90a-real in an object library of
+  # their own and linked into libimmerdink, whatever architectures the rest is built for. On any other device the image is simply
+  # never selected (gemm_k4.cu launches nothing of it there; a library with a 90a-only object runs on sm_89 also with
+  # CUDA_MODULE_LOADING=EAGER, checked 2026-10-26). NDEBUG always: a CUTLASS assert left in the main loop makes ptxas serialise the wgmma (C7510).
+  add_library(imd_k4_hopper OBJECT src/k4/hopper/k4_wgmma_v0.cu)
+  set_target_properties(imd_k4_hopper PROPERTIES CUDA_ARCHITECTURES "90a-real" CUDA_VISIBILITY_PRESET hidden
+                                                 VISIBILITY_INLINES_HIDDEN ON POSITION_INDEPENDENT_CODE ON)
+  target_compile_definitions(imd_k4_hopper PRIVATE NDEBUG)
+  target_link_libraries(imd_k4_hopper PRIVATE imd_host_internal imd_cutlass imd_warnings)
+  target_sources(immerdink PRIVATE $<TARGET_OBJECTS:imd_k4_hopper>)
+  target_compile_definitions(immerdink PRIVATE IMD_K4_WGMMA=1)
+endif()
 if(IMMERDINK_BUILD_TESTS)
   target_sources(immerdink PRIVATE src/test_hooks.cpp)
   # contract.cu's test-only kernels and counters (imd_test_crt_elem, imd_test_k5_launch_counts)

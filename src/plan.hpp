@@ -70,7 +70,28 @@ LaunchLimits default_launch_limits();
 // the kernels' occupancy, after setting their dynamic shared-memory attribute. All of this
 // host state is built here, never in imd_contract. SUCCESS, CUDA_ERROR, INVALID_VALUE (no
 // such configuration), or NOT_SUPPORTED if a shape is out of K4's limits.
-imd_status_t k4_prepare(const ExecPlan& p, int cfg, std::shared_ptr<const K4Plan>* out);
+//
+// Issue 22: `backend` is kK4BackendWgmma when the plan should try the Hopper backend first (the caller decided with
+// k4_wgmma_available and the override); the plan holds the mma.sync parameters either way (the fallback of every launch the
+// Hopper backend does not serve), so the plan's host bytes and launch counts do not depend on it.
+imd_status_t k4_prepare(const ExecPlan& p, int cfg, std::shared_ptr<const K4Plan>* out, int32_t backend = 0);
+
+// Issue 22 (gemm_k4.cu; host/k4_wgmma.hpp): the process-wide backend override (-1 the device class's rule, 0 mma.sync, 1 wgmma; hooks only:
+// imd_test_set_k4_backend, imd_prof_set_k4_backend), read by imd_plan_create and, to lift the profitability floor, by every K4 launch.
+std::atomic<int>& k4_backend_override();
+// Can the Hopper backend run on the current device? The device class's table (host/k4_wgmma.hpp kK4WgmmaTable) and compute
+// capability 9.0, this build having it (IMMERDINK_K4_WGMMA), and the first-use probe (the sm_90a image loads: binaryVersion 90,
+// cluster count >= 1). On any other device: false without a CUDA call.
+bool k4_wgmma_available(int32_t table_id, int32_t cc_major, int32_t cc_minor);
+// The backend a plan tries first (K4Backend).
+int32_t k4_backend_of(const K4Plan& k4);
+// Launches the Hopper backend served / declined (the mma.sync K4 ran them) since the last reset; out[2].
+void k4_wgmma_counts(bool reset, int64_t* out);
+// Test only (tests/test_k4_wgmma.py): the host half of a Hopper launch of a synthetic GEMM (legality, choice, CUTLASS can_implement,
+// the TMA descriptors) without a launch, on any device of a build with the backend. out[7] = variant (-1 not served), swizzle, raster,
+// can_implement (0/1), persistent grid x, y, z. Returns false if the backend is absent or can_implement refuses.
+bool k4_wgmma_dry_run(int64_t m, int64_t nc, int64_t kc, int64_t zc, int64_t k_hat, int64_t n_hat, int64_t batch_a,
+                      int64_t batch_b, int sms, int clusters, bool add, bool force, int32_t* out);
 
 // Plan-time autotuning (imd_options_t.k4_tune, DESIGN v1.5 §6): with k4_tune_bytes(p) > 0,
 // allocate that much device memory, time group 1's K4 launches in every configuration on
