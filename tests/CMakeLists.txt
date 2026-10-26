@@ -348,6 +348,10 @@ if(Python3_FOUND)
              COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/test_seq_crt.py" --bench "${IMMERDINK_BENCH_BIN}"
                      ${_seq_twin_arg})
     set_tests_properties(bench_seq_crt PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
+    # imd_bench accuracy fields (acc_*, --accuracy; docs/NOTES-BENCH-ACCURACY.md).
+    add_test(NAME bench_accuracy_fields
+             COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/test_accuracy_fields.py" --bench "${IMMERDINK_BENCH_BIN}")
+    set_tests_properties(bench_accuracy_fields PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
   endif()
   if(IMMERDINK_SEQ_TWINS)
   add_test(NAME output_hashes_large_seq7
