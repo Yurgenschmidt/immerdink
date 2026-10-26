@@ -501,7 +501,7 @@ __device__ __forceinline__ void crt_step_n(uint32_t (&x)[L], uint32_t Wl) {
 // Mut is a compile-time test knob (default 0 = the shipped code, no other value is instantiated outside IMD_BUILD_TEST_HOOKS builds): tests/test_crt_f64_unit.py
 // instantiates the mutations to show that the device-level test sees them: 1 bias 0, 2 bias 2^-40, 3 limb constant k[N][N-1][0] + 1, 4 Pj[0] + 1,
 // 5 the carry out of the bottom limb dropped, 6 the bottom limb's carry by a logical shift (wrong for a negative r_0), 7 R == P not reduced, 8 bias 2^-46.
-template <int N, int L, int Mut = 0>
+template <int N, int L, int Mut = 0, bool Fin = false>
 __device__ __forceinline__ void crt_f64_elem(const uint32_t (&wv)[N], int e, uint32_t (&x)[L]) {
   constexpr int J = imd::constants::kF64Crt.J[N];
   constexpr int Wb = imd::constants::kF64LimbBits;
@@ -548,11 +548,18 @@ __device__ __forceinline__ void crt_f64_elem(const uint32_t (&wv)[N], int e, uin
   // R in [0, P (1 + 2^-29)): subtract P once if R >= P
   uint32_t d[L];
   uint32_t borrow = 0;
+  if constexpr (Fin && L >= 2 && L <= 5) {   // k5fin (seq bit 128): d = x - P by one PTX carry chain (numerics.cuh sub_limbs: one IADD3 per limb), the same integers as the 64-bit loop below
+    uint32_t pl[L];
+#pragma unroll
+    for (int k = 0; k < L; ++k) pl[k] = c_tables.P[N][k];
+    borrow = imd::kernels::sub_limbs<L>(d, x, pl) != 0 ? 1u : 0u;
+  } else {
 #pragma unroll
   for (int k = 0; k < L; ++k) {
     const uint64_t diff = static_cast<uint64_t>(x[k]) - c_tables.P[N][k] - borrow;
     d[k] = static_cast<uint32_t>(diff);
     borrow = static_cast<uint32_t>(diff >> 63);
+  }
   }
   if constexpr (Mut == 7) {   // R == P (d == 0) is left as it is
     uint32_t any = 0;
@@ -712,6 +719,184 @@ __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
   }
 }
 
+#ifndef IMD_NO_SEQ_TWINS   // the k5fin kernels exist only in a build with the sequence twins (the -Werror build would flag the unused helpers)
+// ---- K5 'k5fin' (seq-set bit 128, docs/NOTES-23-k5.md) ------------------------------------------
+// Instruction-count cuts of the limb-CRT + F1 K5 kernels (the sm_90 default set), same integers, same doubles, same stores as k5_crt_n / k5_crt_bfast
+// with F64 = F1 = true. They are separate kernels, so the shipped kernels are untouched (their SASS does not change with the bit off):
+//   * 32-bit index arithmetic (the host checks that the item count and the launch stride fit in 32 bits, else the shipped kernel runs);
+//   * the metadata of 4 consecutive j-bar read as one 32-bit load of fB and one 64-bit load of sB when n % 4 == 0 and the pointers are aligned,
+//     and a group of 4 elements without a native one (fA, fB all zero: the usual case) is finished without per-element branches;
+//   * alpha == 1 and beta == 0 tested once per thread, not once per store;
+//   * E = 4: when the 32 items of a warp are 32 consecutive j-bar groups of one row (every lane live, no row change) the 4 stores of a lane need no
+//     shuffles: its j are 4 jg0 + lane + 32 r;
+//   * the final "subtract P once" of the limb CRT as one carry chain (crt_f64_elem Fin).
+__device__ __forceinline__ bool k5f_vmeta(const OutArgs& a) {   // 4 consecutive fB / sB entries are one aligned 32- / 64-bit load
+  return (a.n & 3) == 0 && ((reinterpret_cast<uintptr_t>(a.fB) & 3) | (reinterpret_cast<uintptr_t>(a.sB) & 7)) == 0;
+}
+__device__ __forceinline__ bool k5f_alpha1(const OutArgs& a) { return __double_as_longlong(a.alpha) == 0x3FF0000000000000LL; }   // alpha == 1.0, by bits
+__device__ __forceinline__ bool k5f_beta0(const OutArgs& a) { return (__double_as_longlong(a.beta) << 1) == 0; }                  // beta == +-0.0, by bits
+__device__ __forceinline__ void k5f_store(const OutArgs& a, bool a1, bool b0, int64_t off, double D) {
+  const double E = a1 ? D : __dmul_rn(a.alpha, D);   // = store_out (same operations), the two tests hoisted by the caller
+  a.C[off] = b0 ? E : __fma_rn(a.beta, a.C[off], E);
+}
+
+// K5 core of the k5fin kernels: the D values of the E consecutive j-bar j0..j0+E-1 of row t = lambda m + i (j0 < n; with vmeta, n % 4 == 0 and E = 4: all of them valid).
+template <int N, int E>
+__device__ __forceinline__ void k5f_elems(const OutArgs& a, uint32_t t, uint32_t lam, uint32_t j0, bool vmeta, double (&D)[E]) {
+  static_assert(E == 1 || E == 2 || E == 4, "K5 takes 1, 2 or 4 consecutive j-bar per thread");
+  constexpr int L = imd::constants::kTables.L32[N];
+  const int64_t plane = a.b * a.m * a.n_hat;
+  const uint8_t* W = a.W + int64_t{t} * a.n_hat + j0;
+  uint32_t wv[N];
+#pragma unroll
+  for (int l = 0; l < N; ++l) {
+    if constexpr (E == 4) wv[l] = __ldg(reinterpret_cast<const uint32_t*>(W + l * plane));
+    else if constexpr (E == 2) wv[l] = __ldg(reinterpret_cast<const uint16_t*>(W + l * plane));
+    else wv[l] = __ldg(W + l * plane);
+  }
+  uint32_t x[E][L];
+#pragma unroll
+  for (int e = 0; e < E; ++e) {
+#pragma unroll
+    for (int w = 0; w < L; ++w) x[e][w] = 0;
+    crt_f64_elem<N, L, 0, true>(wv, e, x[e]);
+  }
+  const bool fa = a.fA[t] != 0;
+  const int sa = a.sA[t];
+  const int64_t bo = int64_t{lam} * a.n + j0;
+  if constexpr (E == 4) {
+    if (vmeta) {
+      const uint32_t fb = __ldg(reinterpret_cast<const uint32_t*>(a.fB + bo));
+      if (!fa && fb == 0) {   // no native element in the group: the 4 finishes are straight-line
+        const uint2 sb = __ldg(reinterpret_cast<const uint2*>(a.sB + bo));
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const uint32_t w = e < 2 ? sb.x : sb.y;
+          const int sbe = static_cast<int16_t>(static_cast<uint16_t>(w >> (16 * (e & 1))));
+          D[e] = crt_round_fin<L, N>(x[e], -(sa + sbe));
+        }
+        return;
+      }
+    }
+  }
+#pragma unroll
+  for (int e = 0; e < E; ++e) {
+    const int64_t j = int64_t{j0} + e;
+    if (j < a.n) {
+      if (fa || a.fB[bo + e] != 0) {
+        D[e] = native_dot(a, lam, t - lam * static_cast<uint32_t>(a.m), j);
+      } else {
+        D[e] = crt_round_fin<L, N>(x[e], -(sa + int{a.sB[bo + e]}));
+      }
+    }
+  }
+}
+
+// k5fin launch check: the 32-bit index arithmetic must not overflow (items + one grid stride below 2^32; every extent below 2^32; b m below 2^32).
+inline bool k5f_fits(const K5Launch& L, const OutArgs& out) {
+  const int64_t lim = int64_t{1} << 32, stride = L.grid * kThreads;
+  return L.work > 0 && L.work + stride < lim && out.n >= 1 && out.m >= 1 && out.b >= 1 && out.n < lim && out.m < lim && out.b < lim && out.b * out.m < lim;
+}
+
+template <int N, int E>
+__global__ void __launch_bounds__(kThreads) k5f_crt_n(OutArgs a) {
+  __shared__ double sD[E == 4 ? (kThreads / 32) * kK5WarpSlots : 1];
+  const uint32_t m32 = static_cast<uint32_t>(a.m), nn = static_cast<uint32_t>(a.n);
+  const uint32_t ng = (nn + E - 1) / E, total = static_cast<uint32_t>(a.b) * m32 * ng;
+  const uint32_t stride = gridDim.x * kThreads;
+  const int lane = threadIdx.x & 31;
+  const bool a1 = k5f_alpha1(a), b0 = k5f_beta0(a), vmeta = k5f_vmeta(a);
+  double* wD = sD + (E == 4 ? (threadIdx.x / 32) * kK5WarpSlots : 0);
+  for (uint32_t base = blockIdx.x * kThreads; base < total; base += stride) {
+    const uint32_t idx = base + threadIdx.x;
+    const bool live = idx < total;
+    uint32_t jg = 0;
+    int64_t cbase = 0;
+    double D[E];
+#pragma unroll
+    for (int e = 0; e < E; ++e) D[e] = 0.0;
+    if (live) {
+      const uint32_t t = idx / ng, lam = t / m32;
+      jg = idx - t * ng;
+      k5f_elems<N, E>(a, t, lam, E * jg, vmeta, D);
+      cbase = a.c_bat[lam] + a.c_row[t - lam * m32];
+    }
+    if constexpr (E != 4) {
+      if (live) {
+#pragma unroll
+        for (int e = 0; e < E; ++e)
+          if (E * jg + e < nn) k5f_store(a, a1, b0, cbase + a.c_col[E * jg + e], D[e]);
+      }
+    } else {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int s = 4 * lane + e;
+        wD[s + s / 16] = D[e];
+      }
+      __syncwarp();
+      // the warp's 32 items are consecutive j-bar groups of one row (all live, no row change): lane's store r is j = 4 jg0 + lane + 32 r, and every lane has the row offset cbase
+      const uint32_t jg_first = __shfl_sync(0xffffffffu, jg, 0);   // (outside the && below: every lane of the full mask must execute the shuffle)
+      const bool run = live && jg == jg_first + lane;
+      if (__all_sync(0xffffffffu, run)) {
+        const uint32_t j00 = 4 * (jg - lane);
+        const bool n4 = (nn & 3) == 0;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          const int s = lane + 32 * r;
+          const uint32_t j = j00 + s;
+          if (n4 || j < nn) k5f_store(a, a1, b0, cbase + a.c_col[j], wD[s + s / 16]);   // n % 4 == 0: 4 jg0 + 127 <= n - 1 in a run
+        }
+      } else {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          const int s = lane + 32 * r, src = s / 4;
+          const int64_t cb = __shfl_sync(0xffffffffu, cbase, src);
+          const uint32_t j = 4 * __shfl_sync(0xffffffffu, jg, src) + (s & 3);
+          const bool ok = __shfl_sync(0xffffffffu, live ? 1 : 0, src) != 0;
+          if (ok && j < nn) k5f_store(a, a1, b0, cb + a.c_col[j], wD[s + s / 16]);
+        }
+      }
+      __syncwarp();  // wD is rewritten by the next iteration
+    }
+  }
+}
+
+template <int N>
+__global__ void __launch_bounds__(kThreads) k5f_crt_bfast(OutArgs a, int lg_tl) {
+  constexpr int kTile = 1024;
+  __shared__ double sD[kTile + 32];
+  const int tl = 1 << lg_tl, lg_tj = 10 - lg_tl, tj = 1 << lg_tj, pitch = tj + 1;
+  const uint32_t nn = static_cast<uint32_t>(a.n), bb = static_cast<uint32_t>(a.b), m32 = static_cast<uint32_t>(a.m);
+  const uint32_t n_lt = (bb + tl - 1) >> lg_tl, n_jt = (nn + tj - 1) >> lg_tj;
+  const uint32_t tiles = m32 * n_lt * n_jt;
+  const bool a1 = k5f_alpha1(a), b0 = k5f_beta0(a), vmeta = k5f_vmeta(a);
+  const int tid = threadIdx.x;
+  for (uint32_t t = blockIdx.x; t < tiles; t += gridDim.x) {
+    const uint32_t jt = t % n_jt, rest = t / n_jt, lt = rest % n_lt, i = rest / n_lt;
+    const uint32_t lam0 = lt << lg_tl, j00 = jt << lg_tj;
+    {  // compute: thread = (lambda_l, 4 consecutive j-bar), j-bar fastest
+      const int jq = tid & ((tj >> 2) - 1), ll = tid >> (lg_tj - 2);
+      const uint32_t lam = lam0 + ll, j0 = j00 + 4 * jq;
+      if (lam < bb && j0 < nn) {
+        double D[4] = {0, 0, 0, 0};
+        k5f_elems<N, 4>(a, lam * m32 + i, lam, j0, vmeta, D);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) sD[ll * pitch + 4 * jq + e] = D[e];
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int it = 0; it < kTile / kThreads; ++it) {  // store: lambda fastest
+      const int q = tid + it * kThreads, ll = q & (tl - 1), jl = q >> lg_tl;
+      const uint32_t lam = lam0 + ll, j = j00 + jl;
+      if (lam < bb && j < nn)
+        k5f_store(a, a1, b0, a.c_bat[lam] + a.c_row[i] + a.c_col[j], sD[ll * pitch + jl]);
+    }
+    __syncthreads();
+  }
+}
+#endif  // IMD_NO_SEQ_TWINS
+
 __global__ void __launch_bounds__(kThreads) k_direct(OutArgs a) {
   const int64_t total = a.b * a.m * a.n;
   for (int64_t idx = blockIdx.x * int64_t{blockDim.x} + threadIdx.x; idx < total;
@@ -737,7 +922,7 @@ __global__ void __launch_bounds__(kThreads) k5_beta_only(OutArgs a) {
 // the REAL crt_f64_elem<N, L, Mut> (F64) or the REAL integer running CRT (crt_planes_n) of this file. The residue of plane l sits in byte e of the plane's
 // 32-bit word, the other three bytes hold unrelated data (the f64 CRT and the integer CRT must both ignore them, as K5 does for E = 4).
 constexpr int kTestCrtWords = 5;   // the largest L32 (N = 17..20)
-template <int N, int Mut, bool F64>
+template <int N, int Mut, bool F64, bool Fin = false>
 __global__ void __launch_bounds__(kThreads) test_crt_elem_kernel(const uint8_t* W, uint32_t* out, int64_t count, int e) {
   const int64_t idx = blockIdx.x * int64_t{blockDim.x} + threadIdx.x;
   if (idx >= count) return;
@@ -756,7 +941,7 @@ __global__ void __launch_bounds__(kThreads) test_crt_elem_kernel(const uint8_t* 
 #pragma unroll
   for (int w = 0; w < L; ++w) x[0][w] = 0;
   if constexpr (F64) {
-    crt_f64_elem<N, L, Mut>(wv, e, x[0]);
+    crt_f64_elem<N, L, Mut, Fin>(wv, e, x[0]);
   } else {
 #pragma unroll
     for (int l = 0; l < N; ++l) wv[l] >>= 8 * e;   // crt_planes_n reads byte 0 of element 0
@@ -789,6 +974,21 @@ void launch_k5_v(const K5Launch& L, const OutArgs& out, cudaStream_t stream) {
     k5_crt_n<N, 4, F64, F1><<<grid, kThreads, 0, stream>>>(out);
 }
 
+#ifndef IMD_NO_SEQ_TWINS
+template <int N>
+void launch_k5f_v(const K5Launch& L, const OutArgs& out, cudaStream_t stream) {
+  const unsigned grid = static_cast<unsigned>(L.grid);
+  if (L.variant == 3)
+    k5f_crt_bfast<N><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
+  else if (L.elems == 1)
+    k5f_crt_n<N, 1><<<grid, kThreads, 0, stream>>>(out);
+  else if (L.elems == 2)
+    k5f_crt_n<N, 2><<<grid, kThreads, 0, stream>>>(out);
+  else
+    k5f_crt_n<N, 4><<<grid, kThreads, 0, stream>>>(out);
+}
+#endif  // IMD_NO_SEQ_TWINS
+
 template <int N>
 void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
   const K5Launch L = k5_launch(p.k5_batch_fast, p.b, p.m, p.n, p.sms, k5_one_elem_per_sm(),
@@ -800,6 +1000,18 @@ void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
 #endif
   // issue 21: the sums in binary64 limbs (the class set's kSeqLimbCrt bit unless the K5 hook forces a CRT), and the F1 finish (host/seq_config.hpp)
   const bool f1 = (seq & kSeqFinish) != 0;
+  // issue 23: k5fin (bit 128) is the limb CRT + F1 kernels with fewer instructions: only for that combination, and only when its 32-bit index arithmetic fits
+#ifndef IMD_NO_SEQ_TWINS
+  if constexpr ((kSeqSupported & kSeqK5Fin) != 0) {
+    if (f64 && f1 && (seq & kSeqK5Fin) != 0 && k5f_fits(L, out)) {
+#ifdef IMD_BUILD_TEST_HOOKS
+      test_note_k5_fin_launch(L.variant);
+#endif
+      launch_k5f_v<N>(L, out, stream);
+      return;
+    }
+  }
+#endif
   if (f64) {
     if constexpr ((kSeqSupported & kSeqFinish) != 0) {
       if (f1) { launch_k5_v<N, true, true>(L, out, stream); return; }
@@ -1698,11 +1910,13 @@ std::atomic<int>& k5_crt_override() {
 
 #ifdef IMD_BUILD_TEST_HOOKS
 namespace {
+std::atomic<int64_t> g_k5_fin_launches[4];   // issue 23: launches of the k5fin kernels, [variant]
 std::atomic<int64_t> g_k5_launches[2][4];   // [limb CRT?][variant: 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest]
 template <int N, int Mut>
 cudaError_t test_crt_launch(int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
   const unsigned grid = static_cast<unsigned>((count + kThreads - 1) / kThreads);
   if (variant == 0) test_crt_elem_kernel<N, 0, false><<<grid, kThreads>>>(W, out, count, e);
+  else if (variant == 10) test_crt_elem_kernel<N, 0, true, true><<<grid, kThreads>>>(W, out, count, e);   // the k5fin tail (one carry chain for the final subtraction)
   else test_crt_elem_kernel<N, Mut, true><<<grid, kThreads>>>(W, out, count, e);
   return cudaGetLastError();
 }
@@ -1710,7 +1924,7 @@ template <int N>
 cudaError_t test_crt_dispatch(int n, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
   if (n == N) {
     switch (variant) {
-      case 0: case 1: return test_crt_launch<N, 0>(variant, e, count, W, out);
+      case 0: case 1: case 10: return test_crt_launch<N, 0>(variant, e, count, W, out);
       case 2: return test_crt_launch<N, 1>(variant, e, count, W, out);
       case 3: return test_crt_launch<N, 2>(variant, e, count, W, out);
       case 4: return test_crt_launch<N, 3>(variant, e, count, W, out);
@@ -1727,7 +1941,7 @@ cudaError_t test_crt_dispatch(int n, int variant, int e, int64_t count, const ui
 }  // namespace
 
 cudaError_t test_crt_elem(int N, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
-  if (N < imd::constants::kNMin || N > imd::constants::kNMax || variant < 0 || variant > 9 || e < 0 || e > 3 || count < 0)
+  if (N < imd::constants::kNMin || N > imd::constants::kNMax || variant < 0 || variant > 10 || e < 0 || e > 3 || count < 0)
     return cudaErrorInvalidValue;
   if (count == 0) return cudaSuccess;
   return test_crt_dispatch<imd::constants::kNMin>(N, variant, e, count, W, out);
@@ -1735,6 +1949,12 @@ cudaError_t test_crt_elem(int N, int variant, int e, int64_t count, const uint8_
 
 void test_note_k5_launch(bool limb_crt, int variant) {
   g_k5_launches[limb_crt ? 1 : 0][variant].fetch_add(1, std::memory_order_relaxed);
+}
+
+void test_note_k5_fin_launch(int variant) { g_k5_fin_launches[variant].fetch_add(1, std::memory_order_relaxed); }
+
+void test_k5_fin_counts(bool reset, int64_t* out) {
+  for (int v = 0; v < 4; ++v) out[v] = reset ? g_k5_fin_launches[v].exchange(0) : g_k5_fin_launches[v].load();
 }
 
 void test_k5_launch_counts(bool reset, int64_t* out) {
@@ -2137,6 +2357,19 @@ cudaError_t versions_of(Kernel kernel, int32_t* binary, int32_t* ptx) {
 }
 }  // namespace
 
+// Issue 23: the k5fin kernels exist only in a build with the sequence twins; without them the shipped K5 stands in (same module, same code version).
+template <bool Bfast>
+cudaError_t k5f_versions(int32_t* binary, int32_t* ptx) {
+  constexpr int N = imd::constants::kNMin;
+#ifndef IMD_NO_SEQ_TWINS
+  if constexpr (Bfast) return versions_of(k5f_crt_bfast<N>, binary, ptx);
+  else return versions_of(k5f_crt_n<N, 4>, binary, ptx);
+#else
+  if constexpr (Bfast) return versions_of(k5_crt_bfast<N>, binary, ptx);
+  else return versions_of(k5_crt_n<N, 4>, binary, ptx);
+#endif
+}
+
 // The launches that have no IMD_PERF_KERNEL_* id: the K1 kernels and the instantiations for more
 // than kK0SmallModes modes (tests/check_kernel_sites.py keeps this list complete).
 cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) {
@@ -2153,6 +2386,8 @@ cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) 
     case 9: return versions_of(k1_scale<1024>, binary, ptx);
     case 10: return versions_of(k1_scale<kThreads>, binary, ptx);
     case 11: return versions_of(k23_pack_cap<2, 1>, binary, ptx);  // issue 21: the E1 K2/K3 instance held to 4 CTAs per SM
+    case 12: return k5f_versions<true>(binary, ptx);   // issue 23: the k5fin K5 kernels (one n and one batch-fastest instance; same module as the shipped K5)
+    case 13: return k5f_versions<false>(binary, ptx);
     default: return cudaErrorInvalidValue;
   }
 }

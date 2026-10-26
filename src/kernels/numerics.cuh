@@ -493,6 +493,68 @@ __device__ __forceinline__ bool finish_f1_try(const uint32_t (&x)[L], int e, dou
   return true;
 }
 
+// Issue 23 (k5fin, seq bit 128): finish_f1_try with the normalisation stages behind one test of the top limb. When mag's top limb is nonzero every stage
+// of finish_f1_try finds its top limbs nonzero and changes nothing (shifted stays 0), so the stages are skipped: the same values, fewer instructions per element
+// (the usual case: |z| is within 32 bits of P / 2). Not a template twin of finish_f1_try, so the shipped F1 kernels are untouched.
+template <int L, int N>
+__device__ __forceinline__ bool finish_f1_fast(const uint32_t (&x)[L], int e, double* out) {
+  using imd::device::c_tables;
+  constexpr int Lp = L < 2 ? 2 : L;
+  uint32_t xv[Lp], mag[Lp];
+#pragma unroll
+  for (int w = 0; w < Lp; ++w) xv[w] = w < L ? x[w] : 0u;
+  uint32_t hl[Lp], pl[Lp], dh[Lp], pm[Lp];
+#pragma unroll
+  for (int w = 0; w < Lp; ++w) hl[w] = c_tables.H[N][w], pl[w] = c_tables.P[N][w];
+  const bool neg = sub_limbs<Lp>(dh, hl, xv) != 0;  // x > H: the borrow of H - x
+  sub_limbs<Lp>(pm, pl, xv);                        // P - x (used when neg)
+#pragma unroll
+  for (int w = 0; w < Lp; ++w) mag[w] = neg ? pm[w] : xv[w];
+  int shifted = 0;
+  if (mag[Lp - 1] == 0) {   // rare: the 4 / 2 / 1-limb stages of finish_f1_try
+#pragma unroll
+    for (int step = 4; step >= 1; step /= 2) {
+      if (step < Lp) {
+        bool z = true;
+#pragma unroll
+        for (int w = Lp - step; w < Lp; ++w) z = z && mag[w] == 0;
+        uint32_t up[Lp];
+#pragma unroll
+        for (int w = 0; w < Lp; ++w) up[w] = w >= step ? mag[w - step] : 0u;
+#pragma unroll
+        for (int w = 0; w < Lp; ++w) mag[w] = z ? up[w] : mag[w];
+        shifted += z ? step : 0;
+      }
+    }
+    if (mag[Lp - 1] == 0) return false;  // mag = 0
+  }
+  const int b = __clz(static_cast<int>(mag[Lp - 1]));
+  uint32_t y[Lp];
+#pragma unroll
+  for (int j = 0; j < Lp; ++j) y[j] = __funnelshift_l(j > 0 ? mag[j - 1] : 0u, mag[j], b);
+  uint32_t st = 0;
+#pragma unroll
+  for (int j = 0; j < Lp - 2; ++j) st |= y[j];
+  const uint64_t t = (uint64_t{y[Lp - 1]} << 32 | y[Lp - 2]) | (st != 0 ? 1u : 0u);
+  const double dm = __ull2double_rn(t);
+  const int kk = 32 * Lp - 64 - (32 * shifted + b) + e;
+  if (static_cast<uint32_t>(1085 + kk) >= 2045u) return false;
+  const uint32_t hi = static_cast<uint32_t>(__double2hiint(dm)) + (static_cast<uint32_t>(kk) << 20) | (neg ? 0x80000000u : 0u);
+  *out = __hiloint2double(static_cast<int>(hi), __double2loint(dm));
+  return true;
+}
+
+// The finish of one K5 element of the k5fin kernels: finish_f1_fast where it applies, else the existing crt_finish + round_scaled.
+template <int L, int N>
+__device__ __forceinline__ double crt_round_fin(const uint32_t (&x)[L], int e) {
+  double d;
+  if (finish_f1_fast<L, N>(x, e, &d)) return d;
+  uint32_t mag[L];
+  bool neg;
+  crt_finish<L>(x, N, mag, &neg);
+  return round_scaled<L>(mag, neg, e);
+}
+
 // The finish of one K5 element: F1 where it applies, else (and when F1 is off) the existing crt_finish + round_scaled.
 template <int L, int N, bool F1>
 __device__ __forceinline__ double crt_round(const uint32_t (&x)[L], int e) {

@@ -35,7 +35,8 @@
  *                         kSeqLimbCrt bit; a forced set 0..7 has none = integer). Returns 0, 1 if invalid.
  *   imd_prof_set_seq(bits)
  *                         issue 21: later calls run the instruction-sequence set `bits` (1 E1 emitter, 2 Q1 quantize,
- *                         4 F1 finish; host/seq_config.hpp) instead of the device class's; -1 restores it.
+ *                         4 F1 finish, 128 k5fin (issue 23; needs F1, acts only with the limb CRT); host/seq_config.hpp)
+ *                         instead of the device class's; -1 restores it.
  *                         Returns 0, 1 if invalid.
  *   imd_prof_plan_seq(plan, &bits)
  *                         issue 21: the sequence set the plan's launches run now (the forced one, else the device

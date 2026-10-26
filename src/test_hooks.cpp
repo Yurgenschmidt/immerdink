@@ -36,9 +36,9 @@
 //   imd_test_plan_crt(plan)
 //       the CRT variant the plan's K5 runs now, whatever decided it (0 integer, 1 limbs); -1 for a null plan.
 //   imd_test_set_seq(bits)
-//       issue 21: every later imd_contract runs the instruction-sequence set `bits` (1 E1 emitter, 2 Q1 quantize, 4 F1 finish;
-//       host/seq_config.hpp), -1 the plan's (device class) set. Results must not change. Returns 0, or 1 for another value
-//       (also for the Q1 bit without the E1 bit, and for 8..15: the limb-CRT bit 8 is a class default only, see imd_test_set_k5_crt).
+//       issue 21: every later imd_contract runs the instruction-sequence set `bits` (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 128 k5fin
+//       (issue 23: needs F1; its kernels run only with the limb CRT); host/seq_config.hpp), -1 the plan's (device class) set. Results must not change. Returns 0, or 1 for another value
+//       (also for the Q1 bit without the E1 bit, bit 128 without F1, and for 8..15: the limb-CRT bit 8 is a class default only, see imd_test_set_k5_crt).
 //   imd_test_get_seq()
 //       the forced set (-1: none).
 //   imd_test_plan_seq(plan)
@@ -249,6 +249,13 @@ IMD_API int imd_test_kl_launch_counts(int reset, int64_t* out) {
 IMD_API int imd_test_kl_timers(int reset, unsigned long long* out, int n) {
   if (out == nullptr || n < 0) return -3;
   return imd::detail::test_kl_timers(reset != 0, out, n);
+}
+
+// Issue 23: launches of the k5fin K5 kernels (seq bit 128) since the last reset, int64[4]: [variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest]; reset != 0 zeroes them.
+IMD_API int imd_test_k5_fin_counts(int reset, int64_t* out) {
+  if (out == nullptr) return 1;
+  imd::detail::test_k5_fin_counts(reset != 0, out);
+  return 0;
 }
 
 // Issue 21: K5's CRT: the sums in binary64 limbs (1), the integer running CRT (0), or -1 (the default) the plan's set decides (kSeqLimbCrt of the device class).

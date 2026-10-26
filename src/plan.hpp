@@ -52,7 +52,7 @@ cudaError_t kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out);
 cudaError_t kernel_versions(int32_t kernel, int32_t w, int32_t* binary, int32_t* ptx);
 // The same for the launches without an IMD_PERF_KERNEL_* id (index 0 .. kExtraKernels - 1; cudaErrorInvalidValue
 // beyond). Their failing_kernel id in imd_device_info_t is IMD_PERF_KERNEL_COUNT + index.
-constexpr int32_t kExtraKernels = 12;
+constexpr int32_t kExtraKernels = 14;
 cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx);
 
 // K0 (contract.cu): write the p.vec_count scatter vectors to `vec` from p.vec_desc, on
@@ -181,6 +181,9 @@ void test_k5_launch_counts(bool reset, int64_t* out);
 void test_note_kl_launch(int E, int kb);
 void test_kl_launch_counts(bool reset, int64_t* out);
 int test_kl_timers(bool reset, unsigned long long* out, int n);
+// Issue 23: launches of the k5fin kernels (seq bit 128) since the last reset, [variant 0 / 1 / 2 / 3 as above]; test_note_k5_fin_launch is called by launch_k5 only when one runs.
+void test_note_k5_fin_launch(int variant);
+void test_k5_fin_counts(bool reset, int64_t* out);
 #endif
 
 // The execution data of a plan (api.cpp), for the test hooks; nullptr for a null plan.
