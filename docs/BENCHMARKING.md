@@ -511,4 +511,6 @@ bench/run_metrics.sh $HOME/imd-metrics/$(hostname)-$(date +%Y%m%d)
 - **Check the accuracy before believing the speed:** the library's kernels were developed on sm_89, so on a
   new architecture the first thing to read is `max_normerr` in the records (about 1e-16 at N = 14,
   1e-9 at N = 8; `nonfinite` must be 0). `tools/test.sh` runs the correctness tests.
+  Method `imd` records also carry the componentwise `acc_*` fields and a full-matrix comparison with native DGEMM
+  (`--accuracy 0|1`): docs/NOTES-BENCH-ACCURACY.md.
 - If the machine never gets quiet, the sweep stops with exit 3 instead of recording contaminated numbers.

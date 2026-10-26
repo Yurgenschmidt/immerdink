@@ -435,19 +435,20 @@ struct KIter {  // mixed-radix iteration over the contracted labels
   int64_t k = 1;
 };
 
-// out[s] = {hi, lo, ||a_i||_2 ||b_j||_2} of sample s, whose A/B base offsets are offA/offB.
+// out[s] = {hi, lo, ||a_i||_2 ||b_j||_2, sum_k |a_ik b_kj|} of sample s, whose A/B base offsets are offA/offB.
 __global__ void k_reference(const double* A, const double* B, const int64_t* offA,
                             const int64_t* offB, size_t ns, KIter it, double* out) {
   size_t s = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
   if (s >= ns) return;
   int64_t oa = offA[s], ob = offB[s], ctr[kMaxKModes] = {};
   DD acc;
-  double na = 0, nb = 0;
+  double na = 0, nb = 0, sab = 0;
   for (int64_t t = 0; t < it.k; ++t) {
     double a = A[oa], b = B[ob];
     acc.add_prod(a, b);
     na += a * a;
     nb += b * b;
+    sab += fabs(a * b);  // (|A||B|)_ij: its rounding error is irrelevant as a scale
     for (int d = it.nd - 1; d >= 0; --d) {  // increment the K counter
       oa += it.sa[d];
       ob += it.sb[d];
@@ -458,17 +459,44 @@ __global__ void k_reference(const double* A, const double* B, const int64_t* off
     }
   }
   acc.normalize();
-  out[3 * s] = acc.hi;
-  out[3 * s + 1] = acc.lo;
-  out[3 * s + 2] = sqrt(na) * sqrt(nb);
+  out[4 * s] = acc.hi;
+  out[4 * s + 1] = acc.lo;
+  out[4 * s + 2] = sqrt(na) * sqrt(nb);
+  out[4 * s + 3] = sab;
 }
 __global__ void k_gather(const double* C, const size_t* idx, size_t ns, double* out) {
   size_t s = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
   if (s < ns) out[s] = C[idx[s]];
 }
 
+// Full-matrix comparison (method imd, outside every timed region): x = the emulation's C, y = native cuBLAS DGEMM's C, S = (|A||B|)
+// (a DGEMM on |A|, |B|; its own rounding is irrelevant as a scale). Per entry d = |x - y| / S (entries with S == 0 are skipped);
+// reports the max (as the bits of a positive double, for atomicMax), the sum and the counts.
+__global__ void k_abs(const double* in, double* out, size_t n) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+    out[i] = fabs(in[i]);
+}
+__global__ void k_cw_compare(const double* x, const double* y, const double* S, size_t n, unsigned long long* maxbits,
+                             double* sum, unsigned long long* cnt, unsigned long long* nonfin) {
+  double mx = 0, sm = 0;
+  unsigned long long c = 0, nf = 0;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+    if (!isfinite(x[i])) { ++nf; continue; }
+    if (S[i] == 0) continue;
+    const double d = fabs(x[i] - y[i]) / S[i];
+    mx = fmax(mx, d);
+    sm += d;
+    ++c;
+  }
+  atomicMax(maxbits, static_cast<unsigned long long>(__double_as_longlong(mx)));
+  atomicAdd(sum, sm);
+  atomicAdd(cnt, c);
+  atomicAdd(nonfin, nf);
+}
+
 struct Accuracy {
   double max_rel = 0, max_norm = 0;
+  double max_cw = 0;  // max |c - r| / (|A||B|)_ij over the samples (componentwise, the GEMM accuracy measure)
   long long samples = 0, bad = 0;  // bad: non-finite results where the reference is finite
   unsigned long long chash = 0;    // order-independent hash of every bit of the whole C (identical-results test)
 };
@@ -488,7 +516,7 @@ __global__ void k_hash_c(const unsigned long long* p, size_t n, unsigned long lo
 // ||a_i||_2 ||b_j||_2. idx also lives on the device (dIdx) for the gather.
 struct Reference {
   std::vector<size_t> idx;
-  std::vector<double> hi, lo, nrm;
+  std::vector<double> hi, lo, nrm, cw;  // cw: (|A||B|)_ij
   DevBuf dIdx, dGot;
 };
 
@@ -526,7 +554,7 @@ Reference make_reference(const Case& c, const double* dA, const double* dB, long
     offA[s] = oa;
     offB[s] = ob;
   }
-  DevBuf dOA(ns * 8), dOB(ns * 8), dOut(ns * 24);
+  DevBuf dOA(ns * 8), dOB(ns * 8), dOut(ns * 32);
   R.dIdx = DevBuf(ns * sizeof(size_t));
   R.dGot = DevBuf(ns * 8);
   CU(cudaMemcpy(dOA.p, offA.data(), ns * 8, cudaMemcpyHostToDevice));
@@ -536,15 +564,17 @@ Reference make_reference(const Case& c, const double* dA, const double* dB, long
                                                           ns, it, dOut.as<double>());
   CU(cudaStreamSynchronize(st));
   CU(cudaGetLastError());
-  std::vector<double> out(3 * ns);
-  CU(cudaMemcpy(out.data(), dOut.p, ns * 24, cudaMemcpyDeviceToHost));
+  std::vector<double> out(4 * ns);
+  CU(cudaMemcpy(out.data(), dOut.p, ns * 32, cudaMemcpyDeviceToHost));
   R.hi.resize(ns);
   R.lo.resize(ns);
   R.nrm.resize(ns);
+  R.cw.resize(ns);
   for (size_t s = 0; s < ns; ++s) {
-    R.hi[s] = out[3 * s];
-    R.lo[s] = out[3 * s + 1];
-    R.nrm[s] = out[3 * s + 2];
+    R.hi[s] = out[4 * s];
+    R.lo[s] = out[4 * s + 1];
+    R.nrm[s] = out[4 * s + 2];
+    R.cw[s] = out[4 * s + 3];
   }
   return R;
 }
@@ -574,6 +604,7 @@ Accuracy check(Reference& R, const double* dC, cudaStream_t st, size_t total = 0
     if (!std::isfinite(g)) { ++a.bad; continue; }
     if (ref != 0) a.max_rel = std::max(a.max_rel, d / std::fabs(ref));
     if (R.nrm[s] != 0) a.max_norm = std::max(a.max_norm, d / R.nrm[s]);
+    if (R.cw[s] != 0) a.max_cw = std::max(a.max_cw, d / R.cw[s]);
   }
   return a;
 }
@@ -640,6 +671,7 @@ struct Options {
   size_t emu_ws_mib = 2048;                         // --emu-ws-mib: the emulation workspace given to cuBLAS
   std::vector<std::string> g8modes = {"fast"};      // --g8mode fast,accu (GEMMul8)
   std::vector<int> g8fast_N, g8accu_N;              // --g8fast-N / --g8accu-N: moduli per GEMMul8 mode (empty: --N)
+  int accuracy = -1;  // --accuracy 0|1: the full-matrix DGEMM comparison of method imd (-1 auto: on if its extra buffers fit modestly)
   bool gemm_view = false;  // --gemm-view 1: also time the bare GEMM on pre-permuted operands (perm+X cases)
 };
 
@@ -1087,7 +1119,7 @@ struct Bench {
     if (o.keep_samples && method.rfind("duel", 0) != 0) j.raw("samples_s", jarr(T.t));
     j.integer("ws_bytes", (long long)ws_bytes);
     if (acc) {
-      j.num("max_relerr", acc->max_rel).num("max_normerr", acc->max_norm);
+      j.num("max_relerr", acc->max_rel).num("max_normerr", acc->max_norm).num("max_cwerr", acc->max_cw);
       j.integer("err_samples", acc->samples).integer("nonfinite", acc->bad);
       if (acc->chash) {  // the hash of the whole C: equal = bit-identical results
         char hb[24];
@@ -1926,6 +1958,55 @@ struct Bench {
 
   // k4: -1 the plan-time rule, -2 the k4_tune plan option, >= 0 a forced configuration
   // (benchmark hook; needs the profiling build).
+  // Accuracy fields of a method imd record (docs/NOTES-BENCH-ACCURACY.md). Always: the sampled fields against the double-double
+  // reference (acc_ref "dd-dot2-sampled"). With the full-matrix comparison on (--accuracy 1, or auto when it fits): native cuBLAS
+  // DGEMM (PEDANTIC) on the same inputs, its own error against the same reference at the same samples (acc_dgemm_*), and
+  // the emulation against it over every entry (acc_vs_dgemm_*). Runs after the timed loop, on the bench stream; the library is not involved.
+  void accuracy_fields(const Accuracy& acc, Json& e) {
+    auto bits = [](double x) { return x > 0 && std::isfinite(x) ? -std::log2(x) : NAN; };
+    e.str("acc_ref", "dd-dot2-sampled").integer("acc_n_sampled", acc.samples);
+    e.num("acc_max_relerr_cw", acc.max_cw).num("acc_bits_cw", bits(acc.max_cw));
+    e.num("acc_max_relerr_elem", acc.max_rel).num("acc_bits_elem", bits(acc.max_rel));
+    e.num("acc_max_rel_to_norm", acc.max_norm);  // the same quantity as max_normerr
+    if (o.accuracy == 0) { e.str("acc_dgemm", "off (--accuracy 0)"); return; }
+    if (needA || needB || needC) { e.str("acc_dgemm", "skipped: case needs permutations (no plain GEMM view)"); return; }
+    const size_t need = dA.bytes + dB.bytes + 2 * dC.bytes;
+    size_t fr = 0, tot = 0;
+    CU(cudaMemGetInfo(&fr, &tot));
+    const size_t cap = o.accuracy == 1 ? fr - std::min(fr, size_t(256) << 20) : std::min(fr / 2, size_t(8) << 30);
+    if (need > cap) {
+      e.str("acc_dgemm", "skipped: extra buffers " + std::to_string(need >> 20) + " MiB do not fit (" + std::to_string(cap >> 20) +
+                             " MiB allowed)");
+      return;
+    }
+    BlasHandle H(s);
+    CB(cublasSetMathMode(H.h, CUBLAS_PEDANTIC_MATH));
+    GemmFn gemm = cublas_gemm(H.h, CUBLAS_COMPUTE_64F_PEDANTIC);
+    DevBuf Cd(dC.bytes), S(dC.bytes), Aa(dA.bytes), Ba(dB.bytes);
+    gemm(dA.as<double>(), dB.as<double>(), Cd.as<double>());
+    k_abs<<<1024, 256, 0, s>>>(dA.as<double>(), Aa.as<double>(), c.A.size);
+    k_abs<<<1024, 256, 0, s>>>(dB.as<double>(), Ba.as<double>(), c.B.size);
+    gemm(Aa.as<double>(), Ba.as<double>(), S.as<double>());
+    CU(cudaStreamSynchronize(s));
+    CU(cudaGetLastError());
+    const Accuracy ad = check(R, Cd.as<double>(), s);  // native DGEMM against the same reference, same samples
+    DevBuf st(32);
+    CU(cudaMemsetAsync(st.p, 0, 32, s));
+    auto* u = st.as<unsigned long long>();
+    k_cw_compare<<<1024, 256, 0, s>>>(dC.as<double>(), Cd.as<double>(), S.as<double>(), c.C.size, u, st.as<double>() + 1, u + 2, u + 3);
+    unsigned long long h[4];
+    CU(cudaMemcpyAsync(h, st.p, 32, cudaMemcpyDeviceToHost, s));
+    CU(cudaStreamSynchronize(s));
+    CU(cudaGetLastError());
+    double mx, sm;
+    std::memcpy(&mx, &h[0], 8);
+    std::memcpy(&sm, &h[1], 8);
+    e.str("acc_dgemm", "cublas-dgemm-pedantic");
+    e.num("acc_dgemm_max_relerr_cw", ad.max_cw).num("acc_dgemm_max_relerr_elem", ad.max_rel);
+    e.integer("acc_vs_dgemm_n", (long long)h[2]).integer("acc_vs_dgemm_nonfinite", (long long)h[3]);
+    e.num("acc_vs_dgemm_max_cw", mx).num("acc_vs_dgemm_mean_cw", h[2] ? sm / double(h[2]) : NAN);
+  }
+
   void method_imd(int N, int vec_mode, int g, int k4 = -1) {
     auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
       lab.assign(x.labels.begin(), x.labels.end());
@@ -2056,6 +2137,7 @@ struct Bench {
     if (o.seq >= 0) vs += " seq=" + std::to_string(o.seq);
     if (o.crt >= 0) vs += o.crt == 1 ? " crt=f64" : " crt=int";
     if (o.k4b >= 0) vs += o.k4b == 0 ? " k4b=mma" : " k4b=wgmma";
+    accuracy_fields(acc, extra);  // after every timed and profiled call: untimed
     record("imd", vs, N, T, &acc, flops(), wsb, extra);
   }
 
@@ -2804,6 +2886,9 @@ void usage() {
           "      the perm+<method> record, with the cuTENSOR permutations timed, is always written)\n"
           "  [--xduel-b dgemm,emu:fix55,gemmul8:fast:14] (method xduel: immerdink, side --duel-a, against each baseline\n"
           "      INTERLEAVED; records the baseline with xduel_ratio_median and the immerdink side as xduel-imd)\n"
+          "  [--accuracy 0|1] (method imd: the full-matrix comparison with native cuBLAS DGEMM, outside the timed region, adds the acc_dgemm* /\n"
+          "      acc_vs_dgemm_* fields; default: on when its extra buffers (A+B+2C bytes) fit in min(free/2, 8 GiB); 1 forces it, 0 skips it. The sampled fields\n"
+          "      acc_max_relerr_cw etc. (double-double reference at --samples entries) are always written; docs/NOTES-BENCH-ACCURACY.md)\n"
           "  [--keep-samples 0|1] (add the raw per-repetition times: samples_s; duel-b: pair_t_a, pair_t_b)\n"
           "  [--energy-warmup 3] [--energy-seconds 10] [--energy-min-calls 50] [--energy-max-seconds 30]\n"
           "  [--energy-idle 3] [--energy-step-ms <counter step period; default: measured>] (method energy)\n"
@@ -2825,7 +2910,7 @@ int main(int argc, char** argv) {
                                       "sustain-warm-s", "sustain-trace-s", "k-align",
                                       "energy-warmup", "energy-seconds", "energy-max-seconds",
                                       "energy-idle", "energy-min-calls", "energy-step-ms",
-                                      "keep-samples", "seq", "crt", "k4b", "xduel-b", "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
+                                      "keep-samples", "accuracy", "seq", "crt", "k4b", "xduel-b", "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -2855,6 +2940,10 @@ int main(int argc, char** argv) {
     if (a.count("warmup")) B.o.warmup = std::stoi(a["warmup"]);
     if (a.count("max-seconds")) B.o.max_seconds = std::stod(a["max-seconds"]);
     if (a.count("samples")) B.o.samples = std::stoll(a["samples"]);
+    if (a.count("accuracy")) {
+      if (a["accuracy"] != "0" && a["accuracy"] != "1") throw Failure("--accuracy 0|1");
+      B.o.accuracy = a["accuracy"] == "1";
+    }
     if (a.count("keep-samples")) B.o.keep_samples = a["keep-samples"] != "0";
     if (a.count("phase-reps")) B.o.phase_reps = std::stoi(a["phase-reps"]);
     if (a.count("vec")) {
