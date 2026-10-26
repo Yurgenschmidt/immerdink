@@ -143,6 +143,10 @@ class Library:
             self.lib.imd_test_set_k5_elems.restype = C.c_int
             self.lib.imd_test_set_k5_crt.argtypes = [C.c_int]
             self.lib.imd_test_set_k5_crt.restype = C.c_int
+            self.lib.imd_test_get_k5_crt.argtypes = []
+            self.lib.imd_test_get_k5_crt.restype = C.c_int
+            self.lib.imd_test_plan_crt.argtypes = [C.c_void_p]
+            self.lib.imd_test_plan_crt.restype = C.c_int
             self.lib.imd_test_set_seq.argtypes = [C.c_int]
             self.lib.imd_test_set_seq.restype = C.c_int
             self.lib.imd_test_get_seq.argtypes = []
@@ -211,9 +215,17 @@ class Library:
         """A5: K5 (j-bar fastest) with 1, 2 or 4 elements per thread; 0 the launch rule."""
         assert self.lib.imd_test_set_k5_elems(elems) == 0
 
-    def set_k5_crt(self, variant=0):
-        """Issue 21: K5's CRT with the sums in binary64 limbs (1) or the integer running CRT (0, default)."""
+    def set_k5_crt(self, variant=-1):
+        """Issue 21: K5's CRT with the sums in binary64 limbs (1), the integer running CRT (0), or -1 (default) the plan's set decides (the device class's limb-CRT bit)."""
         assert self.lib.imd_test_set_k5_crt(variant) == 0
+
+    def get_k5_crt(self):
+        """The K5 CRT hook's state: -1 follow the plan's set, 0 integer, 1 limbs."""
+        return self.lib.imd_test_get_k5_crt()
+
+    def plan_crt(self, plan):
+        """The CRT variant the plan's K5 runs now, whatever decided it (0 integer, 1 limbs)."""
+        return self.lib.imd_test_plan_crt(plan)
 
     def get_seq(self):
         """The forced instruction-sequence set (-1: none)."""
