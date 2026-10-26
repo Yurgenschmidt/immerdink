@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 CASE = ["--name", "smoke", "--spec", "ik,kj->ij", "--ext", "i=24,j=16,k=40"]
 FAST = ["--N", "8", "--reps", "2", "--warmup", "1", "--phase-reps", "2", "--max-seconds", "5"]
@@ -45,7 +46,19 @@ def main():
     bad = []
     tmp = tempfile.mkdtemp(prefix="imd_seq_crt_")
 
-    u = subprocess.run([args.bench], capture_output=True, text=True, timeout=60)
+    # The usage call needs no GPU and returns in well under a second on the dev box; on the Hopper nodes of R3 it hit the old 60 s timeout
+    # (docs/NOTES-22.md, immerdink-eval findings r3-20261026). stdin is closed so nothing can wait on it, and a timeout is reported with the
+    # elapsed time and the process's dynamic-library view instead of a bare traceback, so the next cluster run explains itself.
+    t0 = time.time()
+    try:
+        u = subprocess.run([args.bench], capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as e:
+        ldd = subprocess.run(["ldd", args.bench], capture_output=True, text=True, timeout=60).stdout[-1500:]
+        print(f"FAIL  the no-argument usage call did not return within {time.time() - t0:.0f} s\nstderr so far: "
+              f"{(e.stderr or b'')[-400:]!r}\nldd:\n{ldd}")
+        return 1
+    if time.time() - t0 > 10:
+        print(f"note  the usage call took {time.time() - t0:.1f} s (normally < 1 s)")
     if u.returncode == 0 or "--seq" not in u.stderr or "--crt" not in u.stderr:
         bad.append("the usage text does not name --seq and --crt (or exits 0)")
 
