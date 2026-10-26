@@ -24,10 +24,13 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 
 #include <cuda_runtime.h>
 
 #include "host/analysis.hpp"  // kK4*Bytes, k4_tune_bytes: libimmerdink_host's sizing
+#include "host/k4_wgmma.hpp"  // issue 22: the Hopper backend's legality, choice and device-class table (CUDA-free)
+#include "k4/hopper/k4_wgmma_ops.hpp"
 #include "k4/k4_ops.hpp"
 #include "plan.hpp"
 #include "profile.hpp"
@@ -49,9 +52,60 @@ const K4Ops& k4_ops(int cfg) {
   }
 }
 
+// Issue 22: the Hopper K4 backend (src/k4/hopper/, sm_90a). Built only with IMMERDINK_K4_WGMMA (IMD_K4_WGMMA); without it every
+// function below reports "not available" and nothing of it is reached.
+#ifdef IMD_K4_WGMMA
+const K4WgmmaOps& k4_wgmma_ops_v0();
+#endif
+const K4WgmmaOps* k4_wgmma_ops(int variant) {
+#ifdef IMD_K4_WGMMA
+  if (variant == 0) return &k4_wgmma_ops_v0();
+#else
+  (void)variant;
+#endif
+  return nullptr;
+}
+
 namespace {
 
 LaunchLimits g_limits = production_launch_limits();
+
+// Issue 22: the process-wide backend override (hooks only), and counters of the launches the Hopper backend served / declined
+// (tests and benchmark records: a forced-wgmma run that served nothing is not a wgmma run).
+std::atomic<int> g_backend_override{kK4BackendAuto};
+std::atomic<int64_t> g_wgmma_launched{0}, g_wgmma_declined{0};
+
+// What the current device offers the Hopper backend, probed once per device (plan creation is the only caller).
+struct WgmmaDevice {
+  bool probed = false, ok = false;
+  int clusters = 0;
+};
+constexpr int kMaxWgmmaDevices = 64;
+std::mutex g_wgmma_mutex;
+WgmmaDevice g_wgmma_dev[kMaxWgmmaDevices];
+
+// A failed probe is "not available", not an error of the caller: clear the (non-sticky) error state only if nothing was pending before the
+// probe started (`had_pending`), so a pending error of the caller's own is not swallowed.
+void clear_own_error(bool had_pending) {
+  if (!had_pending) cudaGetLastError();
+}
+
+WgmmaDevice wgmma_probe(int device) {
+  if (device < 0 || device >= kMaxWgmmaDevices) return {true, false, 0};
+  std::lock_guard<std::mutex> lock(g_wgmma_mutex);
+  WgmmaDevice& d = g_wgmma_dev[device];
+  if (!d.probed) {
+    d.probed = true;
+    const K4WgmmaOps* ops = k4_wgmma_ops(0);
+    const bool had_pending = cudaPeekAtLastError() != cudaSuccess;
+    int clusters = 0, binary = 0;
+    // the sm_90a image must be the one the device runs (binaryVersion 90) and the persistent grid needs a cluster count
+    if (ops != nullptr && ops->setup(&clusters, &binary) == cudaSuccess && binary == 90 && clusters >= 1 && clusters <= 255)
+      d.ok = true, d.clusters = clusters;
+    if (!d.ok) clear_own_error(had_pending);
+  }
+  return d;
+}
 
 // v1.13 §4b.5: the check that every operand pointer call_of forms is = 0 mod the plan's A (a
 // check against index-arithmetic drift that TLA+ cannot see), as a host pre-pass over the
@@ -90,6 +144,12 @@ struct K4Plan {
   int64_t m = 0, n_hat = 0, k_hat = 0, b = 0;
   K4Grid grid;     // n_hat, k_hat, b and the launch limits at creation
   int32_t config = 0;  // IMD_K4_*: the K4Gemm instantiation the parameters belong to
+  // Issue 22 (in the padding after `config`: sizeof(K4Plan) and so the plan host bytes do not change): the backend that is tried first
+  // for each launch (K4Backend; the mma.sync blobs below are the fallback of every launch the wgmma backend does not serve), and
+  // the persistent-grid cluster count of the wgmma kernel on this plan's device.
+  uint8_t backend = kK4BackendMma;
+  uint8_t wgmma_clusters = 0;
+  uint16_t sms = 0;  // the device's SM count (the wgmma backend's persistent grid)
   std::map<ShapeKey, K4Blob> store;  // chunk 0
   std::map<ShapeKey, K4Blob> add;    // chunks > 0
 
@@ -136,6 +196,8 @@ bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, 
                int gsize, cudaStream_t stream, bool prof, int64_t batch_a = 0,
                int64_t batch_b = 0) {
   const K4Ops& ops = k4_ops(k.config);
+  const bool try_wgmma = k.backend != kK4BackendMma;
+  const bool force = k.backend == kK4BackendWgmmaForced;  // a property of the plan (fixed at creation), not of the process-wide override
   bool ok = true;
   k.for_each_launch(gsize, [&](const Launch& L) {
     if (!ok) return;
@@ -143,6 +205,28 @@ bool run_group(const K4Plan& k, const int8_t* RA, const int8_t* RB, uint8_t* W, 
     const auto& map = L.k0 == 0 ? k.store : k.add;
     const auto it = map.find(key);
     const K4Call call = call_of(k, L, RA, RB, W, g0, batch_a, batch_b);
+    if (try_wgmma) {  // issue 22: decided here, on the host, per launch; anything not served falls through to mma.sync
+      const K4WgmmaLaunch wl{k.m, L.nc, L.kc, L.zc, k.k_hat, k.n_hat, call.batch_a, call.batch_b, call.plane_w,
+                             reinterpret_cast<uintptr_t>(call.A), reinterpret_cast<uintptr_t>(call.B),
+                             reinterpret_cast<uintptr_t>(call.W), k.sms};
+      const K4WgmmaPick pick = k4_wgmma_pick(wl, force);
+      const K4WgmmaOps* wops = pick.variant >= 0 ? k4_wgmma_ops(pick.variant) : nullptr;
+      if (wops != nullptr) {
+        const K4WgmmaArgs wa{static_cast<int>(k.m), static_cast<int>(L.nc), static_cast<int>(L.kc), static_cast<int>(L.zc),
+                             k.k_hat, k.n_hat, call.plane_w, k.sms, k.wgmma_clusters, pick.swizzle, pick.raster};
+        const int r = wops->launch(wa, call, L.k0 != 0, stream);  // can_implement is its first step: a refusal queued nothing
+        if (r == K4WgmmaOps::kLaunched) {
+          g_wgmma_launched.fetch_add(1, std::memory_order_relaxed);
+          if (prof) IMD_PROF(stream, L.k0 == 0 ? "K4 gemm store" : "K4 gemm add");
+          return;
+        }
+        if (r == K4WgmmaOps::kLaunchError) {
+          ok = false;
+          return;
+        }
+      }
+      g_wgmma_declined.fetch_add(1, std::memory_order_relaxed);  // not served (illegal, below the floor, or refused): mma.sync runs it
+    }
     ok = it != map.end() && ops.launch(it->second, L.k0 != 0, call, stream);
     if (prof) IMD_PROF(stream, L.k0 == 0 ? "K4 gemm store" : "K4 gemm add");
   });
@@ -172,10 +256,75 @@ int& k4_config_override() {
   return v;
 }
 
-imd_status_t k4_prepare(const ExecPlan& p, int cfg, std::shared_ptr<const K4Plan>* out) {
+std::atomic<int>& k4_backend_override() { return g_backend_override; }
+
+bool k4_wgmma_available(int32_t table_id, int32_t cc_major, int32_t cc_minor) {
+  // The device class first: no CUDA call at all on a device without the backend (RTX 4090, sm_120, anything but sm_90)
+  if (!k4_wgmma_device_ok(table_id, cc_major, cc_minor) || k4_wgmma_ops(0) == nullptr) return false;
+  const bool had_pending = cudaPeekAtLastError() != cudaSuccess;
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    clear_own_error(had_pending);
+    return false;
+  }
+  return wgmma_probe(device).ok;
+}
+
+int32_t k4_backend_of(const K4Plan& k) { return k.backend; }
+
+void k4_wgmma_counts(bool reset, int64_t* out) {
+  out[0] = reset ? g_wgmma_launched.exchange(0) : g_wgmma_launched.load();
+  out[1] = reset ? g_wgmma_declined.exchange(0) : g_wgmma_declined.load();
+}
+
+bool k4_wgmma_dry_run(int64_t m, int64_t nc, int64_t kc, int64_t zc, int64_t k_hat, int64_t n_hat, int64_t batch_a,
+                      int64_t batch_b, int sms, int clusters, bool add, bool force, int32_t* out) {
+  const K4WgmmaOps* ops = k4_wgmma_ops(0);
+  if (ops == nullptr) return false;
+  void* buf = nullptr;  // never read or written: the TMA encoder wants 16-byte aligned, plausible addresses
+  if (cudaMalloc(&buf, 4096) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  const auto base = reinterpret_cast<uintptr_t>(buf);
+  const K4WgmmaLaunch L{m, nc, kc, zc, k_hat, n_hat, batch_a, batch_b, m * n_hat, base, base, base, sms};
+  const K4WgmmaPick pick = k4_wgmma_pick(L, force);
+  out[0] = pick.variant, out[1] = pick.swizzle, out[2] = pick.raster, out[3] = out[4] = out[5] = out[6] = 0;
+  bool ok = true;
+  if (pick.variant >= 0) {
+    const K4Call call{static_cast<const int8_t*>(buf), static_cast<const int8_t*>(buf), static_cast<uint8_t*>(buf), batch_a, batch_b, m * n_hat, 0, 1, 0};
+    const K4WgmmaArgs a{static_cast<int>(m), static_cast<int>(nc), static_cast<int>(kc), static_cast<int>(zc), k_hat, n_hat, m * n_hat, sms,
+                        clusters, pick.swizzle, pick.raster};
+    int gx = 0, gy = 0, gz = 0;
+    int device = 0, major = 0;  // the driver refuses to encode a tensor map below sm_90 (CUDA_ERROR_NOT_SUPPORTED, and CUTLASS only prints)
+    if (cudaGetDevice(&device) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) {
+      cudaGetLastError();
+      major = 0;
+    }
+    ok = ops->dry_run(a, call, add, major >= 9, &gx, &gy, &gz);
+    out[3] = ok ? 1 : 0, out[4] = gx, out[5] = gy, out[6] = gz;
+  }
+  cudaFree(buf);
+  return ok;
+}
+
+imd_status_t k4_prepare(const ExecPlan& p, int cfg, std::shared_ptr<const K4Plan>* out, int32_t backend) {
   if (cfg < 0 || cfg >= kK4ConfigCount) return IMD_STATUS_INVALID_VALUE;
   auto k = std::make_shared<K4Plan>();
   k->m = p.m, k->n_hat = p.n_hat, k->k_hat = p.k_hat, k->b = p.b;
+  k->sms = static_cast<uint16_t>(p.sms > 0 && p.sms < 65536 ? p.sms : 0);
+  if (backend != kK4BackendMma && k->sms > 0) {  // issue 22: the caller decided (k4_wgmma_available); the probe is cached
+    const bool had_pending = cudaPeekAtLastError() != cudaSuccess;
+    int device = 0;
+    if (cudaGetDevice(&device) == cudaSuccess) {
+      const WgmmaDevice d = wgmma_probe(device);
+      // Like the mma.sync setup below, the per-device function attributes (dynamic shared memory) are set on every plan creation
+      int clusters = 0, binary = 0;
+      const bool again = d.ok && k4_wgmma_ops(0)->setup(&clusters, &binary) == cudaSuccess && binary == 90 && clusters == d.clusters;
+      if (d.ok && !again) clear_own_error(had_pending);
+      if (again) k->backend = static_cast<uint8_t>(backend), k->wgmma_clusters = static_cast<uint8_t>(d.clusters);
+    }
+  }
   // The launch structure is the configuration's-independent host one (n-hat split in
   // units of kK4TileN = 256 columns, a multiple of every tile width).
   k->grid = k4_grid(p.n_hat, p.k_hat, p.b, g_limits);

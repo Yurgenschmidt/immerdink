@@ -17,6 +17,11 @@
 //       shared-memory and re-read chunks of KL all run on small shapes). Results must not
 //       change. Returns 0, or 1 for another mode.
 //
+//   imd_test_set_k4_backend(backend) / imd_test_get_k4_backend() / imd_test_plan_k4_backend(plan) / imd_test_k4_wgmma_built() /
+//   imd_test_k4_wgmma_available(handle) / imd_test_k4_wgmma_counts(reset, out[2]) / imd_test_k4_wgmma_dry_run(...)
+//       issue 22: the Hopper (wgmma) K4 backend: force it or the mma.sync K4 for plans created afterwards, read back what a plan
+//       tries first, whether the build and the device have it, the launches it served / declined, and a host-only dry run of one launch.
+//
 //   imd_test_set_k4_config(config)
 //       config -1: plans created afterwards run the K4 configuration of the plan-time rule
 //       (or k4_tune's; production); 0 .. IMD_K4_CONFIG_COUNT - 1: that configuration
@@ -121,7 +126,9 @@
 #include "immerdink/immerdink.h"
 #include "host/analysis.hpp"
 #include "host/index_map.hpp"
+#include "host/k4_wgmma.hpp"
 #include "host/seq_config.hpp"
+#include "k4/hopper/k4_wgmma_ops.hpp"
 #include "plan.hpp"
 
 extern "C" {
@@ -148,6 +155,43 @@ IMD_API int imd_test_set_k4_config(int config) {
   if (config < -1 || config >= IMD_K4_CONFIG_COUNT) return 1;
   imd::detail::k4_config_override() = config;
   return 0;
+}
+
+// Issue 22 (docs/NOTES-22.md "Library integration (design)"): the K4 backend REQUEST of plans created afterwards (-1 the device class's rule, 0 mma.sync,
+// 1 wgmma: the plan is then "wgmma, forced" = backend 2: every legal launch of that plan, the profitability floor lifted, for the plan's life; a
+// device without the backend runs mma.sync whatever is asked). The request is read at plan creation only; resetting it later does not change plans.
+IMD_API int imd_test_set_k4_backend(int backend) {
+  if (!imd::detail::k4_backend_valid(backend)) return 1;
+  imd::detail::k4_backend_override() = backend;
+  return 0;
+}
+IMD_API int imd_test_get_k4_backend(void) { return imd::detail::k4_backend_override().load(); }
+// The backend a plan tries first (0 mma.sync, 1 wgmma with the profitability floor, 2 wgmma forced; -1 for a null plan or a plan without K4).
+IMD_API int imd_test_plan_k4_backend(imd_plan_t plan) {
+  const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
+  return e == nullptr || !e->k4 ? -1 : imd::detail::k4_backend_of(*e->k4);
+}
+// 1 if this build has the Hopper backend (IMMERDINK_K4_WGMMA), 0 if not; and whether it can run on the current device
+// (device class, compute capability, probe) as imd_plan_create would see it.
+IMD_API int imd_test_k4_wgmma_built(void) { return imd::detail::k4_wgmma_ops(0) != nullptr ? 1 : 0; }
+IMD_API int imd_test_k4_wgmma_available(imd_handle_t handle) {
+  imd_device_info_t info{};
+  info.struct_size = sizeof info;
+  if (imd_device_info(handle, &info) != IMD_STATUS_SUCCESS) return -1;
+  return imd::detail::k4_wgmma_available(info.table_id, info.device.cc_major, info.device.cc_minor) ? 1 : 0;
+}
+// Launches the Hopper backend served / declined since the last reset, int64[2]; reset != 0 zeroes them.
+IMD_API int imd_test_k4_wgmma_counts(int reset, int64_t* out) {
+  if (out == nullptr) return 1;
+  imd::detail::k4_wgmma_counts(reset != 0, out);
+  return 0;
+}
+// The host half of a Hopper launch of a synthetic GEMM, on any device of a build with the backend (gemm_k4.cu k4_wgmma_dry_run). out[7] =
+// variant (-1 not served), swizzle, raster, can_implement, persistent grid x / y / z. Returns 0, 1 if the backend is absent or can_implement refused.
+IMD_API int imd_test_k4_wgmma_dry_run(int64_t m, int64_t nc, int64_t kc, int64_t zc, int64_t k_hat, int64_t n_hat, int64_t batch_a,
+                                      int64_t batch_b, int sms, int clusters, int add, int force, int32_t* out) {
+  if (out == nullptr) return 1;
+  return imd::detail::k4_wgmma_dry_run(m, nc, kc, zc, k_hat, n_hat, batch_a, batch_b, sms, clusters, add != 0, force != 0, out) ? 0 : 1;
 }
 
 IMD_API int imd_test_set_k5_one_elem(int64_t per_sm) {

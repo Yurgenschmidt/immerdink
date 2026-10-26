@@ -153,6 +153,21 @@ class Library:
             self.lib.imd_test_get_seq.restype = C.c_int
             self.lib.imd_test_plan_seq.argtypes = [C.c_void_p]
             self.lib.imd_test_plan_seq.restype = C.c_int
+            # Issue 22: the Hopper (wgmma) K4 backend (src/test_hooks.cpp)
+            self.lib.imd_test_set_k4_backend.argtypes = [C.c_int]
+            self.lib.imd_test_set_k4_backend.restype = C.c_int
+            self.lib.imd_test_get_k4_backend.argtypes = []
+            self.lib.imd_test_get_k4_backend.restype = C.c_int
+            self.lib.imd_test_plan_k4_backend.argtypes = [C.c_void_p]
+            self.lib.imd_test_plan_k4_backend.restype = C.c_int
+            self.lib.imd_test_k4_wgmma_built.argtypes = []
+            self.lib.imd_test_k4_wgmma_built.restype = C.c_int
+            self.lib.imd_test_k4_wgmma_available.argtypes = [C.c_void_p]
+            self.lib.imd_test_k4_wgmma_available.restype = C.c_int
+            self.lib.imd_test_k4_wgmma_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
+            self.lib.imd_test_k4_wgmma_counts.restype = C.c_int
+            self.lib.imd_test_k4_wgmma_dry_run.argtypes = [C.c_int64] * 8 + [C.c_int, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_int32)]
+            self.lib.imd_test_k4_wgmma_dry_run.restype = C.c_int
             self.lib.imd_test_crt_elem.argtypes = [C.c_int, C.c_int, C.c_int, C.c_int64, C.c_void_p, C.c_void_p]
             self.lib.imd_test_crt_elem.restype = C.c_int
             self.lib.imd_test_k5_launch_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
@@ -184,6 +199,18 @@ class Library:
                 raise RuntimeError("IMD_TEST_SEQ is set but the library has no test hooks (imd_test_set_seq)")
             if self.lib.imd_test_set_seq(int(env_seq)) != 0 or self.lib.imd_test_get_seq() != int(env_seq):
                 raise RuntimeError(f"IMD_TEST_SEQ={env_seq}: the library did not take that sequence set")
+        # Issue 22: IMD_TEST_K4=mma|wgmma|auto runs the whole process with the K4 backend forced (wgmma: every legal launch, the profitability
+        # floor lifted) instead of the device class's rule. On a device or build without the backend a forced wgmma is mma.sync (the plan
+        # reports it: plan_k4_backend); the override itself must read back, or the run fails.
+        env_k4 = os.environ.get("IMD_TEST_K4")
+        if env_k4 not in (None, ""):
+            if not self.has_test_hooks:
+                raise RuntimeError("IMD_TEST_K4 is set but the library has no test hooks (imd_test_set_k4_backend)")
+            want = {"auto": -1, "mma": 0, "wgmma": 1}.get(env_k4)
+            if want is None:
+                raise RuntimeError(f"IMD_TEST_K4={env_k4}: expected mma, wgmma or auto")
+            if self.lib.imd_test_set_k4_backend(want) != 0 or self.lib.imd_test_get_k4_backend() != want:
+                raise RuntimeError(f"IMD_TEST_K4={env_k4}: the library did not take that backend")
         self.shim = None
 
     def load_alloc_shim(self, path):
@@ -226,6 +253,21 @@ class Library:
     def plan_crt(self, plan):
         """The CRT variant the plan's K5 runs now, whatever decided it (0 integer, 1 limbs)."""
         return self.lib.imd_test_plan_crt(plan)
+
+    def set_k4_backend(self, backend=-1):
+        """Issue 22: the K4 backend of plans created afterwards: -1 the device class's rule, 0 mma.sync, 1 Hopper wgmma (where the device and
+        the build have it: every legal launch, the profitability floor lifted)."""
+        assert self.lib.imd_test_set_k4_backend(backend) == 0
+
+    def plan_k4_backend(self, plan):
+        """The backend the plan tries first (0 mma.sync, 1 wgmma), -1 without K4."""
+        return self.lib.imd_test_plan_k4_backend(plan)
+
+    def k4_wgmma_counts(self, reset=False):
+        """(launches the Hopper backend served, launches it declined) since the last reset."""
+        out = (C.c_int64 * 2)()
+        assert self.lib.imd_test_k4_wgmma_counts(1 if reset else 0, out) == 0
+        return out[0], out[1]
 
     def get_seq(self):
         """The forced instruction-sequence set (-1: none)."""
