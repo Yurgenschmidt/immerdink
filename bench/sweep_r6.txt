@@ -1,0 +1,12 @@
+# R6 (issue 25, docs/NOTES-25.md): klpersist (seq bit 256) on Hopper. NOT in any default list; run it explicitly on an H100 / H200 job:
+#   bench/run_sweep.sh bench/sweep_r6.txt <outdir>/r6.jsonl      (the profiling build of imd_bench: the duel sides force sets through imd_prof_set_seq)
+# A side = the sm_90 class default (seq 173 = 165 + the limb CRT); B side = its forced twin plus klpersist: seq 421 = 165 + 256 with crt=f64 (the same computation as
+# 173 + 256). Same job, interleaved (clock drift cancels). Every record carries seq_eff (A 173, B 421) and c_hash: B must equal A bit for bit.
+# Pre-registered rule (docs/NOTES-25.md "What R6 decides"): ADOPT 256 into the sm_90 row if B/A >= 1.03 whole call on >= 2 of the three lines on BOTH H100 and H200,
+# no line below 0.98, every c_hash equal; otherwise it stays off. On sm_89 / sm_120 the B side's crt=f64 puts the limb CRT on a 1/64-rate FP64 pipe and the A side is
+# the class default 1 / 0: there these lines are only a bit-identity check of B against itself, not a duel.
+# About 3 min per card.
+#   name | einsum spec | extents | methods | N list | extra imd_bench args
+d_klpersist4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=421,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_klpersist8k | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=421,crt=f64 --reps 60 --warmup 10 --max-seconds 4 --samples 8192 --phase-reps 0 --keep-samples 1
+d_klpersist4k_n8 | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 8 | --duel-a seq=default,crt=default --duel-b seq=421,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Issue 23: the KL fixed-part cuts (instruction-sequence bits 16 klwarp, 32 klload, 64 klshape) give the same bits as the baseline KL kernel.
+"""Issue 23: the KL fixed-part cuts (instruction-sequence bits 16 klwarp, 32 klload, 64 klshape; issue 25: 256 klpersist) give the same bits as the baseline KL kernel.
 
     python3 tests/test_kl_bits.py [--lib build/libimmerdink.so] [--quick]
 
@@ -12,6 +12,11 @@ must not be taken, or fall back), zero rows, Inf, NaN and subnormals. The output
 which the launch takes only for a unit-stride k read along k-bar with at most two chunks and a 16-byte aligned base). A bit that silently ran the baseline kernel
 would pass every bit-identity test; the counter is the guard. The committed hashes, the oracle suites and the sequence-set readback are the other tests of these bits
 (ctest *_klN, output_hashes_klN, seq_select).
+
+Issue 25 (docs/NOTES-25.md): bit 256 (klpersist, Kb bit 2; only with klload) is the persistent klload kernel with a cp.async prefetch of the next tile's chunk 0. Its sets
+run three times: with the launch rule (grid 2 x SMs: the small cases have fewer tiles than CTAs, so no prefetch happens) and with the grid forced to 1 and to 3 CTAs
+(imd_test_set_kl_grid), so that every case walks several tiles per CTA and every prefetch path (16-byte copies, zero rows, k tails, unaligned rows, rows of one warp or
+less) is taken; three larger cases have more tiles than 2 x SMs and prefetch under the rule itself.
 """
 import argparse
 import ctypes as C
@@ -59,8 +64,14 @@ def cases(quick):
     cs.append(("tiles64_k100", tens([30, 100], [1, 3]), tens([26, 100], [2, 3]), tens([30, 26], [1, 2]), 14, 0, "u", 3))
     # special values: a zero row, Inf, NaN, subnormals, and a row of all non-finite
     cs.append(("specials", tens([24, 4100], [1, 3]), tens([20, 4100], [2, 3]), tens([24, 20], [1, 2]), 14, 0, "pow2", 2, "specials"))
+    # issue 25: more tiles than 2 x SMs (up to 144 SMs: H200 132, RTX 4090 128), so the persistent kernel prefetches under the launch rule: one-chunk rows, two-chunk rows,
+    # and short rows (k = 70: 32 rows per tile, a ragged last tile)
+    cs.append(("many_tiles_k4096", tens([600, 4096], [1, 3]), tens([310, 4096], [2, 3]), tens([600, 310], [1, 2]), 14, 0, "u", 2))
+    cs.append(("many_tiles_k8192", tens([300, 8192], [1, 3]), tens([299, 8192], [2, 3]), tens([300, 299], [1, 2]), 8, 0, "pow2", 2))
+    cs.append(("many_tiles_k70", tens([9301, 70], [1, 3]), tens([300, 70], [2, 3]), tens([9301, 300], [1, 2]), 14, 0, "pow2", 2))
     if quick:
-        cs = [c for c in cs if c[0] in ("k4096_chunk1", "k1000_tail", "k8192_two_chunks", "odd_pitch_A", "offset_ptr_A", "transposed_B", "specials", "g4_n14")]
+        cs = [c for c in cs if c[0] in ("k4096_chunk1", "k1000_tail", "k8192_two_chunks", "odd_pitch_A", "offset_ptr_A", "transposed_B", "specials", "g4_n14",
+                                        "many_tiles_k4096")]
     return cs
 
 
@@ -133,6 +144,8 @@ def expect(case, bits, fmode, k_hat):
             e = 16 if bits & 64 else 8
             aligned = (X["off"] % 2 == 0)
             kb = (1 if bits & 16 else 0) | (2 if (bits & 32) and unit and aligned else 0)
+            if kb & 2 and bits & 256:   # issue 25: klpersist only where klload runs
+                kb |= 4
         out[(e, kb)] = out.get((e, kb), 0) + 1
     return out
 
@@ -148,7 +161,7 @@ def main():
         print("FAIL  the library has no test hooks")
         return 1
     if args.no_seq_twins:
-        ok = all(lib.lib.imd_test_set_seq(b) != 0 for b in (16, 32, 64, 113))
+        ok = all(lib.lib.imd_test_set_seq(b) != 0 for b in (16, 32, 64, 113, 288, 421))
         print("PASS  the KL bits are refused without the twins" if ok else "FAIL  a KL bit was accepted without the twins")
         return 0 if ok else 1
     bad, n = [], 0
@@ -157,25 +170,32 @@ def main():
         for case in cases(args.quick):
             fmode = case[7]
             ref = None
-            for base, kl in itertools.product(emit_sets, range(8)):
-                bits = base | (16 if kl & 1 else 0) | (32 if kl & 2 else 0) | (64 if kl & 4 else 0)
-                h, seen, k_hat = run(lib, cuda, case, bits, fmode)
-                n += 1
-                ref = ref or h
-                if h != ref:
-                    bad.append(f"{case[0]} seq {bits}: hash {h}, reference {ref} (seq {emit_sets[0]})")
-                want = expect(case, bits, fmode, k_hat)
-                if seen != want:
-                    bad.append(f"{case[0]} seq {bits}: KL launches {seen}, expected {want}")
+            for base, kl in itertools.product(emit_sets, range(16)):
+                bits = base | (16 if kl & 1 else 0) | (32 if kl & 2 else 0) | (64 if kl & 4 else 0) | (256 if kl & 8 else 0)
+                if bits & 256 and not bits & 32:
+                    continue   # klpersist needs klload (not a set)
+                for grid in ((0, 1, 3) if bits & 256 else (0,)):   # issue 25: the persistent kernel's grid (0 the rule)
+                    lib.set_kl_grid(grid)
+                    h, seen, k_hat = run(lib, cuda, case, bits, fmode)
+                    n += 1
+                    ref = ref or h
+                    tag = f"{case[0]} seq {bits}" + (f" kl_grid {grid}" if grid else "")
+                    if h != ref:
+                        bad.append(f"{tag}: hash {h}, reference {ref} (seq {emit_sets[0]})")
+                    want = expect(case, bits, fmode, k_hat)
+                    if seen != want:
+                        bad.append(f"{tag}: KL launches {seen}, expected {want}")
     finally:
         lib.set_seq(-1)
         lib.set_fused(-1)
+        lib.set_kl_grid(0)
     if bad:
         print("FAIL")
         for b in bad[:60]:
             print("  " + b)
         return 1
-    print(f"PASS  {n} runs: every combination of klwarp / klload / klshape over the emitter sets {emit_sets} is bit-identical, and each operand ran the kernel the set asks for")
+    print(f"PASS  {n} runs: every combination of klwarp / klload / klshape / klpersist (grids: rule, 1, 3) over the emitter sets {emit_sets} is bit-identical, "
+          "and each operand ran the kernel the set asks for")
     return 0
 
 

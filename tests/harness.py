@@ -174,6 +174,8 @@ class Library:
             self.lib.imd_test_k5_launch_counts.restype = C.c_int
             self.lib.imd_test_kl_launch_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
             self.lib.imd_test_kl_launch_counts.restype = C.c_int
+            self.lib.imd_test_set_kl_grid.argtypes = [C.c_int]
+            self.lib.imd_test_set_kl_grid.restype = C.c_int
             self.lib.imd_test_kl_timers.argtypes = [C.c_int, C.POINTER(C.c_uint64), C.c_int]
             self.lib.imd_test_kl_timers.restype = C.c_int
             self.lib.imd_test_k5_fin_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
@@ -309,10 +311,14 @@ class Library:
         return {(c, v): out[4 * c + v] for c in range(2) for v in range(4) if out[4 * c + v]}
 
     def kl_launch_counts(self, reset=False):
-        """Issue 23: KL kernel launches since the last reset as {(E, Kb): count}; E = 4 / 8 / 16 values per thread, Kb bit 0 klwarp, bit 1 klload."""
-        out = (C.c_int64 * 12)()
+        """Issue 23: KL kernel launches since the last reset as {(E, Kb): count}; E = 4 / 8 / 16 values per thread, Kb bit 0 klwarp, bit 1 klload, bit 2 klpersist (issue 25)."""
+        out = (C.c_int64 * 24)()
         assert self.lib.imd_test_kl_launch_counts(1 if reset else 0, out) == 0
-        return {((4, 8, 16)[e], k): out[4 * e + k] for e in range(3) for k in range(4) if out[4 * e + k]}
+        return {((4, 8, 16)[e], k): out[8 * e + k] for e in range(3) for k in range(8) if out[8 * e + k]}
+
+    def set_kl_grid(self, blocks=0):
+        """Issue 25: the klpersist KL grid of later calls (0: the rule, 2 x SMs; > 0: forced, so small cases walk several tiles per CTA)."""
+        assert self.lib.imd_test_set_kl_grid(blocks) == 0
 
     def kl_timers(self, reset=False):
         """Issue 23: the KL section timers as a list of 16 sums (None in a build without IMMERDINK_KL_TIMERS); see tools/kl_timers.py."""

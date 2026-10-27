@@ -5,7 +5,7 @@
 
 Checks, on a tiny shape (the GPU is used under the caller's GPU lock; tools/test.sh holds it):
   * the usage text names --seq and --crt;
-  * invalid values are refused before any GPU work: --seq 2, 6, 8, x and --crt foo exit non-zero;
+  * invalid values are refused before any GPU work: --seq 2, 6, 8, 256 / 257 / 272 (klpersist without klload), 512, x and --crt foo exit non-zero;
   * for every sequence set in {default, 0, 1, 7} x CRT variant {default, int, f64}: one imd record whose c_hash is the same for
     all of them (every configuration is bit-identical), whose requested values (seq_req, crt_req) are what was passed
     and whose effective values (seq, crt, phase_seq, phase_crt) are what the library ran (a forced set is read back as
@@ -62,12 +62,12 @@ def main():
     if u.returncode == 0 or "--seq" not in u.stderr or "--crt" not in u.stderr:
         bad.append("the usage text does not name --seq and --crt (or exits 0)")
 
-    for flag, val in (("--seq", "2"), ("--seq", "6"), ("--seq", "8"), ("--seq", "24"), ("--seq", "128"), ("--seq", "130"), ("--seq", "256"), ("--seq", "x"), ("--seq", "-1"), ("--crt", "foo"), ("--crt", "2"), ("--crt", "-1")):
+    for flag, val in (("--seq", "2"), ("--seq", "6"), ("--seq", "8"), ("--seq", "24"), ("--seq", "128"), ("--seq", "130"), ("--seq", "256"), ("--seq", "257"), ("--seq", "272"), ("--seq", "512"), ("--seq", "x"), ("--seq", "-1"), ("--crt", "foo"), ("--crt", "2"), ("--crt", "-1")):
         r = run(args.bench, [flag, val], os.path.join(tmp, "bad.jsonl"))
         if r.returncode == 0:
             bad.append(f"{flag} {val} was accepted")
 
-    sets = ("default", "0", "1") if args.no_seq_twins else ("default", "0", "1", "7", "17", "113", "133", "245")   # 17 = E1 + klwarp, 113 = E1 + the three KL cuts, 133 = E1 + F1 + k5fin, 245 = E1 + F1 + all KL + k5fin (issue 23)
+    sets = ("default", "0", "1") if args.no_seq_twins else ("default", "0", "1", "7", "17", "113", "133", "245", "421")   # 17 = E1 + klwarp, 113 = E1 + the three KL cuts, 133 = E1 + F1 + k5fin, 245 = E1 + F1 + all KL + k5fin (issue 23), 421 = 165 + klpersist (issue 25)
     hashes, default_set, default_crt = {}, None, None
     for crt in ("default", "int", "f64"):
         for seq in sets:

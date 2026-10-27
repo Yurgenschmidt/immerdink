@@ -65,7 +65,8 @@
 //
 //   imd_test_crt_elem(N, variant, e, count, W, out)
 //   imd_test_k5_launch_counts(reset, out)
-//   imd_test_kl_launch_counts(reset, out)   issue 23: KL kernel launches [E 4/8/16][klwarp, klload]
+//   imd_test_kl_launch_counts(reset, out)   issue 23: KL kernel launches [E 4/8/16][Kb 0..7: klwarp, klload, klpersist (issue 25)], int64[24]
+//   imd_test_set_kl_grid(blocks)            issue 25: the klpersist KL grid (0 the rule 2 x SMs, > 0 forced: small cases walk several tiles per CTA)
 //   imd_test_kl_timers(reset, out, n)       issue 23: KL section timers (IMMERDINK_KL_TIMERS builds)
 //       Issue 21 (docs/NOTES-21.md): the first runs the real CRT device functions of contract.cu
 //       (variant 0 integer running CRT, 1 binary64-limb CRT, 2..9 its compile-time mutations) on
@@ -237,10 +238,18 @@ IMD_API int imd_test_k5_launch_counts(int reset, int64_t* out) {
   return 0;
 }
 
-// Issue 23: KL kernel launches since the last reset, int64[12]: [E = 4 / 8 / 16 values per thread][Kb 0..3: bit 0 klwarp, bit 1 klload]; reset != 0 zeroes them.
+// Issue 23: KL kernel launches since the last reset, int64[24]: [E = 4 / 8 / 16 values per thread][Kb 0..7: bit 0 klwarp, bit 1 klload, bit 2 klpersist (issue 25)];
+// reset != 0 zeroes them.
 IMD_API int imd_test_kl_launch_counts(int reset, int64_t* out) {
   if (out == nullptr) return 1;
   imd::detail::test_kl_launch_counts(reset != 0, out);
+  return 0;
+}
+
+// Issue 25: the grid of the klpersist KL kernel for later calls (0: the rule, 2 x SMs; > 0: min(tiles, blocks)). Returns 1 for a negative value.
+IMD_API int imd_test_set_kl_grid(int blocks) {
+  if (blocks < 0) return 1;
+  imd::detail::kl_persist_grid_override() = blocks;
   return 0;
 }
 

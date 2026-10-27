@@ -413,9 +413,11 @@ if(Python3_FOUND)
   # R4 integration (docs/NOTES-R4-INTEGRATION.md): the duel sides' sets forced TOGETHER (E1 1, F1 4, klwarp 16, klload 32, klshape 64, k5fin 128), each with the K5 CRT of the side
   # (crt=f64; the sets without 128 also crt=int): the oracle suites e2e / eps and the 19 committed hashes, one test per (set, crt); and the in-process check of all of them
   # at once with the KL and k5fin launch counters (test_forced_sets.py).
-  foreach(seq 5 21 37 69 53 101 85 117 133 149 165 197 245)
+  # Issue 25 (docs/NOTES-25.md, R6): the klpersist sets (bit 256 on top of klload): 293 = 37 + 256 and 421 = 165 + 256 (with crt=f64: the sm_90 default 173 + klpersist).
+  foreach(seq 5 21 37 69 53 101 85 117 133 149 165 197 245 293 421)
+    math(EXPR k5fin "(${seq} >> 7) & 1")  # bit 128 (k5fin) needs crt=f64; not "seq > 127" since bit 256 exists
     foreach(crt f64 int)
-      if(crt STREQUAL "int" AND seq GREATER 127)
+      if(crt STREQUAL "int" AND k5fin)
         continue()
       endif()
       add_test(NAME r4_set_${seq}_${crt}
@@ -483,6 +485,14 @@ if(Python3_FOUND)
                      "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                      "$<TARGET_FILE:immerdink>")
     set_tests_properties(contract_initcheck_pad PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+    # Issue 25 (docs/NOTES-25.md): the klpersist KL kernel (seq bit 256, cp.async prefetch) under racecheck and synccheck (a dropped cp.async wait passes
+    # the hash tests on the RTX 4090; racecheck reports it).
+    if(IMMERDINK_SEQ_TWINS)
+      add_test(NAME kl_persist_race
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_kl_persist_race.py" --lib "$<TARGET_FILE:immerdink>"
+                       --sanitizer "${_imd_san}")
+      set_tests_properties(kl_persist_race PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+    endif()
   else()
     message(STATUS "compute-sanitizer not found: contract_initcheck_pad not registered "
                    "(set IMMERDINK_COMPUTE_SANITIZER)")

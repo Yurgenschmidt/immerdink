@@ -153,6 +153,7 @@ int64_t& k5_one_elem_per_sm();
 // A5: K5's elements per thread forced to 1, 2 or 4 (0: the launch rule), read by
 // imd_contract; changed only by the hooks imd_test_set_k5_elems / imd_prof_set_k5_elems.
 int& k5_elems_override();
+int& kl_persist_grid_override();       // issue 25: the klpersist KL grid (0 the rule 2 x SMs; > 0 forced, hooks only)
 std::atomic<int>& seq_override();      // issue 21: -1 the plan's set (host/seq_config.hpp), else a forced set of kSeq* bits for every plan (hooks only; relaxed)
 std::atomic<int>& k5_crt_override();   // issue 21: -1 follow the plan's set (kSeqLimbCrt), 0 force the integer CRT, 1 force the binary64-limb CRT (process-wide: all devices, streams and plans; a graph captures it at capture time)
 // The CRT variant K5 runs for a plan now: the limb CRT when the set the plan runs carries kSeqLimbCrt (a forced set 0..7 never does), unless the K5 hook forces one.
@@ -175,8 +176,8 @@ std::atomic<int>& pad_mutation();
 cudaError_t test_crt_elem(int N, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out);
 void test_note_k5_launch(bool limb_crt, int variant);
 void test_k5_launch_counts(bool reset, int64_t* out);
-// Issue 23 (docs/NOTES-23.md): test_note_kl_launch counts the KL kernel instances launched, test_kl_launch_counts copies them (int64[12]: [E = 4 / 8 / 16][Kb: bit 0
-// klwarp, bit 1 klload]; optionally zeroes them); test_kl_timers copies the KL section timers (IMD_KL_TIMERS builds only; slots in contract.cu KlSec) and returns the
+// Issue 23 (docs/NOTES-23.md): test_note_kl_launch counts the KL kernel instances launched, test_kl_launch_counts copies them (int64[24]: [E = 4 / 8 / 16][Kb: bit 0
+// klwarp, bit 1 klload, bit 2 klpersist (issue 25)]; optionally zeroes them); test_kl_timers copies the KL section timers (IMD_KL_TIMERS builds only; slots in contract.cu KlSec) and returns the
 // slot count, -1 in a build without the knob, -2 on a CUDA error.
 void test_note_kl_launch(int E, int kb);
 void test_kl_launch_counts(bool reset, int64_t* out);

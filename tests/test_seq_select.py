@@ -5,7 +5,8 @@
 
 Pins the per-class defaults against this GPU's compute capability (sm_89: E1 = 1; sm_90: E1 + F1 + limb CRT + klload + k5fin = 173 (R2: 13, R4); anything
 else, sm_120 included: 0), checks that a forced set (imd_test_set_seq) is what a plan reports, that -1 restores the class default, and that the
-invalid sets (the Q1 bit without the E1 bit, the KL bits 16 / 32 / 64 are valid in every combination (issue 23: all 48 sets are forced and read back), bit 128 (k5fin) without F1, bit 8 (the limb CRT is a class default only) and out of range) are rejected. The K5 CRT hook is tri-state (-1 follow
+invalid sets (the Q1 bit without the E1 bit, the KL bits 16 / 32 / 64 are valid in every combination (issue 23: all 48 sets are forced and read back), bit 128 (k5fin) without F1, bit 256 (klpersist,
+issue 25) without klload, bit 8 (the limb CRT is a class default only) and out of range) are rejected. The K5 CRT hook is tri-state (-1 follow
 the plan's set, 0 integer, 1 limbs): what the plan's K5 runs (imd_test_plan_crt) is pinned for the default, each forced value, and a forced set 0..7 (integer unless the hook forces limbs). A seq run that silently ran the default would
 pass every bit-identity test without testing anything; this and the harness's IMD_TEST_SEQ read-back are the guard.
 """
@@ -49,20 +50,21 @@ def main():
         if os.environ.get("IMD_TEST_SEQ") in (None, ""):
             if lib.plan_seq(plan) != want_default:
                 bad.append(f"default set {lib.plan_seq(plan)}, expected {want_default} on sm_{major.value}{minor.value}")
-        # every combination of the bits 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin that is a set (Q1 needs E1, 128 needs F1; bit 8 is a class
-        # default only) is forced and read back (issue 23); the KL bits and k5fin are kernel twins like Q1 / F1, so a build without the twins forces E1 and 0 only
-        mask = 1 if args.no_seq_twins else 1 | 2 | 4 | 16 | 32 | 64 | 128
-        valid_sets = [b for b in range(256) if b & ~mask == 0 and (b & 2 == 0 or b & 1) and (b & 128 == 0 or b & 4)]
+        # every combination of the bits 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klpersist that is a set (Q1 needs E1, 128 needs F1, 256 needs
+        # klload; bit 8 is a class default only) is forced and read back (issues 23, 25); the KL bits and k5fin are kernel twins like Q1 / F1, so a build without the twins
+        # forces E1 and 0 only
+        mask = 1 if args.no_seq_twins else 1 | 2 | 4 | 16 | 32 | 64 | 128 | 256
+        valid_sets = [b for b in range(512) if b & ~mask == 0 and (b & 2 == 0 or b & 1) and (b & 128 == 0 or b & 4) and (b & 256 == 0 or b & 32)]
         for bits in valid_sets:
             lib.set_seq(bits)
             if lib.plan_seq(plan) != bits or lib.get_seq() != bits:
                 bad.append(f"forced {bits}: the plan reports {lib.plan_seq(plan)}, the hook {lib.get_seq()}")
         # rejected: Q1 without E1, k5fin without F1, bit 8, the twins' bits in a build without them, out of range
-        rejected = [2, 6, 8, 9, 10, 13, 15, 18, 24, 114, 128, 129, 130, 136, 140, 144, 145, 255, 256, -2]
+        rejected = [2, 6, 8, 9, 10, 13, 15, 18, 24, 114, 128, 129, 130, 136, 140, 144, 145, 255, 256, 257, 256 | 16, 256 | 5, 256 | 133, 256 | 64 | 1, 511, 512, 512 | 33, 1024, -2]
         if args.no_seq_twins:
-            rejected += [3, 4, 5, 7, 16, 17, 32, 64, 113, 127, 132, 133, 135, 245]
+            rejected += [3, 4, 5, 7, 16, 17, 32, 64, 113, 127, 132, 133, 135, 245, 256 | 32, 421]
         else:
-            rejected += [2 | 16, 2 | 32, 2 | 64, 2 | 112, 16 | 8, 127 | 8, 128 | 2 | 4, 128 | 8 | 4]
+            rejected += [2 | 16, 2 | 32, 2 | 64, 2 | 112, 16 | 8, 127 | 8, 128 | 2 | 4, 128 | 8 | 4, 256 | 32 | 8, 256 | 32 | 2]
         lib.set_seq(1)
         for bits in rejected:
             if lib.lib.imd_test_set_seq(bits) == 0:
@@ -91,7 +93,7 @@ def main():
             lib.set_k5_crt(1)
             if lib.plan_crt(plan) != 1:
                 bad.append("crt f64 with the class default set did not run the limb CRT")
-        for bits in ((0, 1) if args.no_seq_twins else (0, 1, 5, 7, 17, 113, 133, 245)):   # forced sets without the limb-CRT bit: integer CRT unless the hook forces limbs
+        for bits in ((0, 1) if args.no_seq_twins else (0, 1, 5, 7, 17, 113, 133, 245, 421)):   # forced sets without the limb-CRT bit: integer CRT unless the hook forces limbs
             lib.set_seq(bits)
             lib.set_k5_crt(-1)
             if lib.plan_crt(plan) != 0:

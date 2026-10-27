@@ -14,6 +14,9 @@
 //   kSeqKlWarp  'klwarp'   row-wide scalar work once per row / tile instead of by every thread / warp (largest_u, tile row setup, cross-warp combines)
 //   kSeqKlLoad  'klload'   direct 16-byte global loads of unit-stride-k operands, no shared-memory gather tile (the other operands keep the gather)
 //   kSeqKlShape 'klshape'  16 values per thread (256 threads) for the rows held on chip (nc <= 2), instead of 8 (512 threads)
+// Bit 256 (issue 25, docs/NOTES-25.md; 'fix 2' of the R5 KL study), default OFF in every class row (intended for sm_90, adopted only on Hopper data):
+//   kSeqKlPersist 'klpersist'  the klload kernel as a persistent kernel (grid = 2 x SMs, tiles strided) that prefetches chunk 0 of its next tile with cp.async
+//               into a 32 KB shared buffer while it computes the current one; needs klload (it only runs where klload runs: nc <= 2, unit-stride k, aligned base)
 // The baseline sequence of each stays in the code and is the choice wherever the new one is not at least as fast:
 // kSeqClasses below is a bit set per device class, decided by the per-class SASS counts recorded in docs/NOTES-21.md and,
 // for the FP64-pipe sets, by the card's FP64 rate and by the measurements (docs/NOTES-21.md "R2 outcome and the sm_90 default").
@@ -32,7 +35,8 @@ constexpr int kSeqLimbCrt = 8;                                            // a c
 constexpr int kSeqKlWarp = 16, kSeqKlLoad = 32, kSeqKlShape = 64;         // issue 23: KL fixed-part cuts
 constexpr int kSeqKl = kSeqKlWarp | kSeqKlLoad | kSeqKlShape;
 constexpr int kSeqK5Fin = 128;                                            // issue 23: K5's instruction-count cuts (limb CRT + F1 only)
-constexpr int kSeqAll = 7 | kSeqKl;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
+constexpr int kSeqKlPersist = 256;                                        // issue 25: persistent klload KL with a cp.async prefetch of the next tile (needs klload)
+constexpr int kSeqAll = 7 | kSeqKl | kSeqKlPersist;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
 // The sets this build can run: with IMMERDINK_SEQ_TWINS=OFF (IMD_NO_SEQ_TWINS) the Q1 / F1 / KL-bit / k5fin kernel twins are not compiled and the
 // hooks refuse them.
 #ifdef IMD_NO_SEQ_TWINS
@@ -70,10 +74,12 @@ constexpr int seq_default_for(int32_t cc_major, int32_t cc_minor) {
 }
 
 // Q1 quantizes into the 64-bit X of the E1 emitter: the Q1 bit without the E1 bit is not a set (it would run the baseline
-// silently), so the hooks reject it. The same for k5fin without F1 (its kernels are F1 kernels).
+// silently), so the hooks reject it. The same for k5fin without F1 (its kernels are F1 kernels), and for klpersist without klload (it is a
+// variant of the klload kernel).
 constexpr bool seq_valid(int bits) {
   return bits >= -1 && (bits < 0 || ((bits & ~kSeqForceMask) == 0 && ((bits & kSeqQuant) == 0 || (bits & kSeqEmit) != 0) &&
-                                      ((bits & kSeqK5Fin) == 0 || (bits & kSeqFinish) != 0)));
+                                      ((bits & kSeqK5Fin) == 0 || (bits & kSeqFinish) != 0) &&
+                                      ((bits & kSeqKlPersist) == 0 || (bits & kSeqKlLoad) != 0)));
 }
 
 // A set as a launch sees it: the plan's bits (the class default, which may carry the limb-CRT bit), or the process-wide override (>= 0; any
@@ -90,13 +96,16 @@ constexpr bool seq_limb_crt(int set_bits, int crt_override) {
 constexpr int seq_pack_s(int bits, int W) {
   return (bits & kSeqEmit) ? ((bits & kSeqQuant) && W == 2 ? 3 : 1) : 0;
 }
-// The KL kernel's template value Kb (kernels' bit 0: klwarp, bit 1: klload) and whether the launch takes the 16-values-per-thread shape.
-constexpr int seq_kl_kb(int bits) { return ((bits & kSeqKlWarp) ? 1 : 0) | ((bits & kSeqKlLoad) ? 2 : 0); }
+// The KL kernel's template value Kb (kernels' bit 0: klwarp, bit 1: klload, bit 2: klpersist) and whether the launch takes the 16-values-per-thread shape.
+constexpr int seq_kl_kb(int bits) {
+  return ((bits & kSeqKlWarp) ? 1 : 0) | ((bits & kSeqKlLoad) ? 2 : 0) | ((bits & kSeqKlPersist) && (bits & kSeqKlLoad) ? 4 : 0);
+}
 constexpr bool seq_kl_shape(int bits) { return (bits & kSeqKlShape) != 0; }
 
 // The class table, checked at compile time (tests/test_seq_table.cpp checks the shipped rows, which depend on IMD_NO_SEQ_TWINS).
 static_assert(seq_default_for(8, 9) == kSeqEmit, "sm_89 default");
 static_assert(seq_default_for(12, 0) == 0 && seq_default_for(7, 5) == 0, "sm_120 and unlisted classes keep the baseline");
+static_assert((seq_default_for(9, 0) & kSeqKlPersist) == 0, "issue 25: klpersist is in no class row (the sm_90 default stays 173)");
 static_assert(seq_valid(-1) && seq_valid(0) && seq_valid(kSeqEmit) && !seq_valid(kSeqLimbCrt) && !seq_valid(kSeqLimbCrt | kSeqEmit), "the limb CRT bit is not forceable");
 
 }  // namespace imd::detail

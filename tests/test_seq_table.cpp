@@ -1,8 +1,8 @@
 // Issue 21 / R2: the per-device-class instruction-sequence defaults of src/host/seq_config.hpp, checked without CUDA (the header is CUDA-free).
 // sm_90 (H100, H200) = E1 + F1 + the binary64-limb CRT = 13 (the R2 combination rule; Q1 stays off); sm_89 (RTX 4090) = E1 = 1; sm_120 and every class
 // not listed = 0 (the limb CRT is slower on 1/64-rate FP64 cards). With IMMERDINK_SEQ_TWINS=OFF (IMD_NO_SEQ_TWINS) the F1 bit is not a supported set and a class
-// default is masked to what the build can run. Also the forcing rules: the hooks force any combination of the bits 1 2 4 16 32 64 and 128 + F1 (a forced set has no limb-CRT bit; Q1 needs E1), and the K5 hook's
-// three states (-1 follow the set, 0 integer, 1 limb) pick the CRT variant. CPU only.
+// default is masked to what the build can run. Also the forcing rules: the hooks force any combination of the bits 1 2 4 16 32 64, 128 + F1 and 256 + klload (issue 25; a forced
+// set has no limb-CRT bit; Q1 needs E1), and the K5 hook's three states (-1 follow the set, 0 integer, 1 limb) pick the CRT variant. CPU only.
 #include <cstdio>
 
 #include "seq_config.hpp"
@@ -28,15 +28,25 @@ int main() {
   CHECK(seq_default_for(9, 0) == (kSeqEmit | kSeqFinish | kSeqLimbCrt | kSeqKlLoad | kSeqK5Fin));
   CHECK((seq_default_for(9, 0) & (kSeqKlWarp | kSeqKlShape)) == 0);   // klwarp (KEEP) and klshape (slower) stay off
   CHECK((seq_default_for(9, 0) & kSeqQuant) == 0);             // Q1 is opt-in on sm_90
-  // every combination of the bits 1, 2, 4, 16, 32, 64 (issue 23: the KL cuts are independent of the emitter set) is a set unless Q1 lacks E1; with 128 (k5fin) it needs F1 too
-  for (int b = 0; b < 256; ++b) {
+  CHECK((seq_default_for(9, 0) & kSeqKlPersist) == 0);         // issue 25: klpersist is off until the Hopper duels decide
+  // every combination of the bits 1, 2, 4, 16, 32, 64 (issue 23: the KL cuts are independent of the emitter set) is a set unless Q1 lacks E1; with 128 (k5fin) it needs F1 too,
+  // with 256 (klpersist, issue 25) it needs klload; nothing at or above 512 is a set
+  for (int b = 0; b < 1024; ++b) {
     const bool bit8 = (b & kSeqLimbCrt) != 0;
-    CHECK(seq_valid(b) == (!bit8 && ((b & kSeqQuant) == 0 || (b & kSeqEmit) != 0) && ((b & kSeqK5Fin) == 0 || (b & kSeqFinish) != 0)));
+    CHECK(seq_valid(b) == (b < 512 && !bit8 && ((b & kSeqQuant) == 0 || (b & kSeqEmit) != 0) && ((b & kSeqK5Fin) == 0 || (b & kSeqFinish) != 0) &&
+                           ((b & kSeqKlPersist) == 0 || (b & kSeqKlLoad) != 0)));
   }
+  // issue 25, klpersist = 256: needs klload; the kernel's Kb bit 2 only together with klload
+  CHECK(kSeqKlPersist == 256 && (kSeqKlPersist & (kSeqKl | kSeqK5Fin | 15)) == 0 && (kSeqAll & kSeqKlPersist) != 0);
+  CHECK(!seq_valid(256) && !seq_valid(256 | 1) && !seq_valid(256 | 16) && !seq_valid(256 | 64 | 5) && seq_valid(256 | 32) && seq_valid(256 | 33) && seq_valid(256 | 37));
+  CHECK(seq_valid(165 + 256) && seq_valid(421) && seq_valid(511 - 8) && !seq_valid(511) && !seq_valid(512) && !seq_valid(512 | 33));
+  CHECK(seq_kl_kb(256 | 32) == 6 && seq_kl_kb(256 | 48) == 7 && seq_kl_kb(256) == 0 && seq_kl_kb(256 | 16) == 1 && seq_kl_kb(421) == 6);
+  CHECK(seq_effective(173, 421) == 421 && seq_effective(173 | kSeqKlPersist, -1) == (173 | kSeqKlPersist) && seq_pack_s(421, 2) == 1);
+  CHECK(!seq_limb_crt(seq_effective(173, 421), -1) && seq_limb_crt(seq_effective(173, 421), 1));   // forced 421 + crt f64 = the default 173 + klpersist
   // issue 23, k5fin = 128: a set needs F1 (its kernels are F1 kernels); no class row carries it (default OFF until a device class has measured it)
   CHECK(!seq_valid(kSeqK5Fin) && !seq_valid(kSeqK5Fin | kSeqEmit) && !seq_valid(kSeqK5Fin | kSeqQuant | kSeqEmit));
   CHECK(seq_valid(kSeqK5Fin | kSeqFinish) && seq_valid(kSeqK5Fin | kSeqFinish | kSeqEmit) && seq_valid(kSeqK5Fin | 7) && seq_valid(132) && seq_valid(133) && seq_valid(135));
-  CHECK(!seq_valid(kSeqK5Fin | kSeqLimbCrt | kSeqFinish) && !seq_valid(256) && !seq_valid(kSeqK5Fin | 2));
+  CHECK(!seq_valid(kSeqK5Fin | kSeqLimbCrt | kSeqFinish) && !seq_valid(kSeqK5Fin | 2));
   CHECK(seq_effective(13, 133) == 133 && seq_effective(13, 132) == 132 && seq_effective(13 | kSeqK5Fin, -1) == (13 | kSeqK5Fin));
   CHECK(!seq_limb_crt(seq_effective(13, 133), -1) && seq_limb_crt(seq_effective(13, 133), 1));   // a forced 133 runs the integer CRT unless the K5 hook forces limbs
 #endif
@@ -49,6 +59,7 @@ int main() {
     CHECK(((c.bits & kSeqLimbCrt) != 0) == (c.cc_major == 9 && c.cc_minor == 0));
     CHECK(((c.bits & (kSeqKl | kSeqK5Fin)) != 0) == (c.cc_major == 9 && c.cc_minor == 0));   // klload + k5fin only on sm_90 (R4); klwarp / klshape in no row
     CHECK((c.bits & (kSeqKlWarp | kSeqKlShape)) == 0);
+    CHECK((c.bits & kSeqKlPersist) == 0);                     // issue 25: in no row
     CHECK(c.cc_major == 9 || c.bits < 16);
   }
   // the KL bits (issue 23): values, independence from the other bits, the kernel's template value and the launch shape
@@ -72,7 +83,7 @@ int main() {
 #ifndef IMD_NO_SEQ_TWINS
   CHECK(seq_valid(16) && seq_valid(32) && seq_valid(64) && seq_valid(113) && seq_valid(119) && !seq_valid(2 | 16) && !seq_valid(2 | 112) && !seq_valid(127 + 1));
 #else
-  CHECK(!seq_valid(16) && !seq_valid(32) && !seq_valid(64) && !seq_valid(113));   // the KL-bit kernels are twins too
+  CHECK(!seq_valid(16) && !seq_valid(32) && !seq_valid(64) && !seq_valid(113) && !seq_valid(256 | 32) && !seq_valid(421));   // the KL-bit kernels are twins too
 #endif
   // what a plan runs: the class set unless forced, a forced set is masked to 0..7
   CHECK(seq_effective(seq_default_for(9, 0), -1) == seq_default_for(9, 0));

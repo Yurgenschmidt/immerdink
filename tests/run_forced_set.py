@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""R4 integration: run the oracle suites (e2e, eps) and the committed hashes (small, mid, large: 19 cases) with ONE forced instruction-sequence set and K5 CRT.
+"""R4 integration: run the oracle suites (e2e, eps) and the committed hashes (small, mid, large: 19 cases) with ONE forced instruction-sequence set and K5 CRT
+(issue 25: the R6 sets with bit 256, klpersist, too; e.g. --seq 421 --crt f64 = the sm_90 default 173 + klpersist).
 
     python3 tests/run_forced_set.py --lib build/libimmerdink.so --shim build/tests/libimd_shim.so --seq 245 --crt f64
 
