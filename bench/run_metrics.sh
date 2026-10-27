@@ -34,6 +34,9 @@
 # Environment: what bench/build.sh, bench/run_sweep.sh and tools/run_bench.sh read (IMMERDINK_ENV,
 # IMMERDINK_BENCH_BUILD, CMAKE_CUDA_ARCHITECTURES, IMMERDINK_GPU_LOCK, QUIET_*), plus
 #   SWEEPS="imd baseline cutws compare compare_energy energy profile"   which sweeps to run (the default, in this
+#                         order; two more tokens exist that are NOT in the default: xduel (sweep_xduel.txt -> xduel.jsonl) and
+#                         extra (sweep_r5.txt -> r5.jsonl: same-job new-vs-old and wgmma-vs-mma duels, sustained large squares, 16384);
+#                         the rest of this description is the default list
 #                         order; compare / compare_energy are the baselines of docs/BENCHMARKING.md Test 4;
 #                         profile = the nsys pass, always last: it needs nsys, and skips itself with a
 #                         note when there is none)
@@ -187,13 +190,24 @@ for sw in ${SWEEPS:-imd baseline cutws compare compare_energy energy profile}; d
       BENCH_RETRIES=1 "$here/run_sweep.sh" "$here/sweep_compare_energy.txt" "$outdir/compare_energy.jsonl" 2>&1 | tee "$outdir/compare_energy.out"
       st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
       ;;
+    xduel)
+      # interleaved immerdink vs GEMMul8 fast (N=14 and 15) per case (bench/sweep_xduel.txt) -> xduel.jsonl; not in the default list
+      "$here/run_sweep.sh" "$here/sweep_xduel.txt" "$outdir/xduel.jsonl" 2>&1 | tee "$outdir/xduel.out"
+      st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
+      ;;
+    extra)
+      # R5 additions (bench/sweep_r5.txt): same-job new-vs-old default and wgmma-vs-mma.sync duels, N=8 against GEMMul8, sustained
+      # large squares, the 16384 square -> r5.jsonl; not in the default list
+      "$here/run_sweep.sh" "$here/sweep_r5.txt" "$outdir/r5.jsonl" 2>&1 | tee "$outdir/r5.out"
+      st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
+      ;;
     profile)
       # short runs under nsys, summarized per kernel category (profile/index.json); a missing nsys is a note, not a failure.
       # It runs last in the default list (a profile changes nothing in the other results, but it is the longest to set up)
       "$here/profile_nsys.sh" "$outdir" 2>&1 | tee "$outdir/profile.out"
       st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
       ;;
-    *) echo "unknown sweep '$sw' in SWEEPS (imd, baseline, cutws, compare, compare_energy, energy, profile)" >&2; exit 2 ;;
+    *) echo "unknown sweep '$sw' in SWEEPS (imd, baseline, cutws, compare, compare_energy, energy, xduel, extra, profile)" >&2; exit 2 ;;
   esac
 done
 if command -v python3 >/dev/null; then
