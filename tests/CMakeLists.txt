@@ -410,6 +410,23 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
                    --lib "$<TARGET_FILE:immerdink>" --tags large)
   set_tests_properties(output_hashes_large_k5fin PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800 ENVIRONMENT "IMD_TEST_SEQ=133;IMD_TEST_K5_CRT=1")
+  # R4 integration (docs/NOTES-R4-INTEGRATION.md): the duel sides' sets forced TOGETHER (E1 1, F1 4, klwarp 16, klload 32, klshape 64, k5fin 128), each with the K5 CRT of the side
+  # (crt=f64; the sets without 128 also crt=int): the oracle suites e2e / eps and the 19 committed hashes, one test per (set, crt); and the in-process check of all of them
+  # at once with the KL and k5fin launch counters (test_forced_sets.py).
+  foreach(seq 5 21 37 69 53 101 85 117 133 149 165 197 245)
+    foreach(crt f64 int)
+      if(crt STREQUAL "int" AND seq GREATER 127)
+        continue()
+      endif()
+      add_test(NAME r4_set_${seq}_${crt}
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/run_forced_set.py"
+                       --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --seq ${seq} --crt ${crt})
+      set_tests_properties(r4_set_${seq}_${crt} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 3600)
+    endforeach()
+  endforeach()
+  add_test(NAME forced_sets
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_forced_sets.py" --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(forced_sets PROPERTIES RESOURCE_LOCK gpu TIMEOUT 3600)
   add_test(NAME output_hashes_large_seq7
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
                    --lib "$<TARGET_FILE:immerdink>" --tags large)

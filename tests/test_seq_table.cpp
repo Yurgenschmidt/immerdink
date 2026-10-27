@@ -57,7 +57,9 @@ int main() {
   CHECK(seq_kl_kb(kSeqKlShape) == 0 && seq_kl_kb(7) == 0 && seq_kl_kb(13) == 0);
   CHECK(seq_kl_shape(kSeqKlShape) && !seq_kl_shape(kSeqKlWarp | kSeqKlLoad | 7) && !seq_kl_shape(13));
   CHECK(seq_pack_s(kSeqKlWarp | kSeqKlLoad | kSeqKlShape, 2) == 0 && seq_pack_s(kSeqEmit | kSeqKl, 2) == 1 && seq_pack_s(kSeqEmit | kSeqQuant | kSeqKl, 2) == 3);
+#ifndef IMD_NO_SEQ_TWINS   // (seq_effective masks a forced set to the supported bits: with the twins off only E1 is left)
   CHECK(seq_effective(13, 17) == 17 && seq_effective(13, 113) == 113 && seq_effective(13, -1) == 13 && (seq_effective(13, 125) & kSeqLimbCrt) == 0);
+#endif
 #ifndef IMD_NO_SEQ_TWINS
   // a class row MAY carry a KL bit later (per device class, with that class's own data): the default mask keeps it and the plan's set runs it
   CHECK(((kSeqEmit | kSeqFinish | kSeqLimbCrt | kSeqKlWarp) & kSeqDefaultMask) == (kSeqEmit | kSeqFinish | kSeqLimbCrt | kSeqKlWarp));
@@ -74,8 +76,11 @@ int main() {
   // what a plan runs: the class set unless forced, a forced set is masked to 0..7
   CHECK(seq_effective(seq_default_for(9, 0), -1) == seq_default_for(9, 0));
   CHECK(seq_effective(seq_default_for(9, 0), -1) & kSeqLimbCrt);
-  CHECK(seq_effective(13, 0) == 0 && seq_effective(13, 1) == 1 && seq_effective(13, 7) == 7);
+  CHECK(seq_effective(13, 0) == 0 && seq_effective(13, 1) == 1);
+#ifndef IMD_NO_SEQ_TWINS
+  CHECK(seq_effective(13, 7) == 7);
   CHECK((seq_effective(13, 5) & kSeqLimbCrt) == 0);
+#endif
   // the CRT variant: follow / force integer / force limb
   CHECK(seq_limb_crt(13, -1) && seq_limb_crt(9, -1) && !seq_limb_crt(5, -1) && !seq_limb_crt(0, -1));
   CHECK(!seq_limb_crt(13, 0) && !seq_limb_crt(9, 0));         // "seq=default crt=int" on sm_90: the integer CRT

@@ -196,7 +196,7 @@ class Library:
             self.lib.imd_test_kernel_occupancy_w.argtypes = [C.c_int32, C.c_int32,
                                                              C.POINTER(C.c_int32)]
             self.lib.imd_test_kernel_occupancy_w.restype = C.c_int
-        # Issue 21: IMD_TEST_SEQ=<bits> runs the whole process with that instruction-sequence set (1 E1, 2 Q1, 4 F1, 16/32/64 the KL cuts of issue 23)
+        # Issue 21: IMD_TEST_SEQ=<bits> runs the whole process with that instruction-sequence set (1 E1, 2 Q1, 4 F1, 16/32/64 the KL cuts of issue 23, 128 k5fin with F1)
         # instead of the device class's: the same tests, the same oracle, the other sequences. It fails loudly if it cannot
         # take effect (no test hooks) or did not (the set read back differs): a seq run must never silently run the default.
         env_seq = os.environ.get("IMD_TEST_SEQ")
