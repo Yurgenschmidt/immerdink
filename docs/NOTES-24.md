@@ -1,5 +1,7 @@
 # Issue 24 (R4 outcome): the sm_90 default set becomes E1 + F1 + limb CRT + klload + k5fin
 
+> Superseded by docs/NOTES-26.md (R5): the sm_90 class default is now 189 = 173 + klwarp (16). The text below describes the R4 state (173).
+
 R4 (2026-10-26, commit a430a5e; jobs 14468448 H100, 14468449 H200, 14468450 RTX PRO 6000 Blackwell; run folder
 `generalWork/immerdink/scratch/runs/20261026-225145`; narrative in `immerdink-eval/findings/r4-20261026.md`).
 
