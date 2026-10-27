@@ -1,18 +1,20 @@
 # R6 (issue 25, docs/NOTES-25.md): klpersist (seq bit 256) on Hopper. NOT in any default list; run it explicitly on an H100 / H200 job:
 #   bench/run_sweep.sh bench/sweep_r6.txt <outdir>/r6.jsonl      (the profiling build of imd_bench: the duel sides force sets through imd_prof_set_seq)
-# A side = the sm_90 class default (seq 173 = 165 + the limb CRT); B side = its forced twin plus klpersist: seq 421 = 165 + 256 with crt=f64 (the same computation as
-# 173 + 256). Same job, interleaved (clock drift cancels). Every record carries seq_eff (A 173, B 421) and c_hash: B must equal A bit for bit.
+# A side = the sm_90 class default (seq 189 = 181 + the limb CRT; klwarp joined it in R5, docs/NOTES-26.md); B side = its forced twin plus klpersist:
+# seq 437 = 181 + 256 = 1 + 4 + 16 + 32 + 128 + 256 with crt=f64 (the same computation as 189 + 256). Same job, interleaved (clock drift cancels).
+# Every record carries seq_eff (A 189, B 437) and c_hash: B must equal A bit for bit.
 # Pre-registered rule (docs/NOTES-25.md "What R6 decides"): ADOPT 256 into the sm_90 row if B/A >= 1.03 whole call on >= 2 of the three lines on BOTH H100 and H200,
 # no line below 0.98, every c_hash equal; otherwise it stays off. On sm_89 / sm_120 the B side's crt=f64 puts the limb CRT on a 1/64-rate FP64 pipe and the A side is
 # the class default 1 / 0: there these lines are only a bit-identity check of B against itself, not a duel.
 # About 3 min per card.
 #   name | einsum spec | extents | methods | N list | extra imd_bench args
-d_klpersist4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=421,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
-d_klpersist8k | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=421,crt=f64 --reps 60 --warmup 10 --max-seconds 4 --samples 8192 --phase-reps 0 --keep-samples 1
-d_klpersist4k_n8 | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 8 | --duel-a seq=default,crt=default --duel-b seq=421,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_klpersist4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=437,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_klpersist8k | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=437,crt=f64 --reps 60 --warmup 10 --max-seconds 4 --samples 8192 --phase-reps 0 --keep-samples 1
+d_klpersist4k_n8 | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 8 | --duel-a seq=default,crt=default --duel-b seq=437,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
 # Extra lines (NOT part of the pre-registered adoption rule above; informational, from the R5 shape analysis): the Hopper shortfall on skinny / long-row shapes is the KL pack.
-#   d_klpersist_skinny   klpersist on r_skinny (nc=1 rows, twice the tiles of sq8192): the case persistent KL targets
-#   d_klwarp_bigk/_mm    klwarp (seq 181 + crt f64) on the long-row shapes (nc=8 / 13, E=4): the R5 klwarp duels only covered nc <= 2 squares
-d_klpersist_skinny | ik,jk->ij | i=16384,j=512,k=4096 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=421,crt=f64 --reps 60 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
-d_klwarp_bigk | ik,jk->ij | i=2048,j=2048,k=32768 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 40 --warmup 5 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
-d_klwarp_mm | ik,jk->ij | i=1000,j=64,k=50000 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 60 --warmup 5 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+#   d_klpersist_skinny    klpersist (B = 437) on r_skinny (nc=1 rows, twice the tiles of sq8192): the case persistent KL targets
+#   d_noklwarp_bigk/_mm   klwarp OFF (B = seq 165 + crt f64 = 189 without klwarp) against the default 189 on the long-row shapes (nc=8 / 13, E=4): does klwarp help
+#                         long rows? (the R5 klwarp duels only covered nc <= 2 squares). Here B / A > 1 means klwarp HURTS that shape. c_hash must still be equal.
+d_klpersist_skinny | ik,jk->ij | i=16384,j=512,k=4096 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=437,crt=f64 --reps 60 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_noklwarp_bigk | ik,jk->ij | i=2048,j=2048,k=32768 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=165,crt=f64 --reps 40 --warmup 5 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_noklwarp_mm | ik,jk->ij | i=1000,j=64,k=50000 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=165,crt=f64 --reps 60 --warmup 5 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1

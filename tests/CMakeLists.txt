@@ -413,8 +413,9 @@ if(Python3_FOUND)
   # R4 integration (docs/NOTES-R4-INTEGRATION.md): the duel sides' sets forced TOGETHER (E1 1, F1 4, klwarp 16, klload 32, klshape 64, k5fin 128), each with the K5 CRT of the side
   # (crt=f64; the sets without 128 also crt=int): the oracle suites e2e / eps and the 19 committed hashes, one test per (set, crt); and the in-process check of all of them
   # at once with the KL and k5fin launch counters (test_forced_sets.py).
-  # Issue 25 (docs/NOTES-25.md, R6): the klpersist sets (bit 256 on top of klload): 293 = 37 + 256 and 421 = 165 + 256 (with crt=f64: the sm_90 default 173 + klpersist).
-  foreach(seq 5 21 37 69 53 101 85 117 133 149 165 197 245 293 421)
+  # Issue 25 (docs/NOTES-25.md, R6): the klpersist sets (bit 256 on top of klload): 293 = 37 + 256, 421 = 165 + 256 (with crt=f64: the R4 sm_90 default 173 + klpersist)
+  # and 437 = 181 + 256 (with crt=f64: the R5 sm_90 default 189 + klpersist = the R6 duel B side; also 181 = the forced twin of 189).
+  foreach(seq 5 21 37 69 53 101 85 117 133 149 165 181 197 245 293 421 437)
     math(EXPR k5fin "(${seq} >> 7) & 1")  # bit 128 (k5fin) needs crt=f64; not "seq > 127" since bit 256 exists
     foreach(crt f64 int)
       if(crt STREQUAL "int" AND k5fin)

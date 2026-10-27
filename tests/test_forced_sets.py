@@ -5,8 +5,8 @@ bits of the baseline.
     python3 tests/test_forced_sets.py [--lib build/libimmerdink.so] [--quick]
 
 The R4 duel sides (docs/NOTES-R4-INTEGRATION.md): 5 (the sm_90 pack set without the limb-CRT bit), 21 / 37 / 69 (+ klwarp / klload / klshape), 53 / 101 / 85 / 117 (KL
-pairs and triple), 133 (+ k5fin), and 149 / 165 / 197 / 245 (k5fin with the KL bits); issue 25 (R6, docs/NOTES-25.md): 293 / 421 (37 / 165 + klpersist: 421 with crt=f64 is the sm_90
-default 173 + klpersist), 309 / 437 (+ klwarp) and 357 / 501 (+ klshape). The klpersist sets also run with the persistent grid forced to 3 CTAs (imd_test_set_kl_grid), so the
+pairs and triple), 133 (+ k5fin), and 149 / 165 / 181 / 197 / 245 (k5fin with the KL bits; 181 with crt=f64 is the R5 sm_90 default 189); issue 25 (R6, docs/NOTES-25.md): 293 / 421 (37 / 165 + klpersist: 421 with crt=f64 is the R4 sm_90
+default 173 + klpersist), 309 / 437 (+ klwarp; 437 with crt=f64 is the R5 sm_90 default 189 + klpersist, the R6 duel B side) and 357 / 501 (+ klshape). The klpersist sets also run with the persistent grid forced to 3 CTAs (imd_test_set_kl_grid), so the
 small cases walk several tiles per CTA and take the prefetch. Every set runs with the K5 CRT forced to the limbs (imd_test_set_k5_crt(1), the duel
 side's `crt=f64`); the sets without bit 128 also run with the integer CRT (crt=int). Each contraction of the KL list (tests/test_kl_bits.py) must give ONE hash over all
 configurations and equal to the baseline (set 0, integer CRT); the KL launch counter must show the kernel each operand's bits ask for, and the k5fin launch counter must be
@@ -22,7 +22,7 @@ sys.path.insert(0, HERE)
 import harness as hz  # noqa: E402
 import test_kl_bits as K  # noqa: E402
 
-SETS = (5, 21, 37, 69, 53, 101, 85, 117, 133, 149, 165, 197, 245, 293, 421, 309, 437, 357, 501)
+SETS = (5, 21, 37, 69, 53, 101, 85, 117, 133, 149, 165, 181, 197, 245, 293, 421, 309, 437, 357, 501)
 
 
 def main():

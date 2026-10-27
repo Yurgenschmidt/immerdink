@@ -3,7 +3,7 @@
 
     python3 tests/test_seq_select.py [--lib build/libimmerdink.so]
 
-Pins the per-class defaults against this GPU's compute capability (sm_89: E1 = 1; sm_90: E1 + F1 + limb CRT + klload + k5fin = 173 (R2: 13, R4); anything
+Pins the per-class defaults against this GPU's compute capability (sm_89: E1 = 1; sm_90: E1 + F1 + limb CRT + klwarp + klload + k5fin = 189 (R2: 13, R4: 173, R5: 189); anything
 else, sm_120 included: 0), checks that a forced set (imd_test_set_seq) is what a plan reports, that -1 restores the class default, and that the
 invalid sets (the Q1 bit without the E1 bit, the KL bits 16 / 32 / 64 are valid in every combination (issue 23: all 48 sets are forced and read back), bit 128 (k5fin) without F1, bit 256 (klpersist,
 issue 25) without klload, bit 8 (the limb CRT is a class default only) and out of range) are rejected. The K5 CRT hook is tri-state (-1 follow
@@ -20,7 +20,7 @@ sys.path.insert(0, HERE)
 import harness as hz  # noqa: E402
 
 LIMB_CRT = 8
-DEFAULTS = {(8, 9): 1, (9, 0): 1 | 4 | LIMB_CRT | 32 | 128}   # keep equal to kSeqClasses in src/host/seq_config.hpp (tests/test_seq_table.cpp checks the same rows without a GPU)
+DEFAULTS = {(8, 9): 1, (9, 0): 1 | 4 | LIMB_CRT | 16 | 32 | 128}   # keep equal to kSeqClasses in src/host/seq_config.hpp (tests/test_seq_table.cpp checks the same rows without a GPU)
 
 
 def main():
@@ -39,7 +39,7 @@ def main():
     cuda.check(cuda.rt.cudaDeviceGetAttribute(C.byref(minor), 76, dev), "cc minor")
     want_default = DEFAULTS.get((major.value, minor.value), 0)
     if args.no_seq_twins:
-        want_default &= ~(2 | 4 | 32 | 128)   # the F1 / Q1 / k5fin kernels are not compiled: the class default is masked
+        want_default &= ~(2 | 4 | 16 | 32 | 128)   # the F1 / Q1 / k5fin kernels are not compiled: the class default is masked
     T = {X: hz.make_tensor(e, hz.dense(e), l) for X, e, l in
          (("A", [16, 32], [1, 3]), ("B", [24, 32], [2, 3]), ("C", [16, 24], [1, 2]))}
     st, plan = lib.plan_create(T["A"], T["B"], T["C"], 8)
@@ -60,9 +60,9 @@ def main():
             if lib.plan_seq(plan) != bits or lib.get_seq() != bits:
                 bad.append(f"forced {bits}: the plan reports {lib.plan_seq(plan)}, the hook {lib.get_seq()}")
         # rejected: Q1 without E1, k5fin without F1, bit 8, the twins' bits in a build without them, out of range
-        rejected = [2, 6, 8, 9, 10, 13, 15, 18, 24, 114, 128, 129, 130, 136, 140, 144, 145, 255, 256, 257, 256 | 16, 256 | 5, 256 | 133, 256 | 64 | 1, 511, 512, 512 | 33, 1024, -2]
+        rejected = [2, 6, 8, 9, 10, 13, 15, 18, 24, 114, 128, 129, 130, 136, 140, 144, 145, 255, 256, 257, 256 | 16, 256 | 5, 256 | 133, 256 | 64 | 1, 189, 445, 511, 512, 512 | 33, 1024, -2]
         if args.no_seq_twins:
-            rejected += [3, 4, 5, 7, 16, 17, 32, 64, 113, 127, 132, 133, 135, 245, 256 | 32, 421]
+            rejected += [3, 4, 5, 7, 16, 17, 32, 64, 113, 127, 132, 133, 135, 245, 256 | 32, 421, 437]
         else:
             rejected += [2 | 16, 2 | 32, 2 | 64, 2 | 112, 16 | 8, 127 | 8, 128 | 2 | 4, 128 | 8 | 4, 256 | 32 | 8, 256 | 32 | 2]
         lib.set_seq(1)
@@ -93,7 +93,7 @@ def main():
             lib.set_k5_crt(1)
             if lib.plan_crt(plan) != 1:
                 bad.append("crt f64 with the class default set did not run the limb CRT")
-        for bits in ((0, 1) if args.no_seq_twins else (0, 1, 5, 7, 17, 113, 133, 245, 421)):   # forced sets without the limb-CRT bit: integer CRT unless the hook forces limbs
+        for bits in ((0, 1) if args.no_seq_twins else (0, 1, 5, 7, 17, 113, 133, 181, 245, 421, 437)):   # forced sets without the limb-CRT bit: integer CRT unless the hook forces limbs
             lib.set_seq(bits)
             lib.set_k5_crt(-1)
             if lib.plan_crt(plan) != 0:

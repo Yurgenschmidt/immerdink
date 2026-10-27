@@ -1,7 +1,7 @@
 # Issue 25 ("fix 2"): klpersist, a persistent klload KL with a cp.async prefetch of the next tile (seq bit 256, default OFF)
 
 Status: implemented on branch `port/25-kl-persist` (from `port/r5-integration` 2410c74), bit-identical on the RTX 4090, **default OFF in every class row**
-(sm_89 = 1, sm_120 = 0, sm_90 = 173 unchanged). Intended for sm_90 (H100 / H200), where KL is latency bound; it is adopted there only if the R6 duels say so
+(sm_89 = 1, sm_120 = 0, sm_90 unchanged: 173 on this branch, 189 after the merge of issue 26 / PR #53 on `port/r6-integration`, see "R6 integration" below). Intended for sm_90 (H100 / H200), where KL is latency bound; it is adopted there only if the R6 duels say so
 (rule below). Nothing in this note is a time: there was no timing run, the 4090's KL is DRAM-bound and is not the target. Written for a reader new to the project.
 
 ## The idea
@@ -43,7 +43,7 @@ set's own Kb) it is 8 bytes of stack and 4 bytes of spill, the same as the exist
 | `src/contract.cu` | `kKlPersist = 4` (Kb bit 2), `KlCpAsync` (cp.async.cg 16 / commit / wait_group 0; static members so a no-twins build has no unused-function warning), the kernel changes above under `if constexpr (kPersist)`, instances `Kb = 6, 7` (E = 8, 16; E = 4 clears the bit: its rows have > 2 chunks), launch: bit cleared where klload is cleared or `p.sms <= 0`, grid as above; the KL launch counter is `[3][8]` |
 | hooks | `imd_test_set_seq` / `imd_prof_set_seq` accept the new sets through `seq_valid`; `imd_test_kl_launch_counts` returns **int64[24]** (`[E 4/8/16][Kb 0..7]`, was 12); new test hook `imd_test_set_kl_grid(blocks)` (0 = the rule, > 0 forces min(tiles, blocks): small cases walk several tiles per CTA) |
 | bench | `imd_bench` `seq_bits_ok` accepts bit 256 with 32 (values up to 503; `--seq 256 / 257 / 272 / 512` refused before any GPU work); messages name all bits. `bench/test_seq_crt.py` adds set 421 and the refusals |
-| `bench/sweep_r6.txt` (new) | three pre-registered duel lines plus three informational ones (r_skinny klpersist, r_bigk / r_mm klwarp), A = class default (173), B = `seq=421,crt=f64` (= 173 + 256): 4096^3 N = 14, 8192^3 N = 14, 4096^3 N = 8. Wired into `run_metrics.sh` as the sweep token `r6` (not in the default list), or run with `bench/run_sweep.sh bench/sweep_r6.txt <out>.jsonl` |
+| `bench/sweep_r6.txt` (new) | three pre-registered duel lines plus three informational ones (r_skinny klpersist; r_bigk / r_mm klwarp off), A = class default (189 after the R6 integration merge), B = `seq=437,crt=f64` (= 189 + 256); the informational klwarp lines B = `seq=165,crt=f64` (189 without klwarp): 4096^3 N = 14, 8192^3 N = 14, 4096^3 N = 8. Wired into `run_metrics.sh` as the sweep token `r6` (not in the default list), or run with `bench/run_sweep.sh bench/sweep_r6.txt <out>.jsonl` |
 | `tools/kl_timers.py` | unchanged (takes any integer set: `--seq 421` works; the timers build compiles with the new kernel at level 1 and 2) |
 
 ## SASS identity (owner's requirement: the shipped kernels do not change)
@@ -115,9 +115,10 @@ not registered. It now tests bit 128; `r4_set_293_int` was then run on its own: 
 
 ## What R6 decides (pre-registered; written before any Hopper number)
 
-`bench/sweep_r6.txt` on H100 and H200 (same job, interleaved duel): A = default (173), B = 421 + crt=f64.
-**ADOPT** bit 256 into the `{9, 0, ...}` row (sm_90 becomes 429) if B / A >= 1.03 whole call on at least 2 of the 3 lines on **both** cards, no line below 0.98,
-and every c_hash equal (`seq_eff` 173 / 421 in the records). Otherwise it stays off (KEEP). sm_89 / sm_120 stay as they are until their own data says otherwise.
+`bench/sweep_r6.txt` on H100 and H200 (same job, interleaved duel): A = default (189 since the issue 26 merge; it was 173 when this was first written),
+B = 437 + crt=f64 (437 = 1 + 4 + 16 + 32 + 128 + 256 = 181 + 256, the same computation as 189 + 256; first written as 421 = 165 + 256 against 173).
+**ADOPT** bit 256 into the `{9, 0, ...}` row (sm_90 becomes 445) if B / A >= 1.03 whole call on at least 2 of the 3 lines on **both** cards, no line below 0.98,
+and every c_hash equal: B must equal A bit for bit (`seq_eff` 189 / 437 in the records). Otherwise it stays off (KEEP). sm_89 / sm_120 stay as they are until their own data says otherwise.
 Expectation (hypothesis, not measured): the gain, if any, is at 4096 and N = 8 where KL is a larger share and the per-tile load latency is exposed; at 8192 the
 chunk-1 loads are not prefetched and the larger shared allocation costs L1.
 
@@ -134,3 +135,12 @@ one `kSeqClasses` row, as for every other bit.
   one-line mask.
 * Chunk 1 of two-chunk rows is not prefetched (the buffer would be 64 KB per CTA); only chunk 0 is.
 * The performance model (`kl_launch`, occupancy) does not describe the persistent grid.
+
+## R6 integration (`port/r6-integration`: this branch merged with issue 26, sm_90 default 173 -> 189)
+
+The R6 run is made from one branch carrying both: the sm_90 default 189 (= 173 + klwarp, docs/NOTES-26.md, PR #53) and bit 256 still in no class row.
+`seq_valid` accepts klwarp + klload + klpersist together (437 = 181 + 256; Kb 7, `kl_scale_pack<E, W, S, 7>` (E = 8; E = 16 with klshape): the persist kernel's row-info
+parts came from klwarp's), and a class row carrying 189 + 256 = 445 would launch the same Kb 7 instance. The duel B side moves from 421 to 437 so it stays
+"A + 256"; the two informational klwarp lines become "default (189) against 165 + crt f64" (klwarp OFF) on r_bigk and r_mm, since klwarp is now in A.
+Tests added for it: `r4_set_181_{f64,int}` and `r4_set_437_f64` (ctest), 181 in `test_forced_sets.py` (437 was there), 181 / 437 / 445 in `test_seq_select.py`, and the CPU
+checks of 437 / 445 / 165 in `test_seq_table.cpp`. `test_kl_bits.py` and `test_kl_persist_race.py` already cover the Kb 7 kernel (sets 305 / 369 and every KL combination).

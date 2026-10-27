@@ -161,7 +161,7 @@ def main():
         print("FAIL  the library has no test hooks")
         return 1
     if args.no_seq_twins:
-        ok = all(lib.lib.imd_test_set_seq(b) != 0 for b in (16, 32, 64, 113, 288, 421))
+        ok = all(lib.lib.imd_test_set_seq(b) != 0 for b in (16, 32, 64, 113, 288, 421, 437))
         print("PASS  the KL bits are refused without the twins" if ok else "FAIL  a KL bit was accepted without the twins")
         return 0 if ok else 1
     bad, n = [], 0

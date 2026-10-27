@@ -67,7 +67,7 @@ def main():
         if r.returncode == 0:
             bad.append(f"{flag} {val} was accepted")
 
-    sets = ("default", "0", "1") if args.no_seq_twins else ("default", "0", "1", "7", "17", "113", "133", "245", "421")   # 17 = E1 + klwarp, 113 = E1 + the three KL cuts, 133 = E1 + F1 + k5fin, 245 = E1 + F1 + all KL + k5fin (issue 23), 421 = 165 + klpersist (issue 25)
+    sets = ("default", "0", "1") if args.no_seq_twins else ("default", "0", "1", "7", "17", "113", "133", "245", "421", "437")   # 17 = E1 + klwarp, 113 = E1 + the three KL cuts, 133 = E1 + F1 + k5fin, 245 = E1 + F1 + all KL + k5fin (issue 23), 421 = 165 + klpersist (issue 25), 437 = 181 + klpersist (= the sm_90 default 189 + klpersist with crt=f64, the R6 duel B side)
     hashes, default_set, default_crt = {}, None, None
     for crt in ("default", "int", "f64"):
         for seq in sets:
