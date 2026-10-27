@@ -1,6 +1,6 @@
 // Issue 22: the Hopper K4 backend's host-side rules (src/host/k4_wgmma.hpp), CUDA-free: the device-class table, the backend resolution,
 // the legality of a launch (TMA / epilogue / CUTLASS requirements), the profitability rule (docs/NOTES-22.md "Profitability rule": the R3
-// floor sweep of 19 shapes on H100 and H200 as expectations, margins and mutants of the constants) and the tile / scheduler choice with the
+// floor sweep of 19 shapes and the R4 floor refit's 16 further shapes on H100 and H200 as expectations, margins and mutants of the constants) and the tile / scheduler choice with the
 // R2 table (docs/NOTES-22.md "Library integration (design)") including edge shapes. Runs everywhere (no GPU, no CUTLASS).
 #include <cstdint>
 #include <cmath>
@@ -91,9 +91,15 @@ int main() {
   CHECK(k4_wgmma_pick(lib_launch(8192, 8192, 8192, 1), false).variant == 0);
   CHECK(k4_wgmma_pick(lib_launch(16, 16, 16, 1), false).variant < 0);           // tiny: never by default
   CHECK(k4_wgmma_pick(lib_launch(1, 16, 16, 1), false).variant < 0);
-  CHECK(k4_wgmma_pick(lib_launch(4096, 4096, 16, 14), false).variant < 0);      // one k step: outside the measured envelope (R3 smallest K chunk 256)
-  CHECK(k4_wgmma_pick(lib_launch(4096, 4096, 128, 14), false).variant < 0 && k4_wgmma_pick(lib_launch(4096, 4096, 256, 14), false).variant == 0);
-  CHECK(k4_wgmma_pick(lib_launch(256, 4096, 4096, 14), false).variant < 0 && k4_wgmma_pick(lib_launch(4096, 256, 4096, 14), false).variant < 0);  // m, n-part < 512: unmeasured
+  CHECK(k4_wgmma_pick(lib_launch(4096, 4096, 16, 14), false).variant < 0);      // a K chunk below 128: outside the measured envelope (R4 smallest K chunk 128)
+  CHECK(k4_wgmma_pick(lib_launch(4096, 4096, 64, 14), false).variant < 0);
+  CHECK(k4_wgmma_pick(lib_launch(4096, 4096, 128, 14), false).variant == 0 && k4_wgmma_pick(lib_launch(4096, 4096, 256, 14), false).variant == 0);  // R4: k = 128 +10 %
+  CHECK(k4_wgmma_pick(lib_launch(2048, 2048, 128, 14), false).variant == 0);    // R4: +8.6 / 9.0 %
+  CHECK(k4_wgmma_pick(lib_launch(2048, 2048, 128, 4), false).variant < 0);      // one k step with 512 tiles per launch: unmeasured (smallest measured 1792), the model alone would serve it
+  CHECK(k4_wgmma_pick(lib_launch(2048, 2048, 128, 1), false).variant < 0);      // 128 tiles: fill
+  CHECK(k4_wgmma_pick(lib_launch(256, 4096, 4096, 14), false).variant == 0 && k4_wgmma_pick(lib_launch(4096, 256, 4096, 14), false).variant == 0);  // R4: +12-14 % (m or n-part 256)
+  CHECK(k4_wgmma_pick(lib_launch(128, 4096, 4096, 14), false).variant < 0 && k4_wgmma_pick(lib_launch(4096, 128, 4096, 14), false).variant < 0);  // R4: m = 128 ties (1.000): outside the envelope
+  CHECK(k4_wgmma_pick(lib_launch(192, 4096, 4096, 14), false).variant < 0);     // between the tie and the smallest winner: unmeasured
   // the device-class row: the sm_89 row has no rule (and no backend): nothing by default, force still serves a legal launch (the host gate
   // never reaches this on such a device; this is the table's own behaviour)
   CHECK(!kK4WgmmaProfit[IMD_TABLE_SM89].enabled && kK4WgmmaProfit[IMD_TABLE_SM90].enabled);
@@ -102,10 +108,13 @@ int main() {
   CHECK(k4_wgmma_pick(lib_launch(4096, 4096, 4096, 14), false, -1).variant < 0 && k4_wgmma_pick(lib_launch(4096, 4096, 4096, 14), false, IMD_TABLE_COUNT).variant < 0);
   CHECK(k4_wgmma_pick(lib_launch(4096, 4096, 4096, 14), false, IMD_TABLE_SM90).variant == 0);
 
-  // ---- the R3 floor sweep (docs/NOTES-22.md "Profitability rule"): 19 shapes, N = 14, whole-call duel forced wgmma vs mma.sync on H100 / H200
-  // (ratio > 1: wgmma faster). g = moduli per K4 launch: 14 = one launch, 4 = launches of 4, 4, 4, 2, 1 = fourteen launches of one.
-  struct R3Row { const char* name; int64_t m, n, k; int g; double h100, h200; };
-  static const R3Row r3[] = {
+  // ---- the floor sweeps (docs/NOTES-22.md "Profitability rule"): R3's 19 shapes, then R4's floor.refit 16 further shapes (jobs 14468448 H100 /
+  // 14468449 H200; the R4 sweep re-measured the R3 shapes within ~2 %, the R3 numbers stay for those), N = 14, whole-call duel forced wgmma vs
+  // mma.sync on H100 / H200 (ratio > 1: wgmma faster). g = moduli per K4 launch: 14 = one launch, 4 = launches of 4, 4, 4, 2, 1 = fourteen launches of one, 3 = 3, 3, 3, 3, 2.
+  // Not in the table: R4's 2048 x 2048 x 200000 (two K chunks, the second add-mod; served by default, default 1.205 / 1.232) and the repeats of
+  // sq512 / sq768 / sq1024 g1 / sq1536 g1 / sq2048 g1 (same shapes, same decisions).
+  struct FloorRow { const char* name; int64_t m, n, k; int g; double h100, h200; };
+  static const FloorRow tab[] = {
       {"r1024x1024x4096", 1024, 1024, 4096, 14, 1.198, 1.209}, {"r1024x4096x4096", 1024, 4096, 4096, 14, 1.268, 1.259},
       {"r1100x3000x2500", 1100, 3000, 2500, 14, 1.189, 1.198}, {"r2048x2048x256", 2048, 2048, 256, 14, 1.115, 1.112},
       {"r4096x1024x4096", 4096, 1024, 4096, 14, 1.255, 1.266}, {"r4096x4096x1024", 4096, 4096, 1024, 14, 1.272, 1.272},
@@ -115,9 +124,20 @@ int main() {
       {"sq1536g1", 1536, 1536, 1536, 1, 1.060, 1.047},         {"sq2048", 2048, 2048, 2048, 14, 1.254, 1.258},
       {"sq2048g1", 2048, 2048, 2048, 1, 1.059, 1.068},         {"sq2048g4", 2048, 2048, 2048, 4, 1.162, 1.169},
       {"sq3072", 3072, 3072, 3072, 14, 1.312, 1.317},          {"sq512", 512, 512, 512, 14, 1.030, 1.031},
-      {"sq768", 768, 768, 768, 14, 1.053, 1.061}};
+      {"sq768", 768, 768, 768, 14, 1.053, 1.061},
+      // R4 floor.refit, the shapes R3 did not have
+      {"r128x4096x4096", 128, 4096, 4096, 14, 1.000, 1.001},   {"r2048x2048x128", 2048, 2048, 128, 14, 1.090, 1.086},
+      {"r256x4096x4096", 256, 4096, 4096, 14, 1.124, 1.142},   {"r4096x256x4096", 4096, 256, 4096, 14, 1.112, 1.132},
+      {"r4096x4096x128", 4096, 4096, 128, 14, 1.101, 1.106},   {"r4096x4096x256", 4096, 4096, 256, 14, 1.162, 1.165},
+      {"sq1024g2", 1024, 1024, 1024, 2, 1.003, 1.010},         {"sq1024g3", 1024, 1024, 1024, 3, 1.036, 1.056},
+      {"sq1024g7", 1024, 1024, 1024, 7, 1.077, 1.085},         {"sq1536g2", 1536, 1536, 1536, 2, 1.123, 1.128},
+      {"sq2048g2", 2048, 2048, 2048, 2, 1.108, 1.119},         {"sq2048g3", 2048, 2048, 2048, 3, 1.140, 1.145},
+      {"sq2048g7", 2048, 2048, 2048, 7, 1.216, 1.219},         {"sq4096g1", 4096, 4096, 4096, 1, 1.153, 1.161},
+      {"sq8192g1", 8192, 8192, 8192, 1, 1.268, 1.281},         {"sq12288", 12288, 12288, 12288, 14, 1.472, 1.483}};
+  constexpr int kRows = sizeof(tab) / sizeof(tab[0]);
+  static_assert(kRows == 35, "19 R3 rows + 16 R4 rows");
   // the rule applied to a whole call: served iff every one of its K4 launches is served (as the library decides them, one by one)
-  const auto call_served = [&](const R3Row& r, const K4WgmmaProfit& P, bool use_pick) {
+  const auto call_served = [&](const FloorRow& r, const K4WgmmaProfit& P, bool use_pick) {
     bool all = true;
     for (int z = 14; z > 0; z -= r.g) {
       const K4WgmmaLaunch L = lib_launch(r.m, (r.n + 15) / 16 * 16, (r.k + 15) / 16 * 16, z < r.g ? z : r.g);  // n-hat, k-hat as the plan pads them
@@ -127,17 +147,27 @@ int main() {
     return all;
   };
   int n_served = 0, n_declined = 0;
-  for (const R3Row& r : r3) {
+  for (const FloorRow& r : tab) {
     const double worst = std::fmin(r.h100, r.h200);
     const bool served = call_served(r, kK4WgmmaProfit[IMD_TABLE_SM90], true);
     served ? ++n_served : ++n_declined;
-    if (served != (worst >= 1.045 && std::strcmp(r.name, "sq512") != 0 && std::strcmp(r.name, "sq1024g1") != 0)) std::printf("R3 shape %s: served %d\n", r.name, served);
+    if (served != (worst >= 1.045)) std::printf("floor shape %s: served %d\n", r.name, served);
     CHECK(served == call_served(r, kK4WgmmaProfit[IMD_TABLE_SM90], false));      // the pick and the estimate are one rule
-    if (served) CHECK(worst >= 1.04);                                          // SAFETY: nothing served that measured slower or within noise (1.02), with a margin
+    if (served) CHECK(worst >= 1.04);                                          // SAFETY: nothing served that measured slower or within noise (1.02), with a margin (R4: served minimum 1.044)
     if (worst >= 1.045) CHECK(served);                                         // every gain of 4.5 % or more on both cards is served
-    if (worst < 1.04) CHECK(!served);                                          // sq512 (1.030) and sq1024 g=1 (0.928) are declined
+    if (worst < 1.04) CHECK(!served);                                          // sq512 (1.030), sq1024 g=1 (0.928), r128 (1.000), sq1024 g=2 (1.003), g=3 (1.036) are declined
   }
-  CHECK(n_served == 17 && n_declined == 2);
+  CHECK(n_served == 30 && n_declined == 5);
+  {  // R4: the four shapes the R3 rule declined although forcing gained 9-14 % are served now; the ties and the loser stay declined
+    const char* gain[] = {"r2048x2048x128", "r4096x4096x128", "r256x4096x4096", "r4096x256x4096"};
+    const char* stay[] = {"r128x4096x4096", "sq1024g1", "sq1024g2", "sq1024g3", "sq512"};
+    for (const FloorRow& r : tab) {
+      for (const char* g : gain) if (!std::strcmp(r.name, g)) CHECK(call_served(r, kK4WgmmaProfit[IMD_TABLE_SM90], true) && std::fmin(r.h100, r.h200) > 1.08);
+      for (const char* g : stay) if (!std::strcmp(r.name, g)) CHECK(!call_served(r, kK4WgmmaProfit[IMD_TABLE_SM90], true) && std::fmin(r.h100, r.h200) < 1.04);
+    }
+    // sq1024 g=3 is served in part (three launches of 3 moduli = 96 tiles; the tail of 2 = 64 tiles is below the fill prior): R4's default run 1.034 / 1.044
+    CHECK(k4_wgmma_pick(lib_launch(1024, 1024, 1024, 3), false).variant == 0 && k4_wgmma_pick(lib_launch(1024, 1024, 1024, 2), false).variant < 0);
+  }
   {  // the one loser: 1024^3 with one modulus per launch, forced 0.928 / 0.930: declined, and the model predicts a loss (not merely a small gain)
     const K4WgmmaLaunch L = lib_launch(1024, 1024, 1024, 1);
     const K4WgmmaEstimate e = k4_wgmma_estimate(L, kK4WgmmaProfit[IMD_TABLE_SM90]);
@@ -151,19 +181,24 @@ int main() {
   {  // the rule's own numbers, restated (the fit of tools/fit_k4_wgmma_profit.py): 4096^3 N = 14: mma.sync K4 estimated at 1.96 ms
     const K4WgmmaEstimate e = k4_wgmma_estimate(lib_launch(4096, 4096, 4096, 14), kK4WgmmaProfit[IMD_TABLE_SM90]);
     const double w = 32.0 * 16 * 14 / 132, kt = 32;
-    CHECK(std::fabs(e.delta_us - (2.40 + w * (-0.57 - 0.51 * kt))) < 1e-9 && std::fabs(e.mma_us - 1.13 * w * kt) < 1e-9);
-    CHECK(e.serve && e.mma_us > 1900 && e.mma_us < 2000 && e.delta_us < -850 && e.delta_us > -1000);  // R3: K4 phase 1.99 -> 1.22 ms (965 -> 1580 TOPS): 0.77 ms saved, the model says 0.92 (optimistic by 20 % on this shape; far from the boundary)
+    CHECK(std::fabs(e.delta_us - (1.98 + w * (-0.45 - 0.53 * kt))) < 1e-9 && std::fabs(e.mma_us - 1.13 * w * kt) < 1e-9);
+    CHECK(e.serve && e.mma_us > 1900 && e.mma_us < 2000 && e.delta_us < -850 && e.delta_us > -1000);  // R3: K4 phase 1.99 -> 1.22 ms (965 -> 1580 TOPS): 0.77 ms saved, the model says 0.94 (optimistic by 20 % on this shape; far from the boundary)
   }
-  // MUTANTS of the constants: each must change at least one outcome of the table (a test that cannot see a changed constant is not a test)
+  // MUTANTS of the constants: each must change at least one outcome of the table (35 shapes and two probes) (a test that cannot see a changed constant is not a test)
   {
     const auto outcomes = [&](const K4WgmmaProfit& P) {
-      unsigned bits = 0;
-      for (int i = 0; i < 19; ++i) bits |= (call_served(r3[i], P, false) ? 1u : 0u) << i;
+      uint64_t bits = 0;
+      for (int i = 0; i < kRows; ++i) bits |= (call_served(tab[i], P, false) ? uint64_t{1} : 0) << i;
+      // two probes outside the measured table, both declined by the base rule on a guard that the table alone cannot see:
+      // 2048 x 2048 x 128 with 4 moduli per launch (512 tiles, one k step: the model alone serves it, the min_fill_k1 guard declines it) and
+      // 4096 x 4096 x 64 (one k step below the envelope: the model serves it, min_kc declines it)
+      bits |= (k4_wgmma_estimate(lib_launch(2048, 2048, 128, 4), P).serve ? uint64_t{1} : 0) << kRows;
+      bits |= (k4_wgmma_estimate(lib_launch(4096, 4096, 64, 14), P).serve ? uint64_t{1} : 0) << (kRows + 1);
       return bits;
     };
     const K4WgmmaProfit base = kK4WgmmaProfit[IMD_TABLE_SM90];
-    const unsigned want = outcomes(base);
-    CHECK(__builtin_popcount(want) == 17);
+    const uint64_t want = outcomes(base);
+    CHECK(__builtin_popcountll(want) == 30);
     const auto mutate = [&](auto&& f) { K4WgmmaProfit P = base; f(P); return outcomes(P) != want; };
     CHECK(mutate([](K4WgmmaProfit& P) { P.launch_us = 0.0; P.min_fill = 0.0; }));        // no launch cost and no fill prior: serves the loser
     CHECK(mutate([](K4WgmmaProfit& P) { P.min_fill = 0.0; P.launch_us = 0.4; }));        // the leave-g1-out fit's neighbourhood alone is not enough either
@@ -171,12 +206,22 @@ int main() {
     CHECK(mutate([](K4WgmmaProfit& P) { P.launch_us = 6.0; }));                          // dearer launches: declines small winners
     CHECK(mutate([](K4WgmmaProfit& P) { P.wave_k_us = -0.2; }));                         // a weaker mainloop gain
     CHECK(mutate([](K4WgmmaProfit& P) { P.wave_us = 0.0; P.launch_us = 4.0; }));         // no tile-fixed gain
-    CHECK(mutate([](K4WgmmaProfit& P) { P.min_gain_us = 1.5; }));                        // the absolute margin is live (sq1536 g=1 needs 1.25)
-    CHECK(mutate([](K4WgmmaProfit& P) { P.min_gain_rel = 0.20; }));                      // the relative margin is live (sq1536 g=1 and sq768)
+    CHECK(mutate([](K4WgmmaProfit& P) { P.min_gain_us = 2.5; }));                        // the absolute margin is live (sq1536 g=1 needs 1.73)
+    CHECK(mutate([](K4WgmmaProfit& P) { P.min_gain_rel = 0.30; }));                      // the relative margin is live (sq1536 g=1 needs 0.23 and sq768 0.39; with the R4 constants 0.20 flips none)
     CHECK(mutate([](K4WgmmaProfit& P) { P.enabled = false; }));
-    CHECK(!mutate([](K4WgmmaProfit& P) { P.min_mn = 0; P.min_kc = 0; }));                // the envelope does not touch the 19 measured shapes (it only keeps the model out of the unmeasured)
-    CHECK(mutate([](K4WgmmaProfit& P) { P.min_mn = 1024; }));                            // ... and 512 is exactly the smallest measured extent that is served
+    CHECK(mutate([](K4WgmmaProfit& P) { P.min_mn = 0; }));                               // no row envelope: serves r128x4096x4096 (a measured tie, 1.000)
+    CHECK(mutate([](K4WgmmaProfit& P) { P.min_mn = 257; }));                             // 256 is exactly the smallest measured extent that is served (r256x4096x4096, r4096x256x4096)
+    CHECK(!mutate([](K4WgmmaProfit& P) { P.min_mn = 129; }));                            // ... and the tie at 128 is the other side of the edge: nothing measured between
+    CHECK(mutate([](K4WgmmaProfit& P) { P.min_mn = 1024; }));
+    CHECK(mutate([](K4WgmmaProfit& P) { P.min_kc = 0; }));                               // no K envelope: the probe at kc = 64 is served
+    CHECK(mutate([](K4WgmmaProfit& P) { P.min_kc = 129; }));                             // 128 is exactly the smallest measured K chunk that is served (r2048x2048x128, r4096x4096x128)
+    CHECK(!mutate([](K4WgmmaProfit& P) { P.min_kc = 65; }));
     CHECK(mutate([](K4WgmmaProfit& P) { P.min_kc = 512; }));
+    CHECK(mutate([](K4WgmmaProfit& P) { P.min_fill_k1 = 0.0; }));                        // no one-k-step guard: the 512-tile probe is served
+    CHECK(mutate([](K4WgmmaProfit& P) { P.min_fill_k1 = 3.0; }));                        // 396 tiles: the 512-tile probe is served
+    CHECK(!mutate([](K4WgmmaProfit& P) { P.min_fill_k1 = 5.0; }));                       // 660 tiles: still declined; nothing is measured between 512 and 1792 tiles
+    CHECK(mutate([](K4WgmmaProfit& P) { P.min_fill_k1 = 20.0; }));                       // 2640 tiles: declines the measured r2048x2048x128 (1792 tiles)
+
     CHECK(mutate([](K4WgmmaProfit& P) { P.wave_k_us = +0.51; }));                        // sign flipped
     CHECK(mutate([](K4WgmmaProfit& P) { P.min_gain_us = -5.0; P.min_gain_rel = 0.0; P.min_fill = 0.0; P.launch_us = 2.0; }));  // margins removed: serves sq512 (+3 %) or the loser
     // and the neighbourhood is a plateau: +-10 % on any constant and +-20 % on the margins keeps the 19 outcomes (the rule is not balanced on a knife edge)
@@ -279,8 +324,9 @@ int main() {
     CHECK(p.raster == kRasterHeuristic || p.raster == kRasterAlongN);
     if (!force) {  // the rule restated independently of the header (integers where it can): tiles, k steps, fill, time estimate
       const double tiles = double(((L.m + 127) / 128) * ((L.nc + 255) / 256) * L.zc), kt = double((L.kc + 127) / 128), w = tiles / L.sms;
-      const double delta = 2.40 + w * (-0.57 - 0.51 * kt), mma = 1.13 * w * kt;
+      const double delta = 1.98 + w * (-0.45 - 0.53 * kt), mma = 1.13 * w * kt;
       CHECK(tiles >= 0.5 * L.sms && -delta >= 0.75 && -delta >= 0.10 * mma - 1e-9);
+      CHECK(L.m >= 256 && L.nc >= 256 && L.kc >= 128 && (kt > 1 || tiles >= 8.0 * L.sms));
     }
     // determinism and monotonicity in `force`: forcing never serves less
     CHECK(k4_wgmma_pick(L, true).variant >= 0);
