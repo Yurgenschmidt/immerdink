@@ -10,3 +10,9 @@
 d_klpersist4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=421,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
 d_klpersist8k | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=421,crt=f64 --reps 60 --warmup 10 --max-seconds 4 --samples 8192 --phase-reps 0 --keep-samples 1
 d_klpersist4k_n8 | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 8 | --duel-a seq=default,crt=default --duel-b seq=421,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+# Extra lines (NOT part of the pre-registered adoption rule above; informational, from the R5 shape analysis): the Hopper shortfall on skinny / long-row shapes is the KL pack.
+#   d_klpersist_skinny   klpersist on r_skinny (nc=1 rows, twice the tiles of sq8192): the case persistent KL targets
+#   d_klwarp_bigk/_mm    klwarp (seq 181 + crt f64) on the long-row shapes (nc=8 / 13, E=4): the R5 klwarp duels only covered nc <= 2 squares
+d_klpersist_skinny | ik,jk->ij | i=16384,j=512,k=4096 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=421,crt=f64 --reps 60 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_klwarp_bigk | ik,jk->ij | i=2048,j=2048,k=32768 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 40 --warmup 5 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_klwarp_mm | ik,jk->ij | i=1000,j=64,k=50000 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 60 --warmup 5 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1

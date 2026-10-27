@@ -201,13 +201,18 @@ for sw in ${SWEEPS:-imd baseline cutws compare compare_energy energy profile}; d
       "$here/run_sweep.sh" "$here/sweep_r5.txt" "$outdir/r5.jsonl" 2>&1 | tee "$outdir/r5.out"
       st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
       ;;
+    r6)
+      # R6 (bench/sweep_r6.txt, issue 25): klpersist and long-row klwarp duels, Hopper only -> r6.jsonl; not in the default list
+      "$here/run_sweep.sh" "$here/sweep_r6.txt" "$outdir/r6.jsonl" 2>&1 | tee "$outdir/r6.out"
+      st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
+      ;;
     profile)
       # short runs under nsys, summarized per kernel category (profile/index.json); a missing nsys is a note, not a failure.
       # It runs last in the default list (a profile changes nothing in the other results, but it is the longest to set up)
       "$here/profile_nsys.sh" "$outdir" 2>&1 | tee "$outdir/profile.out"
       st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
       ;;
-    *) echo "unknown sweep '$sw' in SWEEPS (imd, baseline, cutws, compare, compare_energy, energy, xduel, extra, profile)" >&2; exit 2 ;;
+    *) echo "unknown sweep '$sw' in SWEEPS (imd, baseline, cutws, compare, compare_energy, energy, xduel, extra, r6, profile)" >&2; exit 2 ;;
   esac
 done
 if command -v python3 >/dev/null; then
