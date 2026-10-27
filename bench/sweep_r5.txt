@@ -4,6 +4,7 @@
 # About 20-30 min per card.
 #   d_newold*   the new sm_90 default (seq 173 = 165 + the limb CRT) against the previous default (seq 5 + crt=f64 = set 13): R4 measured +4.7..7.5%
 #   d_twin4k    the default against its forced twin (seq 165, crt f64): expect 1.00 and equal c_hash
+#   d_klwarp*   the default against default + klwarp (forced twin seq 181 = 165 + 16, crt f64 = candidate set 189): R4 combination duel +2.8% at 4096 N=14; adopt if >= 1.02 on both cards with equal c_hash
 #   d_wgmma*    wgmma K4 (default on sm_90) against mma.sync (k4b=mma), same job: the number for "Closing the Hopper gap"
 # d_newold* / d_twin4k / d_wgmma* are Hopper measurements. On sm_120 (and sm_89) the forced seq 5 / 165 + crt=f64 puts the limb CRT on a 1/64-rate FP64 pipe (the
 # 'old default' side is then ~1.85x SLOWER than the class default at 1024^3 on the 4090) and k4b=mma equals the default: read those rows on Blackwell only as a
@@ -13,6 +14,10 @@ d_newold4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=5,crt=f
 d_newold8k | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 14 | --duel-a seq=5,crt=f64 --duel-b seq=default,crt=default --reps 60 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
 d_newold8k_n8 | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 8 | --duel-a seq=5,crt=f64 --duel-b seq=default,crt=default --reps 60 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
 d_twin4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=165,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_klwarp4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_klwarp4k_n8 | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 8 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_klwarp8k | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 60 --warmup 10 --max-seconds 4 --samples 8192 --phase-reps 0 --keep-samples 1
+d_klwarp8k_n8 | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 8 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 60 --warmup 10 --max-seconds 4 --samples 8192 --phase-reps 0 --keep-samples 1
 d_wgmma4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=default,crt=default,k4b=mma --duel-b seq=default,crt=default,k4b=default --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
 d_wgmma8k | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 14 | --duel-a seq=default,crt=default,k4b=mma --duel-b seq=default,crt=default,k4b=default --reps 60 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
 # immerdink against GEMMul8 fast at N=8 (and its N+1), interleaved (sweep_xduel.txt has the N=14 / 15 pairs)
