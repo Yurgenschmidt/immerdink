@@ -21,11 +21,12 @@ int failures = 0;
 int main() {
   using namespace imd::detail;
 #ifdef IMD_NO_SEQ_TWINS
-  CHECK(seq_default_for(9, 0) == (kSeqEmit | kSeqLimbCrt));   // 9: F1 is not compiled
+  CHECK(seq_default_for(9, 0) == (kSeqEmit | kSeqLimbCrt));   // 9: F1, klload and k5fin are not compiled
   CHECK(!seq_valid(kSeqFinish) && !seq_valid(3) && seq_valid(kSeqEmit) && seq_valid(0));
 #else
-  CHECK(seq_default_for(9, 0) == 13);
-  CHECK(seq_default_for(9, 0) == (kSeqEmit | kSeqFinish | kSeqLimbCrt));
+  CHECK(seq_default_for(9, 0) == 173);
+  CHECK(seq_default_for(9, 0) == (kSeqEmit | kSeqFinish | kSeqLimbCrt | kSeqKlLoad | kSeqK5Fin));
+  CHECK((seq_default_for(9, 0) & (kSeqKlWarp | kSeqKlShape)) == 0);   // klwarp (KEEP) and klshape (slower) stay off
   CHECK((seq_default_for(9, 0) & kSeqQuant) == 0);             // Q1 is opt-in on sm_90
   // every combination of the bits 1, 2, 4, 16, 32, 64 (issue 23: the KL cuts are independent of the emitter set) is a set unless Q1 lacks E1; with 128 (k5fin) it needs F1 too
   for (int b = 0; b < 256; ++b) {
@@ -46,9 +47,9 @@ int main() {
   for (const SeqClass& c : kSeqClasses) {                     // no row but sm_90 carries the limb CRT; no row carries Q1
     CHECK((c.bits & kSeqQuant) == 0);
     CHECK(((c.bits & kSeqLimbCrt) != 0) == (c.cc_major == 9 && c.cc_minor == 0));
-    CHECK((c.bits & kSeqKl) == 0);                            // issue 23: every KL bit is off in every class row until the Hopper duels decide
-    CHECK(c.bits < 16);
-    CHECK((c.bits & kSeqK5Fin) == 0);   // issue 23: k5fin is off in every class row
+    CHECK(((c.bits & (kSeqKl | kSeqK5Fin)) != 0) == (c.cc_major == 9 && c.cc_minor == 0));   // klload + k5fin only on sm_90 (R4); klwarp / klshape in no row
+    CHECK((c.bits & (kSeqKlWarp | kSeqKlShape)) == 0);
+    CHECK(c.cc_major == 9 || c.bits < 16);
   }
   // the KL bits (issue 23): values, independence from the other bits, the kernel's template value and the launch shape
   CHECK(kSeqKlWarp == 16 && kSeqKlLoad == 32 && kSeqKlShape == 64 && kSeqKl == 112);

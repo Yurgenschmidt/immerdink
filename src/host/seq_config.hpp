@@ -52,7 +52,7 @@ constexpr int kSeqForceMask = kSeqSupported;
 // src/contract.cu). sm_120 WAS counted and stays on the baseline: the E1 loop is shorter per iteration, but the compiler unrolls it
 // there and two whole kernels grow (kl_scale_pack<4,*> by 428 / 510 instructions), and nothing was timed. Q1 is opt-in everywhere; F1 and the
 // limb CRT are on for sm_90 only, since the Hopper measurements (R2, 2026-10-25, H100 and H200): the pre-registered combination rule gave E1 + F1 + the limb CRT
-// for sm_90 and Q1 off (docs/NOTES-21.md "R2 outcome and the sm_90 default"). Walking sm_90 back is this one table row. The limb CRT must stay off
+// for sm_90 and Q1 off (docs/NOTES-21.md "R2 outcome and the sm_90 default"); R4 (2026-10-26) added klload and k5fin (docs/NOTES-24.md). Walking sm_90 back is this one table row. The limb CRT must stay off
 // on cards with a 1/64-rate FP64 pipe (RTX 4090 sm_89, Blackwell sm_120: measured 0.44-0.84x): their rows do not carry kSeqLimbCrt.
 struct SeqClass {
   int32_t cc_major, cc_minor;
@@ -60,7 +60,7 @@ struct SeqClass {
 };
 constexpr SeqClass kSeqClasses[] = {
     {8, 9, kSeqEmit},  // RTX 4090: E1 (integer only; fewer instructions in every pack kernel counted). Q1 / F1 / the limb CRT would sit on a 1/64-rate FP64 pipe
-    {9, 0, kSeqEmit | kSeqFinish | kSeqLimbCrt},  // H100, H200 (R2): E1 + F1 + limb CRT = 13 (bit-identical). The measured gain is the limb CRT's given E1 + F1 (the crtf1 duels: +4..7% at N = 14 squares, 1.041 / 1.058 / 1.074 at 8192 / 4096 / 2048, r_lowk 1.183); the adopted set was not measured against the old default directly, chaining f1 x crtf1 gives about +6..10% at the same cases. Q1 stays opt-in: alone it ties and is 0.98x at g = 7
+    {9, 0, kSeqEmit | kSeqFinish | kSeqLimbCrt | kSeqKlLoad | kSeqK5Fin},  // H100, H200: E1 + F1 + limb CRT + klload + k5fin = 173 (R2 chose 13; R4 added klload + k5fin, bit-identical; set 165 + crt f64 against 13 on both cards: 4096^3 N=14 1.07 / 1.05, 8192^3 N=14 1.05, N=8 8192 1.075, r_lowk 1.05, t_df 1.08; klwarp ties (KEEP) and klshape is 4-6% slower, so both stay off; docs/NOTES-24.md)
 };
 
 constexpr int seq_default_for(int32_t cc_major, int32_t cc_minor) {
