@@ -90,6 +90,15 @@ def test_classifier():
     assert not bad, "misclassified: %r" % bad
 
 
+def test_wgmma_k4():
+    n = ("void cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal<cute::tuple<int, int, int, int>, "
+         "cutlass::gemm::collective::CollectiveMma<cutlass::gemm::MainloopSm90TmaGmmaWarpSpecialized<4, cute::tuple<cute::C<2>, cute::C<1>, cute::C<1>>>, "
+         "cute::tuple<cute::C<128>, cute::C<256>, cute::C<128>>, signed char, long, signed char, long>, "
+         "cutlass::epilogue::collective::detail::Sm90TmaWarpSpecializedAdapter<imd::hopper::K4ModEpilogue<false, true>>>>(T1::Params)")
+    assert S.classify(n) == "int8_gemm"
+    assert S.classify("void cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal<X>>(T1::Params)") == "other"
+
+
 def test_precedence():
     # a GEMM kernel with a conversion word in its name stays a GEMM; an INT8 GEMM is never fp64
     assert S.classify("cutlass_80_tensorop_s32_i16832gemm_s8_convert_scale") == "int8_gemm"
