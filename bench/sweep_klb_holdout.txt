@@ -1,0 +1,33 @@
+# Issue #7: the disjoint hold-out of bench/sweep_klb_calib.txt, committed BEFORE any run and never
+# used to fit or choose kl.chain (docs/DESIGN.md §6c.10, docs/NOTES-C1.md §5.13). Same groups, other
+# shapes: nc = 3, 4, 5, 7, 10; tiles 125 / 130 / 250 / 260; j = 160 .. 6144 (chain arm / byte arm about
+# 0.2 .. 2 by the 0.22 us per nc*g estimate; P5 counts the rows after the fit); g = 3, 6; KL A narrow (nc = 1 and multi-pass),
+# B along k (nc = 1, 2), a batch label, a tensor spec, imd_pack's KL. bench/sweep_disjoint.py checks it against
+# the fit sweep and every earlier sweep.
+# name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
+h_nc3     | ik,kj->ij | i=1280,k=1344,j=104  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_nc4     | ik,kj->ij | i=1280,k=1920,j=104  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_nc5     | ik,kj->ij | i=1280,k=2560,j=104  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_nc7     | ik,kj->ij | i=1280,k=3328,j=104  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_nc10    | ik,kj->ij | i=1280,k=5120,j=104  | imd | 4,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_w125    | ik,kj->ij | i=1024,k=1536,j=1000 | imd | 8,13 | --reps 100 --phase-reps 10 --max-seconds 1
+h_w130    | ik,kj->ij | i=1024,k=1536,j=1040 | imd | 8,13 | --reps 100 --phase-reps 10 --max-seconds 1
+h_w250    | ik,kj->ij | i=1024,k=1536,j=2000 | imd | 8,13 | --reps 100 --phase-reps 10 --max-seconds 1
+h_w260    | ik,kj->ij | i=1024,k=1536,j=2080 | imd | 8,13 | --reps 100 --phase-reps 10 --max-seconds 1
+h_x160    | ik,kj->ij | i=1024,k=1536,j=160  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_x192    | ik,kj->ij | i=1024,k=1536,j=192  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_x224    | ik,kj->ij | i=1024,k=1536,j=224  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_x288    | ik,kj->ij | i=1024,k=1536,j=288  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_x384    | ik,kj->ij | i=1024,k=1536,j=384  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_x448    | ik,kj->ij | i=1024,k=1536,j=448  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_x768    | ik,kj->ij | i=1024,k=1536,j=768  | imd | 8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_x3072   | ik,kj->ij | i=1024,k=1536,j=3072 | imd | 8,13 | --reps 20 --phase-reps 5 --max-seconds 1
+h_x6144   | ik,kj->ij | i=1024,k=1536,j=6144 | imd | 8,13 | --reps 20 --phase-reps 5 --max-seconds 1
+h_g       | ik,kj->ij | i=1280,k=2560,j=104  | imd | 7,11 | --reps 300 --phase-reps 10 --max-seconds 1 --g 3,6
+h_anarrow | ik,kj->ij | i=104,k=2560,j=1280  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_bnc1    | ik,jk->ij | i=1280,j=104,k=2048  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_anmp    | ki,kj->ij | i=112,k=2048,j=1280 | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_pack    | ik,kj->ij | i=1280,k=2560,j=104  | packed | 4,8 | --reps 100 --phase-reps 10 --max-seconds 1 --pack B --reuse 1
+h_bnc2    | ik,jk->ij | i=1280,j=104,k=6144  | imd | 4,8,13 | --reps 300 --phase-reps 10 --max-seconds 1
+h_batch   | bik,bkj->bij | b=6,i=320,k=1792,j=72 | imd | 4,8 | --reps 100 --phase-reps 10 --max-seconds 1
+h_tensor  | abcd,cdij->abij | a=30,b=30,c=36,d=44,i=9,j=11 | imd | 5,9,13 | --reps 300 --phase-reps 10 --max-seconds 1

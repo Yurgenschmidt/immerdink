@@ -87,6 +87,92 @@ open Immerdink
 #print axioms Segments.kseg_request_core
 #print axioms Segments.kseg_wbar_le
 #print axioms Segments.kseg_rho_le
+#print axioms Segments.kseg_rho_le_sub
+#print axioms Segments.kseg_wbar_sub
+#print axioms Segments.kseg_wbar
+#print axioms Segments.kseg_elementwise
+#print axioms Segments.kseg_absolute
 
 -- Capstone (Exact.lean): L1c + L4 + L2c
 #print axioms Exact.emulated_product_exact
+
+-- DESIGN §3.2 the shift rule as computed (ShiftRule.lean)
+#print axioms Scaling.kappa_isqrt
+#print axioms Scaling.shift_estimate
+#print axioms Scaling.u_eq_estimate
+#print axioms Scaling.S_le
+#print axioms Scaling.S_lt_two_pow_128
+#print axioms Scaling.S_shift_lt
+
+-- DESIGN §3.4-§3.6 residues and exact reductions (Residue.lean)
+#print axioms Residue.smod_modEq
+#print axioms Residue.smod_congr
+#print axioms Residue.smod_range
+#print axioms Residue.smod_int8
+#print axioms Residue.smod_mul_abs_le
+#print axioms Residue.int8_mul_ge
+#print axioms Residue.smod_mul_ge
+#print axioms Residue.smod_table
+#print axioms Residue.smod_neg_odd
+#print axioms Residue.smod_neg_byte
+#print axioms Residue.byte_weights_modEq
+#print axioms Residue.byte_weights_le
+#print axioms Residue.mulhi_div_eq
+#print axioms Residue.mod_p_bytes32
+#print axioms Residue.barrett_epilogue
+#print axioms Residue.residue_mul_reduction
+#print axioms Residue.crt_y_small32
+#print axioms Residue.emulated_product_exact_smod
+
+-- DESIGN §3.6 the CRT word: peak, compare, wrap, centring (CRTWord.lean)
+#print axioms CRT.R_dvd_x
+#print axioms CRT.x_le_P_sub_R
+#print axioms CRT.xp_le_peak
+#print axioms CRT.xp_le_crtPeak
+#print axioms CRT.xp_ne_P
+#print axioms CRT.le_xp_iff_lt
+#print axioms CRT.xp_mod_word
+#print axioms CRT.center_word
+#print axioms CRT.z_word
+#print axioms CRT.center_signmag
+#print axioms CRT.z_signmag
+#print axioms CRT.peak_attained
+#print axioms CRT.crtPeak_attained
+
+-- DESIGN §2 the design instance (Moduli.lean)
+#print axioms Moduli.pm_pos
+#print axioms Moduli.pm_le_256
+#print axioms Moduli.pm_coprime
+#print axioms Moduli.P_even
+#print axioms Moduli.exists_q_design
+#print axioms Moduli.T_ge_180
+#print axioms Moduli.L32_exact
+#print axioms Moduli.peak_needs_every_limb
+#print axioms Moduli.chunk_constants
+#print axioms Moduli.chunk_sum_range
+#print axioms Moduli.epilogue_range_v113
+#print axioms Moduli.barrett_epilogue_v113
+#print axioms Moduli.qd_inv
+#print axioms Moduli.emulated_product_exact_design
+#print axioms Moduli.emulated_product_exact_shipped
+
+-- L5 K-weights (KWeights.lean; NOTES-C1 §4.4)
+#print axioms KWeights.kweight_cancel
+#print axioms KWeights.l2_mul_const
+#print axioms KWeights.norm_le_of_rule
+#print axioms KWeights.kweight_ratio
+#print axioms KWeights.kweight_ratio_rn
+#print axioms KWeights.kweight_ratio_trunc
+#print axioms KWeights.kweight_guard
+#print axioms KWeights.sF_sq_le
+#print axioms KWeights.kweight_guard_lt
+#print axioms KWeights.kweight_transfer_elementwise
+#print axioms KWeights.kweight_transfer_absolute
+#print axioms KWeights.kweight_transfer_normwise
+
+-- L6 a-posteriori certificate (Apost.lean; NOTES-C1 §4.4)
+#print axioms Apost.apost_bound
+#print axioms Apost.apost_scaled
+#print axioms Apost.apost_rho
+#print axioms Apost.apost_elementwise
+#print axioms Apost.apost_pow2

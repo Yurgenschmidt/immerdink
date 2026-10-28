@@ -192,8 +192,8 @@ class Sample:
 # per class (perf.cpp kClockBound; host_perf checks the two agree through predictions).
 CLOCK_BOUND = {
     # v1.17: kf.elem (slot 4) and pack.dram (slot 3) are not clock-bound (tile-load latency,
-    # DRAM bytes); kl slot 4 is the retired op_eps
-    "k0": (2,), "kf": (2, 3, 5), "kl": (2, 3), "pack": (2, 4),  # not wave (slot 5): memory latency
+    # DRAM bytes); v1.20: kl slot 4 is kl.chain (clock-bound, the busiest SM's steps)
+    "k0": (2,), "kf": (2, 3, 5), "kl": (2, 3, 4), "pack": (2, 4),  # not wave (slot 5): memory latency
     "k4_128x256": (0, 1, 2, 3, 5), "k4_128x128": (0, 1, 2, 3, 5), "k4_64x128": (0, 1, 2, 3, 5),
     "k4_64x64": (0, 1, 2, 3, 5), "k5": (2, 3), "direct": (2, 3), "beta": (2,), "call": ()}
 
@@ -351,6 +351,109 @@ def phase_rows(samples, fref=0.0):
 K4_BYTE = 4  # K4 classes: t = max(sum of the round-model terms j != 4, the DRAM term j = 4)
 
 
+KL_CHAIN = 4  # v1.20 (DESIGN §6c.10): kl.chain, the slot of the retired kl.op_eps
+
+
+def fit_slots(names, cls):
+    """The slots a plain NNLS fit of the class uses: every named slot but kl.chain (v1.20), which
+    has its own fit step (fit_kl_chain) and stays absent in a routine recalibration."""
+    return [j for j, n in enumerate(names[cls]) if n and f"{cls}.{n}" != "kl.chain"]
+
+
+def nnls_weighted(X, y, w):
+    """argmin_{theta >= 0} sum((w (X theta - y))^2), exactly, by enumerating active sets (columns
+    <= 5); nnls_relative is w = 1 / y with y the time. Columns that are all zero get 0."""
+    A0 = X * w[:, None]
+    yw = y * w
+    ncol = X.shape[1]
+    used = [j for j in range(ncol) if np.any(X[:, j] != 0)]
+    scale = np.array([np.abs(A0[:, j]).max() if j in used else 1.0 for j in range(ncol)])
+    best, best_res = np.zeros(ncol), float(np.sum(yw ** 2))
+    for r in range(1, len(used) + 1):
+        for S in itertools.combinations(used, r):
+            A = A0[:, S] / scale[list(S)]
+            sol, *_ = np.linalg.lstsq(A, yw, rcond=None)
+            if np.any(sol < 0):
+                continue
+            res = float(np.sum((A @ sol - yw) ** 2))
+            if res < best_res - 1e-15:
+                theta = np.zeros(ncol)
+                theta[list(S)] = sol / scale[list(S)]
+                best, best_res = theta, res
+    return best
+
+
+KL_BASE = (0, 2, 3, 5)  # kl slots outside the max: launch, op, l2byte, wave
+
+
+def kl_chain_scan(X, t, byte_rates, chains):
+    """v1.20 (DESIGN §6c.10): for each (byte rate B, chain C) the max arm r = max(B bytes, C s) is
+    taken off the time and (launch, op, l2byte, wave) are fitted (exact NNLS, relative weights of
+    the time itself) on the remainder; returns the full 6-slot theta (seconds per unit) and the
+    relative SSE of the smallest, over the grid."""
+    w = 1.0 / t
+    best = (float("inf"), None)
+    for B in byte_rates:
+        for C in chains:
+            r = np.maximum(B * X[:, 1], C * X[:, 4])
+            th = np.zeros(X.shape[1])
+            th[list(KL_BASE)] = nnls_weighted(X[:, KL_BASE], t - r, w)
+            th[1], th[4] = B, C
+            sse = float(np.sum(((np.maximum(th[1] * X[:, 1], th[4] * X[:, 4]) + X[:, list(KL_BASE)]
+                                 @ th[list(KL_BASE)] - t) / t) ** 2))
+            if sse < best[0]:
+                best = (sse, th)
+    return best[1], best[0]
+
+
+def kl_chain_grid(b0, n_b=31, n_c=61):
+    """Byte rates around the plain fit's (0.5 x ... 2 x) and chains 10 ps ... 2 us per unit."""
+    return (b0 * np.geomspace(0.5, 2.0, n_b), np.concatenate([[0.0], np.geomspace(1e-11, 2e-6, n_c)]))
+
+
+def fit_kl_chain(X, t, cases, verbose=True):
+    """v1.20 (DESIGN §6c.10, NOTES-C1 §5.13): the KL class with the chain arm. X: the KL phases'
+    features (6 slots; x[4] = s), t: the marks (seconds, raised to COLD), cases: the shape of each
+    phase (the folds). The plain NNLS fit without the chain and the scan with it are each scored
+    by leave-one-shape-out relative SSE; the chain is kept only if its held-out error is smaller
+    (P4), else kl.chain = 0 (absent). Returns (theta in seconds per unit, 6 slots; used: bool)."""
+    used = [0, 1, 2, 3, 5]  # launch, byte, op, l2byte, wave (the plain fit of the class)
+    plain = np.zeros(X.shape[1])
+    plain[used] = nnls_relative(X[:, used], t)
+    b0 = max(plain[1], 1e-13)
+    full, sse_full = kl_chain_scan(X, t, *kl_chain_grid(b0))
+    cs = sorted(set(cases))
+    cv_plain = cv_chain = 0.0
+    bs, chs = kl_chain_grid(b0, 11, 31)
+    for c in cs:
+        tr = np.array([k != c for k in cases])
+        te = ~tr
+        if tr.sum() < 6:
+            continue
+        thp = np.zeros(X.shape[1])
+        thp[used] = nnls_relative(X[tr][:, used], t[tr])
+        cv_plain += float(np.sum(((X[te] @ thp - t[te]) / t[te]) ** 2))
+        thc, _ = kl_chain_scan(X[tr], t[tr], bs, chs)
+        pr = (np.maximum(thc[1] * X[te, 1], thc[4] * X[te, 4]) +
+              X[te][:, list(KL_BASE)] @ thc[list(KL_BASE)])
+        cv_chain += float(np.sum(((pr - t[te]) / t[te]) ** 2))
+    keep = cv_chain < cv_plain and full[4] > 0
+    if verbose:
+        sse_plain = float(np.sum(((X @ plain - t) / t) ** 2))
+        print(f"KL chain (kl.chain): {len(t)} KL phases, {len(cs)} shapes; relative SSE plain "
+              f"{sse_plain:.3f}, with chain {sse_full:.3f}; leave-one-shape-out plain {cv_plain:.3f}, "
+              f"chain {cv_chain:.3f} -> {'kept' if keep else 'absent'}")
+        if keep:
+            print(f"  fitted: byte {full[1] * 1e9:.4g} ns/B, chain {full[4] * 1e9:.4g} ns/unit, "
+                  f"launch {full[0] * 1e9:.4g}, op {full[2] * 1e9:.4g}, l2byte {full[3] * 1e9:.4g}, "
+                  f"wave {full[5] * 1e9:.4g} ns")
+            bb = full[1]
+            prof = [(C, kl_chain_scan(X, t, [bb], [C])[1]) for C in np.geomspace(1e-9, 2e-6, 13)]
+            print("  objective profile in C (ns/unit: relative SSE): " +
+                  ", ".join(f"{C * 1e9:.3g}: {v:.3f}" for C, v in prof))
+    return (full if keep else plain), keep
+
+
 def is_k4(cls):
     return cls.startswith("k4_")
 
@@ -361,6 +464,8 @@ def predicted_ns(params, names, cls, x):
     terms = [params.get(f"{cls}.{n}", 0.0) * x[j] if n else 0.0 for j, n in enumerate(names[cls])]
     if is_k4(cls):
         return max(sum(terms) - terms[K4_BYTE], terms[K4_BYTE])
+    if cls == "kl" and params.get("kl.chain", 0.0) > 0:  # v1.20 (§6c.10): byte arm vs chain arm
+        return sum(terms) - terms[1] - terms[KL_CHAIN] + max(terms[1], terms[KL_CHAIN])
     return sum(terms)
 
 
@@ -411,8 +516,10 @@ def fit_k4(X, t, byte_col, rates=None, T=None):
 
 
 def fit(samples, seed, lib=None, verbose=True, worst=0, k4_shared_dram=False, fref=0.0,
-        drop=()):
-    """drop: parameter keys forced to 0 (e.g. the v1.10 chain features, for an A/B)."""
+        drop=(), kl_chain=False):
+    """drop: parameter keys forced to 0 (e.g. the v1.10 chain features, for an A/B). kl_chain
+    (v1.20, opt-in): the KL class with the chain arm (fit_kl_chain; the samples' features must
+    come from a seed with kl.chain > 0, see main)."""
     names = host.param_names(lib)
     rows = phase_rows(samples, fref)
     params = {}
@@ -426,7 +533,7 @@ def fit(samples, seed, lib=None, verbose=True, worst=0, k4_shared_dram=False, fr
                 data = rows.get(cls, [])
                 if not data:
                     continue
-                used = [j for j, n in enumerate(names[cls]) if n]
+                used = fit_slots(names, cls)
                 X = np.array([d[0][used] for d in data])
                 t = np.array([d[1] for d in data])
                 T = k4_round_monotone(names[cls], used)
@@ -441,7 +548,7 @@ def fit(samples, seed, lib=None, verbose=True, worst=0, k4_shared_dram=False, fr
     for cls in host.PERF_CLASSES:
         if cls in (CALL, "beta"):
             continue
-        used = [j for j, n in enumerate(names[cls]) if n]
+        used = fit_slots(names, cls)
         data = rows.get(cls, [])
         if not data:
             report.append((cls, 0, None, None))
@@ -450,15 +557,24 @@ def fit(samples, seed, lib=None, verbose=True, worst=0, k4_shared_dram=False, fr
         t = np.array([d[1] for d in data])
         for j in [used.index(j) for j in used if f"{cls}.{names[cls][j]}" in drop]:
             X[:, j] = 0.0  # a dropped feature: its parameter fits to 0
+        kl_full = None
         if is_k4(cls):
             theta = fit_k4(X, t, used.index(K4_BYTE), None if shared is None else [shared],
                            k4_round_monotone(names[cls], used))[0]
+        elif cls == "kl" and kl_chain:
+            Xf = np.array([d[0] for d in data])
+            kl_full, _ = fit_kl_chain(Xf, t, [d[2].split()[0] for d in data], verbose)
+            theta = kl_full[used]
         else:
             theta = nnls_relative(X, t)
         for j, v in zip(used, theta):
             params[f"{cls}.{names[cls][j]}"] = float(v) * 1e9  # s -> ns per unit
-        pred = np.array([predicted_ns({f"{cls}.{names[cls][j]}": v for j, v in zip(used, theta)},
-                                      names, cls, d[0]) for d in data])
+        if kl_full is not None:
+            params["kl.chain"] = float(kl_full[KL_CHAIN]) * 1e9
+        pdict = {f"{cls}.{names[cls][j]}": v for j, v in zip(used, theta)}
+        if kl_full is not None:
+            pdict["kl.chain"] = float(kl_full[KL_CHAIN])
+        pred = np.array([predicted_ns(pdict, names, cls, d[0]) for d in data])
         err = np.abs(pred - t) / t
         report.append((cls, len(data), float(np.median(err)), float(np.percentile(err, 90))))
         if worst:
@@ -510,7 +626,7 @@ def k4_error(samples, lib, shared, fref=0.0):
         data = rows.get(cls, [])
         if not data:
             continue
-        used = [j for j, n in enumerate(names[cls]) if n]
+        used = fit_slots(names, cls)
         X = np.array([d[0][used] for d in data])
         t = np.array([d[1] for d in data])
         tot += fit_k4(X, t, used.index(K4_BYTE), None, k4_round_monotone(names[cls], used))[1]
@@ -532,7 +648,7 @@ def clock_summary(records):
 
 # the v1.10 chain parameters (format 2; --no-chain drops them); v1.17's kf.elem / pack.dram
 # are format-2 parameters but not chains of v1.10
-NEW_CHAINS = tuple(sorted(host.FORMAT2_PARAMS - {"kf.elem", "pack.dram"}))
+NEW_CHAINS = tuple(sorted(host.FORMAT2_PARAMS - {"kf.elem", "pack.dram", "kl.chain"}))
 
 
 def occupancy_from_records(records, lib=None):
@@ -814,7 +930,7 @@ def class_error(samples, cls, lib=None, fref=0.0):
     data = phase_rows(samples, fref).get(cls, [])
     if not data:
         return 0, 0.0, 0.0, 0.0
-    used = [j for j, n in enumerate(names[cls]) if n]
+    used = fit_slots(names, cls)
     X = np.array([d[0][used] for d in data])
     t = np.array([d[1] for d in data])
     th = nnls_relative(X, t)
@@ -1091,6 +1207,11 @@ def main(argv=None):
                          "do not get: a number in [0, 1] (the default 0: the key is absent, the "
                          "v1.18 rule, so a routine recalibration cannot ship a nonzero key) or "
                          "'scan' (opt in: fitted against the KL phase marks)")
+    ap.add_argument("--kl-chain", action="store_true",
+                    help="v1.20 (DESIGN §6c.10): fit the KL class with the chain arm "
+                         "max(byte arm, chain arm) and write kl.chain if its leave-one-shape-out "
+                         "error beats the plain fit (opt in: a routine recalibration never ships "
+                         "it); format 2 only")
     ap.add_argument("--byte-pj", type=float, default=0.0,
                     help="scaled form: the fixed unscaled byte energy (pJ per DRAM byte; 0, or "
                          "a stated prior), written as power.byte_pj")
@@ -1198,6 +1319,12 @@ def main(argv=None):
               ", ".join(f"{n} {extra['kernel.' + n][0]}" for n in
                         ("k0", "kf16", "kf4", "kl8", "kl4", "pack", "k5_n14_e4", "k5b_n14")))
     params0 = base_params(a.lib) if extra is not None else host.Calibration.default(a.lib).params
+    if a.kl_chain:
+        if extra is None:
+            ap.error("--kl-chain needs calibration format 2")
+        # the features of the seed's samples: x[4] of a KL phase is filled only for a seed with
+        # kl.chain > 0; this value makes the chain arm negligible (never binding) for them
+        params0 = dict(params0, **{"kl.chain": 1e-9})
     drop = (NEW_CHAINS if a.no_chain else ()) + tuple(a.drop)
     # The seed: the measured device's sm_count and L2 with the shipped parameters (features
     # depend only on sm_count, l2_bytes and the occupancy table).
@@ -1270,7 +1397,7 @@ def main(argv=None):
             print(f"  L_hit {frac:.2f} x L2 ({frac * l2 / 1e6:5.1f} MB): {n} phases, median "
                   f"{100 * med:.1f} %, p90 {100 * p90:.1f} %, relative SSE {sse:.3f}")
     params = fit(samples, seed, a.lib, worst=a.worst, k4_shared_dram=a.k4_shared_dram,
-                 fref=fnorm, drop=drop)
+                 fref=fnorm, drop=drop, kl_chain=a.kl_chain)
     if extra is not None:
         rows = sustained_rows(records, host.Calibration.from_values(meta, params, a.lib, extra),
                               a.lib, gap_us=a.act_gap_us)

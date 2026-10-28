@@ -432,7 +432,8 @@ what has been built since is recorded under "Implementation status".
     and cite M-a (IR12): final, not "provisional", since the M-a summary is published. [M]
     figures at N ∉ {8, 10, 14, 16} stay tagged until M-c (IR4).
   - *PROOFS L7* (L7a recursive summation γ_{S−1}, L7b the bound, L7c the metric forms, L7d
-    the request); L5 and L6 stay reserved.
+    the request); L5 and L6 stay reserved (their lemmas were later proved for issue #12:
+    PROOFS L5, L6).
   - *Lean (IR5): done.* L3c (the ν form `l3c_unit`, the NORMWISE / ELEMENTWISE / ABSOLUTE
     compositions with the normal-range final rounding and the subnormal term, the native
     chain `fma_chain`), the summation lemma γ_k (`Summation.recsum`) and L7 (`kseg_compose`,
@@ -2650,7 +2651,8 @@ b̃_hj = b_hj·2^{−w_h}.
     (§4.5).
 
 **L6 (a-posteriori certificate)** **[stage 5, deferred (IR26); cert: cert_apost, cert_stats_constants,
-cert_stats_bin; TLA+: OzakiScaling `CertSound`; Lean `apost_cert`]**
+cert_stats_bin; TLA+: OzakiScaling `CertSound`; Lean `apost_cert`, proved for issue #12 as
+`Apost.apost_bound`, `apost_rho`, `apost_elementwise`, `apost_pow2`]**
 
 *Setting.* As L3, possibly with weighted operands (L5b). Take δ = ½ (RN) or 1 (TRUNC),
 d = T − κ/2 (RN) or T (TRUNC), and κ = ⌈√k⌉. Define:
@@ -3325,7 +3327,8 @@ zero_exempt=False) -> float`, whose result goes into an ordinary
 - IndexMap: the stats argument checks in the §6b.5 order (`neg_stats_alias`).
 - OzakiScaling JointSpec: `CertSound` (L6a/b on the toy enumeration, the in-range condition
   included), with negatives `neg_cert_no_kdelta2` and `neg_cert_floor_kappa`.
-- PROOFS L6 with its Lean proof `apost_cert`; the stage-5 certificates of §4.4
+- PROOFS L6 with its Lean proof (`apost_cert`; proved for issue #12 as `Apost.apost_bound` …
+  `apost_pow2`, the stage itself still deferred); the stage-5 certificates of §4.4
   (`cert_stats_constants`, `cert_stats_bin`, `cert_apost`); `oracle.stats` and
   `oracle.apost_bin`.
 
@@ -3494,7 +3497,7 @@ No new phase.
 | PackedOperand.tla | 6 | `pos_kw_from_pack`, `neg_kw_partner_own`, `neg_kw_both_packed` |
 | Pipeline.tla | 6 | kw read-only input, read through the q map; `neg_kw_helper_race` |
 | OzakiCRT, CRTRealization, K4Align | — | no change: integer back end independent of how the scaling is chosen (OzakiCRT `CRTExact`) |
-| PROOFS / Lean | 3, 4, 5 | L3c and the FP summation lemma γ_k, then L7 `kseg_compose` (3, IR5); L5 `kweight_cancel`, `kweight_guard` (4); L6 `apost_cert` (5, deferred) |
+| PROOFS / Lean | 3, 4, 5 | L3c and the FP summation lemma γ_k, then L7 `kseg_compose` (3, IR5); L5 `kweight_cancel`, `kweight_guard` (4); L6 `apost_cert` (5, deferred; the lemma proved for issue #12 as `Apost.apost_*`) |
 | params.py | 0, 1, 3, 4, 5, 6 | `cert_footprint_monotone` with I3 (0); `cert_rho_recipe` (1); `cert_kseg_composition` (3); `cert_kw_rule` (multi-partner), `cert_kw_fp64_exact`, `cert_kw_guard` (4); `cert_stats_constants`, `cert_stats_bin`, `cert_apost` (5, deferred); `cert_kw_shift_range`, `cert_workspace`/`cert_plan_bytes` for weighted vec sizes, and reruns (6) |
 | oracle.py | 2, 3, 5, 6 | `kweights` with multi-partner mode (2); `contract_segments` (3); `apost_bin`, `stats` (5, deferred); the weighted quantizer (6) |
 
@@ -5689,6 +5692,130 @@ Records: immerdink-eval `results/c1/first_call_243d9c0.jsonl`, 20 s of GPU.
 condition is amended, because M-d2 passed on the shipped calibration, and C1 is done as amended.
 M-c stays FAILED, MC-3a is not a pass (ruling A), no M-c re-run on the shipped calibration is used
 to claim a pass, and the [M, model-only, outside hold-out] marks stay.
+
+### 5.13 Issue #7: the KL chain term, its offline evidence, review and pre-registered bars (implementer and independent reviewer, 2026-10-12)
+
+C1 is done (§5.12); this is the follow-up of the open defect of §5.11 / DESIGN §6c.9 / §7, reopened by its trigger
+"a calibration sweep that adds narrow multi-pass KL packs". Design: DESIGN §6c.10. Nothing here re-scores M-c
+or M-d2.
+
+**Offline evidence (CPU, allowed records only; immerdink-eval `scripts/c1/klb/`, `FINDINGS.md`).**
+1. KL B's excess tracks a per-(chunk, modulus) chain: Jacobi 0.92 µs per modulus over 16 steps (57 ns),
+   Q24 q_kl1 0.64 µs over 12 (53 ns). The additive chain of §5.11 fits 6–13 ns per step on wide launches
+   because there it hides under the DRAM time; a `max(byte arm, chain arm)` fits both.
+2. Independent review (read-only agent, 2026-10-12), accepted with changes: (a) feature `nc · g · waves`, not
+   `nc · values · g` (`values` flips 8 → 4 at nc 2 → 3, non-monotone; per `nc · g` unit: Q24 KL B 214 / 229 / 209 ns,
+   Jacobi 226 / 225; all KL4 with `values` = 4, so the data cannot separate the two features there, and q_ppl's KL A
+   (nc = 2, KL8, byte-dominated) is no evidence either way; the nc ≤ 2 rows of the new sweep are the test); (b) `wave` outside the max (inside it, launch / byte /
+   l2byte refit to 9.2 µs / 1.153 / 0.542 against 6.6 / 1.003 / 0.361); (c) with `4 · nc · g`, the KL class refit gives narrow KL B
+   4.9 % in-sample and 5.8 % on the Jacobi view, all-KL 6.1 / 17.9 (median / p90), and with all shipped thetas frozen and only
+   the chain fitted, narrow KL B goes 42.7 → 8.2 % and exactly 37 of 728 KL rows change.
+3. Corrections to the first offline run: the Jacobi view is no longer a hold-out (the rate was derived from it);
+   the 7.0 % figure pooled 17 Q24 in-sample rows with 20 Jacobi rows; the baselines did not use `perf_fit`'s machinery
+   (fref normalization), so "shipped ~40 % low" was compared against a different refit; the regime iteration was
+   initialization-dependent (replaced by the (byte rate, chain) scan of DESIGN §6c.10). Only 24 of 448 fit rows are
+   chain-bound, hence the sweep.
+
+**Pre-registered, before any new GPU data.** Fit sweep `bench/sweep_klb_calib.txt` and hold-out `bench/sweep_klb_holdout.txt`
+(committed with this section, the scorer and DESIGN §6c.10 in one commit, the first in `git log -- bench/sweep_klb_calib.txt`, before the first run; `bench/sweep_disjoint.py`: hold-out disjoint from the fit sweep and from every earlier
+sweep, by GEMM view). The hold-out is never used to fit or choose `kl.chain`. Bars, on the hold-out's REPEAT phase marks
+(`bench/perf_validate.py` per-phase), the candidate against the refit without the key by the same `perf_fit`:
+- **Scorer.** `bench/perf_score_kl.py` (committed with the sweeps, before the first run): per-phase signed and unsigned errors of KL
+  phases against the REPEAT marks for every call length (`perf_validate.py --phases` drops calls under 1 ms and reports unsigned
+  pooled errors, so it cannot score this), with filters nc / waves / g / grid, the chain arm / byte arm ratio of the candidate, and
+  per-shape and per-bin counts. Fit data of both fits (candidate and refit without the key): the shipped calibration's sweeps
+  (`sweep_calib.txt`, `sweep_cache.txt`), `sweep_calib_n.txt` and `sweep_klb_calib.txt`; never `sweep_klb_holdout.txt`,
+  `sweep_mc.txt` and `sweep_mc3a_holdout.txt` (the last two were seen by the offline analysis and are reported, not scored).
+  Phase marks are quantized at 1.024 µs; KL B phases are 13–40 µs.
+- **P1** narrow multi-pass KL B (nc ≥ 3, grid below 128 CTAs) on the hold-out: median |err| ≤ 10 %, p90 ≤ 20 %, and no signed
+  bias beyond ±5 % overall or in an nc bin pooled as {3}, {4}, {≥ 5}; a bin of fewer than 3 distinct shapes, and the waves and g bins
+  (waves is 1 when the grid is below 128 CTAs; the g rows are few), are reported, not scored. The risk is stated in advance: part
+  of the small-g miss is a g-independent per-chunk part, which the refit may put in `kl.wave`; if the signed bias at g = 3 / 6 then
+  exceeds 5 %, P1 fails and that is recorded, not adjusted.
+- **P2** every other KL phase (KL A, wide KL B, nc ≤ 2, the pack KL case) and every other class: median and p90 not worse by more than
+  1 point than the refit without the key; with `kl.chain` absent or 0 the prediction is bit-identical to the current library.
+- **P3** call level, REPEAT and COLD, before and after, on the hold-out, Q24 and the Jacobi view: reported with the per-phase
+  decomposition. The cancellation with KL A / K4's +9 % (§5.11) is expected to move COLD call errors negative (Jacobi ≈ +9 → ≈ −4 %,
+  q_kl2 N = 6 ≈ −10 → ≈ −17 %); the size-class targets of DESIGN §6c.5 must still hold on the v1.18 hold-out, or the shipping decision
+  goes to Eric with the numbers.
+- **P4** the chain is kept only if the fit's shape-blocked held-out error beats the fit without it; otherwise the key stays absent.
+- **P5** crossover: the hold-out rows whose chain arm / byte arm (the candidate's own arms) lies in [0.5, 2], at least 6 rows from at
+  least 3 shapes: median |err| ≤ 15 %; fewer rows is reported as "not tested". If it fails, the p-norm fallback of DESIGN §6c.10 is
+  designed (a further optional key, reviewed before use).
+- **If P1 or P2 fails** the key stays absent in the shipped calibration, the candidate and its numbers are recorded here as a negative
+  result, and the tests and the code path may stay only if inert (P2's bit-identity).
+- The `cold` group (`--l2 flush`) yields call totals only (the phase marks stay REPEAT state; the records' prediction state is CLEAN)
+  and is confounded by KF / K4 error: it is reported, and the cache credit is not changed on its evidence alone. `warm.kl_drop` is
+  re-scanned on the KL A marks alone after the chain is in, and stays 0 unless the scan shows a gain by the §5.11 rule.
+**Implemented (2026-10-12), before any sweep run.** `kl.chain` (KL slot 4), the max branch in `perf_phase_seconds`, `x[4]` of a KL
+phase filled only when `kl.chain` > 0, `perf_fit --kl-chain` (opt-in; the (byte rate, chain) scan with leave-one-shape-out
+selection, P4), `host_perf` v1.20 (1982 checks: bit-identity at 0, grammar, spec transcription of the features and the max form,
+clock scaling, locality, monotone scans; mutants with a sum instead of the max, `values` in the feature and an unscaled chain arm
+are caught) and `host_c_api`. A first fit on the SEEN data only (calibration, cache, Q24, sustained; not a result of this section,
+the hold-out is untouched): `kl.chain` 393 ns per unit, kept by the leave-one-shape-out rule (7.44 against 8.67), `kl.launch` /
+`kl.byte` / `kl.l2byte` / `kl.wave` 6500 ns / 0.00096 / 0.00031 / 2806 ns (the shipped 6609 / 0.001003 / 0.000361 / 2160), whereas
+the refit without the key moves `kl.wave` to 4453 ns and `kl.launch` to 5857 ns as §5.11 found; narrow KL B on the seen records
+(Q24 and Jacobi) 42.7 % with the shipped calibration, 18.2 % with the refit without the key, 6.2 % with the chain.
+
+**Run and verdict (2026-10-12; sweeps at commit 4c37dc1, machine quiet and the GPU lock free at the start).** Records in immerdink-eval
+`results/c1/klb/` (`klb_calib.jsonl` 69 ok calls, `klb_holdout.jsonl` 61 ok calls; 55 and 51 of them flagged `contaminated` by
+`warm_run.sh`'s 5 % spread rule, the usual state of 100 µs calls: Q24 had 38 of 43; median spread 10.9 % against Q24's 6.4 %, so
+the marks are noisier than Q24's), candidate and refit without the key (`candidate_chain.calib`, `refit_without_key.calib`, same fit
+data: calibration, cache, Q24, sustained, `klb_calib`), scorer output `score_holdout_*.txt`. The hold-out was not used to fit or choose.
+Candidate: `kl.chain` 320.5 ns per unit, kept by the leave-one-shape-out rule (10.88 against 12.31; 85 shapes); `kl.launch` 5902 ns, `kl.byte`
+0.000888, `kl.l2byte` 0.000217, `kl.wave` 3927 ns. The refit without the key moves `kl.wave` to 5537 ns, `kl.launch` to 5179 ns and `kl.byte` to
+0.000673.
+- **Narrow multi-pass KL B on the hold-out (n = 44, 17 shapes), median / p90 |err|, median signed:** shipped 41.7 / 51.8 %, −41.7 %; refit
+  without the key 6.3 / 17.7 %, −5.3 %; candidate 6.9 / 14.2 %, −6.9 %. The shipped model's defect is therefore mostly a coverage gap: with narrow
+  multi-pass packs in the fit set a plain refit also fits them on the hold-out. Bins of the candidate (signed): nc 3 −3.4 %, nc 4 −2.9 %, nc ≥ 5 −9.2 %;
+  arm ratio 0.5 .. 2 (16 rows, 9 shapes) 9.7 / 15.0 %, −9.7 %; ratio > 2 5.8 / 12.0 %, −5.6 %.
+- **P1: FAILS on its bias clause** (median 6.9 % ≤ 10 %, p90 14.2 % ≤ 20 % pass; signed bias −6.9 % overall and −9.2 % at nc ≥ 5, beyond ±5 %). Recorded, not
+  adjusted. The bias is negative and largest near the crossover and for deep chains, which is the hard max's known weak spot (DESIGN §6c.10).
+- **P2: met against the refit without the key** on what is measured: other KL phases on the hold-out 14.7 / 37.9 % against 15.6 / 38.4 % (all three calibrations
+  are about 14–17 % low on those, a KL A / cache-credit matter outside this change); the in-sample class table of the fit moves only in KL (median 7.7 against 9.1 %,
+  p90 20.4 against 21.6 %), the other classes are identical. Absent or 0 is bit-identical (`host_perf` v1.20). No per-class hold-out table beyond KL was
+  computed.
+- **P3 (call level, `perf_validate`, records' REPEAT state; COLD not run separately):** klb hold-out < 100 µs median / p90 17.6 / 29.9 % shipped
+  (target missed), 7.9 / 20.9 % refit without the key, 6.8 / 19.9 % candidate; 100 µs–1 ms 5.7 / 21.2 % (missed) → 2.8 / 12.4 % → 2.7 / 13.9 %. v1.18 hold-out
+  (no narrow multi-pass shape): all targets met by all three (≥ 1 ms 2.5 / 6.4 % shipped, 2.5 / 5.1 % refit without, 2.4 / 4.8 % candidate). Q24 + Jacobi (in the fit sets):
+  < 100 µs 25.0 / 28.6 % shipped (missed), 11.9 / 15.5 % refit without, 11.1 / 17.6 % candidate; ≥ 1 ms p90 7.0 % shipped, **18.3 % refit without the key (missed, the §5.11
+  distortion)**, 12.5 % candidate (met, but above the shipped 7.0 %).
+- **P4: passes. P5: passes** (9.7 % on 16 rows from 9 shapes, ≤ 15 %).
+- **Verdict.** By the pre-registered rule P1's failure keeps `kl.chain` out of the shipped calibration; the code (optional key, inert when absent) and the candidate stay. The
+  evidence for Eric's decision: the candidate fixes the < 1 ms calls as a refit would, without the ≥ 1 ms distortion of a refit without the key (18.3 against 12.5 % p90 on the
+  seen records), but it is biased 7–9 % low on narrow multi-pass KL B, and a plain refit that includes the new sweep is about as accurate on this hold-out (6.3 / 17.7 %). Shipping
+  either is a new calibration with its own review; M-c / M-d2 are not re-scored.
+
+**The two shipping checks (2026-10-12; immerdink-eval `scripts/c1/klb/cold_check.py`, `results/c1/klb/md2_predict_candidate.json`).**
+- **Cache state.** The records are REPEAT-warm calls, so the REPEAT-state prediction is the like-for-like one; predicting them in the COLD state is a different question. In REPEAT,
+  calls < 100 µs, median signed error shipped / refit without the key / candidate: klb hold-out −16.7 / −7.9 / −6.7 %, Q24 −25.1 / −12.5 / −11.3 %, Jacobi −15.8 / −11.9 / −9.6 %;
+  100 µs–1 ms and ≥ 1 ms within ±3.3 % for all; v1.18 hold-out unchanged (< 100 µs 3.7 / 4.0 / 4.0 %). COLD-state predictions of the same warm calls (not their state) go from
+  +10.5 / +6.0 / +20.0 % (klb hold-out / Q24 / Jacobi, < 100 µs, shipped) to +19.9 / +16.2 / +21.1 % (candidate): the cancellation with the KL A / K4 over-prediction (§5.11) is gone, as
+  expected, and a COLD prediction of a small call is now about 20 % high where it was 6–20 %. On the six `--l2 flush` calls of the fit sweep (inputs cold, CLEAN state; in the fit set,
+  n = 6): errors of the shipped model −5.4 … +4.9 % (median |err| 5.2 %), refit without the key −1.8 … +5.4 % (1.7 %), candidate −2.7 … +8.5 % (4.8 %): no better than shipped there, and
+  the cache credit under a chain arm is not examined by this (too few cold rows).
+- **M-d2 ratios predicted with the candidate against the recorded measurements (no GPU run: the ratios S14 / F14 of §5.12 are measured, only the prediction changes).** PPL view 0.7731
+  predicted against 0.7693 / 0.7688 measured (−0.5 %; the shipped bar 0.750: +2.6 %), DF 0.6650 against 0.6948 / 0.6977 (+4.5 / +4.9 %; shipped +4.7 / +5.2 %), 4096³ 0.6744 against
+  0.6957 / 0.6915 (+3.2 / +2.5 %; shipped +3.4 / +2.8 %), Jacobi view (reported) 0.8088 against 0.8290 / 0.8278 (+2.5 %; shipped 0.7865: +5.4 %); BURST / REPEAT 0.7634 (shipped 0.728).
+  All inside the registered bands. This re-scores nothing: M-d2's pass stays what §5.12 says, on the shipped calibration, and these systems are not a hold-out of the candidate.
+
+**Decision (Eric, 2026-10-12): P1's bias clause is waived and the candidate is shipped.** The bias (−6.9 % overall, −9.2 % at nc ≥ 5, against ±5 %) is
+recorded as a P1 failure and kept on the record; the grounds are the other bars (P2–P5), the two checks above and that the shipped model was −41.7 % on the same rows.
+The shipped file `src/host/calib/rtx4090_sm89.calib` is the candidate's fit (same data and flags as `candidate_chain.calib`: calibration, cache, Q24, `klb_calib`,
+sustained; `--kl-chain`; version `immerdink 09d7156`) with the bands and the rank tie ratio from the v1.18 hold-out (`perf_validate --bands`; the `klb` hold-out
+is not in the bands), sha256 `67791a4a…`. It is a whole refit, not a one-key change: besides `kl.*` and `kl.chain` (320.5 ns per unit), the effective L2 (30.2 → 22.6 MB),
+`pack.chain` (0.85 → 0), `pack.op`, `power.clock_eff_mhz` (2479 → 2519), `power.tc_pj`, `power.alu_pj`, `power.act_w` moved; the warm.* keys are unchanged. Consequences:
+the registered calibration of the M-d2 driver (`bench/accuracy/md2_time.py`, REGISTERED_CALIB) is no longer the shipped one, so a new M-d2 run needs a re-registration
+(the recorded M-d2 pass of §5.12 stands on its calibration); the marks `[M, model-only, outside hold-out]` are unchanged; COLD predictions of small warm calls are about 20 %
+high (see above), which is the end of the KL A / K4 cancellation, not a new error source.
+
+**M-d2 driver re-registered (2026-10-12).** `bench/accuracy/md2_time.py`: REGISTERED_CALIB is the shipped file's sha256 (`67791a4a…`); the bars are `predict`'s on it, rounded to 3 decimals:
+PPL view 0.773, DF 0.665, 4096³ 0.674 (bands [0.6571, 0.8], [0.5653, 0.7647], [0.5729, 0.7751]; p90 15 %), the Jacobi view (reported) 0.809, whose levels are now all in the
+100 µs – 1 ms class (p90 20 %, was 30 %). They were derived after the recorded pass of §5.12 (made on the previous calibration, bars 0.750 / 0.664 / 0.673 / 0.786) and are not used to
+re-score it; `judge` of this driver refuses the old `md2.jsonl` (calibration not the registered one), which stays the record of that pass. `selftest` 102 of 102, `predict` "bars reproduced".
+A new M-d2 run, if wanted, is judged by these bars, with the usual ordering rules and a fresh records file.
+
+The two-locked-clock pass needs the sudo clock lock (docs/BENCHMARKING.md): Eric's call, not run by an agent.
 
 ---
 

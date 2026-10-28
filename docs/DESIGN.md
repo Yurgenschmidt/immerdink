@@ -161,8 +161,8 @@ are NaN, but their payload and sign are unspecified.
 | `M_l, q_l` | `M_l = P/p_l` and `q_l = M_l⁻¹ mod p_l ∈ [1,p_l)`. Then `M_l q_l ≡ δ_lj (mod p_j)`. |
 | `T` | `⌊√H⌋`, the per-side norm budget. `T² ≤ H < (T+1)²`. |
 | `K_c` | `131071 = ⌊(2³¹−1)/128²⌋`. It is tight: `128²·(K_c+1) > 2³¹−1`. CUTLASS 2.x int8 MMA is `.satfinite` ([CUT] `mma_sm80.h`), so overflow **saturates silently**. **Every modulus, including p = 256, must be K-chunked.** The wraparound exemption [G8] relies on with cuBLAS does not apply here. **[spec: OzakiCRT ChunkFits, neg_chunk, neg_order]** |
-| `K_c'` | **[v1.13]** `131008 = ⌊K_c/64⌋·64 = 2047·64` is the chunk length used (it was `131056 = ⌊K_c/16⌋·16`). Numerically any chunk length ≤ K_c is exact. A multiple of 16 keeps CUTLASS pointers 16-byte aligned (correctness). A multiple of 64, K4's threadblock K tile, keeps every full chunk free of a residue tile, so a row's K4 load phase depends on k̂ alone (§4b, performance). 131008 is the largest such multiple ≤ K_c **[cert: cert_kc, cert_row_phase]**. |
-| `L_w` | Width of the **unsigned** CRT word, `32·L32` with `L32` minimal such that `2P ≤ 2^{L_w}`. `L32` = 1 for N ≤ 3, 2 for N ≤ 7, 3 for N ≤ 12, 4 for N ≤ 16, 5 for N ≤ 20. The bound is exact: the reachable peak needs every bit. |
+| `K_c'` | **[v1.13]** `131008 = ⌊K_c/64⌋·64 = 2047·64` is the chunk length used (it was `131056 = ⌊K_c/16⌋·16`). Numerically any chunk length ≤ K_c is exact. A multiple of 16 keeps CUTLASS pointers 16-byte aligned (correctness). A multiple of 64, K4's threadblock K tile, keeps every full chunk free of a residue tile, so a row's K4 load phase depends on k̂ alone (§4b, performance). 131008 is the largest such multiple ≤ K_c **[cert: cert_kc, cert_row_phase; proof: PROOFS R6 `chunk_constants`]**. |
+| `L_w` | Width of the **unsigned** CRT word, `32·L32` with `L32` minimal such that `2P ≤ 2^{L_w}`. `L32` = 1 for N ≤ 3, 2 for N ≤ 7, 3 for N ≤ 12, 4 for N ≤ 16, 5 for N ≤ 20. The bound is exact: the reachable peak needs every limb **[cert: cert_limbs, cert_crt_peak; proof: PROOFS R6 `L32_exact`, `peak_needs_every_limb`]**. |
 
 All constants are generated and checked by `spec/params.py` in exact integer arithmetic.
 It is the only producer of the device constant tables (`--emit-header`, which writes
@@ -191,21 +191,22 @@ significand:
    - Each term is computed **from integers**, as `ceil_shift(m_h², 2(e_h − γ) + F)`, never
      by FP scaling: `2^{−γ}` overflows, and ldexp underflows.
    - Any nonzero entry contributes at least 1.
-   - Terms are < 2⁶³. S is exact, order-independent, and fits uint128 for `k < 2⁶⁶`.
+   - Terms are < 2⁶³. S is exact, order-independent, and fits uint128 for `k < 2⁶⁶`
+     **[proof: PROOFS R3]**.
    - `‖x‖²·2^F ≤ S < ‖x‖²·2^F + k`.
 4. **Shift.** `σ = u − γ`, where `u` is the **largest integer** satisfying
    - RN: `4·S·4^u ≤ R·2^F`, with `R = (2T − κ)²`;
    - TRUNC: `S·4^u ≤ R·2^F`, with `R = T²`.
 
    Here `κ = ⌈√k⌉` is computed exactly in integers (`c = isqrt(k); κ = c + (c² < k)`).
-   Using `⌊√k⌋` is **unsound** **[spec: OzakiScaling neg_kappa_floor; cert]**.
+   Using `⌊√k⌋` is **unsound** **[spec: OzakiScaling neg_kappa_floor; cert; proof: PROOFS R1]**.
 
    Computing u:
    - R is a per-plan constant of at most 157 bits.
    - Estimate `c = (bitlen(R·2^F) − bitlen(LhsCoef·S) + 1) >> 1`. This must be an
      **arithmetic (floor) shift**, because the difference can be negative at real widths.
    - Then do one exact multi-word compare (about 220 bits at N = 20): `u = Rule(c) ? c : c−1`.
-   - **[spec: OzakiScaling ShiftIsMaximal, UOf; cert]**
+   - **[spec: OzakiScaling ShiftIsMaximal, UOf; cert; proof: PROOFS R2]**
 5. **Store.** `σ` is stored as int16.
    - The exact range is `[−1037, 1151]` for k ≤ 2⁴⁰, N = 2…20, both roundings.
    - `σ + τ ∈ [−2074, 2302]` also fits int16.
@@ -255,8 +256,8 @@ Why we deviate:
 
 ### 3.4 Residues
 - `r_l(a') = SMod(a', p_l) ∈ [−⌊p_l/2⌋, ⌈p_l/2⌉−1]`. This fits int8 (`[−128,127]` for
-  p = 256).
-- It is computed exactly as `SMod((μ mod p_l)·(2^ε mod p_l), p_l)`.
+  p = 256) **[proof: PROOFS R4]**.
+- It is computed exactly as `SMod((μ mod p_l)·(2^ε mod p_l), p_l)` **[proof: PROOFS R4]**.
   - `mod` here is the **non-negative** mathematical mod. C `%` on a negative μ is wrong.
   - It uses a `2^ε mod p_l` table.
 - Any exact reduction is allowed (Barrett, dp4a byte weights); only the congruence class
@@ -329,8 +330,8 @@ the lanes' distinct ε. The cost depended on the data (§6c "The eps path").
   needed.
   `r = s − p_l·umulhi(s, ⌈2³²/p_l⌉)` is the non-negative `s mod p_l` for every s < 2²⁴
   (the A5 `mod_p_bytes32` lemma: s·e < 2³² for e = ⌈2³²/p⌉·p − 2³² < p ≤ 256;
-  `mod_p_words32<W>`, device/modp.hpp). For p = 256 the weights are 1, 0, 0, …, so s is
-  the low byte and the quotient is 0.
+  `mod_p_words32<W>`, device/modp.hpp; **[proof: PROOFS R5 `mod_p_bytes32`]**). For p = 256
+  the weights are 1, 0, 0, …, so s is the low byte and the quotient is 0.
 - **Sign and SMod** as before (A5): `SMod(r)`, negated for a' < 0 (SMod(−r mod p) =
   −SMod(r) for odd p; both give the byte (−r) mod 256 for p = 256).
 - **The weights** (`PackWeights`, src/device/residue.hpp, `__constant__ c_pack_weights`) are
@@ -416,7 +417,7 @@ N = 13; the product A/B is in the v1.14 changelog entry.
   - **[v1.13]** For p = 256 the range is `[−2129666048, 2146435327]` (−128·127·K_c' and
     128²·K_c' + 255); it fits int32 **[cert: cert_kc]** **[spec: apalache Epilogue]**. With
     the old 131056 the maximum was 2147221759.
-- **Realization [cert: cert_barrett]:**
+- **Realization [cert: cert_barrett; proof: PROOFS R5 `barrett_epilogue`, `barrett_epilogue_v113`]:**
   - p = 256: `v & 255`;
   - otherwise: `n = v + bias` (u32, `bias = p·⌈2³¹/p⌉`), `q = umulhi64(⌈2⁶⁴/p⌉, n)`,
     `v mod p = n − p·q`.
@@ -428,20 +429,22 @@ N = 13; the product A/B is in the v1.14 changelog entry.
 ### 3.6 CRT reconstruction (exact, multi-word) — **[deviation from D10 as first stated]**
 ```
 x ← 0                                        (unsigned L_w-bit word: L32 little-endian u32 limbs)
-for l = 1..N:  y ← (q_l·W_l) mod p_l         (16-bit value; same umulhi64(⌈2⁶⁴/p⌉) reduction as §3.5)
+for l = 1..N:  y ← (q_l·W_l) mod p_l         (q_l·W_l < 2¹⁶; the 32-bit magic umulhi(·, ⌈2³²/p⌉), mod_p_small32)
                x ← x + M_l·y                 (one fused carry chain: t = x_k + M_l,k·y + carry in u64)
                if x ≥ P: x ← x − P           (invariant x < P; peak < 2P ≤ 2^{L_w})
 z ← (x ≤ H) ? x : x − P                      (z ∈ [H+1−P, H] = [−P/2, P/2−1])
 ```
 - `Σ_h|a'||b'| ≤ H` implies `z = (A'B')_īj̄` exactly; at H+1 this can fail.
   **[spec: OzakiCRT CRTExact, neg_bound; CRTRealization Refines (3 layers: exact CRT →
-  word → limbs); cert: cert_crt_peak, cert_crt_roundtrip; proof: PROOFS L2]**
+  word → limbs); cert: cert_crt_peak, cert_crt_roundtrip; proof: PROOFS L2, R6]**
 - The word is **unsigned**. A signed `__int128` would need `2P ≤ 2^{L_w−1}`, and signed
   overflow is UB.
 - In the centering step, compare the sign bit with the borrow-out
-  **[spec: CRTRealization pos_wordref_nosub]**.
+  **[spec: CRTRealization pos_wordref_nosub; proof: PROOFS R6 `center_word` (word form);
+  the device's sign-magnitude form (`crt_finish`: `neg = x > H`, `|z| = P − x`) is
+  `center_signmag`]**.
 - "No division" means no wide division. `x + M_l y = P` can never occur exactly, so `≥` and
-  `>` behave the same.
+  `>` behave the same **[proof: PROOFS R6 `xp_ne_P`]**.
 - [G8]'s Garner tree is an equivalent exact alternative. [OZ2]'s double-double FP
   reconstruction is superseded, and its error term R_64 disappears.
 
@@ -3034,6 +3037,7 @@ predicted 24 % low; refit on the v1.8 data: K5 phase median on ≥ 1 ms calls 8.
   meaning change is part of host API 11's change set):
   - the `op_eps` feature slots (`kf` slot 4, `kl` slot 4, `pack` slot 3) are always 0, and the
     chain features (`kf.chain`, `pack.chain`) no longer carry the (1 + f) factor;
+    [v1.20: `kl` slot 4 is `kl.chain`'s feature s when the calibration has `kl.chain` > 0, else 0; §6c.10]
   - `imd_perf_request_t.eps_fraction` and `imd_perf_rank_request_t.eps_fraction` are
     **validated as before** (< 0, or 0 … 1; NaN and > 1 are INVALID_VALUE) **and then ignored**;
   - `imd_perf_t.eps_s`, `.eps_fraction` and the rank candidates' `eps_s`, `eps_fraction` are
@@ -3753,7 +3757,7 @@ enum { IMD_PERF_ORDER_TIME = 0, IMD_PERF_ORDER_TIES_BY_FOOTPRINT = 1 };
 - **[v1.17] host API 12:** `imd_perf_calib_t` grows by `pack_l2_hit_bytes` (8 bytes, 3680 →
   3688); a struct of the v7–v11 size is read with it 0 (§6c.2). `imd_perf_param_name`
   returns `"elem"` for KF slot 4 and `"dram"` for PACK slot 3 (were `"op_eps"`) and NULL for
-  KL slot 4 (retired). Python: `Calibration.warm` has `"warm.pack_l2_bytes"`,
+  KL slot 4 (retired; v1.20: `"chain"`, §6c.10). Python: `Calibration.warm` has `"warm.pack_l2_bytes"`,
   `host.FORMAT2_PARAMS` has `kf.elem` and `pack.dram`; `host.API_VERSION` 12.
 - **[v1.18] host API 13:** `imd_perf_calib_t` grows by `clock_boost_mhz`, `power_act_w`,
   `power_act_gap_us`, `energy_dram_pj`, `warm_call_ns`, `warm_clean_byte_ns`,
@@ -4430,8 +4434,8 @@ the saving the model credits is C − R and the share the mark keeps is (C − m
   13.7 → 12.7 % at the best of them, with d = 0.75 (offline, KL class only, allowed records;
   `scripts/c1/mc3a/kl_cv.py`, diff of the trial in `results/c1/mc3a/chain_exploration.diff`).
   A feature restricted to underfilled launches would fit, but its switch breaks the monotonicity
-  of the prediction in the shape (a bigger shape would take less). So no second key; the
-  defect is recorded with its size and a trigger in NOTES-B2 §12 and §7 below, and tracked as
+  of the prediction in the shape (a bigger shape would take less). So no second key *in v1.19*; v1.20 (§6c.10) proposes a max form with a
+  values-independent feature; the defect is recorded with its size and a trigger in NOTES-B2 §12 and §7 below, and tracked as
   [GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog). The narrow packs
   of Q24 enter the refit, which absorbs part of it into `kl.wave` and `kl.launch` (NOTES-C1 §5.11
   reports by how much).
@@ -4447,6 +4451,67 @@ phase's REPEAT time is COLD − (1 − d)(COLD − REPEAT at d = 0), WARM = REPE
 read at its COLD time, COLD / CLEAN and every non-KL phase are unchanged (a mutant that applies
 the share to every phase, and one that ignores the key, are caught); `host_c_api`: the slot (95), the
 round trip, the three rejections.
+
+### 6c.10 The KL chain term, `kl.chain` **[v1.20, shipped 2026-10-12: NOTES-C1 §5.13]**
+
+Closes the open model defect of [GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7):
+KL B on the multi-pass launch (rows of three or more chunks, fewer CTAs than SMs) runs ×1.5–2.0
+its REPEAT prediction.
+
+- **Evidence.** On the shipped calibration's marks, KL B's measured time rises by about 0.9 µs per
+  modulus on the Jacobi view (nc = 4) and 0.64–0.68 µs on Q24 (nc = 3), against 0.18 µs
+  predicted for Jacobi (0.14 and 0.19 µs for q_kl1 and q_kl2); the wide launches of the fit
+  (which are DRAM-bound) show none of it. The time per `nc · g` unit is 209–229 ns on the KL B of
+  nc = 3 and 4. All of those are KL4 (`values` = 4), so the data cannot tell `nc · g` from
+  `nc · values · g` there (they differ by the constant 4); the choice rests on monotonicity and on
+  the work argument below, and the sweep's nc ≤ 2 rows (`values` = 8) are the data test. About
+  half of the excess at small g is independent of g (Jacobi: 10.7 µs at N = 4, of which 3.7 µs is
+  slope), a per-chunk part that a refit is expected to move into `kl.wave` (2.16 µs now); the
+  chain alone does not explain it, and the sweep's `g` group separates the two (NOTES-C1 §5.13).
+- **Model.** A KL phase costs
+  `launch + wave · w + l2byte · l2 + op · ops + max(byte · bytes, chain · s · scale)`,
+  `s = chain_of(grid, 1, tiles, nc · g, resident)` = waves · ceil(tiles / grid) · nc · g, the
+  busiest SM's serial (chunk, modulus) steps, `scale` the SM-clock scale of §6c.1. It is a work/span
+  bound, as K4's `max(round model, DRAM term)`: the chip's DRAM throughput against the critical
+  path of the busiest SM, whose memory latency a wide launch hides under its other CTAs and a
+  grid of fewer CTAs than SMs cannot. `wave` stays outside the max: put inside it, the refit moves
+  `launch`, `byte` and `l2byte` away from their fitted values (9.2 µs / 1.15 / 0.54 against 6.6 /
+  1.00 / 0.36) and puts nc = 1 launches in the chain-bound set.
+- **`values` is not in the feature.** `values` is 8 for nc ≤ 2 and 4 above, so `nc · values · g`
+  falls by 25 % at nc 2 → 3 while the bytes grow, which would let a bigger shape predict less.
+  `s` is non-decreasing in every plan input and the byte arm is too, so the max is.
+- **Key.** `kl.chain` (ns per unit), optional, format 2 only, in KL slot 4 (flat `param[16]`, the
+  slot of the retired `op_eps`; `kl.op_eps` stays accepted and discarded), ≥ 0, written only when
+  non-zero, taken as clock-bound (compute steps, as §6c.1's chain; an assumption the stock-clock sweeps
+  cannot test: the locked-clock pass is Eric's). Absent = 0 = the loop of §6c.1 unchanged, bit-identical predictions and
+  text, and `x[4]` of a KL phase is filled only when `kl.chain` > 0 (so the features `imd_perf_t`
+  returns, and the tests that read them, do not change for a file without the key);
+  `imd_perf_calib_t` and the host API version are unchanged; a library without the key
+  rejects a file that has it. `to_format1_params` zeroes it. One key for one physical effect
+  (§6c.5).
+- **Fit.** Not in the plain NNLS column set (a routine recalibration must not fit it: an additive
+  chain fits 0 or 6–13 ns per step on the calibration's wide launches). `perf_fit --kl-chain` scans
+  `(byte rate, chain)`, fits `launch, l2byte, wave` by NNLS on the remainder, takes the global
+  minimum of the relative squared error, and writes the key only if the shape-blocked held-out
+  error beats the fit without it. Opt-in, like `--kl-drop`.
+- **Not modeled / known weak spots.** Within a CTA load, sync and emit are serial, so near the
+  crossover the truth lies between the max and the sum (the hard max is low by up to half the
+  smaller arm at equal arms); no shipped fit row sits there, the fit sweep's `cross` group does. If
+  it shows a systematic error the fallback is one more optional key (a p-norm of the two arms). The
+  cache credit (§6c.8) is subtracted after the phase time; in a chain-bound phase the DRAM
+  saving may be hidden, which the `cold` group decides. KL A and K4's over-prediction (+9 % in
+  total) no longer cancels KL B's miss at the call total: the call-level effect is reported
+  before shipping (NOTES-C1 §5.13).
+- **Text to update with the code** (it says KL `x[4]` is always 0 and the sum has no max for KL):
+  `include/immerdink/immerdink_host.h` (the feature table and the `sum_j param * x` sentence, K4's
+  max only), §6c.1 (the feature table and the lines on the retired KL slot 4), §6c.2 (the slot
+  names: `imd_perf_param_name` returns NULL for KL slot 4 today and `kl.chain` after),
+  `kParamNames` / `kFormat2Param` / `optional_param` / `kClockBound` in `src/host/perf.cpp`,
+  `CLOCK_BOUND` in `bench/perf_fit.py` and `python/immerdink/host.py`.
+- **Tests** (`host_perf`, planned): absent or 0 bit-identical across shapes and regimes; grammar
+  and slot; only chain-bound KL phases change (the count on a recorded shape set); the monotone
+  scan (`k_hat` through nc 2 → 3 and the tile doublings, rows through 128 / 129 and 256 / 257
+  CTAs, g, N); the C and Python clock-bound tables agree.
 
 ---
 
@@ -5811,7 +5876,7 @@ calibration, which is per card (issue 23); for a borrowed table set the plan is 
 | Multi-N packs; round-to-odd reference-integer packs; lower-N planes from a higher-N pack (NOTES-C1 §3.1 A3, A4, A6) | A multi-N pack has the same bytes as separate packs and saves one FP64 read per pack creation, for N-set key semantics. A round-to-odd pack takes 5 / 8 / 9 / 11 B per element at N_max = 8 / 14 / 16 / 20 (≥ FP64 from N_max = 14), each call still reads ≥ 8 B per element, and it saves only the S pass that KL already fuses. Lower-N planes cannot come from a higher-N pack: σ depends on N, rounding is not modular, and the CRT over a prefix gives z mod P(N′) (PackedOperand `neg_n`). |
 | Choosing N on the device within a call | N fixes the launch sequence, the K5 instantiation, W, the workspace and σ itself, and kernel scope forbids the sync. N is chosen on the host per phase (§6g.10). |
 | Ozaki-I slice mode: prefix slices, one pack for every precision (C1(c), NOTES-C1 §2.9, §3.3) | Parked. Faster than Ozaki-II only on benign data below about 1e−8, break-even near 1e−10, 1.25–1.75× slower at FP64 level [E], no win beyond S = 2 slices on heavy-tailed rows; and no operand is needed at two N at once. **Triggers:** a consumer needs one operand at two or more precisions at once under memory pressure, or M-d measures phase-switch re-packs at ≥ 5 % of a phase. A revival must beat the prefix-plane option and the best configuration without slices (a shared pack, separate packs or in-line). On the DF-CCSD contraction set a pack serving every N could save nothing in the 12 forcing-rule cases with real operands (the best of those configurations is already at or below the ideal: each member at its own floor reading one pack) and up to 9.1 % per iteration with one member's floor a level apart (16.0 % at 8 against 14) in synthetic floor patterns [M, model-only, outside hold-out; the slice pack priced as an ordinary pack at the group's top floor, no slice per-call penalty; B roles of one-factor contractions in-line, bare-factor norms; NOTES-C1 §3.3, M-b]. The share-group raise cost (shared against separate packs) is not that bar. A revival builds its TLA+ then. |
-| **[v1.19]** KL B, the narrow operand's pack on the multi-pass launch (rows of three or more chunks, a grid of fewer CTAs than SMs): its time model (NOTES-C1 §5.9 MC-3a, §5.11; §6c.9) | **Open model defect** ([GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog)). Shipped model: ×1.50–1.81 its REPEAT and ×1.31–1.65 its COLD prediction on Q24's three narrow-KL shapes, ×1.65–2.02 on M-c's Jacobi view; after the MC-3a candidate refit (Q24 in the fit) −18 % median signed on the Jacobi view's KL B marks (12 % median \|error\| on the allowed narrow-KL records), partly hidden at the call total by a KL A / K4 over-prediction of +9 %. The compute chain `nc · values · g` fits Q24 at 57 ns per step but not the calibration's wide launches (6–13 ns), and an underfilled-only feature breaks monotonicity (§6c.9). **Trigger:** a consumer whose planner decision depends on a narrow-n KL call below about 150 µs (the shipped model is 25–45 % low on its KL B phase and 26–29 % low on its total), or a calibration sweep that adds narrow multi-pass KL packs (which would identify the feature), or an explicit decision to adopt the candidate calibration (the independent review of 2026-10-09, ruling A, declined: MC-3a did not pass). |
+| **[v1.19]** KL B, the narrow operand's pack on the multi-pass launch (rows of three or more chunks, a grid of fewer CTAs than SMs): its time model (NOTES-C1 §5.9 MC-3a, §5.11; §6c.9) | **Fixed in v1.20 (§6c.10, NOTES-C1 §5.13; the text below is the v1.19 record).** **Open model defect** ([GitHub issue #7](https://github.com/Yurgenschmidt/immerdink/issues/7) (label backlog)). Shipped model: ×1.50–1.81 its REPEAT and ×1.31–1.65 its COLD prediction on Q24's three narrow-KL shapes, ×1.65–2.02 on M-c's Jacobi view; after the MC-3a candidate refit (Q24 in the fit) −18 % median signed on the Jacobi view's KL B marks (12 % median \|error\| on the allowed narrow-KL records), partly hidden at the call total by a KL A / K4 over-prediction of +9 %. The compute chain `nc · values · g` fits Q24 at 57 ns per step but not the calibration's wide launches (6–13 ns), and an underfilled-only feature breaks monotonicity (§6c.9). **Trigger:** a consumer whose planner decision depends on a narrow-n KL call below about 150 µs (the shipped model is 25–45 % low on its KL B phase and 26–29 % low on its total), or a calibration sweep that adds narrow multi-pass KL packs (which would identify the feature), or an explicit decision to adopt the candidate calibration (the independent review of 2026-10-09, ruling A, declined: MC-3a did not pass). |
 | K5 statistics and a device a-posteriori certificate (lemma L6; NOTES-C1 stage 5) | Deferred: no consumer issues elementwise targets, and the host-side `rho_from_output` (§6g.11) gives a rigorous ρ now. **Triggers** (NOTES-C1 §4.6): T1, a consumer issues ELEMENTWISE requests per phase and the recipe's measured cost is ≥ 3 % of its run; T2, a consumer needs a rigorous per-call elementwise certificate on every call; T3, Eric asks for it. On a trigger it is built as NOTES-C1 §4.6 designs it, with its cost bar restated without `ncu` (compiler resource usage, the occupancy query and A/B timing; IR26). C1's definition of done does not need it (IR26, IR29). |
 | FP8 / INT4 paths | FP8 can't hold residues exactly at speed on Ada. INT4 forces p ≤ 16. |
 

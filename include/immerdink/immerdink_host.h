@@ -439,7 +439,8 @@ enum {
   IMD_PERF_CLASS_KF = 1,         /* (kf) fused small launch: launch, byte, op, row, elem
                                     (v12: the per-element chain), chain                     */
   IMD_PERF_CLASS_KL = 2,         /* (kl) fused large launch, imd_pack: launch, byte, op,
-                                    l2byte, -, wave                                         */
+                                    l2byte, chain (v1.20, optional key kl.chain: the busiest
+                                    SM's nc x g steps against the byte term), wave          */
   IMD_PERF_CLASS_PACK = 3,       /* (pack) K2 / K3, groups 2..: launch, byte, op, dram (v12:
                                     the bytes that are not L2-hit re-reads), chain, wave (the
                                     tile loads in sequence)                                  */
@@ -674,7 +675,8 @@ IMD_API const char* imd_perf_phase_name(int32_t phase);
  * emitter (§3.4.1) has no such path: every residue costs the same for every eps. Since API 11
  * eps_fraction in the requests is validated as before (< 0, or 0..1; NaN or > 1 is
  * INVALID_VALUE) and then IGNORED; eps_s and eps_fraction in the results are always 0; the
- * op_eps features (x[4] of kf / kl, x[3] of pack) are always 0. The fields stay for the ABI. */
+ * op_eps features (x[4] of kf, x[3] of pack, and x[4] of kl unless the calibration has the
+ * optional key kl.chain > 0, v1.20, DESIGN §6c.10) are always 0. The fields stay for the ABI. */
 
 /* What to predict beyond the options. NULL = flags 0, k4_config -1, eps_fraction -1 (ignored). */
 typedef struct {
@@ -696,7 +698,8 @@ typedef struct {
 } imd_perf_request_t;
 
 /* One phase: its features x (the model is sum_j param[cls * 6 + j] x[j]; K4: the max of the
- * terms j != 4 and the term j = 4; the op_eps features are 0 since API 11), its
+ * terms j != 4 and the term j = 4; KL with kl.chain > 0: the byte term j = 1 against the chain
+ * term j = 4, plus the others; the op_eps features are 0 since API 11), its
  * predicted time, and its MEMORY_MODEL §4 lower bound: bound_s = max(bytes / peak DRAM,
  * ops / peak). It has no struct_size: its layout (96 bytes) and IMD_PERF_MAX_PHASES are
  * FROZEN for host API version 6; a change would be a new struct and function names. */

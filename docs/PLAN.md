@@ -54,6 +54,16 @@ Spec follow-ups, to do before or alongside M2/M3 (see `spec/README.md`):
 
 **Exit:** all four lemmas machine-checked with no `sorry`. A CI target builds `proofs/`.
 **Status:** met. `tools/check_proofs.sh` passes; 71 headline theorems use only the standard axioms.
+**Issue #12 (2026-10-11):** the formalization is extended to cover:
+- the realization lemmas R1–R6 (κ and u as computed, S width, SMod and the int8 store, the
+  multiply-high reductions, the CRT word's exact peak, compare, wrap and centring, and the
+  20 design moduli);
+- L5, L6, and L7c's remaining forms;
+- the algorithm-level capstone at the real moduli with the shipped multipliers
+  (`Moduli.emulated_product_exact_shipped`).
+
+145 headline theorems use only the standard axioms. PROOFS "Formalization status" lists the
+remaining hypotheses and the unmodelled machine-level details.
 
 ## M0 — Scaffolding
 

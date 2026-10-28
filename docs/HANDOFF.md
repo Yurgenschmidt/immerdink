@@ -6,6 +6,11 @@ first.
 
 ## Where things stand
 
+- **Update 2026-10-12 (issue #7, DESIGN v1.20 §6c.10, NOTES-C1 §5.13):** the shipped calibration is refitted with the optional
+  key `kl.chain` (KL B / narrow multi-pass packs: a busiest-SM chain arm against the byte arm). Narrow multi-pass KL B on a fresh hold-out
+  41.7 % → 6.9 % median error; P1's bias clause failed and was waived by Eric. The M-d2 driver is re-registered on the new file (bars 0.773 / 0.665 / 0.674,
+  NOTES-C1 §5.13); the old `md2.jsonl` stays the record of the earlier pass. Records and fits: immerdink-eval `results/c1/klb/`. `perf_fit --kl-chain` is opt-in.
+
 - **Branches:** all work is on `dev` (pushed). `main` = PR #1 (v1.3 state); later work reaches
   main by another PR from dev. Never push to main directly.
 - **DESIGN v1.12** (v1.10 §6c performance-model follow-up, v1.11 §6e planner, v1.12 §6f accuracy-aware planning) (docs/DESIGN.md): v1.4 KF fused small path, v1.5 K4 configs and rule, v1.6
@@ -194,6 +199,17 @@ first.
     18 CPU-only tests: pass.
   - Evaluation records and summaries are in immerdink-eval `results/c1/` and
     `findings/c1-*.md`.
+- **Ozaki II proofs (issue #12, 2026-10-11, branch `12-ozaki-scheme-ii-proofs`):** the Lean
+  formalization now covers the realization lemmas PROOFS R1–R6 (`proofs/Proofs/{ShiftRule,
+  Residue,CRTWord,Moduli}.lean`), L5 and L6 (`KWeights.lean`, `Apost.lean`; the lemmas only, and
+  stages 4 and 5 stay closed / deferred), and L7c's remaining forms. The capstone at the real
+  moduli is `Moduli.emulated_product_exact_design`; with the multipliers checked in Lean it is
+  `emulated_product_exact_shipped`. The capstones are at the algorithm level. R5 and R6 prove
+  the machine-word steps separately; PROOFS "Formalization status" lists what is still unmodelled.
+  An independent review found nothing blocking, and its fixes are in. 145 headline theorems.
+  No TLA+ change: every new claim is arithmetic, and the protocol claims were already
+  model-checked. `tools/check_proofs.sh` also checks the Lean moduli against
+  `spec/params_out.json`.
 - **Verification on dev:** 8 CPU + 28 GPU ctest tests, 284 TLC models, 20 Apalache checks,
   oracle suite, 26 params certificates, all passing (b2-accuracy: 9 CPU + 29 GPU ctest tests, 27 certificates) (`tools/test.sh`, `spec/check.sh`,
   `spec/apalache/check.sh`, `spec/test_oracle.py`, `spec/params.py --check`).
