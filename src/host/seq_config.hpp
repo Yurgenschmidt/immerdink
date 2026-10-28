@@ -60,7 +60,7 @@ struct SeqClass {
 };
 constexpr SeqClass kSeqClasses[] = {
     {8, 9, kSeqEmit},  // RTX 4090: E1 (integer only; fewer instructions in every pack kernel counted). Q1 / F1 / the limb CRT would sit on a 1/64-rate FP64 pipe
-    {9, 0, kSeqEmit | kSeqFinish | kSeqLimbCrt | kSeqKlLoad | kSeqK5Fin},  // H100, H200: E1 + F1 + limb CRT + klload + k5fin = 173 (R2 chose 13; R4 added klload + k5fin, bit-identical; set 165 + crt f64 against 13 on both cards: 4096^3 N=14 1.07 / 1.05, 8192^3 N=14 1.05, N=8 8192 1.075, r_lowk 1.05, t_df 1.08; klwarp ties (KEEP) and klshape is 4-6% slower, so both stay off; docs/NOTES-24.md)
+    {9, 0, kSeqEmit | kSeqFinish | kSeqLimbCrt | kSeqKlWarp | kSeqKlLoad | kSeqK5Fin},  // H100, H200: E1 + F1 + limb CRT + klwarp + klload + k5fin = 189 (R2 chose 13; R4 added klload + k5fin = 173, bit-identical; R5 added klwarp, docs/NOTES-26.md; set 165 + crt f64 against 13 on both cards: 4096^3 N=14 1.07 / 1.05, 8192^3 N=14 1.05, N=8 8192 1.075, r_lowk 1.05, t_df 1.08; klshape is 4-6% slower and stays off; docs/NOTES-24.md)
 };
 
 constexpr int seq_default_for(int32_t cc_major, int32_t cc_minor) {

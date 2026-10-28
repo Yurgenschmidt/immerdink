@@ -102,6 +102,8 @@ def classify(name):
     """Category of one kernel (or memcpy / memset activity) name."""
     if name.startswith("[CUDA mem"):
         return "memcpy_memset"
+    if "device_kernel" in name and "K4ModEpilogue" in name:
+        return "int8_gemm"   # the Hopper wgmma K4 (src/k4/hopper): cutlass::device_kernel<GemmUniversal<..., K4ModEpilogue>>; the key rules cannot see its template arguments
     key = kernel_key(name)
     for cat, rx in _COMPILED:
         if rx.search(key):

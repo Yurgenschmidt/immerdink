@@ -1,0 +1,32 @@
+# R5 additions to the metrics sweep (run with SWEEPS="... extra", see bench/run_metrics.sh; NOT in the default list: a local RTX 4090 run never picks it up).
+# Purpose: numbers that the plain sweeps cannot give on a power-capped Hopper: same-job A/B ratios (interleaved, clock drift cancels), sustained
+# windows for the 8192+ squares (the single-run records there are flagged contaminated by the 700 W cap), N=8 against GEMMul8, and the 16384 square.
+# About 20-30 min per card.
+#   d_newold*   the new sm_90 default (seq 173 = 165 + the limb CRT) against the previous default (seq 5 + crt=f64 = set 13): R4 measured +4.7..7.5%
+#   d_twin4k    the default against its forced twin (seq 165, crt f64): expect 1.00 and equal c_hash
+#   d_klwarp*   the default against default + klwarp (forced twin seq 181 = 165 + 16, crt f64 = candidate set 189): R4 combination duel +2.8% at 4096 N=14; adopt if >= 1.02 on both cards with equal c_hash
+#   d_wgmma*    wgmma K4 (default on sm_90) against mma.sync (k4b=mma), same job: the number for "Closing the Hopper gap"
+# d_newold* / d_twin4k / d_wgmma* are Hopper measurements. On sm_120 (and sm_89) the forced seq 5 / 165 + crt=f64 puts the limb CRT on a 1/64-rate FP64 pipe (the
+# 'old default' side is then ~1.85x SLOWER than the class default at 1024^3 on the 4090) and k4b=mma equals the default: read those rows on Blackwell only as a
+# bit_identical check. The x_*, u_* and sq16384 lines are meaningful on every card with enough memory (16384^2 needs ~10 GB+: not for the 24 GB 4090 at N=14).
+#   name | einsum spec | extents | methods | N list | extra imd_bench args
+d_newold4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=5,crt=f64 --duel-b seq=default,crt=default --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_newold8k | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 14 | --duel-a seq=5,crt=f64 --duel-b seq=default,crt=default --reps 60 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_newold8k_n8 | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 8 | --duel-a seq=5,crt=f64 --duel-b seq=default,crt=default --reps 60 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_twin4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=165,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_klwarp4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_klwarp4k_n8 | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 8 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_klwarp8k | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 14 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 60 --warmup 10 --max-seconds 4 --samples 8192 --phase-reps 0 --keep-samples 1
+d_klwarp8k_n8 | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 8 | --duel-a seq=default,crt=default --duel-b seq=181,crt=f64 --reps 60 --warmup 10 --max-seconds 4 --samples 8192 --phase-reps 0 --keep-samples 1
+d_wgmma4k | ik,jk->ij | i=4096,j=4096,k=4096 | duel | 14 | --duel-a seq=default,crt=default,k4b=mma --duel-b seq=default,crt=default,k4b=default --reps 100 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+d_wgmma8k | ik,jk->ij | i=8192,j=8192,k=8192 | duel | 14 | --duel-a seq=default,crt=default,k4b=mma --duel-b seq=default,crt=default,k4b=default --reps 60 --warmup 10 --max-seconds 4 --samples 4096 --phase-reps 0 --keep-samples 1
+# immerdink against GEMMul8 fast at N=8 (and its N+1), interleaved (sweep_xduel.txt has the N=14 / 15 pairs)
+x_sq4096_n8 | ik,jk->ij | i=4096,j=4096,k=4096 | xduel | 8 | --xduel-b gemmul8:fast:8,gemmul8:fast:9 --reps 60 --warmup 5 --max-seconds 3 --samples 262144 --phase-reps 0 --keep-samples 1 --phi 0.5 --seed 1
+x_sq8192_n8 | ik,jk->ij | i=8192,j=8192,k=8192 | xduel | 8 | --xduel-b gemmul8:fast:8,gemmul8:fast:9 --reps 60 --warmup 5 --max-seconds 3 --samples 262144 --phase-reps 0 --keep-samples 1 --phi 0.5 --seed 1
+# sustained windows (60 s pre-heat on the same calls, then the measured window): the absolute large-square numbers without the single-run power-cap wander
+u_sq4096  | ik,jk->ij | i=4096,j=4096,k=4096    | sustained | 8,14 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2
+u_sq8192  | ik,jk->ij | i=8192,j=8192,k=8192    | sustained | 8,14 | --sustain-s 8 --sustain-warm-s 60 --sustain-trace-s 2
+u_sq16384 | ik,jk->ij | i=16384,j=16384,k=16384 | sustained | 8,14 | --sustain-s 10 --sustain-warm-s 60 --sustain-trace-s 2
+# the 16384 square (80/96 GB cards only; the 4090 does not run this sweep): immerdink alone, then against the baselines at the three N that matter
+sq16384_imd | ik,jk->ij | i=16384,j=16384,k=16384 | imd | 8,14 | --max-seconds 6
+sq16384 | ik,jk->ij | i=16384,j=16384,k=16384 | imd,gemmul8,emu,dgemm | | --phi 0.5 --reps 5 --warmup 2 --max-seconds 3 --samples 262144 --phase-reps 0 --N 8,14,15 --g8mode fast --g8fast-N 8,14,15 --emu fix55 --accuracy 0

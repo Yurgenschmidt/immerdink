@@ -35,3 +35,10 @@ t_df   | cutensor      | -
 t_df   | cutensor-emu  | -
 # does the cuBLAS emulation engage at the large size and on a batched case? (the identical-C check of bench/summarize.py
 # needs a dgemm record in the same process; here the nsys INT8-kernel check, engaged_int8, answers it)
+# R5: the competitors at the squares where the Hopper gap was analysed (GEMMul8 fast, cuBLAS emulation fix55): a measured phase split instead of a byte model
+sq4096 | gemmul8 | fast:8
+sq4096 | gemmul8 | fast:14
+sq8192 | gemmul8 | fast:8
+sq8192 | gemmul8 | fast:14
+sq4096 | emu | fix55
+sq8192 | emu | fix55
