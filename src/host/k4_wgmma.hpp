@@ -102,14 +102,18 @@ constexpr const char* k4_wgmma_illegal(const K4WgmmaLaunch& L) {
 
 // PROFITABILITY (the default; a forced backend skips it): serve a launch where the estimated wgmma time beats the mma.sync K4's with a
 // margin, per device class (docs/NOTES-22.md "Profitability rule": data, fit, validation, limits, how to re-fit; the constants are the
-// R3 floor sweep of H100 and H200, tools/fit_k4_wgmma_profit.py re-derives them). For a launch of T = tm * tn * zc output tiles (the 128 x 256
+// R3 floor sweep and the R4 floor refit of H100 and H200, tools/fit_k4_wgmma_profit.py re-derives them). For a launch of T = tm * tn * zc output tiles (the 128 x 256
 // CTA tile; the mma.sync K4 has the same tile) on a device of S SMs, kt = ceil(kc / 128) k steps, w = T / S (waves, fractional):
 //     delta_us = launch_us + w * (wave_us + wave_k_us * kt)        wgmma minus mma.sync (negative: wgmma faster)
 //     mma_us   = mma_wave_k_us * w * kt                            lower estimate of the mma.sync K4 time (no per-wave fixed cost)
-// served iff  m, nc >= min_mn  and  kc >= min_kc  and  T >= min_fill * S  and  -delta_us >= max(min_gain_us, min_gain_rel * mma_us).
+// served iff  m, nc >= min_mn  and  kc >= min_kc  and  T >= min_fill * S  and  (kt > 1 or T >= min_fill_k1 * S)
+//             and  -delta_us >= max(min_gain_us, min_gain_rel * mma_us).
 // The two margins are the conservatism: an absolute one (the model's launch-level residual, about a microsecond on the shapes at the
 // boundary) and one relative to the K4 time (a K4 gain of 10 % is about 2 % of a call whose K4 share is 20 %, the smallest share measured).
-// min_mn / min_kc are the measured envelope (smallest m and n-part 512, smallest K chunk 256): the linear model is not extrapolated below it.
+// min_mn / min_kc are the measured envelope (smallest m and n-part 256, smallest K chunk 128; R4: m = 128 ties at forced 1.00 where the model
+// predicts a gain, a 2 x 1 cluster over a single 128-row tile): the linear model is not extrapolated below it.
+// min_fill_k1: a launch of ONE k step (kc <= 128) is epilogue-bound, its measured launches have 1792 and 7168 tiles (13.6 and 54 waves), so
+// the model's small-launch behaviour is not measured there: such a launch is served only from 8 waves (a prior, like min_fill).
 // min_fill is a prior and not a fit: a launch with fewer tiles than half the SMs leaves most of the persistent 2x1-cluster grid idle; the
 // one loser measured (1024^3, one modulus per launch, 32 tiles = 0.24 of the SMs) lies below it, the nearest winner (72 tiles) above.
 struct K4WgmmaProfit {
@@ -121,13 +125,14 @@ struct K4WgmmaProfit {
   double min_gain_us;      // absolute margin per launch
   double min_gain_rel;     // margin relative to mma_us
   double min_fill;         // fewest tiles per launch, as a fraction of the SMs
+  double min_fill_k1;      // the same for a launch of one k step (kc <= 128), as a fraction of the SMs
   int64_t min_mn;          // fewest rows m and columns of the n-part (the measured envelope)
   int64_t min_kc;          // shortest K chunk (the measured envelope)
 };
 // One row per table set, like kK4WgmmaTable; the sm_89 row has no backend and so no rule. H100 and H200 share the sm_90 row (fit on both).
 constexpr K4WgmmaProfit kK4WgmmaProfit[IMD_TABLE_COUNT] = {
-    {false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0},                    // IMD_TABLE_SM89
-    {true, 2.40, -0.57, -0.51, 1.13, 0.75, 0.10, 0.5, 512, 256},        // IMD_TABLE_SM90 (R3, 19 shapes x 2 cards, N = 14)
+    {false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0},                // IMD_TABLE_SM89
+    {true, 1.98, -0.45, -0.53, 1.13, 0.75, 0.10, 0.5, 8.0, 256, 128},     // IMD_TABLE_SM90 (R4 floor.refit, 41 shapes x 2 cards, N = 14; R3 constants were 2.40 -0.57 -0.51, min_mn 512, min_kc 256)
 };
 constexpr int kK4WgmmaDefaultSms = 132;  // used when the plan does not know the SM count
 
@@ -146,7 +151,7 @@ constexpr K4WgmmaEstimate k4_wgmma_estimate(const K4WgmmaLaunch& L, const K4Wgmm
   e.delta_us = P.launch_us + w * (P.wave_us + P.wave_k_us * kt);
   e.mma_us = P.mma_wave_k_us * w * kt;
   e.envelope_ok = L.m >= P.min_mn && L.nc >= P.min_mn && L.kc >= P.min_kc;
-  e.fill_ok = tiles >= P.min_fill * sms;
+  e.fill_ok = tiles >= P.min_fill * sms && (kt > 1.0 || tiles >= P.min_fill_k1 * sms);
   const double need = P.min_gain_us > P.min_gain_rel * e.mma_us ? P.min_gain_us : P.min_gain_rel * e.mma_us;
   e.serve = P.enabled && e.envelope_ok && e.fill_ok && -e.delta_us >= need;
   return e;
