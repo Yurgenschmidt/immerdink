@@ -26,40 +26,35 @@ fi
 # Desktop renderers (the Claude app, gnome-shell) time-slice the GPU in ~2.2 ms slices when
 # they have work queued, costing a running kernel 0.4-0.5 ms per switch (docs/NOTES-K5-bimodal.md).
 # A clean run's timed-loop spread is small (<= ~2.3 % on medium/large shapes); a contaminated
-# one is >= ~8.7 %. So each case runs into a scratch file and is retried (up to
-# BENCH_RETRIES, default 3) while any record's spread_pct exceeds BENCH_MAX_SPREAD (default 5);
-# the attempt with the smallest worst spread is kept, and every record gets "attempts" and
-# "contaminated" (true if even the best attempt is above the threshold). Tiny shapes (tens of
-# µs) can stay above it from jitter alone; read their flag with that in mind.
-max_spread="${BENCH_MAX_SPREAD:-5}"; retries="${BENCH_RETRIES:-3}"
+# one is >= ~8.7 %. So each case runs into a scratch file and is retried (up to BENCH_RETRIES,
+# default 3) while more than BENCH_MAX_BAD_FRAC (default 0.1) of its records have a spread_pct above
+# BENCH_MAX_SPREAD (default 5): one noisy record among the 24 to 51 configurations of a compare case
+# does not re-run the whole case. The attempt kept has the most status-ok records (a crashed attempt
+# is a prefix of a full one and must not win), then the smaller fraction of noisy records, then the
+# smaller worst spread. An attempt without any record (crash before the first result) is retried.
+# Every record gets "attempts" and "contaminated": true for a record above the limit and, when the
+# kept attempt still has more than BENCH_MAX_BAD_FRAC noisy records (the case as a whole is
+# disturbed), for all of its records. Tiny shapes (tens of µs) can stay above the limit from jitter
+# alone; read their flag with that in mind.
+max_spread="${BENCH_MAX_SPREAD:-5}"; retries="${BENCH_RETRIES:-3}"; max_bad="${BENCH_MAX_BAD_FRAC:-0.1}"
 if [ -z "$out" ]; then "$bench" "$@"; exit $?; fi
-tmpd="$(mktemp -d)"; best=""; best_w=""; rc=0
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+pick="$here/warm_run_pick.py"
+tmpd="$(mktemp -d)"; best=""; best_key=""; best_bad=1; rc=0
 for ((a = 1; a <= retries; a++)); do
   f="$tmpd/a$a.jsonl"; newargs=()
   for ((i = 0; i < ${#args[@]}; i++)); do
     if [ "${args[$i]}" = --out ]; then newargs+=(--out "$f"); i=$((i + 1)); else newargs+=("${args[$i]}"); fi
   done
   "$bench" "${newargs[@]}"; rc=$?
-  w="$(python3 -c 'import json,sys
-m=0.0
-for l in open(sys.argv[1]):
-    d=json.loads(l)
-    if d.get("status")=="ok" and "spread_pct" in d: m=max(m,float(d["spread_pct"]))
-print(m)' "$f" 2>/dev/null || echo 999)"
-  if [ -z "$best" ] || python3 -c "import sys; sys.exit(0 if float('$w') < float('$best_w') else 1)"; then best="$f"; best_w="$w"; fi
-  python3 -c "import sys; sys.exit(0 if float('$w') <= float('$max_spread') else 1)" && break
-  echo "warm_run: $name attempt $a worst spread ${w}% > ${max_spread}%; retrying" >&2
+  read -r n_rec n_ok bad_frac w <<<"$(python3 -I "$pick" score "$f" "$max_spread" 2>/dev/null || echo '0 0 1 999')"
+  cur="$n_ok $bad_frac $w"
+  if [ -z "$best" ] || python3 -I "$pick" better "$cur" "$best_key"; then best="$f"; best_key="$cur"; best_bad="$bad_frac"; fi
+  [ "$n_rec" -gt 0 ] && python3 -c "import sys; sys.exit(0 if float('$bad_frac') <= float('$max_bad') else 1)" && break
+  echo "warm_run: $name attempt $a: $n_ok ok record(s), fraction of records above ${max_spread}% spread $bad_frac (worst ${w}%); retrying" >&2
 done
 attempts=$(( a > retries ? retries : a ))
-python3 - "$best" "$out" "$attempts" "$best_w" "$max_spread" <<'PY'
-import json, sys
-src, dst, attempts, worst, lim = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])
-with open(dst, "a") as o:
-    for l in open(src):
-        d = json.loads(l)
-        d["attempts"] = attempts; d["contaminated"] = worst > lim
-        o.write(json.dumps(d) + "\n")
-PY
+if [ -f "$best" ]; then python3 -I "$pick" finalize "$best" "$out" "$attempts" "$best_bad" "$max_bad" "$max_spread"; fi
 rm -rf "$tmpd"
 
 if [ -n "$out" ] && command -v nvidia-smi >/dev/null; then

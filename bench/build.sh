@@ -14,7 +14,12 @@
 #   CUTENSOR_ROOT          (or CUTENSOR_DIR / CUTENSOR_HOME) a cuTENSOR install (include/cutensor.h, lib/libcutensor.so);
 #                          optional: enables the cutensor / cutensor-emu baselines (also found in the CUDA
 #                          toolkit and the conda env)
+#   GEMMUL8_DIR            a GEMMul8 install (include/gemmul8.hpp, lib/libgemmul8.a), as printed by
+#                          bench/build_gemmul8.sh: optional, enables the gemmul8 baseline (pinned version in
+#                          bench/GEMMUL8_PIN); without it that method is compiled out
+#   (cuBLAS is always linked: methods dgemm and, with a CUDA 13 cuBLAS, emu)
 #   IMMERDINK_LIBRARY      link this prebuilt libimmerdink.so instead of building one
+#   WITH_CEILING=1         also build imd_ceiling (INT8 ceilings, bench/ceiling; a Hopper build compiles it for sm_90a)
 # The build is CPU-heavy: it runs under nice and takes the machine-wide benchmark lock,
 # so it never overlaps a gated timing run; it runs inside tools/memcap.sh with at most 4 jobs.
 set -euo pipefail
@@ -25,6 +30,9 @@ build="${IMMERDINK_BENCH_BUILD:-$root/build/bench}"
 cfg=(-S "$here" -B "$build")
 if [ -x "$env_dir/bin/nvcc" ]; then
   export PATH="$env_dir/bin:$PATH" CONDA_PREFIX="$env_dir"
+  # a loaded gcc module exports GCC_EXEC_PREFIX / COMPILER_PATH; with them set the env's g++ looks for cc1plus in the
+  # module's tree and fails ("cannot execute cc1plus"): the env toolchain must not see them
+  unset GCC_EXEC_PREFIX COMPILER_PATH
   cfg+=(-DCMAKE_C_COMPILER="$env_dir/bin/gcc" -DCMAKE_CXX_COMPILER="$env_dir/bin/g++"
         -DCMAKE_CUDA_COMPILER="$env_dir/bin/nvcc" -DCMAKE_CUDA_HOST_COMPILER="$env_dir/bin/g++"
         -DPython3_EXECUTABLE="$env_dir/bin/python3")
@@ -50,9 +58,21 @@ fi
 [ -n "${IMMERDINK_CUTLASS_DIR:-}" ] && cfg+=(-DIMMERDINK_CUTLASS_DIR="$IMMERDINK_CUTLASS_DIR")
 [ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ] && cfg+=(-DCMAKE_CUDA_ARCHITECTURES="$CMAKE_CUDA_ARCHITECTURES")
 [ -n "${IMMERDINK_LIBRARY:-}" ] && cfg+=(-DIMMERDINK_LIBRARY="$IMMERDINK_LIBRARY")
+if [ -n "${GEMMUL8_DIR:-}" ]; then
+  [ -f "$GEMMUL8_DIR/lib/libgemmul8.a" ] && [ -f "$GEMMUL8_DIR/include/gemmul8.hpp" ] \
+    || { echo "GEMMUL8_DIR=$GEMMUL8_DIR has no lib/libgemmul8.a or include/gemmul8.hpp (bench/build_gemmul8.sh builds one)" >&2; exit 2; }
+  cfg+=(-DGEMMUL8_DIR="$GEMMUL8_DIR")
+  echo "build: GEMMul8 baseline from $GEMMUL8_DIR"
+else
+  cfg+=(-UGEMMUL8_DIR)   # a cached value from an earlier configure must not leak into this build
+  echo "build: GEMMUL8_DIR not set: method gemmul8 is compiled out"
+fi
 
 exec 9>"${TLC_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/immerdink-tlc.lock}"
 flock 9
 cmake "${cfg[@]}"
-nice -n 19 "$root/tools/memcap.sh" cmake --build "$build" --target imd_bench -j "$(( ${JOBS:-4} < 4 ? ${JOBS:-4} : 4 ))"
+targets=(--target imd_bench)
+if [ "${WITH_CEILING:-0}" = 1 ]; then targets+=(--target imd_ceiling); fi    # issue 16: the INT8 ceilings (bench/ceiling)
+nice -n 19 "$root/tools/memcap.sh" cmake --build "$build" "${targets[@]}" -j "$(( ${JOBS:-4} < 4 ? ${JOBS:-4} : 4 ))"
 echo "built: $build/imd_bench"
+if [ "${WITH_CEILING:-0}" = 1 ]; then echo "built: $build/imd_ceiling"; fi

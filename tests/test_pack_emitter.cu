@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -44,7 +45,7 @@ __extension__ typedef unsigned __int128 u128;
     }                                                                              \
   } while (0)
 
-template <int E, int W>
+template <int E, int W, int S, int Mut, int StMut>
 __global__ void emit_kernel(const uint64_t* bits, const int* sigma, int threads, int N, bool trunc,
                             int8_t* out) {
   const int t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -52,10 +53,13 @@ __global__ void emit_kernel(const uint64_t* bits, const int* sigma, int threads,
   uint64_t b[E];
 #pragma unroll
   for (int e = 0; e < E; ++e) b[e] = bits[int64_t{t} * E + e];
-  imd::kernels::PackEmitterT<E, W> em;
+  imd::kernels::PackEmitterT<E, W, S, Mut> em;
   em.load(b, sigma[t], trunc);
   const int64_t plane = int64_t{threads} * E;
-  for (int l = 0; l < N; ++l) em.store(l, out + l * plane + int64_t{t} * E);
+  // store_slots (the launches' addressing) in two parts, so that a start slot other than 0 is exercised too
+  const int split = N / 3;
+  imd::kernels::store_slots<decltype(em), StMut>(em, 0, split, N, out + int64_t{t} * E, plane);
+  imd::kernels::store_slots<decltype(em), StMut>(em, 0, 0, split, out + int64_t{t} * E, plane);
 }
 
 uint64_t xs(uint64_t& x) {
@@ -166,6 +170,23 @@ void gen_thread(int N, int mode, int E, bool trunc, uint64_t& rng, int* sigma,
       if (s >= 0 && m < (uint64_t{1} << 52)) s = -1;                  // keep m normal
       el[e] = make(m, s - *sigma, (r >> 62) & 1);
     }
+  } else if (mode == 3) {  // issue 21: the certified sigma range (Q1's two power-of-two factors), any value the contract allows
+    static const int sg[] = {c::kSigmaMin, c::kSigmaMin + 1, -1000, -513, -512, -2, -1, 0, 1, 2, 511, 512, 1000, 1074, c::kSigmaMax - 1, c::kSigmaMax};
+    *sigma = sg[xs(rng) % (sizeof sg / sizeof sg[0])];
+    for (int e = 0; e < E; ++e) {
+      const uint64_t r = xs(rng);
+      const int te = static_cast<int>(r % static_cast<uint64_t>(tb + 4)) - 3;  // target bit position of |a'|
+      const int ex = te - *sigma;                                          // exponent of the double's top bit
+      uint64_t m = (xs(rng) & ((uint64_t{1} << 52) - 1)) | (uint64_t{1} << 52);
+      if ((r >> 20) % 4 == 0) m = (uint64_t{1} << 53) - 1;
+      if (ex < -1022) {                                                    // a subnormal (or 0 below the grid)
+        const int sh = -1022 - ex;
+        const uint64_t f = sh > 52 ? 0 : m >> sh;
+        el[e] = f == 0 ? 0 : (f | (((r >> 62) & 1) << 63));
+      }
+      else if (ex > 1023) el[e] = 0x7FEFFFFFFFFFFFFFull;                   // the largest double
+      else el[e] = make(m, ex - 52, (r >> 62) & 1);
+    }
   } else {  // T's top 53 bits; 2^53 - 1 and the tie that rounds to 2^53
     *sigma = 1000;
     for (int e = 0; e < E; ++e) {
@@ -213,14 +234,17 @@ void gen_thread(int N, int mode, int E, bool trunc, uint64_t& rng, int* sigma,
   }
 }
 
-template <int E, int W>
+bool g_quiet = false;  // the mutation checks expect mismatches
+Coverage g_scratch;  // coverage of the non-baseline sequences is not asserted (their inputs are the baseline's)
+
+template <int E, int W, int S, int Mut = 0, int StMut = 0>
 long run(int N, bool trunc, int threads, uint64_t seed, Coverage& cov, long* checked) {
   uint64_t rng = seed;
   std::vector<uint64_t> bits;
   std::vector<int> sig(threads);
   bits.reserve(static_cast<size_t>(threads) * E);
   for (int t = 0; t < threads; ++t)
-    gen_thread(N, t % 3, E, trunc, rng, &sig[t], bits, cov, t / 3);
+    gen_thread(N, t % 4, E, trunc, rng, &sig[t], bits, cov, t / 4);
   uint64_t* d_bits;
   int* d_sig;
   int8_t* d_out;
@@ -231,7 +255,7 @@ long run(int N, bool trunc, int threads, uint64_t seed, Coverage& cov, long* che
   CUDA_CHECK(cudaMemcpy(d_bits, bits.data(), bits.size() * 8, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_sig, sig.data(), sig.size() * sizeof(int), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemset(d_out, 0x5A, plane * N));
-  emit_kernel<E, W><<<(threads + 127) / 128, 128>>>(d_bits, d_sig, threads, N, trunc, d_out);
+  emit_kernel<E, W, S, Mut, StMut><<<(threads + 127) / 128, 128>>>(d_bits, d_sig, threads, N, trunc, d_out);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());  // a device assert surfaces here
   std::vector<int8_t> out(plane * N);
@@ -249,9 +273,9 @@ long run(int N, bool trunc, int threads, uint64_t seed, Coverage& cov, long* che
         const int8_t want = ref_res(b, a, c::kTables.moduli[l]);
         const int8_t got = out[l * plane + static_cast<size_t>(t) * E + e];
         if (got != want) {
-          if (bad < 5)
-            std::fprintf(stderr, "  N=%d E=%d W=%d %s t=%d e=%d l=%d x=0x%016llx sigma=%d eps=%d: "
-                         "got %d want %d\n", N, E, W, trunc ? "TRUNC" : "RN", t, e, l,
+          if (bad < 5 && !g_quiet)
+            std::fprintf(stderr, "  N=%d E=%d W=%d S=%d %s t=%d e=%d l=%d x=0x%016llx sigma=%d eps=%d: "
+                         "got %d want %d\n", N, E, W, S, trunc ? "TRUNC" : "RN", t, e, l,
                          static_cast<unsigned long long>(b), sig[t], eps, got, want);
           ++bad;
         }
@@ -264,11 +288,134 @@ long run(int N, bool trunc, int threads, uint64_t seed, Coverage& cov, long* che
 template <int E>
 long run_n(int N, bool trunc, int threads, uint64_t seed, Coverage* cov, long* checked) {
   // cov[W - 1]: the run with W words, for every W >= W(N) (W = 3 is valid at every N, W = 2
-  // at N <= 16); coverage is checked per W.
-  long bad = run<E, 3>(N, trunc, threads, seed, cov[2], checked);
-  if (imd::kernels::pack_words(N) == 2)
-    bad += run<E, 2>(N, trunc, threads, seed + 1, cov[1], checked);
+  // at N <= 16); coverage is checked per W (baseline sequence). Issue 21: the same inputs through the
+  // other instruction sequences (S = 1 the E1 emitter, S = 3 E1 + Q1 quantize, W = 2 only).
+  long bad = run<E, 3, 0>(N, trunc, threads, seed, cov[2], checked);
+  bad += run<E, 3, 1>(N, trunc, threads, seed, g_scratch, checked);
+  if (imd::kernels::pack_words(N) == 2) {
+    bad += run<E, 2, 0>(N, trunc, threads, seed + 1, cov[1], checked);
+    bad += run<E, 2, 1>(N, trunc, threads, seed + 1, g_scratch, checked);
+    bad += run<E, 2, 3>(N, trunc, threads, seed + 1, g_scratch, checked);
+  }
   return bad;
+}
+
+
+// ---- Issue 21, sequence E1: the fused emitter on EVERY reduced value d = sum_j dp4a(x_j, w_j) --------------------------
+// pack_smod (modp.hpp), the function PackEmitterT<.., S & 1> runs, on the real __constant__ table c_pack_emit, for every
+// d in [0, dmax(W, l)], both signs, every modulus and both word counts (11.4 M values), against SMod((sigma d) mod p).
+// dmax comes from the weights computed here by repeated doubling, not from the table under test.
+template <int W>
+__global__ void d_kernel(int l, uint32_t dmax, int8_t* out) {
+  const imd::device::PackEmit& c = imd::device::c_pack_emit.e[W - 2][l];
+  for (uint32_t d = blockIdx.x * blockDim.x + threadIdx.x; d <= dmax; d += gridDim.x * blockDim.x) {
+    out[d] = static_cast<int8_t>(imd::device::pack_smod(d, 1u, c));
+    out[dmax + 1 + d] = static_cast<int8_t>(imd::device::pack_smod(d, 0xFFFFFFFFu, c));
+  }
+}
+
+template <int W>
+long check_d(int l, int8_t* d_out, std::vector<int8_t>& h) {
+  const uint32_t p = c::kTables.moduli[l];
+  uint32_t pw = 1 % p, dmax = 0;
+  for (int i = 0; i < 4 * W; ++i) {
+    if (!(W == 3 && i >= 10)) dmax += 255u * pw;
+    for (int k = 0; k < 8; ++k) pw = (2 * pw) % p;
+  }
+  d_kernel<W><<<256, 256>>>(l, dmax, d_out);
+  CUDA_CHECK(cudaGetLastError());
+  h.resize(2 * (static_cast<size_t>(dmax) + 1));
+  CUDA_CHECK(cudaMemcpy(h.data(), d_out, h.size(), cudaMemcpyDeviceToHost));
+  long bad = 0;
+  const int32_t half = static_cast<int32_t>(p / 2);
+  for (uint32_t d = 0; d <= dmax; ++d)
+    for (int sg = 0; sg < 2; ++sg) {
+      const int64_t v = sg == 0 ? static_cast<int64_t>(d) : -static_cast<int64_t>(d);
+      int32_t r = static_cast<int32_t>(((v % static_cast<int64_t>(p)) + p) % p);
+      int32_t u = r >= (static_cast<int32_t>(p) + 1) / 2 ? r - static_cast<int32_t>(p) : r;  // SMod
+      (void)half;
+      if (h[sg * (static_cast<size_t>(dmax) + 1) + d] != static_cast<int8_t>(u)) ++bad;
+    }
+  return bad;
+}
+
+long check_all_d(long* total) {
+  int8_t* d_out;
+  CUDA_CHECK(cudaMalloc(&d_out, 2 * 12 * 255 * 255 + 64));
+  std::vector<int8_t> h;
+  long bad = 0;
+  for (int l = 0; l < c::kNMax; ++l) {
+    bad += check_d<3>(l, d_out, h), *total += static_cast<long>(h.size());
+    if (l < 16) bad += check_d<2>(l, d_out, h), *total += static_cast<long>(h.size());
+  }
+  CUDA_CHECK(cudaFree(d_out));
+  return bad;
+}
+
+// Mutations of the real constants (cudaMemcpyToSymbol on this TU's copy of c_pack_emit): each one must be caught by the
+// d sweep or by the end-to-end X -> byte runs above. A check that cannot fail checks nothing.
+int mutation_checks() {
+  imd::device::PackEmitTable good = imd::device::kPackEmit;
+  enum Kind { kHmMinus, kM32Minus, kCMinusP, kNegpPlus, kWeightPlus, kCPlus, kHmPlus };
+  struct Mut { const char* what; Kind kind; int w, l; };
+  const Mut muts[] = {{"hm - m32 (h one too small)", kHmMinus, 3, 5}, {"m32 - 1", kM32Minus, 3, 9},
+                      {"C - p (C < dmax)", kCMinusP, 3, 3}, {"negp + 1", kNegpPlus, 2, 0},
+                      {"weight lane +1", kWeightPlus, 3, 7}, {"C + 1 (not a multiple of p)", kCPlus, 2, 12},
+                      {"hm + m32 (h one too large), p = 256", kHmPlus, 3, 19},
+                      {"weight lane +1, W = 2", kWeightPlus, 2, 10},
+                      {"m32 - 1, p = 256 (the low-byte path)", kM32Minus, 3, 19},
+                      {"C - p, p = 256", kCMinusP, 3, 19}};
+  int fails = 0;
+  g_quiet = true;
+  int8_t* d_out;
+  CUDA_CHECK(cudaMalloc(&d_out, 2 * 12 * 255 * 255 + 64));
+  std::vector<int8_t> h;
+  for (const Mut& m : muts) {
+    imd::device::PackEmitTable t = good;
+    imd::device::PackEmit& e = t.e[m.w - 2][m.l];
+    switch (m.kind) {
+      case kHmMinus: e.hm -= e.m32; break;
+      case kM32Minus: e.m32 -= 1; break;
+      case kCMinusP: e.C -= 0u - e.negp; break;
+      case kNegpPlus: e.negp += 1; break;
+      case kWeightPlus: e.w[1] += 1; break;
+      case kCPlus: e.C += 1; break;
+      case kHmPlus: e.hm += e.m32; break;
+    }
+    CUDA_CHECK(cudaMemcpyToSymbol(imd::device::c_pack_emit, &t, sizeof t));
+    long bad = m.w == 3 ? check_d<3>(m.l, d_out, h) : check_d<2>(m.l, d_out, h);
+    long checked = 0;
+    Coverage cv;
+    cv.eps.assign(c::kEpsMax + 1, 0);
+    const int N = 20;
+    bad += m.w == 3 ? run<16, 3, 1>(N, false, 4 * 1024, 77, cv, &checked) : run<16, 2, 1>(16, false, 4 * 1024, 78, cv, &checked);
+    std::printf("mutation \"%s\" (W=%d, modulus %d): %s (%ld mismatches)\n", m.what, m.w, m.l, bad ? "caught" : "NOT CAUGHT", bad);
+    fails += bad == 0;
+  }
+  CUDA_CHECK(cudaMemcpyToSymbol(imd::device::c_pack_emit, &good, sizeof good));
+  CUDA_CHECK(cudaFree(d_out));
+  // Mutants of the sequences' code (the Mut template values: tests of the test, planted in the production templates at compile
+  // time): every one must produce mismatches, except the one marked equivalent, which must produce none.
+  Coverage cv;
+  cv.eps.assign(c::kEpsMax + 1, 0);
+  const auto go = [&](const char* what, bool expect_caught, const auto& f) {
+    long checked = 0, bad = 0;
+    for (int tr = 0; tr < 2; ++tr) bad += f(tr == 1, &checked);
+    const bool ok = expect_caught ? bad != 0 : bad == 0;
+    std::printf("mutant \"%s\": %s (%ld mismatches)\n", what, ok ? (expect_caught ? "caught" : "equivalent, as expected") : "WRONG", bad);
+    fails += !ok;
+  };
+  const int U = 4 * 1024;
+  go("E1 sign polarity (sg inverted)", true, [&](bool t, long* c_) { return run<16, 2, 1, 11>(16, t, U, 5, cv, c_); });
+  go("E1 byte_perm assembly (two bytes swapped)", true, [&](bool t, long* c_) { return run<8, 3, 1, 12>(20, t, U, 6, cv, c_); });
+  go("store_slots start slot not advanced", true, [&](bool t, long* c_) { return run<16, 2, 1, 0, 1>(16, t, U, 7, cv, c_); });
+  go("Q1 without the f2 factor", true, [&](bool t, long* c_) { return run<16, 2, 3, 1>(16, t, U, 8, cv, c_); });
+  go("Q1 RN for TRUNC", true, [&](bool t, long* c_) { return t ? run<16, 2, 3, 2>(16, t, U, 9, cv, c_) : 0L; });
+  go("Q1 without the Inf/NaN mask", true, [&](bool t, long* c_) { return run<16, 2, 3, 3>(16, t, U, 10, cv, c_); });
+  go("Q1 s2 one too large", true, [&](bool t, long* c_) { return run<16, 2, 3, 5>(16, t, U, 11, cv, c_); });
+  go("Q1 sigma / 2 instead of sigma >> 1 (an equivalent split)", false, [&](bool t, long* c_) { return run<16, 2, 3, 4>(16, t, U, 12, cv, c_); });
+  g_quiet = false;
+  return fails;
 }
 
 // v1.16 §3.4.1 (review 2026-10-06): shl_clamped is PTX shl.b64, x << n for n < 64 and 0 for
@@ -326,7 +473,12 @@ int main() {
                     imd::kernels::pack_words(17) == 3,
                 "W rule (cert_pack_words)");
   long bad = 0, checked = 0;
+  g_scratch.eps.assign(c::kEpsMax + 1, 0);
   int fails = check_shl_clamped() != 0;
+  long dtotal = 0;
+  const long dbad = check_all_d(&dtotal);
+  std::printf("E1 emitter on every reduced d: %ld (d, sign) values over 20 moduli and W = 2, 3, %ld mismatches\n", dtotal, dbad);
+  fails += dbad != 0;
   for (int N = c::kNMin; N <= c::kNMax; ++N) {
     Coverage covw[3];  // [W - 1], W = 2, 3 (review L1: "all eps hit" per W)
     for (Coverage& cv : covw) cv.eps.assign(c::kEpsMax + 1, 0);
@@ -335,9 +487,9 @@ int main() {
     for (int tr = 0; tr < 2; ++tr) {
       const bool trunc = tr == 1;
       const uint64_t seed = 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(4 * N + tr + 1);
-      bn += run_n<16>(N, trunc, 3 * 1024, seed, covw, &checked);
-      bn += run_n<8>(N, trunc, 3 * 512, seed ^ 0x1234, covw, &checked);
-      bn += run_n<4>(N, trunc, 3 * 512, seed ^ 0x5678, covw, &checked);
+      bn += run_n<16>(N, trunc, 4 * 1024, seed, covw, &checked);
+      bn += run_n<8>(N, trunc, 4 * 512, seed ^ 0x1234, covw, &checked);
+      bn += run_n<4>(N, trunc, 4 * 512, seed ^ 0x5678, covw, &checked);
     }
     int missing = 0;
     bool cov_ok = true;
@@ -361,6 +513,7 @@ int main() {
     bad += bn;
     fails += bn != 0 || !cov_ok;
   }
+  fails += mutation_checks();
   std::printf("pack emitter: %ld residues checked, %ld mismatches\n%s\n", checked, bad,
               fails == 0 ? "PASS" : "FAIL");
   return fails == 0 ? 0 : 1;

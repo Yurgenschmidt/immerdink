@@ -22,7 +22,8 @@ u128 div_up(u128 a, u128 b) { return a / b + (a % b != 0); }
 
 }  // namespace
 
-K4Rounds k4_rounds(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb, int32_t sms) {
+K4Rounds k4_rounds(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb, int32_t sms,
+                   int32_t table) {
   const K4ConfigDesc& d = kK4Configs[c];
   // Tiles of one launch over a group's g b batches; the busiest SM gets j of them: j / occ
   // full rounds of occ concurrent CTAs, then a round of the remaining j mod occ.
@@ -30,7 +31,7 @@ K4Rounds k4_rounds(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb, i
                                      div_up(static_cast<u128>(n_hat), d.tile_n)),
                              static_cast<u128>(gb));
   const u128 j = div_up(tiles, static_cast<u128>(sms));
-  const u128 occ = static_cast<u128>(d.ctas_per_sm);
+  const u128 occ = static_cast<u128>(kK4Tables[table].ctas_per_sm[c]);
   K4Rounds r;
   r.full = j / occ;
   r.rest = static_cast<int32_t>(j % occ);
@@ -38,30 +39,32 @@ K4Rounds k4_rounds(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb, i
   return r;
 }
 
-u128 k4_estimate_fs(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb, int32_t sms) {
-  const K4Cost& cost = kK4Costs[c];
-  const K4Rounds r = k4_rounds(c, m, n_hat, k_hat, gb, sms);
+u128 k4_estimate_fs(int c, int64_t m, int64_t n_hat, int64_t k_hat, int64_t gb, int32_t sms,
+                    int32_t table) {
+  const K4Cost& cost = kK4Tables[table].costs[c];
+  const K4Rounds r = k4_rounds(c, m, n_hat, k_hat, gb, sms, table);
   const auto round_fs = [&](int q) {  // one round of q concurrent CTAs
     return add_sat(mul_sat(static_cast<u128>(cost.round_ns), 1000000),
                    mul_sat(mul_sat(r.tile_macs, static_cast<u128>(q)), static_cast<u128>(cost.mac_fs[q])));
   };
-  u128 est = r.full == 0 ? 0 : mul_sat(r.full, round_fs(kK4Configs[c].ctas_per_sm));
+  u128 est = r.full == 0 ? 0 : mul_sat(r.full, round_fs(kK4Tables[table].ctas_per_sm[c]));
   if (r.rest != 0) est = add_sat(est, round_fs(r.rest));
   return est;
 }
 
-int32_t k4_select(const ExecPlan& e, int32_t sms) {
+int32_t k4_select(const ExecPlan& e, int32_t sms, int32_t table) {
   if (!emulates(e)) return IMD_K4_128x256;
+  if (table < 0 || table >= IMD_TABLE_COUNT) table = IMD_TABLE_SM89;
   if (sms < 1) sms = kK4ReferenceSms;
   const int64_t gb = static_cast<int64_t>(std::min(e.g, e.N)) * e.b;  // fits: the RA region does
-  const u128 base = k4_estimate_fs(IMD_K4_128x256, e.m, e.n_hat, e.k_hat, gb, sms);
+  const u128 base = k4_estimate_fs(IMD_K4_128x256, e.m, e.n_hat, e.k_hat, gb, sms, table);
   // A smaller tile is taken only when its estimate beats 128x256's by the margin; among
   // those, the smallest estimate (ties: the lower id).
   int32_t best = IMD_K4_128x256;
   u128 best_est = base;
   for (int32_t c = 1; c < kK4ConfigCount; ++c) {
-    const u128 est = k4_estimate_fs(c, e.m, e.n_hat, e.k_hat, gb, sms);
-    if (mul_sat(est, 1000) < mul_sat(base, 1000 - kK4MarginPermille) && est < best_est)
+    const u128 est = k4_estimate_fs(c, e.m, e.n_hat, e.k_hat, gb, sms, table);
+    if (mul_sat(est, 1000) < mul_sat(base, 1000 - kK4Tables[table].margin_permille) && est < best_est)
       best = c, best_est = est;
   }
   return best;

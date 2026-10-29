@@ -1,7 +1,31 @@
 cmake_minimum_required(VERSION 3.28)
 
+# GPU architectures to build for (issue 18, docs/NOTES-18.md D7). CMAKE_CUDA_ARCHITECTURES, when given,
+# wins. Else IMMERDINK_CUDA_ARCHS (a list in CMake's own notation: "89" = SASS + PTX, "90-real" = SASS
+# only), else 89, the RTX 4090 the library is tuned on (DESIGN §4). With IMMERDINK_EMBED_PTX=OFF an entry
+# without a suffix means SASS only: a GPU the build has no SASS for then fails at plan creation
+# (NOT_SUPPORTED) instead of running recompiled code. The release recipe, every shipped card native:
+#   -DIMMERDINK_CUDA_ARCHS="80-real;89;90-real;120-real"   (sm_80 SASS also runs on sm_86 cards)
+set(IMMERDINK_CUDA_ARCHS "" CACHE STRING "CUDA architectures (CMake list); empty: 89")
+option(IMMERDINK_EMBED_PTX "Embed PTX for the architectures given without -real / -virtual" ON)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 89)  # RTX 4090 (sm_89) first: DESIGN §4
+  if(IMMERDINK_CUDA_ARCHS)
+    set(_imd_archs "")
+    foreach(_a IN LISTS IMMERDINK_CUDA_ARCHS)
+      if(NOT IMMERDINK_EMBED_PTX AND _a MATCHES "^[0-9]+[a-z]?$")
+        list(APPEND _imd_archs "${_a}-real")
+      else()
+        list(APPEND _imd_archs "${_a}")
+      endif()
+    endforeach()
+    set(CMAKE_CUDA_ARCHITECTURES "${_imd_archs}")
+  else()
+    if(IMMERDINK_EMBED_PTX)
+      set(CMAKE_CUDA_ARCHITECTURES 89)       # RTX 4090 (sm_89) first: DESIGN §4; machine code and PTX
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES 89-real)  # machine code only
+    endif()
+  endif()
 endif()
 
 # IMMERDINK_HOST_ONLY: build only libimmerdink_host (DESIGN §6a: lowering, legality and the
@@ -31,6 +55,11 @@ endif()
 
 option(IMMERDINK_WERROR "Treat warnings in immerdink's own code as errors" OFF)
 option(IMMERDINK_BUILD_TESTS "Build the tests (and the test-only hooks of src/test_hooks.cpp)" ON)
+option(IMMERDINK_SEQ_TWINS "Compile the Q1 / F1 kernel twins of the pack and K5 kernels (issue 21: Q1 is reachable by the hooks only; F1 is the sm_90 default since R2, so OFF drops it there: the class default is masked to E1 + the limb CRT); OFF omits them: about half the kernel instances and SASS" ON)
+set(IMMERDINK_K4_WGMMA AUTO CACHE STRING "Hopper (wgmma) K4 backend (issue 22, docs/NOTES-22.md): AUTO = built when nvcc >= 12.0, CUTLASS >= 3 and the architectures include 90, ON = built whatever the architectures, OFF = not built. Its kernels are sm_90a-only SASS in their own object library; no other kernel changes")
+set_property(CACHE IMMERDINK_K4_WGMMA PROPERTY STRINGS AUTO ON OFF)
+set(IMMERDINK_KL_TIMERS 0 CACHE STRING "Issue 23 (docs/NOTES-23.md): clock64() section timers inside the KL pack kernel, read back by imd_test_kl_timers (needs IMMERDINK_BUILD_TESTS): 0 = off (default; no shipped kernel changes), 1 = sections, 2 = also the emit and store of the modulus loop separately (perturbs that loop). Diagnostic builds only")
+set_property(CACHE IMMERDINK_KL_TIMERS PROPERTY STRINGS 0 1 2)
 option(IMMERDINK_PROFILE "Benchmark-only per-phase event timing hooks (src/profile.hpp)" OFF)
 set(IMMERDINK_CUTLASS_DIR "${PROJECT_SOURCE_DIR}/third_party/cutlass"
     CACHE PATH "CUTLASS v4.8.0 source tree (default: the git submodule)")
@@ -83,7 +112,7 @@ target_include_directories(imd_constants INTERFACE "${PROJECT_SOURCE_DIR}/includ
 add_library(immerdink_host SHARED
   src/host/index_map.cpp src/host/workspace.cpp src/host/analysis.cpp src/host/k4_config.cpp
   src/host/pack.cpp src/host/host_api.cpp src/host/perf.cpp src/host/accuracy.cpp
-  src/host/k_hat.cpp)
+  src/host/k_hat.cpp src/host/device_class.cpp)
 target_include_directories(immerdink_host PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 # DESIGN §6c.2: the shipped calibration file is embedded as a raw string literal (the file is
@@ -127,16 +156,65 @@ target_include_directories(imd_cutlass SYSTEM INTERFACE "${IMMERDINK_CUTLASS_DIR
 target_compile_options(imd_cutlass INTERFACE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -diag-suppress=20012>)
 
+# --- Hopper K4 (optional component, issue 22) ---------------------------------------------
+# AUTO: on when nvcc >= 12.0 (sm_90a), CUTLASS is 3.x or later and CMAKE_CUDA_ARCHITECTURES names 90 / 90a (any suffix) or all / all-major. Off
+# otherwise (NOT for "native": the detected GPU is not known at configure time), and then the library is built exactly as before (nothing below is
+# evaluated, gemm_k4.cu compiles without IMD_K4_WGMMA). A build meant for a Hopper configures with -DIMMERDINK_K4_WGMMA=ON (the cluster does),
+# so an AUTO that came out OFF cannot go unnoticed: tests/test_k4_wgmma.py fails on a cc 9.0 device whose library has no backend.
+set(IMD_K4_WGMMA_ENABLED OFF)
+if(NOT IMMERDINK_K4_WGMMA STREQUAL "OFF")
+  set(_imd_cutlass_major 0)
+  file(STRINGS "${IMMERDINK_CUTLASS_DIR}/include/cutlass/version.h" _imd_cutlass_ver REGEX "define CUTLASS_MAJOR")
+  if(_imd_cutlass_ver MATCHES "CUTLASS_MAJOR ([0-9]+)")
+    set(_imd_cutlass_major "${CMAKE_MATCH_1}")
+  endif()
+  set(_imd_has90 OFF)
+  foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
+    if(_a MATCHES "^90" OR _a MATCHES "^all")
+      set(_imd_has90 ON)
+    endif()
+  endforeach()
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.0 OR _imd_cutlass_major LESS 3)
+    if(IMMERDINK_K4_WGMMA STREQUAL "ON")
+      message(FATAL_ERROR "IMMERDINK_K4_WGMMA=ON needs nvcc >= 12.0 (have ${CMAKE_CUDA_COMPILER_VERSION}) and CUTLASS >= 3 (have major ${_imd_cutlass_major})")
+    endif()
+  elseif(IMMERDINK_K4_WGMMA STREQUAL "ON" OR _imd_has90)
+    set(IMD_K4_WGMMA_ENABLED ON)
+  endif()
+endif()
+message(STATUS "Hopper wgmma K4 backend: ${IMD_K4_WGMMA_ENABLED} (IMMERDINK_K4_WGMMA=${IMMERDINK_K4_WGMMA}, architectures ${CMAKE_CUDA_ARCHITECTURES})")
+
 # --- Library -----------------------------------------------------------------------------
 # The library: C ABI (api.cpp), K0-K5 + DIRECT kernels (contract.cu), K4 CUTLASS GEMM
 # (gemm_k4.cu, one K4Gemm instantiation per configuration in src/k4/).
 # Test-only hooks (src/test_hooks.cpp: launch-limit override, lowering dump) are built only
 # with IMMERDINK_BUILD_TESTS=ON, and the benchmark phase marks (src/profile.cpp) only with
 # IMMERDINK_PROFILE=ON; a production build exports neither.
-add_library(immerdink SHARED src/api.cpp src/contract.cu src/gemm_k4.cu
+add_library(immerdink SHARED src/api.cpp src/device_state.cpp src/contract.cu src/gemm_k4.cu
   src/k4/k4_cfg0.cu src/k4/k4_cfg1.cu src/k4/k4_cfg2.cu src/k4/k4_cfg3.cu)
+if(IMD_K4_WGMMA_ENABLED)
+  # The wgmma instructions exist in sm_90a code only (not in "90"): the kernels are compiled for 90a-real in an object library of
+  # their own and linked into libimmerdink, whatever architectures the rest is built for. On any other device the image is simply
+  # never selected (gemm_k4.cu launches nothing of it there; a library with a 90a-only object runs on sm_89 also with
+  # CUDA_MODULE_LOADING=EAGER, checked 2026-10-26). NDEBUG always: a CUTLASS assert left in the main loop makes ptxas serialise the wgmma (C7510).
+  add_library(imd_k4_hopper OBJECT src/k4/hopper/k4_wgmma_v0.cu)
+  set_target_properties(imd_k4_hopper PROPERTIES CUDA_ARCHITECTURES "90a-real" CUDA_VISIBILITY_PRESET hidden
+                                                 VISIBILITY_INLINES_HIDDEN ON POSITION_INDEPENDENT_CODE ON)
+  target_compile_definitions(imd_k4_hopper PRIVATE NDEBUG)
+  target_link_libraries(imd_k4_hopper PRIVATE imd_host_internal imd_cutlass imd_warnings)
+  target_sources(immerdink PRIVATE $<TARGET_OBJECTS:imd_k4_hopper>)
+  target_compile_definitions(immerdink PRIVATE IMD_K4_WGMMA=1)
+endif()
 if(IMMERDINK_BUILD_TESTS)
   target_sources(immerdink PRIVATE src/test_hooks.cpp)
+  # contract.cu's test-only kernels and counters (imd_test_crt_elem, imd_test_k5_launch_counts)
+  target_compile_definitions(immerdink PRIVATE IMD_BUILD_TEST_HOOKS=1)
+endif()
+if(NOT IMMERDINK_SEQ_TWINS)
+  target_compile_definitions(immerdink PRIVATE IMD_NO_SEQ_TWINS=1)
+endif()
+if(NOT IMMERDINK_KL_TIMERS STREQUAL "0")
+  target_compile_definitions(immerdink PRIVATE IMD_KL_TIMERS=${IMMERDINK_KL_TIMERS})
 endif()
 if(IMMERDINK_PROFILE)
   target_sources(immerdink PRIVATE src/profile.cpp)

@@ -1,0 +1,3 @@
+# GEMMul8 version the comparison baselines are pinned to: name commit API-generation (the
+# evaluation workspace used this one for the 4090 campaigns). bench/build_gemmul8.sh builds this commit.
+g8-current 6a9eff8bbd65fd98899d4eece5f305d33adc7eb4 3

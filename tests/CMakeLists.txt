@@ -20,10 +20,19 @@ add_test(NAME calib_strings_too_long
 # a property value is a list.)
 set_tests_properties(calib_strings_too_long PROPERTIES PASS_REGULAR_EXPRESSION
   "too_long[.]calib:9:[ \n]+'notes'[ \n]+is[ \n]+128[ \n]+bytes.[ \n]+the[ \n]+calibration[ \n]+field[ \n]+holds[ \n]+127")
+# Issue 22 (docs/NOTES-22.md "Library integration (design)"): the Hopper K4 backend's host rules (device-class table, legality, the R2 tile /
+# scheduler table, the profitability floor), CUDA-free: runs on every machine, with the backend built in or not.
+add_executable(test_k4_wgmma_select test_k4_wgmma_select.cpp)
+target_link_libraries(test_k4_wgmma_select PRIVATE imd_host_internal imd_warnings)
+add_test(NAME k4_wgmma_select COMMAND test_k4_wgmma_select)
 # tools/test.sh's detection of a caller's ctest selection option (-R/-E/-L/...): any such
 # option must put the whole run under the GPU lock (CPU-only; no build, no GPU).
 add_test(NAME tools_test_sh_selftest
          COMMAND bash "${PROJECT_SOURCE_DIR}/tools/test.sh" --self-test)
+# The memory-budget wrapper must not make tools/test.sh relaunch itself forever when there is no
+# systemd user manager (systemctl stubbed to fail). CPU-only.
+add_test(NAME tools_memcap_loop_check
+         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/memcap_loop_check.sh" "${PROJECT_SOURCE_DIR}")
 
 if(Python3_FOUND)
   # The host library and its C++ lowering vs spec/params.py on generated descriptors: the
@@ -47,6 +56,19 @@ if(Python3_FOUND)
   add_executable(test_k_align test_k_align.cpp)
   target_link_libraries(test_k_align PRIVATE imd_host_internal imd_warnings)
   add_test(NAME host_k_align COMMAND test_k_align)
+
+  # Issue 21: K1's L2 budgets as fractions of the card's L2 (the 4090's values exactly). CPU only.
+  add_executable(test_l2_knobs test_l2_knobs.cpp)
+  target_link_libraries(test_l2_knobs PRIVATE imd_host_internal imd_warnings)
+  add_test(NAME host_l2_knobs COMMAND test_l2_knobs)
+
+  # Issue 21 / R2: the per-device-class sequence defaults (sm_90 = E1 + F1 + limb CRT = 13, sm_89 = 1, sm_120 = 0) and the forcing rules. CPU only, CUDA-free.
+  add_executable(test_seq_table test_seq_table.cpp)
+  target_link_libraries(test_seq_table PRIVATE imd_host_internal imd_warnings)
+  if(NOT IMMERDINK_SEQ_TWINS)
+    target_compile_definitions(test_seq_table PRIVATE IMD_NO_SEQ_TWINS=1)
+  endif()
+  add_test(NAME host_seq_table COMMAND test_seq_table)
 
   # The Python wrapper (python/immerdink/host.py) over libimmerdink_host vs the C ABI and
   # vs spec/params.py and spec/oracle.py (lowering summary, sizes, g sweep). CPU only.
@@ -102,7 +124,39 @@ if(Python3_FOUND)
   # not change the driver's sha256. CPU only, standard library, under a second.
   add_test(NAME md2_time_selftest
            COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/bench/accuracy/md2_time.py" selftest)
+  # Campaign kit (issue 15; bench/campaign, docs/CAMPAIGN.md): the statistics (paired interval, tie rule, regression
+  # guard), the manifest lint (gate G1), the resumable runner (kill -9, resume, time limits, copy-back) and the analyzer
+  # (a damaged folder gives INVALID; the issue-11 folders reproduce their tables when they are on this machine).
+  # CPU only, standard library, about 25 s in all.
+  foreach(t stats manifest runner analyze archgate summarize_tests)
+    add_test(NAME campaign_${t}_selftest
+             COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/campaign/test_${t}.py")
+  endforeach()
   add_test(NAME params_check COMMAND Python3::Interpreter "${PROJECT_SOURCE_DIR}/spec/params.py" --check)
+  # Issue 21 (docs/NOTES-21.md): the analysis of the bandwidth microbenchmark (names the limiter of the pack / CRT phases). CPU only.
+  add_test(NAME bench_membw_selftest
+           COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/membw/test_analyze.py")
+  # math.fma for Python before 3.13 (the PACE env), used by the oracle tests. CPU only.
+  add_test(NAME spec_fma_compat
+           COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/spec/test_fma_compat.py")
+  # Issue 21: the CRT with the sums in binary64 limbs against the reference for every N (CPU only; the GPU kernel: crt_f64_gpu).
+  add_test(NAME spec_crt_f64
+           COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/spec/test_crt_f64.py")
+  # Issue 23 (known divergence): the decision logic of contract_api's per-W pack-occupancy check, on mocked tables (the Hopper pattern is
+  # accepted as known, everything else decides as before). CPU only.
+  add_test(NAME contract_occupancy_known
+           COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/test_occupancy_known.py")
+  # Issue 20 (docs/NOTES-20.md): the K4 tile-table fit and its adoption rule (reproduces the shipped 4090 constants
+  # from the A3 data where they are on this machine). CPU only.
+  add_test(NAME bench_k4_fit_selftest
+           COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/test_k4_fit.py")
+  # Issue 18 (docs/NOTES-18.md): the device-class rules (libimmerdink_host against spec/devices.py) and the
+  # coverage of every kernel launch site by the device-status check, with the K4 limits. CPU only.
+  add_test(NAME host_devices
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_devices.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>")
+  add_test(NAME device_kernel_sites
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/check_kernel_sites.py" "${PROJECT_SOURCE_DIR}")
   add_test(NAME constants_header_current
            COMMAND "${CMAKE_COMMAND}" -E compare_files
                    "${IMD_GENERATED_INCLUDE}/immerdink/detail/constants.hpp"
@@ -148,6 +202,11 @@ add_executable(test_pack_emitter test_pack_emitter.cu)
 target_include_directories(test_pack_emitter PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(test_pack_emitter PRIVATE imd_constants imd_warnings)
 add_test(NAME pack_emitter COMMAND test_pack_emitter)
+# Issue 21: sequence F1 (the CRT finish through a hardware u64 -> f64 conversion) against crt_finish + round_scaled, every N, with mutations.
+add_executable(test_finish_f1 test_finish_f1.cu)
+target_include_directories(test_finish_f1 PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(test_finish_f1 PRIVATE imd_constants imd_warnings)
+add_test(NAME finish_f1 COMMAND test_finish_f1)
 
 # CUTLASS de-risking for M1: int8 batched TN GEMM, and the mod-p -> u8 EVT epilogue.
 add_executable(test_cutlass_int8_gemm test_cutlass_int8_gemm.cu)
@@ -158,6 +217,25 @@ add_executable(test_cutlass_mod_epilogue test_cutlass_mod_epilogue.cu)
 target_include_directories(test_cutlass_mod_epilogue PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(test_cutlass_mod_epilogue PRIVATE imd_constants imd_cutlass)
 add_test(NAME cutlass_mod_epilogue COMMAND test_cutlass_mod_epilogue)
+
+# Issue 17 (docs/NOTES-17.md): the Hopper K4 epilogue candidate on accumulators placed in wgmma order, against
+# K4's own epilogue and a host reference. Runs on any sm_80+ GPU.
+add_executable(test_hopper_epilogue test_hopper_epilogue.cu)
+target_include_directories(test_hopper_epilogue PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(test_hopper_epilogue PRIVATE imd_constants imd_cutlass)
+add_test(NAME hopper_epilogue COMMAND test_hopper_epilogue)
+set_tests_properties(hopper_epilogue PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+
+# The register order the Hopper fast epilogue assumes, against CuTe's partition_C of the real TiledMma of every variant. Host code only
+# (no GPU), but built for sm_90a because the variants are.
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)   # sm_90a needs nvcc 12+; the target adds a heavy CUTLASS compile
+  add_executable(test_hopper_partition test_hopper_partition.cu)
+  target_include_directories(test_hopper_partition PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(test_hopper_partition PRIVATE imd_constants imd_cutlass)
+  set_target_properties(test_hopper_partition PROPERTIES CUDA_ARCHITECTURES "90a-real")
+  target_compile_options(test_hopper_partition PRIVATE --expt-relaxed-constexpr)
+  add_test(NAME hopper_partition COMMAND test_hopper_partition)
+endif()
 
 # PLAN M1: exhaustive CPU check of the §3.5 / §3.6 modular reductions (the kernels' code).
 find_package(Threads REQUIRED)
@@ -200,6 +278,185 @@ if(Python3_FOUND)
     set_tests_properties(contract_${suite} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
                          ENVIRONMENT "LD_PRELOAD=${shim}")
   endforeach()
+  # Issue 21 (docs/NOTES-21.md "Pack emitter and finish"): the same oracle tests with the other instruction sequences forced
+  # for every plan (IMD_TEST_SEQ, tests/harness.py: the library must report that set back, or the run fails): 0 = the baseline
+  # sequences (the production path on every class without a default set, and the reference now that the sm_89 / sm_90
+  # default is E1), 1 = E1 emitter, 7 = E1 + Q1 quantize + F1 finish. The suites without a suffix run the class default.
+  foreach(seq 0 1 7)
+    if(seq EQUAL 7 AND NOT IMMERDINK_SEQ_TWINS)
+      continue()
+    endif()
+    foreach(suite e2e tensor every_n eps bigk)
+      if(NOT seq EQUAL 7 AND (suite STREQUAL "tensor" OR suite STREQUAL "every_n" OR suite STREQUAL "bigk"))
+        continue()
+      endif()
+      add_test(NAME contract_${suite}_seq${seq}
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                       --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+      set_tests_properties(contract_${suite}_seq${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                           ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=${seq}")
+    endforeach()
+    add_test(NAME output_hashes_seq${seq}
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                     --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+    set_tests_properties(output_hashes_seq${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                         ENVIRONMENT "IMD_TEST_SEQ=${seq}")
+  endforeach()
+  # Issue 23 (docs/NOTES-23.md): the KL fixed-part cuts (bits 16 klwarp, 32 klload, 64 klshape) forced for every plan on top of E1 (17, 33, 65, 113) and on top of
+  # the baseline emitter (112): the same oracle suites and the committed hashes. They are kernel twins like Q1 / F1 (not built with IMMERDINK_SEQ_TWINS=OFF).
+  if(IMMERDINK_SEQ_TWINS)
+    foreach(seq 17 33 65 113 112)
+      foreach(suite e2e tensor eps)
+        add_test(NAME contract_${suite}_kl${seq}
+                 COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                         --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+        set_tests_properties(contract_${suite}_kl${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                             ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=${seq}")
+      endforeach()
+      add_test(NAME output_hashes_kl${seq}
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                       --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+      set_tests_properties(output_hashes_kl${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                           ENVIRONMENT "IMD_TEST_SEQ=${seq}")
+    endforeach()
+    foreach(seq 17 113)
+      add_test(NAME contract_bigk_kl${seq}
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                       --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite bigk -v)
+      set_tests_properties(contract_bigk_kl${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                           ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=${seq}")
+      add_test(NAME output_hashes_large_kl${seq}
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                       --lib "$<TARGET_FILE:immerdink>" --tags large)
+      set_tests_properties(output_hashes_large_kl${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                           ENVIRONMENT "IMD_TEST_SEQ=${seq}")
+    endforeach()
+  endif()
+  set(_seq_twin_arg "")
+  if(NOT IMMERDINK_SEQ_TWINS)
+    set(_seq_twin_arg --no-seq-twins)
+  endif()
+  # Issue 23: every combination of the KL bits over four emitter sets, bit-identical, with the KL launch counter showing which kernel each operand ran.
+  add_test(NAME kl_bits
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_kl_bits.py" --lib "$<TARGET_FILE:immerdink>"
+                   ${_seq_twin_arg})
+  set_tests_properties(kl_bits PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800)
+  add_test(NAME seq_select
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_seq_select.py" --lib "$<TARGET_FILE:immerdink>"
+                   ${_seq_twin_arg})
+  set_tests_properties(seq_select PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+  # Issue 22 (docs/NOTES-22.md "Library integration (design)"): the Hopper wgmma K4 backend. Registered on every build and device and
+  # passing on all of them (the campaign counts a skipped test as not passed): off sm_90 (or in a build without IMMERDINK_K4_WGMMA) the
+  # backend is unavailable, a forced wgmma plan reports and runs mma.sync, and the launch counters must stay 0; on a Hopper the forced
+  # runs must be served by the wgmma kernel and equal the mma.sync K4 bit for bit. IMD_TEST_K4 (tests/harness.py) forces the backend of
+  # every plan of the process and the library must report it back: wgmma = every legal launch, the profitability floor lifted.
+  add_test(NAME k4_wgmma_exact
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_k4_wgmma.py" --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(k4_wgmma_exact PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+  foreach(suite e2e every_n bigk)
+    add_test(NAME contract_${suite}_k4wgmma
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                     --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+    set_tests_properties(contract_${suite}_k4wgmma PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                         ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_K4=wgmma")
+  endforeach()
+  add_test(NAME output_hashes_k4wgmma
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+  set_tests_properties(output_hashes_k4wgmma PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900 ENVIRONMENT "IMD_TEST_K4=wgmma")
+  add_test(NAME output_hashes_large_k4wgmma
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags large)
+  set_tests_properties(output_hashes_large_k4wgmma PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900 ENVIRONMENT "IMD_TEST_K4=wgmma")
+  # the fallback on a Hopper: every plan forced to the mma.sync K4 reproduces the committed hashes
+  add_test(NAME output_hashes_k4mma
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+  set_tests_properties(output_hashes_k4mma PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900 ENVIRONMENT "IMD_TEST_K4=mma")
+  # imd_bench --seq / --crt (method imd): needs the profiling build of the bench (bench/build.sh), so only when
+  # IMMERDINK_BENCH_BIN names it (environment or cache variable); bench/test_seq_crt.py documents the checks.
+  if(NOT IMMERDINK_BENCH_BIN AND DEFINED ENV{IMMERDINK_BENCH_BIN})
+    set(IMMERDINK_BENCH_BIN "$ENV{IMMERDINK_BENCH_BIN}")
+  endif()
+  if(IMMERDINK_BENCH_BIN)
+    add_test(NAME bench_seq_crt
+             COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/test_seq_crt.py" --bench "${IMMERDINK_BENCH_BIN}"
+                     ${_seq_twin_arg})
+    set_tests_properties(bench_seq_crt PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
+    # imd_bench accuracy fields (acc_*, --accuracy; docs/NOTES-BENCH-ACCURACY.md).
+    add_test(NAME bench_accuracy_fields
+             COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/bench/test_accuracy_fields.py" --bench "${IMMERDINK_BENCH_BIN}")
+    set_tests_properties(bench_accuracy_fields PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
+  endif()
+  if(IMMERDINK_SEQ_TWINS)
+  # Issue 23 (docs/NOTES-23-k5.md): the k5fin kernels (bit 128: set 133 = E1 + F1 + 128 with the limb CRT forced, IMD_TEST_K5_CRT=1) against the oracle and the committed hashes.
+  # (On an RTX 4090 the limb CRT is slow but exact; tests/test_crt_f64_gpu.py compares them with the shipped kernels and checks that they ran.)
+  foreach(suite e2e eps tensor every_n bigk)
+    add_test(NAME contract_${suite}_k5fin
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
+                     --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite ${suite} -v)
+    set_tests_properties(contract_${suite}_k5fin PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800
+                         ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=133;IMD_TEST_K5_CRT=1")
+  endforeach()
+  # graph capture and replay of the k5fin kernels (test_graph reads the same two variables and requires at least one k5fin launch)
+  add_test(NAME graph_capture_k5fin COMMAND test_graph)
+  set_tests_properties(graph_capture_k5fin PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600
+                       ENVIRONMENT "IMD_TEST_SEQ=133;IMD_TEST_K5_CRT=1;IMD_TEST_REQUIRE_K5FIN=1")
+  add_test(NAME output_hashes_k5fin
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+  set_tests_properties(output_hashes_k5fin PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800 ENVIRONMENT "IMD_TEST_SEQ=133;IMD_TEST_K5_CRT=1")
+  add_test(NAME output_hashes_large_k5fin
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags large)
+  set_tests_properties(output_hashes_large_k5fin PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800 ENVIRONMENT "IMD_TEST_SEQ=133;IMD_TEST_K5_CRT=1")
+  # R4 integration (docs/NOTES-R4-INTEGRATION.md): the duel sides' sets forced TOGETHER (E1 1, F1 4, klwarp 16, klload 32, klshape 64, k5fin 128), each with the K5 CRT of the side
+  # (crt=f64; the sets without 128 also crt=int): the oracle suites e2e / eps and the 19 committed hashes, one test per (set, crt); and the in-process check of all of them
+  # at once with the KL and k5fin launch counters (test_forced_sets.py).
+  foreach(seq 5 21 37 69 53 101 85 117 133 149 165 197 245)
+    foreach(crt f64 int)
+      if(crt STREQUAL "int" AND seq GREATER 127)
+        continue()
+      endif()
+      add_test(NAME r4_set_${seq}_${crt}
+               COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/run_forced_set.py"
+                       --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --seq ${seq} --crt ${crt})
+      set_tests_properties(r4_set_${seq}_${crt} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 3600)
+    endforeach()
+  endforeach()
+  add_test(NAME forced_sets
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_forced_sets.py" --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(forced_sets PROPERTIES RESOURCE_LOCK gpu TIMEOUT 3600)
+  add_test(NAME output_hashes_large_seq7
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags large)
+  set_tests_properties(output_hashes_large_seq7 PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900
+                       ENVIRONMENT "IMD_TEST_SEQ=7")
+  endif()
+  # Committed output hashes (tests/data/output_hashes.json): the library's C on this GPU against
+  # hashes from the CPU oracle (small shapes) and from the RTX 4090 (large ones). The same file
+  # is checked on every shipped GPU. output_hashes_oracle recomputes the CPU hashes.
+  add_test(NAME output_hashes
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid)
+  add_test(NAME output_hashes_oracle
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags small mid --oracle)
+  add_test(NAME output_hashes_large
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_output_hashes.py"
+                   --lib "$<TARGET_FILE:immerdink>" --tags large)
+  # Issue 21: K5's CRT with the sums in binary64 limbs equals the integer CRT bit for bit (and reproduces the committed hashes).
+  add_test(NAME crt_f64_gpu
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_crt_f64_gpu.py"
+                   --lib "$<TARGET_FILE:immerdink>" ${_seq_twin_arg})
+  set_tests_properties(crt_f64_gpu PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+  # Issue 21: the real device functions on the edge vectors (before round_scaled), with the mutation check.
+  add_test(NAME crt_f64_unit
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_crt_f64_unit.py"
+                   --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(crt_f64_unit PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+  set_tests_properties(output_hashes output_hashes_oracle output_hashes_large PROPERTIES
+                       RESOURCE_LOCK gpu TIMEOUT 900)
   foreach(suite lowering legality random fixtures robust highrank)
     add_test(NAME contract_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_frontend.py"
@@ -286,6 +543,21 @@ if(Python3_FOUND)
                    --suite plan -v)
   set_tests_properties(host_vs_plan PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
 
+  # Issue 17 (docs/NOTES-17.md): the layouts the Hopper K4 design depends on, read from CUTLASS's CuTe tables
+  # (compiles tests/wgmma_layout_dump.cpp with the host compiler; no GPU).
+  add_test(NAME wgmma_layout
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_wgmma_layout.py"
+                   --cutlass "${IMMERDINK_CUTLASS_DIR}" --cxx "${CMAKE_CXX_COMPILER}"
+                   --include "${CUDAToolkit_INCLUDE_DIRS}")
+  # The status of this GPU (imd_device_info, imd_plan_info), with lazy and with eager module loading.
+  add_test(NAME device_status
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_device_status.py"
+                   --lib "$<TARGET_FILE:immerdink>")
+  add_test(NAME device_status_eager
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_device_status.py"
+                   --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(device_status device_status_eager PROPERTIES RESOURCE_LOCK gpu TIMEOUT 300)
+  set_tests_properties(device_status_eager PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=EAGER")
   add_test(NAME python_harness
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/harness.py"
                    --lib "$<TARGET_FILE:immerdink>")
@@ -305,5 +577,5 @@ if(Python3_FOUND)
 endif()
 
 # GPU tests share one device; run them one at a time.
-set_tests_properties(device_constants pack_emitter cutlass_int8_gemm cutlass_mod_epilogue
+set_tests_properties(device_constants pack_emitter finish_f1 cutlass_int8_gemm cutlass_mod_epilogue
                      PROPERTIES RESOURCE_LOCK gpu)

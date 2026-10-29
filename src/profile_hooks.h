@@ -17,9 +17,35 @@
  *   imd_prof_set_k4_config(config)
  *                         plans created afterwards run K4 configuration `config`; -1
  *                         restores the plan-time rule / k4_tune. Returns 0, 1 if invalid.
+ *   imd_prof_plan_k4_backend(plan, &backend)
+ *                         issue 22: the K4 backend the plan tries first (0 mma.sync, 1 Hopper wgmma with its profitability floor, 2 Hopper
+ *                         wgmma forced: the floor lifted for the plan's life), -1 without K4.
+ *   imd_prof_set_k4_backend(backend)
+ *                         issue 22: plans created afterwards take backend 0 (mma.sync), 1 (wgmma, where the device class has it and
+ *                         the build: the plan is then backend 2, "forced", which lifts the profitability floor for every launch of that plan
+ *                         whatever the override is later) or -1 (the device class's rule). Read at plan creation. Returns 0, 1 if invalid.
+ *   imd_prof_k4_wgmma_counts(reset, out[2])
+ *                         issue 22: K4 launches the Hopper backend served / declined since the last reset.
  *   imd_prof_set_k5_elems(elems)
  *                         later calls run K5 (j-bar fastest) with 1, 2 or 4 elements per
  *                         thread; 0 restores the launch rule (A5). Returns 0, 1 if invalid.
+ *   imd_prof_set_k5_crt(variant)
+ *                         issue 21: later calls run K5's CRT with the sums in binary64 limbs (1) or
+ *                         the integer running CRT (0); -1 (default): the plan's set decides (the device class's
+ *                         kSeqLimbCrt bit; a forced set 0..7 has none = integer). Returns 0, 1 if invalid.
+ *   imd_prof_set_seq(bits)
+ *                         issue 21: later calls run the instruction-sequence set `bits` (1 E1 emitter, 2 Q1 quantize,
+ *                         4 F1 finish, 128 k5fin (issue 23; needs F1, acts only with the limb CRT); host/seq_config.hpp)
+ *                         instead of the device class's; -1 restores it.
+ *                         Returns 0, 1 if invalid.
+ *   imd_prof_plan_seq(plan, &bits)
+ *                         issue 21: the sequence set the plan's launches run now (the forced one, else the device
+ *                         class's). Returns 0, 1 for a null plan.
+ *   imd_prof_get_k5_crt()
+ *                         issue 21: the K5 hook's state (-1 follow the plan's set, 0 integer, 1 binary64 limbs).
+ *   imd_prof_plan_crt(plan, &limb)
+ *                         issue 21: the CRT variant the plan's K5 runs now, whatever decided it (0 integer, 1 limbs).
+ *                         Returns 0, 1 for a null plan.
  *   imd_prof_kernel_occupancy(kernel, out[4])
  *                         v1.10: CTAs per SM, registers, shared memory bytes and threads of
  *                         kernel IMD_PERF_KERNEL_* (immerdink_host.h). Returns 0, 1 on error.
@@ -44,7 +70,15 @@ IMD_API int imd_prof_read(int max, const char** tags, float* ms);
 IMD_API int imd_prof_plan_dims(imd_plan_t plan, int64_t* out);
 IMD_API int imd_prof_plan_k4(imd_plan_t plan, int32_t* config);
 IMD_API int imd_prof_set_k4_config(int32_t config);
+IMD_API int imd_prof_plan_k4_backend(imd_plan_t plan, int32_t* backend);
+IMD_API int imd_prof_set_k4_backend(int32_t backend);
+IMD_API int imd_prof_k4_wgmma_counts(int32_t reset, int64_t* out);
 IMD_API int imd_prof_set_k5_elems(int32_t elems);
+IMD_API int imd_prof_set_k5_crt(int32_t variant);
+IMD_API int imd_prof_set_seq(int32_t bits);
+IMD_API int imd_prof_plan_seq(imd_plan_t plan, int32_t* bits);
+IMD_API int imd_prof_get_k5_crt(void);
+IMD_API int imd_prof_plan_crt(imd_plan_t plan, int32_t* limb);
 IMD_API int imd_prof_kernel_occupancy(int32_t kernel, int32_t* out);
 IMD_API int imd_prof_kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out);
 

@@ -12,6 +12,7 @@
 #include "host/k4_launches.hpp"
 #include "host/pack.hpp"
 #include "host/plan_data.hpp"
+#include "host/seq_config.hpp"
 #include "immerdink/immerdink.h"
 
 namespace imd::detail {
@@ -45,6 +46,15 @@ cudaError_t kernel_occupancy(int32_t kernel, int32_t* out);
 // constrained W: fewest CTAs per SM, then most registers). cudaErrorInvalidValue otherwise.
 cudaError_t kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out);
 
+// Issue 18 (docs/NOTES-18.md D4): the binaryVersion / ptxVersion cudaFuncGetAttributes reports for
+// kernel IMD_PERF_KERNEL_* (K4 excepted, see k4_ops.hpp K4Ops::versions); w as in kernel_occupancy_w (a pack
+// kernel is looked at for one W instantiation; 0 for the others). The error of the CUDA call, else success.
+cudaError_t kernel_versions(int32_t kernel, int32_t w, int32_t* binary, int32_t* ptx);
+// The same for the launches without an IMD_PERF_KERNEL_* id (index 0 .. kExtraKernels - 1; cudaErrorInvalidValue
+// beyond). Their failing_kernel id in imd_device_info_t is IMD_PERF_KERNEL_COUNT + index.
+constexpr int32_t kExtraKernels = 14;
+cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx);
+
 // K0 (contract.cu): write the p.vec_count scatter vectors to `vec` from p.vec_desc, on
 // `stream`. Also builds the resident copy at plan creation. SUCCESS or CUDA_ERROR.
 imd_status_t k0_generate(const ExecPlan& p, int64_t* vec, cudaStream_t stream);
@@ -61,7 +71,28 @@ LaunchLimits default_launch_limits();
 // the kernels' occupancy, after setting their dynamic shared-memory attribute. All of this
 // host state is built here, never in imd_contract. SUCCESS, CUDA_ERROR, INVALID_VALUE (no
 // such configuration), or NOT_SUPPORTED if a shape is out of K4's limits.
-imd_status_t k4_prepare(const ExecPlan& p, int cfg, std::shared_ptr<const K4Plan>* out);
+//
+// Issue 22: `backend` is kK4BackendWgmma / kK4BackendWgmmaForced when the plan should try the Hopper backend first (the caller decided with
+// k4_wgmma_available and the override; forced = the profitability floor is lifted for every launch of this plan); the plan holds the mma.sync parameters either way (the fallback of every launch the
+// Hopper backend does not serve), so the plan's host bytes and launch counts do not depend on it.
+imd_status_t k4_prepare(const ExecPlan& p, int cfg, std::shared_ptr<const K4Plan>* out, int32_t backend = 0);
+
+// Issue 22 (gemm_k4.cu; host/k4_wgmma.hpp): the process-wide backend override (-1 the device class's rule, 0 mma.sync, 1 wgmma; hooks only:
+// imd_test_set_k4_backend, imd_prof_set_k4_backend), a REQUEST read by imd_plan_create only (k4_backend_resolve): launches never read it.
+std::atomic<int>& k4_backend_override();
+// Can the Hopper backend run on the current device? The device class's table (host/k4_wgmma.hpp kK4WgmmaTable) and compute
+// capability 9.0, this build having it (IMMERDINK_K4_WGMMA), and the first-use probe (the sm_90a image loads: binaryVersion 90,
+// cluster count >= 1). On any other device: false without a CUDA call.
+bool k4_wgmma_available(int32_t table_id, int32_t cc_major, int32_t cc_minor);
+// The backend a plan tries first (K4Backend).
+int32_t k4_backend_of(const K4Plan& k4);
+// Launches the Hopper backend served / declined (the mma.sync K4 ran them) since the last reset; out[2].
+void k4_wgmma_counts(bool reset, int64_t* out);
+// Test only (tests/test_k4_wgmma.py): the host half of a Hopper launch of a synthetic GEMM (legality, choice, CUTLASS can_implement,
+// the TMA descriptors) without a launch, on any device of a build with the backend. out[7] = variant (-1 not served), swizzle, raster,
+// can_implement (0/1), persistent grid x, y, z. Returns false if the backend is absent or can_implement refuses.
+bool k4_wgmma_dry_run(int64_t m, int64_t nc, int64_t kc, int64_t zc, int64_t k_hat, int64_t n_hat, int64_t batch_a,
+                      int64_t batch_b, int sms, int clusters, bool add, bool force, int32_t* out);
 
 // Plan-time autotuning (imd_options_t.k4_tune, DESIGN v1.5 §6): with k4_tune_bytes(p) > 0,
 // allocate that much device memory, time group 1's K4 launches in every configuration on
@@ -122,12 +153,38 @@ int64_t& k5_one_elem_per_sm();
 // A5: K5's elements per thread forced to 1, 2 or 4 (0: the launch rule), read by
 // imd_contract; changed only by the hooks imd_test_set_k5_elems / imd_prof_set_k5_elems.
 int& k5_elems_override();
+std::atomic<int>& seq_override();      // issue 21: -1 the plan's set (host/seq_config.hpp), else a forced set of kSeq* bits for every plan (hooks only; relaxed)
+std::atomic<int>& k5_crt_override();   // issue 21: -1 follow the plan's set (kSeqLimbCrt), 0 force the integer CRT, 1 force the binary64-limb CRT (process-wide: all devices, streams and plans; a graph captures it at capture time)
+// The CRT variant K5 runs for a plan now: the limb CRT when the set the plan runs carries kSeqLimbCrt (a forced set 0..7 never does), unless the K5 hook forces one.
+inline bool k5_limb_crt(const ExecPlan& p) {
+  return seq_limb_crt(seq_effective(p.seq, seq_override().load(std::memory_order_relaxed)), k5_crt_override().load(std::memory_order_relaxed));
+}
 // v1.13 §4b (hygiene; contract.cu, test hook imd_test_set_pad_mutation): -1 (production) or
 // the post-swap operand x (0 = the GEMM's A, 1 = its B) whose K2 / K3 pack stores only k-bar
 // < ceil(k)_16 (Pipeline neg_a64_pad_old_k3: [ceil(k)_16, k_hat) left unwritten on one side
 // only, which the bit-exact check cannot see; initcheck must). Read by imd_contract with a
 // relaxed load (an atomic so a hook call racing a contract on another thread is not a data race).
 std::atomic<int>& pad_mutation();
+
+#ifdef IMD_BUILD_TEST_HOOKS
+// Test builds only (contract.cu; hooks imd_test_crt_elem, imd_test_k5_launch_counts). test_crt_elem: the CRT word x in [0, P) (kTestCrtWords = 5 u32 per vector,
+// little-endian limbs, zero above L32(N)) of `count` residue vectors W[l * count + i] (device bytes) for N moduli, before crt_finish / round_scaled, with
+// variant 0 the integer running CRT, 1 the shipped binary64-limb CRT, 2..9 its mutations 1..8 (contract.cu crt_f64_elem); the residue sits in byte e of
+// its plane's word. Launches on the default stream and returns the launch error. test_note_k5_launch counts launch_k5's kernel choices
+// ([limb CRT?][variant]); test_k5_launch_counts copies them (and optionally zeroes them).
+cudaError_t test_crt_elem(int N, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out);
+void test_note_k5_launch(bool limb_crt, int variant);
+void test_k5_launch_counts(bool reset, int64_t* out);
+// Issue 23 (docs/NOTES-23.md): test_note_kl_launch counts the KL kernel instances launched, test_kl_launch_counts copies them (int64[12]: [E = 4 / 8 / 16][Kb: bit 0
+// klwarp, bit 1 klload]; optionally zeroes them); test_kl_timers copies the KL section timers (IMD_KL_TIMERS builds only; slots in contract.cu KlSec) and returns the
+// slot count, -1 in a build without the knob, -2 on a CUDA error.
+void test_note_kl_launch(int E, int kb);
+void test_kl_launch_counts(bool reset, int64_t* out);
+int test_kl_timers(bool reset, unsigned long long* out, int n);
+// Issue 23: launches of the k5fin kernels (seq bit 128) since the last reset, [variant 0 / 1 / 2 / 3 as above]; test_note_k5_fin_launch is called by launch_k5 only when one runs.
+void test_note_k5_fin_launch(int variant);
+void test_k5_fin_counts(bool reset, int64_t* out);
+#endif
 
 // The execution data of a plan (api.cpp), for the test hooks; nullptr for a null plan.
 const ExecPlan* exec_of(imd_plan_t plan);

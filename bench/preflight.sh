@@ -58,6 +58,39 @@ else
   warn "cuTENSOR not found: the cuTENSOR baselines are skipped (module load cutensor, or export CUTENSOR_ROOT=<dir with include/cutensor.h and lib/libcutensor.so>, then rebuild in a fresh IMMERDINK_BENCH_BUILD)"
 fi
 
+echo "comparison baselines (bench/sweep_compare.txt; each one optional, a missing one records an error):"
+cb_hdr=""
+if [ -n "$nvcc" ]; then
+  nroot="$(cd "$(dirname "$nvcc")/.." && pwd)"
+  for d in "$nroot/include" "$nroot/targets/x86_64-linux/include" "$nroot/targets/sbsa-linux/include"; do
+    [ -f "$d/cublas_api.h" ] && { cb_hdr="$d/cublas_api.h"; break; }
+  done
+fi
+if [ -z "$cb_hdr" ]; then warn "cublas_api.h not found next to nvcc: cannot tell whether cuBLAS has the FP64 emulation API (the build tests it)"
+elif grep -q CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT "$cb_hdr"; then ok "cuBLAS FP64 emulation API ($cb_hdr): the emu baseline will be built"
+else warn "cuBLAS in $(dirname "$cb_hdr") has no FP64 emulation API (CUDA 13 needed): the emu baseline records 'needs CUDA 13 cuBLAS'; cuTENSOR's emulation may not engage either"; fi
+if [ -n "${GEMMUL8_DIR:-}" ] && [ -f "$GEMMUL8_DIR/lib/libgemmul8.a" ] && [ -f "$GEMMUL8_DIR/include/gemmul8.hpp" ]; then
+  ok "GEMMul8 ($GEMMUL8_DIR): the gemmul8 baseline will be built; pinned: $(grep -v '^#' "$here/GEMMUL8_PIN" | head -1)"
+else warn "GEMMUL8_DIR not set (or incomplete): the gemmul8 baseline is compiled out; bench/build_gemmul8.sh <GEMMul8 source at the pinned commit> <arch> <dir> builds it"; fi
+
+echo "profiler (the nsys pass of bench/run_metrics.sh, bench/profile_nsys.sh):"
+nsys_bin="${NSYS:-}"
+[ -z "$nsys_bin" ] && nsys_bin="$(command -v nsys || true)"
+if [ -z "$nsys_bin" ]; then
+  for c in "$env_dir/bin/nsys" "${CUDA_HOME:-/nonexistent}/bin/nsys" /usr/local/cuda*/bin/nsys /opt/nvidia/nsight-systems*/bin/nsys \
+           /opt/nvidia/nsight-systems*/*/target-linux-x64/nsys "$HOME"/nsight-systems-*/bin/nsys; do
+    [ -x "$c" ] && nsys_bin="$c"
+  done
+fi
+if [ -n "$nsys_bin" ] && [ -x "$nsys_bin" ]; then
+  ok "nsys $("$nsys_bin" --version 2>/dev/null | head -1 | sed 's/^NVIDIA Nsight Systems version //') ($nsys_bin)"
+  command -v python3 >/dev/null || warn "no python3: the nsys reports cannot be summarized"
+  pp="$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo ?)"
+  echo "  (CUDA trace only: no CPU sampling, so perf_event_paranoid=$pp does not matter)"
+else
+  warn "nsys not found: the profile pass records a note and no profiles (conda: nsight-systems into IMMERDINK_ENV, or module load nsight-systems, or NSYS=<path>)"
+fi
+
 echo "GPU:"
 if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
   nvidia-smi --query-gpu=index,name,compute_cap,driver_version,power.limit,clocks.max.sm,persistence_mode --format=csv,noheader | sed 's/^/  gpu   /'

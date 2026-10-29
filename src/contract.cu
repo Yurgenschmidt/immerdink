@@ -22,11 +22,13 @@
 #include <atomic>
 #include <climits>
 #include <cstdint>
+#include <type_traits>
 
 #include <cuda_runtime.h>
 
 #include "device/constants.cuh"
 #include "host/analysis.hpp"  // kFusedKHatMax
+#include "host/seq_config.hpp"
 #include "kernels/numerics.cuh"
 #include "kernels/pack_emitter.cuh"
 #include "plan.hpp"
@@ -290,10 +292,9 @@ __global__ void __launch_bounds__(T) k1_tiled(ScaleArgs a, int64_t radix, int lg
 // there), so that pass 2 re-reads from L2 (launch_k1, A3): the two-blocks-per-SM long-row
 // variant only while 2 x SMs rows fit (r_bigk's 256 x 256 KB do, r_mm's 256 x 400 KB do not);
 // beyond it, one 1024-thread block per SM walks pass 2 backwards.
-constexpr double kK1L2BudgetBytes = 64.0 * (1 << 20);
-
-unsigned k1_blocks(int64_t work_items, double bytes_per_block, int sms) {
-  const double fit = 40.0 * (1 << 20) / std::max(1.0, bytes_per_block);
+// Issue 21: both budgets are fractions of the card's L2 (host/analysis.hpp k1_l2_budget_bytes, k1_l2_fit_bytes: the old constants on the 4090).
+unsigned k1_blocks(int64_t work_items, double bytes_per_block, int sms, int64_t l2_bytes) {
+  const double fit = imd::detail::k1_l2_fit_bytes(l2_bytes) / std::max(1.0, bytes_per_block);
   int64_t cap = std::max<int64_t>(sms, static_cast<int64_t>(fit));
   if (work_items > cap && cap < 2 * int64_t{sms}) cap = cap / sms * sms;
   return blocks_for(std::min(work_items, cap), 1);
@@ -312,13 +313,32 @@ struct PackArgs {
   int lg_th;          // tile height th = 2^lg_th rows, tk = kTileElems / th k-bar
 };
 
+// Issue 21 (host/seq_config.hpp): the instruction-sequence set of a launch (the plan's, or the hooks' override)
+// and the pack kernels' template value S for it. f(std::integral_constant<int, S>{}) launches the instance.
+inline int seq_bits(const ExecPlan& p) {
+  return seq_effective(p.seq, seq_override().load(std::memory_order_relaxed));
+}
+template <int W, class F>
+void with_pack_seq(const ExecPlan& p, F&& f) {
+  switch (seq_pack_s(seq_bits(p), W)) {
+    case 0: f(std::integral_constant<int, 0>{}); break;
+    case 1: f(std::integral_constant<int, 1>{}); break;
+    default:
+      if constexpr (W == 2 && (kSeqSupported & kSeqQuant) != 0) f(std::integral_constant<int, 3>{});
+      else f(std::integral_constant<int, 1>{});
+  }
+}
+
 // §3.3 + §3.4 for one row's E consecutive k-bar: quantize once, then residues per modulus:
 // PackEmitterT<E, W> (kernels/pack_emitter.cuh, v1.14 §3.4.1: |a'| as W = pack_words(N) u32
 // words, branch-free). Every pack kernel is instantiated for W = 2 and 3; the launch picks W
 // from the plan's N.
 
-template <int W>  // v1.14 §3.4.1: pack_words(N)
-__global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
+// k23_pack's body, shared by the kernels below. The baseline kernel keeps its original launch bounds; the E1 W = 2 instance is
+// held to 4 resident CTAs (64 registers) like the baseline, because left alone it takes 80 registers and so 3 CTAs per SM
+// (E1 + Q1: 94 registers, 2 CTAs; capping that one spills 128 B, so it is not capped; docs/NOTES-21.md).
+template <int W, int Seq>  // v1.14 §3.4.1: pack_words(N); Seq: the instruction-sequence set (kernels/pack_emitter.cuh)
+__device__ __forceinline__ void k23_pack_body(PackArgs a) {
   __shared__ uint64_t tile[kTileSmem];
   __shared__ int64_t s_base[kTileRowsMax];  // v_bat[lambda] + v_row[r]
   __shared__ int64_t s_out[kTileRowsMax];   // (lambda rows_pad + r) k_hat
@@ -369,18 +389,26 @@ __global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
       const uint64_t* src = tile + dl * pitch + hl + hl / kVec;
 #pragma unroll
       for (int e = 0; e < kVec; ++e) bits[e] = src[e];
-      PackEmitterT<kVec, W> em;
+      PackEmitterT<kVec, W, Seq> em;
       em.load(bits, s_sigma[dl], a.trunc);
       int8_t* dst = a.R + s_out[dl] + h0 + hl;
       // Block row y of the grid emits the slots [y gsize / ny, (y + 1) gsize / ny): a small
       // operand is spread over more blocks (each re-reads its tile; same values).
       const int s_lo = int(blockIdx.y) * a.gsize / int(gridDim.y);
       const int s_hi = (int(blockIdx.y) + 1) * a.gsize / int(gridDim.y);
-      for (int s = s_lo; s < s_hi; ++s)
-        em.store(a.g0 + s, dst + s * plane);
+      store_slots(em, a.g0, s_lo, s_hi, dst, plane);
     }
     __syncthreads();  // shared arrays are reused by the next tile
   }
+}
+
+template <int W, int Seq = 0>
+__global__ void __launch_bounds__(kThreads) k23_pack(PackArgs a) {
+  k23_pack_body<W, Seq>(a);
+}
+template <int W, int Seq>
+__global__ void __launch_bounds__(kThreads, 4) k23_pack_cap(PackArgs a) {
+  k23_pack_body<W, Seq>(a);
 }
 
 // gridDim.y of a pack launch: with fewer tiles than 2 per SM, split the group's moduli over
@@ -467,6 +495,82 @@ __device__ __forceinline__ void crt_step_n(uint32_t (&x)[L], uint32_t Wl) {
   }
   crt_mac_sub<L>(x, M, y, P);
 }
+// Issue 21 (docs/NOTES-21.md, spec/crt_f64.py): the CRT of element e of the packed planes wv with the sums in binary64 limbs. The same integer x in [0, P) as crt_planes_n
+// (so crt_finish and round_scaled follow unchanged and the result is bit-identical): s_j = sum_l W_l k_lj by fma (exact), the quotient t = floor(fl(S) / P - 2^-30)
+// (never above the true quotient, at most one below), r_j = s_j - t P_j (exact), the limbs r_j carried into 32-bit words, one conditional subtraction of P.
+// Mut is a compile-time test knob (default 0 = the shipped code, no other value is instantiated outside IMD_BUILD_TEST_HOOKS builds): tests/test_crt_f64_unit.py
+// instantiates the mutations to show that the device-level test sees them: 1 bias 0, 2 bias 2^-40, 3 limb constant k[N][N-1][0] + 1, 4 Pj[0] + 1,
+// 5 the carry out of the bottom limb dropped, 6 the bottom limb's carry by a logical shift (wrong for a negative r_0), 7 R == P not reduced, 8 bias 2^-46.
+template <int N, int L, int Mut = 0, bool Fin = false>
+__device__ __forceinline__ void crt_f64_elem(const uint32_t (&wv)[N], int e, uint32_t (&x)[L]) {
+  constexpr int J = imd::constants::kF64Crt.J[N];
+  constexpr int Wb = imd::constants::kF64LimbBits;
+  double s[J];
+#pragma unroll
+  for (int j = 0; j < J; ++j) s[j] = 0.0;
+#pragma unroll
+  for (int l = 0; l < N; ++l) {
+    const double Wd = __uint2double_rn((wv[l] >> (8 * e)) & 255u);
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+      double kc = imd::device::c_f64crt.k[N][l][j];
+      if constexpr (Mut == 3) kc += (l == N - 1 && j == 0) ? 1.0 : 0.0;
+      s[j] = __fma_rn(Wd, kc, s[j]);
+    }
+  }
+  double Sd = s[J - 1];
+#pragma unroll
+  for (int j = J - 2; j >= 0; --j) Sd = __fma_rn(Sd, 1099511627776.0, s[j]);   // 2^40 = 2^kF64LimbBits
+  static_assert(Wb == 40, "the Horner base above is 2^40");
+  constexpr double bias = Mut == 1 ? 0.0 : Mut == 2 ? 0x1p-40 : Mut == 8 ? 0x1p-46 : 0x1p-30;
+  const int t = __double2int_rd(__fma_rn(Sd, imd::device::c_f64crt.Pinv[N], -bias));      // floor(fl(S) Pinv - 2^-30): the product is fused with the bias, one rounding fewer
+  const double td = static_cast<double>(t);
+  long long carry = 0;
+  uint64_t limb[J];
+#pragma unroll
+  for (int j = 0; j < J; ++j) {
+    double Pjd = imd::device::c_f64crt.Pj[N][j];
+    if constexpr (Mut == 4) Pjd += (j == 0) ? 1.0 : 0.0;
+    const long long a = __double2ll_rn(__fma_rn(-td, Pjd, s[j])) + carry;   // r_j: an exact integer below 2^53
+    limb[j] = static_cast<uint64_t>(a) & ((uint64_t{1} << Wb) - 1);
+    carry = a >> Wb;
+    if constexpr (Mut == 5) { if (j == 0) carry = 0; }
+    if constexpr (Mut == 6) { if (j == 0) carry = static_cast<long long>(static_cast<uint64_t>(a) >> Wb); }
+  }
+  // the carry out of the top limb is zero: R < P (1 + 2^-29) < 2^(40 J) (cert_crt_f64)
+#pragma unroll
+  for (int k = 0; k < L; ++k) {
+    const int bit = 32 * k, j0 = bit / Wb, off = bit % Wb;
+    uint64_t v = j0 < J ? limb[j0] >> off : 0;
+    if (j0 + 1 < J) v |= limb[j0 + 1] << (Wb - off);
+    x[k] = static_cast<uint32_t>(v);
+  }
+  // R in [0, P (1 + 2^-29)): subtract P once if R >= P
+  uint32_t d[L];
+  uint32_t borrow = 0;
+  if constexpr (Fin && L >= 2 && L <= 5) {   // k5fin (seq bit 128): d = x - P by one PTX carry chain (numerics.cuh sub_limbs: one IADD3 per limb), the same integers as the 64-bit loop below
+    uint32_t pl[L];
+#pragma unroll
+    for (int k = 0; k < L; ++k) pl[k] = c_tables.P[N][k];
+    borrow = imd::kernels::sub_limbs<L>(d, x, pl) != 0 ? 1u : 0u;
+  } else {
+#pragma unroll
+  for (int k = 0; k < L; ++k) {
+    const uint64_t diff = static_cast<uint64_t>(x[k]) - c_tables.P[N][k] - borrow;
+    d[k] = static_cast<uint32_t>(diff);
+    borrow = static_cast<uint32_t>(diff >> 63);
+  }
+  }
+  if constexpr (Mut == 7) {   // R == P (d == 0) is left as it is
+    uint32_t any = 0;
+#pragma unroll
+    for (int k = 0; k < L; ++k) any |= d[k];
+    if (any == 0) borrow = 1;
+  }
+#pragma unroll
+  for (int k = 0; k < L; ++k) x[k] = borrow ? x[k] : d[k];
+}
+
 // Planes l .. N-1 for E elements (interleaved: E independent chains per step).
 template <int N, int L, int E, int l = 0>
 __device__ __forceinline__ void crt_planes_n(uint32_t (&x)[E][L], const uint32_t (&wv)[N]) {
@@ -481,7 +585,7 @@ __device__ __forceinline__ void crt_planes_n(uint32_t (&x)[E][L], const uint32_t
 // or 4. j0 is a multiple of E, so each plane's E bytes are one aligned load (n_hat is a
 // multiple of 16). Elements with j >= n are not computed (D[e] unspecified). Every index into
 // x / D / wv is static after unrolling (no local memory).
-template <int N, int E>
+template <int N, int E, bool F64 = false, bool F1 = false>
 __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_t i, int64_t j0,
                                            double (&D)[E]) {
   static_assert(E == 1 || E == 2 || E == 4, "K5 takes 1, 2 or 4 consecutive j-bar per thread");
@@ -500,7 +604,12 @@ __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_
   for (int e = 0; e < E; ++e)
 #pragma unroll
     for (int w = 0; w < L; ++w) x[e][w] = 0;
-  crt_planes_n<N, L, E>(x, wv);
+  if constexpr (F64) {
+#pragma unroll
+    for (int e = 0; e < E; ++e) crt_f64_elem<N, L>(wv, e, x[e]);
+  } else {
+    crt_planes_n<N, L, E>(x, wv);
+  }
   const bool fa = a.fA[row] != 0;
   const int sa = a.sA[row];
 #pragma unroll
@@ -510,10 +619,7 @@ __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_
       if (fa || a.fB[lam * a.n + j] != 0) {
         D[e] = native_dot(a, lam, i, j);
       } else {
-        uint32_t mag[L];
-        bool neg;
-        crt_finish<L>(x[e], N, mag, &neg);
-        D[e] = round_scaled<L>(mag, neg, -(sa + int{a.sB[lam * a.n + j]}));
+        D[e] = crt_round<L, N, F1>(x[e], -(sa + int{a.sB[lam * a.n + j]}));  // crt_finish + round_scaled, or F1
       }
     }
   }
@@ -529,7 +635,7 @@ __device__ __forceinline__ void k5_elems_n(const OutArgs& a, int64_t lam, int64_
 // E = 2: each thread stores its own two elements. Shared slot of result s (= 4 item + e of the warp's 32 items): s + s / 16, which makes
 // both the writes (stride 4 per lane) and the reads (stride 1) bank-conflict free.
 constexpr int kK5WarpSlots = 128 + 8;
-template <int N, int E>
+template <int N, int E, bool F64 = false, bool F1 = false>
 __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
   __shared__ double sD[E == 4 ? (kThreads / 32) * kK5WarpSlots : 1];
   const int64_t ng = (a.n + E - 1) / E, total = a.b * a.m * ng;
@@ -547,7 +653,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
       int64_t t, i, lam;
       divmod(idx, ng, &t, &jg);
       divmod(t, a.m, &lam, &i);
-      k5_elems_n<N, E>(a, lam, i, E * jg, D);
+      k5_elems_n<N, E, F64, F1>(a, lam, i, E * jg, D);
       cbase = a.c_bat[lam] + a.c_row[i];
     }
     if constexpr (E != 4) {
@@ -580,7 +686,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_n(OutArgs a) {
 // tile of TL lambda x TJ j-bar of one row i (TL * TJ = 1024). It computes with j-bar
 // fastest (coalesced W reads), stages D in shared memory and writes C with lambda fastest
 // (coalesced C writes). TL = 2^lg_tl in [2, 32].
-template <int N>
+template <int N, bool F64 = false, bool F1 = false>
 __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
   constexpr int kTile = 1024;
   __shared__ double sD[kTile + 32];
@@ -596,7 +702,7 @@ __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
       const int64_t lam = lam0 + ll, j0 = j00 + 4 * jq;
       if (lam < a.b && j0 < a.n) {
         double D[4] = {0, 0, 0, 0};
-        k5_elems_n<N, 4>(a, lam, i, j0, D);
+        k5_elems_n<N, 4, F64, F1>(a, lam, i, j0, D);
 #pragma unroll
         for (int e = 0; e < 4; ++e) sD[ll * pitch + 4 * jq + e] = D[e];
       }
@@ -612,6 +718,184 @@ __global__ void __launch_bounds__(kThreads) k5_crt_bfast(OutArgs a, int lg_tl) {
     __syncthreads();
   }
 }
+
+#ifndef IMD_NO_SEQ_TWINS   // the k5fin kernels exist only in a build with the sequence twins (the -Werror build would flag the unused helpers)
+// ---- K5 'k5fin' (seq-set bit 128, docs/NOTES-23-k5.md) ------------------------------------------
+// Instruction-count cuts of the limb-CRT + F1 K5 kernels (the sm_90 default set), same integers, same doubles, same stores as k5_crt_n / k5_crt_bfast
+// with F64 = F1 = true. They are separate kernels, so the shipped kernels are untouched (their SASS does not change with the bit off):
+//   * 32-bit index arithmetic (the host checks that the item count and the launch stride fit in 32 bits, else the shipped kernel runs);
+//   * the metadata of 4 consecutive j-bar read as one 32-bit load of fB and one 64-bit load of sB when n % 4 == 0 and the pointers are aligned,
+//     and a group of 4 elements without a native one (fA, fB all zero: the usual case) is finished without per-element branches;
+//   * alpha == 1 and beta == 0 tested once per thread, not once per store;
+//   * E = 4: when the 32 items of a warp are 32 consecutive j-bar groups of one row (every lane live, no row change) the 4 stores of a lane need no
+//     shuffles: its j are 4 jg0 + lane + 32 r;
+//   * the final "subtract P once" of the limb CRT as one carry chain (crt_f64_elem Fin).
+__device__ __forceinline__ bool k5f_vmeta(const OutArgs& a) {   // 4 consecutive fB / sB entries are one aligned 32- / 64-bit load
+  return (a.n & 3) == 0 && ((reinterpret_cast<uintptr_t>(a.fB) & 3) | (reinterpret_cast<uintptr_t>(a.sB) & 7)) == 0;
+}
+__device__ __forceinline__ bool k5f_alpha1(const OutArgs& a) { return __double_as_longlong(a.alpha) == 0x3FF0000000000000LL; }   // alpha == 1.0, by bits
+__device__ __forceinline__ bool k5f_beta0(const OutArgs& a) { return (__double_as_longlong(a.beta) << 1) == 0; }                  // beta == +-0.0, by bits
+__device__ __forceinline__ void k5f_store(const OutArgs& a, bool a1, bool b0, int64_t off, double D) {
+  const double E = a1 ? D : __dmul_rn(a.alpha, D);   // = store_out (same operations), the two tests hoisted by the caller
+  a.C[off] = b0 ? E : __fma_rn(a.beta, a.C[off], E);
+}
+
+// K5 core of the k5fin kernels: the D values of the E consecutive j-bar j0..j0+E-1 of row t = lambda m + i (j0 < n; with vmeta, n % 4 == 0 and E = 4: all of them valid).
+template <int N, int E>
+__device__ __forceinline__ void k5f_elems(const OutArgs& a, uint32_t t, uint32_t lam, uint32_t j0, bool vmeta, double (&D)[E]) {
+  static_assert(E == 1 || E == 2 || E == 4, "K5 takes 1, 2 or 4 consecutive j-bar per thread");
+  constexpr int L = imd::constants::kTables.L32[N];
+  const int64_t plane = a.b * a.m * a.n_hat;
+  const uint8_t* W = a.W + int64_t{t} * a.n_hat + j0;
+  uint32_t wv[N];
+#pragma unroll
+  for (int l = 0; l < N; ++l) {
+    if constexpr (E == 4) wv[l] = __ldg(reinterpret_cast<const uint32_t*>(W + l * plane));
+    else if constexpr (E == 2) wv[l] = __ldg(reinterpret_cast<const uint16_t*>(W + l * plane));
+    else wv[l] = __ldg(W + l * plane);
+  }
+  uint32_t x[E][L];
+#pragma unroll
+  for (int e = 0; e < E; ++e) {
+#pragma unroll
+    for (int w = 0; w < L; ++w) x[e][w] = 0;
+    crt_f64_elem<N, L, 0, true>(wv, e, x[e]);
+  }
+  const bool fa = a.fA[t] != 0;
+  const int sa = a.sA[t];
+  const int64_t bo = int64_t{lam} * a.n + j0;
+  if constexpr (E == 4) {
+    if (vmeta) {
+      const uint32_t fb = __ldg(reinterpret_cast<const uint32_t*>(a.fB + bo));
+      if (!fa && fb == 0) {   // no native element in the group: the 4 finishes are straight-line
+        const uint2 sb = __ldg(reinterpret_cast<const uint2*>(a.sB + bo));
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const uint32_t w = e < 2 ? sb.x : sb.y;
+          const int sbe = static_cast<int16_t>(static_cast<uint16_t>(w >> (16 * (e & 1))));
+          D[e] = crt_round_fin<L, N>(x[e], -(sa + sbe));
+        }
+        return;
+      }
+    }
+  }
+#pragma unroll
+  for (int e = 0; e < E; ++e) {
+    const int64_t j = int64_t{j0} + e;
+    if (j < a.n) {
+      if (fa || a.fB[bo + e] != 0) {
+        D[e] = native_dot(a, lam, t - lam * static_cast<uint32_t>(a.m), j);
+      } else {
+        D[e] = crt_round_fin<L, N>(x[e], -(sa + int{a.sB[bo + e]}));
+      }
+    }
+  }
+}
+
+// k5fin launch check: the 32-bit index arithmetic must not overflow (items + one grid stride below 2^32; every extent below 2^32; b m below 2^32).
+inline bool k5f_fits(const K5Launch& L, const OutArgs& out) {
+  const int64_t lim = int64_t{1} << 32, stride = L.grid * kThreads;
+  return L.work > 0 && L.work + stride < lim && out.n >= 1 && out.m >= 1 && out.b >= 1 && out.n < lim && out.m < lim && out.b < lim && out.b * out.m < lim;
+}
+
+template <int N, int E>
+__global__ void __launch_bounds__(kThreads) k5f_crt_n(OutArgs a) {
+  __shared__ double sD[E == 4 ? (kThreads / 32) * kK5WarpSlots : 1];
+  const uint32_t m32 = static_cast<uint32_t>(a.m), nn = static_cast<uint32_t>(a.n);
+  const uint32_t ng = (nn + E - 1) / E, total = static_cast<uint32_t>(a.b) * m32 * ng;
+  const uint32_t stride = gridDim.x * kThreads;
+  const int lane = threadIdx.x & 31;
+  const bool a1 = k5f_alpha1(a), b0 = k5f_beta0(a), vmeta = k5f_vmeta(a);
+  double* wD = sD + (E == 4 ? (threadIdx.x / 32) * kK5WarpSlots : 0);
+  for (uint32_t base = blockIdx.x * kThreads; base < total; base += stride) {
+    const uint32_t idx = base + threadIdx.x;
+    const bool live = idx < total;
+    uint32_t jg = 0;
+    int64_t cbase = 0;
+    double D[E];
+#pragma unroll
+    for (int e = 0; e < E; ++e) D[e] = 0.0;
+    if (live) {
+      const uint32_t t = idx / ng, lam = t / m32;
+      jg = idx - t * ng;
+      k5f_elems<N, E>(a, t, lam, E * jg, vmeta, D);
+      cbase = a.c_bat[lam] + a.c_row[t - lam * m32];
+    }
+    if constexpr (E != 4) {
+      if (live) {
+#pragma unroll
+        for (int e = 0; e < E; ++e)
+          if (E * jg + e < nn) k5f_store(a, a1, b0, cbase + a.c_col[E * jg + e], D[e]);
+      }
+    } else {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int s = 4 * lane + e;
+        wD[s + s / 16] = D[e];
+      }
+      __syncwarp();
+      // the warp's 32 items are consecutive j-bar groups of one row (all live, no row change): lane's store r is j = 4 jg0 + lane + 32 r, and every lane has the row offset cbase
+      const uint32_t jg_first = __shfl_sync(0xffffffffu, jg, 0);   // (outside the && below: every lane of the full mask must execute the shuffle)
+      const bool run = live && jg == jg_first + lane;
+      if (__all_sync(0xffffffffu, run)) {
+        const uint32_t j00 = 4 * (jg - lane);
+        const bool n4 = (nn & 3) == 0;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          const int s = lane + 32 * r;
+          const uint32_t j = j00 + s;
+          if (n4 || j < nn) k5f_store(a, a1, b0, cbase + a.c_col[j], wD[s + s / 16]);   // n % 4 == 0: 4 jg0 + 127 <= n - 1 in a run
+        }
+      } else {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          const int s = lane + 32 * r, src = s / 4;
+          const int64_t cb = __shfl_sync(0xffffffffu, cbase, src);
+          const uint32_t j = 4 * __shfl_sync(0xffffffffu, jg, src) + (s & 3);
+          const bool ok = __shfl_sync(0xffffffffu, live ? 1 : 0, src) != 0;
+          if (ok && j < nn) k5f_store(a, a1, b0, cb + a.c_col[j], wD[s + s / 16]);
+        }
+      }
+      __syncwarp();  // wD is rewritten by the next iteration
+    }
+  }
+}
+
+template <int N>
+__global__ void __launch_bounds__(kThreads) k5f_crt_bfast(OutArgs a, int lg_tl) {
+  constexpr int kTile = 1024;
+  __shared__ double sD[kTile + 32];
+  const int tl = 1 << lg_tl, lg_tj = 10 - lg_tl, tj = 1 << lg_tj, pitch = tj + 1;
+  const uint32_t nn = static_cast<uint32_t>(a.n), bb = static_cast<uint32_t>(a.b), m32 = static_cast<uint32_t>(a.m);
+  const uint32_t n_lt = (bb + tl - 1) >> lg_tl, n_jt = (nn + tj - 1) >> lg_tj;
+  const uint32_t tiles = m32 * n_lt * n_jt;
+  const bool a1 = k5f_alpha1(a), b0 = k5f_beta0(a), vmeta = k5f_vmeta(a);
+  const int tid = threadIdx.x;
+  for (uint32_t t = blockIdx.x; t < tiles; t += gridDim.x) {
+    const uint32_t jt = t % n_jt, rest = t / n_jt, lt = rest % n_lt, i = rest / n_lt;
+    const uint32_t lam0 = lt << lg_tl, j00 = jt << lg_tj;
+    {  // compute: thread = (lambda_l, 4 consecutive j-bar), j-bar fastest
+      const int jq = tid & ((tj >> 2) - 1), ll = tid >> (lg_tj - 2);
+      const uint32_t lam = lam0 + ll, j0 = j00 + 4 * jq;
+      if (lam < bb && j0 < nn) {
+        double D[4] = {0, 0, 0, 0};
+        k5f_elems<N, 4>(a, lam * m32 + i, lam, j0, vmeta, D);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) sD[ll * pitch + 4 * jq + e] = D[e];
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int it = 0; it < kTile / kThreads; ++it) {  // store: lambda fastest
+      const int q = tid + it * kThreads, ll = q & (tl - 1), jl = q >> lg_tl;
+      const uint32_t lam = lam0 + ll, j = j00 + jl;
+      if (lam < bb && j < nn)
+        k5f_store(a, a1, b0, a.c_bat[lam] + a.c_row[i] + a.c_col[j], sD[ll * pitch + jl]);
+    }
+    __syncthreads();
+  }
+}
+#endif  // IMD_NO_SEQ_TWINS
 
 __global__ void __launch_bounds__(kThreads) k_direct(OutArgs a) {
   const int64_t total = a.b * a.m * a.n;
@@ -633,6 +917,41 @@ __global__ void __launch_bounds__(kThreads) k5_beta_only(OutArgs a) {
   }
 }
 
+#ifdef IMD_BUILD_TEST_HOOKS
+// Test only (tests/test_crt_f64_unit.py, hook imd_test_crt_elem): the CRT word x in [0, P) of one residue vector per thread, before crt_finish and round_scaled, by
+// the REAL crt_f64_elem<N, L, Mut> (F64) or the REAL integer running CRT (crt_planes_n) of this file. The residue of plane l sits in byte e of the plane's
+// 32-bit word, the other three bytes hold unrelated data (the f64 CRT and the integer CRT must both ignore them, as K5 does for E = 4).
+constexpr int kTestCrtWords = 5;   // the largest L32 (N = 17..20)
+template <int N, int Mut, bool F64, bool Fin = false>
+__global__ void __launch_bounds__(kThreads) test_crt_elem_kernel(const uint8_t* W, uint32_t* out, int64_t count, int e) {
+  const int64_t idx = blockIdx.x * int64_t{blockDim.x} + threadIdx.x;
+  if (idx >= count) return;
+  constexpr int L = imd::constants::kTables.L32[N];
+  uint32_t wv[N];
+#pragma unroll
+  for (int l = 0; l < N; ++l) {
+    uint32_t g = static_cast<uint32_t>(idx) * 2654435761u + static_cast<uint32_t>(l) * 40503u + 12345u;
+    g ^= g >> 15;
+    g *= 2246822519u;
+    g ^= g >> 13;
+    g &= ~(255u << (8 * e));
+    wv[l] = g | (uint32_t{W[l * count + idx]} << (8 * e));
+  }
+  uint32_t x[1][L];
+#pragma unroll
+  for (int w = 0; w < L; ++w) x[0][w] = 0;
+  if constexpr (F64) {
+    crt_f64_elem<N, L, Mut, Fin>(wv, e, x[0]);
+  } else {
+#pragma unroll
+    for (int l = 0; l < N; ++l) wv[l] >>= 8 * e;   // crt_planes_n reads byte 0 of element 0
+    crt_planes_n<N, L, 1>(x, wv);
+  }
+#pragma unroll
+  for (int w = 0; w < kTestCrtWords; ++w) out[idx * kTestCrtWords + w] = w < L ? x[0][w] : 0u;
+}
+#endif
+
 // K5 j-bar fastest, elements per thread (a launch choice; the results do not depend on it):
 // 1 while b m n <= k5_one_elem_per_sm() / 2 per SM, 2 while b m n <= 8 k5_one_elem_per_sm()
 // per SM, else 4 (A5, NOTES-A5 §2: nsys K5 times, 1 / 2 / 4 per thread, 16 K to 16 M
@@ -642,19 +961,68 @@ __global__ void __launch_bounds__(kThreads) k5_beta_only(OutArgs a) {
 
 // v1.10: the variant and grid are host/analysis.hpp k5_launch (shared with the performance
 // model), with this library's test hooks.
+template <int N, bool F64, bool F1>
+void launch_k5_v(const K5Launch& L, const OutArgs& out, cudaStream_t stream) {
+  const unsigned grid = static_cast<unsigned>(L.grid);
+  if (L.variant == 3)
+    k5_crt_bfast<N, F64, F1><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
+  else if (L.elems == 1)
+    k5_crt_n<N, 1, F64, F1><<<grid, kThreads, 0, stream>>>(out);
+  else if (L.elems == 2)
+    k5_crt_n<N, 2, F64, F1><<<grid, kThreads, 0, stream>>>(out);
+  else
+    k5_crt_n<N, 4, F64, F1><<<grid, kThreads, 0, stream>>>(out);
+}
+
+#ifndef IMD_NO_SEQ_TWINS
+template <int N>
+void launch_k5f_v(const K5Launch& L, const OutArgs& out, cudaStream_t stream) {
+  const unsigned grid = static_cast<unsigned>(L.grid);
+  if (L.variant == 3)
+    k5f_crt_bfast<N><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
+  else if (L.elems == 1)
+    k5f_crt_n<N, 1><<<grid, kThreads, 0, stream>>>(out);
+  else if (L.elems == 2)
+    k5f_crt_n<N, 2><<<grid, kThreads, 0, stream>>>(out);
+  else
+    k5f_crt_n<N, 4><<<grid, kThreads, 0, stream>>>(out);
+}
+#endif  // IMD_NO_SEQ_TWINS
+
 template <int N>
 void launch_k5(const ExecPlan& p, const OutArgs& out, cudaStream_t stream) {
   const K5Launch L = k5_launch(p.k5_batch_fast, p.b, p.m, p.n, p.sms, k5_one_elem_per_sm(),
                                k5_elems_override());
-  const unsigned grid = static_cast<unsigned>(L.grid);
-  if (L.variant == 3)
-    k5_crt_bfast<N><<<grid, kThreads, 0, stream>>>(out, L.lg_tl);
-  else if (L.elems == 1)
-    k5_crt_n<N, 1><<<grid, kThreads, 0, stream>>>(out);
-  else if (L.elems == 2)
-    k5_crt_n<N, 2><<<grid, kThreads, 0, stream>>>(out);
-  else
-    k5_crt_n<N, 4><<<grid, kThreads, 0, stream>>>(out);
+  const bool f64 = k5_limb_crt(p);   // read once: both re-read relaxed atomics (the hooks), and the counter must agree with the kernel launched
+  const int seq = seq_bits(p);
+#ifdef IMD_BUILD_TEST_HOOKS
+  test_note_k5_launch(f64, L.variant);   // host-side count for tests/test_crt_f64_gpu.py (no device code)
+#endif
+  // issue 21: the sums in binary64 limbs (the class set's kSeqLimbCrt bit unless the K5 hook forces a CRT), and the F1 finish (host/seq_config.hpp)
+  const bool f1 = (seq & kSeqFinish) != 0;
+  // issue 23: k5fin (bit 128) is the limb CRT + F1 kernels with fewer instructions: only for that combination, and only when its 32-bit index arithmetic fits
+#ifndef IMD_NO_SEQ_TWINS
+  if constexpr ((kSeqSupported & kSeqK5Fin) != 0) {
+    if (f64 && f1 && (seq & kSeqK5Fin) != 0 && k5f_fits(L, out)) {
+#ifdef IMD_BUILD_TEST_HOOKS
+      test_note_k5_fin_launch(L.variant);
+#endif
+      launch_k5f_v<N>(L, out, stream);
+      return;
+    }
+  }
+#endif
+  if (f64) {
+    if constexpr ((kSeqSupported & kSeqFinish) != 0) {
+      if (f1) { launch_k5_v<N, true, true>(L, out, stream); return; }
+    }
+    launch_k5_v<N, true, false>(L, out, stream);
+  } else {
+    if constexpr ((kSeqSupported & kSeqFinish) != 0) {
+      if (f1) { launch_k5_v<N, false, true>(L, out, stream); return; }
+    }
+    launch_k5_v<N, false, false>(L, out, stream);
+  }
 }
 
 // K5 for the plan's N: the run-time N picks its kernel (false: N outside [kNMin, kNMax]).
@@ -796,7 +1164,7 @@ __device__ __forceinline__ u128 shfl_xor_u128(u128 v, int d) {
   return (static_cast<u128>(hi) << 64) | lo;
 }
 
-template <int Cap, int E, int W>  // W: v1.14 §3.4.1 pack_words(N)
+template <int Cap, int E, int W, int Seq = 0>  // W: v1.14 §3.4.1 pack_words(N); Seq: sequence set
 __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant__ FusedArgs<Cap> a) {
   constexpr int kLgE = E == 16 ? 4 : 2, kTE = kThreads * E, kLgTE = 8 + kLgE;
   constexpr int kRowsMax = kTE / 16;  // th for tk = 16
@@ -901,13 +1269,13 @@ __global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant_
     }
     // 5. residues of this part's slots (K padding h in [k, k_hat) is zero in the tile)
     if (valid && hl < a.k_hat) {
-      PackEmitterT<E, W> em;
+      PackEmitterT<E, W, Seq> em;
       em.load(bits, sigma, a.trunc != 0);
       const int64_t plane = a.b * a.rows_pad[x] * a.k_hat;
       int64_t lam, r;
       divmod(lo + radix * (d0 + dl), rows, &lam, &r);
       int8_t* dst = a.R[x] + (lam * a.rows_pad[x] + r) * a.k_hat + hl;
-      for (int s = s_lo; s < s_hi; ++s) em.store(s, dst + s * plane);  // group 1: modulus = slot
+      store_slots(em, 0, s_lo, s_hi, dst, plane);  // group 1: modulus = slot
     }
     __syncthreads();  // shared arrays are reused by the next tile
   }
@@ -972,12 +1340,22 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   if (small) tiles = tiles_for(10);
   const dim3 grid(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms));
   const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1
+  const auto run = [&](auto E, auto W) {
+    with_pack_seq<decltype(W)::value>(p, [&](auto S) {
+      kf_scale_pack<Cap, decltype(E)::value, decltype(W)::value, decltype(S)::value>
+          <<<grid, kThreads, 0, stream>>>(a);
+    });
+  };
+  using I4 = std::integral_constant<int, 4>;
+  using I16 = std::integral_constant<int, 16>;
+  using I2 = std::integral_constant<int, 2>;
+  using I3 = std::integral_constant<int, 3>;
   if (small) {
-    if (w2) kf_scale_pack<Cap, 4, 2><<<grid, kThreads, 0, stream>>>(a);
-    else kf_scale_pack<Cap, 4, 3><<<grid, kThreads, 0, stream>>>(a);
+    if (w2) run(I4{}, I2{});
+    else run(I4{}, I3{});
   } else {
-    if (w2) kf_scale_pack<Cap, 16, 2><<<grid, kThreads, 0, stream>>>(a);
-    else kf_scale_pack<Cap, 16, 3><<<grid, kThreads, 0, stream>>>(a);
+    if (w2) run(I16{}, I2{});
+    else run(I16{}, I3{});
   }
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
@@ -1017,6 +1395,9 @@ struct LargeArgs {
   int8_t* R;                       // [s][lambda][rows_pad][k_hat], group 1: modulus = slot s
   uint64_t rhs[4];
   int rhs_bits, lhs_shift;
+  // Issue 23 (kSeqKlWarp): the launch-invariant 64-bit scalars the kernel derives from the arguments (host: kl_launch), appended so that no
+  // earlier field moves (the kernels without the bit ignore them). D = b rows / radix, n_d = ceil(D / th), tiles = radix n_d, nc = ceil(k_hat / tk).
+  int64_t D, n_d, tiles, nc;
 };
 
 __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl) {
@@ -1024,41 +1405,132 @@ __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl
   else if (finite_nonzero(bits)) gmax = max(gmax, ilogb_bits(bits));
 }
 
-template <int E, int W>  // values per thread: 8 (512 threads, 2 CTAs per SM) or 4 (1024
-                         // threads); W: v1.14 §3.4.1 pack_words(N)
+// ---- Issue 23: KL fixed-part variants (host/seq_config.hpp kSeqKlWarp / kSeqKlLoad / kSeqKlShape, docs/NOTES-23.md) ----
+// Kb (template value of kl_scale_pack): bit 0 klwarp, bit 1 klload; Kb = 0 is the original kernel (its SASS is unchanged:
+// tools/sass_ident.sh). klshape is the launch's E (16 values per thread).
+constexpr int kKlWarp = 1, kKlLoad = 2;
+
+// Section timers (compile-time knob IMD_KL_TIMERS = 1 / 2, CMake IMMERDINK_KL_TIMERS; OFF by default and then nothing below exists in any kernel).
+// Lane 0 of every warp stamps clock64() at the section boundaries and adds the elapsed cycles of the section to a shared counter; thread 0 adds a CTA's
+// counters to g_kl_timers at its end. The numbers are SUMS over warps (warp-cycles), so section / sum of sections is the split of a warp's
+// time (barrier waits are inside the section that ends at the barrier); kKltLife is the sum of the CTAs' lifetimes (thread 0).
+// Level 2 also times the modulus loop's emit and its store separately (two stamps per modulus: perturbs that loop).
+#ifdef IMD_KL_TIMERS
+enum KlSec { kKltSetup, kKltLoad, kKltRed1, kKltSsum, kKltRed2, kKltSigma, kKltReload, kKltQuant, kKltEmit, kKltStore, kKltTail,
+             kKltWarpTiles, kKltCtas, kKltLife, kKltSlots = 16 };
+__device__ unsigned long long g_kl_timers[kKltSlots];
+#define KLT_DECL() \
+  __shared__ unsigned long long s_tm[kKltSlots]; \
+  long long t_prev = 0, t_life = 0
+#define KLT_INIT() \
+  do { if (tid < kKltSlots) s_tm[tid] = 0; t_life = clock64(); __syncthreads(); } while (0)
+#define KLT_BEGIN() do { t_prev = clock64(); } while (0)
+#define KLT(sec) \
+  do { if (lane == 0) { const long long t_now = clock64(); atomicAdd(&s_tm[sec], static_cast<unsigned long long>(t_now - t_prev)); t_prev = t_now; } } while (0)
+#define KLT_TILE() do { if (lane == 0) atomicAdd(&s_tm[kKltWarpTiles], 1ull); } while (0)
+#define KLT_END() \
+  do { __syncthreads(); if (tid == 0) { s_tm[kKltCtas] = 1; s_tm[kKltLife] = static_cast<unsigned long long>(clock64() - t_life); } \
+       __syncthreads(); if (tid < kKltSlots) atomicAdd(&g_kl_timers[tid], s_tm[tid]); } while (0)
+#else
+#define KLT_DECL() static_assert(true, "")
+#define KLT_INIT() do {} while (0)
+#define KLT_BEGIN() do {} while (0)
+#define KLT(sec) do {} while (0)
+#define KLT_TILE() do {} while (0)
+#define KLT_END() do {} while (0)
+#endif
+
+template <int E, int W, int Seq = 0, int Kb = 0>  // values per thread: 8 (512 threads, 2 CTAs per SM) or 4 (1024
+                         // threads), or 16 (256 threads; klshape); W: v1.14 §3.4.1 pack_words(N); Seq: sequence set; Kb: the fixed-part cuts
 __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     kl_scale_pack(const __grid_constant__ LargeArgs a) {
   constexpr int T = kTileElems / E, kLgE = E == 16 ? 4 : E == 8 ? 3 : 2;
-  __shared__ uint64_t tile[kTileSmem];
+  constexpr bool kWarp = (Kb & kKlWarp) != 0, kDirect = (Kb & kKlLoad) != 0;
+  __shared__ uint64_t tile[kDirect ? 1 : kTileSmem];  // kDirect: no gather tile
   __shared__ int64_t s_base[kTileRowsMax];  // v_bat[lambda] + v_row[r]
   __shared__ bool s_valid[kTileRowsMax];
   __shared__ int s_wg[T / 32];
   __shared__ unsigned s_wf[T / 32];
   __shared__ u128 s_ws[T / 32];
+  __shared__ int64_t s_rho[kWarp ? kTileRowsMax : 1];  // kWarp: per row rho and the output offset of its first element, computed once per tile
+  __shared__ int64_t s_dst[kWarp ? kTileRowsMax : 1];
+  __shared__ int s_sigma[kWarp ? kTileRowsMax : 1];    // kWarp: sigma of the row, from one warp
+  KLT_DECL();
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  KLT_INIT();
   const int lg_th = a.lg_th, th = 1 << lg_th, lg_tk = 12 - lg_th, tk = 1 << lg_tk;
   const int pitch = tk + tk / kVec + 1;
   const int G = tk / E, Gw = G < 32 ? G : 32;  // threads per row; G | 32 or 32 | G
   const int nw = G > 32 ? G / 32 : 1, w0 = warp & ~(nw - 1);  // the row's warps (G > 32)
   const int dl = tid >> (lg_tk - kLgE), hl = (tid & (G - 1)) * E;  // this thread: row, k-bar
   const uint64_t* mine = tile + dl * pitch + hl + hl / kVec;
-  const int64_t rows = a.op.rows, D = a.b * rows / a.radix;
-  const int64_t n_d = (D + th - 1) >> lg_th, tiles = a.radix * n_d;
-  const int64_t nc = (a.k_hat + tk - 1) >> lg_tk;
+  int64_t rows = a.op.rows, D, n_d, tiles, nc;
+  if constexpr (kWarp) {  // from the host (LargeArgs): no per-thread 64-bit divisions
+    D = a.D, n_d = a.n_d, tiles = a.tiles, nc = a.nc;
+  } else {
+    D = a.b * rows / a.radix;
+    n_d = (D + th - 1) >> lg_th, tiles = a.radix * n_d;
+    nc = (a.k_hat + tk - 1) >> lg_tk;
+  }
   const int64_t plane = a.b * a.rows_pad * a.k_hat;
   for (int64_t t = blockIdx.x; t < tiles; t += gridDim.x) {  // block-uniform
-    const int64_t dt = t % n_d, lo = t / n_d, d0 = dt << lg_th;
+    KLT_BEGIN();
+    KLT_TILE();
+    [[maybe_unused]] int64_t lo = 0, d0 = 0;
+    if constexpr (!kWarp) {
+      const int64_t dt = t % n_d;
+      lo = t / n_d, d0 = dt << lg_th;
+    }
     if (tid < th) {
-      const int64_t d = d0 + tid;
-      const bool valid = d < D;
-      s_valid[tid] = valid;
-      if (valid) {
-        int64_t lam, r;
-        divmod(lo + a.radix * d, rows, &lam, &r);
-        s_base[tid] = a.op.v_bat[lam] + a.op.v_row[r];
+      if constexpr (kWarp) {  // the row info once per row (th threads), including everything the stores need
+        int64_t dt, lam, r;
+        divmod(t, n_d, &lo, &dt);
+        const int64_t d = (dt << lg_th) + tid;
+        const bool valid = d < D;
+        s_valid[tid] = valid;
+        if (valid) {
+          const int64_t rho = lo + a.radix * d;
+          divmod(rho, rows, &lam, &r);
+          s_base[tid] = a.op.v_bat[lam] + a.op.v_row[r];
+          s_rho[tid] = rho;
+          s_dst[tid] = (lam * a.rows_pad + r) * a.k_hat;
+        }
+      } else {
+        const int64_t d = d0 + tid;
+        const bool valid = d < D;
+        s_valid[tid] = valid;
+        if (valid) {
+          int64_t lam, r;
+          divmod(lo + a.radix * d, rows, &lam, &r);
+          s_base[tid] = a.op.v_bat[lam] + a.op.v_row[r];
+        }
       }
     }
     __syncthreads();
+    KLT(kKltSetup);
+    // kDirect (unit-stride k, host-checked): this thread's E consecutive k-bar of chunk c straight from global memory into registers,
+    // 16-byte loads when the address is aligned and the E values are inside the row, else per element (zero outside the operand as the gather)
+    [[maybe_unused]] const bool row_ok = s_valid[dl];
+    [[maybe_unused]] const double* const row_p = row_ok ? a.op.X + s_base[dl] : nullptr;
+    const auto fetch = [&](int64_t c, uint64_t (&bits)[E]) {
+      const int64_t h = (c << lg_tk) + hl;
+      if (!row_ok) {
+#pragma unroll
+        for (int e = 0; e < E; ++e) bits[e] = 0;
+        return;
+      }
+      const double* p = row_p + h;
+      if (h + E <= a.k && (reinterpret_cast<uintptr_t>(p) & 15) == 0) {
+#pragma unroll
+        for (int j = 0; j < E / 2; ++j) {
+          const double2 v = *reinterpret_cast<const double2*>(p + 2 * j);
+          bits[2 * j] = to_bits(v.x), bits[2 * j + 1] = to_bits(v.y);
+        }
+      } else {
+#pragma unroll
+        for (int e = 0; e < E; ++e) bits[e] = h + e < a.k ? to_bits(p[e]) : 0;
+      }
+    };
     // Gather chunk c into the tile (zero outside the operand), coalesced as in k23_pack.
     const auto load = [&](int64_t c) {
       const int64_t h0 = c << lg_tk, h_end = a.k - h0;
@@ -1076,22 +1548,34 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
       }
     };
     // pass 1: flag and gamma; chunk 0 into registers
-    load(0);
-    __syncthreads();
     uint64_t r0[E];
-#pragma unroll
-    for (int e = 0; e < E; ++e) r0[e] = mine[e];
     int gmax = INT_MIN;
     unsigned fl = 0;
+    if constexpr (kDirect) {
+      fetch(0, r0);
+    } else {
+      load(0);
+      __syncthreads();
+#pragma unroll
+      for (int e = 0; e < E; ++e) r0[e] = mine[e];
+    }
 #pragma unroll
     for (int e = 0; e < E; ++e) scan_bits(r0[e], gmax, fl);
     for (int64_t c = 1; c < nc; ++c) {
-      __syncthreads();  // every thread has taken chunk c - 1
-      load(c);
-      __syncthreads();
+      if constexpr (kDirect) {
+        uint64_t bits[E];
+        fetch(c, bits);
 #pragma unroll
-      for (int e = 0; e < E; ++e) scan_bits(mine[e], gmax, fl);
+        for (int e = 0; e < E; ++e) scan_bits(bits[e], gmax, fl);
+      } else {
+        __syncthreads();  // every thread has taken chunk c - 1
+        load(c);
+        __syncthreads();
+#pragma unroll
+        for (int e = 0; e < E; ++e) scan_bits(mine[e], gmax, fl);
+      }
     }
+    KLT(kKltLoad);
     for (int o = Gw / 2; o > 0; o /= 2) {
       gmax = max(gmax, __shfl_xor_sync(0xffffffffu, gmax, o));
       fl |= __shfl_xor_sync(0xffffffffu, fl, o);
@@ -1099,8 +1583,19 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     if (G > 32) {  // block-uniform
       if (lane == 0) s_wg[warp] = gmax, s_wf[warp] = fl;
       __syncthreads();
-      for (int w = w0; w < w0 + nw; ++w) gmax = max(gmax, s_wg[w]), fl |= s_wf[w];
+      if constexpr (kWarp) {  // lane l of every warp takes the row's warp l, then a shuffle reduction over the nw lanes
+        int g2 = lane < nw ? s_wg[w0 + lane] : INT_MIN;
+        unsigned f2 = lane < nw ? s_wf[w0 + lane] : 0u;
+        for (int o = nw >> 1; o > 0; o >>= 1) {
+          g2 = max(g2, __shfl_xor_sync(0xffffffffu, g2, o));
+          f2 |= __shfl_xor_sync(0xffffffffu, f2, o);
+        }
+        gmax = __shfl_sync(0xffffffffu, g2, 0), fl = __shfl_sync(0xffffffffu, f2, 0);
+      } else {
+        for (int w = w0; w < w0 + nw; ++w) gmax = max(gmax, s_wg[w]), fl |= s_wf[w];
+      }
     }
+    KLT(kKltRed1);
     // pass 2: S (exact, order-independent) from registers, shared memory, then L2
     const bool live = gmax != INT_MIN;  // the row has a finite nonzero entry
     u128 S = 0;
@@ -1110,72 +1605,143 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
         if (finite_nonzero(r0[e])) S += square_term_n(r0[e], gmax);
     }
     if (nc > 1) {
-      if (live) {  // chunk nc - 1, still in shared memory
+      if constexpr (kDirect) {  // chunks re-read from global memory (L1 / L2), the last one first
+        for (int64_t c = nc - 1; c >= 1; --c) {
+          uint64_t bits[E];
+          fetch(c, bits);
+          if (live) {
 #pragma unroll
-        for (int e = 0; e < E; ++e) {
-          const uint64_t bits = mine[e];
-          if (finite_nonzero(bits)) S += square_term_n(bits, gmax);
+            for (int e = 0; e < E; ++e)
+              if (finite_nonzero(bits[e])) S += square_term_n(bits[e], gmax);
+          }
         }
-      }
-      for (int64_t c = nc - 2; c >= 1; --c) {
-        __syncthreads();
-        load(c);
-        __syncthreads();
-        if (live) {
+      } else {
+        if (live) {  // chunk nc - 1, still in shared memory
 #pragma unroll
           for (int e = 0; e < E; ++e) {
             const uint64_t bits = mine[e];
             if (finite_nonzero(bits)) S += square_term_n(bits, gmax);
           }
         }
+        for (int64_t c = nc - 2; c >= 1; --c) {
+          __syncthreads();
+          load(c);
+          __syncthreads();
+          if (live) {
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+              const uint64_t bits = mine[e];
+              if (finite_nonzero(bits)) S += square_term_n(bits, gmax);
+            }
+          }
+        }
       }
     }
+    KLT(kKltSsum);
     for (int o = Gw / 2; o > 0; o /= 2) S += shfl_xor_u128(S, o);
-    if (G > 32) {
-      if (lane == 0) s_ws[warp] = S;
-      __syncthreads();
-      S = 0;
-      for (int w = w0; w < w0 + nw; ++w) S += s_ws[w];
-    }
-    // sigma by the first lane of the row's piece in this warp, broadcast within the warp
     int sigma = 0;  // zero row (all entries zero or non-finite): sigma := 0
-    if ((lane & (Gw - 1)) == 0 && live) sigma = largest_u(S, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
-    sigma = __shfl_sync(0xffffffffu, sigma, lane & ~(Gw - 1));
+    if constexpr (kWarp) {
+      if (G > 32) {
+        if (lane == 0) s_ws[warp] = S;
+        __syncthreads();
+        KLT(kKltRed2);
+        if (warp == w0) {  // the row's first warp: lane l takes warp l's S, shuffle reduction, ONE largest_u per row, to shared memory
+          u128 v = lane < nw ? s_ws[w0 + lane] : 0;
+          for (int o = nw >> 1; o > 0; o >>= 1) v += shfl_xor_u128(v, o);
+          if (lane == 0) s_sigma[dl] = live ? largest_u(v, a.lhs_shift, a.rhs, a.rhs_bits) - gmax : 0;
+        }
+        __syncthreads();
+        sigma = s_sigma[dl];
+      } else {
+        KLT(kKltRed2);
+        if ((lane & (Gw - 1)) == 0 && live) sigma = largest_u(S, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
+        sigma = __shfl_sync(0xffffffffu, sigma, lane & ~(Gw - 1));
+      }
+    } else {
+      if (G > 32) {
+        if (lane == 0) s_ws[warp] = S;
+        __syncthreads();
+        S = 0;
+        for (int w = w0; w < w0 + nw; ++w) S += s_ws[w];
+      }
+      KLT(kKltRed2);
+      // sigma by the first lane of the row's piece in this warp, broadcast within the warp
+      if ((lane & (Gw - 1)) == 0 && live) sigma = largest_u(S, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
+      sigma = __shfl_sync(0xffffffffu, sigma, lane & ~(Gw - 1));
+    }
     const bool valid = s_valid[dl];
     int64_t dst_off = 0;  // (lambda rows_pad + r) k_hat + hl
     if (valid) {
-      const int64_t rho = lo + a.radix * (d0 + dl);
-      if ((tid & (G - 1)) == 0) {  // range certified (cert_shift_range)
-        a.sigma[rho] = static_cast<int16_t>(sigma);
-        a.flag[rho] = static_cast<uint8_t>(fl);
+      if constexpr (kWarp) {
+        if ((tid & (G - 1)) == 0) {  // range certified (cert_shift_range)
+          const int64_t rho = s_rho[dl];
+          a.sigma[rho] = static_cast<int16_t>(sigma);
+          a.flag[rho] = static_cast<uint8_t>(fl);
+        }
+        dst_off = s_dst[dl] + hl;
+      } else {
+        const int64_t rho = lo + a.radix * (d0 + dl);
+        if ((tid & (G - 1)) == 0) {  // range certified (cert_shift_range)
+          a.sigma[rho] = static_cast<int16_t>(sigma);
+          a.flag[rho] = static_cast<uint8_t>(fl);
+        }
+        int64_t lam, r;
+        divmod(rho, rows, &lam, &r);
+        dst_off = (lam * a.rows_pad + r) * a.k_hat + hl;
       }
-      int64_t lam, r;
-      divmod(rho, rows, &lam, &r);
-      dst_off = (lam * a.rows_pad + r) * a.k_hat + hl;
     }
+    KLT(kKltSigma);
     // pass 3: residues of every slot of group 1 (K padding h in [k, k_hat) is zero)
     const auto emit = [&](const uint64_t (&bits)[E], int64_t c) {
+      KLT(kKltReload);
       if (valid && (c << lg_tk) + hl < a.k_hat) {  // k_hat is a multiple of 16
-        PackEmitterT<E, W> em;
+        PackEmitterT<E, W, Seq> em;
         em.load(bits, sigma, a.trunc != 0);
+        KLT(kKltQuant);
         int8_t* dst = a.R + dst_off + (c << lg_tk);
-        for (int s = 0; s < a.gsize; ++s) em.store(s, dst + s * plane);
+#if defined(IMD_KL_TIMERS) && IMD_KL_TIMERS >= 2
+        {  // the loop of store_slots with a stamp between the emit and its store
+          int8_t* d = dst;
+          for (int s = 0; s < a.gsize; ++s, d += plane) {
+            uint32_t w[E / 4];
+            em.emit(s, w);
+            KLT(kKltEmit);
+            if constexpr (E == 16) *reinterpret_cast<uint4*>(d) = make_uint4(w[0], w[1], w[2], w[3]);
+            else if constexpr (E == 8) *reinterpret_cast<uint2*>(d) = make_uint2(w[0], w[1]);
+            else *reinterpret_cast<uint32_t*>(d) = w[0];
+            KLT(kKltStore);
+          }
+        }
+#else
+        store_slots(em, 0, 0, a.gsize, dst, plane);
+        KLT(kKltEmit);
+#endif
       }
     };
     emit(r0, 0);
     for (int64_t c = 1; c < nc; ++c) {
-      if (c > 1) {  // chunk 1 is in shared memory after pass 2
-        __syncthreads();
-        load(c);
-        __syncthreads();
-      }
       uint64_t bits[E];
+      if constexpr (kDirect) {
+        fetch(c, bits);
+      } else {
+        if (c > 1) {  // chunk 1 is in shared memory after pass 2
+          __syncthreads();
+          load(c);
+          __syncthreads();
+        }
 #pragma unroll
-      for (int e = 0; e < E; ++e) bits[e] = mine[e];
+        for (int e = 0; e < E; ++e) bits[e] = mine[e];
+      }
       emit(bits, c);
     }
-    __syncthreads();  // the tile and the row info are reused by the next tile
+    if constexpr (kWarp) {
+      if (t + int64_t{gridDim.x} < tiles) __syncthreads();  // the tile and the row info are reused by the next tile (none after the last)
+    } else {
+      __syncthreads();  // the tile and the row info are reused by the next tile
+    }
+    KLT(kKltTail);
   }
+  KLT_END();
   // B rows n..n_hat-1 of every (slot, lambda) of group 1: zero (as k23_zero_rows)
   if (a.rows_pad > rows) {
     const int64_t gt = blockIdx.x * int64_t{T} + tid, gs = int64_t{gridDim.x} * T;
@@ -1186,6 +1752,27 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
           make_uint4(0, 0, 0, 0);
     }
   }
+}
+
+// kl_scale_pack's Kb for a launch (kb: bit 0 klwarp, bit 1 klload; E = 4 never takes klload: its rows are longer than two chunks, the host
+// has cleared the bit).
+template <int E, int W, int S>
+void launch_kl_kb(int kb, unsigned grid, cudaStream_t stream, const LargeArgs& a) {
+  constexpr unsigned T = kTileElems / E;
+  if constexpr (E == 4) kb &= ~kKlLoad;
+  if constexpr ((kSeqSupported & kSeqKl) == 0) kb = 0;
+#ifdef IMD_BUILD_TEST_HOOKS
+  test_note_kl_launch(E, kb);
+#endif
+  if constexpr ((kSeqSupported & kSeqKl) != 0) {
+    switch (kb) {
+      case 1: kl_scale_pack<E, W, S, 1><<<grid, T, 0, stream>>>(a); return;
+      case 2: if constexpr (E != 4) { kl_scale_pack<E, W, S, 2><<<grid, T, 0, stream>>>(a); return; } break;
+      case 3: if constexpr (E != 4) { kl_scale_pack<E, W, S, 3><<<grid, T, 0, stream>>>(a); return; } break;
+      default: break;
+    }
+  }
+  kl_scale_pack<E, W, S, 0><<<grid, T, 0, stream>>>(a);
 }
 
 // KL for operand x of the plan (DESIGN v1.6 §4): tile height and grid.
@@ -1220,12 +1807,37 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
   // (r_bigk 32 MB, r_mm 51 MB: inside the L2 budget of K1, A3).
   const unsigned grid = static_cast<unsigned>(L.grid);
   const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1 (imd_pack: the pack's N)
+  // Issue 23 (docs/NOTES-23.md): the fixed-part cuts of the plan's set. klwarp: the kernel takes the launch-invariant 64-bit scalars from here.
+  // klload: unit-stride k (one fused K mode of stride 1, read along k-bar), the rows held on chip (nc <= 2) and a 16-byte aligned operand base;
+  // the kernel still checks every thread's address (an odd row offset falls back to per-element loads). klshape: 16 values per thread (256 threads)
+  // for the rows held on chip. A bit that does not apply to this operand is simply not taken (the gather / 8 values per thread run).
+  int kb = 0;
+  bool shape16 = false;
+  if constexpr ((kSeqSupported & kSeqKl) != 0) {
+    const int sb = seq_bits(p);
+    kb = seq_kl_kb(sb);
+    if ((kb & kKlLoad) != 0 &&
+        !(a.along_rows == 0 && a.k_affine == 1 && a.k_stride == 1 && L.nc <= 2 && (reinterpret_cast<uintptr_t>(op.X) & 15) == 0))
+      kb &= ~kKlLoad;
+    shape16 = seq_kl_shape(sb) && L.values == 8;
+  }
+  a.D = p.b * op.rows / a.radix, a.nc = L.nc, a.tiles = L.tiles, a.n_d = L.tiles / a.radix;
+  const auto run = [&](auto E, auto W) {
+    with_pack_seq<decltype(W)::value>(p, [&](auto S) {
+      launch_kl_kb<decltype(E)::value, decltype(W)::value, decltype(S)::value>(kb, grid, stream, a);
+    });
+  };
+  using I2 = std::integral_constant<int, 2>;
+  using I3 = std::integral_constant<int, 3>;
   if (L.values == 4) {
-    if (w2) kl_scale_pack<4, 2><<<grid, kTileElems / 4, 0, stream>>>(a);
-    else kl_scale_pack<4, 3><<<grid, kTileElems / 4, 0, stream>>>(a);
+    if (w2) run(std::integral_constant<int, 4>{}, I2{});
+    else run(std::integral_constant<int, 4>{}, I3{});
+  } else if (shape16) {
+    if (w2) run(std::integral_constant<int, 16>{}, I2{});
+    else run(std::integral_constant<int, 16>{}, I3{});
   } else {
-    if (w2) kl_scale_pack<8, 2><<<grid, kTileElems / 8, 0, stream>>>(a);
-    else kl_scale_pack<8, 3><<<grid, kTileElems / 8, 0, stream>>>(a);
+    if (w2) run(std::integral_constant<int, 8>{}, I2{});
+    else run(std::integral_constant<int, 8>{}, I3{});
   }
   return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
 }
@@ -1249,15 +1861,15 @@ static void launch_k1(const ExecPlan& p, int x, const Operand& op, int16_t* sigm
     const int lg_th = 3;
     const int64_t tiles = radix * ((D + (int64_t{1} << lg_th) - 1) >> lg_th);
     const unsigned blocks =
-        k1_blocks(tiles, 8.0 * double(p.k) * double(int64_t{1} << lg_th), p.sms);
+        k1_blocks(tiles, 8.0 * double(p.k) * double(int64_t{1} << lg_th), p.sms, p.l2_bytes);
     if (int64_t{blocks} < 2 * int64_t{p.sms})
       k1_tiled<1024><<<blocks, 1024, 0, stream>>>(sa, radix, lg_th);
     else
       k1_tiled<kThreads><<<blocks, kThreads, 0, stream>>>(sa, radix, lg_th);
   } else {
-    const unsigned blocks = k1_blocks(rows, 8.0 * double(p.k), p.sms);
+    const unsigned blocks = k1_blocks(rows, 8.0 * double(p.k), p.sms, p.l2_bytes);
     if (int64_t{blocks} < 2 * int64_t{p.sms} && rows > int64_t{blocks} && blocks >= unsigned(p.sms) &&
-        2.0 * p.sms * 8.0 * double(p.k) <= kK1L2BudgetBytes)
+        2.0 * p.sms * 8.0 * double(p.k) <= k1_l2_budget_bytes(p.l2_bytes))
       // Long rows, capped grid: two 512-thread blocks per SM, so one block streams a row
       // while the other is in its reductions / sigma tail (A4, r_bigk). A3: only while the
       // 2 x SMs rows in flight fit the L2 budget; beyond it (r_mm: 400 KB rows, 102 MB in
@@ -1266,7 +1878,7 @@ static void launch_k1(const ExecPlan& p, int x, const Operand& op, int16_t* sigm
     else if (int64_t{blocks} < 2 * int64_t{p.sms}) {
       // A3: rows in flight beyond the L2 budget (x300_100k: 128 rows of 800 KB): walk
       // pass 2 backwards (NOTES-A3 §4; forward is faster while the rows fit: r_mm).
-      sa.reverse = double(std::min<int64_t>(blocks, rows)) * 8.0 * double(p.k) > kK1L2BudgetBytes;
+      sa.reverse = double(std::min<int64_t>(blocks, rows)) * 8.0 * double(p.k) > k1_l2_budget_bytes(p.l2_bytes);
       k1_scale<1024><<<blocks, 1024, 0, stream>>>(sa);
       sa.reverse = 0;
     }
@@ -1285,6 +1897,97 @@ int& k5_elems_override() {
   static int v = 0;  // only the test and benchmark hooks change it
   return v;
 }
+
+std::atomic<int>& seq_override() {
+  static std::atomic<int> v{-1};  // -1: the plan's set; only the hooks change it
+  return v;
+}
+
+std::atomic<int>& k5_crt_override() {
+  static std::atomic<int> v{-1};  // -1: follow the plan's set (kSeqLimbCrt, host/seq_config.hpp; default), 0: force the integer running CRT, 1: force the sums in binary64 limbs (issue 21); only the hooks change it, relaxed is enough
+  return v;
+}
+
+#ifdef IMD_BUILD_TEST_HOOKS
+namespace {
+std::atomic<int64_t> g_k5_fin_launches[4];   // issue 23: launches of the k5fin kernels, [variant]
+std::atomic<int64_t> g_k5_launches[2][4];   // [limb CRT?][variant: 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest]
+template <int N, int Mut>
+cudaError_t test_crt_launch(int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
+  const unsigned grid = static_cast<unsigned>((count + kThreads - 1) / kThreads);
+  if (variant == 0) test_crt_elem_kernel<N, 0, false><<<grid, kThreads>>>(W, out, count, e);
+  else if (variant == 10) test_crt_elem_kernel<N, 0, true, true><<<grid, kThreads>>>(W, out, count, e);   // the k5fin tail (one carry chain for the final subtraction)
+  else test_crt_elem_kernel<N, Mut, true><<<grid, kThreads>>>(W, out, count, e);
+  return cudaGetLastError();
+}
+template <int N>
+cudaError_t test_crt_dispatch(int n, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
+  if (n == N) {
+    switch (variant) {
+      case 0: case 1: case 10: return test_crt_launch<N, 0>(variant, e, count, W, out);
+      case 2: return test_crt_launch<N, 1>(variant, e, count, W, out);
+      case 3: return test_crt_launch<N, 2>(variant, e, count, W, out);
+      case 4: return test_crt_launch<N, 3>(variant, e, count, W, out);
+      case 5: return test_crt_launch<N, 4>(variant, e, count, W, out);
+      case 6: return test_crt_launch<N, 5>(variant, e, count, W, out);
+      case 7: return test_crt_launch<N, 6>(variant, e, count, W, out);
+      case 8: return test_crt_launch<N, 7>(variant, e, count, W, out);
+      default: return test_crt_launch<N, 8>(variant, e, count, W, out);
+    }
+  }
+  if constexpr (N < imd::constants::kNMax) return test_crt_dispatch<N + 1>(n, variant, e, count, W, out);
+  else return cudaErrorInvalidValue;
+}
+}  // namespace
+
+cudaError_t test_crt_elem(int N, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
+  if (N < imd::constants::kNMin || N > imd::constants::kNMax || variant < 0 || variant > 10 || e < 0 || e > 3 || count < 0)
+    return cudaErrorInvalidValue;
+  if (count == 0) return cudaSuccess;
+  return test_crt_dispatch<imd::constants::kNMin>(N, variant, e, count, W, out);
+}
+
+void test_note_k5_launch(bool limb_crt, int variant) {
+  g_k5_launches[limb_crt ? 1 : 0][variant].fetch_add(1, std::memory_order_relaxed);
+}
+
+void test_note_k5_fin_launch(int variant) { g_k5_fin_launches[variant].fetch_add(1, std::memory_order_relaxed); }
+
+void test_k5_fin_counts(bool reset, int64_t* out) {
+  for (int v = 0; v < 4; ++v) out[v] = reset ? g_k5_fin_launches[v].exchange(0) : g_k5_fin_launches[v].load();
+}
+
+void test_k5_launch_counts(bool reset, int64_t* out) {
+  for (int c = 0; c < 2; ++c)
+    for (int v = 0; v < 4; ++v) out[4 * c + v] = reset ? g_k5_launches[c][v].exchange(0) : g_k5_launches[c][v].load();
+}
+
+// Issue 23: KL launches by [E = 4 / 8 / 16][Kb 0..3], counted in test builds (a forced bit that ran the baseline kernel must be visible).
+static std::atomic<int64_t> g_kl_launches[3][4];
+void test_note_kl_launch(int E, int kb) { g_kl_launches[E == 4 ? 0 : E == 8 ? 1 : 2][kb & 3].fetch_add(1, std::memory_order_relaxed); }
+void test_kl_launch_counts(bool reset, int64_t* out) {
+  for (int e = 0; e < 3; ++e)
+    for (int k = 0; k < 4; ++k) out[4 * e + k] = reset ? g_kl_launches[e][k].exchange(0) : g_kl_launches[e][k].load();
+}
+// The section timers (IMD_KL_TIMERS, see kl_scale_pack): copies the device sums to out[0..n) (n <= kKltSlots) and optionally zeroes them. Returns the slot count,
+// or -1 in a build without the knob.
+int test_kl_timers(bool reset, unsigned long long* out, int n) {
+#ifdef IMD_KL_TIMERS
+  if (cudaDeviceSynchronize() != cudaSuccess) return -2;
+  unsigned long long h[kKltSlots];
+  if (cudaMemcpyFromSymbol(h, g_kl_timers, sizeof(h)) != cudaSuccess) return -2;
+  for (int i = 0; i < n && i < kKltSlots; ++i) out[i] = h[i];
+  if (reset) {
+    unsigned long long z[kKltSlots] = {};
+    if (cudaMemcpyToSymbol(g_kl_timers, z, sizeof(z)) != cudaSuccess) return -2;
+  }
+  return kKltSlots;
+#else
+  (void)reset, (void)out, (void)n;
+  return -1;
+#endif
+}
+#endif
 
 std::atomic<int>& pad_mutation() {
   static std::atomic<int> v{-1};  // only the test hook imd_test_set_pad_mutation changes it
@@ -1462,8 +2165,13 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
                                        p.sms);
       pa.lg_th = L.lg_th;
       const dim3 grid(static_cast<unsigned>(L.grid_x), static_cast<unsigned>(L.parts));
-      if (pack_words(p.N) == 2) k23_pack<2><<<grid, kThreads, 0, stream>>>(pa);  // v1.14 §3.4.1
-      else k23_pack<3><<<grid, kThreads, 0, stream>>>(pa);
+      if (pack_words(p.N) == 2)  // v1.14 §3.4.1
+        with_pack_seq<2>(p, [&](auto S) {
+          if constexpr (decltype(S)::value == 1) k23_pack_cap<2, 1><<<grid, kThreads, 0, stream>>>(pa);
+          else k23_pack<2, decltype(S)::value><<<grid, kThreads, 0, stream>>>(pa);
+        });
+      else
+        with_pack_seq<3>(p, [&](auto S) { k23_pack<3, decltype(S)::value><<<grid, kThreads, 0, stream>>>(pa); });
       if (pa.rows_pad > pa.op.rows)
         k23_zero_rows<<<blocks_for(gsize * p.b * (pa.rows_pad - pa.op.rows) * p.k_hat / kVec),
                         kThreads, 0, stream>>>(pa.R, pa.op.rows, pa.rows_pad, p.b, p.k_hat,
@@ -1577,10 +2285,15 @@ imd_status_t enqueue_pack(const ExecPlan& p, const PackLayout& pl, const double*
 // ---- v1.10 (DESIGN §6c.1): occupancy of every kernel for the performance-model calibration --
 namespace {
 
+// The code version of the kernel the last occupancy_of call on this thread looked at (issue 18:
+// kernel_versions); set whenever cudaFuncGetAttributes succeeded.
+thread_local int32_t g_last_binary = 0, g_last_ptx = 0;
+
 template <class Kernel>
 cudaError_t occupancy_of(Kernel kernel, int threads, int32_t* out) {
   cudaFuncAttributes a{};
   cudaError_t e = cudaFuncGetAttributes(&a, reinterpret_cast<const void*>(kernel));
+  if (e == cudaSuccess) g_last_binary = a.binaryVersion, g_last_ptx = a.ptxVersion;
   int r = 0;
   if (e == cudaSuccess) e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&r, kernel, threads, 0);
   if (e != cudaSuccess) return e;
@@ -1632,6 +2345,60 @@ cudaError_t kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out) {
     case 3: return pack_occupancy<3>(kernel, out);
     default: return cudaErrorInvalidValue;
   }
+}
+
+namespace {
+template <class Kernel>
+cudaError_t versions_of(Kernel kernel, int32_t* binary, int32_t* ptx) {
+  cudaFuncAttributes a{};
+  const cudaError_t e = cudaFuncGetAttributes(&a, reinterpret_cast<const void*>(kernel));
+  if (e == cudaSuccess) *binary = a.binaryVersion, *ptx = a.ptxVersion;
+  return e;
+}
+}  // namespace
+
+// Issue 23: the k5fin kernels exist only in a build with the sequence twins; without them the shipped K5 stands in (same module, same code version).
+template <bool Bfast>
+cudaError_t k5f_versions(int32_t* binary, int32_t* ptx) {
+  constexpr int N = imd::constants::kNMin;
+#ifndef IMD_NO_SEQ_TWINS
+  if constexpr (Bfast) return versions_of(k5f_crt_bfast<N>, binary, ptx);
+  else return versions_of(k5f_crt_n<N, 4>, binary, ptx);
+#else
+  if constexpr (Bfast) return versions_of(k5_crt_bfast<N>, binary, ptx);
+  else return versions_of(k5_crt_n<N, 4>, binary, ptx);
+#endif
+}
+
+// The launches that have no IMD_PERF_KERNEL_* id: the K1 kernels and the instantiations for more
+// than kK0SmallModes modes (tests/check_kernel_sites.py keeps this list complete).
+cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) {
+  switch (index) {
+    case 0: return versions_of(k0_vec<kK0MaxModes>, binary, ptx);
+    case 1: return versions_of(kf_scale_pack<kK0MaxModes, 16, 2>, binary, ptx);
+    case 2: return versions_of(kf_scale_pack<kK0MaxModes, 16, 3>, binary, ptx);
+    case 3: return versions_of(kf_scale_pack<kK0MaxModes, 4, 2>, binary, ptx);
+    case 4: return versions_of(kf_scale_pack<kK0MaxModes, 4, 3>, binary, ptx);
+    case 5: return versions_of(kp_prep<kK0MaxModes>, binary, ptx);
+    case 6: return versions_of(k1_tiled<1024>, binary, ptx);
+    case 7: return versions_of(k1_tiled<kThreads>, binary, ptx);
+    case 8: return versions_of(k1_scale<512>, binary, ptx);
+    case 9: return versions_of(k1_scale<1024>, binary, ptx);
+    case 10: return versions_of(k1_scale<kThreads>, binary, ptx);
+    case 11: return versions_of(k23_pack_cap<2, 1>, binary, ptx);  // issue 21: the E1 K2/K3 instance held to 4 CTAs per SM
+    case 12: return k5f_versions<true>(binary, ptx);   // issue 23: the k5fin K5 kernels (one n and one batch-fastest instance; same module as the shipped K5)
+    case 13: return k5f_versions<false>(binary, ptx);
+    default: return cudaErrorInvalidValue;
+  }
+}
+
+cudaError_t kernel_versions(int32_t kernel, int32_t w, int32_t* binary, int32_t* ptx) {
+  int32_t row[4];
+  g_last_binary = g_last_ptx = 0;
+  const cudaError_t e = kernel_occupancy_w(kernel, w, row);
+  if (e != cudaSuccess) return e;
+  *binary = g_last_binary, *ptx = g_last_ptx;
+  return cudaSuccess;
 }
 
 cudaError_t kernel_occupancy(int32_t kernel, int32_t* out) {

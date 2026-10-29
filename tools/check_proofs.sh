@@ -13,12 +13,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Lean/Mathlib elaboration is memory-hungry: run inside the shared budget.
-# (Without a systemd user manager memcap.sh runs the command uncapped and outside the slice, so
-# the marker stops a second re-exec.)
-if ! grep -q "/immerdink.slice/" /proc/self/cgroup 2>/dev/null && [[ -z "${IMMERDINK_IN_MEMCAP:-}" ]]; then
-  export IMMERDINK_IN_MEMCAP=1
-  exec "$ROOT/tools/memcap.sh" "$ROOT/tools/check_proofs.sh" "$@"
-fi
+. "$ROOT/tools/budget.sh"
+immerdink_in_budget || exec "$ROOT/tools/memcap.sh" "$ROOT/tools/check_proofs.sh" "$@"
+[ "${1:-}" = --budget-probe ] && { echo "check_proofs.sh: in budget"; exit 0; }
 PROOFS="$ROOT/proofs"
 LAKE="${LAKE:-$(command -v lake || echo "$HOME/.elan/bin/lake")}"
 

@@ -34,6 +34,9 @@ struct K4Ops {
   // Plan creation: the dynamic shared-memory attribute, then the occupancy of the store-mod
   // and add-mod kernels (thread-safe runtime calls).
   cudaError_t (*setup)(int* occ_store, int* occ_add);
+  // The code the store-mod and add-mod kernels run as on the current device (cudaFuncGetAttributes):
+  // binaryVersion / ptxVersion of each (host/device_class.cpp imd_kernel_code_kind reads them).
+  cudaError_t (*versions)(int* binary_store, int* ptx_store, int* binary_add, int* ptx_add);
   // The parameters of a launch of GEMM size m x n x k over `batches` batches with
   // `resident` persistent CTAs.
   void (*make)(K4Blob* out, int m, int n, int k, int64_t lda, int64_t ldb, int64_t ldw,

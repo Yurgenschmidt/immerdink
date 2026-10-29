@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -202,7 +203,23 @@ void run_packed(const char* name, std::vector<int64_t> eA, std::vector<int32_t> 
 
 }  // namespace
 
+// Issue 23: IMD_TEST_SEQ / IMD_TEST_K5_CRT force the instruction-sequence set / the K5 CRT of every call (test hooks of the library built for the tests),
+// so that the graph-captured k5fin kernels (seq 133 with the limb CRT) are captured and replayed too. IMD_TEST_REQUIRE_K5FIN=1: at least one k5fin launch.
+extern "C" int imd_test_set_seq(int bits);
+extern "C" int imd_test_set_k5_crt(int variant);
+extern "C" int imd_test_k5_fin_counts(int reset, int64_t* out);
+
 int main() {
+  if (const char* v = std::getenv("IMD_TEST_SEQ"); v != nullptr && imd_test_set_seq(std::atoi(v)) != 0) {
+    std::printf("FAIL: imd_test_set_seq(%s)\n", v);
+    return 1;
+  }
+  if (const char* v = std::getenv("IMD_TEST_K5_CRT"); v != nullptr && imd_test_set_k5_crt(std::atoi(v)) != 0) {
+    std::printf("FAIL: imd_test_set_k5_crt(%s)\n", v);
+    return 1;
+  }
+  int64_t fin0[4] = {0, 0, 0, 0};
+  imd_test_k5_fin_counts(1, fin0);
   imd_handle_t h = nullptr;
   if (imd_create(&h) != IMD_STATUS_SUCCESS) return 1;
   for (int vec : {IMD_VEC_GENERATE, IMD_VEC_RESIDENT}) {
@@ -228,6 +245,15 @@ int main() {
                {4, 3, 2}, {64, 4, 48}, {1, 4, 2}, 9, 0, 1, vec, h);
   }
   imd_destroy(h);
+  if (const char* r = std::getenv("IMD_TEST_REQUIRE_K5FIN"); r != nullptr && std::atoi(r) != 0) {
+    int64_t fin[4] = {0, 0, 0, 0};
+    imd_test_k5_fin_counts(0, fin);
+    std::printf("k5fin launches (variant 0..3): %lld %lld %lld %lld\n", (long long)fin[0], (long long)fin[1], (long long)fin[2], (long long)fin[3]);
+    if (fin[0] + fin[1] + fin[2] + fin[3] == 0) {
+      std::printf("FAIL: no k5fin kernel launched\n");
+      ++g_failures;
+    }
+  }
   std::printf("%s\n", g_failures == 0 ? "PASS" : "FAIL");
   return g_failures == 0 ? 0 : 1;
 }

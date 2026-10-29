@@ -141,6 +141,43 @@ class Library:
             self.lib.imd_test_set_k5_one_elem.restype = C.c_int
             self.lib.imd_test_set_k5_elems.argtypes = [C.c_int]
             self.lib.imd_test_set_k5_elems.restype = C.c_int
+            self.lib.imd_test_set_k5_crt.argtypes = [C.c_int]
+            self.lib.imd_test_set_k5_crt.restype = C.c_int
+            self.lib.imd_test_get_k5_crt.argtypes = []
+            self.lib.imd_test_get_k5_crt.restype = C.c_int
+            self.lib.imd_test_plan_crt.argtypes = [C.c_void_p]
+            self.lib.imd_test_plan_crt.restype = C.c_int
+            self.lib.imd_test_set_seq.argtypes = [C.c_int]
+            self.lib.imd_test_set_seq.restype = C.c_int
+            self.lib.imd_test_get_seq.argtypes = []
+            self.lib.imd_test_get_seq.restype = C.c_int
+            self.lib.imd_test_plan_seq.argtypes = [C.c_void_p]
+            self.lib.imd_test_plan_seq.restype = C.c_int
+            # Issue 22: the Hopper (wgmma) K4 backend (src/test_hooks.cpp)
+            self.lib.imd_test_set_k4_backend.argtypes = [C.c_int]
+            self.lib.imd_test_set_k4_backend.restype = C.c_int
+            self.lib.imd_test_get_k4_backend.argtypes = []
+            self.lib.imd_test_get_k4_backend.restype = C.c_int
+            self.lib.imd_test_plan_k4_backend.argtypes = [C.c_void_p]
+            self.lib.imd_test_plan_k4_backend.restype = C.c_int
+            self.lib.imd_test_k4_wgmma_built.argtypes = []
+            self.lib.imd_test_k4_wgmma_built.restype = C.c_int
+            self.lib.imd_test_k4_wgmma_available.argtypes = [C.c_void_p]
+            self.lib.imd_test_k4_wgmma_available.restype = C.c_int
+            self.lib.imd_test_k4_wgmma_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
+            self.lib.imd_test_k4_wgmma_counts.restype = C.c_int
+            self.lib.imd_test_k4_wgmma_dry_run.argtypes = [C.c_int64] * 8 + [C.c_int, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_int32)]
+            self.lib.imd_test_k4_wgmma_dry_run.restype = C.c_int
+            self.lib.imd_test_crt_elem.argtypes = [C.c_int, C.c_int, C.c_int, C.c_int64, C.c_void_p, C.c_void_p]
+            self.lib.imd_test_crt_elem.restype = C.c_int
+            self.lib.imd_test_k5_launch_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
+            self.lib.imd_test_k5_launch_counts.restype = C.c_int
+            self.lib.imd_test_kl_launch_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
+            self.lib.imd_test_kl_launch_counts.restype = C.c_int
+            self.lib.imd_test_kl_timers.argtypes = [C.c_int, C.POINTER(C.c_uint64), C.c_int]
+            self.lib.imd_test_kl_timers.restype = C.c_int
+            self.lib.imd_test_k5_fin_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
+            self.lib.imd_test_k5_fin_counts.restype = C.c_int
             self.lib.imd_test_plan_sizes.argtypes = [C.c_void_p, C.POINTER(C.c_int64), C.c_int64,
                                                      C.POINTER(C.c_int64)]
             self.lib.imd_test_plan_sizes.restype = C.c_int
@@ -159,6 +196,35 @@ class Library:
             self.lib.imd_test_kernel_occupancy_w.argtypes = [C.c_int32, C.c_int32,
                                                              C.POINTER(C.c_int32)]
             self.lib.imd_test_kernel_occupancy_w.restype = C.c_int
+        # Issue 21: IMD_TEST_SEQ=<bits> runs the whole process with that instruction-sequence set (1 E1, 2 Q1, 4 F1, 16/32/64 the KL cuts of issue 23, 128 k5fin with F1)
+        # instead of the device class's: the same tests, the same oracle, the other sequences. It fails loudly if it cannot
+        # take effect (no test hooks) or did not (the set read back differs): a seq run must never silently run the default.
+        env_seq = os.environ.get("IMD_TEST_SEQ")
+        if env_seq not in (None, ""):
+            if not self.has_test_hooks:
+                raise RuntimeError("IMD_TEST_SEQ is set but the library has no test hooks (imd_test_set_seq)")
+            if self.lib.imd_test_set_seq(int(env_seq)) != 0 or self.lib.imd_test_get_seq() != int(env_seq):
+                raise RuntimeError(f"IMD_TEST_SEQ={env_seq}: the library did not take that sequence set")
+        # Issue 23: IMD_TEST_K5_CRT=0|1 runs the whole process with K5's CRT forced (0 integer, 1 binary64 limbs; unset: the plan's set decides), which is how the
+        # k5fin kernels (IMD_TEST_SEQ=133: E1 + F1 + bit 128) are run by the oracle suites: a forced set has no limb-CRT bit. The state must read back.
+        env_crt = os.environ.get("IMD_TEST_K5_CRT")
+        if env_crt not in (None, ""):
+            if not self.has_test_hooks:
+                raise RuntimeError("IMD_TEST_K5_CRT is set but the library has no test hooks (imd_test_set_k5_crt)")
+            if self.lib.imd_test_set_k5_crt(int(env_crt)) != 0 or self.lib.imd_test_get_k5_crt() != int(env_crt):
+                raise RuntimeError(f"IMD_TEST_K5_CRT={env_crt}: the library did not take that CRT variant")
+        # Issue 22: IMD_TEST_K4=mma|wgmma|auto runs the whole process with the K4 backend forced (wgmma: every legal launch, the profitability
+        # floor lifted) instead of the device class's rule. On a device or build without the backend a forced wgmma is mma.sync (the plan
+        # reports it: plan_k4_backend); the override itself must read back, or the run fails.
+        env_k4 = os.environ.get("IMD_TEST_K4")
+        if env_k4 not in (None, ""):
+            if not self.has_test_hooks:
+                raise RuntimeError("IMD_TEST_K4 is set but the library has no test hooks (imd_test_set_k4_backend)")
+            want = {"auto": -1, "mma": 0, "wgmma": 1}.get(env_k4)
+            if want is None:
+                raise RuntimeError(f"IMD_TEST_K4={env_k4}: expected mma, wgmma or auto")
+            if self.lib.imd_test_set_k4_backend(want) != 0 or self.lib.imd_test_get_k4_backend() != want:
+                raise RuntimeError(f"IMD_TEST_K4={env_k4}: the library did not take that backend")
         self.shim = None
 
     def load_alloc_shim(self, path):
@@ -189,6 +255,75 @@ class Library:
     def set_k5_elems(self, elems=0):
         """A5: K5 (j-bar fastest) with 1, 2 or 4 elements per thread; 0 the launch rule."""
         assert self.lib.imd_test_set_k5_elems(elems) == 0
+
+    def set_k5_crt(self, variant=-1):
+        """Issue 21: K5's CRT with the sums in binary64 limbs (1), the integer running CRT (0), or -1 (default) the plan's set decides (the device class's limb-CRT bit)."""
+        assert self.lib.imd_test_set_k5_crt(variant) == 0
+
+    def get_k5_crt(self):
+        """The K5 CRT hook's state: -1 follow the plan's set, 0 integer, 1 limbs."""
+        return self.lib.imd_test_get_k5_crt()
+
+    def plan_crt(self, plan):
+        """The CRT variant the plan's K5 runs now, whatever decided it (0 integer, 1 limbs)."""
+        return self.lib.imd_test_plan_crt(plan)
+
+    def set_k4_backend(self, backend=-1):
+        """Issue 22: the K4 backend of plans created afterwards: -1 the device class's rule, 0 mma.sync, 1 Hopper wgmma (where the device and
+        the build have it: every legal launch, the profitability floor lifted)."""
+        assert self.lib.imd_test_set_k4_backend(backend) == 0
+
+    def plan_k4_backend(self, plan):
+        """The backend the plan tries first (0 mma.sync, 1 wgmma), -1 without K4."""
+        return self.lib.imd_test_plan_k4_backend(plan)
+
+    def k4_wgmma_counts(self, reset=False):
+        """(launches the Hopper backend served, launches it declined) since the last reset."""
+        out = (C.c_int64 * 2)()
+        assert self.lib.imd_test_k4_wgmma_counts(1 if reset else 0, out) == 0
+        return out[0], out[1]
+
+    def get_seq(self):
+        """The forced instruction-sequence set (-1: none)."""
+        return self.lib.imd_test_get_seq()
+
+    def plan_seq(self, plan):
+        """The sequence set the plan's launches run now (the forced one, else the device class's)."""
+        return self.lib.imd_test_plan_seq(plan)
+
+    def set_seq(self, bits=-1):
+        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape; -1 the device class's)."""
+        assert self.lib.imd_test_set_seq(bits) == 0
+
+    def crt_elem(self, N, variant, e, count, W_dev, out_dev):
+        """Issue 21 device-level unit hook (src/test_hooks.cpp imd_test_crt_elem): the CRT word x in [0, P) of `count` residue vectors by the real
+        device code, before round_scaled. W_dev: device uint8 [N][count] (the residue of plane l of vector i at l * count + i), out_dev: device uint32
+        [count][5]. variant 0 the integer running CRT, 1 the shipped binary64-limb CRT, 2..9 its mutations 1..8. The residue travels in byte e of its
+        plane's word. Asynchronous: the caller synchronizes (Cuda.sync)."""
+        assert self.lib.imd_test_crt_elem(N, variant, e, count, W_dev, out_dev) == 0
+
+    def k5_launch_counts(self, reset=False):
+        """K5 launches since the last reset as {(limb CRT?, variant): count}; variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest."""
+        out = (C.c_int64 * 8)()
+        assert self.lib.imd_test_k5_launch_counts(1 if reset else 0, out) == 0
+        return {(c, v): out[4 * c + v] for c in range(2) for v in range(4) if out[4 * c + v]}
+
+    def kl_launch_counts(self, reset=False):
+        """Issue 23: KL kernel launches since the last reset as {(E, Kb): count}; E = 4 / 8 / 16 values per thread, Kb bit 0 klwarp, bit 1 klload."""
+        out = (C.c_int64 * 12)()
+        assert self.lib.imd_test_kl_launch_counts(1 if reset else 0, out) == 0
+        return {((4, 8, 16)[e], k): out[4 * e + k] for e in range(3) for k in range(4) if out[4 * e + k]}
+
+    def kl_timers(self, reset=False):
+        """Issue 23: the KL section timers as a list of 16 sums (None in a build without IMMERDINK_KL_TIMERS); see tools/kl_timers.py."""
+        out = (C.c_uint64 * 16)()
+        n = self.lib.imd_test_kl_timers(1 if reset else 0, out, 16)
+        return list(out) if n == 16 else None
+    def k5_fin_counts(self, reset=False):
+        """Issue 23: launches of the k5fin K5 kernels (seq bit 128) since the last reset as {variant: count}; variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest."""
+        out = (C.c_int64 * 4)()
+        assert self.lib.imd_test_k5_fin_counts(1 if reset else 0, out) == 0
+        return {v: out[v] for v in range(4) if out[v]}
 
     def set_k5_mapping(self, fmode):
         """The K5 mapping of a test run with fused mode `fmode` (test_contract, test_packed):
@@ -384,13 +519,24 @@ class Library:
         return v[38], v[39], v[40]
 
 
+def load_cudart():
+    """libcudart of the toolkit the library was built with: 13, then 12, then the unversioned name (a CUDA 12 node has no .so.13)."""
+    last = None
+    for name in ("libcudart.so.13", "libcudart.so.12", "libcudart.so"):
+        try:
+            return C.CDLL(name)
+        except OSError as e:
+            last = e
+    raise last
+
+
 class Cuda:
     """The few CUDA runtime calls the tests need (same libcudart as libimmerdink)."""
 
     H2D, D2H = 1, 2
 
     def __init__(self):
-        self.rt = C.CDLL("libcudart.so.13")
+        self.rt = load_cudart()
         self.rt.cudaMalloc.argtypes = [C.POINTER(C.c_void_p), C.c_size_t]
         self.rt.cudaFree.argtypes = [C.c_void_p]
         self.rt.cudaMemcpy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int]

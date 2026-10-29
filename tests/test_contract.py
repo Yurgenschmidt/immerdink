@@ -31,6 +31,7 @@ IMD_TEST_POISON=0 (tests/initcheck_pad_mutation.sh: the initcheck mutation test)
 
 import argparse
 import contextlib
+import ctypes as ct
 import math
 import os
 import random
@@ -46,6 +47,7 @@ sys.path.insert(0, HERE)
 import oracle as o  # noqa: E402
 import params  # noqa: E402
 import harness as hz  # noqa: E402
+import occupancy_known as oc  # noqa: E402
 
 POISON = os.environ.get("IMD_TEST_POISON", "1") != "0"
 QUICK = os.environ.get("IMD_TEST_QUICK", "0") == "1"
@@ -943,16 +945,18 @@ def suite_api(lib, cuda, verbose):
     # keeps one row per kernel (the most constrained W); its features use the CTAs per SM, so
     # they must be equal for every W, and the reported row must be the most constrained one.
     names = {1: "kf16", 2: "kf4", 3: "kl8", 4: "kl4", 5: "pack"}   # IMD_PERF_KERNEL_*
+    major, dev = ct.c_int(), ct.c_int()
+    cuda.check(cuda.rt.cudaGetDevice(ct.byref(dev)), "cudaGetDevice")
+    cuda.check(cuda.rt.cudaDeviceGetAttribute(ct.byref(major), 75, dev), "compute capability major")
+    cc_major = major.value
     for kern, name in names.items():
         rows = {w: lib.kernel_occupancy_w(kern, w) for w in (0, 2, 3)}
-        if any(r is None or r[0] < 1 for r in rows.values()):
-            raise Fail(f"occupancy {name}: {rows}")
-        if len({rows[w][0] for w in (2, 3)}) != 1:
-            raise Fail(f"occupancy {name}: CTAs per SM differ by W {rows} (the model needs "
-                       "per-W occupancy rows: DESIGN §3.4.1 v1.16)")
-        worst = min((rows[w] for w in (3, 2)), key=lambda r: (r[0], -r[1]))
-        if rows[0] != worst or any(rows[w][2:] != rows[0][2:] for w in (2, 3)):
-            raise Fail(f"occupancy {name}: reported row {rows[0]} is not the most constrained {rows}")
+        status, msg = oc.occupancy_verdict(name, rows, cc_major)
+        if status == "fail":
+            raise Fail(msg)
+        if status == "known":
+            print(f"known  {msg}")   # always printed: a divergence accepted until issue 23, not a pass of the model's assumption
+            continue
         if verbose:
             print(f"  ok  occupancy {name}: {rows[0][0]} CTAs/SM at W = 2, 3; registers "
                   f"{rows[2][1]} / {rows[3][1]}")

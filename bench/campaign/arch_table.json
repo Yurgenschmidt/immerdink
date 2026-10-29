@@ -1,0 +1,2586 @@
+{
+ "note": "Written by archgate.py update (nvcc/ptxas as in the env of the day). Compare: archgate.py check.",
+ "rules": {
+  "must_contain": {
+   "sm_120a": {
+    "bench/ceiling/int8_ceiling.cu": [
+     "IMMA"
+    ],
+    "src/k4/k4_cfg0.cu": [
+     "IMMA"
+    ]
+   },
+   "sm_89": {
+    "bench/ceiling/int8_ceiling.cu": [
+     "IMMA"
+    ],
+    "src/k4/k4_cfg0.cu": [
+     "IMMA"
+    ]
+   },
+   "sm_90a": {
+    "bench/ceiling/int8_ceiling.cu": [
+     "IGMMA",
+     "UTMALDG",
+     "IMMA"
+    ],
+    "src/k4/k4_cfg0.cu": [
+     "IMMA"
+    ]
+   }
+  },
+  "must_not_contain": {
+   "sm_120a": [
+    "HGMMA",
+    "IGMMA",
+    "QGMMA"
+   ],
+   "sm_89": [
+    "HGMMA",
+    "IGMMA",
+    "QGMMA",
+    "UTMALDG"
+   ]
+  }
+ },
+ "table": {
+  "sm_120a": {
+   "bench/ceiling/int8_ceiling.cu": {
+    "kernels": {
+     "_Z10k_mma_peakiPi": {
+      "regs": 26,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_Z6k_fillPammm": {
+      "regs": 22,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi128ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ESJ_SL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESJ_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aSZ_iSE_NS12_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1D_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1C_Li1ENS1I_22PredicatedTileIteratorINS1I_26OutputTileOptimalThreadMapINS1I_15OutputTileShapeILi128ELi8ELi2ELi1ELi1EEENS1M_ILi1ELi8ELi1ELi1ELi8EEELi128ELi16ELi8EEEaLb0ESM_Lb0EEENS1H_4warp24FragmentIteratorTensorOpIS14_S17_iNSK_IiLi4ELb1EEESE_EENS1R_25TileIteratorTensorOpMixedIS14_S17_iLi32ELi8ELi16ELi8ELb1EEENS1I_23SharedLoadIteratorMixedINS1P_18CompactedThreadMapEiLi32ELi8ELi16ELi8ELb1EEENS1H_6thread22LinearCombinationClampIaLi16EifLNS20_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 242,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi128ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ESJ_SL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESJ_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aSZ_iSE_NS12_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1D_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1C_Li1ENS1I_22PredicatedTileIteratorINS1I_26OutputTileOptimalThreadMapINS1I_15OutputTileShapeILi128ELi8ELi2ELi1ELi1EEENS1M_ILi1ELi8ELi1ELi1ELi8EEELi128ELi4ELi32EEEiLb0ESM_Lb0EEENS1H_4warp24FragmentIteratorTensorOpIS14_S17_iNSK_IiLi4ELb1EEESE_EENS1R_20TileIteratorTensorOpIS14_S17_iSE_EENS1I_18SharedLoadIteratorINS1P_18CompactedThreadMapEiLi16EEENS1H_6thread17LinearCombinationIiLi4EiiLNS20_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 238,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi256ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi256EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi256EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi256ELi8ELi2ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi16ELi8EEEaLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_20TileIteratorTensorOpIS16_S19_iSE_EENS1K_18SharedLoadIteratorINS1R_18CompactedThreadMapEiLi64EEENS1J_6thread22LinearCombinationClampIaLi16EifLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 238,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi256ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi256EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi256EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi256ELi8ELi2ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi4ELi32EEEiLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_20TileIteratorTensorOpIS16_S19_iSE_EENS1K_18SharedLoadIteratorINS1R_18CompactedThreadMapEiLi16EEENS1J_6thread17LinearCombinationIiLi4EiiLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 238,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi256ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi256ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi256EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi128EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi128ELi8ELi4ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi16ELi8EEEaLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_25TileIteratorTensorOpMixedIS16_S19_iLi32ELi8ELi16ELi8ELb1EEENS1K_23SharedLoadIteratorMixedINS1R_18CompactedThreadMapEiLi32ELi8ELi16ELi8ELb1EEENS1J_6thread22LinearCombinationClampIaLi16EifLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 238,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi256ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi256ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi256EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi128EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi128ELi8ELi4ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi4ELi32EEEiLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_20TileIteratorTensorOpIS16_S19_iSE_EENS1K_18SharedLoadIteratorINS1R_18CompactedThreadMapEiLi16EEENS1J_6thread17LinearCombinationIiLi4EiiLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 234,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 500,
+     "LDGSTS": 120,
+     "LDSM": 144
+    }
+   },
+   "src/contract.cu": {
+    "kernels": {
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_beta_onlyENS1_7OutArgsE": {
+      "regs": 30,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi10EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi11EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi12EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi13EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi14EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi15EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi16EEEvNS1_7OutArgsEi": {
+      "regs": 80,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi17EEEvNS1_7OutArgsEi": {
+      "regs": 78,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi18EEEvNS1_7OutArgsEi": {
+      "regs": 80,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi19EEEvNS1_7OutArgsEi": {
+      "regs": 78,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi20EEEvNS1_7OutArgsEi": {
+      "regs": 80,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi2EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi3EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi4EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 8,
+      "spill_st": 8,
+      "stack": 8
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi5EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi6EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 8,
+      "spill_st": 8,
+      "stack": 8
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi7EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi8EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi9EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413k23_zero_rowsEPalllli": {
+      "regs": 32,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi16ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 124,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi16ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 124,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi4ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 40,
+      "spill_st": 32,
+      "stack": 32
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi4ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 40,
+      "spill_st": 32,
+      "stack": 32
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi16ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 124,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi16ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 124,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi4ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 40,
+      "spill_st": 32,
+      "stack": 32
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi4ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 40,
+      "spill_st": 32,
+      "stack": 32
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi4ELi2EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36672,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi4ELi3EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36672,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi8ELi2EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36288,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi8ELi3EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36288,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c46k0_vecILi256EEEvNS1_6K0ArgsIXT_EEE": {
+      "regs": 44,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c46k0_vecILi8EEEvNS1_6K0ArgsIXT_EEE": {
+      "regs": 44,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c47kp_prepILi256EEEvNS1_6K0ArgsIXT_EEEPhmmmmmm": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c47kp_prepILi8EEEvNS1_6K0ArgsIXT_EEEPhmmmmmm": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_scaleILi1024EEEvNS1_9ScaleArgsE": {
+      "regs": 62,
+      "smem": 768,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_scaleILi256EEEvNS1_9ScaleArgsE": {
+      "regs": 40,
+      "smem": 192,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_scaleILi512EEEvNS1_9ScaleArgsE": {
+      "regs": 38,
+      "smem": 384,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_tiledILi1024EEEvNS1_9ScaleArgsEli": {
+      "regs": 58,
+      "smem": 25664,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_tiledILi256EEEvNS1_9ScaleArgsEli": {
+      "regs": 48,
+      "smem": 7232,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k23_packILi2EEEvNS1_8PackArgsE": {
+      "regs": 105,
+      "smem": 40768,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k23_packILi3EEEvNS1_8PackArgsE": {
+      "regs": 114,
+      "smem": 40768,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi10ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi10ELi2EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi10ELi4EEEvNS1_7OutArgsE": {
+      "regs": 80,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi11ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi11ELi2EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi11ELi4EEEvNS1_7OutArgsE": {
+      "regs": 80,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi12ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi12ELi2EEEvNS1_7OutArgsE": {
+      "regs": 62,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi12ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi13ELi1EEEvNS1_7OutArgsE": {
+      "regs": 42,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi13ELi2EEEvNS1_7OutArgsE": {
+      "regs": 62,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi13ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 20,
+      "spill_st": 20,
+      "stack": 24
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi14ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi14ELi2EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi14ELi4EEEvNS1_7OutArgsE": {
+      "regs": 80,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi15ELi1EEEvNS1_7OutArgsE": {
+      "regs": 42,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi15ELi2EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi15ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi16ELi1EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi16ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi16ELi4EEEvNS1_7OutArgsE": {
+      "regs": 80,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi17ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi17ELi2EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi17ELi4EEEvNS1_7OutArgsE": {
+      "regs": 108,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi18ELi1EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi18ELi2EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi18ELi4EEEvNS1_7OutArgsE": {
+      "regs": 108,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi19ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi19ELi2EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi19ELi4EEEvNS1_7OutArgsE": {
+      "regs": 108,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi20ELi1EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi20ELi2EEEvNS1_7OutArgsE": {
+      "regs": 76,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi20ELi4EEEvNS1_7OutArgsE": {
+      "regs": 108,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi2ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi2ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi2ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi3ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi3ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi3ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi4ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi4ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi4ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi5ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi5ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi5ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi6ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi6ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi6ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi7ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi7ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi7ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi8ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi8ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi8ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 16,
+      "spill_st": 4,
+      "stack": 8
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi9ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi9ELi2EEEvNS1_7OutArgsE": {
+      "regs": 54,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi9ELi4EEEvNS1_7OutArgsE": {
+      "regs": 80,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k_directENS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {}
+   },
+   "src/gemm_k4.cu": {
+    "kernels": {},
+    "sass": {}
+   },
+   "src/k4/k4_cfg0.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi256ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 236,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi256ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 238,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 128,
+     "LDGSTS": 60,
+     "LDSM": 48
+    }
+   },
+   "src/k4/k4_cfg1.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi128ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 240,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi128ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 242,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 128,
+     "LDGSTS": 80,
+     "LDSM": 48
+    }
+   },
+   "src/k4/k4_cfg2.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi128ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 166,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi128ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 166,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 64,
+     "LDGSTS": 84,
+     "LDSM": 36
+    }
+   },
+   "src/k4/k4_cfg3.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi64ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 166,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi64ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 166,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 64,
+     "LDGSTS": 112,
+     "LDSM": 36
+    }
+   }
+  },
+  "sm_89": {
+   "bench/ceiling/int8_ceiling.cu": {
+    "kernels": {
+     "_Z10k_mma_peakiPi": {
+      "regs": 26,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_Z6k_fillPammm": {
+      "regs": 16,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi128ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ESJ_SL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESJ_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aSZ_iSE_NS12_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1D_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1C_Li1ENS1I_22PredicatedTileIteratorINS1I_26OutputTileOptimalThreadMapINS1I_15OutputTileShapeILi128ELi8ELi2ELi1ELi1EEENS1M_ILi1ELi8ELi1ELi1ELi8EEELi128ELi16ELi8EEEaLb0ESM_Lb0EEENS1H_4warp24FragmentIteratorTensorOpIS14_S17_iNSK_IiLi4ELb1EEESE_EENS1R_25TileIteratorTensorOpMixedIS14_S17_iLi32ELi8ELi16ELi8ELb1EEENS1I_23SharedLoadIteratorMixedINS1P_18CompactedThreadMapEiLi32ELi8ELi16ELi8ELb1EEENS1H_6thread22LinearCombinationClampIaLi16EifLNS20_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 242,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi128ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ESJ_SL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESJ_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aSZ_iSE_NS12_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1D_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1C_Li1ENS1I_22PredicatedTileIteratorINS1I_26OutputTileOptimalThreadMapINS1I_15OutputTileShapeILi128ELi8ELi2ELi1ELi1EEENS1M_ILi1ELi8ELi1ELi1ELi8EEELi128ELi4ELi32EEEiLb0ESM_Lb0EEENS1H_4warp24FragmentIteratorTensorOpIS14_S17_iNSK_IiLi4ELb1EEESE_EENS1R_20TileIteratorTensorOpIS14_S17_iSE_EENS1I_18SharedLoadIteratorINS1P_18CompactedThreadMapEiLi16EEENS1H_6thread17LinearCombinationIiLi4EiiLNS20_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 240,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi256ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi256EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi256EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi256ELi8ELi2ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi16ELi8EEEaLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_20TileIteratorTensorOpIS16_S19_iSE_EENS1K_18SharedLoadIteratorINS1R_18CompactedThreadMapEiLi64EEENS1J_6thread22LinearCombinationClampIaLi16EifLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 238,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi256ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi256EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi256EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi256ELi8ELi2ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi4ELi32EEEiLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_20TileIteratorTensorOpIS16_S19_iSE_EENS1K_18SharedLoadIteratorINS1R_18CompactedThreadMapEiLi16EEENS1J_6thread17LinearCombinationIiLi4EiiLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 240,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi256ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi256ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi256EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi128EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi128ELi8ELi4ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi16ELi8EEEaLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_25TileIteratorTensorOpMixedIS16_S19_iLi32ELi8ELi16ELi8ELb1EEENS1K_23SharedLoadIteratorMixedINS1R_18CompactedThreadMapEiLi32ELi8ELi16ELi8ELb1EEENS1J_6thread22LinearCombinationClampIaLi16EifLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 242,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi256ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi256ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi256EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi128EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi128ELi8ELi4ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi4ELi32EEEiLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_20TileIteratorTensorOpIS16_S19_iSE_EENS1K_18SharedLoadIteratorINS1R_18CompactedThreadMapEiLi16EEENS1J_6thread17LinearCombinationIiLi4EiiLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 240,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 404,
+     "LDGSTS": 120,
+     "LDSM": 144
+    }
+   },
+   "src/contract.cu": {
+    "kernels": {
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_beta_onlyENS1_7OutArgsE": {
+      "regs": 34,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi10EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi11EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi12EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi13EEEvNS1_7OutArgsEi": {
+      "regs": 60,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi14EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi15EEEvNS1_7OutArgsEi": {
+      "regs": 62,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi16EEEvNS1_7OutArgsEi": {
+      "regs": 40,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi17EEEvNS1_7OutArgsEi": {
+      "regs": 60,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi18EEEvNS1_7OutArgsEi": {
+      "regs": 60,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi19EEEvNS1_7OutArgsEi": {
+      "regs": 60,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi20EEEvNS1_7OutArgsEi": {
+      "regs": 60,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi2EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi3EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi4EEEvNS1_7OutArgsEi": {
+      "regs": 63,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi5EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi6EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi7EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi8EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi9EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413k23_zero_rowsEPalllli": {
+      "regs": 28,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi16ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 128,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi16ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 128,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi4ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi4ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi16ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 128,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi16ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 128,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi4ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi4ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi4ELi2EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36672,
+      "spill_ld": 4,
+      "spill_st": 4,
+      "stack": 8
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi4ELi3EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36672,
+      "spill_ld": 16,
+      "spill_st": 12,
+      "stack": 16
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi8ELi2EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36288,
+      "spill_ld": 4,
+      "spill_st": 4,
+      "stack": 8
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi8ELi3EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36288,
+      "spill_ld": 12,
+      "spill_st": 8,
+      "stack": 8
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c46k0_vecILi256EEEvNS1_6K0ArgsIXT_EEE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c46k0_vecILi8EEEvNS1_6K0ArgsIXT_EEE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c47kp_prepILi256EEEvNS1_6K0ArgsIXT_EEEPhmmmmmm": {
+      "regs": 44,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c47kp_prepILi8EEEvNS1_6K0ArgsIXT_EEEPhmmmmmm": {
+      "regs": 44,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_scaleILi1024EEEvNS1_9ScaleArgsE": {
+      "regs": 64,
+      "smem": 768,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_scaleILi256EEEvNS1_9ScaleArgsE": {
+      "regs": 40,
+      "smem": 192,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_scaleILi512EEEvNS1_9ScaleArgsE": {
+      "regs": 40,
+      "smem": 384,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_tiledILi1024EEEvNS1_9ScaleArgsEli": {
+      "regs": 64,
+      "smem": 25664,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_tiledILi256EEEvNS1_9ScaleArgsEli": {
+      "regs": 48,
+      "smem": 7232,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k23_packILi2EEEvNS1_8PackArgsE": {
+      "regs": 84,
+      "smem": 40768,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k23_packILi3EEEvNS1_8PackArgsE": {
+      "regs": 117,
+      "smem": 40768,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi10ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi10ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi10ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi11ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi11ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi11ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi12ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi12ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi12ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi13ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi13ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi13ELi4EEEvNS1_7OutArgsE": {
+      "regs": 62,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi14ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi14ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi14ELi4EEEvNS1_7OutArgsE": {
+      "regs": 61,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi15ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi15ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi15ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi16ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi16ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi16ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi17ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi17ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi17ELi4EEEvNS1_7OutArgsE": {
+      "regs": 63,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi18ELi1EEEvNS1_7OutArgsE": {
+      "regs": 47,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi18ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi18ELi4EEEvNS1_7OutArgsE": {
+      "regs": 62,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi19ELi1EEEvNS1_7OutArgsE": {
+      "regs": 47,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi19ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi19ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi20ELi1EEEvNS1_7OutArgsE": {
+      "regs": 47,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi20ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi20ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi2ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi2ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi2ELi4EEEvNS1_7OutArgsE": {
+      "regs": 61,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi3ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi3ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi3ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi4ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi4ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi4ELi4EEEvNS1_7OutArgsE": {
+      "regs": 63,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi5ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi5ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi5ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi6ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi6ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi6ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi7ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi7ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi7ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi8ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi8ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi8ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi9ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi9ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi9ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k_directENS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {}
+   },
+   "src/gemm_k4.cu": {
+    "kernels": {},
+    "sass": {}
+   },
+   "src/k4/k4_cfg0.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi256ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 248,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi256ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 248,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 128,
+     "LDGSTS": 60,
+     "LDSM": 48
+    }
+   },
+   "src/k4/k4_cfg1.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi128ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 250,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi128ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 252,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 128,
+     "LDGSTS": 80,
+     "LDSM": 48
+    }
+   },
+   "src/k4/k4_cfg2.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi128ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi128ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 64,
+     "LDGSTS": 84,
+     "LDSM": 36
+    }
+   },
+   "src/k4/k4_cfg3.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi64ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi64ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 64,
+     "LDGSTS": 112,
+     "LDSM": 36
+    }
+   }
+  },
+  "sm_90a": {
+   "bench/ceiling/int8_ceiling.cu": {
+    "kernels": {
+     "_Z10k_mma_peakiPi": {
+      "regs": 27,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_Z6k_fillPammm": {
+      "regs": 22,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi4ENS5_IJNS4_1CILi1EEENSA_ILi2EEESB_EEENS1_35KernelTmaWarpSpecializedCooperativeEEENS5_IJNSA_ILi128EEENSA_ILi256EEESG_EEEaNS5_IJlSB_lEEEaSJ_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x256x32_S32S8S8_SS_TNEEEENS4_6LayoutINS5_IJSC_SB_SB_EEENS5_IJSB_NSA_ILi0EEESS_EEEEENS5_IJNS4_10UnderscoreESV_SV_EEEEENS4_23SM90_TMA_LOAD_MULTICASTENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSQ_INS5_IJNSA_ILi8EEESG_EEENS5_IJSG_SB_EEEEEEEvNS4_8identityENS4_13SM90_TMA_LOADES18_vS19_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS1D_15DefaultEpilogueIaSJ_SJ_NS1C_6thread17LinearCombinationIaLi1EifLNS1H_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EaEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi4ENS5_IJNS4_1CILi1EEENSA_ILi2EEESB_EEENS1_35KernelTmaWarpSpecializedCooperativeEEENS5_IJNSA_ILi128EEENSA_ILi256EEESG_EEEaNS5_IJlSB_lEEEaSJ_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x256x32_S32S8S8_SS_TNEEEENS4_6LayoutINS5_IJSC_SB_SB_EEENS5_IJSB_NSA_ILi0EEESS_EEEEENS5_IJNS4_10UnderscoreESV_SV_EEEEENS4_23SM90_TMA_LOAD_MULTICASTENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSQ_INS5_IJNSA_ILi8EEESG_EEENS5_IJSG_SB_EEEEEEEvNS4_8identityENS4_13SM90_TMA_LOADES18_vS19_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS1D_15DefaultEpilogueIiSJ_SJ_NS1C_6thread17LinearCombinationIiLi1EiiLNS1H_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi4ENS5_IJNS4_1CILi1EEESB_SB_EEENS1_35KernelTmaWarpSpecializedCooperativeEEENS5_IJNSA_ILi128EEENSA_ILi256EEESF_EEEaNS5_IJlSB_lEEEaSI_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x256x32_S32S8S8_SS_TNEEEENS4_6LayoutINS5_IJNSA_ILi2EEESB_SB_EEENS5_IJSB_NSA_ILi0EEESS_EEEEENS5_IJNS4_10UnderscoreESV_SV_EEEEENS4_13SM90_TMA_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSP_INS5_IJNSA_ILi8EEESF_EEENS5_IJSF_SB_EEEEEEEvNS4_8identityESY_S18_vS19_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS1C_15DefaultEpilogueIaSI_SI_NS1B_6thread17LinearCombinationIaLi1EifLNS1G_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EaEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi4ENS5_IJNS4_1CILi1EEESB_SB_EEENS1_35KernelTmaWarpSpecializedCooperativeEEENS5_IJNSA_ILi128EEENSA_ILi256EEESF_EEEaNS5_IJlSB_lEEEaSI_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x256x32_S32S8S8_SS_TNEEEENS4_6LayoutINS5_IJNSA_ILi2EEESB_SB_EEENS5_IJSB_NSA_ILi0EEESS_EEEEENS5_IJNS4_10UnderscoreESV_SV_EEEEENS4_13SM90_TMA_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSP_INS5_IJNSA_ILi8EEESF_EEENS5_IJSF_SB_EEEEEEEvNS4_8identityESY_S18_vS19_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS1C_15DefaultEpilogueIiSI_SI_NS1B_6thread17LinearCombinationIiLi1EiiLNS1G_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi4ENS5_IJNS4_1CILi2EEENSA_ILi1EEESC_EEENS1_35KernelTmaWarpSpecializedCooperativeEEENS5_IJNSA_ILi256EEENSA_ILi128EEESH_EEEaNS5_IJlSC_lEEEaSJ_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x128x32_S32S8S8_SS_TNEEEENS4_6LayoutISD_NS5_IJSC_NSA_ILi0EEESR_EEEEENS5_IJNS4_10UnderscoreESU_SU_EEEEENS4_13SM90_TMA_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSQ_INS5_IJNSA_ILi8EEESH_EEENS5_IJSH_SC_EEEEEEEvNS4_8identityENS4_23SM90_TMA_LOAD_MULTICASTES17_vS18_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS1C_15DefaultEpilogueIaSJ_SJ_NS1B_6thread17LinearCombinationIaLi1EifLNS1G_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EaEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi4ENS5_IJNS4_1CILi2EEENSA_ILi1EEESC_EEENS1_35KernelTmaWarpSpecializedCooperativeEEENS5_IJNSA_ILi256EEENSA_ILi128EEESH_EEEaNS5_IJlSC_lEEEaSJ_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x128x32_S32S8S8_SS_TNEEEENS4_6LayoutISD_NS5_IJSC_NSA_ILi0EEESR_EEEEENS5_IJNS4_10UnderscoreESU_SU_EEEEENS4_13SM90_TMA_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSQ_INS5_IJNSA_ILi8EEESH_EEENS5_IJSH_SC_EEEEEEEvNS4_8identityENS4_23SM90_TMA_LOAD_MULTICASTES17_vS18_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS1C_15DefaultEpilogueIiSJ_SJ_NS1B_6thread17LinearCombinationIiLi1EiiLNS1G_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi7ENS5_IJNS4_1CILi1EEESB_SB_EEENS1_32KernelTmaWarpSpecializedPingpongEEENS5_IJNSA_ILi128EEESF_SF_EEEaNS5_IJlSB_lEEEaSH_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x128x32_S32S8S8_SS_TNEEEENS4_6LayoutISC_NS5_IJNSA_ILi0EEESP_SP_EEEEENS5_IJNS4_10UnderscoreESS_SS_EEEEENS4_13SM90_TMA_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSO_INS5_IJNSA_ILi8EEESF_EEENS5_IJSF_SB_EEEEEEEvNS4_8identityESV_S15_vS16_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS19_15DefaultEpilogueIaSH_SH_NS18_6thread17LinearCombinationIaLi1EifLNS1D_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EaEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi7ENS5_IJNS4_1CILi1EEESB_SB_EEENS1_32KernelTmaWarpSpecializedPingpongEEENS5_IJNSA_ILi128EEESF_SF_EEEaNS5_IJlSB_lEEEaSH_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x128x32_S32S8S8_SS_TNEEEENS4_6LayoutISC_NS5_IJNSA_ILi0EEESP_SP_EEEEENS5_IJNS4_10UnderscoreESS_SS_EEEEENS4_13SM90_TMA_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSO_INS5_IJNSA_ILi8EEESF_EEENS5_IJSF_SB_EEEEEEEvNS4_8identityESV_S15_vS16_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS19_15DefaultEpilogueIiSH_SH_NS18_6thread17LinearCombinationIiLi1EiiLNS1D_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi7ENS5_IJNS4_1CILi2EEENSA_ILi1EEESC_EEENS1_35KernelTmaWarpSpecializedCooperativeEEENS5_IJNSA_ILi128EEESG_SG_EEEaNS5_IJlSC_lEEEaSI_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x128x32_S32S8S8_SS_TNEEEENS4_6LayoutISD_NS5_IJSC_NSA_ILi0EEESQ_EEEEENS5_IJNS4_10UnderscoreEST_ST_EEEEENS4_13SM90_TMA_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSP_INS5_IJNSA_ILi8EEESG_EEENS5_IJSG_SC_EEEEEEEvNS4_8identityENS4_23SM90_TMA_LOAD_MULTICASTES16_vS17_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS1B_15DefaultEpilogueIaSI_SI_NS1A_6thread17LinearCombinationIaLi1EifLNS1F_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EaEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi7ENS5_IJNS4_1CILi2EEENSA_ILi1EEESC_EEENS1_35KernelTmaWarpSpecializedCooperativeEEENS5_IJNSA_ILi128EEESG_SG_EEEaNS5_IJlSC_lEEEaSI_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x128x32_S32S8S8_SS_TNEEEENS4_6LayoutISD_NS5_IJSC_NSA_ILi0EEESQ_EEEEENS5_IJNS4_10UnderscoreEST_ST_EEEEENS4_13SM90_TMA_LOADENS4_14ComposedLayoutINS4_7SwizzleILi3ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSP_INS5_IJNSA_ILi8EEESG_EEENS5_IJSG_SC_EEEEEEEvNS4_8identityENS4_23SM90_TMA_LOAD_MULTICASTES16_vS17_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS1B_15DefaultEpilogueIiSI_SI_NS1A_6thread17LinearCombinationIiLi1EiiLNS1F_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi9ENS5_IJNS4_1CILi1EEENSA_ILi2EEESB_EEENS1_35KernelTmaWarpSpecializedCooperativeEEENS5_IJNSA_ILi128EEENSA_ILi256EEENSA_ILi64EEEEEEaNS5_IJlSB_lEEEaSK_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x256x32_S32S8S8_SS_TNEEEENS4_6LayoutINS5_IJSC_SB_SB_EEENS5_IJSB_NSA_ILi0EEEST_EEEEENS5_IJNS4_10UnderscoreESW_SW_EEEEENS4_23SM90_TMA_LOAD_MULTICASTENS4_14ComposedLayoutINS4_7SwizzleILi2ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSR_INS5_IJNSA_ILi8EEESI_EEENS5_IJSI_SB_EEEEEEEvNS4_8identityENS4_13SM90_TMA_LOADES19_vS1A_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS1E_15DefaultEpilogueIaSK_SK_NS1D_6thread17LinearCombinationIaLi1EifLNS1I_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EaEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalIN4cute5tupleIJiiiiEEENS1_10collective13CollectiveMmaINS1_34MainloopSm90TmaGmmaWarpSpecializedILi9ENS5_IJNS4_1CILi1EEENSA_ILi2EEESB_EEENS1_35KernelTmaWarpSpecializedCooperativeEEENS5_IJNSA_ILi128EEENSA_ILi256EEENSA_ILi64EEEEEEaNS5_IJlSB_lEEEaSK_NS4_8TiledMMAINS4_8MMA_AtomIJNS4_4SM904GMMA27MMA_64x256x32_S32S8S8_SS_TNEEEENS4_6LayoutINS5_IJSC_SB_SB_EEENS5_IJSB_NSA_ILi0EEEST_EEEEENS5_IJNS4_10UnderscoreESW_SW_EEEEENS4_23SM90_TMA_LOAD_MULTICASTENS4_14ComposedLayoutINS4_7SwizzleILi2ELi4ELi3EEENS4_18smem_ptr_flag_bitsILi8EEENSR_INS5_IJNSA_ILi8EEESI_EEENS5_IJSI_SB_EEEEEEEvNS4_8identityENS4_13SM90_TMA_LOADES19_vS1A_EENS_8epilogue10collective6detail29Sm90TmaWarpSpecializedAdapterINS1E_15DefaultEpilogueIiSK_SK_NS1D_6thread17LinearCombinationIiLi1EiiLNS1I_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENS1_15EpilogueDefaultEEEEEvvEEEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi128ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ESJ_SL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESJ_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aSZ_iSE_NS12_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1D_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1C_Li1ENS1I_22PredicatedTileIteratorINS1I_26OutputTileOptimalThreadMapINS1I_15OutputTileShapeILi128ELi8ELi2ELi1ELi1EEENS1M_ILi1ELi8ELi1ELi1ELi8EEELi128ELi16ELi8EEEaLb0ESM_Lb0EEENS1H_4warp24FragmentIteratorTensorOpIS14_S17_iNSK_IiLi4ELb1EEESE_EENS1R_25TileIteratorTensorOpMixedIS14_S17_iLi32ELi8ELi16ELi8ELb1EEENS1I_23SharedLoadIteratorMixedINS1P_18CompactedThreadMapEiLi32ELi8ELi16ELi8ELb1EEENS1H_6thread22LinearCombinationClampIaLi16EifLNS20_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 250,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi128ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ESJ_SL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESJ_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aSZ_iSE_NS12_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1D_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1C_Li1ENS1I_22PredicatedTileIteratorINS1I_26OutputTileOptimalThreadMapINS1I_15OutputTileShapeILi128ELi8ELi2ELi1ELi1EEENS1M_ILi1ELi8ELi1ELi1ELi8EEELi128ELi4ELi32EEEiLb0ESM_Lb0EEENS1H_4warp24FragmentIteratorTensorOpIS14_S17_iNSK_IiLi4ELb1EEESE_EENS1R_20TileIteratorTensorOpIS14_S17_iSE_EENS1I_18SharedLoadIteratorINS1P_18CompactedThreadMapEiLi16EEENS1H_6thread17LinearCombinationIiLi4EiiLNS20_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 248,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi256ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi256EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi256EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi256ELi8ELi2ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi16ELi8EEEaLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_20TileIteratorTensorOpIS16_S19_iSE_EENS1K_18SharedLoadIteratorINS1R_18CompactedThreadMapEiLi64EEENS1J_6thread22LinearCombinationClampIaLi16EifLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 248,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi128ELi256ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi128EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi256EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi256EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi256ELi8ELi2ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi4ELi32EEEiLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_20TileIteratorTensorOpIS16_S19_iSE_EENS1K_18SharedLoadIteratorINS1R_18CompactedThreadMapEiLi16EEENS1J_6thread17LinearCombinationIiLi4EiiLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 248,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi256ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi256ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi256EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi128EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi128ELi8ELi4ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi16ELi8EEEaLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_25TileIteratorTensorOpMixedIS16_S19_iLi32ELi8ELi16ELi8ELb1EEENS1K_23SharedLoadIteratorMixedINS1R_18CompactedThreadMapEiLi32ELi8ELi16ELi8ELb1EEENS1J_6thread22LinearCombinationClampIaLi16EifLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 246,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN7cutlass6KernelINS_4gemm6kernel11GemmBatchedINS1_11threadblock13MmaMultistageINS1_9GemmShapeILi256ELi128ELi64EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi256ELi64EEEaNS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi64ELi256EEELi256ENSG_ILi4ELi8EEELi16EEENS_5ArrayIaLi16ELb0EEELb0ENSD_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_aNSD_37RowMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi0ESJ_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi64ELi128EEEaNSD_11ColumnMajorELi0ENSF_INSG_ILi64ELi128EEELi256ESI_Li16EEESL_Lb0ESM_EENSO_ISV_aNSD_40ColumnMajorTensorOpMultiplicandCrosswiseILi8ELi64EEELi1ESY_Li16EEELSU_1EiSE_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi64ELi64EEEaSQ_aS11_iSE_NS14_17MmaTensorOpPolicyINSS_3MmaINS6_ILi16ELi8ELi32EEELi32EaSE_aSW_iSE_NSS_21OpMultiplyAddSaturateEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1F_Li1EEELi3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1E_Li1ENS1K_22PredicatedTileIteratorINS1K_26OutputTileOptimalThreadMapINS1K_15OutputTileShapeILi128ELi8ELi4ELi1ELi1EEENS1O_ILi1ELi8ELi1ELi1ELi8EEELi256ELi4ELi32EEEiLb0ESM_Lb0EEENS1J_4warp24FragmentIteratorTensorOpIS16_S19_iNSK_IiLi4ELb1EEESE_EENS1T_20TileIteratorTensorOpIS16_S19_iSE_EENS1K_18SharedLoadIteratorINS1R_18CompactedThreadMapEiLi16EEENS1J_6thread17LinearCombinationIiLi4EiiLNS22_9ScaleType4KindE0ELNS_15FloatRoundStyleE2EiEENSB_ILi0ELi8EEELi1ELi1EEENS4_37GemmBatchedIdentityThreadblockSwizzleEEEEEvNT_6ParamsE": {
+      "regs": 244,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IGMMA": 120,
+     "IMMA": 500,
+     "LDGSTS": 120,
+     "LDSM": 144,
+     "SYNCS": 566,
+     "UTMALDG": 24
+    }
+   },
+   "src/contract.cu": {
+    "kernels": {
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_beta_onlyENS1_7OutArgsE": {
+      "regs": 32,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi10EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi11EEEvNS1_7OutArgsEi": {
+      "regs": 61,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi12EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi13EEEvNS1_7OutArgsEi": {
+      "regs": 62,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi14EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi15EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi16EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi17EEEvNS1_7OutArgsEi": {
+      "regs": 62,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi18EEEvNS1_7OutArgsEi": {
+      "regs": 60,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi19EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi20EEEvNS1_7OutArgsEi": {
+      "regs": 60,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi2EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi3EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi4EEEvNS1_7OutArgsEi": {
+      "regs": 48,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi5EEEvNS1_7OutArgsEi": {
+      "regs": 63,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi6EEEvNS1_7OutArgsEi": {
+      "regs": 61,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi7EEEvNS1_7OutArgsEi": {
+      "regs": 40,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi8EEEvNS1_7OutArgsEi": {
+      "regs": 64,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c412k5_crt_bfastILi9EEEvNS1_7OutArgsEi": {
+      "regs": 61,
+      "smem": 8448,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413k23_zero_rowsEPalllli": {
+      "regs": 30,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi16ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 128,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi16ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 128,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi4ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 8,
+      "spill_st": 8,
+      "stack": 8
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi256ELi4ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi16ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 128,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi16ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 128,
+      "smem": 47552,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi4ELi2EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 8,
+      "spill_st": 8,
+      "stack": 8
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kf_scale_packILi8ELi4ELi3EEEvNS1_9FusedArgsIXT_EEE": {
+      "regs": 64,
+      "smem": 18176,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi4ELi2EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36672,
+      "spill_ld": 16,
+      "spill_st": 12,
+      "stack": 16
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi4ELi3EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36672,
+      "spill_ld": 4,
+      "spill_st": 4,
+      "stack": 8
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi8ELi2EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36288,
+      "spill_ld": 56,
+      "spill_st": 36,
+      "stack": 32
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c413kl_scale_packILi8ELi3EEEvNS1_9LargeArgsE": {
+      "regs": 64,
+      "smem": 36288,
+      "spill_ld": 76,
+      "spill_st": 44,
+      "stack": 32
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c46k0_vecILi256EEEvNS1_6K0ArgsIXT_EEE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c46k0_vecILi8EEEvNS1_6K0ArgsIXT_EEE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c47kp_prepILi256EEEvNS1_6K0ArgsIXT_EEEPhmmmmmm": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c47kp_prepILi8EEEvNS1_6K0ArgsIXT_EEEPhmmmmmm": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_scaleILi1024EEEvNS1_9ScaleArgsE": {
+      "regs": 34,
+      "smem": 768,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_scaleILi256EEEvNS1_9ScaleArgsE": {
+      "regs": 38,
+      "smem": 192,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_scaleILi512EEEvNS1_9ScaleArgsE": {
+      "regs": 34,
+      "smem": 384,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_tiledILi1024EEEvNS1_9ScaleArgsEli": {
+      "regs": 50,
+      "smem": 25664,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k1_tiledILi256EEEvNS1_9ScaleArgsEli": {
+      "regs": 64,
+      "smem": 7232,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k23_packILi2EEEvNS1_8PackArgsE": {
+      "regs": 64,
+      "smem": 40768,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k23_packILi3EEEvNS1_8PackArgsE": {
+      "regs": 116,
+      "smem": 40768,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi10ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi10ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi10ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi11ELi1EEEvNS1_7OutArgsE": {
+      "regs": 32,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi11ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi11ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi12ELi1EEEvNS1_7OutArgsE": {
+      "regs": 32,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi12ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi12ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi13ELi1EEEvNS1_7OutArgsE": {
+      "regs": 32,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi13ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi13ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi14ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi14ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi14ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi15ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi15ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi15ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi16ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi16ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi16ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi17ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi17ELi2EEEvNS1_7OutArgsE": {
+      "regs": 60,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi17ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi18ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi18ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi18ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi19ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi19ELi2EEEvNS1_7OutArgsE": {
+      "regs": 60,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi19ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi20ELi1EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi20ELi2EEEvNS1_7OutArgsE": {
+      "regs": 60,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi20ELi4EEEvNS1_7OutArgsE": {
+      "regs": 64,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi2ELi1EEEvNS1_7OutArgsE": {
+      "regs": 32,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi2ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi2ELi4EEEvNS1_7OutArgsE": {
+      "regs": 62,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi3ELi1EEEvNS1_7OutArgsE": {
+      "regs": 32,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi3ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi3ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi4ELi1EEEvNS1_7OutArgsE": {
+      "regs": 32,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi4ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi4ELi4EEEvNS1_7OutArgsE": {
+      "regs": 61,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi5ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi5ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi5ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi6ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi6ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi6ELi4EEEvNS1_7OutArgsE": {
+      "regs": 61,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi7ELi1EEEvNS1_7OutArgsE": {
+      "regs": 32,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi7ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi7ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi8ELi1EEEvNS1_7OutArgsE": {
+      "regs": 32,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi8ELi2EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi8ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi9ELi1EEEvNS1_7OutArgsE": {
+      "regs": 40,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi9ELi2EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k5_crt_nILi9ELi4EEEvNS1_7OutArgsE": {
+      "regs": 48,
+      "smem": 8704,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd6detail44_GLOBAL__N__789ef9de_11_contract_cu_97df82c48k_directENS1_7OutArgsE": {
+      "regs": 32,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {}
+   },
+   "src/gemm_k4.cu": {
+    "kernels": {},
+    "sass": {}
+   },
+   "src/k4/k4_cfg0.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi256ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 246,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi256ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 254,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 128,
+     "LDGSTS": 60,
+     "LDSM": 48
+    }
+   },
+   "src/k4/k4_cfg1.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi128ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 248,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi128ELi128ELi64EEENS5_ILi64ELi64ELi64EEELi3ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 255,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 128,
+     "LDGSTS": 80,
+     "LDSM": 48
+    }
+   },
+   "src/k4/k4_cfg2.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi128ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi128ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 168,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 64,
+     "LDGSTS": 84,
+     "LDSM": 36
+    }
+   },
+   "src/k4/k4_cfg3.cu": {
+    "kernels": {
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi64ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb0EEEvNT_6ParamsE": {
+      "regs": 186,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     },
+     "_ZN3imd7kernels9k4_kernelINS0_6K4GemmIN7cutlass4gemm9GemmShapeILi64ELi64ELi64EEENS5_ILi32ELi64ELi64EEELi4ENS3_4arch21OpMultiplyAddSaturateEEELb1EEEvNT_6ParamsE": {
+      "regs": 186,
+      "spill_ld": 0,
+      "spill_st": 0,
+      "stack": 0
+     }
+    },
+    "sass": {
+     "IMMA": 64,
+     "LDGSTS": 112,
+     "LDSM": 36
+    }
+   }
+  }
+ }
+}

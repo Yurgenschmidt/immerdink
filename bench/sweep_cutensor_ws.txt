@@ -1,0 +1,15 @@
+# Is cuTENSOR's emulated FP64 (CUTENSOR_COMPUTE_DESC_8XINT8) held back by the workspace preference? cuTENSOR plans at
+# DEFAULT ("high performance while also reducing the workspace requirement") may exclude algorithms that MAX
+# ("all algorithms will be available") keeps, and an excluded emulation falls back to native FP64 silently.
+# Each case runs twice, once planned at DEFAULT and once at MAX (--ct-ws), native and emulated, same inputs; the records
+# carry ct_ws, ws_bytes and identical_to_native. bench/run_metrics.sh (SWEEPS=cutws) -> cutensor_ws.jsonl and
+# cutensor_ws.md (bench/cutws_table.py). Same line format as sweep_imd.txt:
+#   name | einsum spec (row-major operands) | extents | methods | N list | args
+sq4096 | ik,jk->ij | i=4096,j=4096,k=4096 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws default
+sq4096 | ik,jk->ij | i=4096,j=4096,k=4096 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max
+sq8192 | ik,jk->ij | i=8192,j=8192,k=8192 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws default --max-seconds 6
+sq8192 | ik,jk->ij | i=8192,j=8192,k=8192 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --max-seconds 6
+t_cc   | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws default
+t_cc   | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max
+t_df   | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws default
+t_df   | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max

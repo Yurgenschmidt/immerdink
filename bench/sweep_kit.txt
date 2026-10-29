@@ -1,0 +1,7 @@
+# Campaign kit rehearsal sweep (docs/CAMPAIGN.md): three small immerdink-only cases, under a minute of GPU in all.
+# Used by the rehearsal manifest (generalWork/phoenix/immerdink/campaigns/R0-rehearsal.toml) to exercise the runner, the
+# copy-back and the analyzer with real bench records. Not a performance sweep.
+# name | einsum spec (row-major operands) | extents | methods | N list | extra imd_bench args
+s256    | ik,jk->ij | i=256,j=256,k=256    | imd | 14 | --reps 60 --warmup 5 --max-seconds 0.2 --samples 1024 --phase-reps 0 --keep-samples 1
+s512    | ik,jk->ij | i=512,j=512,k=512    | imd | 14 | --reps 60 --warmup 5 --max-seconds 0.3 --samples 1024 --phase-reps 0 --keep-samples 1
+sq1024  | ik,jk->ij | i=1024,j=1024,k=1024 | imd | 14 | --reps 40 --warmup 3 --max-seconds 0.5 --samples 4096 --phase-reps 0 --keep-samples 1

@@ -38,7 +38,7 @@ int main(void) {
   const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT, IMD_K4_TUNE_OFF};
 
   CHECK(imd_host_api_version() == IMD_HOST_API_VERSION);
-  CHECK(sizeof(imd_lowering_t) == 192 && IMD_HOST_API_VERSION >= 9);
+  CHECK(sizeof(imd_lowering_t) == 200 && IMD_HOST_API_VERSION >= 14);
   CHECK(offsetof(imd_lowering_t, k_align) == 184 && offsetof(imd_lowering_t, reserved6) == 188);
   CHECK(IMD_PACK_FORMAT_A16 == 1 && IMD_PACK_FORMAT_A64 == 2 && IMD_PACK_FORMAT == 2);
   CHECK(sizeof(imd_options_t) == 24);

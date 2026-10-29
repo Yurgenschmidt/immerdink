@@ -3,6 +3,7 @@
 // libimmerdink_host's (src/host/analysis.hpp, DESIGN §6a), the code behind
 // imd_workspace_size and the host queries; this file adds the device-side plan parts.
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <vector>
@@ -10,9 +11,12 @@
 #include <cuda_runtime_api.h>
 
 #include "host/analysis.hpp"
+#include "device_state.hpp"
 #include "host/checked.hpp"
+#include "host/seq_config.hpp"
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink.h"
+#include "host/k4_wgmma.hpp"
 #include "k4/k4_ops.hpp"
 #include "plan.hpp"
 #if defined(IMMERDINK_PROFILE) && IMMERDINK_PROFILE
@@ -112,6 +116,31 @@ imd_status_t imd_destroy(imd_handle_t handle) {
   return IMD_STATUS_SUCCESS;
 }
 
+imd_status_t imd_device_info(imd_handle_t handle, imd_device_info_t* info) {
+  if (handle == nullptr || info == nullptr || info->struct_size < sizeof(imd_device_info_t))
+    return IMD_STATUS_INVALID_VALUE;
+  int device = 0;
+  imd_device_info_t r;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      imd::detail::device_state(device, &r) != cudaSuccess) {
+    cudaGetLastError();
+    return IMD_STATUS_CUDA_ERROR;
+  }
+  const auto caller_size = info->struct_size;   // a caller built against a later header keeps its own size field
+  std::memcpy(info, &r, sizeof r);
+  info->struct_size = caller_size;
+  return IMD_STATUS_SUCCESS;
+}
+
+imd_status_t imd_plan_info(imd_plan_t plan, imd_device_info_t* info) {
+  if (plan == nullptr || info == nullptr || info->struct_size < sizeof(imd_device_info_t))
+    return IMD_STATUS_INVALID_VALUE;
+  const auto caller_size = info->struct_size;
+  std::memcpy(info, &plan->info, sizeof plan->info);
+  info->struct_size = caller_size;
+  return IMD_STATUS_SUCCESS;
+}
+
 }  // extern "C"
 
 namespace {
@@ -148,18 +177,30 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
     p->slot_key[1] = an.packed.key[1];
     imd::detail::ExecPlan& e = p->exec;
     e = std::move(pd);
+    // Issue 18: the device class and the kind of code the library's kernels run as on it. An
+    // unusable device fails here, at plan creation, with NOT_SUPPORTED (info: imd_device_info).
+    // A plan of an empty GEMM touches no CUDA (imd_contract returns SUCCESS without a device): no device query, no probe, info stays zero.
     if (e.path != imd::detail::Path::kNoop) {
       int device = 0;
-      if (cudaGetDevice(&device) != cudaSuccess ||
-          cudaDeviceGetAttribute(&e.sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+      if (cudaGetDevice(&device) != cudaSuccess) {
         cudaGetLastError();
         return IMD_STATUS_CUDA_ERROR;
       }
+      if (imd::detail::device_state(device, &p->info) != cudaSuccess) {
+        cudaGetLastError();
+        return IMD_STATUS_CUDA_ERROR;
+      }
+      if (p->info.status == IMD_PLAN_UNSUPPORTED) return IMD_STATUS_NOT_SUPPORTED;
+      e.sms = p->info.device.sm_count;
+      e.seq = static_cast<uint8_t>(imd::detail::seq_default_for(p->info.device.cc_major, p->info.device.cc_minor));  // issue 21: this device class's instruction sequences
+      e.l2_bytes = static_cast<int64_t>(p->info.device.l2_bytes);
+    } else {
+      p->info.struct_size = sizeof p->info;
     }
     if (emulated) {  // §4 / §6 v1.2: every K4 launch shape's parameters, built here once
       // v1.5: the K4 configuration. libimmerdink_host's rule for this device's SM count (what
       // imd_lowering reports for sm_count = e.sms), or the fastest one timed (k4_tune).
-      e.k4_config = imd::detail::k4_select(e, e.sms);
+      e.k4_config = imd::detail::k4_select(e, e.sms, p->info.table_id);
       if (imd::detail::k4_config_override() >= 0) {
         e.k4_config = imd::detail::k4_config_override();  // test / benchmark hook only
       } else if (an.options.k4_tune == IMD_K4_TUNE_ON) {
@@ -167,9 +208,16 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
             st != IMD_STATUS_SUCCESS)
           return st;
       }
-      if (const imd_status_t st = imd::detail::k4_prepare(e, e.k4_config, &e.k4);
+      // Issue 22: the Hopper backend, where the device class has it and this device passes its probe (never a CUDA call on another
+      // device); the override (hooks only) can force either backend. The plan keeps the mma.sync parameters of e.k4_config as the
+      // fallback of every launch the Hopper backend does not serve.
+      const bool wg_class = p->info.table_id >= 0 && p->info.table_id < IMD_TABLE_COUNT && imd::detail::kK4WgmmaTable[p->info.table_id];
+      const bool wg_avail = wg_class && imd::detail::k4_wgmma_available(p->info.table_id, p->info.device.cc_major, p->info.device.cc_minor);
+      const int32_t backend = imd::detail::k4_backend_resolve(imd::detail::k4_backend_override().load(), wg_avail, wg_class);
+      if (const imd_status_t st = imd::detail::k4_prepare(e, e.k4_config, &e.k4, backend);
           st != IMD_STATUS_SUCCESS)
         return st;
+      p->info.k4_config = e.k4_config;
     }
     if (e.path != imd::detail::Path::kNoop && an.options.vec_mode == IMD_VEC_RESIDENT) {
       // §4 K0 v1.2 IMD_VEC_RESIDENT: build the vectors once in plan-owned device memory
@@ -414,10 +462,56 @@ IMD_API int imd_prof_set_k4_config(int32_t config) {
   imd::detail::k4_config_override() = config;
   return 0;
 }
+// Benchmark-only (issue 22): the K4 backend a plan tries first (host/k4_wgmma.hpp K4Backend: 0 mma.sync, 1 Hopper wgmma with the profitability floor, 2 wgmma
+// forced; -1 without K4), the backend REQUEST every later plan takes (-1 the device class's rule, 0 mma.sync, 1 wgmma where the device has it: that plan
+// is then backend 2 and lifts the profitability floor for all its launches, also after the request is reset), and the launches the Hopper backend served / declined since the last reset (out[2]).
+IMD_API int imd_prof_plan_k4_backend(imd_plan_t plan, int32_t* backend) {
+  if (plan == nullptr || backend == nullptr) return 1;
+  *backend = plan->exec.k4 ? imd::detail::k4_backend_of(*plan->exec.k4) : -1;
+  return 0;
+}
+IMD_API int imd_prof_set_k4_backend(int32_t backend) {
+  if (!imd::detail::k4_backend_valid(backend)) return 1;
+  imd::detail::k4_backend_override() = backend;
+  return 0;
+}
+IMD_API int imd_prof_k4_wgmma_counts(int32_t reset, int64_t* out) {
+  if (out == nullptr) return 1;
+  imd::detail::k4_wgmma_counts(reset != 0, out);
+  return 0;
+}
 // Benchmark-only (A5): K5's elements per thread for later calls (1, 2, 4; 0: the rule).
 IMD_API int imd_prof_set_k5_elems(int32_t elems) {
   if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
   imd::detail::k5_elems_override() = elems;
+  return 0;
+}
+// Benchmark-only (issue 21): the instruction-sequence set of every later call (kSeq* bits of host/seq_config.hpp: 1 E1, 2 Q1, 4 F1); -1 the device class's set.
+IMD_API int imd_prof_set_seq(int32_t bits) {
+  if (!imd::detail::seq_valid(bits)) return 1;
+  imd::detail::seq_override() = bits;
+  return 0;
+}
+// Benchmark-only (issue 21): the set the plan's launches run now (the forced one, else its device class's); -1 for a null plan.
+IMD_API int imd_prof_plan_seq(imd_plan_t plan, int32_t* bits) {
+  const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
+  if (e == nullptr || bits == nullptr) return 1;
+  *bits = imd::detail::seq_effective(e->seq, imd::detail::seq_override().load());
+  return 0;
+}
+// Benchmark-only (issue 21): the K5 hook's state: -1 follow the plan's set (the device class's kSeqLimbCrt bit; the default), 0 forced integer CRT, 1 forced binary64 limbs.
+IMD_API int imd_prof_get_k5_crt(void) { return imd::detail::k5_crt_override().load(); }
+// Benchmark-only (issue 21): the CRT variant the plan's K5 runs now, whatever decided it (0 integer, 1 binary64 limbs); 1 for a null plan.
+IMD_API int imd_prof_plan_crt(imd_plan_t plan, int32_t* limb) {
+  const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
+  if (e == nullptr || limb == nullptr) return 1;
+  *limb = imd::detail::k5_limb_crt(*e) ? 1 : 0;
+  return 0;
+}
+// Benchmark-only (issue 21): K5's CRT variant for later calls (-1 the plan's set, 0 integer running CRT, 1 binary64 limbs).
+IMD_API int imd_prof_set_k5_crt(int32_t variant) {
+  if (variant < -1 || variant > 1) return 1;
+  imd::detail::k5_crt_override() = variant;
   return 0;
 }
 // Benchmark-only (v1.10, DESIGN §6c.1): the measured occupancy of kernel IMD_PERF_KERNEL_*:

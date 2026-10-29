@@ -38,7 +38,15 @@ class Cuda:
     H2D, D2H = 1, 2
 
     def __init__(self):
-        rt = self.rt = C.CDLL("libcudart.so.13")
+        rt = self.rt = None
+        for name in ("libcudart.so.13", "libcudart.so.12", "libcudart.so"):     # a CUDA 12 node has no .so.13
+            try:
+                rt = self.rt = C.CDLL(name)
+                break
+            except OSError:
+                continue
+        if rt is None:
+            raise OSError("no libcudart on the library path")
         for name, args in {
             "cudaMalloc": [C.POINTER(C.c_void_p), C.c_size_t], "cudaFree": [C.c_void_p],
             "cudaMemcpy": [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int],
@@ -283,7 +291,7 @@ def run_plan(cuda, shim, spec, ext, strides=None, kinds=("cai", "cai", "cai"), a
 def test_capi_declares_every_function():
     hdr = open(os.path.join(ROOT, "include", "immerdink", "immerdink.h")).read()
     names = set(re.findall(r"IMD_API\s+imd_status_t\s+(\w+)\s*\(", hdr))
-    assert len(names) == 12 and names <= set(_capi.SIGNATURES), names - set(_capi.SIGNATURES)
+    assert len(names) == 14 and names <= set(_capi.SIGNATURES), names - set(_capi.SIGNATURES)
     for n in ("imd_tensor_t", "imd_options_t", "imd_operand_t"):
         assert n in hdr or n in open(os.path.join(ROOT, "include", "immerdink",
                                                   "immerdink_host.h")).read()

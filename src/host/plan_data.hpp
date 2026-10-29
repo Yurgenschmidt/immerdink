@@ -44,6 +44,7 @@ struct ExecPlan {
   int64_t m = 0, n = 0, k = 0, b = 0, k_hat = 0, n_hat = 0;  // post-swap GEMM view
   int N = 0, g = 0;      // number of moduli, residue group size in [1, N]
   bool trunc = false;    // rounding = TRUNC
+  uint8_t seq = 0;       // issue 21: the instruction-sequence set of the device class (host/seq_config.hpp kSeq*), set by imd_plan_create; 0 = baseline. (In the padding after trunc: sizeof(ExecPlan) is unchanged.)
   // v1.13 §4b: the plan's K alignment A (16 or 64), resolved once by libimmerdink_host
   // (analysis.hpp Analysis::k_align; plan_data), k_hat = ceil(k)_A. Here, not in K4Plan:
   // sizeof(K4Plan) is kK4PlanBytes (plan host bytes). libimmerdink never resolves A itself.
@@ -88,6 +89,7 @@ struct ExecPlan {
   int64_t* vec_dev = nullptr;
 
   int sms = 0;                         // SM count of the device at plan creation (K1 grids)
+  int64_t l2_bytes = 0;                // L2 bytes of the device at plan creation (K1 rows in flight, issue 21; 0: the reference 72 MiB)
   std::shared_ptr<const K4Plan> k4;    // kGemm only: every K4 launch shape's parameters
 
   // §3.2 step 4: u = largest integer with (S << lhs_shift) * 4^u <= rhs, where
@@ -141,6 +143,9 @@ struct imd_plan_st {
   // v1.7 (§6b): the compatibility key of the caller's A / B slot (empty: packed in-line),
   // copied at creation; imd_contract_packed compares the handle it is given with it.
   std::vector<int64_t> slot_key[2];
+  // Issue 18: the device the plan was made for, its table-set selection, the code kinds of the
+  // library's kernels there and the plan's K4 configuration (imd_plan_info).
+  imd_device_info_t info{};
 
   imd_plan_st(const imd_options_t& o, const imd::detail::Lowered& lw, const imd_tensor_t& a,
               const imd_tensor_t& b, const imd_tensor_t& c)

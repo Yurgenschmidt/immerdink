@@ -17,11 +17,33 @@
 //       shared-memory and re-read chunks of KL all run on small shapes). Results must not
 //       change. Returns 0, or 1 for another mode.
 //
+//   imd_test_set_k4_backend(backend) / imd_test_get_k4_backend() / imd_test_plan_k4_backend(plan) / imd_test_k4_wgmma_built() /
+//   imd_test_k4_wgmma_available(handle) / imd_test_k4_wgmma_counts(reset, out[2]) / imd_test_k4_wgmma_dry_run(...)
+//       issue 22: the Hopper (wgmma) K4 backend: force it or the mma.sync K4 for plans created afterwards, read back what a plan
+//       tries first, whether the build and the device have it, the launches it served / declined, and a host-only dry run of one launch.
+//
 //   imd_test_set_k4_config(config)
 //       config -1: plans created afterwards run the K4 configuration of the plan-time rule
 //       (or k4_tune's; production); 0 .. IMD_K4_CONFIG_COUNT - 1: that configuration
 //       (DESIGN v1.5 §4). Results must not change. Returns 0, or 1 for another value.
 //
+//   imd_test_set_k5_crt(variant)
+//       issue 21: every later imd_contract runs K5's CRT with the sums in binary64 limbs (1) or the integer running CRT (0); -1
+//       (default) the plan's set decides (the device class's kSeqLimbCrt bit; a forced set 0..7 has none = integer).
+//       Results must not change. Returns 0, or 1 for another value.
+//   imd_test_get_k5_crt()
+//       the hook's state (-1, 0, 1).
+//   imd_test_plan_crt(plan)
+//       the CRT variant the plan's K5 runs now, whatever decided it (0 integer, 1 limbs); -1 for a null plan.
+//   imd_test_set_seq(bits)
+//       issue 21: every later imd_contract runs the instruction-sequence set `bits` (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 128 k5fin
+//       (issue 23: needs F1; its kernels run only with the limb CRT); host/seq_config.hpp), -1 the plan's (device class) set. Results must not change. Returns 0, or 1 for another value
+//       (also for the Q1 bit without the E1 bit, bit 128 without F1, and for 8..15: the limb-CRT bit 8 is a class default only, see imd_test_set_k5_crt).
+//   imd_test_get_seq()
+//       the forced set (-1: none).
+//   imd_test_plan_seq(plan)
+//       the set the plan's launches run now: the forced one, else the plan's device-class default (which may carry bit 8,
+//       the limb CRT: sm_90 = 13); -1 for a null plan.
 //   imd_test_set_k5_one_elem(per_sm)
 //       K5 (j-bar fastest) takes one element per thread while b m n <= per_sm x SMs, else
 //       4 per thread with warp-transposed stores. per_sm -1 restores the production value;
@@ -40,6 +62,16 @@
 //       by default, and a violation also fails the call, checked before anything is queued).
 //       The K alignment itself is forced by libimmerdink_host's
 //       imd_test_set_k_align (src/host/k_hat.cpp).
+//
+//   imd_test_crt_elem(N, variant, e, count, W, out)
+//   imd_test_k5_launch_counts(reset, out)
+//   imd_test_kl_launch_counts(reset, out)   issue 23: KL kernel launches [E 4/8/16][klwarp, klload]
+//   imd_test_kl_timers(reset, out, n)       issue 23: KL section timers (IMMERDINK_KL_TIMERS builds)
+//       Issue 21 (docs/NOTES-21.md): the first runs the real CRT device functions of contract.cu
+//       (variant 0 integer running CRT, 1 binary64-limb CRT, 2..9 its compile-time mutations) on
+//       `count` device residue vectors and writes x in [0, P) before crt_finish; the second
+//       copies (and optionally zeroes) the counts of K5 launches per [limb CRT?][variant].
+//       tests/test_crt_f64_unit.py, tests/test_crt_f64_gpu.py.
 //
 //   imd_test_set_pad_mutation(operand)
 //       v1.13 §4b (hygiene): operand 0 / 1 makes the K2 / K3 pack of the post-swap GEMM
@@ -96,6 +128,9 @@
 #include "immerdink/immerdink.h"
 #include "host/analysis.hpp"
 #include "host/index_map.hpp"
+#include "host/k4_wgmma.hpp"
+#include "host/seq_config.hpp"
+#include "k4/hopper/k4_wgmma_ops.hpp"
 #include "plan.hpp"
 
 extern "C" {
@@ -124,6 +159,43 @@ IMD_API int imd_test_set_k4_config(int config) {
   return 0;
 }
 
+// Issue 22 (docs/NOTES-22.md "Library integration (design)"): the K4 backend REQUEST of plans created afterwards (-1 the device class's rule, 0 mma.sync,
+// 1 wgmma: the plan is then "wgmma, forced" = backend 2: every legal launch of that plan, the profitability floor lifted, for the plan's life; a
+// device without the backend runs mma.sync whatever is asked). The request is read at plan creation only; resetting it later does not change plans.
+IMD_API int imd_test_set_k4_backend(int backend) {
+  if (!imd::detail::k4_backend_valid(backend)) return 1;
+  imd::detail::k4_backend_override() = backend;
+  return 0;
+}
+IMD_API int imd_test_get_k4_backend(void) { return imd::detail::k4_backend_override().load(); }
+// The backend a plan tries first (0 mma.sync, 1 wgmma with the profitability floor, 2 wgmma forced; -1 for a null plan or a plan without K4).
+IMD_API int imd_test_plan_k4_backend(imd_plan_t plan) {
+  const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
+  return e == nullptr || !e->k4 ? -1 : imd::detail::k4_backend_of(*e->k4);
+}
+// 1 if this build has the Hopper backend (IMMERDINK_K4_WGMMA), 0 if not; and whether it can run on the current device
+// (device class, compute capability, probe) as imd_plan_create would see it.
+IMD_API int imd_test_k4_wgmma_built(void) { return imd::detail::k4_wgmma_ops(0) != nullptr ? 1 : 0; }
+IMD_API int imd_test_k4_wgmma_available(imd_handle_t handle) {
+  imd_device_info_t info{};
+  info.struct_size = sizeof info;
+  if (imd_device_info(handle, &info) != IMD_STATUS_SUCCESS) return -1;
+  return imd::detail::k4_wgmma_available(info.table_id, info.device.cc_major, info.device.cc_minor) ? 1 : 0;
+}
+// Launches the Hopper backend served / declined since the last reset, int64[2]; reset != 0 zeroes them.
+IMD_API int imd_test_k4_wgmma_counts(int reset, int64_t* out) {
+  if (out == nullptr) return 1;
+  imd::detail::k4_wgmma_counts(reset != 0, out);
+  return 0;
+}
+// The host half of a Hopper launch of a synthetic GEMM, on any device of a build with the backend (gemm_k4.cu k4_wgmma_dry_run). out[7] =
+// variant (-1 not served), swizzle, raster, can_implement, persistent grid x / y / z. Returns 0, 1 if the backend is absent or can_implement refused.
+IMD_API int imd_test_k4_wgmma_dry_run(int64_t m, int64_t nc, int64_t kc, int64_t zc, int64_t k_hat, int64_t n_hat, int64_t batch_a,
+                                      int64_t batch_b, int sms, int clusters, int add, int force, int32_t* out) {
+  if (out == nullptr) return 1;
+  return imd::detail::k4_wgmma_dry_run(m, nc, kc, zc, k_hat, n_hat, batch_a, batch_b, sms, clusters, add != 0, force != 0, out) ? 0 : 1;
+}
+
 IMD_API int imd_test_set_k5_one_elem(int64_t per_sm) {
   if (per_sm < -1) return 1;
   static const int64_t production = imd::detail::k5_one_elem_per_sm();
@@ -136,6 +208,67 @@ IMD_API int imd_test_set_k5_elems(int elems) {
   if (elems != 0 && elems != 1 && elems != 2 && elems != 4) return 1;
   imd::detail::k5_elems_override() = elems;
   return 0;
+}
+
+// Issue 21: the instruction-sequence set of later calls (-1: the device class's).
+IMD_API int imd_test_set_seq(int bits) {
+  if (!imd::detail::seq_valid(bits)) return 1;
+  imd::detail::seq_override() = bits;
+  return 0;
+}
+
+IMD_API int imd_test_get_seq(void) { return imd::detail::seq_override().load(); }
+IMD_API int imd_test_plan_seq(imd_plan_t plan) {
+  const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
+  return e == nullptr ? -1 : imd::detail::seq_effective(e->seq, imd::detail::seq_override().load());
+}
+
+// Issue 21 device-level unit test of the binary64-limb CRT: see plan.hpp test_crt_elem. W: device bytes [N][count], out: device u32 [count][5].
+// variant 0 integer running CRT, 1 limb CRT, 2..9 its mutations. Returns 0, or 1 for an invalid argument or a launch error. The caller synchronizes.
+IMD_API int imd_test_crt_elem(int N, int variant, int e, int64_t count, const uint8_t* W, uint32_t* out) {
+  if (count > 0 && (W == nullptr || out == nullptr)) return 1;
+  return imd::detail::test_crt_elem(N, variant, e, count, W, out) == cudaSuccess ? 0 : 1;
+}
+
+// K5 launches since the last reset, int64[8]: [limb CRT?][variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest]; reset != 0 zeroes them.
+IMD_API int imd_test_k5_launch_counts(int reset, int64_t* out) {
+  if (out == nullptr) return 1;
+  imd::detail::test_k5_launch_counts(reset != 0, out);
+  return 0;
+}
+
+// Issue 23: KL kernel launches since the last reset, int64[12]: [E = 4 / 8 / 16 values per thread][Kb 0..3: bit 0 klwarp, bit 1 klload]; reset != 0 zeroes them.
+IMD_API int imd_test_kl_launch_counts(int reset, int64_t* out) {
+  if (out == nullptr) return 1;
+  imd::detail::test_kl_launch_counts(reset != 0, out);
+  return 0;
+}
+
+// Issue 23: the KL section timers (build with -DIMMERDINK_KL_TIMERS=1 or 2): copies up to n unsigned 64-bit sums (warp-cycles per section, then counters; docs/NOTES-23.md) to out,
+// zeroes them when reset != 0, returns the slot count (16), -1 in a build without the timers, -2 on a CUDA error. Synchronizes the device.
+IMD_API int imd_test_kl_timers(int reset, unsigned long long* out, int n) {
+  if (out == nullptr || n < 0) return -3;
+  return imd::detail::test_kl_timers(reset != 0, out, n);
+}
+
+// Issue 23: launches of the k5fin K5 kernels (seq bit 128) since the last reset, int64[4]: [variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest]; reset != 0 zeroes them.
+IMD_API int imd_test_k5_fin_counts(int reset, int64_t* out) {
+  if (out == nullptr) return 1;
+  imd::detail::test_k5_fin_counts(reset != 0, out);
+  return 0;
+}
+
+// Issue 21: K5's CRT: the sums in binary64 limbs (1), the integer running CRT (0), or -1 (the default) the plan's set decides (kSeqLimbCrt of the device class).
+IMD_API int imd_test_set_k5_crt(int variant) {
+  if (variant < -1 || variant > 1) return 1;
+  imd::detail::k5_crt_override() = variant;
+  return 0;
+}
+IMD_API int imd_test_get_k5_crt(void) { return imd::detail::k5_crt_override().load(); }
+// The CRT variant the plan's K5 runs now (0 integer, 1 limbs), whatever decided it; -1 for a null plan.
+IMD_API int imd_test_plan_crt(imd_plan_t plan) {
+  const imd::detail::ExecPlan* e = imd::detail::exec_of(plan);
+  return e == nullptr ? -1 : (imd::detail::k5_limb_crt(*e) ? 1 : 0);
 }
 
 IMD_API int imd_test_set_pad_mutation(int operand) {

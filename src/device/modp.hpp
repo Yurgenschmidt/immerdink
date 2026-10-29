@@ -5,6 +5,8 @@
 
 #include <cstdint>
 
+#include "device/residue.hpp"
+
 #if defined(__CUDACC__)
 #  define IMD_HD __host__ __device__ __forceinline__
 #else
@@ -145,6 +147,28 @@ IMD_HD uint32_t mod_p_words32(const uint32_t (&x)[W], const uint32_t (&wt)[W], u
   const auto q = static_cast<uint32_t>((uint64_t{s} * m32) >> 32);
 #endif
   return s - p * q;
+}
+
+// E1 (device/residue.hpp PackEmit has the math): the signed residue from the dp4a sum d.
+// d = sum_j dp4a(x_j, w_j) (unsigned lanes): 0 <= d <= dmax of the (W, modulus) constants.
+template <int W>
+IMD_HD uint32_t pack_dot(const uint32_t (&x)[W], const PackEmit& c) {
+  static_assert(W == 2 || W == 3, "2 or 3 words");
+  uint32_t d = 0;
+#if defined(__CUDA_ARCH__)
+#pragma unroll
+  for (int j = 0; j < W; ++j) d = __dp4a(x[j], c.w[j], d);
+#else
+  for (int j = 0; j < W; ++j) d += dot_bytes(x[j], c.w[j]);
+#endif
+  return d;
+}
+// u = SMod(sigma d, p) for sigma = +1 (sg = 1) or -1 (sg = 0xFFFFFFFF), as an int32 in [-128, 127]; its low byte is
+// the int8 of the pack. s' + h < 2^24 (pack_emit_bounds_ok), so the 64-bit multiply-add never wraps.
+IMD_HD int32_t pack_smod(uint32_t d, uint32_t sg, const PackEmit& c) {
+  const uint32_t s1 = d * sg + c.C;
+  const auto q = static_cast<uint32_t>((uint64_t{s1} * c.m32 + c.hm) >> 32);
+  return static_cast<int32_t>(s1 + c.negp * q);
 }
 
 }  // namespace imd::device

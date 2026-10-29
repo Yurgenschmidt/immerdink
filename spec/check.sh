@@ -31,7 +31,8 @@
 # (2026-10-03).
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"; cd "$here"
-grep -q "/immerdink.slice/" /proc/self/cgroup 2>/dev/null || exec "$here/../tools/memcap.sh" "$here/check.sh" "$@"
+. "$here/../tools/budget.sh"
+immerdink_in_budget || exec "$here/../tools/memcap.sh" "$here/check.sh" "$@"
 JAR="${TLA2TOOLS:-$(ls -d "$HOME"/.vscode/extensions/tlaplus.vscode-ide-*/tools/tla2tools.jar 2>/dev/null | tail -1)}"
 [ -f "$JAR" ] || { echo "tla2tools.jar not found; set TLA2TOOLS" >&2; exit 2; }
 

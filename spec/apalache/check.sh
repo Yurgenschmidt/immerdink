@@ -17,7 +17,8 @@
 # 1 GB). The whole run sits inside tools/memcap.sh's shared memory budget.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"; cd "$here"
-grep -q "/immerdink.slice/" /proc/self/cgroup 2>/dev/null || exec "$here/../../tools/memcap.sh" "$here/check.sh" "$@"
+. "$here/../../tools/budget.sh"
+immerdink_in_budget || exec "$here/../../tools/memcap.sh" "$here/check.sh" "$@"
 export JVM_ARGS="${JVM_ARGS:--Xmx4g}"
 root="$(cd "$here/../.." && pwd)"
 
