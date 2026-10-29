@@ -42,3 +42,12 @@ sq8192 | gemmul8 | fast:8
 sq8192 | gemmul8 | fast:14
 sq4096 | emu | fix55
 sq8192 | emu | fix55
+# Hopper long-K / skinny rows where GEMMul8 fast is ahead of immerdink at N=14 (final run 20261028-161307, speed ratio immerdink / GEMMul8 fast N=14:
+# r_bigk 0.87 H100 / 0.81 H200, r_mm 0.67 / 0.62, r_skinny 1.05 / 0.87): the measured phase split of both, to see whether pack, GEMM or CRT loses
+# (select them alone with PROFILE_TAGS='^r_(bigk|mm|skinny)-'). Issue: long-row KL (nc > 2) on Hopper.
+r_bigk   | imd     | 14
+r_bigk   | gemmul8 | fast:14
+r_mm     | imd     | 14
+r_mm     | gemmul8 | fast:14
+r_skinny | imd     | 14
+r_skinny | gemmul8 | fast:14
