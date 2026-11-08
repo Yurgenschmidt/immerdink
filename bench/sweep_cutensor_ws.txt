@@ -1,30 +1,30 @@
 # Does cuTENSOR's emulated FP64 (CUTENSOR_COMPUTE_DESC_8XINT8) engage, and at what workspace? cuTENSOR hands the GEMM to
 # cuBLASLt (COMPUTE_64F_EMULATED_FIXEDPOINT), which runs its INT8 (Ozaki II) kernels only if the plan's workspace limit
-# covers their scratch (about 95 MB at 1024^3, 1.3 GB at 4096^3) and otherwise a native FP64 kernel, silently.
+# covers their scratch (about 95 MB at 1024^3, 1.3 GB at 4096^3, 5.2 GB at 8192^3) and otherwise a native FP64 kernel, silently.
 # cuTENSOR's own estimate is 32 MiB at any preference, so a plan limited to it never emulates. Ladder per case:
-#   preference default at 2048 MiB; preference max (the cutensor-emu default) at est / 256 / 2048 / 8192 MiB (--ct-ws-mib;
+#   preference default at 8192 MiB; preference max (the cutensor-emu default) at est / 256 / 2048 / 8192 MiB (--ct-ws-mib;
 #   bench/imd_bench.cu caps the limit at 3/4 of the free device memory and records ws_limit_capped, e.g. 8192 on 24 GB).
 # Native cuTENSOR runs once per case (at its estimate); each cutensor-emu record carries its own native twin at the same
 # preference and limit (identical_to_native_same_ws, native_same_ws_median_s) and emu_engaged (graph capture).
 # Records: ct_ws, ct_ws_mib, ws_est_bytes, ws_limit_bytes, ws_req_bytes (bench_schema 2). bench/run_metrics.sh
 # (SWEEPS=cutws) -> cutensor_ws.jsonl and cutensor_ws.md (bench/cutws_table.py). Same line format as sweep_imd.txt:
 #   name | einsum spec (row-major operands) | extents | methods | N list | args
-sq4096 | ik,jk->ij | i=4096,j=4096,k=4096 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws default --ct-ws-mib 2048
+sq4096 | ik,jk->ij | i=4096,j=4096,k=4096 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws default --ct-ws-mib 8192
 sq4096 | ik,jk->ij | i=4096,j=4096,k=4096 | cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --ct-ws-mib est
 sq4096 | ik,jk->ij | i=4096,j=4096,k=4096 | cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --ct-ws-mib 256
 sq4096 | ik,jk->ij | i=4096,j=4096,k=4096 | cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --ct-ws-mib 2048
 sq4096 | ik,jk->ij | i=4096,j=4096,k=4096 | cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --ct-ws-mib 8192
-sq8192 | ik,jk->ij | i=8192,j=8192,k=8192 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --max-seconds 6 --ct-ws default --ct-ws-mib 2048
+sq8192 | ik,jk->ij | i=8192,j=8192,k=8192 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --max-seconds 6 --ct-ws default --ct-ws-mib 8192
 sq8192 | ik,jk->ij | i=8192,j=8192,k=8192 | cutensor-emu | | --phi 0.5 --samples 262144 --max-seconds 6 --ct-ws max --ct-ws-mib est
 sq8192 | ik,jk->ij | i=8192,j=8192,k=8192 | cutensor-emu | | --phi 0.5 --samples 262144 --max-seconds 6 --ct-ws max --ct-ws-mib 256
 sq8192 | ik,jk->ij | i=8192,j=8192,k=8192 | cutensor-emu | | --phi 0.5 --samples 262144 --max-seconds 6 --ct-ws max --ct-ws-mib 2048
 sq8192 | ik,jk->ij | i=8192,j=8192,k=8192 | cutensor-emu | | --phi 0.5 --samples 262144 --max-seconds 6 --ct-ws max --ct-ws-mib 8192
-t_cc   | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws default --ct-ws-mib 2048
+t_cc   | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws default --ct-ws-mib 8192
 t_cc   | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --ct-ws-mib est
 t_cc   | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --ct-ws-mib 256
 t_cc   | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --ct-ws-mib 2048
 t_cc   | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --ct-ws-mib 8192
-t_df   | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws default --ct-ws-mib 2048
+t_df   | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | cutensor,cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws default --ct-ws-mib 8192
 t_df   | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --ct-ws-mib est
 t_df   | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --ct-ws-mib 256
 t_df   | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws max --ct-ws-mib 2048
