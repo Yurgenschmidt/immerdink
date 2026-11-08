@@ -94,7 +94,7 @@ PackSource pack_source_of(imd_pack_t pack) {
   return {static_cast<int32_t>(pack->tensor.label.size()), pack->tensor.label.data(), &pack->pl};
 }
 int& fused_override() {
-  static int v = -1;  // only the test hook changes it (-1, 0, 2, 3: test_hooks.cpp)
+  static int v = -1;  // test hooks (-1, 0, 2, 3: test_hooks.cpp); bench hook (-1, 0, 4, 5: imd_prof_set_fused)
   return v;
 }
 }  // namespace imd::detail
@@ -166,10 +166,14 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
     if (imd::detail::fused_override() == 0) {
       pd.fused = false;
       pd.fused_large = 0;
-    } else if (imd::detail::fused_override() >= 2 && emulated) {
+    } else if ((imd::detail::fused_override() == 2 || imd::detail::fused_override() == 3) && emulated) {
       pd.fused = false;  // v1.7: KL only for in-line operands
       pd.fused_large = (imd::detail::kFusedLargeA | imd::detail::kFusedLargeB) & ~pd.packed;
       if (imd::detail::fused_override() == 3) pd.kl_lg_rows = 6;
+    } else if (imd::detail::fused_override() == 4) {
+      pd.fused_large &= imd::detail::kFusedLargeA;  // benchmark hook: KL for the GEMM's A only
+    } else if (imd::detail::fused_override() == 5) {
+      pd.fused_large &= imd::detail::kFusedLargeB;  // benchmark hook: KL for the GEMM's B only
     }
 
     auto p = std::make_unique<imd_plan_st>(an.options, an.lowered, *A, *B, *C);
@@ -487,9 +491,10 @@ IMD_API int imd_prof_set_k5_elems(int32_t elems) {
   return 0;
 }
 // Benchmark-only (issue 21, the long-row KL study): plans created afterwards use no fused launch (0: K1 + the group-1 pack instead of
-// KL / KF, as imd_test_set_fused(0)) or the plan-time rules (-1). Read at plan creation; the plan keeps its choice.
+// KL / KF, as imd_test_set_fused(0)) or the plan-time rules (-1); 4 / 5: the plan-time rules, then KL kept for the GEMM's A / B
+// only (the other operand takes K1 + the group-1 pack). Read at plan creation; the plan keeps its choice.
 IMD_API int imd_prof_set_fused(int32_t mode) {
-  if (mode != -1 && mode != 0) return 1;
+  if (mode != -1 && mode != 0 && mode != 4 && mode != 5) return 1;
   imd::detail::fused_override() = mode;
   return 0;
 }

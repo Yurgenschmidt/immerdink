@@ -809,6 +809,8 @@ struct DuelSide {
     if (k4b >= 0) d += k4b == 0 ? " k4b=mma" : " k4b=wgmma";
     if (ka >= 0) d += ka == 0 ? " ka=auto" : " ka=" + std::to_string(ka);
     if (fused == 0) d += " fused=off";
+    if (fused == 4) d += " fused=a";
+    if (fused == 5) d += " fused=b";
     return d;
   }
 };
@@ -832,9 +834,9 @@ DuelSide parse_duel_side(const std::string& spec, int N) {
     else if (k == "seq" && (v == "default" || seq_bits_ok(v))) d.seq = v == "default" ? -1 : std::stoi(v);
     else if (k == "k4b" && (v == "default" || v == "mma" || v == "wgmma")) d.k4b = v == "default" ? -1 : v == "mma" ? 0 : 1;
     else if (k == "ka" && (v == "auto" || v == "16" || v == "64")) d.ka = v == "auto" ? 0 : std::stoi(v);
-    else if (k == "fused" && (v == "default" || v == "off")) d.fused = v == "off" ? 0 : -1;
+    else if (k == "fused" && (v == "default" || v == "off" || v == "a" || v == "b")) d.fused = v == "off" ? 0 : v == "a" ? 4 : v == "b" ? 5 : -1;
     else throw Failure("bad duel side entry '" + kv + "' (N=, vec=generate|resident, g=, "
-                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..255, e.g. 5 or 133>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off)");
+                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..255, e.g. 5 or 133>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off|a|b)");
   }
   return d;
 }
@@ -2883,7 +2885,7 @@ void usage() {
           "  [--mode emulate|direct] (method imd) [--data normal|dominant|decay_opp]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
-          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..255, e.g. 5 or 133>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off)\n"
+          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..255, e.g. 5 or 133>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off|a|b)\n"
           "  [--clock-probe 0|1] [--l2 repeat|flush] (v1.10: per-call SM clock; L2 evicted\n"
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
           "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"
