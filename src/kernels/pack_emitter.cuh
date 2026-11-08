@@ -44,6 +44,7 @@ struct PackEmitterT {
   static_assert(W == 2 || W == 3, "X = |a'| in 2 (N <= 16) or 3 (N <= 20) u32 words");
   static_assert(S >= 0 && S <= 3 && ((S & kSeqQ1) == 0 || W == 2), "S: bit 0 E1, bit 1 Q1 (W = 2 only)");
   static constexpr bool kE1 = (S & kSeqE1) != 0, kQ1 = (S & kSeqQ1) != 0;
+  static constexpr int kE = E, kW = W;
   uint32_t x[W][E];  // X_e = |a'_e| = sum_j x[j][e] 2^(32 j)
   uint32_t neg = 0;  // bit e: a'_e < 0 (baseline emitter)
   uint32_t sg[E];    // E1: sigma_e = +1 or -1 (two's complement) per element
@@ -145,8 +146,9 @@ struct PackEmitterT {
   }
   // E1: d = dp4a chain, s' = sigma d + C, q = hi32(s' m32 + h m32), u = s' - p q = SMod(sigma d, p); the int8 is u's
   // low byte, four of them per word by three byte permutes. No sign select, no SMod compare, no negation.
-  __device__ __forceinline__ void emit_e1(int l, uint32_t (&w)[E / 4]) const {
-    const imd::device::PackEmit& c = imd::device::c_pack_emit.e[W - 2][l];
+  __device__ __forceinline__ void emit_e1(int l, uint32_t (&w)[E / 4]) const { emit_e1_c(imd::device::c_pack_emit.e[W - 2][l], w); }
+  // E1 with the modulus' constants given (store_slots_stepped walks them by pointer).
+  __device__ __forceinline__ void emit_e1_c(const imd::device::PackEmit& c, uint32_t (&w)[E / 4]) const {
     uint32_t u[E];
 #pragma unroll
     for (int e = 0; e < E; ++e) {
@@ -166,6 +168,9 @@ struct PackEmitterT {
   __device__ __forceinline__ void store(int l, int8_t* dst) const {
     uint32_t w[E / 4];
     emit(l, w);
+    store_words(w, dst);
+  }
+  __device__ __forceinline__ static void store_words(const uint32_t (&w)[E / 4], int8_t* dst) {
     if constexpr (E == 16)
       *reinterpret_cast<uint4*>(dst) = make_uint4(w[0], w[1], w[2], w[3]);
     else if constexpr (E == 8)
@@ -185,6 +190,21 @@ __device__ __forceinline__ void store_slots(const Em& em, int l0, int s_lo, int 
     for (int s = s_lo; s < s_hi; ++s, dst += plane) em.store(l0 + s, dst);
   } else {
     for (int s = s_lo; s < s_hi; ++s) em.store(l0 + s, dst + s * plane);
+  }
+}
+
+// Issue 21 (KL with klwarp, sm_90): store_slots of E1 for s in [0, n) with the plane given by the host and the modulus' constants
+// walked by pointer, so that the loop steps both by additions (ALU pipe). store_slots re-derives l sizeof(PackEmit) and the 64-bit
+// plane with IMAD / IMAD.WIDE per modulus (ncu, sm_89 SASS of kl_scale_pack<8,2,1,7>: 9 of the loop's 63 instructions, all on the
+// fmaheavy pipe that binds KL on Hopper). Same bytes at the same addresses.
+template <class Em>
+__device__ __forceinline__ void store_slots_stepped(const Em& em, int n, int8_t* dst, int64_t plane) {
+  static_assert(Em::kE1, "E1 only");
+  const imd::device::PackEmit* c = &imd::device::c_pack_emit.e[Em::kW - 2][0];
+  for (int s = 0; s < n; ++s, ++c, dst += plane) {
+    uint32_t w[Em::kE / 4];
+    em.emit_e1_c(*c, w);
+    Em::store_words(w, dst);
   }
 }
 

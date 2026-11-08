@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Issue 23: the KL fixed-part cuts (instruction-sequence bits 16 klwarp, 32 klload, 64 klshape) give the same bits as the baseline KL kernel.
+"""Issue 23: the KL fixed-part cuts (instruction-sequence bits 16 klwarp, 32 klload, 64 klshape; issue 21: 256 klf64, with klwarp) give the same bits as the baseline KL kernel.
 
     python3 tests/test_kl_bits.py [--lib build/libimmerdink.so] [--quick]
 
@@ -128,11 +128,11 @@ def expect(case, bits, fmode, k_hat):
         # chunks per row: tk = 4096 along k-bar (the whole tile), 512 when the rows are read side by side (k not unit-stride), 64 with the 64-row tiles of mode 3
         nc = -(-k_hat // 64) if fmode == 3 else max(1, -(-k_hat // (4096 if unit else 512)))
         if nc > 2:
-            e, kb = 4, (1 if bits & 16 else 0)
+            e, kb = 4, (1 if bits & 16 else 0) | (4 if bits & 256 else 0)
         else:
             e = 16 if bits & 64 else 8
             aligned = (X["off"] % 2 == 0)
-            kb = (1 if bits & 16 else 0) | (2 if (bits & 32) and unit and aligned else 0)
+            kb = (1 if bits & 16 else 0) | (2 if (bits & 32) and unit and aligned else 0) | (4 if bits & 256 else 0)
         out[(e, kb)] = out.get((e, kb), 0) + 1
     return out
 
@@ -157,8 +157,10 @@ def main():
         for case in cases(args.quick):
             fmode = case[7]
             ref = None
-            for base, kl in itertools.product(emit_sets, range(8)):
-                bits = base | (16 if kl & 1 else 0) | (32 if kl & 2 else 0) | (64 if kl & 4 else 0)
+            for base, kl in itertools.product(emit_sets, range(16)):
+                if kl & 8 and not kl & 1:
+                    continue                                  # klf64 needs klwarp (the hook refuses it alone)
+                bits = base | (16 if kl & 1 else 0) | (32 if kl & 2 else 0) | (64 if kl & 4 else 0) | (256 if kl & 8 else 0)
                 h, seen, k_hat = run(lib, cuda, case, bits, fmode)
                 n += 1
                 ref = ref or h
@@ -175,7 +177,7 @@ def main():
         for b in bad[:60]:
             print("  " + b)
         return 1
-    print(f"PASS  {n} runs: every combination of klwarp / klload / klshape over the emitter sets {emit_sets} is bit-identical, and each operand ran the kernel the set asks for")
+    print(f"PASS  {n} runs: every combination of klwarp / klload / klshape / klf64 over the emitter sets {emit_sets} is bit-identical, and each operand ran the kernel the set asks for")
     return 0
 
 

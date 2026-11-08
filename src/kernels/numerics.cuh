@@ -166,6 +166,35 @@ __device__ __forceinline__ int largest_u(u128 S, int lhs_shift, const uint64_t (
   return rule ? c : c - 1;
 }
 
+// Issue 21 'klf64' (sm_90 class only; docs/NOTES-21-klf64.md): u of §3.2 step 4 from a binary64 square sum, or a request for the
+// exact path. St = the row's sum of fma(y, y, acc) over y = x 2^(30 - gamma) (finite x, any summation order, every operation _rn),
+// for a row whose largest entry is normal (so S >= y_max^2 >= 2^60). Higham: |St - sum y^2| <= gamma_n sum y^2 with n <= nnz <= k_hat
+// inexact roundings on any path (zero operands are exact), and sum y^2 <= S < sum y^2 + nnz (t >= 0 terms are exact integers, t < 0 terms
+// ceilings). So S lies in [lo, hi] with lo = max(RD(St c_lo), 2^60), hi = RU(RU(St c_hi) + k_hat + 1), c_hi = 1 + (k_hat + 2) 2^-52
+// >= 1 / (1 - gamma_n), c_lo = 1 - (k_hat + 2) 2^-52 <= 1 / (1 + gamma_n) (both exact doubles for k_hat < 2^50, which the host
+// enforces; the + 1 covers the underflow terms, which are absolute and below 2^-1000). u(S) does not increase with S, so u(hi) == u(lo)
+// decides u; otherwise the caller runs the exact sum. Doubles >= 2^60 are integers, so lo, hi convert to u128 exactly (hi < 2^115).
+// Model and review: immerdink-eval analysis/20261108-hopper/sfilter_model.py (bit identity against spec/oracle.py).
+__device__ __forceinline__ u128 u128_of_big_double(double d) {  // d >= 2^60, finite
+  const uint64_t b = static_cast<uint64_t>(__double_as_longlong(d));
+  const int e = static_cast<int>((b >> 52) & 0x7FF) - 1075;  // >= 8
+  return static_cast<u128>((b & kFracMask) | (uint64_t{1} << 52)) << e;
+}
+__device__ __forceinline__ bool largest_u_filtered(double St, int64_t k_hat, int lhs_shift, const uint64_t (&rhs)[4],
+                                                   int rhs_bits, int* u) {
+  const double n = static_cast<double>(k_hat + 2) * 0x1p-52;
+  const double hi = __dadd_ru(__dmul_ru(St, 1.0 + n), static_cast<double>(k_hat + 1));
+  const double lo = fmax(__dmul_rd(St, 1.0 - n), 0x1p60);
+  const int ua = largest_u(u128_of_big_double(hi), lhs_shift, rhs, rhs_bits);
+  const int ub = largest_u(u128_of_big_double(lo), lhs_shift, rhs, rhs_bits);
+  *u = ua;
+  return ua == ub;
+}
+// 2^s as a double for s in [-1022, 1023] (exact).
+__device__ __forceinline__ double pow2_double(int s) {
+  return __longlong_as_double(static_cast<long long>(static_cast<uint64_t>(s + 1023) << 52));
+}
+
 // §3.3: a' = RN_even(x 2^sigma) or trunc(x 2^sigma) for finite x, as |a'| = mu * 2^eps.
 // eps <= floor(log2 T) <= kEpsMax by the norm budget (cert_pow2 / cert_shift_rule_guarantee).
 __device__ __forceinline__ void quantize(uint64_t b, int sigma, bool trunc, uint64_t* mu,
