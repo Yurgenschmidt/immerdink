@@ -245,7 +245,8 @@ class Library:
     def set_fused(self, mode=-1):
         """Fused launches of plans created afterwards (src/test_hooks.cpp): -1 the plan-time
         rules (v1.4 KF, v1.6 KL), 0 none, 2 KL for both operands of every emulated plan,
-        3 as 2 with 64-row KL tiles (several chunks per row)."""
+        3 as 2 with 64-row KL tiles (several chunks per row), 6 the sm_90 class's KL rule
+        (issue 21 klstrided) on any device."""
         assert self.lib.imd_test_set_fused(mode) == 0
 
     def set_k5_one_elem(self, per_sm=-1):
@@ -363,6 +364,20 @@ class Library:
     def plan_fused_large(self, plan):
         """The operands a real plan scales and packs with KL (bit 0: A, bit 1: B; v1.6)."""
         return self.plan_sizes(plan)[37]
+
+    def plan_table(self, plan):
+        """The plan's table set (imd_plan_info table_id, IMD_TABLE_*)."""
+        raw = (C.c_uint8 * 168)()
+        C.c_uint32.from_buffer(raw, 0).value = 168
+        assert self.lib.imd_plan_info(plan, raw) == 0
+        return C.c_int32.from_buffer(raw, 160).value
+
+    def plan_fused_large_rule(self, plan):
+        """The KL mask the sm_90 table set's rule allows (issue 21 klstrided): 3 below ceil(k_hat / 512) = 64 chunks; at or above it the
+        plan's own mask (the per-operand rule is checked exactly, GPU-free, by test_host.py check_kl_strided)."""
+        v = self.plan_sizes(plan)
+        k_hat = v[7]
+        return v[37] if -(-k_hat // 512) >= 64 else 3
 
     def plan_k4(self, plan):
         """(K4 configuration the plan runs, that of its K4 parameters, its SM count); the

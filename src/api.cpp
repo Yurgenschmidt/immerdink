@@ -94,7 +94,7 @@ PackSource pack_source_of(imd_pack_t pack) {
   return {static_cast<int32_t>(pack->tensor.label.size()), pack->tensor.label.data(), &pack->pl};
 }
 int& fused_override() {
-  static int v = -1;  // test hooks (-1, 0, 2, 3: test_hooks.cpp); bench hook (-1, 0, 4, 5: imd_prof_set_fused)
+  static int v = -1;  // test hooks (-1, 0, 2, 3, 6: test_hooks.cpp); bench hook (-1, 0, 4, 5: imd_prof_set_fused)
   return v;
 }
 }  // namespace imd::detail
@@ -161,21 +161,6 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
     if (const imd_status_t st = imd::detail::plan_data(an, &pd); st != IMD_STATUS_SUCCESS)
       return st;
     const bool emulated = imd::detail::emulates(pd);  // K4 parameters needed
-    // Test hook only: 0 = no fused launch at all; 2 / 3 = KL for both operands of every
-    // emulated plan (3: with 64-row KL tiles).
-    if (imd::detail::fused_override() == 0) {
-      pd.fused = false;
-      pd.fused_large = 0;
-    } else if ((imd::detail::fused_override() == 2 || imd::detail::fused_override() == 3) && emulated) {
-      pd.fused = false;  // v1.7: KL only for in-line operands
-      pd.fused_large = (imd::detail::kFusedLargeA | imd::detail::kFusedLargeB) & ~pd.packed;
-      if (imd::detail::fused_override() == 3) pd.kl_lg_rows = 6;
-    } else if (imd::detail::fused_override() == 4) {
-      pd.fused_large &= imd::detail::kFusedLargeA;  // benchmark hook: KL for the GEMM's A only
-    } else if (imd::detail::fused_override() == 5) {
-      pd.fused_large &= imd::detail::kFusedLargeB;  // benchmark hook: KL for the GEMM's B only
-    }
-
     auto p = std::make_unique<imd_plan_st>(an.options, an.lowered, *A, *B, *C);
     p->slot_key[0] = an.packed.key[0];  // v1.7: the packed slots' keys, copied
     p->slot_key[1] = an.packed.key[1];
@@ -201,6 +186,25 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
     } else {
       p->info.struct_size = sizeof p->info;
     }
+    // Issue 21 (klstrided): the KL operands by this device class's rule (plan_data used the reference class), then the hooks,
+    // which keep precedence. Test hook only: 0 = no fused launch at all; 2 / 3 = KL for both operands of every
+    // emulated plan (3: with 64-row KL tiles).
+    if (emulated) e.fused_large = imd::detail::fused_large(e, p->info.table_id);
+    if (imd::detail::fused_override() == 0) {
+      e.fused = false;
+      e.fused_large = 0;
+    } else if ((imd::detail::fused_override() == 2 || imd::detail::fused_override() == 3) && emulated) {
+      e.fused = false;  // v1.7: KL only for in-line operands
+      e.fused_large = (imd::detail::kFusedLargeA | imd::detail::kFusedLargeB) & ~e.packed;
+      if (imd::detail::fused_override() == 3) e.kl_lg_rows = 6;
+    } else if (imd::detail::fused_override() == 6 && emulated) {
+      e.fused_large = imd::detail::fused_large(e, IMD_TABLE_SM90);  // test hook: the sm_90 class's KL rule (klstrided) on any device
+    } else if (imd::detail::fused_override() == 4) {
+      e.fused_large &= imd::detail::kFusedLargeA;  // benchmark hook: KL for the GEMM's A only
+    } else if (imd::detail::fused_override() == 5) {
+      e.fused_large &= imd::detail::kFusedLargeB;  // benchmark hook: KL for the GEMM's B only
+    }
+
     if (emulated) {  // §4 / §6 v1.2: every K4 launch shape's parameters, built here once
       // v1.5: the K4 configuration. libimmerdink_host's rule for this device's SM count (what
       // imd_lowering reports for sm_count = e.sms), or the fastest one timed (k4_tune).

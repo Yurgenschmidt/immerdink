@@ -189,7 +189,7 @@ imd_status_t lowering_impl(const imd_tensor_t* A, const imd_tensor_t* B, const i
     // v1.6: the operands of the fused large launch KL (plan_data set e.fused_large).
     const bool fused = imd::detail::fused_path(e);
     r.fused = fused ? 1 : 0;
-    r.fused_large = imd::detail::fused_large(e);
+    r.fused_large = imd::detail::fused_large(e, table);  // issue 21: per table set (klstrided)
     r.kernel_launches = imd::detail::plan_launches(e, fused, r.fused_large,
                                                    an.options.vec_mode == IMD_VEC_RESIDENT,
                                                    r.gemm_launches);

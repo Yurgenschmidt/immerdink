@@ -422,7 +422,8 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     P.launches = v + 1;
   } else {
     const bool fused = fused_path(e);
-    const int32_t fl = fused_large(e);
+    // The calibration names no table set: the reference class's rule (issue 21 klstrided is not modelled yet).
+    const int32_t fl = fused_large(e, IMD_TABLE_SM89);
     const double N = e.N, g = e.g;  // g in [1, N]
     const double rows[2] = {b * m, b * n}, pad[2] = {b * m, b * nh};
     const bool inl[2] = {!(e.packed & 1), !(e.packed & 2)};
