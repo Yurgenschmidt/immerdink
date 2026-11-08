@@ -811,6 +811,7 @@ struct DuelSide {
     if (fused == 0) d += " fused=off";
     if (fused == 4) d += " fused=a";
     if (fused == 5) d += " fused=b";
+    if (fused == 7) d += " fused=ref";
     return d;
   }
 };
@@ -834,9 +835,9 @@ DuelSide parse_duel_side(const std::string& spec, int N) {
     else if (k == "seq" && (v == "default" || seq_bits_ok(v))) d.seq = v == "default" ? -1 : std::stoi(v);
     else if (k == "k4b" && (v == "default" || v == "mma" || v == "wgmma")) d.k4b = v == "default" ? -1 : v == "mma" ? 0 : 1;
     else if (k == "ka" && (v == "auto" || v == "16" || v == "64")) d.ka = v == "auto" ? 0 : std::stoi(v);
-    else if (k == "fused" && (v == "default" || v == "off" || v == "a" || v == "b")) d.fused = v == "off" ? 0 : v == "a" ? 4 : v == "b" ? 5 : -1;
+    else if (k == "fused" && (v == "default" || v == "off" || v == "a" || v == "b" || v == "ref")) d.fused = v == "off" ? 0 : v == "a" ? 4 : v == "b" ? 5 : v == "ref" ? 7 : -1;
     else throw Failure("bad duel side entry '" + kv + "' (N=, vec=generate|resident, g=, "
-                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..511, e.g. 5, 133 or 439>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off|a|b)");
+                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..511, e.g. 5, 133 or 439>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off|a|b|ref)");
   }
   return d;
 }
@@ -1077,6 +1078,20 @@ struct Bench {
   Options o;
   cudaStream_t s = nullptr;
   imd_handle_t imd = nullptr;
+  // PR #55 review: imd_lowering is asked for THIS device (the v3 / v7 inputs sm_count and table_id), so the records' fused_large,
+  // kernel_launches and k4_rule are what the plan runs (issue 21 klstrided makes fused_large per table set). Cached: -1 not yet asked.
+  int32_t low_sms = -1, low_table = -1;
+  void for_device(imd_lowering_t* low) {
+    if (low_table < 0) {
+      imd_device_info_t di{};
+      di.struct_size = sizeof di;
+      const bool ok = imd_device_info(imd, &di) == IMD_STATUS_SUCCESS && di.status != IMD_PLAN_UNSUPPORTED;
+      low_sms = ok ? di.device.sm_count : 0;
+      low_table = ok ? di.table_id : IMD_TABLE_SM89;
+    }
+    low->sm_count = low_sms;
+    low->table_id = low_table;
+  }
   DevBuf dA, dB, dC;
   Reference R;  // sampled reference (host memory O(samples); operands stay on the device)
   Json meta;     // fields common to every record
@@ -2034,6 +2049,7 @@ struct Bench {
     CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
     imd_lowering_t low{};
     low.struct_size = sizeof low;
+    for_device(&low);
     imd_lowering(&A, &B, &C, &opt, &low);
     imd_plan_t plan = nullptr;
 #ifdef IMD_BENCH_PROFILE
@@ -2237,6 +2253,7 @@ struct Bench {
     } ka_restore{o.k_align_hook, d.ka >= 0};
     CI(imd_workspace_size(&A, &B, &C, &opt, &P->wsb));
     P->low.struct_size = sizeof P->low;
+    for_device(&P->low);
     imd_lowering(&A, &B, &C, &opt, &P->low);
 #ifdef IMD_BENCH_PROFILE
     if (imd_prof_set_k4_config(d.k4 >= 0 ? d.k4 : -1) != 0) throw Failure("imd_prof_set_k4_config");
@@ -2414,6 +2431,8 @@ struct Bench {
     CI(imd_workspace_size_packed(&A, &B, &C, &opt, &packing, &wsp));
     imd_lowering_t lu{}, lp{};
     lu.struct_size = lp.struct_size = sizeof lu;
+    for_device(&lu);
+    for_device(&lp);
     imd_lowering(&A, &B, &C, &opt, &lu);
     imd_lowering_packed(&A, &B, &C, &opt, &packing, &lp);
     imd_plan_t plain = nullptr, packed = nullptr;
@@ -2885,7 +2904,7 @@ void usage() {
           "  [--mode emulate|direct] (method imd) [--data normal|dominant|decay_opp]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
-          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..511, e.g. 5, 133 or 439>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off|a|b)\n"
+          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..511, e.g. 5, 133 or 439>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off|a|b|ref)\n"
           "  [--clock-probe 0|1] [--l2 repeat|flush] (v1.10: per-call SM clock; L2 evicted\n"
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
           "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"

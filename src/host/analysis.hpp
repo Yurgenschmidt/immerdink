@@ -118,11 +118,9 @@ inline bool fused_path(const ExecPlan& e) {
 // KL, as a bit mask (bit 0: the GEMM's A, bit 1: its B, post-swap): every in-line (v1.7: not
 // packed) operand of a plan with the emulated GEMM that does not take KF. A pure function of
 // the lowering.
+// Issue 21 (klstrided, per device class): fused_large(e, table) below also drops KL for an
+// operand read along rows on long rows on the classes that carry the rule.
 constexpr int32_t kFusedLargeA = 1, kFusedLargeB = 2;
-inline int32_t fused_large(const ExecPlan& e) {
-  if (!emulates(e) || fused_path(e)) return 0;
-  return (kFusedLargeA | kFusedLargeB) & ~e.packed;
-}
 
 // v1.8 (DESIGN §4, §6c): the moduli parts of a pack launch (KF, K2 / K3; gridDim.y): with
 // fewer tiles than 2 per SM, the group's moduli are split over up to gsize block rows so that
@@ -247,6 +245,35 @@ inline KlLaunch kl_launch(bool along_rows, int32_t lg_rows, int64_t k_hat, int64
   L.values = L.nc > 2 ? 4 : 8;
   L.threads = (1 << kPackTileLgElems) / L.values;
   return L;
+}
+
+// v1.6 (DESIGN §4 "KL"): the operands scaled and packed (group 1) by KL, as a bit mask (bit 0:
+// the GEMM's A, bit 1: its B, post-swap): every in-line (v1.7: not packed) operand of a plan with
+// the emulated GEMM that does not take KF. Issue 21 "klstrided": on the device classes of
+// kKlStridedTable, an operand read along rows (pack_along_rows: th = 8 rows x tk = 512) whose
+// row takes kl_launch(...).nc >= kKlStridedNcMin chunks takes K1 + K2/K3 instead: KL walks such a
+// row in nc chunks from one block (latency-bound: issue% 45-48 on H200 long rows) while K1 + the
+// pack spread k over a large grid. Evidence (H200, all bit-identical; t(KL both) / t(KL k-contiguous
+// operand only)): 264x256x32768 ak,kb 1.50, 1000x64x50000 ik,kj 1.39, 2048^2x32768 ik,kj 1.09; on
+// the RTX 4090 the same choice loses on 4096^3 and 16384x512x4096 (0.96, 0.84), so sm_89 keeps KL.
+// A pure function of the lowering and the table set; workspace and plan bytes do not depend on it.
+// `table`: an IMD_TABLE_* (out of range: the reference IMD_TABLE_SM89).
+constexpr bool kKlStridedTable[IMD_TABLE_COUNT] = {
+    false,  // IMD_TABLE_SM89: RTX 4090 (and sm_120)
+    true,   // IMD_TABLE_SM90: H100, H200
+};
+constexpr int64_t kKlStridedNcMin = 64;  // H200 evidence at nc 64 and 98; H100 thresholds pending
+inline bool kl_strided_rule(int32_t table) {
+  return table >= 0 && table < IMD_TABLE_COUNT && kKlStridedTable[table];
+}
+inline int32_t fused_large(const ExecPlan& e, int32_t table) {
+  if (!emulates(e) || fused_path(e)) return 0;
+  int32_t m = (kFusedLargeA | kFusedLargeB) & ~e.packed;
+  if (kl_strided_rule(table))
+    for (int x = 0; x < 2; ++x)
+      if (e.pack_along_rows[x] && kl_launch(true, -1, e.k_hat, 1, 1, 1).nc >= kKlStridedNcMin)
+        m &= ~(1 << x);
+  return m;
 }
 
 // imd_pack's KL tile height (pack_exec's one-operand view, read along rows): th = 4096 /

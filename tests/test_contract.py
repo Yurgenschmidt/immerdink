@@ -400,7 +400,10 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
                 if fmode in (2, 3) and (fused or large != 3):
                     raise Fail(f"{vname}: KL not forced (fused {fused}, fused_large {large})")
                 emulated = mode == o.EMULATE and view.k > 1 and not view.empty_output()
-                if fmode in (-1, 1) and large != (3 if emulated and not fused else 0):
+                want_large = 3 if emulated and not fused else 0
+                if want_large and lib.plan_table(plan) == 1:   # issue 21 klstrided: the sm_90 class drops KL for long strided rows
+                    want_large = lib.plan_fused_large_rule(plan)
+                if fmode in (-1, 1) and large != want_large:
                     raise Fail(f"{vname}: fused_large {large} against the plan-time rule")
                 if alpha == 0.0 and not view.empty_output():
                     kl = (0 if pvec == params.VEC_RESIDENT else 1) + 1   # K0 + beta kernel

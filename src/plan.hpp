@@ -145,7 +145,8 @@ int64_t k4_align_check(int mode);
 
 // Test hook state (api.cpp; test_hooks.cpp imd_test_set_fused): -1 = the plan-time rule
 // (production), 0 = no fused launch (KF, KL), 2 / 3 = KL for both operands of every emulated
-// plan (3: 64-row KL tiles). Read by imd_plan_create only.
+// plan (3: 64-row KL tiles), 6 = the sm_90 class's KL rule (klstrided) on any device; bench hook (imd_prof_set_fused) 4 / 5 = KL
+// kept for the GEMM's A / B only. Read by imd_plan_create only.
 int& fused_override();
 // K5's one-element-per-thread limit (contract.cu; elements per SM), read by imd_contract;
 // changed only by the test hook imd_test_set_k5_one_elem (not thread-safe, like the hooks).

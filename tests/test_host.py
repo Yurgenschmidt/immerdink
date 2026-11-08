@@ -664,12 +664,43 @@ def check_packed(direct, descs, opts, rng, what):
     return seen
 
 
+def check_kl_strided(direct):
+    """Issue 21 klstrided (analysis.hpp kKlStridedTable, kKlStridedNcMin = 64): on the sm_90 table set an in-line operand whose k is
+    not the unit stride (KL reads it along rows, 512 k per chunk) loses its KL bit when ceil(k_hat / 512) >= 64; the sm_89 set keeps
+    KL for both. Workspace and plan bytes do not depend on the table set."""
+    n_cases = 0
+    for k in (16000, 32256, 32768, 33000, 100000):
+        for a_strided, b_strided in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            A = ([k, 6], [6, 1], [3, 1]) if a_strided else ([6, k], [k, 1], [1, 3])
+            B = ([k, 5], [5, 1], [3, 2]) if b_strided else ([5, k], [k, 1], [2, 3])
+            descs = [A, B, ([6, 5], [5, 1], [1, 2])]
+            co = c_opts(14, 0, TRUNC, "EMULATE", "GENERATE") + (0,)
+            st0, l0 = direct.lowering(descs, co, table_id=0)
+            st1, l1 = direct.lowering(descs, co, table_id=1)
+            if st0 != 0 or st1 != 0:
+                raise Fail(f"klstrided k={k} {a_strided}{b_strided}: imd_lowering {st0} / {st1}")
+            strided = [a_strided, b_strided]
+            if l1["swapped"]:
+                strided.reverse()
+            long_rows = -(-l1["k_hat"] // 512) >= 64
+            want1 = 3 & ~sum(1 << x for x in (0, 1) if strided[x] and long_rows)
+            if l0["fused_large"] != 3 or l1["fused_large"] != want1:
+                raise Fail(f"klstrided k={k} (k_hat {l1['k_hat']}) strided {strided}: fused_large {l0['fused_large']} (sm_89) / "
+                           f"{l1['fused_large']} (sm_90), want 3 / {want1}")
+            for f in ("workspace_bytes", "plan_device_bytes", "plan_host_bytes", "k_hat", "swapped"):
+                if l0[f] != l1[f]:
+                    raise Fail(f"klstrided k={k}: {f} {l0[f]} (sm_89) != {l1[f]} (sm_90)")
+            n_cases += 1
+    return n_cases
+
+
 def suite_host(args):
     direct = Direct(args.host_lib)
     host.load(args.host_lib)  # the wrapper's default library: the one under test
     os.environ["IMMERDINK_HOST_LIB"] = args.host_lib
     rng = random.Random(20261004)
     by = {}
+    check_kl_strided(direct)
     # Random descriptors and options; every 4th also with packed operands (DESIGN §6b).
     packed_seen = {}
     for t in range(args.cases):
@@ -2543,6 +2574,13 @@ def suite_plan(args):
     n_plans, n_k4, n_tuned = 0, 0, 0
     path_of = {0: "NOOP", 1: "EMULATE", 2: "DIRECT"}  # imd::detail::Path order (k = 0: SCALE)
 
+    def plan_table(plan):
+        """The plan's table set (imd_plan_info table_id): issue 21's klstrided KL rule depends on it."""
+        raw = (C.c_uint8 * 168)()
+        C.c_uint32.from_buffer(raw, 0).value = 168
+        assert lib.lib.imd_plan_info(plan, raw) == 0
+        return C.c_int32.from_buffer(raw, 160).value
+
     def one(descs, opts, what, tune=0):
         nonlocal n_plans, n_k4, n_tuned
         co = c_opts(*opts) + (tune,)
@@ -2584,6 +2622,8 @@ def suite_plan(args):
                        k_hat=kh, num_moduli=N, residue_group=g, workspace_bytes=total,
                        gemm_launches=launches, plan_device_bytes=dev, plan_host_bytes=hbytes,
                        fused=fused, kernel_launches=kernels, fused_large=fused_large)
+            if path == 1 and k > 0:   # the device's table set (issue 21 klstrided: the KL rule is per class)
+                low = direct.lowering(descs, co, table_id=plan_table(plan))[1]
             want = dict(low, dispatch=host.DISPATCH[low["dispatch"]])
             for key, val in got.items():
                 if val != want[key]:
@@ -2655,6 +2695,8 @@ def suite_plan(args):
                         dev, store, add, launches, hbytes, fused, kernels = v[27:34]
                         fused_large, slots, pbA, pbB = v[37:41]
                         _, ltot, lay = direct.layout_packed(descs, co, specs)
+                        if path == 1 and k > 0:   # the device's table set (issue 21 klstrided)
+                            low = direct.lowering(descs, co, packing=specs, table_id=plan_table(plan))[1]
                         got = dict(swapped=sw, m=m, n=n, k=k, b=b, n_hat=nh, k_hat=kh,
                                    workspace_bytes=total, gemm_launches=launches,
                                    plan_device_bytes=dev, plan_host_bytes=hbytes, fused=fused,

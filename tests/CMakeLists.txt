@@ -350,6 +350,10 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_kl_bits.py" --lib "$<TARGET_FILE:immerdink>"
                    ${_seq_twin_arg})
   set_tests_properties(kl_bits PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800)
+  # Issue 21 klstrided: the sm_90 class's KL rule (forced with imd_test_set_fused(6) on any device) is bit-identical to KL for both operands.
+  add_test(NAME kl_strided
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_kl_strided.py" --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(kl_strided PROPERTIES RESOURCE_LOCK gpu TIMEOUT 600)
   add_test(NAME seq_select
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_seq_select.py" --lib "$<TARGET_FILE:immerdink>"
                    ${_seq_twin_arg})
