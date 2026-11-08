@@ -62,7 +62,19 @@ while IFS='|' read -r case_ method arg _rest; do
     imd)     N="$arg"; margs="--N $arg"; tag="$tag-N$arg" ;;
     gemmul8) mode="${arg%%:*}"; N="${arg##*:}"; variant="$mode"; margs="--g8mode $mode --N $N"; tag="$tag-$mode-N$N" ;;
     emu)     variant="$arg"; margs="--emu $arg"; tag="$tag-$arg" ;;
-    cutensor|cutensor-emu|dgemm) ;;
+    cutensor-emu)  # argument: - or comma tokens ws<MiB>|wsest, eager|performant, b<bits> (e.g. ws2048 or eager,b55)
+      if [ "$arg" != - ] && [ -n "$arg" ]; then
+        ce=""; for t in ${arg//,/ }; do
+          case "$t" in
+            ws*) margs="$margs --ct-ws-mib ${t#ws}" ;;
+            eager|performant) ce="${ce:+$ce,}strategy=$t" ;;
+            b[0-9]*) ce="${ce:+$ce,}bits=${t#b}" ;;
+            *) echo "profile list: bad cutensor-emu argument '$t'; skipped" >&2; continue 2 ;;
+          esac
+        done
+        [ -n "$ce" ] && margs="$margs --ct-emu $ce"; variant="$arg"; tag="$tag-${arg//,/-}"
+      fi ;;
+    cutensor|dgemm) ;;
     *) echo "profile list: unknown method '$method'; skipped" >&2; continue ;;
   esac
   if [ -n "${PROFILE_TAGS:-}" ] && ! echo "$tag" | grep -Eq "$PROFILE_TAGS"; then continue; fi
