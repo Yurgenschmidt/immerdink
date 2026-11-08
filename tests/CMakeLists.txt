@@ -321,7 +321,7 @@ if(Python3_FOUND)
                            ENVIRONMENT "IMD_TEST_SEQ=${seq}")
     endforeach()
     # Issue 21: the threshold rows (suite klf64: square sums on and next to the sigma thresholds, the exact fallback) under the klf64 sets and the default set.
-    foreach(seq -1 273 305 272 437)
+    foreach(seq -1 273 305 272 437 439)
       add_test(NAME contract_klf64_seq${seq}
                COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                        --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite klf64 -v)
@@ -422,7 +422,7 @@ if(Python3_FOUND)
   # R4 integration (docs/NOTES-R4-INTEGRATION.md): the duel sides' sets forced TOGETHER (E1 1, F1 4, klwarp 16, klload 32, klshape 64, k5fin 128), each with the K5 CRT of the side
   # (crt=f64; the sets without 128 also crt=int): the oracle suites e2e / eps and the 19 committed hashes, one test per (set, crt); and the in-process check of all of them
   # at once with the KL and k5fin launch counters (test_forced_sets.py).
-  foreach(seq 5 21 37 69 53 101 85 117 133 149 165 197 245 437)
+  foreach(seq 5 21 37 69 53 101 85 117 133 149 165 197 245 437 439)
     foreach(crt f64 int)
       if(crt STREQUAL "int" AND seq GREATER 127)
         continue()

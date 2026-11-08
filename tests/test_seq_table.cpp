@@ -1,5 +1,5 @@
 // Issue 21 / R2: the per-device-class instruction-sequence defaults of src/host/seq_config.hpp, checked without CUDA (the header is CUDA-free).
-// sm_90 (H100, H200) = E1 + F1 + the binary64-limb CRT + klwarp + klload + k5fin = 189 (R2: 13, R4: 173, R5: 189; Q1 and klshape stay off); sm_89 (RTX 4090) = E1 = 1; sm_120 and every class
+// sm_90 (H100, H200) = E1 + Q1 + F1 + the binary64-limb CRT + klwarp + klload + k5fin + klf64 = 447 (R2: 13, R4: 173, R5: 189, issue 21 2026-11-08: 447; klshape stays off); sm_89 (RTX 4090) = E1 = 1; sm_120 and every class
 // not listed = 0 (the limb CRT is slower on 1/64-rate FP64 cards). With IMMERDINK_SEQ_TWINS=OFF (IMD_NO_SEQ_TWINS) the F1 bit is not a supported set and a class
 // default is masked to what the build can run. Also the forcing rules: the hooks force any combination of the bits 1 2 4 16 32 64 and 128 + F1 (a forced set has no limb-CRT bit; Q1 needs E1), and the K5 hook's
 // three states (-1 follow the set, 0 integer, 1 limb) pick the CRT variant. CPU only.
@@ -24,10 +24,10 @@ int main() {
   CHECK(seq_default_for(9, 0) == (kSeqEmit | kSeqLimbCrt));   // 9: F1, klwarp, klload and k5fin are not compiled
   CHECK(!seq_valid(kSeqFinish) && !seq_valid(3) && seq_valid(kSeqEmit) && seq_valid(0));
 #else
-  CHECK(seq_default_for(9, 0) == 189);
-  CHECK(seq_default_for(9, 0) == (kSeqEmit | kSeqFinish | kSeqLimbCrt | kSeqKlWarp | kSeqKlLoad | kSeqK5Fin));
+  CHECK(seq_default_for(9, 0) == 447);
+  CHECK(seq_default_for(9, 0) == (kSeqEmit | kSeqQuant | kSeqFinish | kSeqLimbCrt | kSeqKlWarp | kSeqKlLoad | kSeqK5Fin | kSeqKlF64));
   CHECK((seq_default_for(9, 0) & kSeqKlShape) == 0);   // klshape (slower) stays off; klwarp is on since R5 (docs/NOTES-26.md)
-  CHECK((seq_default_for(9, 0) & kSeqQuant) == 0);             // Q1 is opt-in on sm_90
+  CHECK((seq_default_for(9, 0) & kSeqQuant) != 0 && seq_valid(seq_default_for(9, 0) & ~kSeqLimbCrt));   // Q1 + klf64 on sm_90 since 2026-11-08; the row minus the limb-CRT bit is a forceable set (its twin, 439)
   // every combination of the bits 1, 2, 4, 16, 32, 64 (issue 23: the KL cuts are independent of the emitter set) is a set unless Q1 lacks E1; with 128 (k5fin) it needs F1 too
   for (int b = 0; b < 256; ++b) {
     const bool bit8 = (b & kSeqLimbCrt) != 0;
@@ -44,8 +44,8 @@ int main() {
   CHECK(seq_default_for(8, 9) == 1);                          // RTX 4090: E1 only, no FP64-pipe set
   CHECK(seq_default_for(12, 0) == 0);                         // Blackwell sm_120: the baseline
   CHECK(seq_default_for(10, 0) == 0 && seq_default_for(8, 0) == 0 && seq_default_for(8, 6) == 0 && seq_default_for(7, 5) == 0 && seq_default_for(0, 0) == 0);
-  for (const SeqClass& c : kSeqClasses) {                     // no row but sm_90 carries the limb CRT; no row carries Q1
-    CHECK((c.bits & kSeqQuant) == 0);
+  for (const SeqClass& c : kSeqClasses) {                     // no row but sm_90 carries the limb CRT, Q1 or klf64
+    CHECK(((c.bits & (kSeqQuant | kSeqKlF64)) != 0) == (c.cc_major == 9 && c.cc_minor == 0));
     CHECK(((c.bits & kSeqLimbCrt) != 0) == (c.cc_major == 9 && c.cc_minor == 0));
     CHECK(((c.bits & (kSeqKlLoad | kSeqK5Fin)) != 0) == (c.cc_major == 9 && c.cc_minor == 0));   // klwarp + klload + k5fin only on sm_90 (R4, R5); klshape in no row
     CHECK((c.bits & kSeqKlShape) == 0);

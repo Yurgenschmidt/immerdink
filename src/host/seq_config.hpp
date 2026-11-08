@@ -10,7 +10,7 @@
 // Bit 8 is a CRT variant, not a pack / finish sequence: it exists only as a class default (the hooks force the sets without it, which
 // run the integer CRT, and the K5 hooks force the CRT separately: 0 integer, 1 limb, -1 follow the class set).
 // Bit 256 'klf64' (issue 21, docs/NOTES-21-klf64.md): KL's gamma scan and exact square sum replaced by a high-word max and a binary64 sum with a
-// rigorous filter (bit-identical; the exact passes run for a tile whose decision is close); FP64 pipe, so sm_90 only; needs klwarp; off by default until measured.
+// rigorous filter (bit-identical; the exact passes run for a tile whose decision is close); FP64 pipe, so sm_90 only; needs klwarp; on in the sm_90 row since 2026-11-08 (H200 1.04-1.09).
 // Bits 16, 32, 64 (issue 23, docs/NOTES-23.md) are cuts of the FIXED part of the large-row pack KL (everything that does not scale with N), each
 // independent of the emitter set and of the others; all off in every class row until the Hopper duels decide:
 //   kSeqKlWarp  'klwarp'   row-wide scalar work once per row / tile instead of by every thread / warp (largest_u, tile row setup, cross-warp combines)
@@ -53,7 +53,7 @@ constexpr int kSeqForceMask = kSeqSupported;
 // rate, and sm_120 maps onto the sm_89 row there). A class that is not listed gets 0 = the baseline. Evidence per row: the SASS
 // counts and register / occupancy figures of docs/NOTES-21.md "Pack emitter and finish" (sm_89, sm_90 and sm_120 builds of
 // src/contract.cu). sm_120 WAS counted and stays on the baseline: the E1 loop is shorter per iteration, but the compiler unrolls it
-// there and two whole kernels grow (kl_scale_pack<4,*> by 428 / 510 instructions), and nothing was timed. Q1 is opt-in everywhere; F1 and the
+// there and two whole kernels grow (kl_scale_pack<4,*> by 428 / 510 instructions), and nothing was timed. Q1 is on for sm_90 only since 2026-11-08 (it tied in R2 while KL was co-bound on the FP64-free pipes; after klf64 and the emit-loop cut it gains 3-8%), opt-in elsewhere; F1 and the
 // limb CRT are on for sm_90 only, since the Hopper measurements (R2, 2026-10-25, H100 and H200): the pre-registered combination rule gave E1 + F1 + the limb CRT
 // for sm_90 and Q1 off (docs/NOTES-21.md "R2 outcome and the sm_90 default"); R4 (2026-10-26) added klload and k5fin (docs/NOTES-24.md). Walking sm_90 back is this one table row. The limb CRT must stay off
 // on cards with a 1/64-rate FP64 pipe (RTX 4090 sm_89, Blackwell sm_120: measured 0.44-0.84x): their rows do not carry kSeqLimbCrt.
@@ -63,7 +63,7 @@ struct SeqClass {
 };
 constexpr SeqClass kSeqClasses[] = {
     {8, 9, kSeqEmit},  // RTX 4090: E1 (integer only; fewer instructions in every pack kernel counted). Q1 / F1 / the limb CRT would sit on a 1/64-rate FP64 pipe
-    {9, 0, kSeqEmit | kSeqFinish | kSeqLimbCrt | kSeqKlWarp | kSeqKlLoad | kSeqK5Fin},  // H100, H200: E1 + F1 + limb CRT + klwarp + klload + k5fin = 189 (R2 chose 13; R4 added klload + k5fin = 173, bit-identical; R5 added klwarp, docs/NOTES-26.md; set 165 + crt f64 against 13 on both cards: 4096^3 N=14 1.07 / 1.05, 8192^3 N=14 1.05, N=8 8192 1.075, r_lowk 1.05, t_df 1.08; klshape is 4-6% slower and stays off; docs/NOTES-24.md)
+    {9, 0, kSeqEmit | kSeqQuant | kSeqFinish | kSeqLimbCrt | kSeqKlWarp | kSeqKlLoad | kSeqK5Fin | kSeqKlF64},  // H100, H200: 447 = 189 + Q1 + klf64 (issue 21, 2026-11-08, H200 duels with crt f64, all bit-identical: klf64 437 vs 181 1.04-1.09; Q1 439 vs 437 sq4096 1.035, r_skinny 1.081, r_bigk 1.041, r_mm 1.055, N=8 1.03-1.05; H100: findings/hopper-tuning-20261108.md). Before: E1 + F1 + limb CRT + klwarp + klload + k5fin = 189 (R2 chose 13; R4 added klload + k5fin = 173, bit-identical; R5 added klwarp, docs/NOTES-26.md; set 165 + crt f64 against 13 on both cards: 4096^3 N=14 1.07 / 1.05, 8192^3 N=14 1.05, N=8 8192 1.075, r_lowk 1.05, t_df 1.08; klshape is 4-6% slower and stays off; docs/NOTES-24.md)
 };
 
 constexpr int seq_default_for(int32_t cc_major, int32_t cc_minor) {
