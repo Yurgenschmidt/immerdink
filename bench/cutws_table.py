@@ -5,7 +5,9 @@ Per case, preference (ct_ws) and plan limit (ct_ws_mib): native and emulated TFL
 requires (ws_req), whether the INT8 emulation ran (emu_engaged: kernel names of one graph-captured call, bench_schema 2),
 and the native twin planned at the same preference and limit (identical_to_native_same_ws, its TFLOPS-eq): a larger
 workspace can also make cuTENSOR pick another NATIVE algorithm, which is not emulation. Records without bench_schema 2
-(capped at cuTENSOR's 32 MiB estimate) never engaged; for them only the old identical-results column is shown.
+(capped at cuTENSOR's 32 MiB estimate) never engaged. If no record has bench_schema 2 the old (schema-1) table is printed
+unchanged, so the tables written by earlier campaigns regenerate byte for byte (bench/campaign/test_analyze.py Golden); its
+footnote's claim that an RTX 4090 cannot emulate was later shown wrong (the 32 MiB cap, not the GPU, kept it native).
 Python 3.6+, stdlib only."""
 import json, sys
 
@@ -23,6 +25,9 @@ def main():
                 continue
             if r.get("method") in ("cutensor", "cutensor-emu"):
                 recs.append(r)
+    if not any(r.get("bench_schema", 1) >= 2 for r in recs):
+        legacy(recs)
+        return
     native = {}
     emu = []
     for r in recs:
@@ -69,6 +74,39 @@ def main():
     print()
     print("`engaged` decides (graph capture of one call; confirm with the nsys profile of the cutensor-emu runs). The same-ws "
           "native twin separates a workspace effect on native cuTENSOR from emulation.")
+
+
+def legacy(recs):
+    """The schema-1 table, as earlier campaigns wrote it."""
+    by = {}
+    for r in recs:
+        by.setdefault((r["case"], r.get("ct_ws", "?")), {})[r["method"]] = r
+    print("| case | ct_ws | native TFLOPS-eq | emulated TFLOPS-eq | emu / native | native ws MiB | emu ws MiB | differs from native |")
+    print("|---|---|---|---|---|---|---|---|")
+    for (case, ws), m in sorted(by.items()):
+        n, e = m.get("cutensor"), m.get("cutensor-emu")
+        def tf(x):
+            return "-" if not x or x.get("status") != "ok" else "%.2f" % x["tflops_eq"]
+        def mib(x):
+            return "-" if not x else "%.0f" % (x.get("ws_bytes", 0) / 1048576.0)
+        ratio = "-"
+        if n and e and n.get("status") == "ok" and e.get("status") == "ok":
+            ratio = "%.2fx" % (e["tflops_eq"] / n["tflops_eq"])
+        if e and e.get("status") != "ok":
+            diff = "emulated run failed: %s" % str(e.get("status"))[:60]
+        elif e and e.get("identical_to_native") is not None:
+            diff = "no (identical to native)" if e["identical_to_native"] else "YES"
+        elif n and e and n.get("c_hash") and e.get("c_hash"):
+            diff = "no (identical to native)" if n["c_hash"] == e["c_hash"] else "YES"
+        else:
+            diff = "-"
+        print("| %s | %s | %s | %s | %s | %s | %s | %s |" % (case, ws, tf(n), tf(e), ratio, mib(n), mib(e), diff))
+
+
+    print()
+    print("`YES` alone does not prove the emulation ran: cuTENSOR can also pick a different NATIVE plan when emulation is requested "
+          "(an RTX 4090, which cannot emulate, shows `YES` on t_cc with a larger workspace). Confirm with the nsys profile "
+          "(INT8 tensor-core kernels) of the cutensor-emu runs.")
 
 
 if __name__ == "__main__":
