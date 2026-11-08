@@ -652,7 +652,7 @@ struct Options {
   // sustained's measured window and warm-up.
   bool clock_probe = false;
   int k_align_hook = 0;  // v1.13 §4b: --k-align (0 = auto) / IMD_BENCH_K_ALIGN
-  // Issue 21 (method imd): --seq <bits 0..255|default> forces the instruction-sequence set (bits 1 E1, 2 Q1, 4 F1, 128 k5fin (issue 23: K5's instruction-count cuts, limb CRT + F1 only); -1 = the device class's),
+  // Issue 21 (method imd): --seq <bits 0..511|default> forces the instruction-sequence set (bits 1 E1, 2 Q1, 4 F1, 128 k5fin (issue 23: K5's instruction-count cuts, limb CRT + F1 only); -1 = the device class's),
   // --crt <default|int|f64> K5's CRT variant (-1 default: the class's set decides, 0 int, 1 f64). Set for the method's plan and calls only, then reset.
   // Issue 22 (method imd): --k4b <default|mma|wgmma> the K4 backend of the plan (-1 the device class's rule; wgmma forces every legal launch onto the
   // Hopper kernel, lifting its profitability floor; unavailable on a device without it: the plan then runs mma.sync and the record says so).
@@ -836,7 +836,7 @@ DuelSide parse_duel_side(const std::string& spec, int N) {
     else if (k == "ka" && (v == "auto" || v == "16" || v == "64")) d.ka = v == "auto" ? 0 : std::stoi(v);
     else if (k == "fused" && (v == "default" || v == "off" || v == "a" || v == "b")) d.fused = v == "off" ? 0 : v == "a" ? 4 : v == "b" ? 5 : -1;
     else throw Failure("bad duel side entry '" + kv + "' (N=, vec=generate|resident, g=, "
-                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..255, e.g. 5 or 133>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off|a|b)");
+                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..511, e.g. 5, 133 or 439>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off|a|b)");
   }
   return d;
 }
@@ -2885,7 +2885,7 @@ void usage() {
           "  [--mode emulate|direct] (method imd) [--data normal|dominant|decay_opp]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
-          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..255, e.g. 5 or 133>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off|a|b)\n"
+          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..511, e.g. 5, 133 or 439>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off|a|b)\n"
           "  [--clock-probe 0|1] [--l2 repeat|flush] (v1.10: per-call SM clock; L2 evicted\n"
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
           "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"

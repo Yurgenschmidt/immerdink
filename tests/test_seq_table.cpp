@@ -57,6 +57,9 @@ int main() {
   CHECK((kSeqKl & 15) == 0 && (kSeqKl & 128) == 0);
   CHECK(seq_kl_kb(0) == 0 && seq_kl_kb(kSeqKlWarp) == 1 && seq_kl_kb(kSeqKlLoad) == 2 && seq_kl_kb(kSeqKlWarp | kSeqKlLoad) == 3);
   CHECK(seq_kl_kb(kSeqKlShape) == 0 && seq_kl_kb(7) == 0 && seq_kl_kb(13) == 0);
+  // klf64 (review 2026-11-08): valid only with klwarp; Kb bit 2 (instances 5 and 7)
+  CHECK(seq_valid(kSeqKlF64 | kSeqKlWarp) && !seq_valid(kSeqKlF64 | 1) && seq_kl_kb(kSeqKlF64) == 0);
+  CHECK(seq_kl_kb(kSeqKlF64 | kSeqKlWarp) == 5 && seq_kl_kb(kSeqKlF64 | kSeqKlWarp | kSeqKlLoad) == 7);
   CHECK(seq_kl_shape(kSeqKlShape) && !seq_kl_shape(kSeqKlWarp | kSeqKlLoad | 7) && !seq_kl_shape(13));
   CHECK(seq_pack_s(kSeqKlWarp | kSeqKlLoad | kSeqKlShape, 2) == 0 && seq_pack_s(kSeqEmit | kSeqKl, 2) == 1 && seq_pack_s(kSeqEmit | kSeqQuant | kSeqKl, 2) == 3);
 #ifndef IMD_NO_SEQ_TWINS   // (seq_effective masks a forced set to the supported bits: with the twins off only E1 is left)

@@ -1250,7 +1250,11 @@ def suite_klf64(lib, cuda, verbose):
             (9, 7, 8192, 14, 0, "RN", True, False),       # two chunks per row; B read side by side
             (8, 6, 1500, 8, 0, "TRUNC", True, True),
             (6, 5, 9000, 20, 4, "RN", False, True),       # more than two chunks (4 values per thread)
-            (7, 9, 2100, 12, 3, "TRUNC", False, False)):
+            (7, 9, 2100, 12, 3, "TRUNC", False, False),
+            # review 2026-11-08: tiles of G <= 32 threads per row (the leader-lane filter branch); run_case forces KL
+            # (fused modes 2 / 3), k_hat <= 256 along k-bar and k_hat in (256, 2048] with the 64-row tiles of mode 3
+            (14, 11, 200, 14, 0, "RN", True, True),
+            (10, 12, 700, 12, 0, "TRUNC", True, False)):
         plan = o.Plan(N, k, rnd)
         A, B, C = matrix(rng, m, n, k, a_kfast=a_kf, b_kfast=b_kf)
         TA = klf64_operand(rng, plan, m, k, 0)
