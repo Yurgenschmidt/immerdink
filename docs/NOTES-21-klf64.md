@@ -75,3 +75,26 @@ the threshold suite below forces it on purpose.
   subnormal-only, Inf / NaN rows; one, two and more than two chunks per row; RN and TRUNC; bit-exact against the oracle.
 * The oracle suites and committed hashes under 273 (E1 + klwarp + klf64), 305 (+ klload), 272 (baseline emitter), bigk under 273, and the
   R4 forced set 437 (the sm_90 default 181 + klf64).
+
+## Follow-up: the emit loop's per-modulus overhead (klwarp + E1)
+
+**Evidence.** After klf64, the 4090 ncu counts of `kl_scale_pack<8,2,1,7>` (sq4096, N = 14) are 219 issued instructions per element, 108 of them
+on the fmaheavy pipe (IMAD, IMAD.WIDE, IDP, IMAD.MOV). IMAD and IDP issue at half rate, so the per-pipe bound is t ~ max(issue, 2 x fmaheavy)
+= max(219, 216): both bind on Hopper. The hottest loop (one iteration per modulus, ~1.75 iterations per element) is 63 instructions. 9 of them are
+bookkeeping on the fmaheavy pipe: `IMAD.MOV 0x20` and `IMAD l, 32, table` re-derive the constant-table address of modulus l, and two IMAD,
+an IMAD.WIDE, an IMAD.IADD and three IMAD.MOV redo the 64-bit `plane = (b rows_pad) k_hat` multiply on every iteration (the compiler
+rematerializes it instead of holding it in registers).
+
+**Change.** With klwarp the host now passes `plane` in LargeArgs, and the loop (`store_slots_stepped`, pack_emitter.cuh) walks the
+modulus' `PackEmit` entry by pointer. Both advance by additions on the ALU pipe. The bytes and addresses are the same; only kernels with klwarp
+change (they are off by default on every row except sm_90).
+
+**Prediction (before measuring).** Per iteration -9 fmaheavy, +~3 ALU (IADD3 for the pointer, IADD3 / IADD3.X for dst). Per element:
+fmaheavy 108 -> ~92, issued 219 -> ~208, so the bound becomes max(208, 184): issue alone, about -5 % of KL time on H100 / H200 at
+unchanged issue efficiency (~-1 % of an sq4096 call). On the 4090, KL is memory-bound: no change.
+
+**SASS check (sm_90a, still before measuring).** The loop of `kl_scale_pack<8,2,1,7>` is 60 instructions (the same loop without klwarp,
+`<8,2,1,0>`, is 63). Its bookkeeping is now VIADD x2, ULDC.64, IADD3 / IADD3.X and two IMAD.MOV (copies of dst kept for the store, which the
+scheduler issues after the next address is formed), against nine IMAD-family instructions before. The refined prediction is therefore
+-7 fmaheavy and -3 issued per iteration: per element fmaheavy 108 -> ~96 and issued 219 -> ~213. That is about -3 % of KL time on Hopper,
+smaller than the first estimate because the replacement additions still issue.

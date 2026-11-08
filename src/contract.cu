@@ -1398,6 +1398,7 @@ struct LargeArgs {
   // Issue 23 (kSeqKlWarp): the launch-invariant 64-bit scalars the kernel derives from the arguments (host: kl_launch), appended so that no
   // earlier field moves (the kernels without the bit ignore them). D = b rows / radix, n_d = ceil(D / th), tiles = radix n_d, nc = ceil(k_hat / tk).
   int64_t D, n_d, tiles, nc;
+  int64_t plane;  // issue 21 (klwarp + E1): b rows_pad k_hat, the distance between two moduli's planes of R
 };
 
 __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl) {
@@ -1835,7 +1836,8 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
           }
         }
 #else
-        store_slots(em, 0, 0, a.gsize, dst, plane);
+        if constexpr (kWarp && PackEmitterT<E, W, Seq>::kE1) store_slots_stepped(em, a.gsize, dst, a.plane);  // issue 21: plane from the host
+        else store_slots(em, 0, 0, a.gsize, dst, plane);
         KLT(kKltEmit);
 #endif
       }
@@ -1950,6 +1952,7 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
     shape16 = seq_kl_shape(sb) && L.values == 8;
   }
   a.D = p.b * op.rows / a.radix, a.nc = L.nc, a.tiles = L.tiles, a.n_d = L.tiles / a.radix;
+  a.plane = a.b * a.rows_pad * a.k_hat;
   const auto run = [&](auto E, auto W) {
     with_pack_seq<decltype(W)::value>(p, [&](auto S) {
       launch_kl_kb<decltype(E)::value, decltype(W)::value, decltype(S)::value>(kb, grid, stream, a);
