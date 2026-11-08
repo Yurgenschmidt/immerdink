@@ -68,6 +68,7 @@
 #include <sys/resource.h>
 #include <immerdink/immerdink.h>
 #ifdef IMD_BENCH_CUTENSOR
+#include <cuda.h>      // driver types for the kernel-name check (entry points fetched at run time, no libcuda link)
 #include <cutensor.h>  // optional baseline: native and emulated FP64 contractions (bench/CMakeLists.txt)
 #endif
 
@@ -95,6 +96,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cmath>
+#include <cxxabi.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -105,6 +107,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <sstream>
 #include <atomic>
 #include <stdexcept>
@@ -679,6 +682,9 @@ struct Options {
   std::vector<std::string> emu_variants = {"dyn"};  // --emu dyn,fix39,fix55 (cuBLAS fixed-point emulation)
   std::string ct_ws;                                // --ct-ws min|default|max: cuTENSOR workspace preference (empty: native default, emulation max)
   size_t emu_ws_mib = 2048;                         // --emu-ws-mib: the emulation workspace given to cuBLAS
+  long long ct_ws_mib = -2;                         // --ct-ws-mib <MiB|est>: cutensor-emu plan limit (-2: --emu-ws-mib, -1: estimate)
+  std::string ct_emu_tag;                           // --ct-emu strategy=eager[,bits=N] (the cuBLAS env vars main() set)
+  int ct_emu_bits = 0;                              // its bits (0: dynamic)
   std::vector<std::string> g8modes = {"fast"};      // --g8mode fast,accu (GEMMul8)
   std::vector<int> g8fast_N, g8accu_N;              // --g8fast-N / --g8accu-N: moduli per GEMMul8 mode (empty: --N)
   int accuracy = -1;  // --accuracy 0|1: the full-matrix DGEMM comparison of method imd (-1 auto: on if its extra buffers fit modestly)
@@ -1556,16 +1562,41 @@ struct Bench {
   // ------------------------------------------------------- cuTENSOR baselines (optional) ---
   // `cutensor`: the contraction on the original layouts with CUTENSOR_COMPUTE_DESC_64F (native
   // FP64). `cutensor-emu`: the same with CUTENSOR_COMPUTE_DESC_8XINT8, cuTENSOR's INT8-based FP64
-  // emulation (cuTENSOR >= 2.4; the header lists it as Hopper+; since 2.6 it falls back to native
-  // FP64 where it does not apply, silently: the record cannot tell, so compare its time and error
-  // with the native record of the same case: bench/summarize.py flags "not engaged"). A plan that
-  // cuTENSOR refuses is recorded as an error, never fatal. Same inputs, same reference, same timing
-  // code as method imd; `energy-cutensor[-emu]` use the energy protocol of method energy.
+  // emulation. cuTENSOR hands the GEMM to cublasLtMatmul with COMPUTE_64F_EMULATED_FIXEDPOINT, and
+  // cuBLASLt runs its Ozaki II INT8 kernels only if the plan's workspace limit covers their scratch
+  // (about 95 MB at 1024^3, 1.3 GB at 4096^3); otherwise it runs a native DMMA kernel, silently.
+  // cuTENSOR's own estimate (even at WORKSPACE_MAX) is 32 MiB, far too small, so the emulated plan
+  // gets limit = max(estimate, --ct-ws-mib MiB) (default --emu-ws-mib, 2048, as cuBLAS emulation) and
+  // allocates what the plan then requires (CUTENSOR_PLAN_REQUIRED_WORKSPACE). Native `cutensor` keeps
+  // the estimate as its limit, as users call it. Per record (bench_schema 2):
+  //   ws_est_bytes / ws_limit_bytes / ws_req_bytes (ws_bytes = required);
+  //   emu_engaged: graph capture of one untimed call, kernel names matched against the INT8
+  //     emulation kernels (engaged_src "graph_capture"; null + capture_error if capture fails).
+  //     Caveat: the dynamic mantissa control decides on the device, so a captured emulation path
+  //     with a device-side fall back to native would still read "engaged"; the error tells.
+  //   identical_to_native (native twin at its own default limit, as before) and
+  //   identical_to_native_same_ws + native_same_ws_median_s (native twin planned with the emulated
+  //   plan's preference and limit, timed): separates "more workspace picked another native
+  //   algorithm" from emulation.
+  // --ct-emu strategy=eager[,bits=N]: CUBLAS_EMULATION_STRATEGY / CUBLAS_FIXEDPOINT_EMULATION_
+  // MANTISSA_BIT_COUNT, set in main() before any CUDA call (cuBLASLt reads them; cuTENSOR has no knob),
+  // named in the variant ("CUTENSOR_COMPUTE_DESC_8XINT8 eager,bits=55") and N = bits.
+  // A plan that cuTENSOR refuses is recorded as an error, never fatal. Same inputs, same reference,
+  // same timing code as method imd; `energy-cutensor[-emu]` use the energy protocol of method energy.
+  std::string ct_variant(bool emu) const {
+    if (!emu) return "CUTENSOR_COMPUTE_DESC_64F";
+    return o.ct_emu_tag.empty() ? "CUTENSOR_COMPUTE_DESC_8XINT8" : "CUTENSOR_COMPUTE_DESC_8XINT8 " + o.ct_emu_tag;
+  }
 #ifdef IMD_BENCH_CUTENSOR
   cutensorHandle_t tens = nullptr;
   struct CtPlan {
     cutensorPlan_t plan = nullptr;
-    uint64_t wsb = 0;
+    uint64_t wsb = 0;    // the workspace passed to cutensorContract (= req)
+    uint64_t est = 0;    // cutensorEstimateWorkspaceSize at the preference
+    uint64_t limit = 0;  // the limit given to cutensorCreatePlan
+    uint64_t req = 0;    // CUTENSOR_PLAN_REQUIRED_WORKSPACE
+    bool capped = false; // limit lowered to fit the free device memory
+    cutensorWorksizePreference_t pref = CUTENSOR_WORKSPACE_DEFAULT;
     CtPlan() = default;
     CtPlan(const CtPlan&) = delete;
     CtPlan& operator=(const CtPlan&) = delete;
@@ -1583,7 +1614,13 @@ struct Bench {
     if (o.ct_ws == "max") return CUTENSOR_WORKSPACE_MAX;
     return emu ? CUTENSOR_WORKSPACE_MAX : CUTENSOR_WORKSPACE_DEFAULT;
   }
-  void make_ct(CtPlan& P, bool emu) {
+  // The workspace limit in MiB for a plan: -1 = the estimate. Emulated: --ct-ws-mib, else --emu-ws-mib.
+  long long ct_ws_mib(bool emu) const {
+    if (!emu) return -1;
+    return o.ct_ws_mib == -2 ? (long long)o.emu_ws_mib : o.ct_ws_mib;
+  }
+  // limit_bytes: -1 = the estimate; else max(estimate, limit_bytes), capped at 3/4 of the free device memory.
+  void make_ct(CtPlan& P, bool emu, cutensorWorksizePreference_t wpref, long long limit_bytes) {
     if (!tens) CT(cutensorCreate(&tens));
     cutensorTensorDescriptor_t d[3] = {nullptr, nullptr, nullptr};
     cutensorOperationDescriptor_t op = nullptr;
@@ -1606,60 +1643,218 @@ struct Bench {
                                    m[2].data(), emu ? CUTENSOR_COMPUTE_DESC_8XINT8 : CUTENSOR_COMPUTE_DESC_64F));
       CT(cutensorCreatePlanPreference(tens, &pref, CUTENSOR_ALGO_DEFAULT, CUTENSOR_JIT_MODE_NONE));
       // The preference decides which algorithms are candidates: DEFAULT "aims to attain high performance while also
-      // reducing the workspace requirement", only MAX makes "all algorithms available" (cutensor/types.h). The INT8
-      // emulation needs scratch for its slices, so it is planned at MAX unless --ct-ws says otherwise (a plan that
-      // excludes the emulation falls back to native FP64 silently); native stays at DEFAULT, as users call it.
-      CT(cutensorEstimateWorkspaceSize(tens, op, pref, ct_ws_pref(emu), &P.wsb));
-      CT(cutensorCreatePlan(tens, &P.plan, op, pref, P.wsb));
+      // reducing the workspace requirement", only MAX makes "all algorithms available" (cutensor/types.h). The
+      // emulated plan is estimated at MAX unless --ct-ws says otherwise; native stays at DEFAULT, as users call it.
+      // The estimate does not cover cuBLASLt's emulation scratch: the limit does (see above).
+      P.pref = wpref;
+      CT(cutensorEstimateWorkspaceSize(tens, op, pref, wpref, &P.est));
+      P.limit = P.est;
+      if (limit_bytes >= 0) {
+        P.limit = std::max<uint64_t>(P.est, uint64_t(limit_bytes));
+        size_t fr = 0, tot = 0;
+        if (cudaMemGetInfo(&fr, &tot) == cudaSuccess && P.limit > fr / 4 * 3) {  // memcap: never ask for more than fits
+          P.limit = std::max<uint64_t>(P.est, fr / 4 * 3);
+          P.capped = true;
+        }
+      }
+      CT(cutensorCreatePlan(tens, &P.plan, op, pref, P.limit));
+      CT(cutensorPlanGetAttribute(tens, P.plan, CUTENSOR_PLAN_REQUIRED_WORKSPACE, &P.req, sizeof(P.req)));
+      if (P.req > P.limit)
+        throw Failure("cuTENSOR plan requires " + std::to_string(P.req) + " B > limit " + std::to_string(P.limit) + " B");
+      P.wsb = P.req;
     } catch (...) {
       cleanup();
       throw;
     }
     cleanup();
   }
-  Json ct_extra(bool emu) {
+  void make_ct(CtPlan& P, bool emu) {
+    const long long mib = ct_ws_mib(emu);
+    make_ct(P, emu, ct_ws_pref(emu), mib < 0 ? -1 : (long long)(uint64_t(mib) << 20));
+  }
+
+  // Engagement: capture one call into a graph (not launched) and read its kernel names through the
+  // driver API (entry points fetched at run time: no libcuda link). Returns false with `err` set if
+  // the capture or the inspection fails.
+  struct DrvFns {
+    CUresult (*node_params)(CUgraphNode, CUDA_KERNEL_NODE_PARAMS*) = nullptr;
+    CUresult (*func_name)(const char**, CUfunction) = nullptr;
+    CUresult (*kern_name)(const char**, CUkernel) = nullptr;
+    bool ok = false;
+  };
+  static const DrvFns& drv() {
+    static DrvFns f = [] {
+      DrvFns d;
+      cudaDriverEntryPointQueryResult q;
+      d.ok = cudaGetDriverEntryPointByVersion("cuGraphKernelNodeGetParams", (void**)&d.node_params, 12000,
+                                              cudaEnableDefault, &q) == cudaSuccess && q == cudaDriverEntryPointSuccess &&
+             cudaGetDriverEntryPointByVersion("cuFuncGetName", (void**)&d.func_name, 12030, cudaEnableDefault, &q) ==
+                 cudaSuccess && q == cudaDriverEntryPointSuccess;
+      if (cudaGetDriverEntryPointByVersion("cuKernelGetName", (void**)&d.kern_name, 12030, cudaEnableDefault, &q) !=
+              cudaSuccess || q != cudaDriverEntryPointSuccess)
+        d.kern_name = nullptr;
+      cudaGetLastError();
+      return d;
+    }();
+    return f;
+  }
+  static std::string short_kernel_name(const char* mangled) {
+    int st = 0;
+    char* dm = abi::__cxa_demangle(mangled, nullptr, nullptr, &st);
+    std::string s = (st == 0 && dm) ? dm : mangled;
+    free(dm);
+    if (s.rfind("void ", 0) == 0) s = s.substr(5);
+    // cutlass::Kernel<X<...>> / Kernel2<X>: the real kernel is the first template argument
+    if (s.rfind("cutlass::Kernel", 0) == 0) {
+      size_t a = s.find('<');
+      if (a != std::string::npos) s = s.substr(a + 1);
+    }
+    size_t e = s.find_first_of("<(>,");
+    if (e != std::string::npos) s = s.substr(0, e);
+    return s.size() > 96 ? s.substr(0, 96) : s;
+  }
+  static void graph_kernels(cudaGraph_t g, std::vector<std::string>& out, std::string& err) {
+    size_t n = 0;
+    if (cudaGraphGetNodes(g, nullptr, &n) != cudaSuccess) { err = "cudaGraphGetNodes"; return; }
+    std::vector<cudaGraphNode_t> nodes(n);
+    if (n && cudaGraphGetNodes(g, nodes.data(), &n) != cudaSuccess) { err = "cudaGraphGetNodes"; return; }
+    for (auto nd : nodes) {
+      cudaGraphNodeType t;
+      if (cudaGraphNodeGetType(nd, &t) != cudaSuccess) continue;
+      if (t == cudaGraphNodeTypeGraph) {
+        cudaGraph_t child = nullptr;
+        if (cudaGraphChildGraphNodeGetGraph(nd, &child) == cudaSuccess) graph_kernels(child, out, err);
+        continue;
+      }
+      if (t != cudaGraphNodeTypeKernel) continue;
+      CUDA_KERNEL_NODE_PARAMS p{};
+      const char* nm = nullptr;
+      if (drv().node_params((CUgraphNode)nd, &p) == CUDA_SUCCESS) {
+        if (p.func) drv().func_name(&nm, p.func);
+        if (!nm && p.kern && drv().kern_name) drv().kern_name(&nm, p.kern);
+      }
+      out.push_back(nm ? short_kernel_name(nm) : std::string("?"));
+    }
+  }
+  // The INT8 emulation kernels of cuBLASLt (bench/nsys_summarize.py's INT8 GEMM and emulation-helper rules,
+  // narrowed to names that only the emulated path launches; native FP64 runs d884 / dmma kernels only).
+  static bool is_emu_kernel(const std::string& k) {
+    static const std::regex re(
+        "oz2_|prolog_mod|prolog_quantize|reduce_nmoduli|sft_fast|get_minmax|imma_emu|inverse_scaling|"
+        "^nvjet_sm[0-9]+[a-z]?_[a-z]*i[a-z]*_|imma|igemm|i8816|i8832|i16832|i16864|int8",
+        std::regex::icase);
+    return std::regex_search(k, re);
+  }
+  // Fills e with emu_engaged / emu_kernels / engaged_src (or capture_error), prefix for the twin.
+  void ct_engagement(const std::function<void()>& call, Json& e, const std::string& prefix) {
+    std::string err;
+    std::vector<std::string> ks;
+    if (!drv().ok) err = "driver entry points cuGraphKernelNodeGetParams / cuFuncGetName unavailable";
+    if (err.empty()) {
+      cudaGraph_t g = nullptr;
+      CU(cudaStreamSynchronize(s));
+      cudaError_t b = cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed);
+      if (b != cudaSuccess) err = std::string("cudaStreamBeginCapture: ") + cudaGetErrorString(b);
+      else {
+        std::string cerr;
+        try { call(); } catch (const std::exception& x) { cerr = x.what(); }
+        cudaError_t en = cudaStreamEndCapture(s, &g);
+        if (!cerr.empty()) err = "call under capture: " + cerr;
+        else if (en != cudaSuccess) err = std::string("cudaStreamEndCapture: ") + cudaGetErrorString(en);
+        else graph_kernels(g, ks, err);
+        if (g) cudaGraphDestroy(g);
+      }
+      cudaGetLastError();
+    }
+    if (!err.empty()) {
+      e.raw(prefix + "emu_engaged", "null").str(prefix + "capture_error", err).str(prefix + "engaged_src", "none (nsys decides)");
+      return;
+    }
+    bool eng = false;
+    std::vector<std::string> uniq;
+    for (auto& k : ks) {
+      eng = eng || is_emu_kernel(k);
+      if (std::find(uniq.begin(), uniq.end(), k) == uniq.end()) uniq.push_back(k);
+    }
+    std::string arr = "[";
+    for (size_t i = 0; i < uniq.size(); ++i) arr += (i ? ", " : "") + jstr(uniq[i]);
+    arr += "]";
+    e.raw(prefix + "emu_engaged", eng ? "true" : "false").raw(prefix + "emu_kernels", arr)
+        .integer(prefix + "graph_kernel_nodes", (long long)ks.size()).str(prefix + "engaged_src", "graph_capture");
+  }
+  Json ct_extra(bool emu, const CtPlan& P) {
     Json e;
+    e.integer("bench_schema", 2);
     e.str("compute_desc", emu ? "CUTENSOR_COMPUTE_DESC_8XINT8" : "CUTENSOR_COMPUTE_DESC_64F");
     e.integer("cutensor_version", (long long)cutensorGetVersion());
     e.raw("emulated_requested", emu ? "true" : "false");
-    e.str("ct_ws", ct_ws_name(ct_ws_pref(emu)));
-    if (emu) e.str("note", "emulation may fall back to native FP64 silently (cuTENSOR >= 2.6): compare with the cutensor record");
+    e.str("ct_ws", ct_ws_name(P.pref));
+    const long long mib = ct_ws_mib(emu);
+    e.str("ct_ws_mib", mib < 0 ? "est" : std::to_string(mib));
+    e.integer("ws_est_bytes", (long long)P.est).integer("ws_limit_bytes", (long long)P.limit)
+        .integer("ws_req_bytes", (long long)P.req);
+    if (P.capped) e.raw("ws_limit_capped", "true");
+    // the cuBLAS emulation environment this process runs with (--ct-emu sets it; an inherited value shows too)
+    const char* st = getenv("CUBLAS_EMULATION_STRATEGY");
+    const char* bt = getenv("CUBLAS_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT");
+    e.str("emu_strategy", st ? st : "default").str("emu_bits", bt ? bt : "dynamic");
+    if (!o.ct_emu_tag.empty()) e.str("ct_emu", o.ct_emu_tag);
     return e;
   }
   void method_cutensor(bool emu, bool energy) {
     if (energy && (!nvml_e().ok || !nvml_e().energy)) throw Failure("NVML energy counter unavailable");
-    CtPlan P;
-    make_ct(P, emu);
-    DevBuf ws(P.wsb);
     const double one = 1.0, zero = 0.0;
-    auto run = [&] {
-      CT(cutensorContract(tens, P.plan, &one, dA.p, dB.p, &zero, dC.p, dC.p, ws.p, P.wsb, s));
-    };
     const std::string name = emu ? "cutensor-emu" : "cutensor";
-    const std::string variant = emu ? "CUTENSOR_COMPUTE_DESC_8XINT8" : "CUTENSOR_COMPUTE_DESC_64F";
-    if (energy) {
-      energy_measure(run, name, variant, 0, P.wsb, ct_extra(emu));
-      return;
-    }
-    poison_C();
-    Timing T = time_it(run, s, o);
-    Accuracy acc = result_accuracy();
-    Json ex = ct_extra(emu);
-    // Identical-results test (outside the timed window). repeat_identical: a second call gives the
-    // same bits (a native kernel that is not run-to-run reproducible cannot be compared bit for bit).
-    // For cutensor-emu: identical_to_native: the emulated C equals the native C (same inputs) bit for
-    // bit, which is what cuTENSOR's silent fall back to native FP64 gives; the sampled error and the
-    // time cannot tell the two apart reliably (bench/summarize.py).
-    try {
-      CU(cudaStreamSynchronize(s));
+    const std::string variant = ct_variant(emu);
+    const int N = emu ? o.ct_emu_bits : 0;
+    Json ex;
+    Timing T;
+    Accuracy acc{};
+    uint64_t wsb = 0;
+    cutensorWorksizePreference_t epref = CUTENSOR_WORKSPACE_DEFAULT;
+    uint64_t elimit = 0;
+    {
+      CtPlan P;
+      make_ct(P, emu);
+      DevBuf ws(P.wsb);
+      auto run = [&] {
+        CT(cutensorContract(tens, P.plan, &one, dA.p, dB.p, &zero, dC.p, dC.p, ws.p, P.wsb, s));
+      };
+      ex = ct_extra(emu, P);
+      if (energy) {
+        energy_measure(run, name, variant, N, P.wsb, ex);
+        return;
+      }
       poison_C();
-      run();
-      CU(cudaStreamSynchronize(s));
-      const Accuracy a2 = result_accuracy();
-      char rb[24];
-      snprintf(rb, sizeof rb, "%016llx", a2.chash);
-      ex.raw("repeat_identical", a2.chash == acc.chash ? "true" : "false").str("repeat_c_hash", rb);
-      if (emu) {
+      T = time_it(run, s, o);
+      acc = result_accuracy();
+      wsb = P.wsb;
+      epref = P.pref;
+      elimit = P.limit;
+      // Identical-results test (outside the timed window). repeat_identical: a second call gives the
+      // same bits (a native kernel that is not run-to-run reproducible cannot be compared bit for bit).
+      try {
+        CU(cudaStreamSynchronize(s));
+        poison_C();
+        run();
+        CU(cudaStreamSynchronize(s));
+        const Accuracy a2 = result_accuracy();
+        char rb[24];
+        snprintf(rb, sizeof rb, "%016llx", a2.chash);
+        ex.raw("repeat_identical", a2.chash == acc.chash ? "true" : "false").str("repeat_c_hash", rb);
+      } catch (const std::exception& e) {
+        ex.str("identical_test_error", e.what());
+        cudaGetLastError();
+      }
+      ct_engagement(run, ex, "");
+    }  // the plan's workspace is freed before the twins allocate theirs
+    // For cutensor-emu, two native twins on the same inputs (outside the timed window):
+    //   identical_to_native: native planned as `cutensor` is (its own estimate as the limit);
+    //   identical_to_native_same_ws: native planned with this record's preference and limit, and timed
+    //   (native_same_ws_median_s): more workspace may let cuTENSOR pick another native algorithm, which is
+    //   not emulation. Equal bits mean the emulated plan ran the native path.
+    if (emu) {
+      try {
         CtPlan PN;
         make_ct(PN, false);
         DevBuf wsn(PN.wsb);
@@ -1670,12 +1865,32 @@ struct Bench {
         char hb[24];
         snprintf(hb, sizeof hb, "%016llx", an.chash);
         ex.raw("identical_to_native", an.chash == acc.chash ? "true" : "false").str("native_c_hash", hb);
+      } catch (const std::exception& e) {
+        ex.str("identical_test_error", e.what());
+        cudaGetLastError();
       }
-    } catch (const std::exception& e) {
-      ex.str("identical_test_error", e.what());
-      cudaGetLastError();
+      try {
+        CtPlan PS;
+        make_ct(PS, false, epref, (long long)elimit);
+        DevBuf wss(PS.wsb);
+        auto runn = [&] {
+          CT(cutensorContract(tens, PS.plan, &one, dA.p, dB.p, &zero, dC.p, dC.p, wss.p, PS.wsb, s));
+        };
+        poison_C();
+        Timing TN = time_it(runn, s, o);
+        const Accuracy an = result_accuracy();
+        char hb[24];
+        snprintf(hb, sizeof hb, "%016llx", an.chash);
+        ex.raw("identical_to_native_same_ws", an.chash == acc.chash ? "true" : "false")
+            .str("native_same_ws_c_hash", hb).num("native_same_ws_median_s", TN.median())
+            .integer("native_same_ws_req_bytes", (long long)PS.req).num("native_same_ws_max_normerr", an.max_norm);
+        ct_engagement(runn, ex, "native_same_ws_");
+      } catch (const std::exception& e) {
+        ex.str("same_ws_test_error", e.what());
+        cudaGetLastError();
+      }
     }
-    record(name, variant, 0, T, &acc, flops(), P.wsb, ex);
+    record(name, variant, N, T, &acc, flops(), wsb, ex);
   }
 #else
   void method_cutensor(bool, bool) {
@@ -1935,6 +2150,30 @@ struct Bench {
     e.integer("mantissa_max_bits", maxbits).integer("mantissa_offset", offset)
         .str("mantissa_control", mc == CUDA_EMULATION_MANTISSA_CONTROL_FIXED ? "FIXED" : "DYNAMIC")
         .str("emu_strategy", "EAGER").integer("emu_ws_mib", (long long)(ws.bytes >> 20));
+    // Engagement: one untimed call with the mantissa-bit-count pointer set (a device int): the bits cuBLAS
+    // retained, -1 = it ran native FP64 (dynamic control may decide so per call and per input). The pointer is
+    // cleared before timing; mb outlives the handle's use of it either way.
+    DevBuf mb(sizeof(int));
+    if (!energy) {
+      try {
+        ensure_perm();
+        const double* pa = needA ? pA.as<double>() : dA.as<double>();
+        const double* pb = needB ? pB.as<double>() : dB.as<double>();
+        double* pc = needC ? pC.as<double>() : dC.as<double>();
+        int got = -2;
+        CU(cudaMemcpyAsync(mb.p, &got, sizeof got, cudaMemcpyHostToDevice, s));
+        CB(cublasSetFixedPointEmulationMantissaBitCountPointer(H.h, mb.as<int>()));
+        permute_in();
+        cublas_gemm(H.h, CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT)(pa, pb, pc);
+        CU(cudaMemcpyAsync(&got, mb.p, sizeof got, cudaMemcpyDeviceToHost, s));
+        CU(cudaStreamSynchronize(s));
+        e.integer("mantissa_bits_used", got).str("mantissa_bits_src", "bit_count_pointer (one untimed call)");
+      } catch (const std::exception& x) {
+        e.str("mantissa_bits_error", x.what());
+        cudaGetLastError();
+      }
+      cublasSetFixedPointEmulationMantissaBitCountPointer(H.h, nullptr);
+    }
     run_matrix_family("emu", variant, bits, cublas_gemm(H.h, CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT),
                       ws.bytes, e, energy);
     CU(cudaStreamSynchronize(s));
@@ -2900,6 +3139,10 @@ void usage() {
           "      energy-cutensor, energy-cutensor-emu; cuBLAS: dgemm, emu (FP64 fixed-point emulation, CUDA 13\n"
           "      cuBLAS), energy-dgemm, energy-emu; GEMMul8 (built with GEMMUL8_DIR): gemmul8, energy-gemmul8\n"
           "  [--ct-ws min|default|max] (cuTENSOR workspace preference; default: native default, emulation max)\n"
+          "  [--ct-ws-mib <MiB>|est] (cutensor-emu plan workspace limit, max(estimate, MiB); default --emu-ws-mib;\n"
+          "      native cutensor always plans at its estimate) [--ct-emu strategy=eager|performant[,bits=N]] (sets\n"
+          "      CUBLAS_EMULATION_STRATEGY / CUBLAS_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT for cuTENSOR's cuBLASLt calls;\n"
+          "      cuTENSOR methods only)\n"
           "  [--emu dyn,fix39,fix55] [--emu-ws-mib 2048] (method emu) [--g8mode fast,accu] (gemmul8; --N = moduli,\n"
           "      or --g8fast-N / --g8accu-N for one mode)\n"
           "  [--gemm-view 0|1] (dgemm, emu, gemmul8 on a case not in the GEMM view: 1 also records the bare GEMM;\n"
@@ -2935,6 +3178,7 @@ int main(int argc, char** argv) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
     k = k.substr(2);
+    if (k == "ct-ws-mib" || k == "ct-emu") { a[k] = argv[++i]; continue; }  // cuTENSOR emulation options (below)
     if (std::find(std::begin(kKeys), std::end(kKeys), k) == std::end(kKeys)) {
       fprintf(stderr, "unknown option --%s\n", k.c_str());
       usage();
@@ -2953,7 +3197,43 @@ int main(int argc, char** argv) {
       return 2;
     }
   if (!a.count("name") || !a.count("spec") || !a.count("ext")) { usage(); return 2; }
+  // --ct-emu strategy=eager|performant[,bits=N]: cuTENSOR's 8XINT8 path has no emulation knobs of its own; cuBLASLt
+  // reads CUBLAS_EMULATION_STRATEGY and CUBLAS_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT, so they are set here, before
+  // any CUDA call (an sbatch env filter drops them at submit time). They would change every cuBLAS method in the
+  // process, so only the cuTENSOR methods may share it. CUBLAS_EMULATE_DOUBLE_PRECISION is never set.
+  std::string ct_emu_tag;
+  int ct_emu_bits = 0;
+  if (a.count("ct-emu")) {
+    std::string strategy;
+    for (auto& kv : split(a["ct-emu"], ',')) {
+      const size_t eq = kv.find('=');
+      const std::string k = kv.substr(0, eq), v = eq == std::string::npos ? "" : kv.substr(eq + 1);
+      if (k == "strategy" && (v == "eager" || v == "performant")) strategy = v;
+      else if (k == "bits" && !v.empty() && v.find_first_not_of("0123456789") == std::string::npos &&
+               std::stoi(v) > 0 && std::stoi(v) <= 127) ct_emu_bits = std::stoi(v);
+      else {
+        fprintf(stderr, "--ct-emu strategy=eager|performant[,bits=N] (got %s)\n", a["ct-emu"].c_str());
+        return 2;
+      }
+    }
+    for (auto& m : split(a["methods"], ','))
+      if (m != "cutensor" && m != "cutensor-emu" && m != "energy-cutensor" && m != "energy-cutensor-emu") {
+        fprintf(stderr, "--ct-emu sets process-wide cuBLAS emulation variables: it cannot share a process with method %s\n",
+                m.c_str());
+        return 2;
+      }
+    if (!strategy.empty()) {
+      setenv("CUBLAS_EMULATION_STRATEGY", strategy.c_str(), 1);
+      ct_emu_tag = strategy;
+    }
+    if (ct_emu_bits) {
+      setenv("CUBLAS_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT", std::to_string(ct_emu_bits).c_str(), 1);
+      ct_emu_tag += (ct_emu_tag.empty() ? "" : ",") + std::string("bits=") + std::to_string(ct_emu_bits);
+    }
+  }
   Bench B;
+  B.o.ct_emu_tag = ct_emu_tag;
+  B.o.ct_emu_bits = ct_emu_bits;
   try {
     B.c = parse_case(a["name"], a["spec"], a["ext"]);
     if (a.count("reps")) B.o.reps = std::stoi(a["reps"]);
@@ -3004,6 +3284,12 @@ int main(int argc, char** argv) {
         fprintf(stderr, "--ct-ws must be min, default or max\n");
         return 2;
       }
+    }
+    if (a.count("ct-ws-mib")) {  // the cutensor-emu plan's workspace limit: <MiB> or est (cuTENSOR's estimate)
+      const std::string& v = a["ct-ws-mib"];
+      if (v == "est") B.o.ct_ws_mib = -1;
+      else if (!v.empty() && v.find_first_not_of("0123456789") == std::string::npos) B.o.ct_ws_mib = std::stoll(v);
+      else throw Failure("--ct-ws-mib <MiB>|est");
     }
     if (a.count("g8mode")) {
       B.o.g8modes = split(a["g8mode"], ',');
@@ -3082,7 +3368,8 @@ int main(int argc, char** argv) {
     // per call, an error in one never stops the next
     auto baselines = [&](const std::string& base, bool en) {
       if (base == "cutensor" || base == "cutensor-emu")
-        guarded(base, "", 0, [&] { B.method_cutensor(base == "cutensor-emu", en); }, en);
+        guarded(base, B.ct_variant(base == "cutensor-emu"), base == "cutensor-emu" ? B.o.ct_emu_bits : 0,
+                [&] { B.method_cutensor(base == "cutensor-emu", en); }, en);
       else if (base == "dgemm")
         guarded(base, "CUBLAS_COMPUTE_64F_PEDANTIC", 0, [&] { B.method_dgemm(en); }, en);
       else if (base == "emu")
