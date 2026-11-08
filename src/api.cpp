@@ -486,6 +486,13 @@ IMD_API int imd_prof_set_k5_elems(int32_t elems) {
   imd::detail::k5_elems_override() = elems;
   return 0;
 }
+// Benchmark-only (issue 21, the long-row KL study): plans created afterwards use no fused launch (0: K1 + the group-1 pack instead of
+// KL / KF, as imd_test_set_fused(0)) or the plan-time rules (-1). Read at plan creation; the plan keeps its choice.
+IMD_API int imd_prof_set_fused(int32_t mode) {
+  if (mode != -1 && mode != 0) return 1;
+  imd::detail::fused_override() = mode;
+  return 0;
+}
 // Benchmark-only (issue 21): the instruction-sequence set of every later call (kSeq* bits of host/seq_config.hpp: 1 E1, 2 Q1, 4 F1); -1 the device class's set.
 IMD_API int imd_prof_set_seq(int32_t bits) {
   if (!imd::detail::seq_valid(bits)) return 1;

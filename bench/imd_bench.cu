@@ -658,6 +658,7 @@ struct Options {
   // Hopper kernel, lifting its profitability floor; unavailable on a device without it: the plan then runs mma.sync and the record says so).
   int k4b = -1;
   int seq = -1, crt = -1;
+  int fused = -1;  // issue 21 (method imd): --fused default|off: -1 the plan-time rules, 0 no fused launch (K1 + the group-1 pack instead of KL / KF)
   bool l2_flush = false;
   // Campaign kit: --keep-samples 1 adds the raw per-repetition times to the timed records ("samples_s", seconds), and to
   // method duel's duel-b record both sides' times of every interleaved pair ("pair_t_a", "pair_t_b"), so the analyzer can
@@ -797,6 +798,7 @@ struct DuelSide {
   int seq = -1;  // issue 21: -1 the device class's instruction-sequence set, else forced bits (benchmark hook)
   int k4b = -1;  // issue 22: the K4 backend of the plan: -1 the device class's rule, 0 mma.sync, 1 wgmma (plan-time benchmark hook)
   int ka = -1;  // v1.13 §4b: -1 = the run's --k-align, 0 = AUTO, 16 / 64 = forced (plan-time hook)
+  int fused = -1;  // issue 21: -1 the plan-time rules, 0 no fused launch (K1 + the group-1 pack instead of KL / KF; plan-time benchmark hook)
   std::string describe() const {
     std::string d = "N=" + std::to_string(N) + " g=" + ((g == 0 || g >= N) ? "N" : std::to_string(g));
     d += vec == IMD_VEC_RESIDENT ? " vec=resident" : " vec=generate";
@@ -806,6 +808,7 @@ struct DuelSide {
     if (seq >= 0) d += " seq=" + std::to_string(seq);
     if (k4b >= 0) d += k4b == 0 ? " k4b=mma" : " k4b=wgmma";
     if (ka >= 0) d += ka == 0 ? " ka=auto" : " ka=" + std::to_string(ka);
+    if (fused == 0) d += " fused=off";
     return d;
   }
 };
@@ -829,8 +832,9 @@ DuelSide parse_duel_side(const std::string& spec, int N) {
     else if (k == "seq" && (v == "default" || seq_bits_ok(v))) d.seq = v == "default" ? -1 : std::stoi(v);
     else if (k == "k4b" && (v == "default" || v == "mma" || v == "wgmma")) d.k4b = v == "default" ? -1 : v == "mma" ? 0 : 1;
     else if (k == "ka" && (v == "auto" || v == "16" || v == "64")) d.ka = v == "auto" ? 0 : std::stoi(v);
+    else if (k == "fused" && (v == "default" || v == "off")) d.fused = v == "off" ? 0 : -1;
     else throw Failure("bad duel side entry '" + kv + "' (N=, vec=generate|resident, g=, "
-                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..255, e.g. 5 or 133>, k4b=default|mma|wgmma, ka=auto|16|64)");
+                       "k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..255, e.g. 5 or 133>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off)");
   }
   return d;
 }
@@ -2041,10 +2045,12 @@ struct Bench {
     if (imd_prof_set_k5_crt(o.crt) != 0) throw Failure("imd_prof_set_k5_crt");
     // Issue 22: the K4 backend of this method's plan (a plan-time choice), reset when the plan exists.
     if (imd_prof_set_k4_backend(o.k4b) != 0) throw Failure("imd_prof_set_k4_backend");
+    if (imd_prof_set_fused(o.fused) != 0) throw Failure("imd_prof_set_fused");  // issue 21: plan-time, reset when the plan exists
 #else
     if (k4 >= 0) throw Failure("--k4 <config> needs the profiling build");
     if (o.seq >= 0 || o.crt >= 0) throw Failure("--seq / --crt need the profiling build");
     if (o.k4b >= 0) throw Failure("--k4b needs the profiling build");
+    if (o.fused >= 0) throw Failure("--fused needs the profiling build");
 #endif
     const auto c0 = std::chrono::steady_clock::now();
     const imd_status_t pst = imd_plan_create(imd, &A, &B, &C, &opt, &plan);
@@ -2052,6 +2058,7 @@ struct Bench {
 #ifdef IMD_BENCH_PROFILE
     imd_prof_set_k4_config(-1);
     imd_prof_set_k4_backend(-1);
+    imd_prof_set_fused(-1);
     int64_t wg_counts[2] = {0, 0};
     imd_prof_k4_wgmma_counts(1, wg_counts);  // the launches the Hopper backend serves from here on: warm-up, timed calls and profile
 #endif
@@ -2106,7 +2113,7 @@ struct Bench {
       int32_t k4b_run = -1;
       imd_prof_plan_k4_backend(plan, &k4b_run);
       imd_prof_k4_wgmma_counts(0, wg_counts);
-      extra.integer("k4b_req", o.k4b).integer("k4b_run", k4b_run).integer("k4_wgmma_served", wg_counts[0]).integer("k4_wgmma_declined", wg_counts[1]);
+      extra.integer("fused_req", o.fused).integer("k4b_req", o.k4b).integer("k4b_run", k4b_run).integer("k4_wgmma_served", wg_counts[0]).integer("k4_wgmma_declined", wg_counts[1]);
     }
 #endif
     {  // Issue 21: what was asked for and what the library ran ("seq_req": -1 = the device class's set), in the record (the phases belong to it)
@@ -2210,7 +2217,7 @@ struct Bench {
     auto P = std::make_unique<DuelPlan>();
     P->cfg = d;
 #ifndef IMD_BENCH_PROFILE
-    if (d.k4 >= 0 || d.k5 != 0 || d.crt >= 0 || d.seq >= 0 || d.k4b >= 0) throw Failure("duel k4=<config> / k5=<elems> / crt=f64 / seq=<bits> / k4b=<backend> need the profiling build");
+    if (d.k4 >= 0 || d.k5 != 0 || d.crt >= 0 || d.seq >= 0 || d.k4b >= 0 || d.fused >= 0) throw Failure("duel k4=<config> / k5=<elems> / crt=f64 / seq=<bits> / k4b=<backend> / fused=off need the profiling build");
 #endif
     auto t = [&](const Operand& x, std::vector<int32_t>& lab) {
       lab.assign(x.labels.begin(), x.labels.end());
@@ -2232,6 +2239,7 @@ struct Bench {
 #ifdef IMD_BENCH_PROFILE
     if (imd_prof_set_k4_config(d.k4 >= 0 ? d.k4 : -1) != 0) throw Failure("imd_prof_set_k4_config");
     if (imd_prof_set_k4_backend(d.k4b) != 0) throw Failure("imd_prof_set_k4_backend");  // issue 22: a plan-time choice, kept by the plan
+    if (imd_prof_set_fused(d.fused) != 0) throw Failure("imd_prof_set_fused");  // issue 21: a plan-time choice, kept by the plan
 #endif
     const auto c0 = std::chrono::steady_clock::now();
     const imd_status_t pst = imd_plan_create(imd, &A, &B, &C, &opt, &P->plan);
@@ -2239,6 +2247,7 @@ struct Bench {
 #ifdef IMD_BENCH_PROFILE
     imd_prof_set_k4_config(-1);
     imd_prof_set_k4_backend(-1);
+    imd_prof_set_fused(-1);
 #endif
     CI(pst);
     CI(imd_plan_device_bytes(P->plan, &P->plan_dev));
@@ -2356,7 +2365,7 @@ struct Bench {
       e.str("duel_side", which).str("duel_config", p.cfg.describe());
       e.integer("plan_device_bytes", (long long)p.plan_dev).num("plan_create_ms", p.create_ms);
       e.integer("g", (long long)((p.cfg.g == 0 || p.cfg.g >= p.cfg.N) ? p.cfg.N : p.cfg.g));
-      e.integer("k4_rule", p.low.k4_config).integer("k4_config", p.k4_run).integer("k4b_req", p.cfg.k4b).integer("k4b_run", p.k4b_run)
+      e.integer("k4_rule", p.low.k4_config).integer("k4_config", p.k4_run).integer("k4b_req", p.cfg.k4b).integer("fused_req", p.cfg.fused).integer("k4b_run", p.k4b_run)
           .integer("k4_wgmma_served", p.wg_served).integer("k4_wgmma_declined", p.wg_declined);  // over the timed calls of this side
       e.integer("kernel_launches", p.low.kernel_launches);
       if (p.seq_eff >= 0) e.integer("seq_eff", p.seq_eff).str("crt_eff", p.crt_eff ? "f64" : "int");
@@ -2874,7 +2883,7 @@ void usage() {
           "  [--mode emulate|direct] (method imd) [--data normal|dominant|decay_opp]\n"
           "  [--pack A,B] [--reuse 1,4,16] (method packed)\n"
           "  [--duel-a default] [--duel-b k4=tune] (method duel; a side: default or a comma\n"
-          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..255, e.g. 5 or 133>, k4b=default|mma|wgmma, ka=auto|16|64)\n"
+          "      list of N=, vec=generate|resident, g=, k4=rule|tune|0..3, k5=0|1|2|4, crt=default|int|f64, seq=default|<bits 0..255, e.g. 5 or 133>, k4b=default|mma|wgmma, ka=auto|16|64, fused=default|off)\n"
           "  [--clock-probe 0|1] [--l2 repeat|flush] (v1.10: per-call SM clock; L2 evicted\n"
           "      before each timed imd call) [--sustain-s 8] [--sustain-warm-s 3] (sustained)\n"
           "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"
@@ -2919,7 +2928,7 @@ int main(int argc, char** argv) {
                                       "sustain-warm-s", "sustain-trace-s", "k-align",
                                       "energy-warmup", "energy-seconds", "energy-max-seconds",
                                       "energy-idle", "energy-min-calls", "energy-step-ms",
-                                      "keep-samples", "accuracy", "seq", "crt", "k4b", "xduel-b", "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
+                                      "keep-samples", "accuracy", "seq", "crt", "k4b", "fused", "xduel-b", "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -3027,6 +3036,10 @@ int main(int argc, char** argv) {
     if (a.count("k4b")) {
       if (a["k4b"] != "default" && a["k4b"] != "mma" && a["k4b"] != "wgmma") throw Failure("--k4b default|mma|wgmma");
       B.o.k4b = a["k4b"] == "default" ? -1 : a["k4b"] == "mma" ? 0 : 1;
+    }
+    if (a.count("fused")) {
+      if (a["fused"] != "default" && a["fused"] != "off") throw Failure("--fused default|off");
+      B.o.fused = a["fused"] == "off" ? 0 : -1;
     }
     // v1.13 §4b: --k-align, else IMD_BENCH_K_ALIGN (tools/calibrate.sh --k-align), set
     // before any plan or pack is created.

@@ -33,6 +33,9 @@
  *                         issue 21: later calls run K5's CRT with the sums in binary64 limbs (1) or
  *                         the integer running CRT (0); -1 (default): the plan's set decides (the device class's
  *                         kSeqLimbCrt bit; a forced set 0..7 has none = integer). Returns 0, 1 if invalid.
+ *   imd_prof_set_fused(mode)
+ *                         issue 21: plans created afterwards use no fused launch (0: K1 + the group-1 pack instead of KL / KF)
+ *                         or the plan-time rules (-1). Read at plan creation. Returns 0, 1 if invalid.
  *   imd_prof_set_seq(bits)
  *                         issue 21: later calls run the instruction-sequence set `bits` (1 E1 emitter, 2 Q1 quantize,
  *                         4 F1 finish, 128 k5fin (issue 23; needs F1, acts only with the limb CRT); host/seq_config.hpp)
@@ -76,6 +79,7 @@ IMD_API int imd_prof_k4_wgmma_counts(int32_t reset, int64_t* out);
 IMD_API int imd_prof_set_k5_elems(int32_t elems);
 IMD_API int imd_prof_set_k5_crt(int32_t variant);
 IMD_API int imd_prof_set_seq(int32_t bits);
+IMD_API int imd_prof_set_fused(int32_t mode);
 IMD_API int imd_prof_plan_seq(imd_plan_t plan, int32_t* bits);
 IMD_API int imd_prof_get_k5_crt(void);
 IMD_API int imd_prof_plan_crt(imd_plan_t plan, int32_t* limb);
