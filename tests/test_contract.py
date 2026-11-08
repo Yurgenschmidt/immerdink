@@ -1170,9 +1170,98 @@ def suite_eps(lib, cuda, verbose):
             raise Fail(f"suite eps: N={N} did not reach the intended eps ({r})")
 
 
+def adversarial_vec(rng, plan, k, scale_exp=0):
+    """Issue 21 (klf64, docs/NOTES-21-klf64.md): a length-k vector whose exact square sum S (§3.2 step 4) is a threshold
+    of largest_u or within a few units of one, so that a binary64 estimate of S cannot decide u and the exact passes must
+    run. Entries are y 2^(scale_exp - 30) with integers y < 2^31 (the largest, y0 >= 2^30, sets gamma = scale_exp), so S
+    = sum y^2 exactly. Many equal small entries make the binary64 sum round many times. Returns None when no threshold
+    is reachable."""
+    c, R = plan.shift_lhs_mul, plan.shift_rhs
+    y0 = rng.randrange(2 ** 30, 2 ** 31)
+    S0 = y0 * y0
+    cands = []
+    for u in range(-80, 80):
+        t = R // (c * 4 ** u) if u >= 0 else (R * 4 ** (-u)) // c   # the largest S with c S 4^u <= R
+        if S0 < t < S0 + (k - 1) * (y0 * y0 - 1):
+            cands.append(t)
+    if not cands:
+        return None
+    r = rng.random()
+    off = 0 if r < 0.3 else rng.choice((-1, 1)) if r < 0.7 else rng.choice((-1, 1)) * rng.randint(2, 2 ** rng.randint(2, 30))
+    target = rng.choice(cands) + off
+    ys = [y0]
+    if rng.random() < 0.5:        # a bulk of equal entries (many roundings), the rest greedy
+        cnt = rng.randint(k // 4, k - 8)
+        v = math.isqrt((target - S0) // (cnt + 1))
+        if 0 < v < y0:
+            ys += [v] * cnt
+    rest = target - sum(y * y for y in ys)
+    while rest > 0 and len(ys) < k:
+        y = min(math.isqrt(rest), y0)
+        ys.append(y)
+        rest -= y * y
+    if rest != 0:
+        return None
+    vec = [math.ldexp(float(y), scale_exp - 30) * rng.choice((1, -1)) for y in ys]
+    vec += [0.0] * (k - len(vec))
+    rng.shuffle(vec)
+    return vec
+
+
+def klf64_operand(rng, plan, rows, k, kind_seed):
+    """rows x k, each row one of: adversarial (most), random phi, zero, a lone 5e-324, subnormal-only, normal with
+    subnormals, adversarial with an Inf / NaN, all non-finite."""
+    X = np.zeros((rows, k))
+    for r in range(rows):
+        kind = rng.choice(("adv",) * 6 + ("phi", "zero", "min_sub", "sub_only", "mixed_sub", "adv_nonfinite", "nonfinite"))
+        if kind in ("adv", "adv_nonfinite"):
+            v = None
+            for _ in range(50):
+                v = adversarial_vec(rng, plan, k, rng.choice((0, 0, rng.randint(-1000, 990))))
+                if v is not None:
+                    break
+            if v is None:
+                raise Fail(f"suite klf64: no reachable threshold (N={plan.N}, k={k})")
+            X[r] = v
+            if kind == "adv_nonfinite":
+                X[r, rng.randrange(k)] = rng.choice((math.inf, -math.inf, math.nan))
+        elif kind == "phi":
+            X[r] = gen(rng, (k,), "phi")
+        elif kind == "min_sub":
+            X[r, rng.randrange(k)] = rng.choice((5e-324, -5e-324))
+        elif kind == "sub_only":
+            for h in rng.sample(range(k), rng.randint(1, 40)):
+                X[r, h] = math.ldexp(rng.getrandbits(rng.randint(1, 52)) | 1, -1074)
+        elif kind == "mixed_sub":
+            X[r] = gen(rng, (k,), "tiny")
+            X[r, rng.randrange(k)] = math.ldexp(1.0, -1022) * rng.uniform(1, 2)
+        elif kind == "nonfinite":
+            X[r] = [rng.choice((math.inf, -math.inf, math.nan)) for _ in range(k)]
+    return X
+
+
+def suite_klf64(lib, cuda, verbose):
+    """Issue 21 (klf64): operands whose rows' square sums sit on or next to the sigma thresholds (the filter must fall
+    back to the exact passes there), mixed in tiles with ordinary, zero, subnormal and non-finite rows (the fallback is
+    tile-wide). Bit-exact vs the oracle under any instruction-sequence set; meaningful with IMD_TEST_SEQ = a klf64 set."""
+    rng = random.Random(2111)
+    for (m, n, k, N, g, rnd, a_kf, b_kf) in (
+            (12, 10, 4096, 14, 0, "RN", True, True),      # one chunk per row (the sm_90 sq4096 shape)
+            (9, 7, 8192, 14, 0, "RN", True, False),       # two chunks per row; B read side by side
+            (8, 6, 1500, 8, 0, "TRUNC", True, True),
+            (6, 5, 9000, 20, 4, "RN", False, True),       # more than two chunks (4 values per thread)
+            (7, 9, 2100, 12, 3, "TRUNC", False, False)):
+        plan = o.Plan(N, k, rnd)
+        A, B, C = matrix(rng, m, n, k, a_kfast=a_kf, b_kfast=b_kf)
+        TA = klf64_operand(rng, plan, m, k, 0)
+        TB = klf64_operand(rng, plan, n, k, 1).T.copy()
+        run_case(lib, cuda, f"klf64 thresholds {m}x{n} k={k} N={N} g={g} {rnd}", A, B, C, TA, TB,
+                 gen(rng, (m, n), "uniform"), 1.0, 0.5, N, g, rnd, rng=rng, expect_kind="GEMM", verbose=verbose)
+
+
 SUITES = {"api": suite_api, "replay": suite_replay, "stages": suite_stages, "e2e": suite_e2e, "tensor": suite_tensor,
           "bigk": suite_bigk, "every_n": suite_every_n, "k_align": suite_k_align,
-          "pad_mutation": suite_pad_mutation, "eps": suite_eps}
+          "pad_mutation": suite_pad_mutation, "eps": suite_eps, "klf64": suite_klf64}
 
 
 def main():

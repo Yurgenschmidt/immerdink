@@ -27,7 +27,7 @@
 //             call, in one process (docs/BENCHMARKING.md "Tiny shapes", NOTES-A5 §1.2): both
 //             sides see the same GPU clock / DVFS / host-core state. A side is "default" or
 //             a comma list of N=<n>, vec=generate|resident, g=<g> (0 = N),
-//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule), crt=default|int|f64 (issue 21: K5's CRT; default = the device class's set decides, sm_90: limbs), seq=default|<bits> (issue 21 / 23: the instruction-sequence set, bits 1 E1 emitter / 2 Q1 quantize / 4 F1 finish / 16 klwarp / 32 klload / 64 klshape (the KL fixed-part cuts, e.g. seq=17) / 128 k5fin (issue 23: K5 instruction-count cuts, needs F1 and the limb CRT to engage, e.g. seq=133 with crt=f64); default = the device class's, sm_90: 189 = E1 + F1 + the limb CRT + klwarp + klload + k5fin (bit 8 is a class default, so `--seq 189` itself is not accepted; 181 with crt=f64 is the same computation); a forced 0..7 runs the integer CRT unless crt=f64), k4b=default|mma|wgmma (issue 22: the K4 backend of the side's plan; wgmma = every legal launch on a Hopper, the profitability floor lifted; a device without the backend runs mma.sync, see k4b_run in the record), ka=auto|16|64 (v1.13 §4b:
+//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule), crt=default|int|f64 (issue 21: K5's CRT; default = the device class's set decides, sm_90: limbs), seq=default|<bits> (issue 21 / 23: the instruction-sequence set, bits 1 E1 emitter / 2 Q1 quantize / 4 F1 finish / 16 klwarp / 32 klload / 64 klshape (the KL fixed-part cuts, e.g. seq=17) / 128 k5fin (issue 23: K5 instruction-count cuts, needs F1 and the limb CRT to engage, e.g. seq=133 with crt=f64) / 256 klf64 (issue 21: KL's gamma and S filtered in binary64, needs 16; sm_90 set + klf64 = seq=437 with crt=f64); default = the device class's, sm_90: 189 = E1 + F1 + the limb CRT + klwarp + klload + k5fin (bit 8 is a class default, so `--seq 189` itself is not accepted; 181 with crt=f64 is the same computation); a forced 0..7 runs the integer CRT unless crt=f64), k4b=default|mma|wgmma (issue 22: the K4 backend of the side's plan; wgmma = every legal launch on a Hopper, the profitability floor lifted; a device without the backend runs mma.sync, see k4b_run in the record), ka=auto|16|64 (v1.13 §4b:
 //             the side's K alignment, via the test hook at plan creation); unset keys keep the plan
 //             defaults, N defaults to the --N value. Defaults: A = default (the K4 rule),
 //             B = k4=tune (the plan-time K4 autotune); when both pick the same K4
@@ -117,7 +117,8 @@
 static bool seq_bits_ok(const std::string& v) {
   if (v.empty() || v.size() > 3 || v.find_first_not_of("0123456789") != std::string::npos) return false;
   const int b = std::stoi(v);
-  return (b & ~(1 | 2 | 4 | 16 | 32 | 64 | 128)) == 0 && ((b & 2) == 0 || (b & 1) != 0) && ((b & 128) == 0 || (b & 4) != 0);
+  return (b & ~(1 | 2 | 4 | 16 | 32 | 64 | 128 | 256)) == 0 && ((b & 2) == 0 || (b & 1) != 0) && ((b & 128) == 0 || (b & 4) != 0) &&
+         ((b & 256) == 0 || (b & 16) != 0);  // 256 klf64 (issue 21) needs 16 klwarp
 }
 
 // libimmerdink_host's test-only K-alignment hook (src/host/k_hat.cpp; not in a public header).
@@ -3017,7 +3018,7 @@ int main(int argc, char** argv) {
       const std::string& v = a["seq"];
       if (v == "default") B.o.seq = -1;
       else if (seq_bits_ok(v)) B.o.seq = std::stoi(v);
-      else throw Failure("--seq default|<bits> (bits: 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin; Q1 needs E1, 128 needs F1; e.g. 0 1 3 5 7 17 33 65 113 133 245)");
+      else throw Failure("--seq default|<bits> (bits: 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64; Q1 needs E1, 128 needs F1, 256 needs 16; e.g. 0 1 3 5 7 17 33 65 113 133 245 437)");
     }
     if (a.count("crt")) {
       if (a["crt"] != "default" && a["crt"] != "int" && a["crt"] != "f64") throw Failure("--crt default|int|f64");

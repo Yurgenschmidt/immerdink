@@ -1408,7 +1408,7 @@ __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl
 // ---- Issue 23: KL fixed-part variants (host/seq_config.hpp kSeqKlWarp / kSeqKlLoad / kSeqKlShape, docs/NOTES-23.md) ----
 // Kb (template value of kl_scale_pack): bit 0 klwarp, bit 1 klload; Kb = 0 is the original kernel (its SASS is unchanged:
 // tools/sass_ident.sh). klshape is the launch's E (16 values per thread).
-constexpr int kKlWarp = 1, kKlLoad = 2;
+constexpr int kKlWarp = 1, kKlLoad = 2, kKlF64 = 4;  // kKlF64 (issue 21 'klf64', sm_90): gamma from the high words, S filtered in binary64
 
 // Section timers (compile-time knob IMD_KL_TIMERS = 1 / 2, CMake IMMERDINK_KL_TIMERS; OFF by default and then nothing below exists in any kernel).
 // Lane 0 of every warp stamps clock64() at the section boundaries and adds the elapsed cycles of the section to a shared counter; thread 0 adds a CTA's
@@ -1445,8 +1445,10 @@ template <int E, int W, int Seq = 0, int Kb = 0>  // values per thread: 8 (512 t
 __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     kl_scale_pack(const __grid_constant__ LargeArgs a) {
   constexpr int T = kTileElems / E, kLgE = E == 16 ? 4 : E == 8 ? 3 : 2;
-  constexpr bool kWarp = (Kb & kKlWarp) != 0, kDirect = (Kb & kKlLoad) != 0;
+  constexpr bool kWarp = (Kb & kKlWarp) != 0, kDirect = (Kb & kKlLoad) != 0, kF64 = (Kb & kKlF64) != 0;
+  static_assert(!kF64 || kWarp, "klf64 takes the per-row sigma of klwarp");
   __shared__ uint64_t tile[kDirect ? 1 : kTileSmem];  // kDirect: no gather tile
+  __shared__ double s_wd[kF64 ? T / 32 : 1];          // klf64: per warp square sums
   __shared__ int64_t s_base[kTileRowsMax];  // v_bat[lambda] + v_row[r]
   __shared__ bool s_valid[kTileRowsMax];
   __shared__ int s_wg[T / 32];
@@ -1547,10 +1549,130 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
         tile[ql * pitch + qh + qh / kVec] = v;
       }
     };
-    // pass 1: flag and gamma; chunk 0 into registers
     uint64_t r0[E];
     int gmax = INT_MIN;
     unsigned fl = 0;
+    int sigma = 0;  // zero row (all entries zero or non-finite): sigma := 0
+    bool exact = true;  // block-uniform: the exact passes below run (always without klf64)
+    if constexpr (kF64) {
+      // klf64 (issue 21, sm_90; numerics.cuh largest_u_filtered): the same loads in the same order as the exact passes (so pass 3 finds r0
+      // and the tile as they leave them), with cheap bodies. Pass 1: the max |high word| and the OR of the low words. A non-finite entry has
+      // |hi| >= 0x7FF00000, a finite one less, so fl is exact; when the max is a normal number's, gamma is its exponent field - 1023.
+      uint32_t ghi = 0, lor = 0;
+      const auto scan_hw = [&](const uint64_t (&bb)[E]) {
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+          ghi = max(ghi, static_cast<uint32_t>(bb[e] >> 32) & 0x7FFFFFFFu);
+          lor |= static_cast<uint32_t>(bb[e]);
+        }
+      };
+      if constexpr (kDirect) {
+        fetch(0, r0);
+      } else {
+        load(0);
+        __syncthreads();
+#pragma unroll
+        for (int e = 0; e < E; ++e) r0[e] = mine[e];
+      }
+      scan_hw(r0);
+      for (int64_t c = 1; c < nc; ++c) {
+        uint64_t bits[E];
+        if constexpr (kDirect) {
+          fetch(c, bits);
+        } else {
+          __syncthreads();  // every thread has taken chunk c - 1
+          load(c);
+          __syncthreads();
+#pragma unroll
+          for (int e = 0; e < E; ++e) bits[e] = mine[e];
+        }
+        scan_hw(bits);
+      }
+      KLT(kKltLoad);
+      for (int o = Gw / 2; o > 0; o /= 2) {
+        ghi = max(ghi, __shfl_xor_sync(0xffffffffu, ghi, o));
+        lor |= __shfl_xor_sync(0xffffffffu, lor, o);
+      }
+      if (G > 32) {  // block-uniform
+        if (lane == 0) s_wg[warp] = static_cast<int>(ghi), s_wf[warp] = lor;
+        __syncthreads();
+        uint32_t g2 = lane < nw ? static_cast<uint32_t>(s_wg[w0 + lane]) : 0u, f2 = lane < nw ? s_wf[w0 + lane] : 0u;
+        for (int o = nw >> 1; o > 0; o >>= 1) {
+          g2 = max(g2, __shfl_xor_sync(0xffffffffu, g2, o));
+          f2 |= __shfl_xor_sync(0xffffffffu, f2, o);
+        }
+        ghi = __shfl_sync(0xffffffffu, g2, 0), lor = __shfl_sync(0xffffffffu, f2, 0);
+      }
+      KLT(kKltRed1);
+      // Row classes (row-uniform values): normal max -> filtered; all entries +-0 -> zero row (sigma 0, as the exact path); otherwise
+      // (a non-finite entry, or the largest finite entry subnormal: then the low words decide, [5e-324] has hi = 0) -> the exact path.
+      fl = ghi >= 0x7FF00000u ? 1u : 0u;
+      const bool normal = fl == 0 && ghi >= 0x00100000u;
+      bool need = !normal && (ghi != 0 || lor != 0);
+      if (normal) gmax = static_cast<int>(ghi >> 20) - 1023;
+      // pass 2: y = x 2^(30 - gamma) by two exact power-of-two multiplies (s1, s2 in [-497, 526]), acc = fma(y, y, acc); every op _rn
+      const int s = normal ? 30 - gmax : 0, s1 = s >> 1;
+      const double f1 = pow2_double(s1), f2 = pow2_double(s - s1);
+      double acc = 0.0;
+      const auto sq_hw = [&](const uint64_t (&bb)[E]) {
+        if (normal) {
+#pragma unroll
+          for (int e = 0; e < E; ++e) {
+            const double y = __dmul_rn(__dmul_rn(__longlong_as_double(static_cast<long long>(bb[e])), f1), f2);
+            acc = __fma_rn(y, y, acc);
+          }
+        }
+      };
+      sq_hw(r0);
+      if (nc > 1) {
+        if constexpr (kDirect) {  // chunks re-read from global memory (L1 / L2), the last one first
+          for (int64_t c = nc - 1; c >= 1; --c) {
+            uint64_t bits[E];
+            fetch(c, bits);
+            sq_hw(bits);
+          }
+        } else {
+          for (int64_t c = nc - 1; c >= 1; --c) {  // chunk nc - 1 is still in shared memory
+            if (c < nc - 1) {
+              __syncthreads();
+              load(c);
+              __syncthreads();
+            }
+            uint64_t bits[E];
+#pragma unroll
+            for (int e = 0; e < E; ++e) bits[e] = mine[e];
+            sq_hw(bits);
+          }
+        }
+      }
+      KLT(kKltSsum);
+      // xor butterflies: both partners add the same two doubles (commutative), so every lane of a row ends with the same bits
+      for (int o = Gw / 2; o > 0; o /= 2) acc = __dadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
+      int u = 0;
+      if (G > 32) {
+        if (lane == 0) s_wd[warp] = acc;
+        __syncthreads();
+        KLT(kKltRed2);
+        if (warp == w0) {  // the row's first warp: one filter per row
+          double v = lane < nw ? s_wd[w0 + lane] : 0.0;
+          for (int o = nw >> 1; o > 0; o >>= 1) v = __dadd_rn(v, __shfl_xor_sync(0xffffffffu, v, o));
+          if (lane == 0) {
+            if (normal && !largest_u_filtered(v, a.k_hat, a.lhs_shift, a.rhs, a.rhs_bits, &u)) need = true;
+            s_sigma[dl] = normal ? u - gmax : 0;
+          }
+        }
+      } else {
+        KLT(kKltRed2);
+        if ((lane & (Gw - 1)) == 0 && normal && !largest_u_filtered(acc, a.k_hat, a.lhs_shift, a.rhs, a.rhs_bits, &u)) need = true;
+        sigma = __shfl_sync(0xffffffffu, normal ? u - gmax : 0, lane & ~(Gw - 1));
+      }
+      exact = __syncthreads_or(need) != 0;  // also the barrier after s_sigma
+      if (G > 32) sigma = s_sigma[dl];
+      KLT(kKltSigma);
+    }
+    if (exact) {  // block-uniform
+    gmax = INT_MIN, fl = 0, sigma = 0;
+    // pass 1: flag and gamma; chunk 0 into registers
     if constexpr (kDirect) {
       fetch(0, r0);
     } else {
@@ -1639,7 +1761,6 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     }
     KLT(kKltSsum);
     for (int o = Gw / 2; o > 0; o /= 2) S += shfl_xor_u128(S, o);
-    int sigma = 0;  // zero row (all entries zero or non-finite): sigma := 0
     if constexpr (kWarp) {
       if (G > 32) {
         if (lane == 0) s_ws[warp] = S;
@@ -1669,6 +1790,7 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
       if ((lane & (Gw - 1)) == 0 && live) sigma = largest_u(S, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
       sigma = __shfl_sync(0xffffffffu, sigma, lane & ~(Gw - 1));
     }
+    }  // exact
     const bool valid = s_valid[dl];
     int64_t dst_off = 0;  // (lambda rows_pad + r) k_hat + hl
     if (valid) {
@@ -1760,6 +1882,7 @@ template <int E, int W, int S>
 void launch_kl_kb(int kb, unsigned grid, cudaStream_t stream, const LargeArgs& a) {
   constexpr unsigned T = kTileElems / E;
   if constexpr (E == 4) kb &= ~kKlLoad;
+  if ((kb & kKlWarp) == 0) kb &= ~kKlF64;  // klf64 takes klwarp's per-row sigma
   if constexpr ((kSeqSupported & kSeqKl) == 0) kb = 0;
 #ifdef IMD_BUILD_TEST_HOOKS
   test_note_kl_launch(E, kb);
@@ -1769,6 +1892,9 @@ void launch_kl_kb(int kb, unsigned grid, cudaStream_t stream, const LargeArgs& a
       case 1: kl_scale_pack<E, W, S, 1><<<grid, T, 0, stream>>>(a); return;
       case 2: if constexpr (E != 4) { kl_scale_pack<E, W, S, 2><<<grid, T, 0, stream>>>(a); return; } break;
       case 3: if constexpr (E != 4) { kl_scale_pack<E, W, S, 3><<<grid, T, 0, stream>>>(a); return; } break;
+      // klf64 (bit 2) only with klwarp (seq_kl_kb never sets it alone)
+      case 5: kl_scale_pack<E, W, S, 5><<<grid, T, 0, stream>>>(a); return;
+      case 7: if constexpr (E != 4) { kl_scale_pack<E, W, S, 7><<<grid, T, 0, stream>>>(a); return; } break;
       default: break;
     }
   }
@@ -1819,6 +1945,8 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
     if ((kb & kKlLoad) != 0 &&
         !(a.along_rows == 0 && a.k_affine == 1 && a.k_stride == 1 && L.nc <= 2 && (reinterpret_cast<uintptr_t>(op.X) & 15) == 0))
       kb &= ~kKlLoad;
+    // klf64: the filter's constants are exact doubles for k_hat < 2^50 (numerics.cuh largest_u_filtered); beyond, the exact passes
+    if ((kb & kKlF64) != 0 && p.k_hat >= (int64_t{1} << 50)) kb &= ~kKlF64;
     shape16 = seq_kl_shape(sb) && L.values == 8;
   }
   a.D = p.b * op.rows / a.radix, a.nc = L.nc, a.tiles = L.tiles, a.n_d = L.tiles / a.radix;
@@ -1962,12 +2090,12 @@ void test_k5_launch_counts(bool reset, int64_t* out) {
     for (int v = 0; v < 4; ++v) out[4 * c + v] = reset ? g_k5_launches[c][v].exchange(0) : g_k5_launches[c][v].load();
 }
 
-// Issue 23: KL launches by [E = 4 / 8 / 16][Kb 0..3], counted in test builds (a forced bit that ran the baseline kernel must be visible).
-static std::atomic<int64_t> g_kl_launches[3][4];
-void test_note_kl_launch(int E, int kb) { g_kl_launches[E == 4 ? 0 : E == 8 ? 1 : 2][kb & 3].fetch_add(1, std::memory_order_relaxed); }
+// Issue 23: KL launches by [E = 4 / 8 / 16][Kb 0..7: bit 0 klwarp, bit 1 klload, bit 2 klf64 (issue 21)], counted in test builds (a forced bit that ran the baseline kernel must be visible).
+static std::atomic<int64_t> g_kl_launches[3][8];
+void test_note_kl_launch(int E, int kb) { g_kl_launches[E == 4 ? 0 : E == 8 ? 1 : 2][kb & 7].fetch_add(1, std::memory_order_relaxed); }
 void test_kl_launch_counts(bool reset, int64_t* out) {
   for (int e = 0; e < 3; ++e)
-    for (int k = 0; k < 4; ++k) out[4 * e + k] = reset ? g_kl_launches[e][k].exchange(0) : g_kl_launches[e][k].load();
+    for (int k = 0; k < 8; ++k) out[8 * e + k] = reset ? g_kl_launches[e][k].exchange(0) : g_kl_launches[e][k].load();
 }
 // The section timers (IMD_KL_TIMERS, see kl_scale_pack): copies the device sums to out[0..n) (n <= kKltSlots) and optionally zeroes them. Returns the slot count,
 // or -1 in a build without the knob.

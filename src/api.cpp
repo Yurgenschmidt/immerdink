@@ -192,7 +192,7 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
       }
       if (p->info.status == IMD_PLAN_UNSUPPORTED) return IMD_STATUS_NOT_SUPPORTED;
       e.sms = p->info.device.sm_count;
-      e.seq = static_cast<uint8_t>(imd::detail::seq_default_for(p->info.device.cc_major, p->info.device.cc_minor));  // issue 21: this device class's instruction sequences
+      e.seq = static_cast<uint16_t>(imd::detail::seq_default_for(p->info.device.cc_major, p->info.device.cc_minor));  // issue 21: this device class's instruction sequences
       e.l2_bytes = static_cast<int64_t>(p->info.device.l2_bytes);
     } else {
       p->info.struct_size = sizeof p->info;

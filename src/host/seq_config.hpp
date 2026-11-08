@@ -9,6 +9,8 @@
 //               any other combination the shipped K5 runs and the bit does nothing); bit-identical; default OFF in every class row until a device class has measured it
 // Bit 8 is a CRT variant, not a pack / finish sequence: it exists only as a class default (the hooks force the sets without it, which
 // run the integer CRT, and the K5 hooks force the CRT separately: 0 integer, 1 limb, -1 follow the class set).
+// Bit 256 'klf64' (issue 21, docs/NOTES-21-klf64.md): KL's gamma scan and exact square sum replaced by a high-word max and a binary64 sum with a
+// rigorous filter (bit-identical; the exact passes run for a tile whose decision is close); FP64 pipe, so sm_90 only; needs klwarp; off by default until measured.
 // Bits 16, 32, 64 (issue 23, docs/NOTES-23.md) are cuts of the FIXED part of the large-row pack KL (everything that does not scale with N), each
 // independent of the emitter set and of the others; all off in every class row until the Hopper duels decide:
 //   kSeqKlWarp  'klwarp'   row-wide scalar work once per row / tile instead of by every thread / warp (largest_u, tile row setup, cross-warp combines)
@@ -32,7 +34,8 @@ constexpr int kSeqLimbCrt = 8;                                            // a c
 constexpr int kSeqKlWarp = 16, kSeqKlLoad = 32, kSeqKlShape = 64;         // issue 23: KL fixed-part cuts
 constexpr int kSeqKl = kSeqKlWarp | kSeqKlLoad | kSeqKlShape;
 constexpr int kSeqK5Fin = 128;                                            // issue 23: K5's instruction-count cuts (limb CRT + F1 only)
-constexpr int kSeqAll = 7 | kSeqKl;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
+constexpr int kSeqKlF64 = 256;  // issue 21 'klf64': KL's gamma from the high words and S filtered in binary64 (FP64 pipe; needs klwarp; docs/NOTES-21-klf64.md)
+constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
 // The sets this build can run: with IMMERDINK_SEQ_TWINS=OFF (IMD_NO_SEQ_TWINS) the Q1 / F1 / KL-bit / k5fin kernel twins are not compiled and the
 // hooks refuse them.
 #ifdef IMD_NO_SEQ_TWINS
@@ -73,7 +76,8 @@ constexpr int seq_default_for(int32_t cc_major, int32_t cc_minor) {
 // silently), so the hooks reject it. The same for k5fin without F1 (its kernels are F1 kernels).
 constexpr bool seq_valid(int bits) {
   return bits >= -1 && (bits < 0 || ((bits & ~kSeqForceMask) == 0 && ((bits & kSeqQuant) == 0 || (bits & kSeqEmit) != 0) &&
-                                      ((bits & kSeqK5Fin) == 0 || (bits & kSeqFinish) != 0)));
+                                      ((bits & kSeqK5Fin) == 0 || (bits & kSeqFinish) != 0) &&
+                                      ((bits & kSeqKlF64) == 0 || (bits & kSeqKlWarp) != 0)));
 }
 
 // A set as a launch sees it: the plan's bits (the class default, which may carry the limb-CRT bit), or the process-wide override (>= 0; any
@@ -91,7 +95,9 @@ constexpr int seq_pack_s(int bits, int W) {
   return (bits & kSeqEmit) ? ((bits & kSeqQuant) && W == 2 ? 3 : 1) : 0;
 }
 // The KL kernel's template value Kb (kernels' bit 0: klwarp, bit 1: klload) and whether the launch takes the 16-values-per-thread shape.
-constexpr int seq_kl_kb(int bits) { return ((bits & kSeqKlWarp) ? 1 : 0) | ((bits & kSeqKlLoad) ? 2 : 0); }
+constexpr int seq_kl_kb(int bits) {
+  return ((bits & kSeqKlWarp) ? 1 : 0) | ((bits & kSeqKlLoad) ? 2 : 0) | ((bits & kSeqKlF64) && (bits & kSeqKlWarp) ? 4 : 0);
+}
 constexpr bool seq_kl_shape(int bits) { return (bits & kSeqKlShape) != 0; }
 
 // The class table, checked at compile time (tests/test_seq_table.cpp checks the shipped rows, which depend on IMD_NO_SEQ_TWINS).
