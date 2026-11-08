@@ -94,7 +94,7 @@ PackSource pack_source_of(imd_pack_t pack) {
   return {static_cast<int32_t>(pack->tensor.label.size()), pack->tensor.label.data(), &pack->pl};
 }
 int& fused_override() {
-  static int v = -1;  // test hooks (-1, 0, 2, 3, 6: test_hooks.cpp); bench hook (-1, 0, 4, 5: imd_prof_set_fused)
+  static int v = -1;  // test hooks (-1, 0, 2, 3, 6: test_hooks.cpp); bench hook (-1, 0, 4, 5, 7: imd_prof_set_fused)
   return v;
 }
 }  // namespace imd::detail
@@ -199,6 +199,8 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
       if (imd::detail::fused_override() == 3) e.kl_lg_rows = 6;
     } else if (imd::detail::fused_override() == 6 && emulated) {
       e.fused_large = imd::detail::fused_large(e, IMD_TABLE_SM90);  // test hook: the sm_90 class's KL rule (klstrided) on any device
+    } else if (imd::detail::fused_override() == 7 && emulated) {
+      e.fused_large = imd::detail::fused_large(e, IMD_TABLE_SM89);  // bench hook: the reference class's KL rule (KL for both in-line operands)
     } else if (imd::detail::fused_override() == 4) {
       e.fused_large &= imd::detail::kFusedLargeA;  // benchmark hook: KL for the GEMM's A only
     } else if (imd::detail::fused_override() == 5) {
@@ -495,10 +497,11 @@ IMD_API int imd_prof_set_k5_elems(int32_t elems) {
   return 0;
 }
 // Benchmark-only (issue 21, the long-row KL study): plans created afterwards use no fused launch (0: K1 + the group-1 pack instead of
-// KL / KF, as imd_test_set_fused(0)) or the plan-time rules (-1); 4 / 5: the plan-time rules, then KL kept for the GEMM's A / B
-// only (the other operand takes K1 + the group-1 pack). Read at plan creation; the plan keeps its choice.
+// KL / KF, as imd_test_set_fused(0)) or the plan-time rules (-1); 4 / 5: the device class's rules, then KL kept for the GEMM's A / B
+// only (the other operand takes K1 + the group-1 pack; on sm_90 the klstrided rule may already have dropped one); 7: the reference
+// class's KL rule (IMD_TABLE_SM89: KL for both in-line operands), so "KL both" stays measurable on sm_90. Read at plan creation.
 IMD_API int imd_prof_set_fused(int32_t mode) {
-  if (mode != -1 && mode != 0 && mode != 4 && mode != 5) return 1;
+  if (mode != -1 && mode != 0 && mode != 4 && mode != 5 && mode != 7) return 1;
   imd::detail::fused_override() = mode;
   return 0;
 }
