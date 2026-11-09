@@ -56,6 +56,74 @@ IMD_HD uint32_t mod_p_barrett_neg(int32_t v, uint32_t neg_p, uint32_t bias, uint
   const uint32_t n = static_cast<uint32_t>(v) + bias;
   return n + neg_p * umulhi64_u32(magic, n);
 }
+// Issue 58: the same residue as mod_p_barrett_neg, for p != 256, by a byte fold and FP32 subnormal arithmetic, with one
+// instruction on sm_90's half-rate fmaheavy pipe instead of four IMADs (the K4 Hopper epilogue is fmaheavy-bound).
+// This is the reduction cuBLAS's nvjet "smod" epilogue uses (read from its SASS on an H200, 2026-11-09).
+//   n = u32(v + bias)            bias a multiple of p as in mod_p_barrett_neg, so n mod p = v mod p
+//   y = sum_i byte_i(n) C_i      C_i = 256^i mod p, one unsigned dp4a; y = n (mod p), y <= 255 sum C_i < 2^18
+//   q = RD(y' * c)               y' = y 2^-149 (y's bits read as an FP32 subnormal), c = RU(1/p): the product is below
+//                                2^-126, so round-down lands on the subnormal grid: q = floor(y c) 2^-149
+//   r = RN(q * (-p) + y')        = (y - p floor(y c)) 2^-149, exact; its bits are the integer y mod p in [0, p)
+// floor(y c) = floor(y / p) needs y < 1 / (p (c - 1/p)), at least 1.2e7 for the table's moduli, against y < 2^18
+// (immerdink-eval analysis/20261109-ozaki-spike/k4_epi_fold_check.py checks every y of every modulus exactly).
+// Subnormals must survive: mul.rm.f32 / fma.rn.f32 WITHOUT .ftz, as inline PTX so an -ftz=true build cannot flush them.
+struct FoldConsts {
+  uint32_t c4;  // C_0..C_3 as bytes (C_0 = 1); the same word as kPackWeights.w[0][l]
+  float rcp;    // RU(1/p) in binary32
+  float neg_p;  // -p
+};
+// RU(1/p) for 128 < p < 256: 1/p lies in [2^-8, 2^-7), where the binary32 spacing is 2^-31, so RU(1/p) = ceil(2^31/p) 2^-31
+// (an integer below 2^24 times a power of two: exact as a float constant).
+constexpr float ru_recip_f32(uint32_t p) {
+  return static_cast<float>(((uint64_t{1} << 31) + p - 1) / p) / 2147483648.0f;
+}
+constexpr FoldConsts make_fold_consts(uint32_t p) {
+  const uint32_t c1 = 256u % p, c2 = (c1 * 256u) % p, c3 = (c2 * 256u) % p;
+  return FoldConsts{1u | (c1 << 8) | (c2 << 16) | (c3 << 24), ru_recip_f32(p), -static_cast<float>(p)};
+}
+struct FoldTable {
+  FoldConsts f[imd::constants::kNMax];  // zeros for p = 256 (the mask path)
+};
+constexpr FoldTable make_fold_table(const imd::constants::Tables& t) {
+  FoldTable r{};
+  for (int l = 0; l < imd::constants::kNMax; ++l)
+    if (t.moduli[l] != 256u) r.f[l] = make_fold_consts(t.moduli[l]);
+  return r;
+}
+inline constexpr FoldTable kFold = make_fold_table(imd::constants::kTables);
+// The bounds the derivation needs, per modulus: 128 < p < 256 (the RU formula), y_max = 255 sum C_i < 2^18 (the fold
+// stays a small subnormal; product y_max c < 2^23), and y_max < 2^31 / (ceil(2^31/p) p - 2^31) (floor(y c) = floor(y/p)).
+constexpr bool fold_table_ok(const imd::constants::Tables& t) {
+  for (int l = 0; l < imd::constants::kNMax; ++l) {
+    const uint64_t p = t.moduli[l];
+    if (p == 256u) continue;
+    if (p <= 128u || p >= 256u) return false;
+    const uint32_t c4 = kFold.f[l].c4;
+    const uint64_t ymax = 255u * ((c4 & 255u) + ((c4 >> 8) & 255u) + ((c4 >> 16) & 255u) + (c4 >> 24));
+    const uint64_t m = ((uint64_t{1} << 31) + p - 1) / p, ex = m * p - (uint64_t{1} << 31);  // c - 1/p = ex / (p 2^31)
+    if (ymax >= (uint64_t{1} << 18)) return false;
+    if (ex != 0 && ymax * ex >= (uint64_t{1} << 31)) return false;
+  }
+  return true;
+}
+static_assert(fold_table_ok(imd::constants::kTables), "mod_p_fold: a modulus is outside the certified range");
+
+IMD_HD uint32_t mod_p_fold(int32_t v, uint32_t bias, FoldConsts f, [[maybe_unused]] uint32_t p) {
+  const uint32_t n = static_cast<uint32_t>(v) + bias;
+#if defined(__CUDA_ARCH__)
+  const uint32_t y = __dp4a(n, f.c4, 0u);
+  const float ys = __uint_as_float(y);
+  float q, r;
+  asm("mul.rm.f32 %0, %1, %2;" : "=f"(q) : "f"(ys), "f"(f.rcp));
+  asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(q), "f"(f.neg_p), "f"(ys));
+  return __float_as_uint(r);
+#else
+  uint32_t y = 0;
+  for (int i = 0; i < 4; ++i) y += ((n >> (8 * i)) & 255u) * ((f.c4 >> (8 * i)) & 255u);
+  return y % p;
+#endif
+}
+
 IMD_HD uint32_t mod_p_barrett(int32_t v, uint32_t p, uint32_t bias, uint64_t magic) {
   return mod_p_barrett_neg(v, 0u - p, bias, magic);
 }
