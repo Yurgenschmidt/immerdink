@@ -368,7 +368,7 @@ IMD_HOST_INTERNAL uint64_t ceil_sqrt_u64(uint64_t k);
 // the §3.2 step 4 constants, the pack and K5 mappings, the K0 fused-mode descriptor and the
 // plan's device bytes. Leaves sms, k4, vec_resident and vec_dev to libimmerdink. Returns
 // SUCCESS, NOT_SUPPORTED, or INVALID_VALUE (more than kMaxVecModes fused modes:
-// unreachable). The GEMM view (m, n, k, b, n_hat, k_hat, N, g, swapped, trunc), the path,
+// unreachable). The GEMM view (m, n, k, b, n_hat, k_hat, N, g, swapped, trunc), the path, the pack pivots,
 // k_align and the layout are set whatever the status. v1.13 §4b: k_align = an.k_align for a
 // plan with residue rows (EMULATE, non-empty output, k >= 2), else 16 (NOOP, SCALE, DIRECT,
 // K-empty, whatever the hook says); k_hat = ceil(k)_k_align.

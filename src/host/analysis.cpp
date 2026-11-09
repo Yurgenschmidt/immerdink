@@ -317,18 +317,23 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
     for (int r = 0; r < 3; ++r) e.pack_off[x][r] = an.packed.layout[x].offset[r];
     e.pack_bytes[x] = an.packed.layout[x].total;
   }
-  // §3.2 RN acceptance (accuracy policy): reject kappa >= T when the emulated GEMM runs.
   const bool emulated = emulates(e);  // non-empty output, EMULATE, k >= 2
-  if (emulated && rn && kappa_at_least_T(ceil_sqrt_u64(static_cast<uint64_t>(lw.k)), N))
-    return IMD_STATUS_NOT_SUPPORTED;
-
+  // The pack pivots are view data: set before the RN check, so that a NOT_SUPPORTED plan's
+  // lowering summary (imd_lowering: fused_large, kernel_launches) follows the issue-21 KL rules
+  // like the spec's (tests/test_host.py spec_expect) instead of the default pivot.
   if (emulated) {
-    set_shift_constants(N, rn, static_cast<uint64_t>(lw.k), &e);
     for (int x = 0; x < 2; ++x) {
       const PackPivot pv = pack_pivot(lw, x);
       e.pack_along_rows[x] = pv.along_rows;
       e.pack_radix[x] = pv.radix;
     }
+  }
+  // §3.2 RN acceptance (accuracy policy): reject kappa >= T when the emulated GEMM runs.
+  if (emulated && rn && kappa_at_least_T(ceil_sqrt_u64(static_cast<uint64_t>(lw.k)), N))
+    return IMD_STATUS_NOT_SUPPORTED;
+
+  if (emulated) {
+    set_shift_constants(N, rn, static_cast<uint64_t>(lw.k), &e);
     e.k5_batch_fast = k5_batch_fastest(lw);
     e.fused = fused_path(e);
     e.fused_large = fused_large(e, IMD_TABLE_SM89, kK4ReferenceSms);  // the reference class and SM count; api.cpp redoes it for the device's
