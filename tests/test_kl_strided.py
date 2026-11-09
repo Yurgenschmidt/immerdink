@@ -21,7 +21,7 @@ tens = KB.tens
 
 def cases():
     # (name, A, B, C, N, g, family, fmode-unused, KL operands expected under mode 6)
-    # The strided (along-rows) operands of the nc cases have 1040 rows: 130 KL tiles > SMs / 2 on any device of <= 260 SMs, so
+    # The strided (along-rows) operands of the nc cases have 1040 rows: 130 KL tiles > SMs / 2 on any device of < 260 SMs, so
     # klstarve keeps their KL and only the nc rule (klstrided) can drop it. The "starved" cases isolate klstarve (nc 8, 20 rows;
     # nc 3 is under its floor).
     k, R = 33000, 1040  # k_hat >= 32768: nc >= 64 for an operand read along rows
