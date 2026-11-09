@@ -19,7 +19,7 @@ nvcc -O3 -std=c++17 -arch="sm_${arch%%-*}" "$root/bench/membw/imd_membw.cu" -o "
 echo "built $out/imd_membw (sm_${arch%%-*})"
 if [ "${1:-}" = run ]; then
   shift
-  gpu_lock="${IMMERDINK_GPU_LOCK:-/home/ef/repos/ehrenfest-ipdps/_wip/gpu.lock}"
+  gpu_lock="${IMMERDINK_GPU_LOCK:-$HOME/.cache/ehrenfest/gpu.lock}"
   if [ "$gpu_lock" != none ] && [ "${IMMERDINK_GPU_LOCK_HELD:-}" != "$gpu_lock" ] && [ -d "$(dirname "$gpu_lock")" ]; then   # tools/run_bench.sh already holds it
     flock "$gpu_lock" "$out/imd_membw" --out "$out/membw.jsonl" "$@"
   else

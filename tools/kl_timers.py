@@ -36,7 +36,7 @@ def main():
     ap.add_argument("--N", type=int, default=14)
     ap.add_argument("--b-kn", action="store_true", help="B as [k, n] (the usual row-major NN layout: B is read along rows, klload does not apply to it)")
     args = ap.parse_args()
-    lock = os.environ.get("IMMERDINK_GPU_LOCK", "/home/ef/repos/ehrenfest-ipdps/_wip/gpu.lock")
+    lock = os.environ.get("IMMERDINK_GPU_LOCK", os.path.expanduser("~/.cache/ehrenfest/gpu.lock"))
     if lock != "none":
         if not os.path.isdir(os.path.dirname(lock)):
             lock = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "gpu.lock")
