@@ -26,7 +26,7 @@ whole suite on the other GPUs, plus a committed list of output hashes.
 2. **The suite runs on a cluster GPU.** `IMMERDINK_ENV=none` uses the `cmake`, `nvcc`, `g++` and
    `python3` on `PATH`; `IMMERDINK_CUDA_ARCH` (or the `CMAKE_CUDA_ARCHITECTURES` the cluster jobs
    export) picks the architecture (90 for H100 and H200, 120 for the RTX PRO 6000; the default is
-   89). `IMMERDINK_GPU_LOCK=none` skips the lock that protects the shared desktop GPU (**cluster jobs must set it**: the default path is this desktop's `ehrenfest-ipdps/_wip/gpu.lock`, with `$XDG_RUNTIME_DIR` or `/tmp` as the fallback). Both `90` and
+   89). `IMMERDINK_GPU_LOCK=none` skips the lock that protects the shared desktop GPU (**cluster jobs must set it**: the default path is this desktop's `~/.cache/ehrenfest/gpu.lock`, with `$XDG_RUNTIME_DIR` or `/tmp` as the fallback). Both `90` and
    `120` build the library and all tests on the 4090 machine (checked on 2026-10-15).
 3. **Host-only tests simulate the cluster cards.** The planner rules were already checked with 132 SMs (H100,
    H200); 188 (RTX PRO 6000) is added to the host tests (`test_host_python`), alongside 16, 46, 82 and 170.
