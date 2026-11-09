@@ -121,7 +121,7 @@ fi
 
 # GPU tests share the machine with other projects: hold the advisory GPU lock for ctest
 # (IMMERDINK_GPU_LOCK, same default as tools/run_quiet.sh; "none" disables).
-gpu_lock="${IMMERDINK_GPU_LOCK:-/home/ef/repos/ehrenfest-ipdps/_wip/gpu.lock}"
+gpu_lock="${IMMERDINK_GPU_LOCK:-$HOME/.cache/ehrenfest/gpu.lock}"
 [ "$gpu_lock" = none ] || [ -d "$(dirname "$gpu_lock")" ] || gpu_lock="${XDG_RUNTIME_DIR:-/tmp}/gpu.lock"
 # Without a caller's selection option: CPU-only tests never touch the GPU, so they run first
 # without the lock; only the GPU tests wait for it. With one (has_selection), the caller's

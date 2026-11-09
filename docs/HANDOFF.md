@@ -252,7 +252,7 @@ first.
 ## Machine notes
 
 - RTX 4090 shared with the ehrenfest session(s): all GPU work under
-  `flock /home/ef/repos/ehrenfest-ipdps/_wip/gpu.lock` (the tools take it themselves; never
+  `flock ~/.cache/ehrenfest/gpu.lock` (the one canonical lock since 2026-11-08; the tools take it themselves; never
   nest it around them).
 - Heavy jobs run inside `tools/memcap.sh` (shared cgroup budget, RAM/2). The tools already do.
 - PCIe was stuck at gen1 on 2026-10-03 and recovered after the reboot (gen4 x16, 21 GB/s).
