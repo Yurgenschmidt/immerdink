@@ -74,7 +74,7 @@ __global__ void wg_kernel(const int32_t* acc, uint8_t* plane, int l, int m, int 
   const uint32_t mod = imd::device::c_tables.moduli[l];
   imd::kernels::HopperEpilogue::run<kNW, kAdd>(
       r, warp, lane, 64 * wgi, col0, plane, kN, m, n, mod, imd::device::c_tables.epi_bias[l],
-      imd::device::c_tables.epi_magic[l]);
+      imd::device::c_tables.epi_magic[l], imd::device::c_fold.f[l]);
 }
 
 int fails = 0;
