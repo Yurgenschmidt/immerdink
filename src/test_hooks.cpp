@@ -10,13 +10,15 @@
 //
 //   imd_test_set_fused(mode)
 //       mode -1: plans created afterwards take the v1.4 fused path KF and the v1.6 fused
-//       large path KL when the plan-time rules (analysis.hpp fused_path, fused_large) say so
+//       large path KL when the plan-time rules (analysis.hpp fused_path, fused_large; the
+//       device class and SM count) say so
 //       (production); 0: never (K0, K1 and the packs of group 1 run as separate launches);
 //       2: every plan with the emulated GEMM takes KL for both operands (never KF); 3: as 2,
 //       with KL tiles of 64 rows (so rows of k_hat > 64 span several chunks: the register,
 //       shared-memory and re-read chunks of KL all run on small shapes); 6: the plan-time
-//       rules with the sm_90 class's KL rule (issue 21 klstrided: no KL for an operand read
-//       along rows of nc >= kKlStridedNcMin chunks) on any device. Results must not change.
+//       rules with the sm_90 class's KL rules at the device's SM count (issue 21: no KL for an
+//       operand read along rows whose KL grid has 2 tiles <= SMs at nc >= kKlStarvedNcMin,
+//       klstarve, or nc >= kKlStridedNcMin chunks, klstrided) on any device. Results must not change.
 //       Returns 0, or 1 for another mode.
 //
 //   imd_test_set_k4_backend(backend) / imd_test_get_k4_backend() / imd_test_plan_k4_backend(plan) / imd_test_k4_wgmma_built() /

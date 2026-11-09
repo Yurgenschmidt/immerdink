@@ -3353,3 +3353,55 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# --- Issue 21: the KL operand rule (host/analysis.hpp fused_large, kl_launch), transcribed ---------------------------------
+KF_K_HAT_MAX = 1024                   # §4 KF iff k_hat <= this (and not both operands packed)
+K4_REFERENCE_SMS = 128                # host/k4_config.hpp kK4ReferenceSms
+KL_STRIDED_TABLE = (False, True)      # kKlStridedTable per IMD_TABLE_* (SM89, SM90)
+KL_STRIDED_NC_MIN = 64
+KL_STARVED_TABLE = (True, True)       # kKlStarvedTable
+KL_STARVED_NC_MIN = 4
+
+
+def pack_pivot(groups, h_step):
+    """host/index_map.cpp pack_pivot: groups = (extent, stride) of the row class's fused modes, then L's, first fastest;
+    h_step = the first K mode's stride. (along_rows, radix): along rows iff the smallest nonzero |stride| of the groups is
+    below |h_step| (or h_step = 0); radix = the extents before that mode."""
+    best, radix, best_radix = None, 1, 1
+    for e, s in groups:
+        if s and (best is None or abs(s) < best):
+            best, best_radix = abs(s), radix
+        radix *= e
+    if best is not None and (h_step == 0 or best < abs(h_step)):
+        return True, best_radix
+    return False, 1
+
+
+def kl_launch_shape(along_rows, k_hat, b, rows, radix):
+    """(nc, tiles) of kl_launch with the production tile (lg_rows -1): along rows 8 rows x 512 k, else tk = pow2 >= k_hat in
+    [64, 4096]."""
+    lg_tk = 9 if along_rows else min(12, max(6, (k_hat - 1).bit_length()))
+    th = 4096 >> lg_tk
+    nc = -(-k_hat // (1 << lg_tk))
+    D = b * rows // radix
+    return nc, radix * -(-D // th)
+
+
+def fused_large(emulates, k_hat, packed, b, m, n, pivot, table=0, sms=0):
+    """The KL operand mask (bit 0 A, bit 1 B, post-swap) of host/analysis.hpp fused_large(e, table, sms). pivot: the post-swap
+    (along_rows, radix) of A and B; table out of range: the v1.6 rule (KL for every in-line operand without KF)."""
+    if not emulates or (k_hat <= KF_K_HAT_MAX and packed != 3):
+        return 0
+    mask = 3 & ~packed
+    ok = 0 <= table < len(KL_STRIDED_TABLE)
+    strided, starved = ok and KL_STRIDED_TABLE[table], ok and KL_STARVED_TABLE[table]
+    sms = sms if sms > 0 else K4_REFERENCE_SMS
+    for x in (0, 1):
+        along, radix = pivot[x]
+        if not (mask >> x) & 1 or not along:
+            continue
+        nc, tiles = kl_launch_shape(True, k_hat, b, n if x else m, radix)
+        if (strided and nc >= KL_STRIDED_NC_MIN) or (starved and nc >= KL_STARVED_NC_MIN and 2 * tiles <= sms):
+            mask &= ~(1 << x)
+    return mask

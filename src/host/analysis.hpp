@@ -118,8 +118,8 @@ inline bool fused_path(const ExecPlan& e) {
 // KL, as a bit mask (bit 0: the GEMM's A, bit 1: its B, post-swap): every in-line (v1.7: not
 // packed) operand of a plan with the emulated GEMM that does not take KF. A pure function of
 // the lowering.
-// Issue 21 (klstrided, per device class): fused_large(e, table) below also drops KL for an
-// operand read along rows on long rows on the classes that carry the rule.
+// Issue 21 (klstarve, klstrided; per device class): fused_large(e, table, sms) below drops KL for
+// an operand read along rows whose KL grid is starved or whose rows are long.
 constexpr int32_t kFusedLargeA = 1, kFusedLargeB = 2;
 
 // v1.8 (DESIGN §4, §6c): the moduli parts of a pack launch (KF, K2 / K3; gridDim.y): with
@@ -249,30 +249,60 @@ inline KlLaunch kl_launch(bool along_rows, int32_t lg_rows, int64_t k_hat, int64
 
 // v1.6 (DESIGN §4 "KL"): the operands scaled and packed (group 1) by KL, as a bit mask (bit 0:
 // the GEMM's A, bit 1: its B, post-swap): every in-line (v1.7: not packed) operand of a plan with
-// the emulated GEMM that does not take KF. Issue 21 "klstrided": on the device classes of
-// kKlStridedTable, an operand read along rows (pack_along_rows: th = 8 rows x tk = 512) whose
-// row takes kl_launch(...).nc >= kKlStridedNcMin chunks takes K1 + K2/K3 instead: KL walks such a
-// row in nc chunks from one block (latency-bound: issue% 45-48 on H200 long rows) while K1 + the
-// pack spread k over a large grid. Evidence (H200, all bit-identical; t(KL both) / t(KL k-contiguous
-// operand only)): 264x256x32768 ak,kb 1.50, 1000x64x50000 ik,kj 1.39, 2048^2x32768 ik,kj 1.09; on
-// the RTX 4090 the same choice loses on 4096^3 and 16384x512x4096 (0.96, 0.84), so sm_89 keeps KL.
-// A pure function of the lowering and the table set; workspace and plan bytes do not depend on it.
-// `table`: an IMD_TABLE_* (out of range: the reference IMD_TABLE_SM89).
+// the emulated GEMM that does not take KF, except an operand read along rows (pack_along_rows:
+// th = 8 rows x tk = 512) for which one of the two issue-21 rules below says K1 + K2/K3 is faster.
+// KL walks such a row in nc = ceil(k_hat / 512) chunks from one block (about 5.5 us per chunk on
+// the RTX 4090 and H100), while K1 + the pack spread k over a large grid.
+//  - "klstarve" (all classes of kKlStarvedTable): the operand's KL grid would leave at least half
+//    the SMs idle (2 tiles <= sms) and nc >= kKlStarvedNcMin. Evidence (RTX 4090, 128 SMs, N=14,
+//    bit-identical; t(KL both) / t(KL for the other operand only)), ik,kj m=4096 k=8192 (nc 16):
+//    B tiles 8 / 32 / 64 / 128 / 256 -> 1.061 / 1.033 / 1.006 / 0.997 / 0.986 (mirror ki,jk on A
+//    1.054 / 0.999 / 0.985); tiles 8 at nc 4 / 8: 1.034 / 1.052; 1000x64x32768 1.205. H100 (132
+//    SMs) 1000x64 kj (8 tiles) at nc 16 / 32 / 98: 1.34 / 1.32 / 1.34. The H100 crossover (<= 66
+//    tiles) is taken from the 4090; nc 3 (k_hat 1025..1536) is unmeasured, hence the floor at 4.
+//    IMD_TABLE_SM89 also serves sm_120, which inherits the rule without its own evidence.
+//  - "klstrided" (classes of kKlStridedTable): the row takes nc >= kKlStridedNcMin chunks
+//    (latency-bound: issue% 45-48 on H200 long rows). Evidence (H200; t(KL both) / t(KL k-contiguous
+//    operand only)): 264x256x32768 ak,kb 1.50, 1000x64x50000 ik,kj 1.39, 2048^2x32768 ik,kj 1.09;
+//    on the RTX 4090 the same choice loses on 4096^3 and 16384x512x4096 (0.96, 0.84), so sm_89
+//    keeps KL there.
+// A pure function of the lowering, the table and the SM count; workspace and plan bytes do not
+// depend on it. `table`: an IMD_TABLE_* (out of range: neither rule's class); `sms` <= 0: the
+// reference kK4ReferenceSms. KL's grid is 1-D (each block loops over the group's moduli), so the
+// tile count of kl_launch is its block count.
 constexpr bool kKlStridedTable[IMD_TABLE_COUNT] = {
     false,  // IMD_TABLE_SM89: RTX 4090 (and sm_120)
     true,   // IMD_TABLE_SM90: H100, H200
 };
 constexpr int64_t kKlStridedNcMin = 64;  // H200 evidence at nc 64 and 98; H100 thresholds pending
+constexpr bool kKlStarvedTable[IMD_TABLE_COUNT] = {
+    true,  // IMD_TABLE_SM89: RTX 4090 (and sm_120, no evidence of its own)
+    true,  // IMD_TABLE_SM90: H100, H200
+};
+constexpr int64_t kKlStarvedNcMin = 4;  // smallest measured nc (4090: +3% at nc 4)
 inline bool kl_strided_rule(int32_t table) {
   return table >= 0 && table < IMD_TABLE_COUNT && kKlStridedTable[table];
 }
-inline int32_t fused_large(const ExecPlan& e, int32_t table) {
+inline bool kl_starved_rule(int32_t table) {
+  return table >= 0 && table < IMD_TABLE_COUNT && kKlStarvedTable[table];
+}
+// The KL launch of operand x of an emulated plan (production tile height).
+inline KlLaunch kl_launch_of(const ExecPlan& e, int x) {
+  return kl_launch(e.pack_along_rows[x], -1, e.k_hat, e.b, x ? e.n : e.m, e.pack_radix[x]);
+}
+inline int32_t fused_large(const ExecPlan& e, int32_t table, int32_t sms) {
   if (!emulates(e) || fused_path(e)) return 0;
   int32_t m = (kFusedLargeA | kFusedLargeB) & ~e.packed;
-  if (kl_strided_rule(table))
-    for (int x = 0; x < 2; ++x)
-      if (e.pack_along_rows[x] && kl_launch(true, -1, e.k_hat, 1, 1, 1).nc >= kKlStridedNcMin)
-        m &= ~(1 << x);
+  const bool strided = kl_strided_rule(table), starved = kl_starved_rule(table);
+  if (!strided && !starved) return m;
+  if (sms <= 0) sms = kK4ReferenceSms;
+  for (int x = 0; x < 2; ++x) {
+    if (!(m & (1 << x)) || !e.pack_along_rows[x]) continue;
+    const KlLaunch L = kl_launch_of(e, x);
+    if ((strided && L.nc >= kKlStridedNcMin) ||
+        (starved && L.nc >= kKlStarvedNcMin && 2 * L.tiles <= int64_t{sms}))
+      m &= ~(1 << x);
+  }
   return m;
 }
 

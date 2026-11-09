@@ -264,11 +264,13 @@ def spec_expect(descs, N, g, rnd, mode, vec):
                    gemm_launches=sum(chunks * -(-len(grp) * b // 65535) * nparts
                                      for grp in groups))
     # v1.4 (DESIGN §4, §6a): the fused launch KF iff EMULATE and k_hat <= 1024; v1.6: else
-    # KL for both operands (fused_large = 3) on EMULATE; kernel launches per call with
-    # alpha != 0.
+    # KL for both operands on EMULATE, issue 21: less an operand read along rows whose KL grid
+    # is starved (params.fused_large; the reference table set and 128 SMs); kernel launches per
+    # call with alpha != 0.
     k0 = 0 if vec == "RESIDENT" else 1
     fused = dispatch == "EMULATE" and k_hat <= 1024   # 512 until v1.5 (A3)
-    fused_large = 3 if dispatch == "EMULATE" and not fused else 0
+    fused_large = (params.fused_large(True, k_hat, 0, b, m, n, [v.pivot(0), v.pivot(1)], 0, 128)
+                   if dispatch == "EMULATE" else 0)
     if dispatch == "NOOP":
         launches = 0
     elif dispatch != "EMULATE":
@@ -280,7 +282,8 @@ def spec_expect(descs, N, g, rnd, mode, vec):
                                   + (0 if fused_large & 2 else 1 + zero_rows))
         launches = ((1 if fused else k0 + 2) + (exp["num_groups"] - 1) * per_group + group1
                     + exp["gemm_launches"] + 1)
-    exp.update(fused=int(fused), kernel_launches=launches, fused_large=fused_large)
+    exp.update(fused=int(fused), kernel_launches=launches, fused_large=fused_large,
+               pivot=[v.pivot(0), v.pivot(1)] if dispatch == "EMULATE" else None)
     # v1.5 (DESIGN §4, §6 k4_tune, §6a): the K4 rule for the reference 128 SMs and the
     # autotuning scratch bytes (both only with the emulated GEMM).
     emu = dispatch == "EMULATE"
@@ -466,6 +469,11 @@ def check_case(direct, descs, opts, what):
                                   exp["residue_group"], sms)
             if st_s != st_c or low_s["sm_count"] != sms or low_s["k4_config"] != want:
                 raise Fail(f"{what}: sm_count {sms}: k4_config {low_s['k4_config']}, spec {want}")
+            # issue 21 klstarve: the KL operands follow the SM count as well
+            want_fl = params.fused_large(True, exp["k_hat"], 0, exp["b"], exp["m"], exp["n"],
+                                         exp["pivot"], 0, sms)
+            if low_s["fused_large"] != want_fl:
+                raise Fail(f"{what}: sm_count {sms}: fused_large {low_s['fused_large']}, spec {want_fl}")
     if bool(low_c["swapped"]) != exp["swapped"] or host.DISPATCH[low_c["dispatch"]] != exp["dispatch"]:
         raise Fail(f"{what}: swap / dispatch differ from the spec")
     regs = [(host.REGIONS[r], o, o + nb) for r, (o, nb) in enumerate(lay) if nb]
@@ -642,7 +650,7 @@ def check_packed(direct, descs, opts, rng, what):
         n_hat, k_hat = params.align_up(v.n, 16), params.k_hat_of(v.k, A_res)
         pbits = (1 if "A" in roles else 0) | (2 if "B" in roles else 0)
         fused = emu and k_hat <= 1024 and pbits != 3
-        fl = (3 & ~pbits) if emu and not fused else 0
+        fl = params.fused_large(emu, k_hat, pbits, v.b, v.m, v.n, [v.pivot(0), v.pivot(1)], 0, 128)
         if emu:
             k0 = 0 if vec == "RESIDENT" else 1
             zr = 1 if n_hat > v.n else 0
@@ -667,13 +675,15 @@ def check_packed(direct, descs, opts, rng, what):
 def check_kl_strided(direct):
     """Issue 21 klstrided (analysis.hpp kKlStridedTable, kKlStridedNcMin = 64): on the sm_90 table set an in-line operand whose k is
     not the unit stride (KL reads it along rows, 512 k per chunk) loses its KL bit when ceil(k_hat / 512) >= 64; the sm_89 set keeps
-    KL for both. Workspace and plan bytes do not depend on the table set."""
+    KL for both. Rows 1032 / 1040 (KL tiles 129 / 130 > 128 / 2): klstarve drops nothing, so this isolates the nc rule. Workspace and
+    plan bytes do not depend on the table set."""
     n_cases = 0
+    M, Nn = 1032, 1040
     for k in (16000, 32256, 32768, 33000, 100000):
         for a_strided, b_strided in ((0, 0), (1, 0), (0, 1), (1, 1)):
-            A = ([k, 6], [6, 1], [3, 1]) if a_strided else ([6, k], [k, 1], [1, 3])
-            B = ([k, 5], [5, 1], [3, 2]) if b_strided else ([5, k], [k, 1], [2, 3])
-            descs = [A, B, ([6, 5], [5, 1], [1, 2])]
+            A = ([k, M], [M, 1], [3, 1]) if a_strided else ([M, k], [k, 1], [1, 3])
+            B = ([k, Nn], [Nn, 1], [3, 2]) if b_strided else ([Nn, k], [k, 1], [2, 3])
+            descs = [A, B, ([M, Nn], [Nn, 1], [1, 2])]
             co = c_opts(14, 0, TRUNC, "EMULATE", "GENERATE") + (0,)
             st0, l0 = direct.lowering(descs, co, table_id=0)
             st1, l1 = direct.lowering(descs, co, table_id=1)
@@ -694,6 +704,46 @@ def check_kl_strided(direct):
     return n_cases
 
 
+def check_kl_starved(direct):
+    """Issue 21 klstarve (analysis.hpp kKlStarvedTable, kKlStarvedNcMin = 4): on both table sets an in-line operand read along rows
+    loses its KL bit when its KL grid has 2 tiles <= SMs (tiles = ceil(b rows / 8)) and nc = ceil(k_hat / 512) >= 4. The edge at
+    128 and 132 SMs (64 / 66 tiles), the nc floor (k 1536: nc 3), batched rows, and the k-contiguous operand (never dropped)."""
+    n_cases = 0
+    co = c_opts(14, 0, TRUNC, "EMULATE", "GENERATE") + (0,)
+    for sms in (128, 132):
+        edge = 8 * (sms // 2)
+        for rows in (8, edge - 8, edge, edge + 1, edge + 8, 4096):
+            for k in (1536, 2048, 8192):
+                for bat in (1, 2):
+                    # B read along rows (n fastest), A k-contiguous; the batch L outermost on both
+                    if bat == 1:
+                        A, B = ([64, k], [k, 1], [1, 3]), ([k, rows], [rows, 1], [3, 2])
+                        Cd = ([64, rows], [rows, 1], [1, 2])
+                    else:
+                        A = ([2, 64, k], [64 * k, k, 1], [4, 1, 3])
+                        B = ([2, k, rows], [k * rows, rows, 1], [4, 3, 2])
+                        Cd = ([2, 64, rows], [64 * rows, rows, 1], [4, 1, 2])
+                    for table in (0, 1):
+                        st, lw = direct.lowering([A, B, Cd], co, sm_count=sms, table_id=table)
+                        if st != 0:
+                            raise Fail(f"klstarve rows={rows} k={k} b={bat}: imd_lowering {st}")
+                        if lw["sm_count"] != sms:
+                            raise Fail(f"klstarve: sm_count {lw['sm_count']} != {sms}")
+                        x = 0 if lw["swapped"] else 1   # the post-swap role of the rows-read operand
+                        nc = -(-lw["k_hat"] // 512)
+                        tiles = -(-(bat * rows) // 8)
+                        if lw["k_hat"] <= 1024:
+                            want = 0
+                        else:
+                            drop = nc >= 4 and 2 * tiles <= sms or (table == 1 and nc >= 64)
+                            want = 3 & ~((1 << x) if drop else 0)
+                        if lw["fused_large"] != want:
+                            raise Fail(f"klstarve sms={sms} table={table} rows={rows} k={k} b={bat} (k_hat {lw['k_hat']}, "
+                                       f"tiles {tiles}, swapped {lw['swapped']}): fused_large {lw['fused_large']}, want {want}")
+                        n_cases += 1
+    return n_cases
+
+
 def suite_host(args):
     direct = Direct(args.host_lib)
     host.load(args.host_lib)  # the wrapper's default library: the one under test
@@ -701,6 +751,7 @@ def suite_host(args):
     rng = random.Random(20261004)
     by = {}
     check_kl_strided(direct)
+    check_kl_starved(direct)
     # Random descriptors and options; every 4th also with packed operands (DESIGN §6b).
     packed_seen = {}
     for t in range(args.cases):
@@ -1028,6 +1079,8 @@ def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod
                                                               r("kf4"))]))
     else:
         for x, name in ((0, "KL A"), (1, "KL B")):
+            if not (lw.fused_large >> x) & 1:   # issue 21: KL dropped (K1 is folded into the pack phase)
+                continue
             lg_tk = 9 if along_rows[x] else min(12, max(6, (kh - 1).bit_length()))
             tk = 1 << lg_tk
             th = 4096 // tk
@@ -1050,21 +1103,29 @@ def spec_phases(lw, vec, along_rows, l2, beta=False, occ=None, sms=128, tail_mod
         S += g * b * m * nh * (2 * lw.k_chunks - 1)
     hit = 0 < l_hit and S <= l_hit
     for x, name in ((0, "K2 pack A"), (1, "K3 pack B")):
-        if G > 1:
+        # issue 21: an operand without KF or KL takes K1 (folded in here: one launch, two reads, the
+        # second an L2 re-read, sigma and the flag) and packs every group
+        k1 = not lw.fused and not (lw.fused_large >> x) & 1
+        groups = G if k1 else G - 1
+        if groups > 0:
             per = 2 if (x == 1 and nh > n) else 1
             chain = wave = 0
-            for gs in sizes[1:]:  # group 1 is KF's / KL's
+            for gs in (sizes if k1 else sizes[1:]):  # group 1 is KF's / KL's
                 tiles = -(-rows[x] // 64) * -(-kh // 64)
                 parts = spec_parts(tiles, gs, sms)
                 chain += spec_chain(spec_launch_blocks(tiles, 1), parts, tiles,
                                     16 * -(-gs // parts), r("pack"), sms)
                 wave += spec_chain(spec_launch_blocks(tiles, 1), parts, tiles, 1, r("pack"), sms)
-            byts = (G - 1) * 8 * rows[x] * k + (N - g) * pad[x] * kh
+            moduli = N if k1 else N - g
+            byts = groups * 8 * rows[x] * k + moduli * pad[x] * kh
+            if k1:
+                byts += 16 * rows[x] * k + 3 * rows[x]
             # v1.17: slot 3 = the bytes that are not L2-hit re-reads (group 1 is KF's / KL's,
-            # so every pack read is a re-read)
-            ph.append((name, (G - 1) * per, [(G - 1) * per, byts, (N - g) * rows[x] * k,
-                                             byts - ((G - 1) * 8 * rows[x] * k if hit else 0),
-                                             (1 + wide) * chain, wave]))
+            # so every pack read is a re-read; with K1, its first read is the operand's first)
+            rr = (groups + 1 if hit else 1) if k1 else (groups if hit else 0)
+            launches = groups * per + (1 if k1 else 0)
+            ph.append((name, launches, [launches, byts, moduli * rows[x] * k,
+                                        byts - rr * 8 * rows[x] * k, (1 + wide) * chain, wave]))
     ph.append(("K4 gemm", lw.gemm_launches,
                spec_k4_features(lw.k4_config, m, nh, kh, b, N, g, sms, lw.k_chunks, l2,
                                 tail_mod)))
@@ -1826,11 +1887,13 @@ def suite_perf_v120(cal):
     2 -> 3 and the tile doublings), in rows (through 128 / 129 and 256 / 257 CTAs), g and N."""
     count = 0
     key = "kl.chain"
-    shapes = [("ik,kj->ij", dict(i=1600, k=1600, j=100)),     # KL B narrow, nc 4
+    # issue 21 klstarve: an along-rows B of <= 8 x SMs / 2 rows at nc >= 4 takes K1 + K3, no KL phase,
+    # so the narrow KL B cases have 536 rows (67 tiles)
+    shapes = [("ik,kj->ij", dict(i=1600, k=1600, j=536)),     # KL B narrow, nc 4
               ("ik,kj->ij", dict(i=1408, k=1408, j=96)),      # nc 3
               ("ik,kj->ij", dict(i=1024, k=1536, j=1032)),    # 129 CTAs: two waves
               ("ik,jk->ij", dict(i=1536, j=96, k=4608)),      # B along k, nc 2 (KL8)
-              ("abcd,cdij->abij", dict(a=40, b=40, c=40, d=40, i=10, j=10)),
+              ("abcd,cdij->abij", dict(a=40, b=40, c=40, d=40, i=67, j=8)),
               ("ik,jk->ij", dict(i=256, j=256, k=256)),       # KF: no KL phase
               ("ik,jk->ij", dict(i=2048, j=2048, k=2048))]    # wide KL: DRAM-bound
     caches = ("COLD", "REPEAT")
@@ -1904,7 +1967,7 @@ def suite_perf_v120(cal):
         params = dict(cal.params, **{key: chain})
         for (sp, ex), N, g in itertools.product(shapes, (4, 8, 14), (0, 4)):
             for rg, cache in (("BURST", "REPEAT"), ("BURST", "COLD")):
-                lw = host.lowering(sp, ex, N=N, g=g)
+                lw = host.lowering(sp, ex, N=N, g=g, sm_count=sms)  # issue 21: the model's KL rule is at its SM count
                 pb = host.predict(sp, ex, N=N, g=g, regime=rg, cache=cache, calib=base)
                 pc = host.predict(sp, ex, N=N, g=g, regime=rg, cache=cache, calib=cc)
                 if pb.status != pc.status:
@@ -1985,15 +2048,15 @@ def suite_perf_v120(cal):
 
     for N, g in ((8, 0), (8, 3), (14, 4)):
         count += check_mono(f"k_hat, N={N} g={g}", [
-            (k, kl_time("ik,kj->ij", dict(i=512, k=k, j=96), N, g)) for k in range(1040, 4400, 16)])
+            (k, kl_time("ik,kj->ij", dict(i=512, k=k, j=536), N, g)) for k in range(1040, 4400, 16)])
         count += check_mono(f"k_hat along k, N={N} g={g}", [
             (k, kl_time("ik,jk->ij", dict(i=512, j=96, k=k), N, g)) for k in range(1040, 9000, 64)])
         for lo, hi in ((900, 1100), (1980, 2100), (400, 520)):
             count += check_mono(f"rows {lo}..{hi}, N={N} g={g}", [
                 (j, kl_time("ik,kj->ij", dict(i=512, k=1536, j=j), N, g)) for j in range(lo, hi, 4)])
-    count += check_mono("g", [(g, kl_time("ik,kj->ij", dict(i=512, k=1792, j=96), 14, g))
+    count += check_mono("g", [(g, kl_time("ik,kj->ij", dict(i=512, k=1792, j=536), 14, g))
                               for g in range(1, 15)])
-    count += check_mono("N", [(N, kl_time("ik,kj->ij", dict(i=512, k=1792, j=96), N, 0))
+    count += check_mono("N", [(N, kl_time("ik,kj->ij", dict(i=512, k=1792, j=536), N, 0))
                               for N in range(2, 21)])
     return count
 
@@ -2267,7 +2330,8 @@ def suite_perf(args):
         ("ik,jk->ij", dict(i=300, j=200, k=1000), (False, False)),
         ("ik,jk->ij", dict(i=2048, j=1000, k=3000), (False, False)),
         ("ik,jk->ij", dict(i=1000, j=64, k=50000), (False, False)),
-        ("ki,kj->ij", dict(i=512, j=384, k=5000), (True, True)),
+        ("ki,kj->ij", dict(i=512, j=384, k=5000), (True, True)),     # issue 21 klstarve: K1 + K2/K3 for both
+        ("ki,kj->ij", dict(i=1032, j=1040, k=5000), (True, True)),   # 129 / 130 KL tiles: KL for both
         ("ik,jk->ij", dict(i=5, j=7, k=300000), (False, False)),
         ("lik,ljk->lij", dict(l=6, i=100, j=60, k=1500), (False, False)),
         ("ikl,kjl->ijl", dict(i=128, j=96, k=2500, l=4), (True, True)),
@@ -2291,7 +2355,8 @@ def suite_perf(args):
         for N, g in ((8, 0), (14, 4), (20, 7), (3, 1)):
             for vec in ("GENERATE", "RESIDENT"):
                 for mode in ("EMULATE", "DIRECT"):
-                    lw = host.lowering(spec, ext, N=N, g=g, vec_mode=vec, mode=mode)
+                    lw = host.lowering(spec, ext, N=N, g=g, vec_mode=vec, mode=mode,
+                                       sm_count=hcal.meta["sm_count"])  # issue 21: the model's SM count
                     p = host.predict(spec, ext, N=N, g=g, vec_mode=vec, mode=mode, calib=hcal)
                     if p.status != lw.status:
                         raise Fail(f"{spec} {ext}: status {p.status} vs lowering {lw.status}")
@@ -2622,8 +2687,8 @@ def suite_plan(args):
                        k_hat=kh, num_moduli=N, residue_group=g, workspace_bytes=total,
                        gemm_launches=launches, plan_device_bytes=dev, plan_host_bytes=hbytes,
                        fused=fused, kernel_launches=kernels, fused_large=fused_large)
-            if path == 1 and k > 0:   # the device's table set (issue 21 klstrided: the KL rule is per class)
-                low = direct.lowering(descs, co, table_id=plan_table(plan))[1]
+            if path == 1 and k > 0:   # the device's table set and SM count (issue 21: the KL rule is per class and SM count)
+                low = direct.lowering(descs, co, sm_count=sms, table_id=plan_table(plan))[1]
             want = dict(low, dispatch=host.DISPATCH[low["dispatch"]])
             for key, val in got.items():
                 if val != want[key]:
@@ -2695,8 +2760,9 @@ def suite_plan(args):
                         dev, store, add, launches, hbytes, fused, kernels = v[27:34]
                         fused_large, slots, pbA, pbB = v[37:41]
                         _, ltot, lay = direct.layout_packed(descs, co, specs)
-                        if path == 1 and k > 0:   # the device's table set (issue 21 klstrided)
-                            low = direct.lowering(descs, co, packing=specs, table_id=plan_table(plan))[1]
+                        if path == 1 and k > 0:   # the device's table set and SM count (issue 21)
+                            low = direct.lowering(descs, co, packing=specs, sm_count=v[36],
+                                                  table_id=plan_table(plan))[1]
                         got = dict(swapped=sw, m=m, n=n, k=k, b=b, n_hat=nh, k_hat=kh,
                                    workspace_bytes=total, gemm_launches=launches,
                                    plan_device_bytes=dev, plan_host_bytes=hbytes, fused=fused,

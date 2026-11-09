@@ -186,10 +186,12 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
     } else {
       p->info.struct_size = sizeof p->info;
     }
-    // Issue 21 (klstrided): the KL operands by this device class's rule (plan_data used the reference class), then the hooks,
-    // which keep precedence. Test hook only: 0 = no fused launch at all; 2 / 3 = KL for both operands of every
-    // emulated plan (3: with 64-row KL tiles).
-    if (emulated) e.fused_large = imd::detail::fused_large(e, p->info.table_id);
+    // Issue 21 (klstarve, klstrided): the KL operands by this device class's rule and SM count (plan_data used the
+    // reference class and count), then the hooks, which keep precedence. Test hook only: 0 = no fused launch at all;
+    // 2 / 3 = KL for both operands of every emulated plan (3: with 64-row KL tiles). Benchmark hooks 4 / 5 / 7 start
+    // from the v1.6 rule (table -1: KL for every in-line operand of a plan without KF), so a duel stays meaningful
+    // when the device's rule already dropped an operand.
+    if (emulated) e.fused_large = imd::detail::fused_large(e, p->info.table_id, e.sms);
     if (imd::detail::fused_override() == 0) {
       e.fused = false;
       e.fused_large = 0;
@@ -198,13 +200,13 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
       e.fused_large = (imd::detail::kFusedLargeA | imd::detail::kFusedLargeB) & ~e.packed;
       if (imd::detail::fused_override() == 3) e.kl_lg_rows = 6;
     } else if (imd::detail::fused_override() == 6 && emulated) {
-      e.fused_large = imd::detail::fused_large(e, IMD_TABLE_SM90);  // test hook: the sm_90 class's KL rule (klstrided) on any device
+      e.fused_large = imd::detail::fused_large(e, IMD_TABLE_SM90, e.sms);  // test hook: the sm_90 class's KL rule on any device
     } else if (imd::detail::fused_override() == 7 && emulated) {
-      e.fused_large = imd::detail::fused_large(e, IMD_TABLE_SM89);  // bench hook: the reference class's KL rule (KL for both in-line operands)
+      e.fused_large = imd::detail::fused_large(e, -1, 0);  // bench hook: the v1.6 rule (KL for both in-line operands)
     } else if (imd::detail::fused_override() == 4) {
-      e.fused_large &= imd::detail::kFusedLargeA;  // benchmark hook: KL for the GEMM's A only
+      e.fused_large = imd::detail::fused_large(e, -1, 0) & imd::detail::kFusedLargeA;  // benchmark hook: KL for the GEMM's A only
     } else if (imd::detail::fused_override() == 5) {
-      e.fused_large &= imd::detail::kFusedLargeB;  // benchmark hook: KL for the GEMM's B only
+      e.fused_large = imd::detail::fused_large(e, -1, 0) & imd::detail::kFusedLargeB;  // benchmark hook: KL for the GEMM's B only
     }
 
     if (emulated) {  // §4 / §6 v1.2: every K4 launch shape's parameters, built here once

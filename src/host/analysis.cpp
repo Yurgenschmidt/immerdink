@@ -331,7 +331,7 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
     }
     e.k5_batch_fast = k5_batch_fastest(lw);
     e.fused = fused_path(e);
-    e.fused_large = fused_large(e, IMD_TABLE_SM89);  // the reference class; api.cpp redoes it for the device's
+    e.fused_large = fused_large(e, IMD_TABLE_SM89, kK4ReferenceSms);  // the reference class and SM count; api.cpp redoes it for the device's
     // v1.13 §4b.5 (hygiene: at plan time, not per call): KF's tile row covers the whole
     // padded row, so KF writes the zeros [k, k_hat). Unreachable (kf_lg_tk rounds up).
     if (e.fused && (int64_t{1} << kf_lg_tk(e.k_hat)) < e.k_hat) return IMD_STATUS_INVALID_VALUE;

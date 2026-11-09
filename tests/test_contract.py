@@ -400,9 +400,11 @@ def run_case(lib, cuda, name, A, B, Cd, TA, TB, TC, alpha, beta, N, g=0, roundin
                 if fmode in (2, 3) and (fused or large != 3):
                     raise Fail(f"{vname}: KL not forced (fused {fused}, fused_large {large})")
                 emulated = mode == o.EMULATE and view.k > 1 and not view.empty_output()
-                want_large = 3 if emulated and not fused else 0
-                if want_large and lib.plan_table(plan) == 1:   # issue 21 klstrided: the sm_90 class drops KL for long strided rows
-                    want_large = lib.plan_fused_large_rule(plan)
+                # v1.6 KL for both in-line operands without KF; issue 21 (klstarve, klstrided): less an operand read along
+                # rows that the device class's rule drops at this device's SM count (params.fused_large, transcribed)
+                want_large = params.fused_large(emulated, lib.plan_sizes(plan)[7], 0, view.b, view.m, view.n,
+                                                [view.pivot(0), view.pivot(1)], lib.plan_table(plan),
+                                                lib.plan_k4(plan)[2]) if emulated else 0
                 if fmode in (-1, 1) and large != want_large:
                     raise Fail(f"{vname}: fused_large {large} against the plan-time rule")
                 if alpha == 0.0 and not view.empty_output():
