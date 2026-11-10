@@ -21,17 +21,25 @@ def residues(z, p):
     return [z % pl for pl in p]
 
 
-def main():
-    rng = random.Random(21)
-    total = 0
+def corpus(rng):
+    """The residue-vector corpus, per N: (N, plan constants, sorted z0 in [0, P)). With rng = random.Random(21) it is the 63,841-vector corpus of main()
+    (with the W_l = p_l - 1 vector main adds per N); spec/test_crt_f64_ro.py reuses it."""
     for N in range(o.N_MIN, o.N_MAX + 1):
         c = C.F64Crt(N)
-        P, H, p = c.P, c.plan.H, c.plan.p
+        P, H = c.P, c.plan.H
         zs = {0, 1, 2, 3, 255, 256, 65535, H - 1, H, H + 1, P - 1, P - 2, P - 3, P - 256, P // 2, P // 3, P // 255}
         zs |= set(range(0, 300)) | set(range(P - 300, P))
         zs |= {rng.randrange(0, 1 << rng.randint(1, P.bit_length())) % P for _ in range(1500)}
         zs |= {rng.randrange(P) for _ in range(1500)}
-        for z in sorted({x % P for x in zs}):
+        yield N, c, sorted({x % P for x in zs})
+
+
+def main():
+    rng = random.Random(21)
+    total = 0
+    for N, c, zlist in corpus(rng):
+        P, p = c.P, c.plan.p
+        for z in zlist:
             W = residues(z, p)
             got = c.crt(W)
             assert got == z, (N, z, got)

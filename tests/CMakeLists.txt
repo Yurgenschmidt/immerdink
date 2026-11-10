@@ -142,6 +142,9 @@ if(Python3_FOUND)
   # Issue 21: the CRT with the sums in binary64 limbs against the reference for every N (CPU only; the GPU kernel: crt_f64_gpu).
   add_test(NAME spec_crt_f64
            COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/spec/test_crt_f64.py")
+  # Issue 21 (K5 lever 3, gate 1): the exact FP64 finish (centred quotient, Boldo-Melquiond round-to-odd sum, fallback) against the reference. CPU only, ~35 s.
+  add_test(NAME spec_crt_f64_ro
+           COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/spec/test_crt_f64_ro.py")
   # Issue 23 (known divergence): the decision logic of contract_api's per-W pack-occupancy check, on mocked tables (the Hopper pattern is
   # accepted as known, everything else decides as before). CPU only.
   add_test(NAME contract_occupancy_known
