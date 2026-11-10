@@ -2,13 +2,13 @@
 # explore/syrk-big: C = A A^T (SYRK) at large n on ONE H200, phases of one PACE embers batch job (syrk_job.sh runs
 # build check bench). Two immerdink paths: dense imd (B = A, method imd) and the block-SYRK prototype (method imd_syrk:
 # the packed API, lower block pairs + a mirror pass); baselines cuBLAS DSYRK (+ mirror), DGEMM and FP64 fixed-point
-# emulation (fix55). Each phase writes $O/<phase>/step.log and its JSONL.
+# emulation (fix55). Each phase writes $O/<phase>/step.log and its JSONL; syrk_job.sh prints the tables
+# (bench/explore/syrk/syrk_tab.py) into $O/<phase>/tab.txt after each phase, so a phase cut by its timeout still has them.
 #   build   bench/build.sh through pace_immerdink_build.sbatch (ARCH=90, profiling build, no GEMMul8) into build90syrk
-#   check   correctness BEFORE any timing: whole-C bit identity of imd_syrk against dense immerdink (N = 8, 14, RN) at
+#   check   correctness BEFORE any timing: whole-C bit identity of imd_syrk against dense immerdink (--N 8,14; both round to nearest) at
 #           n = 4096 k = 2048 and at n not a multiple of the block (5000 x 1999 with block 2048, 4100 x 2048 with block
 #           1024), both stream counts; the error of imd / imd_syrk / dsyrk against native DGEMM (max relative, normwise)
-#   bench   the timing sweep; TFLOPS-eq uses the dense count 2 n^2 k for every method (bench/explore/syrk/syrk_tab.py
-#           prints the tables)
+#   bench   the timing sweep; TFLOPS-eq uses the dense count 2 n^2 k for every method
 # Budget (H200, model in the job notes): every timed configuration stops after 3 repetitions once 2 s are spent (10 at
 # most), so the largest case (n = 65536, k = 32768) costs about 4 calls per method; the whole bench phase is ~8 GPU-minutes
 # plus process setups. Writes only under $HOME/scratch/claude-imd/oz/ and $TMPDIR. No mail options.
@@ -51,11 +51,12 @@ BIN=$B/imd_bench
 [ -x "$BIN" ] || { echo "ERROR: no $BIN"; exit 6; }
 nvidia-smi --query-gpu=name,clocks.sm,clocks.max.sm,clocks.mem,temperature.gpu,power.draw,memory.total,driver_version --format=csv,noheader
 J=$O/$ph.jsonl
+rm -f "$J"   # imd_bench appends: a re-run phase must not double its records
 # one imd_bench process per case: <timeout s> <name> <n> <k> <args...>
 run() {
   local to=$1 nm=$2 n=$3 k=$4; shift 4
   local t0=$SECONDS
-  timeout "$to" "$BIN" --name "$nm" --spec "ik,jk->ij" --ext "i=$n,j=$n,k=$k" --self 1 --seed 1 --phi 0.5 --clock-probe 1 \
+  timeout -k 20 "$to" "$BIN" --name "$nm" --spec "ik,jk->ij" --ext "i=$n,j=$n,k=$k" --self 1 --seed 1 --phi 0.5 --clock-probe 1 \
     --out "$J" "$@" > "$O/$nm.log" 2>&1
   local rc=$?
   echo "$nm (n=$n k=$k) exit $rc in $((SECONDS - t0)) s"
@@ -68,8 +69,7 @@ check)
   c=(--N 8,14 --syrk-check 1 --syrk-streams 1,2 --accuracy 1 --reps 2 --warmup 1 --max-seconds 0.1 --samples 4096 --phase-reps 1)
   run 200 chk_n4096 4096 2048 --methods imd,imd_syrk,dsyrk,dgemm --syrk-block 1024,2048 "${c[@]}"
   run 120 chk_n5000 5000 1999 --methods imd,imd_syrk --syrk-block 2048 "${c[@]}"
-  run 120 chk_n4100 4100 2048 --methods imd_syrk --syrk-block 1024 "${c[@]}"
-  python3 "$W/bench/explore/syrk/syrk_tab.py" "$J" ;;
+  run 120 chk_n4100 4100 2048 --methods imd_syrk --syrk-block 1024 "${c[@]}" ;;
 bench)
   # Headline shape first (n = 32768, k = 16384); the lead's predicted TFLOPS-eq there: dense 185-215 (N=8) / 115-125 (N=14),
   # imd_syrk 330-380 / 200-230, native DSYRK <= ~110-120. Per-case estimated wall (H200 ~1.7-1.8 GHz) in the comments.
@@ -93,8 +93,7 @@ bench)
   # n=65536 k=32768 (A 17 GB, C 34 GB): dense imd does not fit at N=14 (~171 GB) and barely at N=8 (~120 GB): SYRK paths,
   # dsyrk, dgemm (4.7 s per call) and emu; ~150 s
   run 540 b_n65536_k32768 65536 32768 --methods imd_syrk,dsyrk,dgemm,emu,imd --syrk-block 8192 --syrk-streams 2 \
-    --emu-ws-mib 40960 --reps 4 --warmup 1 --max-seconds 2 --samples 1024 --phase-reps 1 --N 8,14 --emu fix55
-  python3 "$W/bench/explore/syrk/syrk_tab.py" "$J" ;;
+    --emu-ws-mib 40960 --reps 4 --warmup 1 --max-seconds 2 --samples 1024 --phase-reps 1 --N 8,14 --emu fix55 ;;
 *) echo "unknown phase $ph"; exit 2 ;;
 esac
 nvidia-smi --query-gpu=clocks.sm,temperature.gpu,power.draw --format=csv,noheader
