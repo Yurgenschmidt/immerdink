@@ -1,0 +1,7 @@
+immerdink commit 91a5cbec6bf67bbc2da2437cb4a5b95ed72ea802 (Sun Nov 8 21:42:07 2026 -0500 Merge pull request #57 from Yurgenschmidt/chore/gpu-lock-canonical)
+src/contract.cu blob 04539495b2c5cb0f4c6318efba40be5e24d6d5eb lines 437-466 504-573 637 733-794 801-863
+include/immerdink/detail/constants.hpp blob 466a673d8a283b1e50d0ba2005310d875936ed49
+src/device/constants.cuh blob ccc14e5c55c2c1995b0a78dc26aeb1e0439b2e01
+src/device/modp.hpp blob 2f320aef45f326add9c9e7546cfd62bc9f6979e8
+src/device/residue.hpp blob fbf7907617080080ddcfc9f3b13cf91a2e7c3d21
+src/kernels/numerics.cuh blob 19482af788bc224034a4d738f255cf235542fe52
