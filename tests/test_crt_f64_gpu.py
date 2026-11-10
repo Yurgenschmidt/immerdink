@@ -21,6 +21,8 @@ import test_output_hashes as T  # noqa: E402
 
 
 LIMB_CRT_CLASSES = {(9, 0)}
+# Classes whose default set runs k5fin: the limb CRT + F1 (bit 4) + k5fin (bit 128). sm_90 since R4 (91697ae, set 173; now 447).
+K5FIN_DEFAULT_CLASSES = {(9, 0)}
 
 
 def case(name, spec_a, spec_b, spec_c, N, family, rounding="RN", alpha=1.0, beta=0.0):
@@ -40,6 +42,7 @@ def main():
     cuda.check(cuda.rt.cudaDeviceGetAttribute(C.byref(major), 75, dev), "cc major")
     cuda.check(cuda.rt.cudaDeviceGetAttribute(C.byref(minor), 76, dev), "cc minor")
     default_limb = 1 if (major.value, minor.value) in LIMB_CRT_CLASSES else 0   # keep equal to the kSeqLimbCrt rows of kSeqClasses (src/host/seq_config.hpp)
+    default_k5fin = default_limb == 1 and (major.value, minor.value) in K5FIN_DEFAULT_CLASSES   # keep equal to the rows with kSeqLimbCrt | kSeqFinish | kSeqK5Fin
     with open(T.DATA) as f:
         committed = [c for c in json.load(f)["cases"] if args.full or set(c["tags"]) & {"small", "mid"}]
     cases = [(c, c["c_hash"]) for c in committed]
@@ -128,8 +131,10 @@ def main():
                     lib.k5_fin_counts(reset=True)
                     hs.append(T.hash_c(T.run_gpu(lib, cuda, c)))
                     seen = lib.k5_launch_counts(reset=True)
-                    if lib.k5_fin_counts(reset=True):
-                        bad.append(f"{c['name']}: crt hook {crt} seq hook {seq}: a k5fin kernel ran, but no class default has bit 128")
+                    fin = lib.k5_fin_counts(reset=True)   # k5fin runs only for the class default (both hooks -1) of a class whose set has it
+                    want_fin = {variant: 1} if (crt == -1 and seq == -1 and default_k5fin) else {}
+                    if fin != want_fin:
+                        bad.append(f"{c['name']}: crt hook {crt} seq hook {seq}: the k5fin launches were {fin}, expected {want_fin}")
                     if seen != {(want(crt, seq), variant): 1}:
                         bad.append(f"{c['name']}: crt hook {crt} seq hook {seq}: the K5 launches were {seen}, expected exactly one launch of variant {names[variant]} ({want(crt, seq)}, {variant})")
                 n += 1
