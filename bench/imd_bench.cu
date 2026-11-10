@@ -23,7 +23,13 @@
 //             (--reuse 1,4,16): R x imd_contract vs imd_pack + R x imd_contract_packed,
 //             interleaved per repetition, plus imd_pack / imd_contract / imd_contract_packed
 //             alone; workspaces and pack bytes
-//   duel      two immerdink configurations (--duel-a, --duel-b) timed INTERLEAVED, call by
+//   imd_syrk  explore/syrk-big (needs --self 1, B = A, spec ik,jk->ij): C = A A^T as a block SYRK from
+//             the packed API: each row block of A packed once (one buffer serves the A and B roles),
+//             one imd_contract_packed per lower block pair (--syrk-block, --syrk-streams), a mirror
+//             pass for the upper triangle; --syrk-check 1 compares all of C bit for bit with dense
+//             immerdink. TFLOPS-eq uses the dense count 2 n^2 k like every other method.
+//   dsyrk     cuBLAS DSYRK (lower) + the mirror pass (needs --self 1)
+//   duel     two immerdink configurations (--duel-a, --duel-b) timed INTERLEAVED, call by
 //             call, in one process (docs/BENCHMARKING.md "Tiny shapes", NOTES-A5 §1.2): both
 //             sides see the same GPU clock / DVFS / host-core state. A side is "default" or
 //             a comma list of N=<n>, vec=generate|resident, g=<g> (0 = N),
@@ -160,20 +166,29 @@ struct Failure : std::runtime_error {
 struct DevBuf {
   void* p = nullptr;
   size_t bytes = 0;
+  bool own = true;  // false: a view of another buffer (--self 1: B is A), never freed here
   DevBuf() = default;
   explicit DevBuf(size_t n) : bytes(n) {
     if (n) CU(cudaMalloc(&p, n));
   }
+  static DevBuf view(void* q, size_t n) {
+    DevBuf d;
+    d.p = q;
+    d.bytes = n;
+    d.own = false;
+    return d;
+  }
   DevBuf(const DevBuf&) = delete;
   DevBuf& operator=(const DevBuf&) = delete;
-  DevBuf(DevBuf&& o) noexcept : p(o.p), bytes(o.bytes) { o.p = nullptr; o.bytes = 0; }
+  DevBuf(DevBuf&& o) noexcept : p(o.p), bytes(o.bytes), own(o.own) { o.p = nullptr; o.bytes = 0; }
   DevBuf& operator=(DevBuf&& o) noexcept {
     std::swap(p, o.p);
     std::swap(bytes, o.bytes);
+    std::swap(own, o.own);
     return *this;
   }
   ~DevBuf() {
-    if (p) cudaFree(p);
+    if (p && own) cudaFree(p);
   }
   template <class T> T* as() const { return static_cast<T*>(p); }
 };
@@ -503,6 +518,66 @@ __global__ void k_cw_compare(const double* x, const double* y, const double* S, 
   atomicAdd(nonfin, nf);
 }
 
+// The same comparison, elementwise and normwise (explore/syrk-big): max |x - y| / |y| over y != 0 (as bits for
+// atomicMax), sum (x - y)^2 and sum y^2 over the finite x (the Frobenius-norm relative error is sqrt of their ratio).
+__global__ void k_rel_compare(const double* x, const double* y, size_t n, unsigned long long* maxbits, double* sq) {
+  double mx = 0, d2 = 0, y2 = 0;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+    if (!isfinite(x[i])) continue;
+    const double d = x[i] - y[i];
+    if (y[i] != 0) mx = fmax(mx, fabs(d) / fabs(y[i]));
+    d2 += d * d;
+    y2 += y[i] * y[i];
+  }
+  atomicMax(maxbits, static_cast<unsigned long long>(__double_as_longlong(mx)));
+  atomicAdd(&sq[0], d2);
+  atomicAdd(&sq[1], y2);
+}
+
+// ---- explore/syrk-big: the block-SYRK prototype's device helpers ----
+// Mirror of a row-major n x n C over 32 x 32 tiles. dir 0 writes the upper triangle from the lower one, dir 1 the lower from
+// the upper. Tile t in [0, T), T = nt (nt + 1) / 2 with nt = ceil(n / 32), is the lower tile (bi, bj), bi >= bj,
+// t = bi (bi + 1) / 2 + bj (grid-stride over t, so no CTA is launched for an upper tile). nb > 0 (a multiple of 32) skips
+// the tiles inside one diagonal block of nb rows: the block SYRK computes those blocks in full. Block (32, 8); loads and
+// stores are coalesced along rows (32 doubles) through a padded shared tile.
+__global__ void k_mirror(double* C, int64_t n, int64_t nb, int dir, int64_t T) {
+  __shared__ double sm[32][33];
+  const int tx = threadIdx.x, ty = threadIdx.y;
+  for (int64_t t = blockIdx.x; t < T; t += gridDim.x) {
+    int64_t bi = static_cast<int64_t>((sqrt(8.0 * static_cast<double>(t) + 1.0) - 1.0) * 0.5);
+    while (bi > 0 && bi * (bi + 1) / 2 > t) --bi;
+    while ((bi + 1) * (bi + 2) / 2 <= t) ++bi;
+    const int64_t bj = t - bi * (bi + 1) / 2;
+    if (nb > 0 && (bi * 32) / nb == (bj * 32) / nb) continue;  // uniform in the CTA (t is)
+    const int64_t r0 = bi * 32, c0 = bj * 32;
+    if (dir == 0) {
+      for (int r = ty; r < 32; r += 8)  // lower tile: rows r0.., columns c0..
+        if (r0 + r < n && c0 + tx < n) sm[r][tx] = C[(r0 + r) * n + c0 + tx];
+      __syncthreads();
+      for (int r = ty; r < 32; r += 8)  // upper (c0 + r, r0 + tx) = C(r0 + tx, c0 + r)
+        if (c0 + r < n && r0 + tx < n && (bi != bj || r < tx)) C[(c0 + r) * n + r0 + tx] = sm[tx][r];
+    } else {
+      for (int r = ty; r < 32; r += 8)  // upper tile: rows c0.., columns r0..
+        if (c0 + r < n && r0 + tx < n) sm[r][tx] = C[(c0 + r) * n + r0 + tx];
+      __syncthreads();
+      for (int r = ty; r < 32; r += 8)  // lower (r0 + r, c0 + tx) = C(c0 + tx, r0 + r)
+        if (r0 + r < n && c0 + tx < n && (bi != bj || r > tx)) C[(r0 + r) * n + c0 + tx] = sm[tx][r];
+    }
+    __syncthreads();
+  }
+}
+// (k_count_diff, the bitwise element comparison, is defined below with method duel.)
+// Pairs i > j of a row-major n x n x with x(i, j) != x(j, i) bitwise (a bit-symmetric x gives 0).
+__global__ void k_count_asym(const unsigned long long* x, int64_t n, unsigned long long* out) {
+  unsigned long long c = 0;
+  const size_t ne = size_t(n) * size_t(n);
+  for (size_t q = blockIdx.x * size_t(blockDim.x) + threadIdx.x; q < ne; q += size_t(gridDim.x) * blockDim.x) {
+    const size_t i = q / size_t(n), j = q % size_t(n);
+    if (i > j) c += x[q] != x[j * size_t(n) + i];
+  }
+  atomicAdd(out, c);
+}
+
 struct Accuracy {
   double max_rel = 0, max_norm = 0;
   double max_cw = 0;  // max |c - r| / (|A||B|)_ij over the samples (componentwise, the GEMM accuracy measure)
@@ -683,6 +758,14 @@ struct Options {
   std::vector<int> g8fast_N, g8accu_N;              // --g8fast-N / --g8accu-N: moduli per GEMMul8 mode (empty: --N)
   int accuracy = -1;  // --accuracy 0|1: the full-matrix DGEMM comparison of method imd (-1 auto: on if its extra buffers fit modestly)
   bool gemm_view = false;  // --gemm-view 1: also time the bare GEMM on pre-permuted operands (perm+X cases)
+  // Exploration (D3, explore/syrk-big): --self 1 makes B the same device buffer as A (C = A A^T for ik,jk->ij;
+  // B's extents and strides must equal A's). Method imd_syrk (block SYRK prototype on the packed-operand API):
+  // --syrk-block row-block heights (multiples of 32), --syrk-streams concurrent streams for the block calls,
+  // --syrk-check 1 compares the whole C bit for bit with dense immerdink (and counts C(i,j) != C(j,i)).
+  bool self = false;
+  std::vector<int64_t> syrk_blocks = {4096};
+  std::vector<int> syrk_streams = {2};
+  bool syrk_check = false;
 };
 
 // A5 diagnostic (IMD_BENCH_CLOCK=1): the SM clock right after each timed call, measured by
@@ -748,6 +831,61 @@ Timing time_it(const std::function<void()>& run, cudaStream_t s, const Options& 
     cudaFreeHost(clk_buf);
   }
   return T;
+}
+
+// explore/syrk-big: time_it for a call made of stages run in order on stream s, with an event after each stage. Same
+// warm-up, repetition, budget and clock-probe rules as time_it. Returns the whole call's Timing and each stage's median ms
+// (events on s: a stage that forks work to other streams must join them back into s before it returns).
+std::pair<Timing, std::vector<double>> time_stages(const std::vector<std::function<void()>>& stages, cudaStream_t s,
+                                                   const Options& o) {
+  const size_t ns = stages.size();
+  for (int w = 0; w < o.warmup; ++w)
+    for (auto& f : stages) f();
+  CU(cudaStreamSynchronize(s));
+  CU(cudaGetLastError());
+  std::vector<cudaEvent_t> ev(ns + 1, nullptr);
+  for (auto& e : ev) CU(cudaEventCreate(&e));
+  const char* clk_env = getenv("IMD_BENCH_CLOCK");
+  const bool clk = (clk_env && *clk_env == '1') || o.clock_probe;
+  unsigned long long* clk_buf = nullptr;
+  if (clk) CU(cudaHostAlloc(&clk_buf, 2 * sizeof(unsigned long long), cudaHostAllocMapped));
+  Timing T;
+  std::vector<std::vector<double>> per(ns);
+  double total = 0;
+  for (int r = 0; r < o.reps; ++r) {
+    CU(cudaEventRecord(ev[0], s));
+    for (size_t i = 0; i < ns; ++i) {
+      stages[i]();
+      CU(cudaEventRecord(ev[i + 1], s));
+    }
+    CU(cudaEventSynchronize(ev[ns]));
+    float ms = 0;
+    CU(cudaEventElapsedTime(&ms, ev[0], ev[ns]));
+    T.t.push_back(ms * 1e-3);
+    for (size_t i = 0; i < ns; ++i) {
+      float x = 0;
+      CU(cudaEventElapsedTime(&x, ev[i], ev[i + 1]));
+      per[i].push_back(x);
+    }
+    if (clk) {
+      k_clock_probe<<<1, 32, 0, s>>>(clk_buf);
+      CU(cudaStreamSynchronize(s));
+      T.mhz.push_back(1e3 * double(clk_buf[0]) / double(clk_buf[1]));
+    }
+    total += ms * 1e-3;
+    if (r + 1 >= o.min_reps && total > o.max_seconds) break;
+  }
+  CU(cudaGetLastError());
+  for (auto& e : ev) cudaEventDestroy(e);
+  if (clk_buf) cudaFreeHost(clk_buf);
+  std::vector<double> med(ns);
+  for (size_t i = 0; i < ns; ++i) {
+    auto v = per[i];
+    std::sort(v.begin(), v.end());
+    const size_t z = v.size();
+    med[i] = z == 0 ? NAN : (z % 2 ? v[z / 2] : 0.5 * (v[z / 2 - 1] + v[z / 2]));
+  }
+  return {T, med};
 }
 
 // Two callables timed INTERLEAVED, call by call, each with its own event pair, alternating which goes first (the same
@@ -1202,8 +1340,11 @@ struct Bench {
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     CI(imd_create(&imd));
 
+    if (o.self && (c.A.extent != c.B.extent || c.A.stride != c.B.stride))
+      throw Failure("--self 1 needs B with A's extents and strides (e.g. ik,jk->ij with i = j)");
+    if (o.self && (o.dominant || o.decay_opp)) throw Failure("--self 1 supports --data normal only");
     dA = DevBuf(c.A.size * 8);
-    dB = DevBuf(c.B.size * 8);
+    dB = o.self ? DevBuf::view(dA.p, dA.bytes) : DevBuf(c.B.size * 8);
     dC = DevBuf(c.C.size * 8);
     const size_t dom = o.dominant ? size_t(c.k) : 0;
     if (o.decay_opp) {
@@ -1213,7 +1354,7 @@ struct Bench {
                                         decay_map(c.B, c, true));
     } else {
       k_fill<<<1024, 256, 0, s>>>(dA.as<double>(), c.A.size, splitmix64(o.seed * 3 + 0), o.phi, dom);
-      k_fill<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1), o.phi, dom);
+      if (!o.self) k_fill<<<1024, 256, 0, s>>>(dB.as<double>(), c.B.size, splitmix64(o.seed * 3 + 1), o.phi, dom);
     }
     CU(cudaStreamSynchronize(s));
     CU(cudaGetLastError());
@@ -1244,7 +1385,7 @@ struct Bench {
     meta.integer("m", c.m).integer("n", c.n).integer("k", c.k).integer("b", c.b);
     meta.str("gemm_view", cA + "," + cB + "->" + cC);
     meta.raw("perm_needed", std::string("\"") + (needA ? "A" : "") + (needB ? "B" : "") + (needC ? "C" : "") + "\"");
-    meta.num("phi", o.phi).integer("seed", (long long)o.seed);
+    meta.num("phi", o.phi).integer("seed", (long long)o.seed).raw("self", o.self ? "true" : "false");
     meta.integer("k_align_hook", o.k_align_hook);  // v1.13 §4b: 0 = AUTO, else forced A
     meta.str("data", o.decay_opp ? "decay_opp" : o.dominant ? "dominant" : "normal");
     meta.str("gpu", p.name).integer("sm_count", p.multiProcessorCount);
@@ -2035,6 +2176,20 @@ struct Bench {
     e.num("acc_dgemm_max_relerr_cw", ad.max_cw).num("acc_dgemm_max_relerr_elem", ad.max_rel);
     e.integer("acc_vs_dgemm_n", (long long)h[2]).integer("acc_vs_dgemm_nonfinite", (long long)h[3]);
     e.num("acc_vs_dgemm_max_cw", mx).num("acc_vs_dgemm_mean_cw", h[2] ? sm / double(h[2]) : NAN);
+    {  // elementwise max relative and Frobenius-normwise relative difference to native DGEMM (explore/syrk-big)
+      DevBuf r(24);
+      CU(cudaMemsetAsync(r.p, 0, 24, s));
+      k_rel_compare<<<1024, 256, 0, s>>>(dC.as<double>(), Cd.as<double>(), c.C.size, r.as<unsigned long long>(), r.as<double>() + 1);
+      unsigned long long q[3];
+      CU(cudaMemcpyAsync(q, r.p, 24, cudaMemcpyDeviceToHost, s));
+      CU(cudaStreamSynchronize(s));
+      CU(cudaGetLastError());
+      double mr, d2, y2;
+      std::memcpy(&mr, &q[0], 8);
+      std::memcpy(&d2, &q[1], 8);
+      std::memcpy(&y2, &q[2], 8);
+      e.num("acc_vs_dgemm_max_rel", mr).num("acc_vs_dgemm_fro_rel", y2 > 0 ? std::sqrt(d2 / y2) : NAN);
+    }
   }
 
   void method_imd(int N, int vec_mode, int g, int k4 = -1) {
@@ -2097,7 +2252,9 @@ struct Bench {
     // C's bits after the timed calls (FNV-1a 64 over the whole C buffer): equal hashes across
     // builds = bit-identical results (v1.14 A/B).
     std::string c_hash;
-    {
+    if (dC.bytes > (size_t(2) << 30)) {
+      c_hash = "skipped: C > 2 GiB (c_hash_dev is the device hash of all of C)";
+    } else {
       std::vector<unsigned char> hc(dC.bytes);
       CU(cudaMemcpy(hc.data(), dC.p, dC.bytes, cudaMemcpyDeviceToHost));
       uint64_t h = 0xcbf29ce484222325ull;
@@ -2125,6 +2282,11 @@ struct Bench {
 #endif
     extra.integer("plan_device_bytes", (long long)plan_dev).num("plan_create_ms", 1e3 * create_s);
     extra.str("c_hash", c_hash);
+    {  // the order-independent device hash of all of C (k_hash_c), comparable with method imd_syrk's
+      char hb[24];
+      snprintf(hb, sizeof hb, "%016llx", acc.chash);
+      extra.str("c_hash_dev", hb);
+    }
 #ifdef IMD_BENCH_PROFILE
     {  // Issue 22: the K4 backend asked for, the one the plan tries first (0 mma.sync, 1 wgmma: unchanged by the reset above), and the launches
        // the Hopper backend served / declined over the method's calls (served 0 with k4b_run 1: every launch fell back to mma.sync)
@@ -2546,6 +2708,336 @@ struct Bench {
     CU(cudaStreamSynchronize(s));
   }
 
+  // ---- explore/syrk-big (D3 exploration, not product API) ----------------------------------------------------------
+  // A plain ik,jk->ij case with i = j run with --self 1: C = A A^T, A row-major n x k.
+  void need_self_square(const char* method) const {
+    if (!o.self) throw Failure(std::string(method) + " needs --self 1 (B = A)");
+    if (c.b != 1 || c.I.size() != 1 || c.J.size() != 1 || c.K.size() != 1 || !c.L.empty() || c.A.labels != c.I + c.K ||
+        c.B.labels != c.J + c.K || c.C.labels != c.I + c.J || c.m != c.n)
+      throw Failure(std::string(method) + " needs a plain ik,jk->ij case with i = j");
+  }
+  unsigned mirror_grid(int64_t T) const {
+    int sms = 0;
+    CU(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    return unsigned(std::max<int64_t>(1, std::min<int64_t>(T, int64_t(sms) * 16)));
+  }
+  static std::string hex64(unsigned long long h) {
+    char hb[24];
+    snprintf(hb, sizeof hb, "%016llx", h);
+    return hb;
+  }
+
+  // Method imd_syrk: a block SYRK built from the public packed-operand API (DESIGN §6b), no library change.
+  //   1. pack: A's rows are cut into blocks of nb rows (the last one may be shorter); each block is packed ONCE with
+  //      imd_pack (sigma and all N residue planes). The A-role and B-role pack descriptors of a block (imd_pack_desc_for
+  //      operand 0 / 1) have the same key and layout (checked: pack_shared_roles), so one buffer serves both roles.
+  //   2. blocks: every lower block pair I >= J is one imd_contract_packed call: K4 on that pair's tiles only, K5 on its
+  //      outputs, written straight into C's block (I, J) through C's strides. Diagonal blocks are computed in full.
+  //      The calls go round-robin over S streams (S workspaces), so one call's tail wave and K5 overlap the next K4.
+  //   3. mirror: one pass writes the upper triangle of the off-diagonal blocks from the lower one.
+  // sigma_i depends on row i alone (DESIGN §3.2: sigma = tau for the same fibre), so every block of C equals dense
+  // immerdink's bit for bit; --syrk-check 1 verifies it over all of C. K4 work: sum over pairs of R_I R_J = about
+  // (b + 1) / (2 b) of the dense GEMM's (b blocks); K5 work the same fraction; pack 1/2 of dense (A once, not A and B).
+  void method_imd_syrk(int N, int64_t nb_req, int S) {
+    need_self_square("imd_syrk");
+    if (nb_req <= 0 || nb_req % 32 != 0) throw Failure("--syrk-block must be a positive multiple of 32");
+    if (S < 1 || S > 8) throw Failure("--syrk-streams 1..8");
+    const int64_t n = c.n, k = c.k;
+    const int64_t nb = std::min(nb_req, (n + 31) / 32 * 32);
+    const int64_t nblk = (n + nb - 1) / nb;
+    auto rows_of = [&](int64_t I) { return std::min(nb, n - I * nb); };
+    const imd_options_t opt{N, 0, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT, IMD_K4_TUNE_OFF};
+
+    // One block height R: its operand tensors, the A-role and B-role pack handles and sizes.
+    struct RowSet {
+      int64_t R = 0;
+      int64_t ext[2] = {}, str[2] = {}, cext[2] = {}, cstr[2] = {};
+      int32_t la[2] = {}, lb[2] = {}, lc[2] = {};
+      imd_tensor_t A{}, B{}, C{};
+      imd_pack_desc_t dA{}, dB{};
+      int32_t labA[8] = {}, labB[8] = {};
+      imd_pack_t pA = nullptr, pB = nullptr;
+      size_t bytesA = 0, wsA = 0, bytesB = 0, wsB = 0;
+      bool shared = false;  // B-role key and layout == A-role: one packed buffer serves both roles
+      RowSet() = default;
+      RowSet(const RowSet&) = delete;
+      RowSet& operator=(const RowSet&) = delete;
+      ~RowSet() {
+        if (pA) imd_pack_destroy(pA);
+        if (pB) imd_pack_destroy(pB);
+      }
+    };
+    std::vector<std::unique_ptr<RowSet>> rsets;
+    auto rowset = [&](int64_t R) -> RowSet& {
+      for (auto& r : rsets)
+        if (r->R == R) return *r;
+      auto r = std::make_unique<RowSet>();
+      r->R = R;
+      r->ext[0] = R, r->ext[1] = k, r->str[0] = c.A.stride[0], r->str[1] = c.A.stride[1];
+      r->cext[0] = R, r->cext[1] = R, r->cstr[0] = c.C.stride[0], r->cstr[1] = c.C.stride[1];
+      for (int d = 0; d < 2; ++d) r->la[d] = c.A.labels[d], r->lb[d] = c.B.labels[d], r->lc[d] = c.C.labels[d];
+      r->A = imd_tensor_t{2, r->ext, r->str, r->la};
+      r->B = imd_tensor_t{2, r->ext, r->str, r->lb};
+      r->C = imd_tensor_t{2, r->cext, r->cstr, r->lc};
+      r->dA.struct_size = r->dB.struct_size = sizeof(imd_pack_desc_t);
+      CI(imd_pack_desc_for(&r->A, &r->B, &r->C, &opt, 0, &r->dA, r->labA, 8));
+      CI(imd_pack_desc_for(&r->A, &r->B, &r->C, &opt, 1, &r->dB, r->labB, 8));
+      CI(imd_pack_create(imd, &r->dA, &r->pA));
+      CI(imd_pack_create(imd, &r->dB, &r->pB));
+      CI(imd_pack_bytes(r->pA, &r->bytesA, &r->wsA));
+      CI(imd_pack_bytes(r->pB, &r->bytesB, &r->wsB));
+      imd_pack_layout_t ya{}, yb{};
+      ya.struct_size = yb.struct_size = sizeof(imd_pack_layout_t);
+      CI(imd_pack_layout(&r->dA, &ya));
+      CI(imd_pack_layout(&r->dB, &yb));
+      r->shared = ya.key_digest == yb.key_digest && ya.format == yb.format && ya.k_hat == yb.k_hat && ya.r == yb.r &&
+                  ya.pack_bytes == yb.pack_bytes && ya.sig.offset == yb.sig.offset && ya.flag.offset == yb.flag.offset &&
+                  ya.res.offset == yb.res.offset && ya.res.bytes == yb.res.bytes;
+      rsets.push_back(std::move(r));
+      return *rsets.back();
+    };
+    // One plan per (R_I, R_J): at most (nb, nb), (r, nb), (r, r) with r the last block's height.
+    struct PlanE {
+      int64_t RI = 0, RJ = 0;
+      int64_t ext[2] = {}, str[2] = {};
+      int32_t lc[2] = {};
+      imd_plan_t plan = nullptr;
+      size_t ws = 0;
+      PlanE() = default;
+      PlanE(const PlanE&) = delete;
+      PlanE& operator=(const PlanE&) = delete;
+      ~PlanE() {
+        if (plan) {
+          cudaDeviceSynchronize();  // a resident plan's vectors are read by in-flight kernels
+          imd_plan_destroy(plan);
+        }
+      }
+    };
+    std::vector<std::unique_ptr<PlanE>> plans;
+    auto plan_of = [&](int64_t RI, int64_t RJ) -> PlanE& {
+      for (auto& p : plans)
+        if (p->RI == RI && p->RJ == RJ) return *p;
+      RowSet& a = rowset(RI);
+      RowSet& b = rowset(RJ);
+      auto p = std::make_unique<PlanE>();
+      p->RI = RI, p->RJ = RJ;
+      p->ext[0] = RI, p->ext[1] = RJ, p->str[0] = c.C.stride[0], p->str[1] = c.C.stride[1];
+      p->lc[0] = c.C.labels[0], p->lc[1] = c.C.labels[1];
+      const imd_tensor_t C{2, p->ext, p->str, p->lc};
+      const imd_packing_t packing{&a.dA, &b.dB};
+      CI(imd_workspace_size_packed(&a.A, &b.B, &C, &opt, &packing, &p->ws));
+      CI(imd_plan_create_packed(imd, &a.A, &b.B, &C, &opt, a.pA, b.pB, &p->plan));
+      plans.push_back(std::move(p));
+      return *plans.back();
+    };
+    // Everything is created before the timed loop.
+    double work = 0;  // sum over the block pairs of R_I R_J / n^2 (the K4 / K5 work against dense)
+    for (int64_t I = 0; I < nblk; ++I)
+      for (int64_t J = 0; J <= I; ++J) {
+        plan_of(rows_of(I), rows_of(J));
+        work += double(rows_of(I)) * double(rows_of(J)) / (double(n) * double(n));
+      }
+    bool all_shared = true;
+    size_t pws = 0, pack_total = 0, wsb = 0;
+    std::vector<DevBuf> PA, PB;
+    for (int64_t I = 0; I < nblk; ++I) {
+      RowSet& r = rowset(rows_of(I));
+      all_shared = all_shared && r.shared;
+      PA.emplace_back(r.bytesA);
+      PB.emplace_back(r.shared ? 0 : r.bytesB);  // a B-role pack of its own only if the layouts differ
+      pack_total += r.bytesA + (r.shared ? 0 : r.bytesB);
+      pws = std::max({pws, r.wsA, r.wsB});
+    }
+    for (auto& p : plans) wsb = std::max(wsb, p->ws);
+    DevBuf PW(pws);
+    std::vector<DevBuf> WS;
+    for (int q = 0; q < S; ++q) WS.emplace_back(wsb);
+    // Streams for S > 1 (fork after the packs, join before the mirror).
+    struct Fork {
+      std::vector<cudaStream_t> st;
+      std::vector<cudaEvent_t> ev;
+      cudaEvent_t packed = nullptr;
+      ~Fork() {
+        cudaDeviceSynchronize();
+        for (auto x : st) if (x) cudaStreamDestroy(x);
+        for (auto x : ev) if (x) cudaEventDestroy(x);
+        if (packed) cudaEventDestroy(packed);
+      }
+    } fk;
+    if (S > 1) {
+      fk.st.assign(S, nullptr);
+      fk.ev.assign(S, nullptr);
+      for (int q = 0; q < S; ++q) {
+        CU(cudaStreamCreateWithFlags(&fk.st[q], cudaStreamNonBlocking));
+        CU(cudaEventCreateWithFlags(&fk.ev[q], cudaEventDisableTiming));
+      }
+      CU(cudaEventCreateWithFlags(&fk.packed, cudaEventDisableTiming));
+    }
+    const double* A = dA.as<double>();
+    double* Cp = dC.as<double>();
+    const int64_t sa0 = c.A.stride[0], sc0 = c.C.stride[0], sc1 = c.C.stride[1];
+    auto do_pack = [&] {
+      for (int64_t I = 0; I < nblk; ++I) {
+        RowSet& r = rowset(rows_of(I));
+        const double* X = A + I * nb * sa0;
+        CI(imd_pack(r.pA, X, PA[I].p, r.bytesA, PW.p, pws, s));
+        if (!r.shared) CI(imd_pack(r.pB, X, PB[I].p, r.bytesB, PW.p, pws, s));
+      }
+    };
+    auto do_blocks = [&](int Se) {
+      if (Se > 1) {
+        CU(cudaEventRecord(fk.packed, s));
+        for (int q = 0; q < Se; ++q) CU(cudaStreamWaitEvent(fk.st[q], fk.packed, 0));
+      }
+      int q = 0;
+      for (int64_t I = 0; I < nblk; ++I)
+        for (int64_t J = 0; J <= I; ++J) {
+          RowSet& ri = rowset(rows_of(I));
+          RowSet& rj = rowset(rows_of(J));
+          PlanE& p = plan_of(rows_of(I), rows_of(J));
+          const imd_operand_t oA{A + I * nb * sa0, PA[I].p, ri.bytesA, ri.pA};
+          const imd_operand_t oB{A + J * nb * sa0, rj.shared ? PA[J].p : PB[J].p, rj.shared ? rj.bytesA : rj.bytesB, rj.pB};
+          double* Cij = Cp + I * nb * sc0 + J * nb * sc1;
+          CI(imd_contract_packed(p.plan, 1.0, &oA, &oB, 0.0, Cij, WS[q].p, wsb, Se > 1 ? fk.st[q] : s));
+          q = (q + 1) % Se;
+        }
+      if (Se > 1)
+        for (int q2 = 0; q2 < Se; ++q2) {
+          CU(cudaEventRecord(fk.ev[q2], fk.st[q2]));
+          CU(cudaStreamWaitEvent(s, fk.ev[q2], 0));
+        }
+    };
+    const int64_t nt = (n + 31) / 32, T = nt * (nt + 1) / 2;
+    const unsigned mg = mirror_grid(T);
+    auto do_mirror = [&] {
+      if (nblk > 1) k_mirror<<<mg, dim3(32, 8), 0, s>>>(Cp, n, nb, 0, T);
+      CU(cudaPeekAtLastError());
+    };
+
+    poison_C();
+    auto [Tm, med] = time_stages({do_pack, [&] { do_blocks(S); }, do_mirror}, s, o);
+    poison_C();  // one more call from a poisoned C: every element must be written
+    do_pack();
+    do_blocks(S);
+    do_mirror();
+    CU(cudaStreamSynchronize(s));
+    Accuracy acc = result_accuracy();
+    Json e;
+    e.integer("syrk_block", nb).integer("syrk_blocks", nblk).integer("syrk_calls", nblk * (nblk + 1) / 2);
+    e.integer("syrk_rows_last", rows_of(nblk - 1)).integer("syrk_streams", S).num("syrk_work_frac", work);
+    e.raw("pack_shared_roles", all_shared ? "true" : "false").integer("pack_bytes_total", (long long)pack_total);
+    e.integer("pack_ws_bytes", (long long)pws).integer("ws_bytes_per_stream", (long long)wsb).integer("plans", (long long)plans.size());
+    e.num("stage_pack_ms", med[0]).num("stage_blocks_ms", med[1]).num("stage_mirror_ms", med[2]);
+    e.num("tflops_eq_lower_only", flops() / (Tm.median() - 1e-3 * med[2]) / 1e12);  // without the mirror (BLAS SYRK output)
+    e.str("c_hash_dev", hex64(acc.chash));
+#ifdef IMD_BENCH_PROFILE
+    if (o.phase_reps > 0) {  // one serial pass (one stream) with the library's phase marks: K4 / K5 / pack totals
+      int64_t wg[2] = {0, 0};
+      imd_prof_k4_wgmma_counts(1, wg);
+      if (imd_prof_enable(1) != 0) throw Failure("imd_prof_enable failed");
+      imd_prof_reset();
+      do_pack();
+      do_blocks(1);
+      std::vector<const char*> tags(8192);
+      std::vector<float> ms(8192);
+      const int cnt = imd_prof_read(8192, tags.data(), ms.data());
+      imd_prof_enable(0);
+      if (cnt < 0) throw Failure("imd_prof_read failed");
+      imd_prof_k4_wgmma_counts(0, wg);
+      double pk = 0, k4 = 0, k5 = 0, gap = 0, other = 0;
+      for (int i = 0; i < cnt; ++i) {
+        const std::string t = tags[i];
+        if (t.rfind("pack", 0) == 0) pk += ms[i];
+        else if (t.rfind("K4 gemm", 0) == 0) k4 += ms[i];
+        else if (t == "K5 crt") k5 += ms[i];
+        else if (t == "begin") gap += ms[i];
+        else other += ms[i];
+      }
+      e.num("prof_pack_ms", pk).num("prof_k4_ms", k4).num("prof_k5_ms", k5).num("prof_gap_ms", gap).num("prof_other_ms", other);
+      e.integer("prof_segments", cnt).raw("prof_truncated", cnt >= 4095 ? "true" : "false");
+      e.integer("k4_wgmma_served", wg[0]).integer("k4_wgmma_declined", wg[1]);
+      int32_t k4b = -1, k4cfg = -1;
+      imd_prof_plan_k4_backend(plans.front()->plan, &k4b);
+      imd_prof_plan_k4(plans.front()->plan, &k4cfg);
+      e.integer("k4b_run", k4b).integer("k4_config", k4cfg);
+      fprintf(stderr, "  imd_syrk N=%d nb=%lld: pack %.3f K4 %.3f K5 %.3f gap %.3f other %.3f ms (%d segments), wgmma %lld/%lld\n", N,
+              (long long)nb, pk, k4, k5, gap, other, cnt, (long long)wg[0], (long long)wg[1]);
+    }
+#endif
+    if (o.syrk_check) {  // dense immerdink on the same A (B = A, method imd's plan) into C2: whole-C bitwise comparison
+      std::vector<int32_t> la(c.A.labels.begin(), c.A.labels.end()), lb(c.B.labels.begin(), c.B.labels.end()),
+          lc(c.C.labels.begin(), c.C.labels.end());
+      const imd_tensor_t tA{2, c.A.extent.data(), c.A.stride.data(), la.data()};
+      const imd_tensor_t tB{2, c.B.extent.data(), c.B.stride.data(), lb.data()};
+      const imd_tensor_t tC{2, c.C.extent.data(), c.C.stride.data(), lc.data()};
+      const imd_options_t dopt{N, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+      size_t dws = 0;
+      CI(imd_workspace_size(&tA, &tB, &tC, &dopt, &dws));
+      imd_plan_t dp = nullptr;
+      CI(imd_plan_create(imd, &tA, &tB, &tC, &dopt, &dp));
+      std::unique_ptr<imd_plan_st, imd_status_t (*)(imd_plan_t)> dg(dp, imd_plan_destroy);
+      DevBuf W(dws), C2(dC.bytes), cnt(24);
+      CU(cudaMemsetAsync(C2.p, 0xff, C2.bytes, s));
+      CI(imd_contract(dp, 1.0, dA.as<double>(), dB.as<double>(), 0.0, C2.as<double>(), W.p, dws, s));
+      CU(cudaMemsetAsync(cnt.p, 0, 24, s));
+      auto* u = cnt.as<unsigned long long>();
+      k_count_diff<<<1024, 256, 0, s>>>(dC.as<unsigned long long>(), C2.as<unsigned long long>(), c.C.size, u);
+      k_count_asym<<<1024, 256, 0, s>>>(C2.as<unsigned long long>(), n, u + 1);
+      k_count_asym<<<1024, 256, 0, s>>>(dC.as<unsigned long long>(), n, u + 2);
+      unsigned long long h[3];
+      CU(cudaMemcpyAsync(h, cnt.p, 24, cudaMemcpyDeviceToHost, s));
+      CU(cudaStreamSynchronize(s));
+      CU(cudaGetLastError());
+      e.integer("syrk_vs_dense_mismatch", (long long)h[0]).integer("dense_asym_pairs", (long long)h[1]);
+      e.integer("syrk_asym_pairs", (long long)h[2]).integer("check_elems", (long long)c.C.size);
+      e.raw("bit_identical_to_dense", h[0] == 0 ? "true" : "false");
+      fprintf(stderr, "  imd_syrk check N=%d nb=%lld S=%d: %llu mismatches vs dense over %zu elements; asym pairs dense %llu, syrk %llu\n",
+              N, (long long)nb, S, h[0], c.C.size, h[1], h[2]);
+    }
+    accuracy_fields(acc, e);  // untimed
+    record("imd_syrk", "RN nb=" + std::to_string(nb) + " S=" + std::to_string(S), N, Tm, &acc, flops(),
+           pack_total + size_t(S) * wsb, e);
+  }
+
+  // Method dsyrk: native cuBLAS DSYRK (FP64, lower) plus the mirror pass, the complete C = A A^T; one record per math
+  // mode (PEDANTIC as method dgemm; DEFAULT). Row-major A (n x k) is the column-major k x n matrix X with ld k, and
+  // X^T X = A A^T; cuBLAS' column-major lower triangle is the row-major upper one, so the mirror fills the row-major lower
+  // triangle from it. Stage times: stage_syrk_ms (the BLAS SYRK result alone) and stage_mirror_ms.
+  void method_dsyrk() {
+    need_self_square("dsyrk");
+    const int64_t nt = (c.n + 31) / 32, T = nt * (nt + 1) / 2;
+    const unsigned mg = mirror_grid(T);
+    for (const bool pedantic : {true, false}) {
+      BlasHandle H(s);
+      CB(cublasSetMathMode(H.h, pedantic ? CUBLAS_PEDANTIC_MATH : CUBLAS_DEFAULT_MATH));
+      const double one = 1.0, zero = 0.0;
+      auto do_syrk = [&] {
+#if CUBLAS_VER_MAJOR >= 12
+        CB(cublasDsyrk_64(H.h, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T, c.n, c.k, &one, dA.as<double>(), c.k, &zero,
+                          dC.as<double>(), c.n));
+#else
+        CB(cublasDsyrk(H.h, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T, int(c.n), int(c.k), &one, dA.as<double>(), int(c.k),
+                       &zero, dC.as<double>(), int(c.n)));
+#endif
+      };
+      auto do_mirror = [&] {
+        k_mirror<<<mg, dim3(32, 8), 0, s>>>(dC.as<double>(), c.n, 0, 1, T);
+        CU(cudaPeekAtLastError());
+      };
+      poison_C();
+      auto [Tm, med] = time_stages({do_syrk, do_mirror}, s, o);
+      Accuracy acc = result_accuracy();
+      Json e;
+      e.num("stage_syrk_ms", med[0]).num("stage_mirror_ms", med[1]);
+      e.num("tflops_eq_lower_only", flops() / (1e-3 * med[0]) / 1e12);
+      e.str("c_hash_dev", hex64(acc.chash));
+      accuracy_fields(acc, e);
+      record("dsyrk", pedantic ? "cublasDsyrk lower + mirror, PEDANTIC" : "cublasDsyrk lower + mirror, DEFAULT", 0, Tm, &acc,
+             flops(), 0, e);
+    }
+    CU(cudaStreamSynchronize(s));
+  }
+
 #ifdef IMD_BENCH_PROFILE
   // Per-phase times from the library's event marks, against the MEMORY_MODEL §4 lower bounds
   // and the performance model's predicted phase times (DESIGN §6c: `pred` is imd_perf_predict /
@@ -2931,6 +3423,10 @@ void usage() {
           "  [--keep-samples 0|1] (add the raw per-repetition times: samples_s; duel-b: pair_t_a, pair_t_b)\n"
           "  [--energy-warmup 3] [--energy-seconds 10] [--energy-min-calls 50] [--energy-max-seconds 30]\n"
           "  [--energy-idle 3] [--energy-step-ms <counter step period; default: measured>] (method energy)\n"
+          "  [--self 0|1] (B = A: one buffer, the case must be ik,jk->ij with i = j for imd_syrk / dsyrk)\n"
+          "  [--syrk-block 4096] [--syrk-streams 2] [--syrk-check 0|1] (method imd_syrk, explore/syrk-big: block SYRK from the\n"
+          "      packed API, lower block pairs + mirror; check: whole-C bitwise comparison with dense immerdink)\n"
+          "  methods with --self 1: imd_syrk, dsyrk (cuBLAS DSYRK lower + mirror; PEDANTIC and DEFAULT math)\n"
           "  [--out file.jsonl]\n");
 }
 
@@ -2949,7 +3445,8 @@ int main(int argc, char** argv) {
                                       "sustain-warm-s", "sustain-trace-s", "k-align",
                                       "energy-warmup", "energy-seconds", "energy-max-seconds",
                                       "energy-idle", "energy-min-calls", "energy-step-ms",
-                                      "keep-samples", "accuracy", "seq", "crt", "k4b", "fused", "xduel-b", "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view"};
+                                      "keep-samples", "accuracy", "seq", "crt", "k4b", "fused", "xduel-b", "emu", "emu-ws-mib", "ct-ws", "g8mode", "g8fast-N", "g8accu-N", "gemm-view",
+                                      "self", "syrk-block", "syrk-streams", "syrk-check"};
   for (int i = 1; i < argc; ++i) {
     std::string k = argv[i];
     if (k.rfind("--", 0) != 0 || i + 1 >= argc) { usage(); return 2; }
@@ -2964,11 +3461,11 @@ int main(int argc, char** argv) {
   static const char* const kMethods[] = {"imd", "packed", "duel", "bw", "occupancy", "sustained", "pair",
                                          "energy", "xduel", "cutensor", "cutensor-emu", "dgemm", "emu", "gemmul8",
                                          "energy-cutensor", "energy-cutensor-emu", "energy-dgemm",
-                                         "energy-emu", "energy-gemmul8"};
+                                         "energy-emu", "energy-gemmul8", "imd_syrk", "dsyrk"};
   for (auto& m : split(a["methods"], ','))
     if (std::find(std::begin(kMethods), std::end(kMethods), m) == std::end(kMethods)) {
       fprintf(stderr, "unknown method %s (imd, packed, duel, bw, occupancy, sustained, pair, energy; "
-                      "baselines: cutensor, cutensor-emu, dgemm, emu, gemmul8 and energy-<baseline>)\n", m.c_str());
+                      "baselines: cutensor, cutensor-emu, dgemm, emu, gemmul8 and energy-<baseline>; with --self 1: imd_syrk, dsyrk)\n", m.c_str());
       return 2;
     }
   if (!a.count("name") || !a.count("spec") || !a.count("ext")) { usage(); return 2; }
@@ -3034,6 +3531,19 @@ int main(int argc, char** argv) {
         for (auto& v : split(a[key], ','))
           (std::string(key) == "g8fast-N" ? B.o.g8fast_N : B.o.g8accu_N).push_back(std::stoi(v));
     if (a.count("gemm-view")) B.o.gemm_view = a["gemm-view"] == "1";
+    if (a.count("self")) {
+      if (a["self"] != "0" && a["self"] != "1") throw Failure("--self 0|1");
+      B.o.self = a["self"] == "1";
+    }
+    if (a.count("syrk-block")) {
+      B.o.syrk_blocks.clear();
+      for (auto& v : split(a["syrk-block"], ',')) B.o.syrk_blocks.push_back(std::stoll(v));
+    }
+    if (a.count("syrk-streams")) {
+      B.o.syrk_streams.clear();
+      for (auto& v : split(a["syrk-streams"], ',')) B.o.syrk_streams.push_back(std::stoi(v));
+    }
+    if (a.count("syrk-check")) B.o.syrk_check = a["syrk-check"] == "1";
     if (a.count("phi")) B.o.phi = std::stod(a["phi"]);
     if (a.count("clock-probe")) B.o.clock_probe = a["clock-probe"] == "1";
     if (a.count("l2")) {
@@ -3158,7 +3668,14 @@ int main(int argc, char** argv) {
       for (int N : Ns)
         for (auto& w : split(a.count("pack") ? a["pack"] : "A", ','))
           guarded(m, "pack " + w, N, [&] { B.method_packed(N, w == "B" ? 1 : 0, reuse); });
-    }
+    } else if (m == "imd_syrk") {  // explore/syrk-big: --self 1 --syrk-block 2048,4096 --syrk-streams 1,2 [--syrk-check 1]
+      for (int N : Ns)
+        for (int64_t nb : B.o.syrk_blocks)
+          for (int S : B.o.syrk_streams)
+            guarded(m, "RN nb=" + std::to_string(nb) + " S=" + std::to_string(S), N,
+                    [&] { B.method_imd_syrk(N, nb, S); });
+    } else if (m == "dsyrk")
+      guarded(m, "cublasDsyrk lower + mirror", 0, [&] { B.method_dsyrk(); });
   }
   if (B.out != stdout) fclose(B.out);
   return 0;
