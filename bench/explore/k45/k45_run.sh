@@ -28,7 +28,7 @@ source $HOME/repos/generalWork/phoenix/immerdink/hpc_common.sh
 hpc_toolchain_setup || { echo "ERROR: toolchain"; exit 4; }
 export TMPDIR=${TMPDIR:-/tmp}
 export CUDA_CACHE_PATH=$TMPDIR/nvcache IMMERDINK_GPU_LOCK=none
-export XDG_RUNTIME_DIR=$TMPDIR/xdg; mkdir -p "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR=$TMPDIR/xdg XDG_CACHE_HOME=$TMPDIR/xdgcache; mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CACHE_HOME"
 CTR="$(find_cutensor 2>/dev/null)" || CTR=$E
 [ -n "$CTR" ] || CTR=$E
 CTL="$(_cutensor_lib "$CTR")" || CTL=$E/lib
