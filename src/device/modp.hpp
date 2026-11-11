@@ -170,5 +170,18 @@ IMD_HD int32_t pack_smod(uint32_t d, uint32_t sg, const PackEmit& c) {
   const auto q = static_cast<uint32_t>((uint64_t{s1} * c.m32 + c.hm) >> 32);
   return static_cast<int32_t>(s1 + c.negp * q);
 }
+// O1 (residue.hpp PackEmitTableO): s' = C2 + sum_j dp4a(y_j, w_j), the start value riding in the chain's accumulator, and
+// u = SMod(s', p) by the same quotient as pack_smod without the sign multiply. s' + h < 2^24 (pack_emit_o_bounds_ok).
+IMD_HD uint32_t pack_dot_o(const uint32_t (&y)[2], const PackEmit& c) {
+#if defined(__CUDA_ARCH__)
+  return __dp4a(y[1], c.w[1], __dp4a(y[0], c.w[0], c.C));
+#else
+  return c.C + dot_bytes(y[0], c.w[0]) + dot_bytes(y[1], c.w[1]);
+#endif
+}
+IMD_HD int32_t pack_smod_o(uint32_t s1, const PackEmit& c) {
+  const auto q = static_cast<uint32_t>((uint64_t{s1} * c.m32 + c.hm) >> 32);
+  return static_cast<int32_t>(s1 + c.negp * q);
+}
 
 }  // namespace imd::device

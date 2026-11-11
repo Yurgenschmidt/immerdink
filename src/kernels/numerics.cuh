@@ -252,6 +252,15 @@ __device__ __forceinline__ uint64_t quantize_cvt(uint64_t b, const QuantScale& s
   const uint64_t X = rz ? static_cast<uint64_t>(__double2ull_rz(y)) : static_cast<uint64_t>(__double2ull_rn(y));
   return Mut == 3 ? X : (non_finite(b) ? 0 : X);
 }
+// O1 (issue 21, task 17): the same conversion of the SIGNED product, written as the offset-binary Y = a' + 2^63. RN and RZ are
+// symmetric in the sign, so a' = sign(x) quantize_cvt(|x|) exactly; |a'| < 2^63 (W = 2), so the int64 conversion never saturates.
+template <bool TRUNC, int Mut = 0>
+__device__ __forceinline__ uint64_t quantize_cvt_offset(uint64_t b, const QuantScale& s) {
+  const double y = from_bits(b) * s.f1 * (Mut == 1 ? 1.0 : s.f2);
+  const bool rz = TRUNC && Mut != 2;
+  const auto a = static_cast<uint64_t>(rz ? __double2ll_rz(y) : __double2ll_rn(y));
+  return (Mut == 3 ? a : (non_finite(b) ? 0 : a)) ^ (Mut == 13 ? 0 : kSignBit);  // Mut 13: the top bit not flipped
+}
 
 // §3.4: SMod((mu mod p)(2^eps mod p), p) as int8 for a' = (neg ? -1 : 1) mu 2^eps.
 __device__ __forceinline__ int8_t residue(uint64_t mu, bool neg, int eps, int l) {

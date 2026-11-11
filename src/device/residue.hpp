@@ -122,4 +122,41 @@ constexpr bool pack_emit_bounds_ok(const PackEmitTable& t) {
 }
 static_assert(pack_emit_bounds_ok(kPackEmit), "E1: C >= dmax, C multiple of p, C + dmax + h < 2^24");
 
+// ---- Sequence O1 (issue 21, task 17): the offset-binary input of the E1 emitter, W = 2 only. The quantize writes
+// Y = a' + 2^63 (the two's-complement a' with its top bit flipped; |a'| <= T(N) < 2^63 for W = 2, so 0 < Y < 2^64) instead of
+// |a'| and a sign. The sign then needs no per-modulus multiply: with C2 = (-2^63) mod p as the dp4a chain's start value,
+//   s' = C2 + sum_j dp4a(y_j, w_j) = Y - 2^63 = a' (mod p),  0 <= s' <= C2 + dmax < p + dmax,
+// and q, u as for E1: u = SMod(a', p). p = 256: C2 = 0, the low byte of Y is the low byte of a'. Same struct as E1, C holds C2.
+constexpr uint32_t pow2_63_mod(uint32_t p) {
+  uint32_t r = 1 % p;
+  for (int i = 0; i < 63; ++i) r = (2 * r) % p;
+  return r;
+}
+struct alignas(16) PackEmitTableO {
+  PackEmit e[imd::constants::kNMax];  // [l]; the W = 2 weights (meaningful for l < kPackW2MaxN)
+};
+constexpr PackEmitTableO make_pack_emit_o(const PackEmitTable& t2, const imd::constants::Tables& t) {
+  PackEmitTableO r{};
+  for (int l = 0; l < imd::constants::kNMax; ++l) {
+    r.e[l] = t2.e[0][l];
+    const uint32_t p = t.moduli[l];
+    r.e[l].C = (p - pow2_63_mod(p)) % p;
+  }
+  return r;
+}
+inline constexpr PackEmitTableO kPackEmitO = make_pack_emit_o(kPackEmit, imd::constants::kTables);
+// O1's bounds: C2 < p and C2 = -2^63 (mod p); s' + h <= C2 + dmax + floor(p / 2) < 2^24 (the A5 range of E1).
+constexpr bool pack_emit_o_bounds_ok(const PackEmitTableO& t) {
+  for (int l = 0; l < imd::constants::kNMax; ++l) {
+    const PackEmit& c = t.e[l];
+    const uint32_t p = 0u - c.negp;
+    uint32_t dmax = 0;
+    for (int j = 0; j < 2; ++j)
+      for (int i = 0; i < 4; ++i) dmax += 255u * ((c.w[j] >> (8 * i)) & 255u);
+    if (c.w[2] != 0 || c.C >= p || (c.C + pow2_63_mod(p)) % p != 0 || c.C + dmax + p / 2 >= (1u << 24)) return false;
+  }
+  return true;
+}
+static_assert(pack_emit_o_bounds_ok(kPackEmitO), "O1: C2 = -2^63 mod p, C2 + dmax + h < 2^24");
+
 }  // namespace imd::device
