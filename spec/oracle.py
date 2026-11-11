@@ -747,6 +747,14 @@ class GemmView:
     def empty_output(self):
         return self.b == 0 or self.m == 0 or self.n == 0
 
+    def pivot(self, x):
+        """host/index_map.cpp pack_pivot of post-swap operand x (0: A, 1: B) on this view's fused modes (params.pack_pivot):
+        (along_rows, radix)."""
+        import params  # spec/params.py, beside this file (on sys.path: _load_moduli)
+        X = "AB"[x]
+        groups = [(e, st[X]) for _, e, st in self.fused["IJ"[x]] + self.fused["L"]]
+        return params.pack_pivot(groups, self.fused["K"][0][2][X] if self.fused["K"] else 0)
+
 
 def lower(A: Desc, B: Desc, C: Desc, mode=EMULATE, build_vec=True, orders=None) -> GemmView:
     """DESIGN §5 lowering with the legality rows 1-5 in precedence order (rows 6-7 are

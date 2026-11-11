@@ -275,3 +275,43 @@ The fixed (N-independent) part of the large-row pack KL is cut by three new sequ
 a compile-time section-timer knob (`-DIMMERDINK_KL_TIMERS`) and `tools/kl_timers.py` for the dynamic cycle split on the cluster. What is redundant (static analysis and
 executed-instruction counts), what each bit does, SASS identity of the off path on sm_89 / sm_90a / sm_120, resources, tests, expectations per class and the pre-registered R4
 adoption rule are in `docs/NOTES-23.md`. The hooks now force every supported combination of the bits (1, 2, 4, 16, 32, 64; Q1 needs E1); bit 8 is still a class default only.
+
+## KL operand rules: klstrided and klstarve
+
+**What.** Without the small-k fused launch KF (k̂ > 1024), each in-line operand is scaled and packed (residue group 1) by the
+fused large launch **KL**, or by **K1** (the scale kernel) followed by the group-1 pack **K2/K3**. Both give bit-identical results;
+only the speed differs. `fused_large` (host/analysis.hpp) is the plan-time choice. It is a bit mask over the GEMM's A and B
+(post-swap).
+
+**Why KL can lose.** An operand read *along rows* (its unit stride is a row index, not k) is tiled as 8 rows × 512 k. One KL block
+walks a row's nc = ⌈k̂/512⌉ chunks serially, at about 5.5 µs per chunk on both the RTX 4090 and the H100. K1 + K2/K3 spread k
+over a large grid instead. KL therefore loses when the walk is long or when its grid is too small to fill the GPU:
+
+| rule | classes | drops an along-rows operand when | evidence: t(KL both) / t(KL dropped), same bits |
+|---|---|---|---|
+| klstrided | sm_90 (`kKlStridedTable`) | nc ≥ 64 | H200: 264×256×32768 ak,kb 1.50; 1000×64×50000 ik,kj 1.39; 2048²×32768 ik,kj 1.09. On the 4090 it loses (0.96, 0.84), so it is off there. |
+| klstarve | all (`kKlStarvedTable`) | 2 · tiles ≤ SMs and nc ≥ 4; tiles = radix · ⌈(b·rows/radix)/8⌉, the KL block count | 4090 (128 SMs), N=14, ik,kj m=4096 k=8192 (nc 16): B tiles 8 / 32 / 64 / 128 / 256 → 1.061 / 1.033 / 1.006 / 0.997 / 0.986. Mirror ki,jk on A: 1.054 / 0.999 / 0.985. 8 tiles at nc 4 / 8: 1.034 / 1.052. 1000×64×32768: 1.205. H100 (132 SMs) 1000×64 kj (8 tiles) at nc 16 / 32 / 98: 1.34 / 1.32 / 1.34. |
+
+The klstarve saving grows linearly with nc: 0.012 / 0.039 / 0.089 / 0.35 ms at nc 4 / 8 / 16 / 64, which matches the serial
+chunk walk. The crossover sits between 64 and 128 tiles on 128 SMs, which is where the SMs/2 threshold comes from.
+
+**Method lesson.** I predicted the starvation gain from the KL phase alone and got it 4× too high. The saving itself was right
+(about 5.5 µs per chunk). The ratio's denominator was wrong: it left out the other operand's 268 MB pack. Predict a ratio against
+the whole call, not the phase.
+
+**Caveats (not yet measured):**
+- The H100 crossover (≤ 66 tiles) is extrapolated from the 4090. There are H100 points only at 8 and 256 tiles.
+- nc = 3 (k̂ 1025..1536) is unmeasured, hence the floor nc ≥ 4.
+- All points are N=14 with n a multiple of 16. Dropping KL adds one launch (the group-1 pack), or two for B with n̂ > n (the
+  zero-rows launch). Small N (one residue group) and odd n are untested.
+- IMD_TABLE_SM89 also serves sm_120, which inherits klstarve without evidence of its own.
+- `imd_pack` keeps KL (its cost is paid once and amortized; it has no K1 + K2/K3 path).
+
+**Performance model.** perf.cpp applies the reference class's rule (klstarve) at the calibration's SM count. A dropped operand
+has no KL phase. Its K1 is folded into its PACK phase: one launch, two reads of the operand (the second an L2 re-read), σ and the
+flag, and no chain term yet. A K1 phase of its own waits for the next calibration. Records from now-starved shapes no longer
+carry KL features, which shifts the `kl.chain` refit data.
+
+**Hooks.** `imd_test_set_fused(6)` applies the sm_90 rules at the device's SM count on any device. The bench hooks
+`fused=a|b|ref` (4 / 5 / 7) start from the v1.6 rule (KL for every in-line operand), so duels stay meaningful where the device
+rule already dropped an operand.

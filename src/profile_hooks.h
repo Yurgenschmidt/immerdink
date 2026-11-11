@@ -35,9 +35,9 @@
  *                         kSeqLimbCrt bit; a forced set 0..7 has none = integer). Returns 0, 1 if invalid.
  *   imd_prof_set_fused(mode)
  *                         issue 21: plans created afterwards use no fused launch (0: K1 + the group-1 pack instead of KL / KF)
- *                         or the plan-time rules (-1); 4 / 5: the device class's rules, then KL kept for the GEMM's A / B only
- *                         (the other operand takes K1 + the group-1 pack); 7: the reference class's KL rule (KL for both in-line
- *                         operands, also on sm_90 where klstrided drops one). Read at plan creation. Returns 0, 1 if invalid.
+ *                         or the plan-time rules (-1); 4 / 5: KL for the GEMM's A / B only (the other operand takes K1 + the
+ *                         group-1 pack); 7: KL for both in-line operands (the v1.6 rule, whatever the device class's klstarve /
+ *                         klstrided rules drop); 4, 5 and 7 keep KF where it applies. Read at plan creation. Returns 0, 1 if invalid.
  *   imd_prof_set_seq(bits)
  *                         issue 21: later calls run the instruction-sequence set `bits` (1 E1 emitter, 2 Q1 quantize,
  *                         4 F1 finish, 128 k5fin (issue 23; needs F1, acts only with the limb CRT); host/seq_config.hpp)

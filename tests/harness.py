@@ -372,14 +372,6 @@ class Library:
         assert self.lib.imd_plan_info(plan, raw) == 0
         return C.c_int32.from_buffer(raw, 160).value
 
-    def plan_fused_large_rule(self, plan):
-        """The KL mask the sm_90 table set's rule allows (issue 21 klstrided): 3 below ceil(k_hat / 512) = 64 chunks; at or above it the
-        plan's own mask: a placeholder there (it accepts whatever the plan chose). The per-operand rule is checked exactly, GPU-free, by
-        test_host.py check_kl_strided, and the plan-to-lowering wiring by test_host suite_plan run on an H100 / H200."""
-        v = self.plan_sizes(plan)
-        k_hat = v[7]
-        return v[37] if -(-k_hat // 512) >= 64 else 3
-
     def plan_k4(self, plan):
         """(K4 configuration the plan runs, that of its K4 parameters, its SM count); the
         first two are -1 without K4 (v1.5)."""

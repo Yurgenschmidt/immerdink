@@ -226,8 +226,12 @@ int main() {
     run("matrix 300x200x700 N=14 g=5", {300, 700}, {1, 3}, {700, 200}, {3, 2}, {300, 200}, {1, 2},
         14, 5, 1.0, vec, h);
     // v1.6 KL for both operands (k_hat = 5008 > 1024): A along k (two chunks), B along rows
-    // (8-row tiles, ten chunks: re-read chunks), RB rows 40..47 zeroed by KL_B; g = 3.
-    run("matrix 200x40x5000 N=8 g=3 (KL)", {200, 5000}, {1, 3}, {5000, 40}, {3, 2}, {200, 40},
+    // (8-row tiles, ten chunks: re-read chunks), RB rows 1032..1039 zeroed by KL_B; g = 3. B has
+    // 1032 rows (129 KL tiles: issue 21 klstarve keeps its KL on any device of < 258 SMs).
+    run("matrix 200x1032x5000 N=8 g=3 (KL)", {200, 5000}, {1, 3}, {5000, 1032}, {3, 2}, {200, 1032},
+        {1, 2}, 8, 3, 1.0, vec, h);
+    // issue 21 klstarve: a 40-row B read along rows (5 KL tiles) takes K1 + K3 under capture.
+    run("matrix 200x40x5000 N=8 g=3 (K1 + K3 for B)", {200, 5000}, {1, 3}, {5000, 40}, {3, 2}, {200, 40},
         {1, 2}, 8, 3, 1.0, vec, h);
     run("batched lik,lkj->ilj N=9", {4, 64, 200}, {4, 1, 3}, {4, 200, 48}, {4, 3, 2}, {64, 4, 48},
         {1, 4, 2}, 9, 0, -1.5, vec, h);

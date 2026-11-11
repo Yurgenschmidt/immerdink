@@ -422,8 +422,11 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     P.launches = v + 1;
   } else {
     const bool fused = fused_path(e);
-    // The calibration names no table set: the reference class's rule (issue 21 klstrided is not modelled yet).
-    const int32_t fl = fused_large(e, IMD_TABLE_SM89);
+    // The calibration names no table set: the reference class's rule (issue 21 klstarve) at the calibration's
+    // SM count (klstrided, an sm_90 rule, is not modelled yet). An in-line operand without KF or KL takes K1 +
+    // K2/K3: its K1 is folded into its PACK phase below (one launch, two reads of the operand, the second an
+    // L2 re-read, sigma and the flag; no chain term yet: a K1 phase of its own waits for the next calibration).
+    const int32_t fl = fused_large(e, IMD_TABLE_SM89, sms);
     const double N = e.N, g = e.g;  // g in [1, N]
     const double rows[2] = {b * m, b * n}, pad[2] = {b * m, b * nh};
     const bool inl[2] = {!(e.packed & 1), !(e.packed & 2)};
@@ -447,9 +450,9 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
       add_phase(&P, IMD_PERF_PHASE_KF, IMD_PERF_CLASS_KF, 1,
                 {1, bytes, ops, r, kf_elem_chain(e, cal), chain}, bytes)
           .in_bytes = in;
-    } else {  // KL per in-line operand (v1.6: every in-line operand without KF)
+    } else {  // KL per operand of fl (v1.6: every in-line operand without KF; issue 21: less the dropped)
       for (int x = 0; x < 2; ++x)
-        if (inl[x])
+        if (fl & (1 << x))
           add_kl(&P, cal, x == 0 ? IMD_PERF_PHASE_KL_A : IMD_PERF_PHASE_KL_B, rows[x], pad[x], k,
                  kh, g, e.pack_along_rows[x], e.k_hat, -1, e.b, x == 0 ? e.m : e.n,
                  e.pack_radix[x]);
@@ -472,10 +475,12 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
     for (int x = 0; x < 2; ++x) {
       if (!inl[x]) continue;
       const bool first_done = fused || (fl & (1 << x));
+      const bool k1 = !first_done;  // issue 21: KL dropped for this operand, so K1 runs (folded in)
       const int64_t groups = G - (first_done ? 1 : 0);
       if (groups <= 0) continue;
       const double moduli = first_done ? N - g : N;  // moduli of the packed groups
-      const double bytes = groups * 8 * rows[x] * k + moduli * pad[x] * kh;
+      const double k1_bytes = k1 ? 16 * rows[x] * k + 3 * rows[x] : 0;
+      const double bytes = groups * 8 * rows[x] * k + moduli * pad[x] * kh + k1_bytes;
       const int64_t per = 1 + ((x == 1 && e.n_hat > e.n) ? 1 : 0);
       // v1.10: the chain of each group's k23_pack launch (pack_launch, shared with contract.cu).
       double chain = 0, wave = 0;
@@ -491,12 +496,17 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
       }
       // v1.15: the chain has no (1 + f) factor; v1.17: slot 3 = the bytes that are not L2-hit
       // re-reads (every read after the operand's first in this call, when S <= L_hit; §6c.1)
-      const double hit = l2_hit ? dbl(groups - (first_done ? 0 : 1)) * 8 * rows[x] * k : 0;
-      add_phase(&P, x == 0 ? IMD_PERF_PHASE_PACK_A : IMD_PERF_PHASE_PACK_B, IMD_PERF_CLASS_PACK,
-                groups * per,
-                {static_cast<double>(groups * per), bytes, moduli * rows[x] * k, bytes - hit,
-                 chain, wave},
-                bytes);
+      // (with K1: its second pass is an L2 re-read, and its first read is the operand's first)
+      const double hit = k1 ? dbl(l2_hit ? groups + 1 : 1) * 8 * rows[x] * k
+                     : l2_hit ? dbl(groups - (first_done ? 0 : 1)) * 8 * rows[x] * k
+                              : 0;
+      const int64_t launches = groups * per + (k1 ? 1 : 0);
+      PerfPhase& ph = add_phase(&P, x == 0 ? IMD_PERF_PHASE_PACK_A : IMD_PERF_PHASE_PACK_B,
+                                IMD_PERF_CLASS_PACK, launches,
+                                {static_cast<double>(launches), bytes, moduli * rows[x] * k,
+                                 bytes - hit, chain, wave},
+                                bytes);
+      if (k1) ph.in_bytes = 8 * rows[x] * k;
     }
     // K4: the A3 round model of the configuration, over the groups and the K-chunks.
     const int32_t cfg = k4 >= 0 ? k4 : k4_select(e, sms);

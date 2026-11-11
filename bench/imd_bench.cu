@@ -1079,7 +1079,7 @@ struct Bench {
   cudaStream_t s = nullptr;
   imd_handle_t imd = nullptr;
   // PR #55 review: imd_lowering is asked for THIS device (the v3 / v7 inputs sm_count and table_id), so the records' fused_large,
-  // kernel_launches and k4_rule are what the plan runs (issue 21 klstrided makes fused_large per table set). Cached: -1 not yet asked.
+  // kernel_launches and k4_rule are what the plan runs (issue 21 makes fused_large per table set and SM count: klstrided, klstarve). Cached: -1 not yet asked.
   int32_t low_sms = -1, low_table = -1;
   void for_device(imd_lowering_t* low) {
     if (low_table < 0) {

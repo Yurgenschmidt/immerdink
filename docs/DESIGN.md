@@ -770,8 +770,16 @@ than the remaining residues whenever N − g > 8. So the workspace formula (§4a
 unchanged and later groups re-read x as before.
 
 **Selection (`fused_large`, libimmerdink_host).** Bit 0 (A) / bit 1 (B) is set iff the plan
-runs the emulated GEMM without KF (k̂ > 1024). It is decided at plan time from the lowering
-only (no SM count, no data), so `imd_lowering` reports the plan's choice exactly.
+runs the emulated GEMM without KF (k̂ > 1024) and x is in-line, except (issue 21, per device
+class) for an operand x read along rows (8-row × 512-k tiles, nc = ⌈k̂/512⌉ chunks per row
+walked serially by one block) that takes K1 + its group-1 pack instead when
+- **klstarve** (every class): its KL grid would leave half the SMs idle, 2 · tiles ≤ SMs
+  with tiles = radix · ⌈(b · rows / radix) / 8⌉, and nc ≥ 4; or
+- **klstrided** (sm_90): nc ≥ 64.
+
+It is decided at plan time from the lowering, the table set and the device's SM count (no
+data), so `imd_lowering` with the device's `sm_count` and `table_id` reports the plan's
+choice exactly. Evidence and caveats: `docs/NOTES-21.md` "KL operand rules".
 
 **[v1.4] Moduli parts.** A pack launch (K2/K3 and KF) with fewer tiles than about two per
 SM splits the group's slots over `gridDim.y` block rows: part y of a row writes the slots

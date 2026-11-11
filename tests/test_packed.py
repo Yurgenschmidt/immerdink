@@ -396,9 +396,12 @@ def suite_packed(lib, cuda, verbose):
         which="AB", alpha=0.0, beta=-2.0)
     run("k=0", T([m, 0], [I, K]), T([0, n], [K, J]), T([m, n], [I, J]), which="AB", beta=-2.0)
     run("empty output", T([0, k], [I, K]), T([k, n], [K, J]), T([0, n], [I, J]), which="AB")
-    # rows longer than one KL chunk at the production rule (k_hat > 1024: KL in-line)
+    # rows longer than one KL chunk at the production rule (k_hat > 1024: KL in-line for the k-contiguous A; issue 21
+    # klstarve: the 2-row B, read along rows, takes K1 + K3), and a B of 520 rows (65 KL tiles: KL along rows on <= 128 SMs)
     run("long k (KL rule)", T([3, 2100], [I, K]), T([2100, 2], [K, J]), T([3, 2], [I, J]),
         which=both, order="auto", N=9, nonfinite=True)
+    run("long k, 520-row B (KL along rows)", T([3, 2100], [I, K]), T([2100, 520], [K, J]), T([3, 520], [I, J]),
+        which=both, order="auto", N=9)
     # m = n = 1, b = 3300, g = N = 20: 66000 batches (the K4 batch split) over pack planes
     run("kl,kl->l (b=3300)", T([3, 3300], [K, L]), T([3, 3300], [K, L]), T([3300], [L]),
         which="AB", order="auto", N=20, kind="uniform")
