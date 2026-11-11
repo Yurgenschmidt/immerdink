@@ -101,14 +101,16 @@ struct PackEmitterT {
     else if constexpr (kE1) sg[e] = ((b >> 63) != 0) != (Mut == 11) ? 0xFFFFFFFFu : 1u;  // Mut 11: the sign inverted
     else neg |= static_cast<uint32_t>((b & kSignBit) != 0) << e;
   }
-  // Q1 (W = 2): X from the conversion of |x| 2^sigma.
+  // Q1 (W = 2): X from the conversion of |x| 2^sigma; with O1, Y = a' + 2^63 from the conversion of the signed x 2^sigma.
   template <bool TRUNC>
   __device__ __forceinline__ void load_cvt(const uint64_t* bits, const QuantScale& qs) {
 #pragma unroll
     for (int e = 0; e < E; ++e) {
       const uint64_t X = kO1 ? quantize_cvt_offset<TRUNC, Mut>(bits[e], qs) : quantize_cvt<TRUNC, Mut>(bits[e], qs);
 #ifndef NDEBUG
-      assert(Mut != 0 || kO1 || X >> imd::constants::kPackXBits2 == 0);  // (a planted bug may break the bound)
+      // (a planted bug may break the bound) E1: bitlen X <= 63; O1: the signed F2I did not saturate (|a'| < 2^63, review of 05697a4)
+      assert(Mut != 0 || (kO1 ? static_cast<int64_t>(X ^ kSignBit) != INT64_MIN && static_cast<int64_t>(X ^ kSignBit) != INT64_MAX
+                              : X >> imd::constants::kPackXBits2 == 0));
 #endif
       set_sign(e, bits[e]);
       x[0][e] = static_cast<uint32_t>(X);
@@ -162,13 +164,13 @@ struct PackEmitterT {
     uint32_t u[E];
 #pragma unroll
     for (int e = 0; e < E; ++e) {
-      uint32_t xe[W];
-#pragma unroll
-      for (int j = 0; j < W; ++j) xe[j] = x[j][e];
       if constexpr (kO1) {
         const uint32_t y[2] = {x[0][e], x[1][e]};
         u[e] = static_cast<uint32_t>(imd::device::pack_smod_o(imd::device::pack_dot_o(y, c), c));
       } else {
+        uint32_t xe[W];
+#pragma unroll
+        for (int j = 0; j < W; ++j) xe[j] = x[j][e];
         u[e] = static_cast<uint32_t>(imd::device::pack_smod(imd::device::pack_dot<W>(xe, c), sg[e], c));
       }
     }

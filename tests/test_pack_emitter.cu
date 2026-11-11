@@ -427,7 +427,7 @@ int mutation_checks() {
   CUDA_CHECK(cudaMemcpyToSymbol(imd::device::c_pack_emit, &good, sizeof good));
   // O1's table (task 17): C2 off by one, m32 - 1, a weight lane +1; each caught by the O1 d sweep or the O1 end-to-end run
   const imd::device::PackEmitTableO good_o = imd::device::kPackEmitO;
-  const struct { const char* what; int kind, l; } muts_o[] = {{"O1 C2 + 1", 0, 4}, {"O1 C2 - 1 (mod p), p = 256", 1, 15},
+  const struct { const char* what; int kind, l; } muts_o[] = {{"O1 C2 + 1", 0, 4}, {"O1 C2 - 1 (mod p), p = 256", 1, 0},
                                                               {"O1 m32 - 1", 2, 9}, {"O1 weight lane +1", 3, 11}};
   for (const auto& m : muts_o) {
     imd::device::PackEmitTableO t = good_o;
