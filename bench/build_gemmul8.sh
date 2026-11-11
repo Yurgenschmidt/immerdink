@@ -78,7 +78,8 @@ tar -C "$src" --exclude=.git --exclude=./build --exclude=./lib -cf - . | tar -C 
 mkdir -p "$inst/lib" "$inst/include"
 log="$inst/build.log"
 
-exec 9>"${TLC_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/immerdink-tlc.lock}"
+rt="${XDG_RUNTIME_DIR:-/tmp}"; [ -d "$rt" ] && [ -w "$rt" ] || rt=/tmp   # Slurm can export a /run/user dir that does not exist
+exec 9>"${TLC_LOCK:-$rt/immerdink-tlc.lock}"
 flock 9
 t0=$(date +%s)
 echo "build_gemmul8: $pin_name ($pin_commit) for sm_$arch, INT8 GEMM family, static library (log: $log)"

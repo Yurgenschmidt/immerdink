@@ -68,7 +68,8 @@ else
   echo "build: GEMMUL8_DIR not set: method gemmul8 is compiled out"
 fi
 
-exec 9>"${TLC_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/immerdink-tlc.lock}"
+rt="${XDG_RUNTIME_DIR:-/tmp}"; [ -d "$rt" ] && [ -w "$rt" ] || rt=/tmp   # Slurm can export a /run/user dir that does not exist
+exec 9>"${TLC_LOCK:-$rt/immerdink-tlc.lock}"
 flock 9
 cmake "${cfg[@]}"
 targets=(--target imd_bench)

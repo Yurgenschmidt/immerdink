@@ -11,7 +11,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 [ $# -ge 1 ] || { echo "usage: $0 command [args...]" >&2; exit 2; }
 
 if [ "${QUIET_GATE:-0}" = 1 ]; then
-  exec 9>"${TLC_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/immerdink-tlc.lock}"
+  rt="${XDG_RUNTIME_DIR:-/tmp}"; [ -d "$rt" ] && [ -w "$rt" ] || rt=/tmp   # Slurm can export a /run/user dir that does not exist
+  exec 9>"${TLC_LOCK:-$rt/immerdink-tlc.lock}"
   flock 9
   if [ "${QUIET_MODE:-gate}" = record ]; then
     # Opt-in: do not wait, only record the conditions (QUIET_LOG). For shared nodes where the quiet checks cannot
