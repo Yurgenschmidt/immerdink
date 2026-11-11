@@ -11,6 +11,10 @@
 // run the integer CRT, and the K5 hooks force the CRT separately: 0 integer, 1 limb, -1 follow the class set).
 // Bit 256 'klf64' (issue 21, docs/NOTES-21-klf64.md): KL's gamma scan and exact square sum replaced by a high-word max and a binary64 sum with a
 // rigorous filter (bit-identical; the exact passes run for a tile whose decision is close); FP64 pipe, so sm_90 only; needs klwarp; on in the sm_90 row since 2026-11-08 (H200 1.04-1.09).
+// Bit 512 'kllong' (issue 21, task 15): klload's direct loads for the LONG rows too (nc > 2 chunks, 4 values per thread, 1024 threads), where the
+// generic shared-memory gather costs about 40 instructions per element and pass, three passes (H200 ncu, r_bigk: 42 % of KL's 282 per element);
+// the same gates as klload (unit-stride k read along k-bar, 16-byte aligned base); independent of bit 32, which covers the rows held on chip
+// (nc <= 2). Off in every class row until a device class has measured it.
 // Bits 16, 32, 64 (issue 23, docs/NOTES-23.md) are cuts of the FIXED part of the large-row pack KL (everything that does not scale with N), each
 // independent of the emitter set and of the others; all off in every class row until the Hopper duels decide:
 //   kSeqKlWarp  'klwarp'   row-wide scalar work once per row / tile instead of by every thread / warp (largest_u, tile row setup, cross-warp combines)
@@ -35,7 +39,8 @@ constexpr int kSeqKlWarp = 16, kSeqKlLoad = 32, kSeqKlShape = 64;         // iss
 constexpr int kSeqKl = kSeqKlWarp | kSeqKlLoad | kSeqKlShape;
 constexpr int kSeqK5Fin = 128;                                            // issue 23: K5's instruction-count cuts (limb CRT + F1 only)
 constexpr int kSeqKlF64 = 256;  // issue 21 'klf64': KL's gamma from the high words and S filtered in binary64 (FP64 pipe; needs klwarp; docs/NOTES-21-klf64.md)
-constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
+constexpr int kSeqKlLong = 512;  // issue 21 'kllong': klload's direct loads for rows of nc > 2 chunks (the E = 4 kernel)
+constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
 // The sets this build can run: with IMMERDINK_SEQ_TWINS=OFF (IMD_NO_SEQ_TWINS) the Q1 / F1 / KL-bit / k5fin kernel twins are not compiled and the
 // hooks refuse them.
 #ifdef IMD_NO_SEQ_TWINS
@@ -99,6 +104,9 @@ constexpr int seq_kl_kb(int bits) {
   return ((bits & kSeqKlWarp) ? 1 : 0) | ((bits & kSeqKlLoad) ? 2 : 0) | ((bits & kSeqKlF64) && (bits & kSeqKlWarp) ? 4 : 0);
 }
 constexpr bool seq_kl_shape(int bits) { return (bits & kSeqKlShape) != 0; }
+// Whether a KL launch takes the direct loads (Kb bit 1), before the operand's own gates (unit-stride k along k-bar, aligned base):
+// klload for the rows held on chip (nc <= 2), kllong for the longer rows.
+constexpr bool seq_kl_direct(int bits, int64_t nc) { return (bits & (nc > 2 ? kSeqKlLong : kSeqKlLoad)) != 0; }
 
 // The class table, checked at compile time (tests/test_seq_table.cpp checks the shipped rows, which depend on IMD_NO_SEQ_TWINS).
 static_assert(seq_default_for(8, 9) == kSeqEmit, "sm_89 default");

@@ -61,6 +61,11 @@ int main() {
   CHECK(seq_valid(kSeqKlF64 | kSeqKlWarp) && !seq_valid(kSeqKlF64 | 1) && seq_kl_kb(kSeqKlF64) == 0);
   CHECK(seq_kl_kb(kSeqKlF64 | kSeqKlWarp) == 5 && seq_kl_kb(kSeqKlF64 | kSeqKlWarp | kSeqKlLoad) == 7);
   CHECK(seq_kl_shape(kSeqKlShape) && !seq_kl_shape(kSeqKlWarp | kSeqKlLoad | 7) && !seq_kl_shape(13));
+  // kllong (issue 21, task 15): bit 512, the direct loads for nc > 2 (klload covers nc <= 2); never in seq_kl_kb (the host sets Kb bit 1 per operand)
+  CHECK(kSeqKlLong == 512 && (kSeqKl & kSeqKlLong) == 0 && seq_kl_kb(kSeqKlLong) == 0 && seq_kl_kb(kSeqKlLong | kSeqKlWarp) == 1);
+  CHECK(seq_kl_direct(kSeqKlLoad, 1) && seq_kl_direct(kSeqKlLoad, 2) && !seq_kl_direct(kSeqKlLoad, 3) && !seq_kl_direct(kSeqKlLong, 2) &&
+        seq_kl_direct(kSeqKlLong, 3) && seq_kl_direct(kSeqKlLong, 98) && !seq_kl_direct(447, 8) && seq_kl_direct(447, 2));
+  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqKlLong) == 0);   // off in every row until a class has measured it
   CHECK(seq_pack_s(kSeqKlWarp | kSeqKlLoad | kSeqKlShape, 2) == 0 && seq_pack_s(kSeqEmit | kSeqKl, 2) == 1 && seq_pack_s(kSeqEmit | kSeqQuant | kSeqKl, 2) == 3);
 #ifndef IMD_NO_SEQ_TWINS   // (seq_effective masks a forced set to the supported bits: with the twins off only E1 is left)
   CHECK(seq_effective(13, 17) == 17 && seq_effective(13, 113) == 113 && seq_effective(13, -1) == 13 && (seq_effective(13, 125) & kSeqLimbCrt) == 0);
@@ -75,7 +80,9 @@ int main() {
   CHECK(!seq_valid(kSeqLimbCrt) && !seq_valid(13) && !seq_valid(-2) && !seq_valid(128) && !seq_valid(256) && !seq_valid(24) && seq_valid(-1));
 #ifndef IMD_NO_SEQ_TWINS
   CHECK(seq_valid(16) && seq_valid(32) && seq_valid(64) && seq_valid(113) && seq_valid(119) && !seq_valid(2 | 16) && !seq_valid(2 | 112) && !seq_valid(127 + 1));
+  CHECK(seq_valid(512) && seq_valid(512 | 439) && seq_valid(512 | 7) && !seq_valid(512 | 2) && !seq_valid(1024) && !seq_valid(512 | 256));
 #else
+  CHECK(!seq_valid(512));
   CHECK(!seq_valid(16) && !seq_valid(32) && !seq_valid(64) && !seq_valid(113));   // the KL-bit kernels are twins too
 #endif
   // what a plan runs: the class set unless forced, a forced set is masked to 0..7

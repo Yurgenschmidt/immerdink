@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Issue 23: the KL fixed-part cuts (instruction-sequence bits 16 klwarp, 32 klload, 64 klshape; issue 21: 256 klf64, with klwarp) give the same bits as the baseline KL kernel.
+"""Issue 23: the KL fixed-part cuts (instruction-sequence bits 16 klwarp, 32 klload, 64 klshape; issue 21: 256 klf64, with klwarp; 512 kllong) give the same bits as the baseline KL kernel.
 
     python3 tests/test_kl_bits.py [--lib build/libimmerdink.so] [--quick]
 
@@ -9,7 +9,7 @@ a multiple of the vector width or of 16, rows of one chunk, two chunks and more 
 rows (odd row pitch: row bases that are not 16-byte aligned), a transposed operand (the gather path of klload), a base pointer offset by one double (misaligned: klload
 must not be taken, or fall back), zero rows, Inf, NaN and subnormals. The output hash must be one value per case over ALL sets, and the launch counter
 (imd_test_kl_launch_counts) must show that each operand ran the kernel the set asks for: E = 4 / 8 / 16 values per thread and Kb (bit 0 klwarp, bit 1 klload,
-which the launch takes only for a unit-stride k read along k-bar with at most two chunks and a 16-byte aligned base). A bit that silently ran the baseline kernel
+which the launch takes only for a unit-stride k read along k-bar and a 16-byte aligned base: by bit 32 klload for at most two chunks, by bit 512 kllong for more). A bit that silently ran the baseline kernel
 would pass every bit-identity test; the counter is the guard. The committed hashes, the oracle suites and the sequence-set readback are the other tests of these bits
 (ctest *_klN, output_hashes_klN, seq_select).
 """
@@ -127,12 +127,13 @@ def expect(case, bits, fmode, k_hat):
         unit = X["stride"][-1] == 1 and X["label"][-1] == 3   # k is the last mode, read along k-bar
         # chunks per row: tk = 4096 along k-bar (the whole tile), 512 when the rows are read side by side (k not unit-stride), 64 with the 64-row tiles of mode 3
         nc = -(-k_hat // 64) if fmode == 3 else max(1, -(-k_hat // (4096 if unit else 512)))
-        if nc > 2:
-            e, kb = 4, (1 if bits & 16 else 0) | (4 if bits & 256 else 0)
+        aligned = (X["off"] % 2 == 0)
+        direct = unit and aligned
+        if nc > 2:   # kllong (512) takes the direct loads here, klload (32) only for the rows held on chip
+            e, kb = 4, (1 if bits & 16 else 0) | (2 if (bits & 512) and direct else 0) | (4 if bits & 256 else 0)
         else:
             e = 16 if bits & 64 else 8
-            aligned = (X["off"] % 2 == 0)
-            kb = (1 if bits & 16 else 0) | (2 if (bits & 32) and unit and aligned else 0) | (4 if bits & 256 else 0)
+            kb = (1 if bits & 16 else 0) | (2 if (bits & 32) and direct else 0) | (4 if bits & 256 else 0)
         out[(e, kb)] = out.get((e, kb), 0) + 1
     return out
 
@@ -157,10 +158,10 @@ def main():
         for case in cases(args.quick):
             fmode = case[7]
             ref = None
-            for base, kl in itertools.product(emit_sets, range(16)):
+            for base, kl in itertools.product(emit_sets, range(32)):
                 if kl & 8 and not kl & 1:
                     continue                                  # klf64 needs klwarp (the hook refuses it alone)
-                bits = base | (16 if kl & 1 else 0) | (32 if kl & 2 else 0) | (64 if kl & 4 else 0) | (256 if kl & 8 else 0)
+                bits = base | (16 if kl & 1 else 0) | (32 if kl & 2 else 0) | (64 if kl & 4 else 0) | (256 if kl & 8 else 0) | (512 if kl & 16 else 0)
                 h, seen, k_hat = run(lib, cuda, case, bits, fmode)
                 n += 1
                 ref = ref or h
@@ -177,7 +178,7 @@ def main():
         for b in bad[:60]:
             print("  " + b)
         return 1
-    print(f"PASS  {n} runs: every combination of klwarp / klload / klshape / klf64 over the emitter sets {emit_sets} is bit-identical, and each operand ran the kernel the set asks for")
+    print(f"PASS  {n} runs: every combination of klwarp / klload / klshape / klf64 / kllong over the emitter sets {emit_sets} is bit-identical, and each operand ran the kernel the set asks for")
     return 0
 
 

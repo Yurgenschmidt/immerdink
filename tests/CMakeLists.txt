@@ -306,7 +306,8 @@ if(Python3_FOUND)
   # the baseline emitter (112): the same oracle suites and the committed hashes. They are kernel twins like Q1 / F1 (not built with IMMERDINK_SEQ_TWINS=OFF).
   if(IMMERDINK_SEQ_TWINS)
     # Issue 21 (docs/NOTES-21-klf64.md): klf64 (256, needs klwarp) on E1 + klwarp (273), + klload (305) and on the baseline emitter (272).
-    foreach(seq 17 33 65 113 112 273 305 272)
+    # Issue 21 kllong (512: klload's direct loads for rows of nc > 2 chunks): alone on E1 (513), with klwarp (529), with klwarp + klf64 (785), and the sm_90 twin 439 + 512 (951).
+    foreach(seq 17 33 65 113 112 273 305 272 513 529 785 951)
       foreach(suite e2e tensor eps)
         add_test(NAME contract_${suite}_kl${seq}
                  COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
@@ -321,14 +322,14 @@ if(Python3_FOUND)
                            ENVIRONMENT "IMD_TEST_SEQ=${seq}")
     endforeach()
     # Issue 21: the threshold rows (suite klf64: square sums on and next to the sigma thresholds, the exact fallback) under the klf64 sets and the default set.
-    foreach(seq -1 273 305 272 437 439)
+    foreach(seq -1 273 305 272 437 439 785 951)
       add_test(NAME contract_klf64_seq${seq}
                COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                        --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite klf64 -v)
       set_tests_properties(contract_klf64_seq${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800
                            ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=${seq}")
     endforeach()
-    foreach(seq 17 113 273)
+    foreach(seq 17 113 273 529 785)
       add_test(NAME contract_bigk_kl${seq}
                COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                        --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite bigk -v)
