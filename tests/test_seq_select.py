@@ -51,17 +51,17 @@ def main():
                 bad.append(f"default set {lib.plan_seq(plan)}, expected {want_default} on sm_{major.value}{minor.value}")
         # every combination of the bits 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin that is a set (Q1 needs E1, 128 needs F1; bit 8 is a class
         # default only) is forced and read back (issue 23); the KL bits and k5fin are kernel twins like Q1 / F1, so a build without the twins forces E1 and 0 only
-        mask = 1 if args.no_seq_twins else 1 | 2 | 4 | 16 | 32 | 64 | 128 | 256 | 512 | 1024   # 256 klf64 (needs 16), 512 kllong, 1024 O1 (needs 1) (issue 21)
-        valid_sets = [b for b in range(2048) if b & ~mask == 0 and (b & 2 == 0 or b & 1) and (b & 128 == 0 or b & 4) and (b & 256 == 0 or b & 16)
-                      and (b & 1024 == 0 or b & 1)]
+        mask = 1 if args.no_seq_twins else 1 | 2 | 4 | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048   # 256 klf64 (needs 16), 512 kllong, 1024 O1 (needs 1), 2048 fq (needs 1024) (issue 21)
+        valid_sets = [b for b in range(4096) if b & ~mask == 0 and (b & 2 == 0 or b & 1) and (b & 128 == 0 or b & 4) and (b & 256 == 0 or b & 16)
+                      and (b & 1024 == 0 or b & 1) and (b & 2048 == 0 or b & 1024)]
         for bits in valid_sets:
             lib.set_seq(bits)
             if lib.plan_seq(plan) != bits or lib.get_seq() != bits:
                 bad.append(f"forced {bits}: the plan reports {lib.plan_seq(plan)}, the hook {lib.get_seq()}")
         # rejected: Q1 without E1, k5fin without F1, bit 8, the twins' bits in a build without them, out of range
-        rejected = [2, 6, 8, 9, 10, 13, 15, 18, 24, 114, 128, 129, 130, 136, 140, 144, 145, 255, 256, 512 | 256, 1024, 1024 | 2, 1024 | 512, 2048, 2049, -2]
+        rejected = [2, 6, 8, 9, 10, 13, 15, 18, 24, 114, 128, 129, 130, 136, 140, 144, 145, 255, 256, 512 | 256, 1024, 1024 | 2, 1024 | 512, 2048, 2049, 2048 | 439, 2048 | 1024, 4096, 4097, -2]
         if args.no_seq_twins:
-            rejected += [3, 4, 5, 7, 16, 17, 32, 64, 113, 127, 132, 133, 135, 245, 512, 513, 1025, 1463]
+            rejected += [3, 4, 5, 7, 16, 17, 32, 64, 113, 127, 132, 133, 135, 245, 512, 513, 1025, 1463, 3073, 4023]
         else:
             rejected += [2 | 16, 2 | 32, 2 | 64, 2 | 112, 16 | 8, 127 | 8, 128 | 2 | 4, 128 | 8 | 4]
         lib.set_seq(1)

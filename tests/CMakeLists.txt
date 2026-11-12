@@ -282,13 +282,13 @@ if(Python3_FOUND)
   # for every plan (IMD_TEST_SEQ, tests/harness.py: the library must report that set back, or the run fails): 0 = the baseline
   # sequences (the production path on every class without a default set, and the reference now that the sm_89 / sm_90
   # default is E1), 1 = E1 emitter, 7 = E1 + Q1 quantize + F1 finish, 1031 = 7 + O1 (issue 21, task 17: the offset-binary emitter input, every N
-  # through every_n: W = 2 takes O1, W = 3 falls back to E1). The suites without a suffix run the class default.
-  foreach(seq 0 1 7 1031)
-    if((seq EQUAL 7 OR seq EQUAL 1031) AND NOT IMMERDINK_SEQ_TWINS)
+  # through every_n: W = 2 takes O1, W = 3 falls back to E1), 3079 = 1031 + fq (task 18: O1's quotient in binary32). The suites without a suffix run the class default.
+  foreach(seq 0 1 7 1031 3079)
+    if((seq EQUAL 7 OR seq EQUAL 1031 OR seq EQUAL 3079) AND NOT IMMERDINK_SEQ_TWINS)
       continue()
     endif()
     foreach(suite e2e tensor every_n eps bigk)
-      if(NOT (seq EQUAL 7 OR seq EQUAL 1031) AND (suite STREQUAL "tensor" OR suite STREQUAL "every_n" OR suite STREQUAL "bigk"))
+      if(NOT (seq EQUAL 7 OR seq EQUAL 1031 OR seq EQUAL 3079) AND (suite STREQUAL "tensor" OR suite STREQUAL "every_n" OR suite STREQUAL "bigk"))
         continue()
       endif()
       add_test(NAME contract_${suite}_seq${seq}
@@ -309,7 +309,8 @@ if(Python3_FOUND)
     # Issue 21 (docs/NOTES-21-klf64.md): klf64 (256, needs klwarp) on E1 + klwarp (273), + klload (305) and on the baseline emitter (272).
     # Issue 21 kllong (512: klload's direct loads for rows of nc > 2 chunks): alone on E1 (513), with klwarp (529), with klwarp + klf64 (785), and the sm_90 twin 439 + 512 (951).
     # Issue 21 O1 (1024, task 17): on E1 alone (1025, the sm_89 shape), on the sm_90 twin (1463 = 439 + 1024) and with kllong too (1975 = 951 + 1024).
-    foreach(seq 17 33 65 113 112 273 305 272 513 529 785 951 1025 1463 1975)
+    # Issue 21 fq (2048, task 18, needs O1): the same three shapes, 3073, 3511, 4023.
+    foreach(seq 17 33 65 113 112 273 305 272 513 529 785 951 1025 1463 1975 3073 3511 4023)
       foreach(suite e2e tensor eps)
         add_test(NAME contract_${suite}_kl${seq}
                  COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
@@ -324,14 +325,14 @@ if(Python3_FOUND)
                            ENVIRONMENT "IMD_TEST_SEQ=${seq}")
     endforeach()
     # Issue 21: the threshold rows (suite klf64: square sums on and next to the sigma thresholds, the exact fallback) under the klf64 sets and the default set.
-    foreach(seq -1 273 305 272 437 439 785 951 1463)
+    foreach(seq -1 273 305 272 437 439 785 951 1463 3511)
       add_test(NAME contract_klf64_seq${seq}
                COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                        --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite klf64 -v)
       set_tests_properties(contract_klf64_seq${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800
                            ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=${seq}")
     endforeach()
-    foreach(seq 17 113 273 529 785 1025 1975)
+    foreach(seq 17 113 273 529 785 1025 1975 3073 4023)
       add_test(NAME contract_bigk_kl${seq}
                COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                        --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite bigk -v)

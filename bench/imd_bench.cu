@@ -112,14 +112,15 @@
 #include <thread>
 #include <vector>
 
-// Issue 21 / 23: a forced instruction-sequence set written as a decimal number: bits 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1 (host/seq_config.hpp;
+// Issue 21 / 23: a forced instruction-sequence set written as a decimal number: bits 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq (host/seq_config.hpp;
 // bit 8, the limb CRT, is a class default only: --crt forces it), Q1 needs E1 and 128 needs F1. The library's hook decides whether this build can run it.
 static bool seq_bits_ok(const std::string& v) {
   if (v.empty() || v.size() > 4 || v.find_first_not_of("0123456789") != std::string::npos) return false;
   const int b = std::stoi(v);
-  return (b & ~(1 | 2 | 4 | 16 | 32 | 64 | 128 | 256 | 512 | 1024)) == 0 && ((b & 2) == 0 || (b & 1) != 0) && ((b & 128) == 0 || (b & 4) != 0) &&
+  return (b & ~(1 | 2 | 4 | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048)) == 0 && ((b & 2) == 0 || (b & 1) != 0) && ((b & 128) == 0 || (b & 4) != 0) &&
          ((b & 256) == 0 || (b & 16) != 0) &&  // 256 klf64 (issue 21) needs 16 klwarp; 512 kllong (issue 21): klload's direct loads for nc > 2
-         ((b & 1024) == 0 || (b & 1) != 0);    // 1024 O1 (issue 21): the offset-binary emitter, needs E1
+         ((b & 1024) == 0 || (b & 1) != 0) &&  // 1024 O1 (issue 21): the offset-binary emitter, needs E1
+         ((b & 2048) == 0 || (b & 1024) != 0);  // 2048 fq (issue 21): O1's quotient in binary32, needs O1
 }
 
 // libimmerdink_host's test-only K-alignment hook (src/host/k_hat.cpp; not in a public header).
@@ -2911,7 +2912,7 @@ void usage() {
           "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"
           "  [--k-align auto|16|64] (v1.13 §4b: force the K alignment of every plan / pack)\n"
           "  [--seq default|<bits>] [--crt default|int|f64] (method imd, profiling build; issue 21: the instruction-sequence set, bits 1 E1 / 2 Q1 /\n"
-          "      4 F1 / 16 klwarp / 32 klload / 64 klshape / 128 k5fin (issue 23) / 256 klf64 / 512 kllong (issue 21) with Q1 needing E1 and 128 needing F1 (a forced set 0..7 runs the integer CRT), and K5's CRT variant (default: the class's set decides), for this method's plan and calls; the record gets seq_req, seq (the set the\n"
+          "      4 F1 / 16 klwarp / 32 klload / 64 klshape / 128 k5fin (issue 23) / 256 klf64 / 512 kllong / 1024 O1 / 2048 fq (issue 21) with Q1 and 1024 needing E1, 2048 needing 1024 and 128 needing F1 (a forced set 0..7 runs the integer CRT), and K5's CRT variant (default: the class's set decides), for this method's plan and calls; the record gets seq_req, seq (the set the\n"
           "      plan ran), crt_req, crt, and c_hash, which must be equal across configurations)\n"
           "  [--k4b default|mma|wgmma] (method imd, profiling build; issue 22: the K4 backend of the plan, wgmma = every legal launch on the Hopper\n"
           "      kernel, floor lifted; the record gets k4b_req, k4b_run (what the plan tries first: 0 mma.sync, 1 wgmma with the floor, 2 wgmma forced), k4_wgmma_served / _declined; a duel record carries them per side)\n"
@@ -3049,7 +3050,7 @@ int main(int argc, char** argv) {
       const std::string& v = a["seq"];
       if (v == "default") B.o.seq = -1;
       else if (seq_bits_ok(v)) B.o.seq = std::stoi(v);
-      else throw Failure("--seq default|<bits> (bits: 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1; Q1 and 1024 need E1, 128 needs F1, 256 needs 16; e.g. 0 1 3 5 7 17 33 65 113 133 245 437 951 1025 1463)");
+      else throw Failure("--seq default|<bits> (bits: 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq; Q1 and 1024 need E1, 2048 needs 1024, 128 needs F1, 256 needs 16; e.g. 0 1 3 5 7 17 33 65 113 133 245 437 951 1025 1463 3511 4023)");
     }
     if (a.count("crt")) {
       if (a["crt"] != "default" && a["crt"] != "int" && a["crt"] != "f64") throw Failure("--crt default|int|f64");

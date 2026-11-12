@@ -298,6 +298,8 @@ long run_n(int N, bool trunc, int threads, uint64_t seed, Coverage* cov, long* c
     bad += run<E, 2, 3>(N, trunc, threads, seed + 1, g_scratch, checked);
     bad += run<E, 2, 5>(N, trunc, threads, seed + 1, g_scratch, checked);  // O1 (task 17): offset-binary input, integer quantize
     bad += run<E, 2, 7>(N, trunc, threads, seed + 1, g_scratch, checked);  // O1 + Q1: the signed F2I
+    bad += run<E, 2, 13>(N, trunc, threads, seed + 1, g_scratch, checked);  // fq (task 18): O1's quotient in binary32
+    bad += run<E, 2, 15>(N, trunc, threads, seed + 1, g_scratch, checked);  // fq + Q1
   }
   return bad;
 }
@@ -370,6 +372,55 @@ long check_d_o(int l, int8_t* d_out, std::vector<int8_t>& h) {
   return bad;
 }
 
+// fq (task 18): pack_smod_f on every dot value of the O1 range, s = C + d (C = 0x4B000000 + C3), on the real table c_pack_emit_f, device and
+// host (the same function), against SMod((d - 2^63) mod p) as a byte: T = 2^23 + C3 + d = C2 + d (mod p). Only u's low byte is defined, and
+// for p = 256 the tie T - 256 q = +-128 stores 0x80 either way, the int8 of SMod = -128.
+__global__ void d_kernel_f(int l, uint32_t dmax, int8_t* out) {
+  const imd::device::PackEmit& c = imd::device::c_pack_emit_f.e[l];
+  for (uint32_t d = blockIdx.x * blockDim.x + threadIdx.x; d <= dmax; d += gridDim.x * blockDim.x)
+    out[d] = static_cast<int8_t>(imd::device::pack_smod_f(d + c.C, c));
+}
+
+long check_d_f(int l, int8_t* d_out, std::vector<int8_t>& h, const imd::device::PackEmit* host_c = nullptr) {
+  const uint32_t p = c::kTables.moduli[l];
+  uint32_t pw = 1 % p, dmax = 0, p63 = 1 % p;
+  for (int i = 0; i < 63; ++i) p63 = (2 * p63) % p;
+  for (int i = 0; i < 8; ++i) {
+    dmax += 255u * pw;
+    for (int k = 0; k < 8; ++k) pw = (2 * pw) % p;
+  }
+  d_kernel_f<<<256, 256>>>(l, dmax, d_out);
+  CUDA_CHECK(cudaGetLastError());
+  h.resize(static_cast<size_t>(dmax) + 1);
+  CUDA_CHECK(cudaMemcpy(h.data(), d_out, h.size(), cudaMemcpyDeviceToHost));
+  const imd::device::PackEmit& hc = host_c ? *host_c : imd::device::kPackEmitF.e[l];
+  long bad = 0;
+  for (uint32_t d = 0; d <= dmax; ++d) {
+    const int32_t r = static_cast<int32_t>((d % p + p - p63) % p);
+    const int8_t u = static_cast<int8_t>(r >= (static_cast<int32_t>(p) + 1) / 2 ? r - static_cast<int32_t>(p) : r);  // SMod
+    bad += h[d] != u;
+    bad += static_cast<int8_t>(imd::device::pack_smod_f(d + hc.C, hc)) != u;  // the host path of the same function
+  }
+  return bad;
+}
+
+// fq's reciprocals: rcp_bits(p) (residue.hpp, integer arithmetic) is the IEEE single division 1.0f / p, correctly rounded, for every modulus.
+long check_rcp_bits() {
+  long bad = 0;
+  for (int l = 0; l < c::kPackW2MaxN; ++l) {
+    const uint32_t p = c::kTables.moduli[l];
+    const volatile float pf = static_cast<float>(p);
+    const float r = 1.0f / pf;
+    uint32_t b;
+    std::memcpy(&b, &r, 4);
+    if (b != imd::device::rcp_bits(p) || imd::device::kPackEmitF.e[l].m32 != b) {
+      std::fprintf(stderr, "  fq rcp, modulus %d (p = %u): rcp_bits 0x%08x, 1.0f / p 0x%08x\n", l, p, imd::device::rcp_bits(p), b);
+      ++bad;
+    }
+  }
+  return bad;
+}
+
 long check_all_d(long* total) {
   int8_t* d_out;
   CUDA_CHECK(cudaMalloc(&d_out, 2 * 12 * 255 * 255 + 64));
@@ -379,6 +430,7 @@ long check_all_d(long* total) {
     bad += check_d<3>(l, d_out, h), *total += static_cast<long>(h.size());
     if (l < 16) bad += check_d<2>(l, d_out, h), *total += static_cast<long>(h.size());
     if (l < 16) bad += check_d_o(l, d_out, h), *total += static_cast<long>(h.size());
+    if (l < 16) bad += check_d_f(l, d_out, h), *total += static_cast<long>(h.size());
   }
   CUDA_CHECK(cudaFree(d_out));
   return bad;
@@ -448,6 +500,29 @@ int mutation_checks() {
     fails += bad == 0;
   }
   CUDA_CHECK(cudaMemcpyToSymbol(imd::device::c_pack_emit_o, &good_o, sizeof good_o));
+  // fq's table (task 18): rcp one ulp up / down where the exact criterion has the least room (p = 255: T e at 0.99 of 2^30, e > 0; p = 227:
+  // 0.70, e < 0), C3 + 1, the 2^23 bias dropped (T no longer 2^23 + s''); each caught by the fq d sweep (device and host) or the fq end-to-end runs
+  const imd::device::PackEmitTableF good_f = imd::device::kPackEmitF;
+  const struct { const char* what; int kind, l; } muts_f[] = {{"fq rcp + 1 ulp, p = 255", 0, 1}, {"fq rcp - 1 ulp, p = 227", 1, 9},
+                                                              {"fq C3 + 1", 2, 6}, {"fq without the 2^23 bias", 3, 13}};
+  for (const auto& m : muts_f) {
+    imd::device::PackEmitTableF t = good_f;
+    imd::device::PackEmit& e = t.e[m.l];
+    switch (m.kind) {
+      case 0: e.m32 += 1; break;
+      case 1: e.m32 -= 1; break;
+      case 2: e.C += 1; break;
+      case 3: e.C -= imd::device::kFqBias; break;
+    }
+    CUDA_CHECK(cudaMemcpyToSymbol(imd::device::c_pack_emit_f, &t, sizeof t));
+    long bad = check_d_f(m.l, d_out, h, &e), checked = 0;
+    Coverage cv;
+    cv.eps.assign(c::kEpsMax + 1, 0);
+    bad += run<16, 2, 13>(16, false, 4 * 1024, 81, cv, &checked) + run<16, 2, 15>(16, true, 4 * 1024, 82, cv, &checked);
+    std::printf("mutation \"%s\" (modulus %d): %s (%ld mismatches)\n", m.what, m.l, bad ? "caught" : "NOT CAUGHT", bad);
+    fails += bad == 0;
+  }
+  CUDA_CHECK(cudaMemcpyToSymbol(imd::device::c_pack_emit_f, &good_f, sizeof good_f));
   CUDA_CHECK(cudaFree(d_out));
   // Mutants of the sequences' code (the Mut template values: tests of the test, planted in the production templates at compile
   // time): every one must produce mismatches, except the one marked equivalent, which must produce none.
@@ -475,6 +550,9 @@ int mutation_checks() {
   go("O1 + Q1 RN for TRUNC", true, [&](bool t, long* c_) { return t ? run<16, 2, 7, 2>(16, t, U, 16, cv, c_) : 0L; });
   go("O1 + Q1 without the Inf/NaN mask", true, [&](bool t, long* c_) { return run<16, 2, 7, 3>(16, t, U, 17, cv, c_); });
   go("O1 sign polarity mutant of E1 (Mut 11: no sg in O1)", false, [&](bool t, long* c_) { return run<16, 2, 5, 11>(16, t, U, 18, cv, c_); });
+  go("fq quotient rounded toward zero", true, [&](bool t, long* c_) { return run<16, 2, 13, 14>(16, t, U, 19, cv, c_); });
+  go("fq + Q1 quotient rounded toward zero", true, [&](bool t, long* c_) { return run<8, 2, 15, 14>(16, t, U, 20, cv, c_); });
+  go("fq top bit not flipped (O1's input mutant)", true, [&](bool t, long* c_) { return run<16, 2, 13, 13>(16, t, U, 21, cv, c_); });
   g_quiet = false;
   return fails;
 }
@@ -540,6 +618,9 @@ int main() {
   const long dbad = check_all_d(&dtotal);
   std::printf("E1 emitter on every reduced d: %ld (d, sign) values over 20 moduli and W = 2, 3, %ld mismatches\n", dtotal, dbad);
   fails += dbad != 0;
+  const long rbad = check_rcp_bits();
+  std::printf("fq reciprocals RN32(1/p) for %d moduli: %ld mismatches\n", c::kPackW2MaxN, rbad);
+  fails += rbad != 0;
   for (int N = c::kNMin; N <= c::kNMax; ++N) {
     Coverage covw[3];  // [W - 1], W = 2, 3 (review L1: "all eps hit" per W)
     for (Coverage& cv : covw) cv.eps.assign(c::kEpsMax + 1, 0);
