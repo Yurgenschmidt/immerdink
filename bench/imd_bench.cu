@@ -2912,7 +2912,7 @@ void usage() {
           "  [--sustain-trace-s 0] (sustained: time series every T s of the window)\n"
           "  [--k-align auto|16|64] (v1.13 §4b: force the K alignment of every plan / pack)\n"
           "  [--seq default|<bits>] [--crt default|int|f64] (method imd, profiling build; issue 21: the instruction-sequence set, bits 1 E1 / 2 Q1 /\n"
-          "      4 F1 / 16 klwarp / 32 klload / 64 klshape / 128 k5fin (issue 23) / 256 klf64 / 512 kllong (issue 21) with Q1 needing E1 and 128 needing F1 (a forced set 0..7 runs the integer CRT), and K5's CRT variant (default: the class's set decides), for this method's plan and calls; the record gets seq_req, seq (the set the\n"
+          "      4 F1 / 16 klwarp / 32 klload / 64 klshape / 128 k5fin (issue 23) / 256 klf64 / 512 kllong / 1024 O1 / 2048 fq (issue 21) with Q1 and 1024 needing E1, 2048 needing 1024 and 128 needing F1 (a forced set 0..7 runs the integer CRT), and K5's CRT variant (default: the class's set decides), for this method's plan and calls; the record gets seq_req, seq (the set the\n"
           "      plan ran), crt_req, crt, and c_hash, which must be equal across configurations)\n"
           "  [--k4b default|mma|wgmma] (method imd, profiling build; issue 22: the K4 backend of the plan, wgmma = every legal launch on the Hopper\n"
           "      kernel, floor lifted; the record gets k4b_req, k4b_run (what the plan tries first: 0 mma.sync, 1 wgmma with the floor, 2 wgmma forced), k4_wgmma_served / _declined; a duel record carries them per side)\n"

@@ -341,9 +341,11 @@ void with_pack_seq(const ExecPlan& p, F&& f) {
       if constexpr (W == 2 && (kSeqSupported & kSeqFloatQ) != 0) f(std::integral_constant<int, 13>{});
       else f(std::integral_constant<int, 1>{});
       break;
-    default:
+    case 15:
       if constexpr (W == 2 && (kSeqSupported & kSeqFloatQ) != 0 && (kSeqSupported & kSeqQuant) != 0) f(std::integral_constant<int, 15>{});
       else f(std::integral_constant<int, 1>{});
+      break;
+    default: f(std::integral_constant<int, 1>{});  // seq_pack_s gives 0, 1, 3, 5, 7, 13, 15 only (test_seq_table); never a set nobody asked for
   }
 }
 

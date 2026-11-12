@@ -204,7 +204,8 @@ constexpr bool pack_emit_f_bounds_ok(const PackEmitTableF& t) {
     uint32_t dmax = 0;
     for (int j = 0; j < 2; ++j)
       for (int i = 0; i < 4; ++i) dmax += 255u * ((c.w[j] >> (8 * i)) & 255u);
-    if (p <= 128 || p > 256 || c.w[2] != 0 || c.hm != 0 || c.C < kFqBias) return false;
+    // odd p (T / p never a half-integer) or p = 256 (rcp exact): the criterion's premise, checked (review of 5c27189)
+    if (p <= 128 || p > 256 || (p % 2 == 0 && p != 256) || c.w[2] != 0 || c.hm != 0 || c.C < kFqBias) return false;
     const uint32_t C3 = c.C - kFqBias;
     if (C3 >= p || (C3 + (1u << 23) % p + pow2_63_mod(p)) % p != 0 || C3 + dmax >= (1u << 23) || c.m32 != rcp_bits(p)) return false;
     const uint64_t R = (c.m32 & 0x7FFFFFu) | (1u << 23);
