@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cstdlib>
 #include <cstdint>
 #include <type_traits>
 
@@ -1419,6 +1420,7 @@ struct LargeArgs {
   // earlier field moves (the kernels without the bit ignore them). D = b rows / radix, n_d = ceil(D / th), tiles = radix n_d, nc = ceil(k_hat / tk).
   int64_t D, n_d, tiles, nc;
   int64_t plane;  // issue 21 (klwarp + E1): b rows_pad k_hat, the distance between two moduli's planes of R
+  int64_t dephase_ns;  // issue 21 task 20 'klph': the start delay of the odd first-wave CTAs of the long-row kernel (0 = off; host: kl_dephase_ns)
 };
 
 __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl) {
@@ -1486,6 +1488,27 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
   KLT_DECL();
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   KLT_INIT();
+  // klph (issue 21 task 20, H200 job 15535376 PM sampling): with one CTA per SM and equal rows, all SMs run pass 1 (DRAM-bound, issue ~12 %) at
+  // the same time and pass 3 + emit (issue-bound, DRAM reads ~0) at the same time. The odd CTAs of the first wave start a_dephase_ns late, so
+  // half the SMs are in pass 1 while the other half are in pass 3; the rows are equal, so the offset carries over to the later waves. Only a
+  // delay: the results are the same bits. CTA-uniform condition (the barrier is safe); a grid of fewer than two waves is not delayed.
+  if constexpr (kWarp && kDirect && kF64 && E == 4) {
+    if (a.dephase_ns > 0 && (blockIdx.x & 1u) != 0) {
+      unsigned nsm;
+      asm("mov.u32 %0, %%nsmid;" : "=r"(nsm));
+      if (blockIdx.x < nsm && gridDim.x >= 2 * nsm) {
+        if (tid == 0) {
+          uint64_t t0, t;
+          asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+          do {
+            __nanosleep(256);
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+          } while (t - t0 < static_cast<uint64_t>(a.dephase_ns));
+        }
+        __syncthreads();
+      }
+    }
+  }
   const int lg_th = a.lg_th, th = 1 << lg_th, lg_tk = 12 - lg_th, tk = 1 << lg_tk;
   const int pitch = tk + tk / kVec + 1;
   const int G = tk / E, Gw = G < 32 ? G : 32;  // threads per row; G | 32 or 32 | G
@@ -1905,6 +1928,18 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
 
 // kl_scale_pack's Kb for a launch (kb: bit 0 klwarp, bit 1 the direct loads: klload for E = 8 / 16, kllong for E = 4, decided by the host).
 template <int E, int W, int S>
+// klph: the delay of the odd first-wave CTAs, ps_per_k picoseconds per element of k_hat. Default 300 ps (H200 job 15535376: pass 1 at full
+// contention ~0.28 ns per element of k_hat at r_bigk, the row period ~1.1 ns); IMD_KL_DEPHASE_PS overrides it (an experiment knob, read once;
+// to be replaced by a per-class constant once measured).
+static int64_t kl_dephase_ns(int64_t k_hat) {
+  static const int64_t ps_per_k = [] {
+    const char* e = std::getenv("IMD_KL_DEPHASE_PS");
+    const long v = e != nullptr ? std::strtol(e, nullptr, 10) : 300;
+    return static_cast<int64_t>(v > 0 && v < 100000 ? v : 300);
+  }();
+  return k_hat * ps_per_k / 1000;
+}
+
 void launch_kl_kb(int kb, unsigned grid, cudaStream_t stream, const LargeArgs& a) {
   constexpr unsigned T = kTileElems / E;
   if ((kb & kKlWarp) == 0) kb &= ~kKlF64;  // klf64 takes klwarp's per-row sigma
@@ -1979,6 +2014,8 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
     // klf64: the filter's constants are exact doubles for k_hat < 2^50 (numerics.cuh largest_u_filtered); beyond, the exact passes
     if ((kb & kKlF64) != 0 && p.k_hat >= (int64_t{1} << 50)) kb &= ~kKlF64;
     shape16 = seq_kl_shape(sb) && L.values == 8;
+    // klph (issue 21 task 20): the long-row kernel with klwarp + the direct loads + klf64 (E = 4, W = 2) only
+    if ((sb & kSeqKlPh) != 0 && L.values == 4 && w2 && (kb & 7) == 7) a.dephase_ns = kl_dephase_ns(p.k_hat);
   }
   a.D = p.b * op.rows / a.radix, a.nc = L.nc, a.tiles = L.tiles, a.n_d = L.tiles / a.radix;
   a.plane = a.b * a.rows_pad * a.k_hat;

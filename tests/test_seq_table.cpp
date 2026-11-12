@@ -87,13 +87,17 @@ int main() {
   CHECK(kSeqKlCs == 4096 && (kSeqKlCs & (kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqK5Fin | kSeqOffset | kSeqFloatQ | 15)) == 0);
   CHECK(seq_kl_kb(kSeqKlCs) == 8 && seq_kl_kb(4023 | kSeqKlCs) == (seq_kl_kb(4023) | 8) && seq_kl_kb(4023) == 7);
   CHECK(seq_pack_s(4023 | kSeqKlCs, 2) == seq_pack_s(4023, 2) && !seq_kl_direct(kSeqKlCs, 8) && seq_kl_direct(4023 | kSeqKlCs, 8));
-  CHECK(!seq_valid(8192) && !seq_valid(8192 | 4023));
+  CHECK(!seq_valid(16384) && !seq_valid(16384 | 4023));
 #ifndef IMD_NO_SEQ_TWINS
-  CHECK(seq_valid(kSeqKlCs) && seq_valid(4023 | kSeqKlCs));
+  CHECK(seq_valid(kSeqKlCs) && seq_valid(4023 | kSeqKlCs) && seq_valid(kSeqKlPh) && seq_valid(8119 | kSeqKlPh));
 #else
-  CHECK(!seq_valid(kSeqKlCs));
+  CHECK(!seq_valid(kSeqKlCs) && !seq_valid(kSeqKlPh));
 #endif
   for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqKlCs) == 0 || (c.cc_major == 9 && c.cc_minor == 0));   // on in the sm_90 row only (k15e, 2026-11-12)
+  // klph (issue 21, task 20): bit 8192, a runtime delay: no Kb bit, no emitter or direct-load effect, no dependency
+  CHECK(kSeqKlPh == 8192 && (kSeqKlPh & (kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqK5Fin | kSeqOffset | kSeqFloatQ | kSeqKlCs | 15)) == 0);
+  CHECK(seq_kl_kb(kSeqKlPh) == 0 && seq_kl_kb(8119 | kSeqKlPh) == seq_kl_kb(8119) && seq_pack_s(8119 | kSeqKlPh, 2) == seq_pack_s(8119, 2));
+  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqKlPh) == 0);   // off in every row until a class has measured it
 #ifndef IMD_NO_SEQ_TWINS   // (seq_effective masks a forced set to the supported bits: with the twins off only E1 is left)
   CHECK(seq_effective(13, 17) == 17 && seq_effective(13, 113) == 113 && seq_effective(13, -1) == 13 && (seq_effective(13, 125) & kSeqLimbCrt) == 0);
 #endif
@@ -112,7 +116,7 @@ int main() {
         !seq_valid(2048) && !seq_valid(2049));
   for (int b = 0; b < 2048; ++b) CHECK(seq_valid(b | 1024) == ((b & 1) != 0 && seq_valid(b & ~1024)));   // O1 needs E1 and nothing else
   CHECK(seq_valid(3073) && seq_valid(3079) && seq_valid(3511) && seq_valid(4023) && !seq_valid(2048) && !seq_valid(2049) && !seq_valid(2048 | 439) &&
-        !seq_valid(8192) && !seq_valid(8192 | 3073));
+        !seq_valid(16384) && !seq_valid(16384 | 3073));
   for (int b = 0; b < 4096; ++b) CHECK(seq_valid(b | 2048) == ((b & 1024) != 0 && seq_valid(b & ~2048)));   // fq needs O1 and nothing else
 #else
   CHECK(!seq_valid(512) && !seq_valid(1025) && !seq_valid(1024) && !seq_valid(3073));

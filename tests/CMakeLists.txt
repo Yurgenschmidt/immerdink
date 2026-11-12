@@ -310,8 +310,8 @@ if(Python3_FOUND)
     # Issue 21 kllong (512: klload's direct loads for rows of nc > 2 chunks): alone on E1 (513), with klwarp (529), with klwarp + klf64 (785), and the sm_90 twin 439 + 512 (951).
     # Issue 21 O1 (1024, task 17): on E1 alone (1025, the sm_89 shape), on the sm_90 twin (1463 = 439 + 1024) and with kllong too (1975 = 951 + 1024).
     # Issue 21 fq (2048, task 18, needs O1): the same three shapes, 3073, 3511, 4023.
-    # Issue 21 task 20 klcs (4096) on the sm_90 long-row set 4023: 8119.
-    foreach(seq 17 33 65 113 112 273 305 272 513 529 785 951 1025 1463 1975 3073 3511 4023 8119)
+    # Issue 21 task 20 klcs (4096) on the sm_90 long-row set 4023: 8119; klph (8192) on top: 16311.
+    foreach(seq 17 33 65 113 112 273 305 272 513 529 785 951 1025 1463 1975 3073 3511 4023 8119 16311)
       foreach(suite e2e tensor eps)
         add_test(NAME contract_${suite}_kl${seq}
                  COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
@@ -333,7 +333,7 @@ if(Python3_FOUND)
       set_tests_properties(contract_klf64_seq${seq} PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800
                            ENVIRONMENT "LD_PRELOAD=${shim};IMD_TEST_SEQ=${seq}")
     endforeach()
-    foreach(seq 17 113 273 529 785 1025 1975 3073 4023 8119)
+    foreach(seq 17 113 273 529 785 1025 1975 3073 4023 8119 16311)
       add_test(NAME contract_bigk_kl${seq}
                COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                        --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite bigk -v)

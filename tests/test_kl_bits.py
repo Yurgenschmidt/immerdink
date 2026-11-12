@@ -163,13 +163,14 @@ def main():
         for case in cases(args.quick):
             fmode = case[7]
             ref = None
-            # klcs (issue 21 task 20) on the sets that take it (klwarp + klload + klf64 + kllong) and on one that does not (klwarp + kllong)
-            extra = [(base, 27 | 32) for base in emit_sets] + [(emit_sets[-1], 17 | 32)]
+            # klcs / klph (issue 21 task 20) on the sets that take them (klwarp + klload + klf64 + kllong) and on one that does not (klwarp + kllong);
+            # klph is a runtime delay (no Kb bit): the same kernel runs, the bits must not change
+            extra = [(base, 27 | x) for base in emit_sets for x in (32, 64, 96)] + [(emit_sets[-1], 17 | 96)]
             for base, kl in list(itertools.product(emit_sets, range(32))) + extra:
                 if kl & 8 and not kl & 1:
                     continue                                  # klf64 needs klwarp (the hook refuses it alone)
                 bits = base | (16 if kl & 1 else 0) | (32 if kl & 2 else 0) | (64 if kl & 4 else 0) | (256 if kl & 8 else 0) | (512 if kl & 16 else 0) | \
-                    (4096 if kl & 32 else 0)
+                    (4096 if kl & 32 else 0) | (8192 if kl & 64 else 0)
                 h, seen, k_hat = run(lib, cuda, case, bits, fmode)
                 n += 1
                 ref = ref or h
@@ -186,7 +187,7 @@ def main():
         for b in bad[:60]:
             print("  " + b)
         return 1
-    print(f"PASS  {n} runs: every combination of klwarp / klload / klshape / klf64 / kllong (and klcs on the long-row sets) over the emitter sets {emit_sets} is bit-identical, and each operand ran the kernel the set asks for")
+    print(f"PASS  {n} runs: every combination of klwarp / klload / klshape / klf64 / kllong (and klcs / klph on the long-row sets) over the emitter sets {emit_sets} is bit-identical, and each operand ran the kernel the set asks for")
     return 0
 
 

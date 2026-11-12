@@ -293,7 +293,7 @@ class Library:
         return self.lib.imd_test_plan_seq(plan)
 
     def set_seq(self, bits=-1):
-        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq, 4096 klcs; -1 the device class's)."""
+        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq, 4096 klcs, 8192 klph; -1 the device class's)."""
         assert self.lib.imd_test_set_seq(bits) == 0
 
     def crt_elem(self, N, variant, e, count, W_dev, out_dev):

@@ -27,6 +27,9 @@
 // (H200 job 15526028: DRAM read 791 -> 543 MB, KL -7.8 % on r_bigk). It applies only to the sm_90 long-row kernel (E = 4, W = 2) with klwarp +
 // klload/kllong + klf64 (Kb 7); elsewhere the bit is simply not taken. Same bytes. Off in every class row until measured on both Hopper cards.
 // (A pass-1 L2 prefetch 'klpf' was measured in the same job and dropped: no gain, pass 1 is bandwidth-bound.)
+// Bit 8192 'klph' (issue 21, task 20; H200 job 15535376 PM sampling: the SMs run the KL phases in lockstep, pass 1 DRAM-bound with issue ~12 %, pass 3
+// issue-bound with DRAM reads ~0): the odd CTAs of the first wave of the same long-row kernel start late (contract.cu kl_dephase_ns), so half the
+// SMs read while the other half compute. A runtime delay, no kernel twin, no Kb bit; same bits. Off in every class row until measured.
 // Bits 16, 32, 64 (issue 23, docs/NOTES-23.md) are cuts of the FIXED part of the large-row pack KL (everything that does not scale with N), each
 // independent of the emitter set and of the others; all off in every class row until the Hopper duels decide:
 //   kSeqKlWarp  'klwarp'   row-wide scalar work once per row / tile instead of by every thread / warp (largest_u, tile row setup, cross-warp combines)
@@ -55,7 +58,8 @@ constexpr int kSeqKlLong = 512;  // issue 21 'kllong': klload's direct loads for
 constexpr int kSeqOffset = 1024;  // issue 21 'O1': the offset-binary emitter input (needs E1; W = 2)
 constexpr int kSeqFloatQ = 2048;  // issue 21 'fq': O1's quotient in binary32, one FFMA (needs O1; W = 2)
 constexpr int kSeqKlCs = 4096;  // issue 21 task 20 'klcs': KL's R stores evict-first (sm_90 long rows)
-constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqOffset | kSeqFloatQ | kSeqKlCs;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
+constexpr int kSeqKlPh = 8192;  // issue 21 task 20 'klph': the first wave's odd CTAs start late (sm_90 long rows; runtime, no twin)
+constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqOffset | kSeqFloatQ | kSeqKlCs | kSeqKlPh;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
 // The sets this build can run: with IMMERDINK_SEQ_TWINS=OFF (IMD_NO_SEQ_TWINS) the Q1 / F1 / KL-bit / k5fin kernel twins are not compiled and the
 // hooks refuse them.
 #ifdef IMD_NO_SEQ_TWINS
