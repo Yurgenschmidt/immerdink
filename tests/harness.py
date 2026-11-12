@@ -196,7 +196,7 @@ class Library:
             self.lib.imd_test_kernel_occupancy_w.argtypes = [C.c_int32, C.c_int32,
                                                              C.POINTER(C.c_int32)]
             self.lib.imd_test_kernel_occupancy_w.restype = C.c_int
-        # Issue 21: IMD_TEST_SEQ=<bits> runs the whole process with that instruction-sequence set (1 E1, 2 Q1, 4 F1, 16/32/64 the KL cuts of issue 23, 128 k5fin with F1)
+        # Issue 21: IMD_TEST_SEQ=<bits> runs the whole process with that instruction-sequence set (1 E1, 2 Q1, 4 F1, 16/32/64 the KL cuts of issue 23, 128 k5fin with F1, 256 klf64, 512 kllong, 1024 O1 with E1)
         # instead of the device class's: the same tests, the same oracle, the other sequences. It fails loudly if it cannot
         # take effect (no test hooks) or did not (the set read back differs): a seq run must never silently run the default.
         env_seq = os.environ.get("IMD_TEST_SEQ")
@@ -293,7 +293,7 @@ class Library:
         return self.lib.imd_test_plan_seq(plan)
 
     def set_seq(self, bits=-1):
-        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape; -1 the device class's)."""
+        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1; -1 the device class's)."""
         assert self.lib.imd_test_set_seq(bits) == 0
 
     def crt_elem(self, N, variant, e, count, W_dev, out_dev):

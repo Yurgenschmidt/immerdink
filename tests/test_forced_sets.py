@@ -19,7 +19,7 @@ sys.path.insert(0, HERE)
 import harness as hz  # noqa: E402
 import test_kl_bits as K  # noqa: E402
 
-SETS = (5, 21, 37, 69, 53, 101, 85, 117, 133, 149, 165, 197, 245)
+SETS = (5, 21, 37, 69, 53, 101, 85, 117, 133, 149, 165, 197, 245, 1029, 1269)   # 1029, 1269 = 5, 245 + O1 (1024, issue 21 task 17)
 
 
 def main():

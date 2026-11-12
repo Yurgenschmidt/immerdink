@@ -118,7 +118,8 @@ if "$root/tools/quiet_check.sh" >/tmp/imd-preflight-quiet.$$ 2>&1; then ok "quie
 else warn "not quiet (see below); set QUIET_LOAD / QUIET_CPU / QUIET_GPU_IGNORE or run on an exclusive node"; sed 's/^/        /' /tmp/imd-preflight-quiet.$$ | tail -15; fi
 rm -f /tmp/imd-preflight-quiet.$$
 echo "other:"
-[ -w "${XDG_RUNTIME_DIR:-/tmp}" ] && ok "lock directory writable" || bad "${XDG_RUNTIME_DIR:-/tmp} not writable (set XDG_RUNTIME_DIR / TLC_LOCK / IMMERDINK_GPU_LOCK)"
+rt="${XDG_RUNTIME_DIR:-/tmp}"; [ -d "$rt" ] || rt=/tmp   # the build scripts fall back to /tmp the same way
+[ -w "$rt" ] && ok "lock directory $rt writable" || bad "$rt not writable (set XDG_RUNTIME_DIR / TLC_LOCK / IMMERDINK_GPU_LOCK)"
 command -v flock >/dev/null && ok "flock" || bad "no flock (util-linux)"
 command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1 && ok "systemd user manager (memory cap active)" || warn "no systemd user manager: runs uncapped (fine on an HPC node with its own memory limit)"
 

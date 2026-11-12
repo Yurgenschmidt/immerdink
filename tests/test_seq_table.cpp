@@ -67,6 +67,12 @@ int main() {
         seq_kl_direct(kSeqKlLong, 3) && seq_kl_direct(kSeqKlLong, 98) && !seq_kl_direct(447, 8) && seq_kl_direct(447, 2));
   for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqKlLong) == 0);   // off in every row until a class has measured it
   CHECK(seq_pack_s(kSeqKlWarp | kSeqKlLoad | kSeqKlShape, 2) == 0 && seq_pack_s(kSeqEmit | kSeqKl, 2) == 1 && seq_pack_s(kSeqEmit | kSeqQuant | kSeqKl, 2) == 3);
+  // O1 (issue 21, task 17): bit 1024, emitter S bit 4 at W = 2 only (5 = E1 + O1, 7 = E1 + Q1 + O1); nothing without E1; W = 3 runs E1 / E1 + nothing
+  CHECK(kSeqOffset == 1024 && (kSeqOffset & (kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqK5Fin | 15)) == 0);
+  CHECK(seq_pack_s(kSeqEmit | kSeqOffset, 2) == 5 && seq_pack_s(kSeqEmit | kSeqQuant | kSeqOffset, 2) == 7 && seq_pack_s(kSeqEmit | kSeqOffset, 3) == 1 &&
+        seq_pack_s(kSeqEmit | kSeqQuant | kSeqOffset, 3) == 1 && seq_pack_s(kSeqOffset, 2) == 0 && seq_pack_s(447 | kSeqOffset, 2) == 7);
+  CHECK(seq_kl_kb(kSeqOffset) == 0 && seq_kl_kb(447 | kSeqOffset) == seq_kl_kb(447) && !seq_kl_direct(kSeqOffset, 8));
+  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqOffset) == 0);   // off in every row until a class has measured it
 #ifndef IMD_NO_SEQ_TWINS   // (seq_effective masks a forced set to the supported bits: with the twins off only E1 is left)
   CHECK(seq_effective(13, 17) == 17 && seq_effective(13, 113) == 113 && seq_effective(13, -1) == 13 && (seq_effective(13, 125) & kSeqLimbCrt) == 0);
 #endif
@@ -81,8 +87,11 @@ int main() {
 #ifndef IMD_NO_SEQ_TWINS
   CHECK(seq_valid(16) && seq_valid(32) && seq_valid(64) && seq_valid(113) && seq_valid(119) && !seq_valid(2 | 16) && !seq_valid(2 | 112) && !seq_valid(127 + 1));
   CHECK(seq_valid(512) && seq_valid(512 | 439) && seq_valid(512 | 7) && !seq_valid(512 | 2) && !seq_valid(1024) && !seq_valid(512 | 256));
+  CHECK(seq_valid(1025) && seq_valid(1024 | 439) && seq_valid(1024 | 951) && seq_valid(1024 | 7) && !seq_valid(1024 | 2) && !seq_valid(1024 | 512) &&
+        !seq_valid(2048) && !seq_valid(2049));
+  for (int b = 0; b < 2048; ++b) CHECK(seq_valid(b | 1024) == ((b & 1) != 0 && seq_valid(b & ~1024)));   // O1 needs E1 and nothing else
 #else
-  CHECK(!seq_valid(512));
+  CHECK(!seq_valid(512) && !seq_valid(1025) && !seq_valid(1024));
   CHECK(!seq_valid(16) && !seq_valid(32) && !seq_valid(64) && !seq_valid(113));   // the KL-bit kernels are twins too
 #endif
   // what a plan runs: the class set unless forced, a forced set is masked to 0..7

@@ -296,6 +296,8 @@ long run_n(int N, bool trunc, int threads, uint64_t seed, Coverage* cov, long* c
     bad += run<E, 2, 0>(N, trunc, threads, seed + 1, cov[1], checked);
     bad += run<E, 2, 1>(N, trunc, threads, seed + 1, g_scratch, checked);
     bad += run<E, 2, 3>(N, trunc, threads, seed + 1, g_scratch, checked);
+    bad += run<E, 2, 5>(N, trunc, threads, seed + 1, g_scratch, checked);  // O1 (task 17): offset-binary input, integer quantize
+    bad += run<E, 2, 7>(N, trunc, threads, seed + 1, g_scratch, checked);  // O1 + Q1: the signed F2I
   }
   return bad;
 }
@@ -339,6 +341,35 @@ long check_d(int l, int8_t* d_out, std::vector<int8_t>& h) {
   return bad;
 }
 
+// O1 (task 17): pack_smod_o on every start-shifted dot value s' = C2 + d, d in [0, dmax(2, l)], on the real table c_pack_emit_o,
+// against SMod((d - 2^63) mod p): d is the dot of Y = a' + 2^63, so this also checks C2 = -2^63 mod p.
+__global__ void d_kernel_o(int l, uint32_t dmax, int8_t* out) {
+  const imd::device::PackEmit& c = imd::device::c_pack_emit_o.e[l];
+  for (uint32_t d = blockIdx.x * blockDim.x + threadIdx.x; d <= dmax; d += gridDim.x * blockDim.x)
+    out[d] = static_cast<int8_t>(imd::device::pack_smod_o(d + c.C, c));
+}
+
+long check_d_o(int l, int8_t* d_out, std::vector<int8_t>& h) {
+  const uint32_t p = c::kTables.moduli[l];
+  uint32_t pw = 1 % p, dmax = 0, p63 = 1 % p;
+  for (int i = 0; i < 63; ++i) p63 = (2 * p63) % p;
+  for (int i = 0; i < 8; ++i) {
+    dmax += 255u * pw;
+    for (int k = 0; k < 8; ++k) pw = (2 * pw) % p;
+  }
+  d_kernel_o<<<256, 256>>>(l, dmax, d_out);
+  CUDA_CHECK(cudaGetLastError());
+  h.resize(static_cast<size_t>(dmax) + 1);
+  CUDA_CHECK(cudaMemcpy(h.data(), d_out, h.size(), cudaMemcpyDeviceToHost));
+  long bad = 0;
+  for (uint32_t d = 0; d <= dmax; ++d) {
+    const int32_t r = static_cast<int32_t>((d % p + p - p63) % p);
+    const int32_t u = r >= (static_cast<int32_t>(p) + 1) / 2 ? r - static_cast<int32_t>(p) : r;  // SMod
+    if (h[d] != static_cast<int8_t>(u)) ++bad;
+  }
+  return bad;
+}
+
 long check_all_d(long* total) {
   int8_t* d_out;
   CUDA_CHECK(cudaMalloc(&d_out, 2 * 12 * 255 * 255 + 64));
@@ -347,6 +378,7 @@ long check_all_d(long* total) {
   for (int l = 0; l < c::kNMax; ++l) {
     bad += check_d<3>(l, d_out, h), *total += static_cast<long>(h.size());
     if (l < 16) bad += check_d<2>(l, d_out, h), *total += static_cast<long>(h.size());
+    if (l < 16) bad += check_d_o(l, d_out, h), *total += static_cast<long>(h.size());
   }
   CUDA_CHECK(cudaFree(d_out));
   return bad;
@@ -393,6 +425,29 @@ int mutation_checks() {
     fails += bad == 0;
   }
   CUDA_CHECK(cudaMemcpyToSymbol(imd::device::c_pack_emit, &good, sizeof good));
+  // O1's table (task 17): C2 off by one, m32 - 1, a weight lane +1; each caught by the O1 d sweep or the O1 end-to-end run
+  const imd::device::PackEmitTableO good_o = imd::device::kPackEmitO;
+  const struct { const char* what; int kind, l; } muts_o[] = {{"O1 C2 + 1", 0, 4}, {"O1 C2 - 1 (mod p), p = 256", 1, 0},
+                                                              {"O1 m32 - 1", 2, 9}, {"O1 weight lane +1", 3, 11}};
+  for (const auto& m : muts_o) {
+    imd::device::PackEmitTableO t = good_o;
+    imd::device::PackEmit& e = t.e[m.l];
+    const uint32_t p = 0u - e.negp;
+    switch (m.kind) {
+      case 0: e.C = (e.C + 1) % p; break;
+      case 1: e.C = (e.C + p - 1) % p; break;
+      case 2: e.m32 -= 1; break;
+      case 3: e.w[1] += 1; break;
+    }
+    CUDA_CHECK(cudaMemcpyToSymbol(imd::device::c_pack_emit_o, &t, sizeof t));
+    long bad = check_d_o(m.l, d_out, h), checked = 0;
+    Coverage cv;
+    cv.eps.assign(c::kEpsMax + 1, 0);
+    bad += run<16, 2, 5>(16, false, 4 * 1024, 79, cv, &checked) + run<16, 2, 7>(16, true, 4 * 1024, 80, cv, &checked);
+    std::printf("mutation \"%s\" (modulus %d): %s (%ld mismatches)\n", m.what, m.l, bad ? "caught" : "NOT CAUGHT", bad);
+    fails += bad == 0;
+  }
+  CUDA_CHECK(cudaMemcpyToSymbol(imd::device::c_pack_emit_o, &good_o, sizeof good_o));
   CUDA_CHECK(cudaFree(d_out));
   // Mutants of the sequences' code (the Mut template values: tests of the test, planted in the production templates at compile
   // time): every one must produce mismatches, except the one marked equivalent, which must produce none.
@@ -414,6 +469,12 @@ int mutation_checks() {
   go("Q1 without the Inf/NaN mask", true, [&](bool t, long* c_) { return run<16, 2, 3, 3>(16, t, U, 10, cv, c_); });
   go("Q1 s2 one too large", true, [&](bool t, long* c_) { return run<16, 2, 3, 5>(16, t, U, 11, cv, c_); });
   go("Q1 sigma / 2 instead of sigma >> 1 (an equivalent split)", false, [&](bool t, long* c_) { return run<16, 2, 3, 4>(16, t, U, 12, cv, c_); });
+  go("O1 top bit not flipped (integer quantize)", true, [&](bool t, long* c_) { return run<16, 2, 5, 13>(16, t, U, 13, cv, c_); });
+  go("O1 top bit not flipped (signed F2I)", true, [&](bool t, long* c_) { return run<8, 2, 7, 13>(16, t, U, 14, cv, c_); });
+  go("O1 + Q1 without the f2 factor", true, [&](bool t, long* c_) { return run<4, 2, 7, 1>(16, t, U, 15, cv, c_); });
+  go("O1 + Q1 RN for TRUNC", true, [&](bool t, long* c_) { return t ? run<16, 2, 7, 2>(16, t, U, 16, cv, c_) : 0L; });
+  go("O1 + Q1 without the Inf/NaN mask", true, [&](bool t, long* c_) { return run<16, 2, 7, 3>(16, t, U, 17, cv, c_); });
+  go("O1 sign polarity mutant of E1 (Mut 11: no sg in O1)", false, [&](bool t, long* c_) { return run<16, 2, 5, 11>(16, t, U, 18, cv, c_); });
   g_quiet = false;
   return fails;
 }

@@ -37,15 +37,17 @@ __device__ __forceinline__ uint64_t shl_clamped(uint64_t x, uint32_t n) {
 // at least as fast.
 constexpr int kSeqE1 = 1;  // fused residue emitter (device/residue.hpp PackEmit, modp.hpp pack_smod)
 constexpr int kSeqQ1 = 2;  // quantize by DMUL, DMUL, F2I.U64 (numerics.cuh quantize_cvt); W = 2 only
+constexpr int kSeqO1 = 4;  // offset-binary input Y = a' + 2^63 (device/residue.hpp PackEmitTableO): no per-modulus sign multiply; E1, W = 2 only
 
 template <int E, int W, int S = 0, int Mut = 0>  // E consecutive k-bar of one row: 16 (one uint4 per modulus), 8 or 4; Mut: planted bugs for the unit test
 struct PackEmitterT {
   static_assert(E == 16 || E == 8 || E == 4, "16, 8 or 4 values per emitter");
   static_assert(W == 2 || W == 3, "X = |a'| in 2 (N <= 16) or 3 (N <= 20) u32 words");
-  static_assert(S >= 0 && S <= 3 && ((S & kSeqQ1) == 0 || W == 2), "S: bit 0 E1, bit 1 Q1 (W = 2 only)");
-  static constexpr bool kE1 = (S & kSeqE1) != 0, kQ1 = (S & kSeqQ1) != 0;
+  static_assert(S >= 0 && S <= 7 && ((S & kSeqQ1) == 0 || W == 2) && ((S & kSeqO1) == 0 || (W == 2 && (S & kSeqE1) != 0)),
+                "S: bit 0 E1, bit 1 Q1 (W = 2 only), bit 2 O1 (E1, W = 2 only)");
+  static constexpr bool kE1 = (S & kSeqE1) != 0, kQ1 = (S & kSeqQ1) != 0, kO1 = (S & kSeqO1) != 0;
   static constexpr int kE = E, kW = W;
-  uint32_t x[W][E];  // X_e = |a'_e| = sum_j x[j][e] 2^(32 j)
+  uint32_t x[W][E];  // X_e = |a'_e| = sum_j x[j][e] 2^(32 j); O1: Y_e = a'_e + 2^63
   uint32_t neg = 0;  // bit e: a'_e < 0 (baseline emitter)
   uint32_t sg[E];    // E1: sigma_e = +1 or -1 (two's complement) per element
 
@@ -75,8 +77,10 @@ struct PackEmitterT {
         // (result 0), instead of the C++ shift, undefined for eps >= 64: a sigma bug cannot
         // turn into undefined behaviour in builds without the assert above (wrong bytes).
         const uint64_t X = shl_clamped(mu, static_cast<uint32_t>(eps));
-        x[0][e] = static_cast<uint32_t>(X);
-        x[1][e] = static_cast<uint32_t>(X >> 32);
+        // O1: Y = a' + 2^63 = (sign ? -X : X) with the top bit flipped (X < 2^63)
+        const uint64_t Y = kO1 ? ((bits[e] & kSignBit) != 0 ? 0 - X : X) ^ (Mut == 13 ? 0 : kSignBit) : X;
+        x[0][e] = static_cast<uint32_t>(Y);
+        x[1][e] = static_cast<uint32_t>(Y >> 32);
       } else {
         // mu's words shifted by b = eps mod 32, placed by q = eps / 32 in {0, 1, 2} with
         // selects (static indices only: no local memory). Words past x[2] are zero (X < 2^78).
@@ -93,17 +97,20 @@ struct PackEmitterT {
     }
   }
   __device__ __forceinline__ void set_sign(int e, uint64_t b) {
-    if constexpr (kE1) sg[e] = ((b >> 63) != 0) != (Mut == 11) ? 0xFFFFFFFFu : 1u;  // Mut 11: the sign inverted
+    if constexpr (kO1) return;  // the sign is in Y
+    else if constexpr (kE1) sg[e] = ((b >> 63) != 0) != (Mut == 11) ? 0xFFFFFFFFu : 1u;  // Mut 11: the sign inverted
     else neg |= static_cast<uint32_t>((b & kSignBit) != 0) << e;
   }
-  // Q1 (W = 2): X from the conversion of |x| 2^sigma.
+  // Q1 (W = 2): X from the conversion of |x| 2^sigma; with O1, Y = a' + 2^63 from the conversion of the signed x 2^sigma.
   template <bool TRUNC>
   __device__ __forceinline__ void load_cvt(const uint64_t* bits, const QuantScale& qs) {
 #pragma unroll
     for (int e = 0; e < E; ++e) {
-      const uint64_t X = quantize_cvt<TRUNC, Mut>(bits[e], qs);
+      const uint64_t X = kO1 ? quantize_cvt_offset<TRUNC, Mut>(bits[e], qs) : quantize_cvt<TRUNC, Mut>(bits[e], qs);
 #ifndef NDEBUG
-      assert(Mut != 0 || X >> imd::constants::kPackXBits2 == 0);  // (a planted bug may break the bound)
+      // (a planted bug may break the bound) E1: bitlen X <= 63; O1: the signed F2I did not saturate (|a'| < 2^63, review of 05697a4)
+      assert(Mut != 0 || (kO1 ? static_cast<int64_t>(X ^ kSignBit) != INT64_MIN && static_cast<int64_t>(X ^ kSignBit) != INT64_MAX
+                              : X >> imd::constants::kPackXBits2 == 0));
 #endif
       set_sign(e, bits[e]);
       x[0][e] = static_cast<uint32_t>(X);
@@ -146,16 +153,26 @@ struct PackEmitterT {
   }
   // E1: d = dp4a chain, s' = sigma d + C, q = hi32(s' m32 + h m32), u = s' - p q = SMod(sigma d, p); the int8 is u's
   // low byte, four of them per word by three byte permutes. No sign select, no SMod compare, no negation.
-  __device__ __forceinline__ void emit_e1(int l, uint32_t (&w)[E / 4]) const { emit_e1_c(imd::device::c_pack_emit.e[W - 2][l], w); }
+  __device__ __forceinline__ void emit_e1(int l, uint32_t (&w)[E / 4]) const { emit_e1_c(table()[l], w); }
+  // The E1 / O1 constants of modulus 0 (the launch walks them by pointer).
+  __device__ __forceinline__ static const imd::device::PackEmit* table() {
+    if constexpr (kO1) return &imd::device::c_pack_emit_o.e[0];
+    else return &imd::device::c_pack_emit.e[W - 2][0];
+  }
   // E1 with the modulus' constants given (store_slots_stepped walks them by pointer).
   __device__ __forceinline__ void emit_e1_c(const imd::device::PackEmit& c, uint32_t (&w)[E / 4]) const {
     uint32_t u[E];
 #pragma unroll
     for (int e = 0; e < E; ++e) {
-      uint32_t xe[W];
+      if constexpr (kO1) {
+        const uint32_t y[2] = {x[0][e], x[1][e]};
+        u[e] = static_cast<uint32_t>(imd::device::pack_smod_o(imd::device::pack_dot_o(y, c), c));
+      } else {
+        uint32_t xe[W];
 #pragma unroll
-      for (int j = 0; j < W; ++j) xe[j] = x[j][e];
-      u[e] = static_cast<uint32_t>(imd::device::pack_smod(imd::device::pack_dot<W>(xe, c), sg[e], c));
+        for (int j = 0; j < W; ++j) xe[j] = x[j][e];
+        u[e] = static_cast<uint32_t>(imd::device::pack_smod(imd::device::pack_dot<W>(xe, c), sg[e], c));
+      }
     }
 #pragma unroll
     for (int q = 0; q < E / 4; ++q) {
@@ -200,7 +217,7 @@ __device__ __forceinline__ void store_slots(const Em& em, int l0, int s_lo, int 
 template <class Em>
 __device__ __forceinline__ void store_slots_stepped(const Em& em, int n, int8_t* dst, int64_t plane) {
   static_assert(Em::kE1, "E1 only");
-  const imd::device::PackEmit* c = &imd::device::c_pack_emit.e[Em::kW - 2][0];
+  const imd::device::PackEmit* c = Em::table();
   for (int s = 0; s < n; ++s, ++c, dst += plane) {
     uint32_t w[Em::kE / 4];
     em.emit_e1_c(*c, w);

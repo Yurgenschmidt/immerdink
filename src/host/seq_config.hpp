@@ -15,6 +15,9 @@
 // generic shared-memory gather costs about 40 instructions per element and pass, three passes (H200 ncu, r_bigk: 42 % of KL's 282 per element);
 // the same gates as klload (unit-stride k read along k-bar, 16-byte aligned base); independent of bit 32, which covers the rows held on chip
 // (nc <= 2). Off in every class row until a device class has measured it.
+// Bit 1024 'O1' (issue 21, task 17): the E1 emitter on the offset-binary Y = a' + 2^63 (device/residue.hpp PackEmitTableO): the sign rides in Y and in the
+// dp4a chain's start value, so the per-element-and-modulus sign multiply (one fmaheavy IMAD, the pipe that binds the emit loop on H200) goes. Needs E1;
+// W = 2 only (N <= 16; N > 16 runs E1). Any card (integer pipe; with Q1 the conversion is the signed F2I). Off in every class row until measured.
 // Bits 16, 32, 64 (issue 23, docs/NOTES-23.md) are cuts of the FIXED part of the large-row pack KL (everything that does not scale with N), each
 // independent of the emitter set and of the others; all off in every class row until the Hopper duels decide:
 //   kSeqKlWarp  'klwarp'   row-wide scalar work once per row / tile instead of by every thread / warp (largest_u, tile row setup, cross-warp combines)
@@ -40,7 +43,8 @@ constexpr int kSeqKl = kSeqKlWarp | kSeqKlLoad | kSeqKlShape;
 constexpr int kSeqK5Fin = 128;                                            // issue 23: K5's instruction-count cuts (limb CRT + F1 only)
 constexpr int kSeqKlF64 = 256;  // issue 21 'klf64': KL's gamma from the high words and S filtered in binary64 (FP64 pipe; needs klwarp; docs/NOTES-21-klf64.md)
 constexpr int kSeqKlLong = 512;  // issue 21 'kllong': klload's direct loads for rows of nc > 2 chunks (the E = 4 kernel)
-constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
+constexpr int kSeqOffset = 1024;  // issue 21 'O1': the offset-binary emitter input (needs E1; W = 2)
+constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqOffset;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
 // The sets this build can run: with IMMERDINK_SEQ_TWINS=OFF (IMD_NO_SEQ_TWINS) the Q1 / F1 / KL-bit / k5fin kernel twins are not compiled and the
 // hooks refuse them.
 #ifdef IMD_NO_SEQ_TWINS
@@ -82,13 +86,14 @@ constexpr int seq_default_for(int32_t cc_major, int32_t cc_minor) {
 constexpr bool seq_valid(int bits) {
   return bits >= -1 && (bits < 0 || ((bits & ~kSeqForceMask) == 0 && ((bits & kSeqQuant) == 0 || (bits & kSeqEmit) != 0) &&
                                       ((bits & kSeqK5Fin) == 0 || (bits & kSeqFinish) != 0) &&
-                                      ((bits & kSeqKlF64) == 0 || (bits & kSeqKlWarp) != 0)));
+                                      ((bits & kSeqKlF64) == 0 || (bits & kSeqKlWarp) != 0) &&
+                                      ((bits & kSeqOffset) == 0 || (bits & kSeqEmit) != 0)));
 }
 
 // A set as a launch sees it: the plan's bits (the class default, which may carry the limb-CRT bit), or the process-wide override (>= 0; any
 // supported combination, no limb-CRT bit: a forced set runs the integer CRT unless the K5 hook forces the limb CRT). Q1 needs the 64-bit X of W = 2
 // and is only offered together with E1: the pack template value S (kernels/pack_emitter.cuh) is
-// E1 -> 1, E1 + Q1 -> 3.
+// E1 -> 1, E1 + Q1 -> 3; O1 adds 4 at W = 2 (E1 + O1 -> 5, E1 + Q1 + O1 -> 7; W = 3 drops it).
 constexpr int seq_effective(int plan_bits, int override_bits) {
   return override_bits >= 0 ? (override_bits & kSeqForceMask) : (plan_bits & kSeqDefaultMask);
 }
@@ -97,7 +102,7 @@ constexpr bool seq_limb_crt(int set_bits, int crt_override) {
   return crt_override < 0 ? (set_bits & kSeqLimbCrt) != 0 : crt_override == 1;
 }
 constexpr int seq_pack_s(int bits, int W) {
-  return (bits & kSeqEmit) ? ((bits & kSeqQuant) && W == 2 ? 3 : 1) : 0;
+  return (bits & kSeqEmit) ? ((bits & kSeqQuant) && W == 2 ? 3 : 1) | ((bits & kSeqOffset) && W == 2 ? 4 : 0) : 0;
 }
 // The KL kernel's template value Kb (kernels' bit 0: klwarp, bit 1: klload) and whether the launch takes the 16-values-per-thread shape.
 constexpr int seq_kl_kb(int bits) {
