@@ -1878,12 +1878,10 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
   }
 }
 
-// kl_scale_pack's Kb for a launch (kb: bit 0 klwarp, bit 1 klload; E = 4 never takes klload: its rows are longer than two chunks, the host
-// has cleared the bit).
+// kl_scale_pack's Kb for a launch (kb: bit 0 klwarp, bit 1 the direct loads: klload for E = 8 / 16, kllong for E = 4, decided by the host).
 template <int E, int W, int S>
 void launch_kl_kb(int kb, unsigned grid, cudaStream_t stream, const LargeArgs& a) {
   constexpr unsigned T = kTileElems / E;
-  if constexpr (E == 4) kb &= ~kKlLoad;
   if ((kb & kKlWarp) == 0) kb &= ~kKlF64;  // klf64 takes klwarp's per-row sigma
   if constexpr ((kSeqSupported & kSeqKl) == 0) kb = 0;
 #ifdef IMD_BUILD_TEST_HOOKS
@@ -1892,11 +1890,11 @@ void launch_kl_kb(int kb, unsigned grid, cudaStream_t stream, const LargeArgs& a
   if constexpr ((kSeqSupported & kSeqKl) != 0) {
     switch (kb) {
       case 1: kl_scale_pack<E, W, S, 1><<<grid, T, 0, stream>>>(a); return;
-      case 2: if constexpr (E != 4) { kl_scale_pack<E, W, S, 2><<<grid, T, 0, stream>>>(a); return; } break;
-      case 3: if constexpr (E != 4) { kl_scale_pack<E, W, S, 3><<<grid, T, 0, stream>>>(a); return; } break;
+      case 2: kl_scale_pack<E, W, S, 2><<<grid, T, 0, stream>>>(a); return;
+      case 3: kl_scale_pack<E, W, S, 3><<<grid, T, 0, stream>>>(a); return;
       // klf64 (bit 2) only with klwarp (seq_kl_kb never sets it alone)
       case 5: kl_scale_pack<E, W, S, 5><<<grid, T, 0, stream>>>(a); return;
-      case 7: if constexpr (E != 4) { kl_scale_pack<E, W, S, 7><<<grid, T, 0, stream>>>(a); return; } break;
+      case 7: kl_scale_pack<E, W, S, 7><<<grid, T, 0, stream>>>(a); return;
       default: break;
     }
   }
@@ -1936,17 +1934,18 @@ imd_status_t launch_kl(const ExecPlan& p, int x, const Operand& op, int16_t* sig
   const unsigned grid = static_cast<unsigned>(L.grid);
   const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1 (imd_pack: the pack's N)
   // Issue 23 (docs/NOTES-23.md): the fixed-part cuts of the plan's set. klwarp: the kernel takes the launch-invariant 64-bit scalars from here.
-  // klload: unit-stride k (one fused K mode of stride 1, read along k-bar), the rows held on chip (nc <= 2) and a 16-byte aligned operand base;
+  // klload: unit-stride k (one fused K mode of stride 1, read along k-bar), the rows held on chip (nc <= 2; kllong: longer rows) and a 16-byte aligned operand base;
   // the kernel still checks every thread's address (an odd row offset falls back to per-element loads). klshape: 16 values per thread (256 threads)
   // for the rows held on chip. A bit that does not apply to this operand is simply not taken (the gather / 8 values per thread run).
   int kb = 0;
   bool shape16 = false;
   if constexpr ((kSeqSupported & kSeqKl) != 0) {
     const int sb = seq_bits(p);
-    kb = seq_kl_kb(sb);
-    if ((kb & kKlLoad) != 0 &&
-        !(a.along_rows == 0 && a.k_affine == 1 && a.k_stride == 1 && L.nc <= 2 && (reinterpret_cast<uintptr_t>(op.X) & 15) == 0))
-      kb &= ~kKlLoad;
+    kb = seq_kl_kb(sb) & ~kKlLoad;
+    // the direct loads: klload (bit 32) for the rows held on chip, kllong (bit 512, issue 21) for nc > 2 chunks (every pass re-reads the chunks
+    // from L1 / L2 there, gather or not, so the direct loads move the same bytes with about a tenth of the gather's instructions)
+    if (seq_kl_direct(sb, L.nc) && a.along_rows == 0 && a.k_affine == 1 && a.k_stride == 1 && (reinterpret_cast<uintptr_t>(op.X) & 15) == 0)
+      kb |= kKlLoad;
     // klf64: the filter's constants are exact doubles for k_hat < 2^50 (numerics.cuh largest_u_filtered); beyond, the exact passes
     if ((kb & kKlF64) != 0 && p.k_hat >= (int64_t{1} << 50)) kb &= ~kKlF64;
     shape16 = seq_kl_shape(sb) && L.values == 8;
