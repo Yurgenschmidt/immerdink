@@ -3,7 +3,9 @@
 // cert_crt_y_reduction in spec/params.py prove it).
 #pragma once
 
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 
 #include "device/residue.hpp"
 
@@ -182,6 +184,26 @@ IMD_HD uint32_t pack_dot_o(const uint32_t (&y)[2], const PackEmit& c) {
 IMD_HD int32_t pack_smod_o(uint32_t s1, const PackEmit& c) {
   const auto q = static_cast<uint32_t>((uint64_t{s1} * c.m32 + c.hm) >> 32);
   return static_cast<int32_t>(s1 + c.negp * q);
+}
+// FQ (residue.hpp PackEmitTableF): s = pack_dot_o(y, c) is the bit pattern of the binary32 T = 2^23 + s'' (the start value 0x4B000000 + C3),
+// qm = fma_rn(T, rcp, 1.5 * 2^23) = M + RN(T / p) (one FFMA: fmaheavy or fmalite, where O1's quotient is an IMAD.WIDE on fmaheavy), and
+// u = s + negp * bits(qm), whose low byte (only that byte is defined) is SMod(a', p). Mut 14 (unit test): the quotient rounded toward zero.
+template <int Mut = 0>
+IMD_HD uint32_t pack_smod_f(uint32_t s, const PackEmit& c) {
+#if defined(__CUDA_ARCH__)
+  const float qm = Mut == 14 ? __fmaf_rz(__uint_as_float(s), __uint_as_float(c.m32), 12582912.0f)
+                             : __fmaf_rn(__uint_as_float(s), __uint_as_float(c.m32), 12582912.0f);
+  return s + c.negp * __float_as_uint(qm);
+#else
+  float T, r;
+  std::memcpy(&T, &s, 4);
+  std::memcpy(&r, &c.m32, 4);
+  // (host: the default rounding mode is RN; Mut 14 is a device-only mutant)
+  const float qm = std::fma(T, r, 12582912.0f);
+  uint32_t b;
+  std::memcpy(&b, &qm, 4);
+  return s + c.negp * b;
+#endif
 }
 
 }  // namespace imd::device

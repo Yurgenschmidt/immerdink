@@ -159,4 +159,64 @@ constexpr bool pack_emit_o_bounds_ok(const PackEmitTableO& t) {
 }
 static_assert(pack_emit_o_bounds_ok(kPackEmitO), "O1: C2 = -2^63 mod p, C2 + dmax + h < 2^24");
 
+// ---- Sequence FQ (issue 21, task 18; "F1" in the issue-21 findings, renamed here: F1 is the finish set, bit 4): the O1 emitter with its
+// quotient in binary32. The emit loop of KL is fmaheavy-bound on H200, and O1's quotient q = hi32(s' m32 + h) is an IMAD.WIDE on that pipe;
+// an FFMA can issue to fmalite too. The dp4a chain starts at C = 0x4B000000 + C3 with C3 = (C2 - 2^23) mod p, so the chain's sum s is the
+// bit pattern of the binary32 T = 2^23 + s'' (s'' = C3 + d < 2^23: exponent 150, mantissa s'') and T = 2^23 + C3 + d = C2 + d = a' (mod p).
+// Then qm = fma_rn(T, rcp, 1.5 * 2^23) with rcp = RN32(1/p) holds M + RN(T rcp) in [2^23, 2^24) (ulp 1; M = 1.5 * 2^23, 0x4B400000), and
+//   u = s + negp * bits(qm) = (T - 2^23 + 0x4B000000) - p (0x4B400000 + q) = T - p q (mod 256),
+// since 0x4B000000, 2^23 and 0x4B400000 are 0 mod 256: u's low byte is the int8 of T - p q, which is SMod(a', p) when q = RN(T / p).
+// q = RN(T rcp) = RN(T / p) for every T in range (pack_emit_f_bounds_ok, an exact criterion; p = 256: rcp = 2^-8 is exact, and the tie
+// T - 256 q = +-128 stores 0x80 either way). Same struct, C = 0x4B000000 + C3, m32 = the bits of rcp, hm = 0 (unused). W = 2, l < kPackW2MaxN.
+constexpr uint32_t kFqBias = 0x4B000000u;  // the bits of 2^23
+constexpr uint32_t kFqMagic = 0x4B400000u; // the bits of 1.5 * 2^23
+// RN32(1/p) for 128 < p <= 256 as bits: 1/p = 2^-8 (2^8 / p), significand R = RN(2^31 / p) in [2^23, 2^24) (ties to even; p odd has none).
+constexpr uint32_t rcp_bits(uint32_t p) {
+  uint32_t R = (1u << 31) / p;
+  const uint32_t rem = (1u << 31) % p;
+  if (2 * rem > p || (2 * rem == p && (R & 1u) != 0)) ++R;
+  return ((127u - 8u) << 23) | (R - (1u << 23));
+}
+struct alignas(16) PackEmitTableF {
+  PackEmit e[imd::constants::kNMax];  // [l]; meaningful for l < kPackW2MaxN (the moduli 128 < p <= 256 the rcp form needs)
+};
+constexpr PackEmitTableF make_pack_emit_f(const PackEmitTableO& to, const imd::constants::Tables& t) {
+  PackEmitTableF r{};
+  for (int l = 0; l < imd::constants::kNMax; ++l) {
+    r.e[l] = to.e[l];
+    if (l >= imd::constants::kPackW2MaxN) continue;
+    const uint32_t p = t.moduli[l];
+    r.e[l].C = kFqBias + (to.e[l].C + p - (1u << 23) % p) % p;
+    r.e[l].m32 = rcp_bits(p);
+    r.e[l].hm = 0;
+  }
+  return r;
+}
+inline constexpr PackEmitTableF kPackEmitF = make_pack_emit_f(kPackEmitO, imd::constants::kTables);
+// FQ's bounds and its quotient, exactly. With rcp = R 2^-31 and e = R p - 2^31, T rcp = T / p + T e / (p 2^31). For odd p, T / p is never a
+// half-integer, and RN(T rcp) != RN(T / p) needs T rcp to reach the half-integer next to T / p: for T = p n + r the distance is |p - 2 r| / (2 p),
+// so a wrong q needs T |e| >= 2^30 |p - 2 r| with r on the side e points to. The check: every T <= Tmax with r = (p -+ 1) / 2 (|p - 2r| = 1,
+// the side of e) has T |e| < 2^30, and Tmax |e| < 3 * 2^30 (every other r). Tmax = 2^23 + C3 + dmax; also C3 + dmax < 2^23 (T's mantissa).
+constexpr bool pack_emit_f_bounds_ok(const PackEmitTableF& t) {
+  for (int l = 0; l < imd::constants::kPackW2MaxN; ++l) {
+    const PackEmit& c = t.e[l];
+    const uint32_t p = 0u - c.negp;
+    uint32_t dmax = 0;
+    for (int j = 0; j < 2; ++j)
+      for (int i = 0; i < 4; ++i) dmax += 255u * ((c.w[j] >> (8 * i)) & 255u);
+    if (p <= 128 || p > 256 || c.w[2] != 0 || c.hm != 0 || c.C < kFqBias) return false;
+    const uint32_t C3 = c.C - kFqBias;
+    if (C3 >= p || (C3 + (1u << 23) % p + pow2_63_mod(p)) % p != 0 || C3 + dmax >= (1u << 23) || c.m32 != rcp_bits(p)) return false;
+    const uint64_t R = (c.m32 & 0x7FFFFFu) | (1u << 23);
+    const int64_t e = static_cast<int64_t>(R * p) - (int64_t{1} << 31);
+    const uint64_t ae = static_cast<uint64_t>(e < 0 ? -e : e);
+    const uint64_t Tmax = (1u << 23) + C3 + dmax;
+    const uint64_t r = e > 0 ? (p - 1) / 2 : (p + 1) / 2;
+    const uint64_t Tr = Tmax - (Tmax + p - r) % p;  // the largest T <= Tmax with T = r (mod p)
+    if (Tr * ae >= (uint64_t{1} << 30) || Tmax * ae >= 3 * (uint64_t{1} << 30)) return false;
+  }
+  return true;
+}
+static_assert(pack_emit_f_bounds_ok(kPackEmitF), "FQ: C = 2^23 bits + C3, C3 = C2 - 2^23 mod p, C3 + dmax < 2^23, q = RN(T / p) on the whole range");
+
 }  // namespace imd::device

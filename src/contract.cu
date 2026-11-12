@@ -332,8 +332,17 @@ void with_pack_seq(const ExecPlan& p, F&& f) {
       if constexpr (W == 2 && (kSeqSupported & kSeqOffset) != 0) f(std::integral_constant<int, 5>{});
       else f(std::integral_constant<int, 1>{});
       break;
-    default:
+    case 7:
       if constexpr (W == 2 && (kSeqSupported & kSeqOffset) != 0 && (kSeqSupported & kSeqQuant) != 0) f(std::integral_constant<int, 7>{});
+      else f(std::integral_constant<int, 1>{});
+      break;
+    // FQ (issue 21, task 18): seq_pack_s gives 13 / 15 at W = 2 only (FQ needs O1)
+    case 13:
+      if constexpr (W == 2 && (kSeqSupported & kSeqFloatQ) != 0) f(std::integral_constant<int, 13>{});
+      else f(std::integral_constant<int, 1>{});
+      break;
+    default:
+      if constexpr (W == 2 && (kSeqSupported & kSeqFloatQ) != 0 && (kSeqSupported & kSeqQuant) != 0) f(std::integral_constant<int, 15>{});
       else f(std::integral_constant<int, 1>{});
   }
 }
@@ -2308,6 +2317,7 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
         with_pack_seq<2>(p, [&](auto S) {
           if constexpr (decltype(S)::value == 1) k23_pack_cap<2, 1><<<grid, kThreads, 0, stream>>>(pa);
           else if constexpr (decltype(S)::value == 5) k23_pack_cap<2, 5><<<grid, kThreads, 0, stream>>>(pa);  // O1: E1's register cap too
+          else if constexpr (decltype(S)::value == 13) k23_pack_cap<2, 13><<<grid, kThreads, 0, stream>>>(pa);  // FQ: the same cap
           else k23_pack<2, decltype(S)::value><<<grid, kThreads, 0, stream>>>(pa);
         });
       else

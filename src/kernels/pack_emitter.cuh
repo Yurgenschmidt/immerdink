@@ -38,14 +38,16 @@ __device__ __forceinline__ uint64_t shl_clamped(uint64_t x, uint32_t n) {
 constexpr int kSeqE1 = 1;  // fused residue emitter (device/residue.hpp PackEmit, modp.hpp pack_smod)
 constexpr int kSeqQ1 = 2;  // quantize by DMUL, DMUL, F2I.U64 (numerics.cuh quantize_cvt); W = 2 only
 constexpr int kSeqO1 = 4;  // offset-binary input Y = a' + 2^63 (device/residue.hpp PackEmitTableO): no per-modulus sign multiply; E1, W = 2 only
+constexpr int kSeqFq = 8;  // O1's quotient as one FFMA (device/residue.hpp PackEmitTableF, modp.hpp pack_smod_f): off fmaheavy-only IMAD.WIDE; needs O1
 
 template <int E, int W, int S = 0, int Mut = 0>  // E consecutive k-bar of one row: 16 (one uint4 per modulus), 8 or 4; Mut: planted bugs for the unit test
 struct PackEmitterT {
   static_assert(E == 16 || E == 8 || E == 4, "16, 8 or 4 values per emitter");
   static_assert(W == 2 || W == 3, "X = |a'| in 2 (N <= 16) or 3 (N <= 20) u32 words");
-  static_assert(S >= 0 && S <= 7 && ((S & kSeqQ1) == 0 || W == 2) && ((S & kSeqO1) == 0 || (W == 2 && (S & kSeqE1) != 0)),
-                "S: bit 0 E1, bit 1 Q1 (W = 2 only), bit 2 O1 (E1, W = 2 only)");
-  static constexpr bool kE1 = (S & kSeqE1) != 0, kQ1 = (S & kSeqQ1) != 0, kO1 = (S & kSeqO1) != 0;
+  static_assert(S >= 0 && S <= 15 && ((S & kSeqQ1) == 0 || W == 2) && ((S & kSeqO1) == 0 || (W == 2 && (S & kSeqE1) != 0)) &&
+                    ((S & kSeqFq) == 0 || (S & kSeqO1) != 0),
+                "S: bit 0 E1, bit 1 Q1 (W = 2 only), bit 2 O1 (E1, W = 2 only), bit 3 FQ (O1 only)");
+  static constexpr bool kE1 = (S & kSeqE1) != 0, kQ1 = (S & kSeqQ1) != 0, kO1 = (S & kSeqO1) != 0, kFq = (S & kSeqFq) != 0;
   static constexpr int kE = E, kW = W;
   uint32_t x[W][E];  // X_e = |a'_e| = sum_j x[j][e] 2^(32 j); O1: Y_e = a'_e + 2^63
   uint32_t neg = 0;  // bit e: a'_e < 0 (baseline emitter)
@@ -154,9 +156,10 @@ struct PackEmitterT {
   // E1: d = dp4a chain, s' = sigma d + C, q = hi32(s' m32 + h m32), u = s' - p q = SMod(sigma d, p); the int8 is u's
   // low byte, four of them per word by three byte permutes. No sign select, no SMod compare, no negation.
   __device__ __forceinline__ void emit_e1(int l, uint32_t (&w)[E / 4]) const { emit_e1_c(table()[l], w); }
-  // The E1 / O1 constants of modulus 0 (the launch walks them by pointer).
+  // The E1 / O1 / FQ constants of modulus 0 (the launch walks them by pointer).
   __device__ __forceinline__ static const imd::device::PackEmit* table() {
-    if constexpr (kO1) return &imd::device::c_pack_emit_o.e[0];
+    if constexpr (kFq) return &imd::device::c_pack_emit_f.e[0];
+    else if constexpr (kO1) return &imd::device::c_pack_emit_o.e[0];
     else return &imd::device::c_pack_emit.e[W - 2][0];
   }
   // E1 with the modulus' constants given (store_slots_stepped walks them by pointer).
@@ -166,7 +169,8 @@ struct PackEmitterT {
     for (int e = 0; e < E; ++e) {
       if constexpr (kO1) {
         const uint32_t y[2] = {x[0][e], x[1][e]};
-        u[e] = static_cast<uint32_t>(imd::device::pack_smod_o(imd::device::pack_dot_o(y, c), c));
+        if constexpr (kFq) u[e] = imd::device::pack_smod_f<Mut>(imd::device::pack_dot_o(y, c), c);  // only u's low byte is defined
+        else u[e] = static_cast<uint32_t>(imd::device::pack_smod_o(imd::device::pack_dot_o(y, c), c));
       } else {
         uint32_t xe[W];
 #pragma unroll
