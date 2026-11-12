@@ -58,7 +58,10 @@ int main() {
   CHECK(seq_kl_kb(0) == 0 && seq_kl_kb(kSeqKlWarp) == 1 && seq_kl_kb(kSeqKlLoad) == 2 && seq_kl_kb(kSeqKlWarp | kSeqKlLoad) == 3);
   CHECK(seq_kl_kb(kSeqKlShape) == 0 && seq_kl_kb(7) == 0 && seq_kl_kb(13) == 0);
   // klf64 (review 2026-11-08): valid only with klwarp; Kb bit 2 (instances 5 and 7)
-  CHECK(seq_valid(kSeqKlF64 | kSeqKlWarp) && !seq_valid(kSeqKlF64 | 1) && seq_kl_kb(kSeqKlF64) == 0);
+  CHECK(!seq_valid(kSeqKlF64 | 1) && seq_kl_kb(kSeqKlF64) == 0);
+#ifndef IMD_NO_SEQ_TWINS   // (a build without the twins refuses every KL bit)
+  CHECK(seq_valid(kSeqKlF64 | kSeqKlWarp));
+#endif
   CHECK(seq_kl_kb(kSeqKlF64 | kSeqKlWarp) == 5 && seq_kl_kb(kSeqKlF64 | kSeqKlWarp | kSeqKlLoad) == 7);
   CHECK(seq_kl_shape(kSeqKlShape) && !seq_kl_shape(kSeqKlWarp | kSeqKlLoad | 7) && !seq_kl_shape(13));
   // kllong (issue 21, task 15): bit 512, the direct loads for nc > 2 (klload covers nc <= 2); never in seq_kl_kb (the host sets Kb bit 1 per operand)
@@ -80,12 +83,17 @@ int main() {
         seq_pack_s(447 | kSeqOffset | kSeqFloatQ, 2) == 15);
   CHECK(seq_kl_kb(kSeqFloatQ) == 0 && seq_kl_kb(447 | kSeqOffset | kSeqFloatQ) == seq_kl_kb(447) && !seq_kl_direct(kSeqFloatQ, 8));
   for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqFloatQ) == 0);   // off in every row until a class has measured it
-  // klcs / klpf (issue 21, task 20): bits 4096 / 8192, Kb bits 8 / 16 (the launch keeps them on Kb 7 only); no emitter or direct-load effect; no dependency
-  CHECK(kSeqKlCs == 4096 && kSeqKlPf == 8192 && ((kSeqKlCs | kSeqKlPf) & (kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqK5Fin | kSeqOffset | kSeqFloatQ | 15)) == 0);
-  CHECK(seq_kl_kb(kSeqKlCs) == 8 && seq_kl_kb(kSeqKlPf) == 16 && seq_kl_kb(4023 | kSeqKlCs | kSeqKlPf) == (seq_kl_kb(4023) | 24) && seq_kl_kb(4023) == 7);
-  CHECK(seq_pack_s(4023 | kSeqKlCs | kSeqKlPf, 2) == seq_pack_s(4023, 2) && !seq_kl_direct(kSeqKlCs | kSeqKlPf, 8) && seq_kl_direct(4023 | kSeqKlPf, 8));
-  CHECK(seq_valid(kSeqKlCs) && seq_valid(kSeqKlPf) && seq_valid(4023 | kSeqKlCs | kSeqKlPf) && !seq_valid(16384));
-  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & (kSeqKlCs | kSeqKlPf)) == 0);   // off in every row until a class has measured it
+  // klcs (issue 21, task 20): bit 4096, Kb bit 8 (the launch keeps it on Kb 7 only); no emitter or direct-load effect; no dependency
+  CHECK(kSeqKlCs == 4096 && (kSeqKlCs & (kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqK5Fin | kSeqOffset | kSeqFloatQ | 15)) == 0);
+  CHECK(seq_kl_kb(kSeqKlCs) == 8 && seq_kl_kb(4023 | kSeqKlCs) == (seq_kl_kb(4023) | 8) && seq_kl_kb(4023) == 7);
+  CHECK(seq_pack_s(4023 | kSeqKlCs, 2) == seq_pack_s(4023, 2) && !seq_kl_direct(kSeqKlCs, 8) && seq_kl_direct(4023 | kSeqKlCs, 8));
+  CHECK(!seq_valid(8192) && !seq_valid(8192 | 4023));
+#ifndef IMD_NO_SEQ_TWINS
+  CHECK(seq_valid(kSeqKlCs) && seq_valid(4023 | kSeqKlCs));
+#else
+  CHECK(!seq_valid(kSeqKlCs));
+#endif
+  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqKlCs) == 0);   // off in every row until a class has measured it
 #ifndef IMD_NO_SEQ_TWINS   // (seq_effective masks a forced set to the supported bits: with the twins off only E1 is left)
   CHECK(seq_effective(13, 17) == 17 && seq_effective(13, 113) == 113 && seq_effective(13, -1) == 13 && (seq_effective(13, 125) & kSeqLimbCrt) == 0);
 #endif
@@ -104,7 +112,7 @@ int main() {
         !seq_valid(2048) && !seq_valid(2049));
   for (int b = 0; b < 2048; ++b) CHECK(seq_valid(b | 1024) == ((b & 1) != 0 && seq_valid(b & ~1024)));   // O1 needs E1 and nothing else
   CHECK(seq_valid(3073) && seq_valid(3079) && seq_valid(3511) && seq_valid(4023) && !seq_valid(2048) && !seq_valid(2049) && !seq_valid(2048 | 439) &&
-        !seq_valid(16384) && !seq_valid(16384 | 3073));
+        !seq_valid(8192) && !seq_valid(8192 | 3073));
   for (int b = 0; b < 4096; ++b) CHECK(seq_valid(b | 2048) == ((b & 1024) != 0 && seq_valid(b & ~2048)));   // fq needs O1 and nothing else
 #else
   CHECK(!seq_valid(512) && !seq_valid(1025) && !seq_valid(1024) && !seq_valid(3073));

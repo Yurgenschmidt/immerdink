@@ -1430,10 +1430,10 @@ __device__ __forceinline__ void scan_bits(uint64_t bits, int& gmax, unsigned& fl
 // Kb (template value of kl_scale_pack): bit 0 klwarp, bit 1 klload; Kb = 0 is the original kernel (its SASS is unchanged:
 // tools/sass_ident.sh). klshape is the launch's E (16 values per thread).
 constexpr int kKlWarp = 1, kKlLoad = 2, kKlF64 = 4;  // kKlF64 (issue 21 'klf64', sm_90): gamma from the high words, S filtered in binary64
-// Issue 21 task 20 (memory-level parallelism, sm_90 long rows): kKlCs, R stored evict-first (st.global.cs); kKlPf, pass 1 prefetches its chunks to L2
-// kKlPfAhead chunks ahead of the loads (klf64's pass 1 with the direct loads). The launch keeps them only on Kb 7 with E = 4, W = 2.
-constexpr int kKlCs = 8, kKlPf = 16;
-constexpr int kKlPfAhead = 4;  // chunks in flight per thread in pass 1: 4 x 32 bytes beyond the demand load (128 KB per SM at 1024 threads)
+// Issue 21 task 20 (memory-level parallelism, sm_90 long rows): kKlCs, R stored evict-first (st.global.cs), so the rows stay in L2 for passes 2 / 3.
+// The launch keeps it only on Kb 7 with E = 4, W = 2. (An L2 prefetch of pass 1, 'klpf', was measured and dropped: H200 job 15526028, pass 1 is
+// bandwidth-bound across the SMs, not latency-bound per SM; immerdink-eval analysis/20261110-k15/findings.md.)
+constexpr int kKlCs = 8;
 
 // Section timers (compile-time knob IMD_KL_TIMERS = 1 / 2, CMake IMMERDINK_KL_TIMERS; OFF by default and then nothing below exists in any kernel).
 // Lane 0 of every warp stamps clock64() at the section boundaries and adds the elapsed cycles of the section to a shared counter; thread 0 adds a CTA's
@@ -1471,9 +1471,8 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
     kl_scale_pack(const __grid_constant__ LargeArgs a) {
   constexpr int T = kTileElems / E, kLgE = E == 16 ? 4 : E == 8 ? 3 : 2;
   constexpr bool kWarp = (Kb & kKlWarp) != 0, kDirect = (Kb & kKlLoad) != 0, kF64 = (Kb & kKlF64) != 0;
-  constexpr bool kCs = (Kb & kKlCs) != 0, kPf = (Kb & kKlPf) != 0;
+  constexpr bool kCs = (Kb & kKlCs) != 0;
   static_assert(!kF64 || kWarp, "klf64 takes the per-row sigma of klwarp");
-  static_assert(!kPf || (kF64 && kDirect), "klpf prefetches klf64's pass 1 of the direct loads");
   __shared__ uint64_t tile[kDirect ? 1 : kTileSmem];  // kDirect: no gather tile
   __shared__ double s_wd[kF64 ? T / 32 : 1];          // klf64: per warp square sums
   __shared__ int64_t s_base[kTileRowsMax];  // v_bat[lambda] + v_row[r]
@@ -1560,11 +1559,6 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
         for (int e = 0; e < E; ++e) bits[e] = h + e < a.k ? to_bits(p[e]) : 0;
       }
     };
-    // klpf: chunk c of this thread's row to L2 (a hint: no registers, no wait); the lanes of a warp cover E * 32 * 8 contiguous bytes
-    [[maybe_unused]] const auto prefetch = [&](int64_t c) {
-      const int64_t h = (c << lg_tk) + hl;
-      if (row_ok && c < nc && h < a.k) asm volatile("prefetch.global.L2 [%0];" ::"l"(row_p + h));
-    };
     // Gather chunk c into the tile (zero outside the operand), coalesced as in k23_pack.
     const auto load = [&](int64_t c) {
       const int64_t h0 = c << lg_tk, h_end = a.k - h0;
@@ -1598,10 +1592,6 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
           lor |= static_cast<uint32_t>(bb[e]);
         }
       };
-      if constexpr (kPf) {
-#pragma unroll
-        for (int j = 1; j <= kKlPfAhead; ++j) prefetch(j);
-      }
       if constexpr (kDirect) {
         fetch(0, r0);
       } else {
@@ -1613,7 +1603,6 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
       scan_hw(r0);
       for (int64_t c = 1; c < nc; ++c) {
         uint64_t bits[E];
-        if constexpr (kPf) prefetch(c + kKlPfAhead);
         if constexpr (kDirect) {
           fetch(c, bits);
         } else {
@@ -1919,7 +1908,7 @@ template <int E, int W, int S>
 void launch_kl_kb(int kb, unsigned grid, cudaStream_t stream, const LargeArgs& a) {
   constexpr unsigned T = kTileElems / E;
   if ((kb & kKlWarp) == 0) kb &= ~kKlF64;  // klf64 takes klwarp's per-row sigma
-  // klcs / klpf (issue 21 task 20): only the sm_90 long-row kernel with klwarp + the direct loads + klf64 has the twins
+  // klcs (issue 21 task 20): only the sm_90 long-row kernel with klwarp + the direct loads + klf64 has the twin
   if (!(E == 4 && W == 2) || (kb & 7) != (kKlWarp | kKlLoad | kKlF64)) kb &= 7;
   if constexpr ((kSeqSupported & kSeqKl) == 0) kb = 0;
 #ifdef IMD_BUILD_TEST_HOOKS
@@ -1935,13 +1924,8 @@ void launch_kl_kb(int kb, unsigned grid, cudaStream_t stream, const LargeArgs& a
       case 7: kl_scale_pack<E, W, S, 7><<<grid, T, 0, stream>>>(a); return;
       default: break;
     }
-    if constexpr (E == 4 && W == 2) {  // klcs (8) / klpf (16) on Kb 7
-      switch (kb) {
-        case 15: kl_scale_pack<E, W, S, 15><<<grid, T, 0, stream>>>(a); return;
-        case 23: kl_scale_pack<E, W, S, 23><<<grid, T, 0, stream>>>(a); return;
-        case 31: kl_scale_pack<E, W, S, 31><<<grid, T, 0, stream>>>(a); return;
-        default: break;
-      }
+    if constexpr (E == 4 && W == 2) {  // klcs (8) on Kb 7
+      if (kb == 15) { kl_scale_pack<E, W, S, 15><<<grid, T, 0, stream>>>(a); return; }
     }
   }
   kl_scale_pack<E, W, S, 0><<<grid, T, 0, stream>>>(a);
@@ -2138,13 +2122,13 @@ void test_k5_launch_counts(bool reset, int64_t* out) {
     for (int v = 0; v < 4; ++v) out[4 * c + v] = reset ? g_k5_launches[c][v].exchange(0) : g_k5_launches[c][v].load();
 }
 
-// Issue 23: KL launches by [E = 4 / 8 / 16][Kb 0..31: bit 0 klwarp, bit 1 klload, bit 2 klf64, bit 3 klcs, bit 4 klpf (issue 21)], counted in test builds (a forced bit
+// Issue 23: KL launches by [E = 4 / 8 / 16][Kb 0..15: bit 0 klwarp, bit 1 klload, bit 2 klf64, bit 3 klcs (issue 21)], counted in test builds (a forced bit
 // that ran the baseline kernel must be visible).
-static std::atomic<int64_t> g_kl_launches[3][32];
-void test_note_kl_launch(int E, int kb) { g_kl_launches[E == 4 ? 0 : E == 8 ? 1 : 2][kb & 31].fetch_add(1, std::memory_order_relaxed); }
+static std::atomic<int64_t> g_kl_launches[3][16];
+void test_note_kl_launch(int E, int kb) { g_kl_launches[E == 4 ? 0 : E == 8 ? 1 : 2][kb & 15].fetch_add(1, std::memory_order_relaxed); }
 void test_kl_launch_counts(bool reset, int64_t* out) {
   for (int e = 0; e < 3; ++e)
-    for (int k = 0; k < 32; ++k) out[32 * e + k] = reset ? g_kl_launches[e][k].exchange(0) : g_kl_launches[e][k].load();
+    for (int k = 0; k < 16; ++k) out[16 * e + k] = reset ? g_kl_launches[e][k].exchange(0) : g_kl_launches[e][k].load();
 }
 // The section timers (IMD_KL_TIMERS, see kl_scale_pack): copies the device sums to out[0..n) (n <= kKltSlots) and optionally zeroes them. Returns the slot count,
 // or -1 in a build without the knob.
