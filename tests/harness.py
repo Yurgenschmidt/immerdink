@@ -295,13 +295,14 @@ class Library:
         return self.lib.imd_test_plan_seq(plan)
 
     def set_seq(self, bits=-1):
-        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq, 4096 klcs, 16384 kff64, 32768 kfaff; -1 the device class's)."""
+        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq, 4096 klcs, 8192 k5ro, 16384 kff64, 32768 kfaff; -1 the device class's)."""
         assert self.lib.imd_test_set_seq(bits) == 0
 
     def crt_elem(self, N, variant, e, count, W_dev, out_dev):
         """Issue 21 device-level unit hook (src/test_hooks.cpp imd_test_crt_elem): the CRT word x in [0, P) of `count` residue vectors by the real
         device code, before round_scaled. W_dev: device uint8 [N][count] (the residue of plane l of vector i at l * count + i), out_dev: device uint32
-        [count][5]. variant 0 the integer running CRT, 1 the shipped binary64-limb CRT, 2..9 its mutations 1..8. The residue travels in byte e of its
+        [count][5]. variant 0 the integer running CRT, 1 the shipped binary64-limb CRT, 2..9 its mutations 1..8, 10 the k5fin tail, 11 the k5ro FP64 finish (issue 21,
+        N <= 17: out[i][0] holds the int32 unscaling exponent on entry; out[i][0..1] the double, [2] the fast-path flag, [3..4] the fast double). The residue travels in byte e of its
         plane's word. Asynchronous: the caller synchronizes (Cuda.sync)."""
         assert self.lib.imd_test_crt_elem(N, variant, e, count, W_dev, out_dev) == 0
 
@@ -330,9 +331,16 @@ class Library:
         return list(out) if n == 16 else None
     def k5_fin_counts(self, reset=False):
         """Issue 23: launches of the k5fin K5 kernels (seq bit 128) since the last reset as {variant: count}; variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest."""
-        out = (C.c_int64 * 4)()
+        out = (C.c_int64 * 8)()
         assert self.lib.imd_test_k5_fin_counts(1 if reset else 0, out) == 0
         return {v: out[v] for v in range(4) if out[v]}
+
+    def k5_ro_counts(self, reset=False):
+        """Issue 21: launches of the k5fin K5 kernels that ran the k5ro finish (seq bit 8192) since the last reset as {variant: count}. Reads (and with reset
+        zeroes) the same counters as k5_fin_counts."""
+        out = (C.c_int64 * 8)()
+        assert self.lib.imd_test_k5_fin_counts(1 if reset else 0, out) == 0
+        return {v: out[4 + v] for v in range(4) if out[4 + v]}
 
     def set_k5_mapping(self, fmode):
         """The K5 mapping of a test run with fused mode `fmode` (test_contract, test_packed):

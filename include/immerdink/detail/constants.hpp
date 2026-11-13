@@ -72,6 +72,7 @@ struct F64Crt {
   double k[kNMax + 1][kNMax][kF64MaxJ];
   double Pj[kNMax + 1][kF64MaxJ];
   double Pinv[kNMax + 1];
+  double thr[kNMax + 1];   // issue 21 K5 exact FP64 finish: fallback threshold on |z~|; 0.0 = not covered (N >= 18)
 };
 
 inline constexpr Tables kTables = {
@@ -1231,6 +1232,7 @@ inline constexpr F64Crt kF64Crt = {
       {0x1.beb98dfa00000p+39, 0x1.aa79451d68000p+39, 0x1.9128f53506000p+39, 0x1.4b27367800000p+35},  // N = 20
     },
     /* Pinv */ {0.0, 0.0, 0x1.0101010101010p-16, 0x1.040d287a7051fp-24, 0x1.093b510fbf0d4p-32, 0x1.12e5617d255d8p-40, 0x1.2401777d7fdb6p-48, 0x1.38c6a8b145786p-56, 0x1.57a6a12c3f24ap-64, 0x1.802b2f252aa3fp-72, 0x1.b13f5ca3b64a6p-80, 0x1.f15c410568cccp-88, 0x1.255fb5199b040p-95, 0x1.63f115f5d0b38p-103, 0x1.c9e518641aa18p-111, 0x1.2983f5dbae8abp-118, 0x1.8aa1c572fa163p-126, 0x1.0877227a9f8e3p-133, 0x1.760ceb764616ep-141, 0x1.0b7a38d26e2fep-148, 0x1.8bce042d07acep-156},
+    /* thr */ {0.0, 0.0, 0x1.fdfffffff0100p+14, 0x1.f805fffff03fdp+22, 0x1.ee2de1fff08e9p+30, 0x1.dcce450df1198p+38, 0x1.c0de2f021ff90p+46, 0x1.a30f6de2fbd98p+54, 0x1.7d690b039738fp+62, 0x1.552ef6da3645fp+70, 0x1.2e88a4e37e200p+78, 0x1.078907a22addep+86, 0x1.bec64ef0ecac3p+93, 0x1.703d73109311ep+101, 0x1.1e3fc471e252fp+109, 0x1.b88e24574653ap+116, 0x1.4c232965cc051p+124, 0x1.ef9c77c5e66f8p+131, 0.0, 0.0, 0.0},
 };
 
 }  // namespace imd::constants

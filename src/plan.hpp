@@ -186,7 +186,8 @@ void test_kl_launch_counts(bool reset, int64_t* out);
 void test_note_kf_launch(int E, int kf);
 void test_kf_launch_counts(bool reset, int64_t* out);
 int test_kl_timers(bool reset, unsigned long long* out, int n);
-// Issue 23: launches of the k5fin kernels (seq bit 128) since the last reset, [variant 0 / 1 / 2 / 3 as above]; test_note_k5_fin_launch is called by launch_k5 only when one runs.
+// Issue 23: launches of the k5fin kernels (seq bit 128) since the last reset, [variant 0 / 1 / 2 / 3 as above], then [4 + variant] those that ran the k5ro
+// finish (issue 21, seq bit 8192; also counted in [variant]); test_note_k5_fin_launch is called by launch_k5 only when one runs.
 void test_note_k5_fin_launch(int variant);
 void test_k5_fin_counts(bool reset, int64_t* out);
 #endif

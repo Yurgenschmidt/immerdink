@@ -27,6 +27,11 @@
 // (H200 job 15526028: DRAM read 791 -> 543 MB, KL -7.8 % on r_bigk). It applies only to the sm_90 long-row kernel (E = 4, W = 2) with klwarp +
 // klload/kllong + klf64 (Kb 7); elsewhere the bit is simply not taken. Same bytes. Off in every class row until measured on both Hopper cards.
 // (A pass-1 L2 prefetch 'klpf' was measured in the same job and dropped: no gain, pass 1 is bandwidth-bound.)
+// Bit 8192 'k5ro' (issue 21, the K5 exact FP64 finish; spec in issue 21 comment 6750980047, model and proof spec/crt_f64_ro.py, gate 1 spec/test_crt_f64_ro.py):
+// the k5fin kernels' integer tail (the F2I quotient, the F2I limb conversions, the 40 -> 32-bit repack, the subtraction of P and the F1 finish) replaced by
+// FP64 arithmetic: a centred quotient by DFMA + a magic DADD, exact limb remainders, the Boldo-Melquiond round-to-odd sum of three doubles, 2^e by an
+// exponent add. Elements near +-P/2 (2^-37 of uniform values), subnormal or overflowing results take today's finish. Bit-identical. Needs k5fin (so F1);
+// N <= 17 (N = 18..20 keep the k5fin kernels). FP64 pipe at full rate: sm_90 / sm_100 only. Off in every class row until measured.
 // Bits 16384 'kff64' and 32768 'kfaff' (issue 21 task 28): the fixed part of the fused small-k pack KF (k_hat <= 1024), from the H200 KF source
 // counters (k16 job 15566591, r_lowk: per element ~33 descriptor instructions, ~20 of them the per-tile table of k offsets by division, ~36 tile load,
 // ~30 gamma scan and ~65 exact square sum, ~104 emit). kff64 = klf64's binary64 square sum with its rigorous filter, for KF (FP64 pipe: sm_90 only;
@@ -60,6 +65,7 @@ constexpr int kSeqKlLong = 512;  // issue 21 'kllong': klload's direct loads for
 constexpr int kSeqOffset = 1024;  // issue 21 'O1': the offset-binary emitter input (needs E1; W = 2)
 constexpr int kSeqFloatQ = 2048;  // issue 21 'fq': O1's quotient in binary32, one FFMA (needs O1; W = 2)
 constexpr int kSeqKlCs = 4096;  // issue 21 task 20 'klcs': KL's R stores evict-first (sm_90 long rows)
+constexpr int kSeqK5Ro = 8192;  // issue 21 'k5ro': K5's finish in FP64 with a round-to-odd sum (needs k5fin; N <= 17)
 constexpr int kSeqKfF64 = 16384;  // issue 21 task 28 'kff64': KF's gamma from the high words and S filtered in binary64 (FP64 pipe)
 constexpr int kSeqKfAff = 32768;  // issue 21 task 28 'kfaff': KF's k offsets as h * stride for a K class of one mode
 constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqOffset | kSeqFloatQ | kSeqKlCs | kSeqKfF64 | kSeqKfAff;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
@@ -68,7 +74,7 @@ constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqOffset | kSeqF
 #ifdef IMD_NO_SEQ_TWINS
 constexpr int kSeqSupported = kSeqEmit;
 #else
-constexpr int kSeqSupported = kSeqAll | kSeqK5Fin;
+constexpr int kSeqSupported = kSeqAll | kSeqK5Fin | kSeqK5Ro;
 #endif
 // What a class default may contain in this build: the supported sequences, and the limb CRT (its kernels are not twins; they are always compiled).
 constexpr int kSeqDefaultMask = kSeqSupported | kSeqLimbCrt;
@@ -102,10 +108,11 @@ constexpr int seq_default_for(int32_t cc_major, int32_t cc_minor) {
 }
 
 // Q1 quantizes into the 64-bit X of the E1 emitter: the Q1 bit without the E1 bit is not a set (it would run the baseline
-// silently), so the hooks reject it. The same for k5fin without F1 (its kernels are F1 kernels).
+// silently), so the hooks reject it. The same for k5fin without F1 (its kernels are F1 kernels), and k5ro without k5fin (a variant of the k5fin kernels).
 constexpr bool seq_valid(int bits) {
   return bits >= -1 && (bits < 0 || ((bits & ~kSeqForceMask) == 0 && ((bits & kSeqQuant) == 0 || (bits & kSeqEmit) != 0) &&
                                       ((bits & kSeqK5Fin) == 0 || (bits & kSeqFinish) != 0) &&
+                                      ((bits & kSeqK5Ro) == 0 || (bits & kSeqK5Fin) != 0) &&
                                       ((bits & kSeqKlF64) == 0 || (bits & kSeqKlWarp) != 0) &&
                                       ((bits & kSeqOffset) == 0 || (bits & kSeqEmit) != 0) &&
                                       ((bits & kSeqFloatQ) == 0 || (bits & kSeqOffset) != 0)));
