@@ -1926,8 +1926,6 @@ __global__ void __launch_bounds__(kTileElems / E, E == 4 ? 1 : 2)
   }
 }
 
-// kl_scale_pack's Kb for a launch (kb: bit 0 klwarp, bit 1 the direct loads: klload for E = 8 / 16, kllong for E = 4, decided by the host).
-template <int E, int W, int S>
 // klph: the delay of the odd first-wave CTAs, ps_per_k picoseconds per element of k_hat. Default 300 ps (H200 job 15535376: pass 1 at full
 // contention ~0.28 ns per element of k_hat at r_bigk, the row period ~1.1 ns); IMD_KL_DEPHASE_PS overrides it (an experiment knob, read once;
 // to be replaced by a per-class constant once measured).
@@ -1940,6 +1938,8 @@ static int64_t kl_dephase_ns(int64_t k_hat) {
   return k_hat * ps_per_k / 1000;
 }
 
+// kl_scale_pack's Kb for a launch (kb: bit 0 klwarp, bit 1 the direct loads: klload for E = 8 / 16, kllong for E = 4, decided by the host).
+template <int E, int W, int S>
 void launch_kl_kb(int kb, unsigned grid, cudaStream_t stream, const LargeArgs& a) {
   constexpr unsigned T = kTileElems / E;
   if ((kb & kKlWarp) == 0) kb &= ~kKlF64;  // klf64 takes klwarp's per-row sigma
