@@ -618,19 +618,36 @@ __device__ __forceinline__ double ro_add(double a, double b) {
   return __longlong_as_double(nudge ? bs + step : bs);
 }
 template <int N>
-__device__ __forceinline__ bool crt_ro_try(const uint32_t (&wv)[N], int eb, int e, double* out) {
-  constexpr int J = imd::constants::kF64Crt.J[N];
+constexpr int kRoJ = imd::constants::kF64Crt.J[N];
+// The limb sums s_j of E elements (element i: byte eb0 + i of the plane words) at once. sm_90 FP64 instructions take no constant-bank operand, so every
+// multiplier k[l][j] is an LDC.64 into a register (an MIO instruction): one load feeds the E elements' FMAs (k16 H200 ncu: v1 summed one element at a time,
+// 42 LDC per output at N = 14, MIO-throttle and short-scoreboard stalls, issue 75 -> 61 %).
+template <int N, int E>
+__device__ __forceinline__ void crt_ro_sums(const uint32_t (&wv)[N], int eb0, double (&s)[E][kRoJ<N>]) {
+  constexpr int J = kRoJ<N>;
   static_assert(J >= 1 && J <= 4 && imd::constants::kF64Crt.thr[N] > 0.0, "k5ro covers N <= 17 (spec/params.py cert_crt_f64_ro)");
-  static_assert(imd::constants::kF64LimbBits == 40, "the scalings below are 2^(40 j)");
-  double s[J];
 #pragma unroll
-  for (int j = 0; j < J; ++j) s[j] = 0.0;
+  for (int i = 0; i < E; ++i)
+#pragma unroll
+    for (int j = 0; j < J; ++j) s[i][j] = 0.0;
 #pragma unroll
   for (int l = 0; l < N; ++l) {
-    const double Wd = __uint2double_rn((wv[l] >> (8 * eb)) & 255u);
+    double Wd[E];
 #pragma unroll
-    for (int j = 0; j < J; ++j) s[j] = __fma_rn(Wd, imd::device::c_f64crt.k[N][l][j], s[j]);
+    for (int i = 0; i < E; ++i) Wd[i] = __uint2double_rn((wv[l] >> (8 * (eb0 + i))) & 255u);
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+      const double c = imd::device::c_f64crt.k[N][l][j];
+#pragma unroll
+      for (int i = 0; i < E; ++i) s[i][j] = __fma_rn(Wd[i], c, s[i][j]);
+    }
   }
+}
+// The finish of one element from its limb sums: true and *out = D, or false (the caller takes the integer finish).
+template <int N>
+__device__ __forceinline__ bool crt_ro_fin(const double (&s)[kRoJ<N>], int e, double* out) {
+  constexpr int J = kRoJ<N>;
+  static_assert(imd::constants::kF64LimbBits == 40, "the scalings below are 2^(40 j)");
   double Sd = s[J - 1];
 #pragma unroll
   for (int j = J - 2; j >= 0; --j) Sd = __fma_rn(Sd, 1099511627776.0, s[j]);
@@ -665,6 +682,12 @@ __device__ __forceinline__ bool crt_ro_try(const uint32_t (&wv)[N], int eb, int 
   if (static_cast<unsigned>(be + e - 1) >= 2046u) return false;   // z~ 2^e subnormal or overflowing (lemma 7: tested on z~, before any scaling)
   *out = __hiloint2double(hi + static_cast<int>(static_cast<unsigned>(e) << 20), __double2loint(z));
   return true;
+}
+template <int N>
+__device__ __forceinline__ bool crt_ro_try(const uint32_t (&wv)[N], int eb, int e, double* out) {   // one element (the test hook)
+  double s[1][kRoJ<N>];
+  crt_ro_sums<N, 1>(wv, eb, s);
+  return crt_ro_fin<N>(s[0], e, out);
 }
 #endif  // IMD_NO_SEQ_TWINS
 
@@ -844,14 +867,25 @@ __device__ __forceinline__ void k5f_store(const OutArgs& a, bool a1, bool b0, in
 // One finish of the k5fin kernels for element eb of wv with exponent e: k5ro first when Ro (seq bit 8192), else / on its fallback the limb CRT +
 // crt_round_fin. (Ro = false never calls this: its kernels keep the shipped order, the CRT of every element before the metadata loads.)
 template <int N, int L>
-__device__ __forceinline__ double k5f_finish_ro(const uint32_t (&wv)[N], int eb, int e) {
-  double d;
-  if (crt_ro_try<N>(wv, eb, e, &d)) return d;
+__device__ __forceinline__ double k5f_finish_int(const uint32_t (&wv)[N], int eb, int e) {   // the integer finish (k5ro fallback)
   uint32_t x[L];
 #pragma unroll
   for (int w = 0; w < L; ++w) x[w] = 0;
   crt_f64_elem<N, L, 0, true>(wv, eb, x);
   return crt_round_fin<L, N>(x, e);
+}
+template <int N, int L>
+__device__ __forceinline__ double k5f_finish_ro(const uint32_t (&wv)[N], int eb, int e) {
+  double d;
+  if (crt_ro_try<N>(wv, eb, e, &d)) return d;
+  return k5f_finish_int<N, L>(wv, eb, e);
+}
+// k5ro in the kernels: the finish of element eb from its precomputed limb sums, the integer finish on the fallback.
+template <int N, int L>
+__device__ __forceinline__ double k5f_finish_ro_s(const uint32_t (&wv)[N], int eb, const double (&s)[kRoJ<N>], int e) {
+  double d;
+  if (crt_ro_fin<N>(s, e, &d)) return d;
+  return k5f_finish_int<N, L>(wv, eb, e);
 }
 
 template <int N, int E, bool Ro = false>
@@ -868,6 +902,8 @@ __device__ __forceinline__ void k5f_elems(const OutArgs& a, uint32_t t, uint32_t
     else wv[l] = __ldg(W + l * plane);
   }
   uint32_t x[Ro ? 1 : E][L];
+  [[maybe_unused]] double rs[E][Ro ? kRoJ<Ro ? N : 2> : 1];   // k5ro: the limb sums of the E elements, one LDC per constant (crt_ro_sums)
+  if constexpr (Ro) crt_ro_sums<N, E>(wv, 0, rs);
   if constexpr (!Ro) {
 #pragma unroll
     for (int e = 0; e < E; ++e) {
@@ -888,7 +924,7 @@ __device__ __forceinline__ void k5f_elems(const OutArgs& a, uint32_t t, uint32_t
         for (int e = 0; e < 4; ++e) {
           const uint32_t w = e < 2 ? sb.x : sb.y;
           const int sbe = static_cast<int16_t>(static_cast<uint16_t>(w >> (16 * (e & 1))));
-          if constexpr (Ro) D[e] = k5f_finish_ro<N, L>(wv, e, -(sa + sbe));
+          if constexpr (Ro) D[e] = k5f_finish_ro_s<N, L>(wv, e, rs[e], -(sa + sbe));
           else D[e] = crt_round_fin<L, N>(x[e], -(sa + sbe));
         }
         return;
@@ -902,7 +938,7 @@ __device__ __forceinline__ void k5f_elems(const OutArgs& a, uint32_t t, uint32_t
       if (fa || a.fB[bo + e] != 0) {
         D[e] = native_dot(a, lam, t - lam * static_cast<uint32_t>(a.m), j);
       } else if constexpr (Ro) {
-        D[e] = k5f_finish_ro<N, L>(wv, e, -(sa + int{a.sB[bo + e]}));
+        D[e] = k5f_finish_ro_s<N, L>(wv, e, rs[e], -(sa + int{a.sB[bo + e]}));
       } else {
         D[e] = crt_round_fin<L, N>(x[e], -(sa + int{a.sB[bo + e]}));
       }
