@@ -21,6 +21,12 @@
 // Bit 2048 'fq' (issue 21, task 18; "F1" in the issue-21 findings, not the finish set F1 = bit 4): O1's quotient as one binary32 FFMA (device/residue.hpp
 // PackEmitTableF): the dp4a chain's sum is the bit pattern of T = 2^23 + s'', q = fma_rn(T, RN32(1/p), 1.5 * 2^23); the FFMA can issue to fmalite where O1's
 // IMAD.WIDE is fmaheavy only. Needs O1 (so E1; W = 2). Off in every class row until measured.
+// Bit 4096 'klcs' (issue 21, task 20): memory-level parallelism of the long-row KL on H200 (job 15524418 source counters: long_scoreboard
+// 40 % of the samples, 23 points of it in pass 1's DRAM chain, 15 in pass 3's re-reads; DRAM reads 791 MB for a 537 MB operand because the 915 MB of R
+// stores evict the rows from L2 before passes 2 / 3 re-read them). klcs: KL's R stores evict-first (st.global.cs), so the rows stay in L2
+// (H200 job 15526028: DRAM read 791 -> 543 MB, KL -7.8 % on r_bigk). It applies only to the sm_90 long-row kernel (E = 4, W = 2) with klwarp +
+// klload/kllong + klf64 (Kb 7); elsewhere the bit is simply not taken. Same bytes. Off in every class row until measured on both Hopper cards.
+// (A pass-1 L2 prefetch 'klpf' was measured in the same job and dropped: no gain, pass 1 is bandwidth-bound.)
 // Bits 16, 32, 64 (issue 23, docs/NOTES-23.md) are cuts of the FIXED part of the large-row pack KL (everything that does not scale with N), each
 // independent of the emitter set and of the others; all off in every class row until the Hopper duels decide:
 //   kSeqKlWarp  'klwarp'   row-wide scalar work once per row / tile instead of by every thread / warp (largest_u, tile row setup, cross-warp combines)
@@ -48,7 +54,8 @@ constexpr int kSeqKlF64 = 256;  // issue 21 'klf64': KL's gamma from the high wo
 constexpr int kSeqKlLong = 512;  // issue 21 'kllong': klload's direct loads for rows of nc > 2 chunks (the E = 4 kernel)
 constexpr int kSeqOffset = 1024;  // issue 21 'O1': the offset-binary emitter input (needs E1; W = 2)
 constexpr int kSeqFloatQ = 2048;  // issue 21 'fq': O1's quotient in binary32, one FFMA (needs O1; W = 2)
-constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqOffset | kSeqFloatQ;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
+constexpr int kSeqKlCs = 4096;  // issue 21 task 20 'klcs': KL's R stores evict-first (sm_90 long rows)
+constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqOffset | kSeqFloatQ | kSeqKlCs;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
 // The sets this build can run: with IMMERDINK_SEQ_TWINS=OFF (IMD_NO_SEQ_TWINS) the Q1 / F1 / KL-bit / k5fin kernel twins are not compiled and the
 // hooks refuse them.
 #ifdef IMD_NO_SEQ_TWINS
@@ -76,7 +83,7 @@ struct SeqClass {
 };
 constexpr SeqClass kSeqClasses[] = {
     {8, 9, kSeqEmit},  // RTX 4090: E1 (integer only; fewer instructions in every pack kernel counted). Q1 / F1 / the limb CRT would sit on a 1/64-rate FP64 pipe
-    {9, 0, kSeqEmit | kSeqQuant | kSeqFinish | kSeqLimbCrt | kSeqKlWarp | kSeqKlLoad | kSeqK5Fin | kSeqKlF64},  // H100, H200: 447 = 189 + Q1 + klf64 (issue 21, 2026-11-08, H200 duels with crt f64, all bit-identical: klf64 437 vs 181 1.04-1.09; Q1 439 vs 437 sq4096 1.035, r_skinny 1.081, r_bigk 1.041, r_mm 1.055, N=8 1.03-1.05; H100: findings/hopper-tuning-20261108.md). Before: E1 + F1 + limb CRT + klwarp + klload + k5fin = 189 (R2 chose 13; R4 added klload + k5fin = 173, bit-identical; R5 added klwarp, docs/NOTES-26.md; set 165 + crt f64 against 13 on both cards: 4096^3 N=14 1.07 / 1.05, 8192^3 N=14 1.05, N=8 8192 1.075, r_lowk 1.05, t_df 1.08; klshape is 4-6% slower and stays off; docs/NOTES-24.md)
+    {9, 0, kSeqEmit | kSeqQuant | kSeqFinish | kSeqLimbCrt | kSeqKlWarp | kSeqKlLoad | kSeqK5Fin | kSeqKlF64 | kSeqKlLong | kSeqOffset | kSeqFloatQ | kSeqKlCs},  // H100, H200: 8127 = 447 + kllong + O1 + fq + klcs (issue 21, 2026-11-12, k15e duels of the twin 8119 against 439 with crt f64, all bit-identical; H200 job 15535376 / H100 job 15535380: r_mm 1.820 / 1.665, r_bigk 1.397 / 1.381, mid16k 1.284 / 1.278, r_skinny 1.115 / 1.105, N=8 r_bigk 1.516 / 1.496, sq4096 1.045 / 1.043, t_df 1.035 / 1.035, s512 1.029 / 1.040, r_lowk 1.013 / 1.011; no shape slower on either card). Before: 447 = 189 + Q1 + klf64 (issue 21, 2026-11-08, H200 duels with crt f64, all bit-identical: klf64 437 vs 181 1.04-1.09; Q1 439 vs 437 sq4096 1.035, r_skinny 1.081, r_bigk 1.041, r_mm 1.055, N=8 1.03-1.05; H100: findings/hopper-tuning-20261108.md). Before: E1 + F1 + limb CRT + klwarp + klload + k5fin = 189 (R2 chose 13; R4 added klload + k5fin = 173, bit-identical; R5 added klwarp, docs/NOTES-26.md; set 165 + crt f64 against 13 on both cards: 4096^3 N=14 1.07 / 1.05, 8192^3 N=14 1.05, N=8 8192 1.075, r_lowk 1.05, t_df 1.08; klshape is 4-6% slower and stays off; docs/NOTES-24.md)
 };
 
 constexpr int seq_default_for(int32_t cc_major, int32_t cc_minor) {
@@ -113,7 +120,8 @@ constexpr int seq_pack_s(int bits, int W) {
 }
 // The KL kernel's template value Kb (kernels' bit 0: klwarp, bit 1: klload) and whether the launch takes the 16-values-per-thread shape.
 constexpr int seq_kl_kb(int bits) {
-  return ((bits & kSeqKlWarp) ? 1 : 0) | ((bits & kSeqKlLoad) ? 2 : 0) | ((bits & kSeqKlF64) && (bits & kSeqKlWarp) ? 4 : 0);
+  return ((bits & kSeqKlWarp) ? 1 : 0) | ((bits & kSeqKlLoad) ? 2 : 0) | ((bits & kSeqKlF64) && (bits & kSeqKlWarp) ? 4 : 0) |
+         ((bits & kSeqKlCs) ? 8 : 0);  // klcs: the launch keeps it only on Kb 7 (E = 4, W = 2)
 }
 constexpr bool seq_kl_shape(int bits) { return (bits & kSeqKlShape) != 0; }
 // Whether a KL launch takes the direct loads (Kb bit 1), before the operand's own gates (unit-stride k along k-bar, aligned base):

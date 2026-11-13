@@ -293,7 +293,7 @@ class Library:
         return self.lib.imd_test_plan_seq(plan)
 
     def set_seq(self, bits=-1):
-        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq; -1 the device class's)."""
+        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq, 4096 klcs; -1 the device class's)."""
         assert self.lib.imd_test_set_seq(bits) == 0
 
     def crt_elem(self, N, variant, e, count, W_dev, out_dev):
@@ -310,10 +310,10 @@ class Library:
         return {(c, v): out[4 * c + v] for c in range(2) for v in range(4) if out[4 * c + v]}
 
     def kl_launch_counts(self, reset=False):
-        """Issue 23: KL kernel launches since the last reset as {(E, Kb): count}; E = 4 / 8 / 16 values per thread, Kb bit 0 klwarp, bit 1 klload, bit 2 klf64 (issue 21)."""
-        out = (C.c_int64 * 24)()
+        """Issue 23: KL kernel launches since the last reset as {(E, Kb): count}; E = 4 / 8 / 16 values per thread, Kb bit 0 klwarp, bit 1 klload, bit 2 klf64, bit 3 klcs (issue 21)."""
+        out = (C.c_int64 * 48)()
         assert self.lib.imd_test_kl_launch_counts(1 if reset else 0, out) == 0
-        return {((4, 8, 16)[e], k): out[8 * e + k] for e in range(3) for k in range(8) if out[8 * e + k]}
+        return {((4, 8, 16)[e], k): out[16 * e + k] for e in range(3) for k in range(16) if out[16 * e + k]}
 
     def kl_timers(self, reset=False):
         """Issue 23: the KL section timers as a list of 16 sums (None in a build without IMMERDINK_KL_TIMERS); see tools/kl_timers.py."""

@@ -27,7 +27,7 @@
 //             call, in one process (docs/BENCHMARKING.md "Tiny shapes", NOTES-A5 §1.2): both
 //             sides see the same GPU clock / DVFS / host-core state. A side is "default" or
 //             a comma list of N=<n>, vec=generate|resident, g=<g> (0 = N),
-//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule), crt=default|int|f64 (issue 21: K5's CRT; default = the device class's set decides, sm_90: limbs), seq=default|<bits> (issue 21 / 23: the instruction-sequence set, bits 1 E1 emitter / 2 Q1 quantize / 4 F1 finish / 16 klwarp / 32 klload / 64 klshape (the KL fixed-part cuts, e.g. seq=17) / 128 k5fin (issue 23: K5 instruction-count cuts, needs F1 and the limb CRT to engage, e.g. seq=133 with crt=f64) / 256 klf64 (issue 21: KL's gamma and S filtered in binary64, needs 16; sm_90 set + klf64 = seq=437 with crt=f64); default = the device class's, sm_90: 447 = E1 + Q1 + F1 + the limb CRT + klwarp + klload + k5fin + klf64 (bit 8 is a class default, so `--seq 447` itself is not accepted; 439 with crt=f64 is the same computation; the previous default 189 = 181 with crt=f64); a forced 0..7 runs the integer CRT unless crt=f64), k4b=default|mma|wgmma (issue 22: the K4 backend of the side's plan; wgmma = every legal launch on a Hopper, the profitability floor lifted; a device without the backend runs mma.sync, see k4b_run in the record), ka=auto|16|64 (v1.13 §4b:
+//             k4=rule|tune|0..3, k5=0|1|2|4 (0 = the launch rule), crt=default|int|f64 (issue 21: K5's CRT; default = the device class's set decides, sm_90: limbs), seq=default|<bits> (issue 21 / 23: the instruction-sequence set, bits 1 E1 emitter / 2 Q1 quantize / 4 F1 finish / 16 klwarp / 32 klload / 64 klshape (the KL fixed-part cuts, e.g. seq=17) / 128 k5fin (issue 23: K5 instruction-count cuts, needs F1 and the limb CRT to engage, e.g. seq=133 with crt=f64) / 256 klf64 (issue 21: KL's gamma and S filtered in binary64, needs 16; sm_90 set + klf64 = seq=437 with crt=f64); default = the device class's, sm_90: 8127 = E1 + Q1 + F1 + the limb CRT + klwarp + klload + k5fin + klf64 + kllong + O1 + fq + klcs (bit 8 is a class default, so `--seq 8127` itself is not accepted; 8119 with crt=f64 is the same computation; the previous defaults 447 = 439 and 189 = 181 with crt=f64); a forced 0..7 runs the integer CRT unless crt=f64), k4b=default|mma|wgmma (issue 22: the K4 backend of the side's plan; wgmma = every legal launch on a Hopper, the profitability floor lifted; a device without the backend runs mma.sync, see k4b_run in the record), ka=auto|16|64 (v1.13 §4b:
 //             the side's K alignment, via the test hook at plan creation); unset keys keep the plan
 //             defaults, N defaults to the --N value. Defaults: A = default (the K4 rule),
 //             B = k4=tune (the plan-time K4 autotune); when both pick the same K4
@@ -112,12 +112,13 @@
 #include <thread>
 #include <vector>
 
-// Issue 21 / 23: a forced instruction-sequence set written as a decimal number: bits 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq (host/seq_config.hpp;
+// Issue 21 / 23: a forced instruction-sequence set written as a decimal number: bits 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq,
+// 4096 klcs (host/seq_config.hpp;
 // bit 8, the limb CRT, is a class default only: --crt forces it), Q1 needs E1 and 128 needs F1. The library's hook decides whether this build can run it.
 static bool seq_bits_ok(const std::string& v) {
   if (v.empty() || v.size() > 4 || v.find_first_not_of("0123456789") != std::string::npos) return false;
   const int b = std::stoi(v);
-  return (b & ~(1 | 2 | 4 | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048)) == 0 && ((b & 2) == 0 || (b & 1) != 0) && ((b & 128) == 0 || (b & 4) != 0) &&
+  return (b & ~(1 | 2 | 4 | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096)) == 0 && ((b & 2) == 0 || (b & 1) != 0) && ((b & 128) == 0 || (b & 4) != 0) &&
          ((b & 256) == 0 || (b & 16) != 0) &&  // 256 klf64 (issue 21) needs 16 klwarp; 512 kllong (issue 21): klload's direct loads for nc > 2
          ((b & 1024) == 0 || (b & 1) != 0) &&  // 1024 O1 (issue 21): the offset-binary emitter, needs E1
          ((b & 2048) == 0 || (b & 1024) != 0);  // 2048 fq (issue 21): O1's quotient in binary32, needs O1
@@ -3050,7 +3051,7 @@ int main(int argc, char** argv) {
       const std::string& v = a["seq"];
       if (v == "default") B.o.seq = -1;
       else if (seq_bits_ok(v)) B.o.seq = std::stoi(v);
-      else throw Failure("--seq default|<bits> (bits: 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq; Q1 and 1024 need E1, 2048 needs 1024, 128 needs F1, 256 needs 16; e.g. 0 1 3 5 7 17 33 65 113 133 245 437 951 1025 1463 3511 4023)");
+      else throw Failure("--seq default|<bits> (bits: 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq, 4096 klcs; Q1 and 1024 need E1, 2048 needs 1024, 128 needs F1, 256 needs 16; 4096 acts on the long-row KL with 16 + 512 + 256 only; e.g. 0 1 3 5 7 17 33 65 113 133 245 437 951 1025 1463 3511 4023 8119)");
     }
     if (a.count("crt")) {
       if (a["crt"] != "default" && a["crt"] != "int" && a["crt"] != "f64") throw Failure("--crt default|int|f64");

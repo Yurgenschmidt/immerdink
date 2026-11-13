@@ -191,13 +191,23 @@ struct PackEmitterT {
     emit(l, w);
     store_words(w, dst);
   }
+  // Cs (issue 21 'klcs'): st.global.cs, evict-first in L1 and L2 (the R planes are not re-read by this kernel; the rows it re-reads stay in L2).
+  template <bool Cs = false>
   __device__ __forceinline__ static void store_words(const uint32_t (&w)[E / 4], int8_t* dst) {
-    if constexpr (E == 16)
+    if constexpr (Cs) {
+      if constexpr (E == 16)
+        __stcs(reinterpret_cast<uint4*>(dst), make_uint4(w[0], w[1], w[2], w[3]));
+      else if constexpr (E == 8)
+        __stcs(reinterpret_cast<uint2*>(dst), make_uint2(w[0], w[1]));
+      else
+        __stcs(reinterpret_cast<unsigned int*>(dst), w[0]);
+    } else if constexpr (E == 16) {
       *reinterpret_cast<uint4*>(dst) = make_uint4(w[0], w[1], w[2], w[3]);
-    else if constexpr (E == 8)
+    } else if constexpr (E == 8) {
       *reinterpret_cast<uint2*>(dst) = make_uint2(w[0], w[1]);
-    else
+    } else {
       *reinterpret_cast<uint32_t*>(dst) = w[0];
+    }
   }
 };
 
@@ -218,14 +228,14 @@ __device__ __forceinline__ void store_slots(const Em& em, int l0, int s_lo, int 
 // walked by pointer, so that the loop steps both by additions (ALU pipe). store_slots re-derives l sizeof(PackEmit) and the 64-bit
 // plane with IMAD / IMAD.WIDE per modulus (ncu, sm_89 SASS of kl_scale_pack<8,2,1,7>: 9 of the loop's 63 instructions, all on the
 // fmaheavy pipe that binds KL on Hopper). Same bytes at the same addresses.
-template <class Em>
+template <class Em, bool Cs = false>  // Cs: the stores evict-first (issue 21 'klcs')
 __device__ __forceinline__ void store_slots_stepped(const Em& em, int n, int8_t* dst, int64_t plane) {
   static_assert(Em::kE1, "E1 only");
   const imd::device::PackEmit* c = Em::table();
   for (int s = 0; s < n; ++s, ++c, dst += plane) {
     uint32_t w[Em::kE / 4];
     em.emit_e1_c(*c, w);
-    Em::store_words(w, dst);
+    Em::template store_words<Cs>(w, dst);
   }
 }
 

@@ -69,7 +69,7 @@
 //
 //   imd_test_crt_elem(N, variant, e, count, W, out)
 //   imd_test_k5_launch_counts(reset, out)
-//   imd_test_kl_launch_counts(reset, out)   issue 23: KL kernel launches [E 4/8/16][klwarp, klload, klf64]
+//   imd_test_kl_launch_counts(reset, out)   issue 23: KL kernel launches, int64[48]: [E 4/8/16][Kb 0..15: klwarp, klload, klf64, klcs]
 //   imd_test_kl_timers(reset, out, n)       issue 23: KL section timers (IMMERDINK_KL_TIMERS builds)
 //       Issue 21 (docs/NOTES-21.md): the first runs the real CRT device functions of contract.cu
 //       (variant 0 integer running CRT, 1 binary64-limb CRT, 2..9 its compile-time mutations) on
@@ -241,7 +241,7 @@ IMD_API int imd_test_k5_launch_counts(int reset, int64_t* out) {
   return 0;
 }
 
-// Issue 23: KL kernel launches since the last reset, int64[24]: [E = 4 / 8 / 16 values per thread][Kb 0..7: bit 0 klwarp, bit 1 klload, bit 2 klf64 (issue 21)]; reset != 0 zeroes them.
+// Issue 23: KL kernel launches since the last reset, int64[48]: [E = 4 / 8 / 16 values per thread][Kb 0..15: bit 0 klwarp, bit 1 klload, bit 2 klf64, bit 3 klcs (issue 21)]; reset != 0 zeroes them.
 IMD_API int imd_test_kl_launch_counts(int reset, int64_t* out) {
   if (out == nullptr) return 1;
   imd::detail::test_kl_launch_counts(reset != 0, out);

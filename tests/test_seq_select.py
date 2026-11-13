@@ -3,7 +3,7 @@
 
     python3 tests/test_seq_select.py [--lib build/libimmerdink.so]
 
-Pins the per-class defaults against this GPU's compute capability (sm_89: E1 = 1; sm_90: E1 + Q1 + F1 + limb CRT + klwarp + klload + k5fin + klf64 = 447 (R2: 13, R4: 173, R5: 189, 2026-11-08: 447); anything
+Pins the per-class defaults against this GPU's compute capability (sm_89: E1 = 1; sm_90: E1 + Q1 + F1 + limb CRT + klwarp + klload + k5fin + klf64 + kllong + O1 + fq + klcs = 8127 (R2: 13, R4: 173, R5: 189, 2026-11-08: 447, 2026-11-12: 8127); anything
 else, sm_120 included: 0), checks that a forced set (imd_test_set_seq) is what a plan reports, that -1 restores the class default, and that the
 invalid sets (the Q1 bit without the E1 bit, the KL bits 16 / 32 / 64 are valid in every combination (issue 23: all 48 sets are forced and read back), bit 128 (k5fin) without F1, bit 8 (the limb CRT is a class default only) and out of range) are rejected. The K5 CRT hook is tri-state (-1 follow
 the plan's set, 0 integer, 1 limbs): what the plan's K5 runs (imd_test_plan_crt) is pinned for the default, each forced value, and a forced set 0..7 (integer unless the hook forces limbs). A seq run that silently ran the default would
@@ -19,7 +19,7 @@ sys.path.insert(0, HERE)
 import harness as hz  # noqa: E402
 
 LIMB_CRT = 8
-DEFAULTS = {(8, 9): 1, (9, 0): 1 | 2 | 4 | LIMB_CRT | 16 | 32 | 128 | 256}   # keep equal to kSeqClasses in src/host/seq_config.hpp (tests/test_seq_table.cpp checks the same rows without a GPU)
+DEFAULTS = {(8, 9): 1, (9, 0): 1 | 2 | 4 | LIMB_CRT | 16 | 32 | 128 | 256 | 512 | 1024 | 2048 | 4096}   # keep equal to kSeqClasses in src/host/seq_config.hpp (tests/test_seq_table.cpp checks the same rows without a GPU)
 
 
 def main():
@@ -38,7 +38,7 @@ def main():
     cuda.check(cuda.rt.cudaDeviceGetAttribute(C.byref(minor), 76, dev), "cc minor")
     want_default = DEFAULTS.get((major.value, minor.value), 0)
     if args.no_seq_twins:
-        want_default &= ~(2 | 4 | 16 | 32 | 128)   # the F1 / Q1 / k5fin kernels are not compiled: the class default is masked
+        want_default &= 1 | LIMB_CRT   # only E1 is compiled (kSeqSupported): the class default is masked to E1 + the limb CRT
     T = {X: hz.make_tensor(e, hz.dense(e), l) for X, e, l in
          (("A", [16, 32], [1, 3]), ("B", [24, 32], [2, 3]), ("C", [16, 24], [1, 2]))}
     st, plan = lib.plan_create(T["A"], T["B"], T["C"], 8)
@@ -51,17 +51,17 @@ def main():
                 bad.append(f"default set {lib.plan_seq(plan)}, expected {want_default} on sm_{major.value}{minor.value}")
         # every combination of the bits 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin that is a set (Q1 needs E1, 128 needs F1; bit 8 is a class
         # default only) is forced and read back (issue 23); the KL bits and k5fin are kernel twins like Q1 / F1, so a build without the twins forces E1 and 0 only
-        mask = 1 if args.no_seq_twins else 1 | 2 | 4 | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048   # 256 klf64 (needs 16), 512 kllong, 1024 O1 (needs 1), 2048 fq (needs 1024) (issue 21)
-        valid_sets = [b for b in range(4096) if b & ~mask == 0 and (b & 2 == 0 or b & 1) and (b & 128 == 0 or b & 4) and (b & 256 == 0 or b & 16)
+        mask = 1 if args.no_seq_twins else 1 | 2 | 4 | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096   # 256 klf64 (needs 16), 512 kllong, 1024 O1 (needs 1), 2048 fq (needs 1024), 4096 klcs (issue 21)
+        valid_sets = [b for b in range(8192) if b & ~mask == 0 and (b & 2 == 0 or b & 1) and (b & 128 == 0 or b & 4) and (b & 256 == 0 or b & 16)
                       and (b & 1024 == 0 or b & 1) and (b & 2048 == 0 or b & 1024)]
         for bits in valid_sets:
             lib.set_seq(bits)
             if lib.plan_seq(plan) != bits or lib.get_seq() != bits:
                 bad.append(f"forced {bits}: the plan reports {lib.plan_seq(plan)}, the hook {lib.get_seq()}")
         # rejected: Q1 without E1, k5fin without F1, bit 8, the twins' bits in a build without them, out of range
-        rejected = [2, 6, 8, 9, 10, 13, 15, 18, 24, 114, 128, 129, 130, 136, 140, 144, 145, 255, 256, 512 | 256, 1024, 1024 | 2, 1024 | 512, 2048, 2049, 2048 | 439, 2048 | 1024, 4096, 4097, -2]
+        rejected = [2, 6, 8, 9, 10, 13, 15, 18, 24, 114, 128, 129, 130, 136, 140, 144, 145, 255, 256, 512 | 256, 1024, 1024 | 2, 1024 | 512, 2048, 2049, 2048 | 439, 2048 | 1024, 8192, 8193, 8192 | 4023, 16384, -2]
         if args.no_seq_twins:
-            rejected += [3, 4, 5, 7, 16, 17, 32, 64, 113, 127, 132, 133, 135, 245, 512, 513, 1025, 1463, 3073, 4023]
+            rejected += [3, 4, 5, 7, 16, 17, 32, 64, 113, 127, 132, 133, 135, 245, 512, 513, 1025, 1463, 3073, 4023, 4096, 8119]
         else:
             rejected += [2 | 16, 2 | 32, 2 | 64, 2 | 112, 16 | 8, 127 | 8, 128 | 2 | 4, 128 | 8 | 4]
         lib.set_seq(1)

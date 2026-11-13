@@ -59,8 +59,11 @@ def cases(quick):
     cs.append(("tiles64_k100", tens([30, 100], [1, 3]), tens([26, 100], [2, 3]), tens([30, 26], [1, 2]), 14, 0, "u", 3))
     # special values: a zero row, Inf, NaN, subnormals, and a row of all non-finite
     cs.append(("specials", tens([24, 4100], [1, 3]), tens([20, 4100], [2, 3]), tens([24, 20], [1, 2]), 14, 0, "pow2", 2, "specials"))
+    # issue 21 task 20 (klcs): long rows (nc = 4; with specials klf64 falls back to the exact passes) with the special values
+    cs.append(("specials_long", tens([12, 12300], [1, 3]), tens([11, 12300], [2, 3]), tens([12, 11], [1, 2]), 14, 0, "pow2", 2, "specials"))
     if quick:
-        cs = [c for c in cs if c[0] in ("k4096_chunk1", "k1000_tail", "k8192_two_chunks", "odd_pitch_A", "offset_ptr_A", "transposed_B", "specials", "g4_n14")]
+        cs = [c for c in cs if c[0] in ("k4096_chunk1", "k1000_tail", "k8192_two_chunks", "odd_pitch_A", "offset_ptr_A", "transposed_B", "specials", "g4_n14",
+                                        "k8300_three_chunks", "specials_long")]
     return cs
 
 
@@ -131,6 +134,8 @@ def expect(case, bits, fmode, k_hat):
         direct = unit and aligned
         if nc > 2:   # kllong (512) takes the direct loads here, klload (32) only for the rows held on chip
             e, kb = 4, (1 if bits & 16 else 0) | (2 if (bits & 512) and direct else 0) | (4 if bits & 256 else 0)
+            if kb == 7 and case[4] <= 16:   # klcs (4096): only on Kb 7 with E = 4, W = 2 (N <= 16)
+                kb |= 8 if bits & 4096 else 0
         else:
             e = 16 if bits & 64 else 8
             kb = (1 if bits & 16 else 0) | (2 if (bits & 32) and direct else 0) | (4 if bits & 256 else 0)
@@ -158,10 +163,13 @@ def main():
         for case in cases(args.quick):
             fmode = case[7]
             ref = None
-            for base, kl in itertools.product(emit_sets, range(32)):
+            # klcs (issue 21 task 20) on the sets that take it (klwarp + klload + klf64 + kllong) and on one that does not (klwarp + kllong)
+            extra = [(base, 27 | 32) for base in emit_sets] + [(emit_sets[-1], 17 | 32)]
+            for base, kl in list(itertools.product(emit_sets, range(32))) + extra:
                 if kl & 8 and not kl & 1:
                     continue                                  # klf64 needs klwarp (the hook refuses it alone)
-                bits = base | (16 if kl & 1 else 0) | (32 if kl & 2 else 0) | (64 if kl & 4 else 0) | (256 if kl & 8 else 0) | (512 if kl & 16 else 0)
+                bits = base | (16 if kl & 1 else 0) | (32 if kl & 2 else 0) | (64 if kl & 4 else 0) | (256 if kl & 8 else 0) | (512 if kl & 16 else 0) | \
+                    (4096 if kl & 32 else 0)
                 h, seen, k_hat = run(lib, cuda, case, bits, fmode)
                 n += 1
                 ref = ref or h
@@ -178,7 +186,7 @@ def main():
         for b in bad[:60]:
             print("  " + b)
         return 1
-    print(f"PASS  {n} runs: every combination of klwarp / klload / klshape / klf64 / kllong over the emitter sets {emit_sets} is bit-identical, and each operand ran the kernel the set asks for")
+    print(f"PASS  {n} runs: every combination of klwarp / klload / klshape / klf64 / kllong (and klcs on the long-row sets) over the emitter sets {emit_sets} is bit-identical, and each operand ran the kernel the set asks for")
     return 0
 
 
