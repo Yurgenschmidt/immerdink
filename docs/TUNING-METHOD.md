@@ -100,13 +100,22 @@ Do not change code until the limiter is named and backed by a measurement:
 - **Predicting a pipe move.** The gain from moving work off a saturated pipe shows up as a drop in the
   math-throttle stall. fq's float multiply-adds split about 50/50 between fmaheavy and fmalite, not all
   onto fmalite. Assume a 50 % lite share unless measured.
-- **Lockstep (phase-locked SMs).** With one block per SM and uniform tiles, every SM runs the same phase at
-  the same time. In KL's pass 1, DRAM was busy (65–97 %) while issue sat at about 12 %. In pass 3 the
-  pattern reversed. A per-SM Little's-law argument [2] about memory parallelism then fails, because the
-  shared DRAM is the limit. A prefetch (klpf) was built on that argument and made KL 1.8 % slower. Check:
-  `ncu --section PmSampling` with a short interval shows the DRAM and issue time series. An
-  autocorrelation of 0.85–0.89 at the row period confirmed the lockstep on both cards. Note that ncu
-  stretches the time axis by about 1.3×.
+- **Lockstep (phase-locked SMs): showing it is not the same as showing it costs time.** With one block per
+  SM and uniform tiles, every SM runs the same phase at the same time. `ncu --section PmSampling` with a
+  short interval gives the DRAM and issue time series. In KL, the DRAM-read series has an autocorrelation of
+  0.85–0.89 at the row period. In pass 1, DRAM was busy (65–97 %) while issue sat at about 12 %; in pass 3
+  the pattern reversed. ncu stretches the time axis by about 1.3×. Two levers were built on two readings of
+  this picture, and both failed:
+  - **klpf** (prefetch the next row inside the same warps) assumed each SM lacked bytes in flight. KL got
+    1.8 % slower.
+  - **klph** (delay half the first-wave blocks so the SMs fall out of step) assumed pass 1 was limited by
+    shared DRAM contention. The SMs fell back into step within a few rows. Even where they were de-phased,
+    the first third of the run, which had half as many idle-DRAM bins, KL was no faster (586–605 µs
+    against 590 µs).
+
+  The rule: before predicting a gain from changing *when* phases run, show that the phase is limited by a
+  resource the other SMs leave idle. Do this by measuring the phase alone, e.g. a pass-1-only variant, or
+  ncu with pass markers. A clean periodic signal is evidence of alignment, not of cost.
 - **Cache working set.** Rows in flight × row bytes against the L2 size (H100: 132 rows × 400 KB = 53 MB,
   more than the 50 MB L2) tells you whether re-reads hit L2 or DRAM.
 - **Check every memory level.** NVIDIA GPUs have no L3. The levels, fastest first, are:
@@ -247,10 +256,11 @@ This automates what took several jobs on Hopper. It is not built yet.
 | O1 (1024) | emit loop bound on fmaheavy | offset-binary emit, no per-modulus sign multiply | | 1.038 / 1.024 |
 | fq (2048) | 64-bit multiply on fmaheavy only | quotient as one binary32 FFMA | −9.1 %, math-throttle stall 16.6 → 10.6 % | 1.069 / 1.044 |
 | klcs (4096) | DRAM 55 % plus long_scoreboard, reads evicted by the plane writes | streaming stores (`st.global.cs`) | −7.8 %, DRAM reads 791 → 543 MB | 1.015 / 1.015 |
-| klpf (8192) | assumed per-SM memory parallelism | prefetch | +1.8 %, falsified by lockstep | dropped |
+| klpf (8192) | assumed per-SM memory parallelism | prefetch in the same warps | +1.8 % | dropped |
+| klph (8192) | assumed shared-DRAM contention from lockstep | de-phase the first wave | ±0.5 %; lockstep re-forms | dropped (PR #65) |
 
-The H100 agreed on every shape (r_mm 1.665, r_bigk 1.381). The row moved from 447 to 8127 in PR #64. The
-next lever, de-phasing the first wave (klph), tests the lockstep finding directly.
+The H100 agreed on every shape (r_mm 1.665, r_bigk 1.381). The row moved from 447 to 8127 in PR #64.
+After klpf and klph, the limiter of KL's pass 1 is not yet named; the lockstep trap above is the lesson.
 
 ## References
 
