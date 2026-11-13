@@ -131,6 +131,20 @@ Do not change code until the limiter is named and backed by a measurement:
 
   Hopper also lets the blocks of a thread-block cluster read each other's shared memory, and the TMA unit
   can multicast loads across them. Neither is used yet.
+- **Proxy architectures for instruction gates.** K5's exact FP64 finish (k5ro) measured 239 → 210 instructions per
+  output on the local RTX 4090 (sm_89). It then measured 261 → 265 on the H200 (sm_90), failing its ≤ 235 gate. The
+  sm_90 compiler already emitted a leaner shipped kernel (50 FP64 instructions per output, against 70 on sm_89).
+  Check: count a gate on the target architecture. A static SASS count of the hot path from a local `sm_90` compile
+  costs no GPU time.
+- **Constant operands.** On sm_90, FP64 instructions take no constant-bank operand: every multiplier from
+  `__constant__` memory is an `LDC.64` into a register, and `LDC` is an MIO instruction. k5ro's first version
+  reloaded 42 constants per output and stalled on MIO (issue 75 → 61 %, math-pipe throttle only 0.3 per issue). The
+  shipped kernel interleaves 4 elements, so each loaded constant feeds 4 FMAs. Check: in the SASS, count `LDC` per
+  output and look for FP64 instructions with `c[...]` operands.
+- **Static spill size is not spill cost.** KF with min-blocks 4 reported 76/116 B of spill per thread and was
+  predicted to lose to min-blocks 3. At run time the spills were 0.7 % of instructions and mostly hit L1 (+17 MB
+  of DRAM), and min-blocks 4 won (KF −28 %, t_batch 1.17×). Check: where the spill instructions sit (inside the
+  loop or not), and the executed local loads and stores in ncu.
 - **Power cap.** PACE's H200s run under an administrative 560 W cap. Long dense runs drop the clock
   (1290 MHz against 990 MHz between two sizes). Read sustained results per clock, not per second.
 
