@@ -1184,8 +1184,15 @@ __device__ __forceinline__ u128 shfl_xor_u128(u128 v, int d) {
   return (static_cast<u128>(hi) << 64) | lo;
 }
 
+// Experiment knob (issue 21 task 25): -DIMD_KF_MINB=n gives KF a minimum-blocks launch bound of n for ptxas. Unset, KF has no bound (the shipped code): an explicit
+// bound of 1 is NOT the same as none (sm_90 KF<8,16,2,15>: 107 registers unbounded, 137 with a bound of 1), so the default must leave it out.
+#ifdef IMD_KF_MINB
+#define IMD_KF_BOUNDS __launch_bounds__(kThreads, IMD_KF_MINB)
+#else
+#define IMD_KF_BOUNDS __launch_bounds__(kThreads)
+#endif
 template <int Cap, int E, int W, int Seq = 0>  // W: v1.14 §3.4.1 pack_words(N); Seq: sequence set
-__global__ void __launch_bounds__(kThreads) kf_scale_pack(const __grid_constant__ FusedArgs<Cap> a) {
+__global__ void IMD_KF_BOUNDS kf_scale_pack(const __grid_constant__ FusedArgs<Cap> a) {
   constexpr int kLgE = E == 16 ? 4 : 2, kTE = kThreads * E, kLgTE = 8 + kLgE;
   constexpr int kRowsMax = kTE / 16;  // th for tk = 16
   // 47.5 KB of static shared memory with E = 16 (the 48 KB limit): the output row offsets are
