@@ -1184,10 +1184,16 @@ __device__ __forceinline__ u128 shfl_xor_u128(u128 v, int d) {
   return (static_cast<u128>(hi) << 64) | lo;
 }
 
-// Experiment knob (issue 21 task 25): -DIMD_KF_MINB=n gives KF a minimum-blocks launch bound of n for ptxas. Unset, KF has no bound (the shipped code): an explicit
-// bound of 1 is NOT the same as none (sm_90 KF<8,16,2,15>: 107 registers unbounded, 137 with a bound of 1), so the default must leave it out.
-#ifdef IMD_KF_MINB
+// KF's minimum blocks per SM for ptxas (issue 21 task 25). sm_90: 4 (64 registers, 4 blocks per SM, 196 KB carveout). k16 H200 job 15566591: KF -28 % at
+// r_lowk, t_batch 1.17x, sq1024 1.10x, no shape slower, bit-identical C; KF is latency-bound there (issue 43 % at 2 blocks), and its 76/116 B of spill
+// are 0.7 % of the executed instructions, mostly L1 hits. Other architectures: no bound (an explicit bound of 1 is NOT the same as none: sm_90 KF
+// 107 registers unbounded, 137 with a bound of 1). -DIMD_KF_MINB=n overrides it on every architecture (experiments; 0 = no bound, the pre-k16 code).
+#if defined(IMD_KF_MINB) && IMD_KF_MINB > 0
 #define IMD_KF_BOUNDS __launch_bounds__(kThreads, IMD_KF_MINB)
+#elif defined(IMD_KF_MINB)
+#define IMD_KF_BOUNDS __launch_bounds__(kThreads)
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+#define IMD_KF_BOUNDS __launch_bounds__(kThreads, 4)
 #else
 #define IMD_KF_BOUNDS __launch_bounds__(kThreads)
 #endif
