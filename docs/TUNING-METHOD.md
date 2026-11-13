@@ -119,8 +119,10 @@ Do not change code until the limiter is named and backed by a measurement:
 - **Cache working set.** Rows in flight × row bytes against the L2 size (H100: 132 rows × 400 KB = 53 MB,
   more than the 50 MB L2) tells you whether re-reads hit L2 or DRAM.
 - **Check every memory level.** NVIDIA GPUs have no L3. The levels, fastest first, are:
-  1. **Registers per thread.** They set occupancy. KF at 112 registers fits only 2 blocks per SM on the
-     H200.
+  1. **Registers per thread.** They set occupancy. KF at 107 registers fits only 2 blocks per SM on the
+     H200. Read the count from `-Xptxas -v` for the exact build you will run: writing an explicit
+     minimum-blocks bound of 1 (`__launch_bounds__(256, 1)`) is not the same as writing none, and moved
+     KF to 137 registers (1 block per SM).
   2. **L1 / shared memory per SM.** 256 KB combined on Hopper. klload keeps rows of up to two chunks on
      chip; klsplit was killed on its L1 counts; K4's tiles live here.
   3. **L2.** Shared by all SMs. On Hopper it is split into two partitions, and traffic across the
@@ -242,8 +244,8 @@ This automates what took several jobs on Hopper. It is not built yet.
   float quotient. Today this is done by hand and by tests.
 - **Constraint programming (for example OR-Tools CP-SAT).** Choose discrete launch settings under hard
   limits: blocks per SM, register caps, shared memory, tile sizes, and per-plan memory footprints. This
-  fits once a cost model exists. The first candidate is KF's register cap (112 registers today, which
-  allows only 2 blocks per SM).
+  fits once a cost model exists. The first candidate is KF's register cap (107 registers today, which
+  allows only 2 blocks per SM; PR #68 times min-blocks 3 and 4).
 - **Equality saturation or superoptimization** of the inner instruction sequences, with an SMT check of
   each rewrite. This is research-grade. The levers so far were found by reading SASS against the floors.
 
