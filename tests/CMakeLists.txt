@@ -142,6 +142,9 @@ if(Python3_FOUND)
   # Issue 21: the CRT with the sums in binary64 limbs against the reference for every N (CPU only; the GPU kernel: crt_f64_gpu).
   add_test(NAME spec_crt_f64
            COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/spec/test_crt_f64.py")
+  # Issue 21 (K5 lever 3, gate 1): the exact FP64 finish (centred quotient, Boldo-Melquiond round-to-odd sum, fallback) against the reference. CPU only, ~35 s.
+  add_test(NAME spec_crt_f64_ro
+           COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/spec/test_crt_f64_ro.py")
   # Issue 23 (known divergence): the decision logic of contract_api's per-W pack-occupancy check, on mocked tables (the Hopper pattern is
   # accepted as known, everything else decides as before). CPU only.
   add_test(NAME contract_occupancy_known
@@ -473,6 +476,13 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_crt_f64_unit.py"
                    --lib "$<TARGET_FILE:immerdink>")
   set_tests_properties(crt_f64_unit PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+  # Issue 21 k5ro (seq bit 8192): the real FP64 finish on gate 1's adversarial vectors, against the oracle and the CPU model (test-hook builds with the twins).
+  if(NOT _seq_twin_arg)
+    add_test(NAME crt_f64_ro_gpu
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_crt_f64_ro_gpu.py"
+                     --lib "$<TARGET_FILE:immerdink>")
+    set_tests_properties(crt_f64_ro_gpu PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+  endif()
   set_tests_properties(output_hashes output_hashes_oracle output_hashes_large PROPERTIES
                        RESOURCE_LOCK gpu TIMEOUT 900)
   foreach(suite lowering legality random fixtures robust highrank)

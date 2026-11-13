@@ -59,7 +59,9 @@ def main():
     # through I2F.F64.U64, issue 21 sequence bit 4) and both together must give the same bits.
     # Issue 23: bit 128 (k5fin, the limb CRT + F1 kernels with fewer instructions) is added: (1, 132) is the kernel it replaces' combination (limb CRT, F1, bit 128), (1, 135) the whole stack,
     # (0, 132) the integer CRT with the bit set, where it must do nothing (the shipped K5 runs).
-    combos = [(1, 0)] if args.no_seq_twins else [(1, 0), (0, 4), (1, 4), (0, 7), (1, 132), (1, 135), (0, 132)]
+    # Issue 21: bit 8192 (k5ro, the K5 exact FP64 finish) on the k5fin kernels: (1, 8324) = 132 + k5ro, (1, 8327) the whole stack, (0, 8324) the integer CRT with
+    # the bits set (nothing changes); N = 18..20 keep the k5fin kernels.
+    combos = [(1, 0)] if args.no_seq_twins else [(1, 0), (0, 4), (1, 4), (0, 7), (1, 132), (1, 135), (0, 132), (1, 8324), (1, 8327), (0, 8324)]
     try:
         for c, committed_hash in cases:
             lib.set_k5_crt(0)
@@ -119,10 +121,14 @@ def main():
                     seen = lib.k5_launch_counts(reset=True)
                     if seen != {(crt, variant): 1}:
                         bad.append(f"{c['name']}: CRT {crt} seq {seq}: the K5 launches were {seen}, expected exactly one launch of variant {names[variant]} ({crt}, {variant})")
+                    ro = lib.k5_ro_counts()                # k5ro (bit 8192) runs on the k5fin kernels for N <= 17 (also counted as k5fin)
                     fin = lib.k5_fin_counts(reset=True)   # k5fin (bit 128) runs for the limb CRT + F1 + bit 128, nowhere else
                     want_fin = {variant: 1} if (crt == 1 and (seq & 132) == 132) else {}
                     if fin != want_fin:
                         bad.append(f"{c['name']}: CRT {crt} seq {seq}: the k5fin launches were {fin}, expected {want_fin}")
+                    want_ro = want_fin if (seq & 8192) and N <= 17 else {}
+                    if ro != want_ro:
+                        bad.append(f"{c['name']}: CRT {crt} seq {seq}: the k5ro launches were {ro}, expected {want_ro}")
                 for crt, seq in dcombos:
                     lib.set_k5_crt(crt)
                     lib.set_seq(seq)
@@ -149,7 +155,7 @@ def main():
         for b in bad:
             print("  " + b)
         return 1
-    print(f"PASS  {n} cases: the binary64-limb CRT and the F1 finish, alone and together, are bit-identical to the integer CRT with the baseline finish (N = 2..20, both input families, RN and TRUNC, batched, alpha and beta; K5 variants E = 1, 2, 4 and bfast forced and confirmed, also with F1, for N = 5, 8, 12, 16, 20)")
+    print(f"PASS  {n} cases: the binary64-limb CRT and the F1 finish, alone and together, (and k5ro) are bit-identical to the integer CRT with the baseline finish (N = 2..20, both input families, RN and TRUNC, batched, alpha and beta; K5 variants E = 1, 2, 4 and bfast forced and confirmed, also with F1, for N = 5, 8, 12, 16, 20)")
     return 0
 
 

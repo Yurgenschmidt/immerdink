@@ -1415,7 +1415,34 @@ def f64_crt_constants(N):
         need(x >> (F64_LIMB_BITS * J) == 0, "limbs cover the value")
         return out
     K = [ql * Ml for ql, Ml in zip(c["q"], c["M"])]
-    return {"J": J, "k": [limbs(x) for x in K], "Pj": limbs(P), "Pinv": 1.0 / P, "P": P, "K": K}
+    return {"J": J, "k": [limbs(x) for x in K], "Pj": limbs(P), "Pinv": 1.0 / P, "P": P, "K": K, "thr": f64_ro_threshold(N, J, P)}
+
+
+def f64_ro_quotient_error(N, J, P):
+    """delta_N (exact rational) of spec/crt_f64_ro.py lemma 3: |fl(S) Pinv - S / P| <= tmax ((1 + 2^-53)^(J - 1) (1 + |Pinv P - 1|) - 1)."""
+    from fractions import Fraction
+    u = Fraction(1, 1 << 53)
+    eta = abs(Fraction(1.0 / P) * P - 1)
+    return N * F64_W_MAX * ((1 + u) ** (J - 1) * (1 + eta) - 1)
+
+
+def f64_ro_top_merge_exact(N, J, P):
+    """spec/crt_f64_ro.py lemma 6 (J = 4): r'_3 + r'_2 is a multiple of 2^(2w) of magnitude below 2^(53 + 2w), so a double and the add is exact."""
+    from fractions import Fraction
+    w = F64_LIMB_BITS
+    bound = Fraction(P, 2) + f64_ro_quotient_error(N, J, P) * P + ((1 << 53) - 1) * ((1 << w) + 1)
+    return bound < (1 << (53 + 2 * w))
+
+
+def f64_ro_threshold(N, J, P):
+    """Issue 21 K5 exact FP64 finish (spec/crt_f64_ro.py): the fallback threshold RD(P/2 - 2^-38 P) on |z~|, or 0.0 for the N the finish does not cover
+    (J = 4 without an exact top merge: N >= 18; those keep the integer finish). Any double <= RN(P/2) is sound (lemma 5)."""
+    from fractions import Fraction
+    if J > 4 or (J == 4 and not f64_ro_top_merge_exact(N, J, P)):
+        return 0.0
+    x = Fraction(P, 2) - Fraction(P, 1 << 38)
+    f = float(x)
+    return f if Fraction(f) <= x else math.nextafter(f, 0.0)
 
 
 @check("§3.6 CRT sums in binary64 limbs are exact (issue 21)")
@@ -1442,6 +1469,27 @@ def cert_crt_f64():
                 need((Kl * W - Ml * ((ql * W) % pl)) % c["P"] == 0, f"N={N} l={l} W={W} congruence")
         need(sum(f["Pj"][j] << (F64_LIMB_BITS * j) for j in range(J)) == c["P"], f"N={N} P limbs")
     return f"N={N_MIN}..{N_MAX}: {F64_LIMB_BITS}-bit limbs, J <= {F64_MAX_J}, sums < 2^53, quotient error < 2^-37"
+
+
+@check("§3.6 K5 exact FP64 finish: coverage, quotient error and threshold (issue 21, spec/crt_f64_ro.py)")
+def cert_crt_f64_ro():
+    """The preconditions spec/crt_f64_ro.py's lemmas take from the plan-time constants (the algorithm is tested bit for bit by spec/test_crt_f64_ro.py):
+    the centred quotient error delta_N < 2^-39 (lemma 3: t is within one of t*, and r'_j stays exact by cert_crt_f64's bounds, 0 <= t <= tmax);
+    for J = 4 the top merge is exact (lemma 6); the threshold is a positive double <= RN(P/2) (lemma 5); covered exactly for N <= 17."""
+    from fractions import Fraction
+    covered = []
+    for N in range(N_MIN, N_MAX + 1):
+        f = f64_crt_constants(N)
+        J, P, thr = f["J"], f["P"], f["thr"]
+        if thr == 0.0:
+            need(J == 4 and not f64_ro_top_merge_exact(N, J, P), f"N={N}: uncovered only for a four-term sum")
+            continue
+        covered.append(N)
+        need(f64_ro_quotient_error(N, J, P) < Fraction(1, 1 << 39), f"N={N} delta_N < 2^-39")
+        need(0.0 < thr <= float(P // 2) and Fraction(thr) <= Fraction(P, 2) - Fraction(P, 1 << 38), f"N={N} threshold")
+        need(Fraction(thr) >= Fraction(P, 2) * (1 - Fraction(1, 1 << 36)), f"N={N} threshold not far below P/2 (fallback rate)")
+    need(covered == list(range(N_MIN, 18)), f"covered N {covered}")
+    return f"N={N_MIN}..17 covered (N=18..20 keep the integer finish), delta_N < 2^-39, thr = RD(P/2 - 2^-38 P)"
 
 
 @check("§3.4 residues fit int8")
@@ -3242,6 +3290,7 @@ def build_header():
     w("  double k[kNMax + 1][kNMax][kF64MaxJ];")
     w("  double Pj[kNMax + 1][kF64MaxJ];")
     w("  double Pinv[kNMax + 1];")
+    w("  double thr[kNMax + 1];   // issue 21 K5 exact FP64 finish: fallback threshold on |z~|; 0.0 = not covered (N >= 18)")
     w("};")
     w("")
     w("inline constexpr Tables kTables = {")
@@ -3296,6 +3345,7 @@ def build_header():
         w(f"      {row(pad4(f64[N]['Pj']) if N in f64 else pad4([]), dbl)},  // N = {N}")
     w("    },")
     w(f"    /* Pinv */ {row([f64[N]['Pinv'] if N in f64 else 0.0 for N in range(N_MAX + 1)], dbl)},")
+    w(f"    /* thr */ {row([f64[N]['thr'] if N in f64 else 0.0 for N in range(N_MAX + 1)], dbl)},")
     w("};")
     w("")
     w("}  // namespace imd::constants")

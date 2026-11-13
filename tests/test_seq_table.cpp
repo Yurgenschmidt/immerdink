@@ -87,13 +87,23 @@ int main() {
   CHECK(kSeqKlCs == 4096 && (kSeqKlCs & (kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqK5Fin | kSeqOffset | kSeqFloatQ | 15)) == 0);
   CHECK(seq_kl_kb(kSeqKlCs) == 8 && seq_kl_kb(4023 | kSeqKlCs) == (seq_kl_kb(4023) | 8) && seq_kl_kb(4023) == 7);
   CHECK(seq_pack_s(4023 | kSeqKlCs, 2) == seq_pack_s(4023, 2) && !seq_kl_direct(kSeqKlCs, 8) && seq_kl_direct(4023 | kSeqKlCs, 8));
-  CHECK(!seq_valid(8192) && !seq_valid(8192 | 4023));
+  CHECK(!seq_valid(16384) && !seq_valid(16384 | 4023));
 #ifndef IMD_NO_SEQ_TWINS
   CHECK(seq_valid(kSeqKlCs) && seq_valid(4023 | kSeqKlCs));
 #else
   CHECK(!seq_valid(kSeqKlCs));
 #endif
   for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqKlCs) == 0 || (c.cc_major == 9 && c.cc_minor == 0));   // on in the sm_90 row only (k15e, 2026-11-12)
+  // k5ro (issue 21, the K5 exact FP64 finish): bit 8192, needs k5fin (so F1) and nothing else; no pack / KL effect; off in every class row until measured
+  CHECK(kSeqK5Ro == 8192 && (kSeqK5Ro & (kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqK5Fin | kSeqOffset | kSeqFloatQ | kSeqKlCs | 15)) == 0);
+  CHECK(seq_kl_kb(8127 | kSeqK5Ro) == seq_kl_kb(8127) && seq_pack_s(8127 | kSeqK5Ro, 2) == seq_pack_s(8127, 2) && !seq_valid(kSeqK5Ro) && !seq_valid(kSeqK5Ro | 4));
+#ifndef IMD_NO_SEQ_TWINS
+  CHECK(seq_valid(kSeqK5Ro | 133) && seq_valid(kSeqK5Ro | 4023) && seq_valid(kSeqK5Ro | 8119));
+  for (int b = 0; b < 8192; ++b) CHECK(seq_valid(b | kSeqK5Ro) == ((b & kSeqK5Fin) != 0 && seq_valid(b)));   // k5ro needs k5fin and nothing else
+#else
+  CHECK(!seq_valid(kSeqK5Ro | 133));
+#endif
+  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqK5Ro) == 0);
 #ifndef IMD_NO_SEQ_TWINS   // (seq_effective masks a forced set to the supported bits: with the twins off only E1 is left)
   CHECK(seq_effective(13, 17) == 17 && seq_effective(13, 113) == 113 && seq_effective(13, -1) == 13 && (seq_effective(13, 125) & kSeqLimbCrt) == 0);
 #endif
