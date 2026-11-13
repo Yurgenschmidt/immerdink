@@ -15,7 +15,7 @@
 #   baselines.jsonl   cuTENSOR native / emulated throughput records
 #   energy.jsonl      energy records (idle baseline + one record per case and N)
 #   compare.jsonl     throughput / accuracy of immerdink and the baselines on the same inputs (sweep_compare.txt)
-#   cutensor_ws.jsonl     cuTENSOR native vs emulated at workspace preference default and max (sweep_cutensor_ws.txt);
+#   cutensor_ws.jsonl     cuTENSOR emulation at a workspace-limit ladder est/256/2048/8192 MiB (sweep_cutensor_ws.txt);
 #                         cutensor_ws.md is its table (cutws_table.py)
 #   compare_energy.jsonl  board-energy records of the same configurations (sweep_compare_energy.txt)
 #   profile/          nsys pass: index.json, <tag>/summary.json (kernels by category, engaged_int8), <tag>/run.log;
@@ -175,8 +175,8 @@ for sw in ${SWEEPS:-imd baseline cutws compare compare_energy energy profile}; d
       st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
       ;;
     cutws)
-      # cuTENSOR emulation vs native planned at workspace preference DEFAULT and MAX (bench/sweep_cutensor_ws.txt):
-      # is the emulation held back by the plan's workspace preference? -> cutensor_ws.jsonl, cutensor_ws.md
+      # cuTENSOR emulation at a ladder of plan workspace limits (bench/sweep_cutensor_ws.txt): from which limit does
+      # cuBLASLt's INT8 path engage, per case? -> cutensor_ws.jsonl, cutensor_ws.md
       "$here/run_sweep.sh" "$here/sweep_cutensor_ws.txt" "$outdir/cutensor_ws.jsonl" 2>&1 | tee "$outdir/cutensor_ws.out"
       st=${PIPESTATUS[0]}; [ "$st" = 0 ] || rc=$st
       ;;

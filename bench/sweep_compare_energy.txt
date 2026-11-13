@@ -7,12 +7,21 @@
 #   energy configurations: imd N=8,11,14,16; GEMMul8 fast N=8,11,14, accurate N=14; cuBLAS emulation
 #   dyn,fix39,fix55; DGEMM; cuTENSOR native; cuTENSOR emulated (14 per case). A matrix-only method on a case that
 #   is not a GEMM view is measured with its cuTENSOR permutations (perm+<method>), like sweep_compare.txt.
+# Each case also runs energy-cutensor-emu with --ct-emu strategy=eager,bits=55 in a process of its own (it sets
+# process-wide cuBLAS environment variables; bench/imd_bench.cu); cutensor-emu plans at --ct-ws-mib 8192 (the default).
 # One attempt per case (@BENCH_RETRIES=1): an energy case takes minutes and its spread is not the retry criterion.
 # Needs the NVML energy counter (see Test 2): without it every energy record is an error.
 sq2048   | ik,jk->ij | i=2048,j=2048,k=2048 | energy,energy-gemmul8,energy-emu,energy-dgemm,energy-cutensor,energy-cutensor-emu | | --phi 0.5 --samples 1048576 --N 8,11,14,16 --g8mode fast,accu --g8fast-N 8,11,14 --g8accu-N 14 --emu dyn,fix39,fix55 @BENCH_RETRIES=1
+sq2048   | ik,jk->ij | i=2048,j=2048,k=2048 | energy-cutensor-emu | | --phi 0.5 --samples 1048576 --ct-ws-mib 8192 --ct-emu strategy=eager,bits=55 @BENCH_RETRIES=1
 sq4096   | ik,jk->ij | i=4096,j=4096,k=4096 | energy,energy-gemmul8,energy-emu,energy-dgemm,energy-cutensor,energy-cutensor-emu | | --phi 0.5 --samples 1048576 --N 8,11,14,16 --g8mode fast,accu --g8fast-N 8,11,14 --g8accu-N 14 --emu dyn,fix39,fix55 @BENCH_RETRIES=1
+sq4096   | ik,jk->ij | i=4096,j=4096,k=4096 | energy-cutensor-emu | | --phi 0.5 --samples 1048576 --ct-ws-mib 8192 --ct-emu strategy=eager,bits=55 @BENCH_RETRIES=1
 sq8192   | ik,jk->ij | i=8192,j=8192,k=8192 | energy,energy-gemmul8,energy-emu,energy-dgemm,energy-cutensor,energy-cutensor-emu | | --phi 0.5 --samples 262144 --N 8,11,14,16 --g8mode fast,accu --g8fast-N 8,11,14 --g8accu-N 14 --emu dyn,fix39,fix55 @BENCH_RETRIES=1
+sq8192   | ik,jk->ij | i=8192,j=8192,k=8192 | energy-cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws-mib 8192 --ct-emu strategy=eager,bits=55 @BENCH_RETRIES=1
 t_df     | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | energy,energy-gemmul8,energy-emu,energy-dgemm,energy-cutensor,energy-cutensor-emu | | --phi 0.5 --samples 262144 --N 8,11,14,16 --g8mode fast,accu --g8fast-N 8,11,14 --g8accu-N 14 --emu dyn,fix39,fix55 @BENCH_RETRIES=1
+t_df     | acQ,bdQ->acbd | a=64,b=64,c=64,d=64,Q=2048 | energy-cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws-mib 8192 --ct-emu strategy=eager,bits=55 @BENCH_RETRIES=1
 t_cc     | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | energy,energy-gemmul8,energy-emu,energy-dgemm,energy-cutensor,energy-cutensor-emu | | --phi 0.5 --samples 262144 --N 8,11,14,16 --g8mode fast,accu --g8fast-N 8,11,14 --g8accu-N 14 --emu dyn,fix39,fix55 @BENCH_RETRIES=1
+t_cc     | kjbc,kiac->abij | i=32,j=32,k=32,a=128,b=128,c=128 | energy-cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws-mib 8192 --ct-emu strategy=eager,bits=55 @BENCH_RETRIES=1
 t_batch  | lik,ljk->lij | i=1024,j=1024,k=1024,l=16 | energy,energy-gemmul8,energy-emu,energy-dgemm,energy-cutensor,energy-cutensor-emu | | --phi 0.5 --samples 262144 --N 8,11,14,16 --g8mode fast,accu --g8fast-N 8,11,14 --g8accu-N 14 --emu dyn,fix39,fix55 @BENCH_RETRIES=1
+t_batch  | lik,ljk->lij | i=1024,j=1024,k=1024,l=16 | energy-cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws-mib 8192 --ct-emu strategy=eager,bits=55 @BENCH_RETRIES=1
 s_batch  | lik,ljk->lij | i=64,j=64,k=64,l=256 | energy,energy-gemmul8,energy-emu,energy-dgemm,energy-cutensor,energy-cutensor-emu | | --phi 0.5 --samples 262144 --N 8,11,14,16 --g8mode fast,accu --g8fast-N 8,11,14 --g8accu-N 14 --emu dyn,fix39,fix55 @BENCH_RETRIES=1
+s_batch  | lik,ljk->lij | i=64,j=64,k=64,l=256 | energy-cutensor-emu | | --phi 0.5 --samples 262144 --ct-ws-mib 8192 --ct-emu strategy=eager,bits=55 @BENCH_RETRIES=1

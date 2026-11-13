@@ -265,6 +265,13 @@ def emu_verdict(nat, emu):
     that is not run-to-run reproducible (repeat_identical false) cannot show a difference by itself."""
     if emu is None:
         return "none", "—"
+    # bench_schema 2: per-record evidence decides (kernel names of one graph-captured call; native twin at the same workspace)
+    if isinstance(emu.get("emu_engaged"), bool):
+        if emu.get("identical_to_native_same_ws") is True:
+            return "no", "NOT engaged (C bit-identical to the native twin at the same workspace)"
+        if emu["emu_engaged"]:
+            return "yes", "ENGAGED (graph capture: INT8 emulation kernels in the call)"
+        return "no", "NOT engaged (graph capture: native FP64 kernels only)"
 
     def similar():  # time within 5 % and error within a factor 2 of native
         if not nat:
