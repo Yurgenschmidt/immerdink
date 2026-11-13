@@ -98,3 +98,50 @@ unchanged issue efficiency (~-1 % of an sq4096 call). On the 4090, KL is memory-
 scheduler issues after the next address is formed), against nine IMAD-family instructions before. The refined prediction is therefore
 -7 fmaheavy and -3 issued per iteration: per element fmaheavy 108 -> ~96 and issued 219 -> ~213. That is about -3 % of KL time on Hopper,
 smaller than the first estimate because the replacement additions still issue.
+
+## KF twins: 'kff64' (bit 16384) and 'kfaff' (bit 32768), issue 21 task 28
+
+**KF** is the fused pack for small k (k_hat <= 1024, DESIGN v1.4 §4): one launch reads both operands' tiles into shared memory, finds each
+row's sigma (the same K1 integers as KL) and writes group 1's residues. It is the pack of every "remaining" Hopper shape: r_lowk (8192 x 8192 x 1024),
+t_batch (16 x 1024^3), sq1024, s512, s256.
+
+**Limiter, with evidence.** H200 job 15566591 (k16), r_lowk N = 14, KF with min-blocks 4: 0.232 ms, 61 % issue active, 48 % warps active,
+143.3 M warp instructions for 16.8 M elements = **272 thread instructions per element**; DRAM floor 0.08 ms, issue floor 0.14 ms (t_batch: the
+same 274 per element, 0.454 ms). The KF source counters (ncu SourceCounters of the k16 report, split at the kernel's barriers) give per element:
+
+| part | instructions / element | stall samples |
+|---|---|---|
+| step 1, descriptor: the per-tile table of k offsets `s_vk` (one 32-bit division per column and tile), row bases | ~33 (the table ~20) | 10 % |
+| step 2, tile load into shared memory | ~36 | 36 % |
+| step 3, gamma scan + flag + their reductions | ~30 | 10 % |
+| step 3, exact u128 square sum + reductions + largest_u | ~65 | 21 % |
+| step 5, emit (14 moduli) | ~104 | 21 % |
+
+So, as in KL before klf64, the fixed part (everything except the emit) is ~60 % of KF's instructions on a card whose FP64 pipe is full rate.
+
+**What the bits do.** `kff64` is klf64 inside KF: gamma from the max high word, S as a binary64 sum of y^2 with y = x 2^(30 - gamma), and the
+filter `largest_u_filtered` decides u; a tile with an undecided, non-finite or subnormal-max row runs the exact integers (block-uniform,
+`__syncthreads_or`). The proof above does not depend on the summation order or on where the row is held, and KF's rows are whole tile rows
+(k_hat <= 1024 << 2^50), so it carries over unchanged. `kfaff` replaces the table of k offsets by h * stride when the K class is one fused
+mode (the usual GEMM; k0_offset of one mode is exactly that for h < k). Both are bit-identical twins (template value Kf of kf_scale_pack),
+compiled for the sm_90 emitter sets only (pack S = 15 at W = 2, S = 1 at W = 3) and the small descriptor capacity; elsewhere the launch runs the
+shipped KF. The 606 shipped sm_90 kernels are SASS-identical with and without the twins; the twins use 64 registers (spill: kff64 E = 16 W = 2
+76 / 136 B against 76 / 116 B; the others equal or less).
+
+**Prediction (before any measurement).** Per element: step 3 ~95 -> ~15 (kff64), step 1 ~33 -> ~13 (kfaff), total ~272 -> ~175 (-35 %).
+KF is not purely issue-bound (61 % issue, 36 % of the samples wait on the tile's loads), so the time gain is smaller: KF -20 .. -30 % on H200
+(r_lowk 0.236 -> 0.17 .. 0.19 ms, t_batch 0.462 -> 0.33 .. 0.37 ms), end to end t_batch 1.10 .. 1.13x, sq1024 1.05 .. 1.10x,
+r_lowk 1.02x, s256 / s512 within noise or better. On the 4090 the bits can only cost (KF is memory-bound there, FP64 at 1/64 rate): sm_90 row only.
+
+**Tests.** `test_kf_bits.py` (ctest kf_bits): every combination of the two bits over emitter sets with and without a KF twin, 12 contractions
+(k_hat 16 .. 1024, N = 8 / 14 / 20, batched, g > 1, a transposed operand, an odd pitch, a K class of two modes, rows of special values), with
+and without the small-problem variants, one hash per case, and the KF launch counter (`imd_test_kf_launch_counts`) shows the twin ran.
+The klf64 threshold suite gained KF shapes (k_hat 64 / 900 / 1000 / 1024) and runs under 24503 (8119 + kff64), 57271 (+ kfaff) and
+19895 (3511 + kff64); e2e / tensor / eps and the committed hashes run under 57271 and 40887 (8119 + kfaff).
+
+**Review.** An independent read-only review (2026-11-13) found no blocker: barriers and full-mask shuffles block-uniform, every shared-memory
+write-after-read separated by a barrier, the zero / invalid / padding / non-finite / subnormal-max rows equal to the exact path, the filter's
+preconditions met (St >= 2^60, k_hat << 2^50), every lane of a row with the same sigma, kfaff equal to k0_offset for h < k, and no twin
+launched without being instantiated. Acted on: `ExecPlan::seq` is 16 bits and now full (a static_assert guards the next bit), and the bench's
+`--seq` accepts the new bits. Left as is: when a row spans two warps, both warps run the filter (klf64 runs it once per row; two extra 128-bit
+compares per row of 1024 values).

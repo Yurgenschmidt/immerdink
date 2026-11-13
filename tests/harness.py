@@ -174,6 +174,8 @@ class Library:
             self.lib.imd_test_k5_launch_counts.restype = C.c_int
             self.lib.imd_test_kl_launch_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
             self.lib.imd_test_kl_launch_counts.restype = C.c_int
+            self.lib.imd_test_kf_launch_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
+            self.lib.imd_test_kf_launch_counts.restype = C.c_int
             self.lib.imd_test_kl_timers.argtypes = [C.c_int, C.POINTER(C.c_uint64), C.c_int]
             self.lib.imd_test_kl_timers.restype = C.c_int
             self.lib.imd_test_k5_fin_counts.argtypes = [C.c_int, C.POINTER(C.c_int64)]
@@ -293,7 +295,7 @@ class Library:
         return self.lib.imd_test_plan_seq(plan)
 
     def set_seq(self, bits=-1):
-        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq, 4096 klcs; -1 the device class's)."""
+        """Issue 21: the instruction-sequence set of later calls (1 E1 emitter, 2 Q1 quantize, 4 F1 finish, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq, 4096 klcs, 16384 kff64, 32768 kfaff; -1 the device class's)."""
         assert self.lib.imd_test_set_seq(bits) == 0
 
     def crt_elem(self, N, variant, e, count, W_dev, out_dev):
@@ -314,6 +316,12 @@ class Library:
         out = (C.c_int64 * 48)()
         assert self.lib.imd_test_kl_launch_counts(1 if reset else 0, out) == 0
         return {((4, 8, 16)[e], k): out[16 * e + k] for e in range(3) for k in range(16) if out[16 * e + k]}
+
+    def kf_launch_counts(self, reset=False):
+        """Issue 21 task 28: KF kernel launches since the last reset as {(E, Kf): count}; E = 4 / 16 values per thread, Kf bit 0 kff64, bit 1 kfaff."""
+        out = (C.c_int64 * 8)()
+        assert self.lib.imd_test_kf_launch_counts(1 if reset else 0, out) == 0
+        return {((4, 16)[e], k): out[4 * e + k] for e in range(2) for k in range(4) if out[4 * e + k]}
 
     def kl_timers(self, reset=False):
         """Issue 23: the KL section timers as a list of 16 sums (None in a build without IMMERDINK_KL_TIMERS); see tools/kl_timers.py."""
