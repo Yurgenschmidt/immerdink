@@ -476,6 +476,13 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_crt_f64_unit.py"
                    --lib "$<TARGET_FILE:immerdink>")
   set_tests_properties(crt_f64_unit PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+  # Issue 21 k5ro (seq bit 8192): the real FP64 finish on gate 1's adversarial vectors, against the oracle and the CPU model (test-hook builds with the twins).
+  if(NOT _seq_twin_arg)
+    add_test(NAME crt_f64_ro_gpu
+             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_crt_f64_ro_gpu.py"
+                     --lib "$<TARGET_FILE:immerdink>")
+    set_tests_properties(crt_f64_ro_gpu PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
+  endif()
   set_tests_properties(output_hashes output_hashes_oracle output_hashes_large PROPERTIES
                        RESOURCE_LOCK gpu TIMEOUT 900)
   foreach(suite lowering legality random fixtures robust highrank)

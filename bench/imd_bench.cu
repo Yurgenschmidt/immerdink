@@ -113,12 +113,12 @@
 #include <vector>
 
 // Issue 21 / 23: a forced instruction-sequence set written as a decimal number: bits 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq,
-// 4096 klcs (host/seq_config.hpp;
-// bit 8, the limb CRT, is a class default only: --crt forces it), Q1 needs E1 and 128 needs F1. The library's hook decides whether this build can run it.
+// 4096 klcs, 8192 k5ro (host/seq_config.hpp;
+// bit 8, the limb CRT, is a class default only: --crt forces it), Q1 needs E1, 128 needs F1 and 8192 needs 128. The library's hook decides whether this build can run it.
 static bool seq_bits_ok(const std::string& v) {
-  if (v.empty() || v.size() > 4 || v.find_first_not_of("0123456789") != std::string::npos) return false;
+  if (v.empty() || v.size() > 5 || v.find_first_not_of("0123456789") != std::string::npos) return false;
   const int b = std::stoi(v);
-  return (b & ~(1 | 2 | 4 | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096)) == 0 && ((b & 2) == 0 || (b & 1) != 0) && ((b & 128) == 0 || (b & 4) != 0) &&
+  return (b & ~(1 | 2 | 4 | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192)) == 0 && ((b & 8192) == 0 || (b & 128) != 0) && ((b & 2) == 0 || (b & 1) != 0) && ((b & 128) == 0 || (b & 4) != 0) &&
          ((b & 256) == 0 || (b & 16) != 0) &&  // 256 klf64 (issue 21) needs 16 klwarp; 512 kllong (issue 21): klload's direct loads for nc > 2
          ((b & 1024) == 0 || (b & 1) != 0) &&  // 1024 O1 (issue 21): the offset-binary emitter, needs E1
          ((b & 2048) == 0 || (b & 1024) != 0);  // 2048 fq (issue 21): O1's quotient in binary32, needs O1
@@ -3051,7 +3051,7 @@ int main(int argc, char** argv) {
       const std::string& v = a["seq"];
       if (v == "default") B.o.seq = -1;
       else if (seq_bits_ok(v)) B.o.seq = std::stoi(v);
-      else throw Failure("--seq default|<bits> (bits: 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq, 4096 klcs; Q1 and 1024 need E1, 2048 needs 1024, 128 needs F1, 256 needs 16; 4096 acts on the long-row KL with 16 + 512 + 256 only; e.g. 0 1 3 5 7 17 33 65 113 133 245 437 951 1025 1463 3511 4023 8119)");
+      else throw Failure("--seq default|<bits> (bits: 1 E1, 2 Q1, 4 F1, 16 klwarp, 32 klload, 64 klshape, 128 k5fin, 256 klf64, 512 kllong, 1024 O1, 2048 fq, 4096 klcs, 8192 k5ro; Q1 and 1024 need E1, 2048 needs 1024, 128 needs F1, 256 needs 16, 8192 needs 128; 4096 acts on the long-row KL with 16 + 512 + 256 only; 8192 on K5 at N <= 17; e.g. 0 1 3 5 7 17 33 65 113 133 245 437 951 1025 1463 3511 4023 8119)");
     }
     if (a.count("crt")) {
       if (a["crt"] != "default" && a["crt"] != "int" && a["crt"] != "f64") throw Failure("--crt default|int|f64");

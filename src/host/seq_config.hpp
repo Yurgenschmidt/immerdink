@@ -27,6 +27,11 @@
 // (H200 job 15526028: DRAM read 791 -> 543 MB, KL -7.8 % on r_bigk). It applies only to the sm_90 long-row kernel (E = 4, W = 2) with klwarp +
 // klload/kllong + klf64 (Kb 7); elsewhere the bit is simply not taken. Same bytes. Off in every class row until measured on both Hopper cards.
 // (A pass-1 L2 prefetch 'klpf' was measured in the same job and dropped: no gain, pass 1 is bandwidth-bound.)
+// Bit 8192 'k5ro' (issue 21, the K5 exact FP64 finish; spec in issue 21 comment 6750980047, model and proof spec/crt_f64_ro.py, gate 1 spec/test_crt_f64_ro.py):
+// the k5fin kernels' integer tail (the F2I quotient, the F2I limb conversions, the 40 -> 32-bit repack, the subtraction of P and the F1 finish) replaced by
+// FP64 arithmetic: a centred quotient by DFMA + a magic DADD, exact limb remainders, the Boldo-Melquiond round-to-odd sum of three doubles, 2^e by an
+// exponent add. Elements near +-P/2 (2^-37 of uniform values), subnormal or overflowing results take today's finish. Bit-identical. Needs k5fin (so F1);
+// N <= 17 (N = 18..20 keep the k5fin kernels). FP64 pipe at full rate: sm_90 / sm_100 only. Off in every class row until measured.
 // Bits 16, 32, 64 (issue 23, docs/NOTES-23.md) are cuts of the FIXED part of the large-row pack KL (everything that does not scale with N), each
 // independent of the emitter set and of the others; all off in every class row until the Hopper duels decide:
 //   kSeqKlWarp  'klwarp'   row-wide scalar work once per row / tile instead of by every thread / warp (largest_u, tile row setup, cross-warp combines)
@@ -55,13 +60,14 @@ constexpr int kSeqKlLong = 512;  // issue 21 'kllong': klload's direct loads for
 constexpr int kSeqOffset = 1024;  // issue 21 'O1': the offset-binary emitter input (needs E1; W = 2)
 constexpr int kSeqFloatQ = 2048;  // issue 21 'fq': O1's quotient in binary32, one FFMA (needs O1; W = 2)
 constexpr int kSeqKlCs = 4096;  // issue 21 task 20 'klcs': KL's R stores evict-first (sm_90 long rows)
+constexpr int kSeqK5Ro = 8192;  // issue 21 'k5ro': K5's finish in FP64 with a round-to-odd sum (needs k5fin; N <= 17)
 constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqOffset | kSeqFloatQ | kSeqKlCs;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
 // The sets this build can run: with IMMERDINK_SEQ_TWINS=OFF (IMD_NO_SEQ_TWINS) the Q1 / F1 / KL-bit / k5fin kernel twins are not compiled and the
 // hooks refuse them.
 #ifdef IMD_NO_SEQ_TWINS
 constexpr int kSeqSupported = kSeqEmit;
 #else
-constexpr int kSeqSupported = kSeqAll | kSeqK5Fin;
+constexpr int kSeqSupported = kSeqAll | kSeqK5Fin | kSeqK5Ro;
 #endif
 // What a class default may contain in this build: the supported sequences, and the limb CRT (its kernels are not twins; they are always compiled).
 constexpr int kSeqDefaultMask = kSeqSupported | kSeqLimbCrt;
@@ -93,10 +99,11 @@ constexpr int seq_default_for(int32_t cc_major, int32_t cc_minor) {
 }
 
 // Q1 quantizes into the 64-bit X of the E1 emitter: the Q1 bit without the E1 bit is not a set (it would run the baseline
-// silently), so the hooks reject it. The same for k5fin without F1 (its kernels are F1 kernels).
+// silently), so the hooks reject it. The same for k5fin without F1 (its kernels are F1 kernels), and k5ro without k5fin (a variant of the k5fin kernels).
 constexpr bool seq_valid(int bits) {
   return bits >= -1 && (bits < 0 || ((bits & ~kSeqForceMask) == 0 && ((bits & kSeqQuant) == 0 || (bits & kSeqEmit) != 0) &&
                                       ((bits & kSeqK5Fin) == 0 || (bits & kSeqFinish) != 0) &&
+                                      ((bits & kSeqK5Ro) == 0 || (bits & kSeqK5Fin) != 0) &&
                                       ((bits & kSeqKlF64) == 0 || (bits & kSeqKlWarp) != 0) &&
                                       ((bits & kSeqOffset) == 0 || (bits & kSeqEmit) != 0) &&
                                       ((bits & kSeqFloatQ) == 0 || (bits & kSeqOffset) != 0)));

@@ -218,7 +218,7 @@ int main() {
     std::printf("FAIL: imd_test_set_k5_crt(%s)\n", v);
     return 1;
   }
-  int64_t fin0[4] = {0, 0, 0, 0};
+  int64_t fin0[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   imd_test_k5_fin_counts(1, fin0);
   imd_handle_t h = nullptr;
   if (imd_create(&h) != IMD_STATUS_SUCCESS) return 1;
@@ -250,7 +250,7 @@ int main() {
   }
   imd_destroy(h);
   if (const char* r = std::getenv("IMD_TEST_REQUIRE_K5FIN"); r != nullptr && std::atoi(r) != 0) {
-    int64_t fin[4] = {0, 0, 0, 0};
+    int64_t fin[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     imd_test_k5_fin_counts(0, fin);
     std::printf("k5fin launches (variant 0..3): %lld %lld %lld %lld\n", (long long)fin[0], (long long)fin[1], (long long)fin[2], (long long)fin[3]);
     if (fin[0] + fin[1] + fin[2] + fin[3] == 0) {

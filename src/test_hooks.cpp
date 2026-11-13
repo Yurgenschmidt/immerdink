@@ -72,7 +72,8 @@
 //   imd_test_kl_launch_counts(reset, out)   issue 23: KL kernel launches, int64[48]: [E 4/8/16][Kb 0..15: klwarp, klload, klf64, klcs]
 //   imd_test_kl_timers(reset, out, n)       issue 23: KL section timers (IMMERDINK_KL_TIMERS builds)
 //       Issue 21 (docs/NOTES-21.md): the first runs the real CRT device functions of contract.cu
-//       (variant 0 integer running CRT, 1 binary64-limb CRT, 2..9 its compile-time mutations) on
+//       (variant 0 integer running CRT, 1 binary64-limb CRT, 2..9 its compile-time mutations, 10 the k5fin tail,
+//       11 the k5ro FP64 finish, N <= 17: exponent in, double + fast-path flag out, tests/test_crt_f64_ro_gpu.py) on
 //       `count` device residue vectors and writes x in [0, P) before crt_finish; the second
 //       copies (and optionally zeroes) the counts of K5 launches per [limb CRT?][variant].
 //       tests/test_crt_f64_unit.py, tests/test_crt_f64_gpu.py.
@@ -255,7 +256,8 @@ IMD_API int imd_test_kl_timers(int reset, unsigned long long* out, int n) {
   return imd::detail::test_kl_timers(reset != 0, out, n);
 }
 
-// Issue 23: launches of the k5fin K5 kernels (seq bit 128) since the last reset, int64[4]: [variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest]; reset != 0 zeroes them.
+// Issue 23: launches of the k5fin K5 kernels (seq bit 128) since the last reset, int64[8]: [variant 0 / 1 / 2 = 1 / 2 / 4 elements per thread, 3 = batch fastest],
+// then [4 + variant] those of them that ran the k5ro finish (issue 21, seq bit 8192); reset != 0 zeroes them.
 IMD_API int imd_test_k5_fin_counts(int reset, int64_t* out) {
   if (out == nullptr) return 1;
   imd::detail::test_k5_fin_counts(reset != 0, out);
