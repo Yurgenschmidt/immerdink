@@ -3,7 +3,7 @@
 
     python3 tests/test_seq_select.py [--lib build/libimmerdink.so]
 
-Pins the per-class defaults against this GPU's compute capability (sm_89: E1 = 1; sm_90: E1 + Q1 + F1 + limb CRT + klwarp + klload + k5fin + klf64 + kllong + O1 + fq + klcs = 8127 (R2: 13, R4: 173, R5: 189, 2026-11-08: 447, 2026-11-12: 8127); anything
+Pins the per-class defaults against this GPU's compute capability (sm_89: E1 = 1; sm_90: E1 + Q1 + F1 + limb CRT + klwarp + klload + k5fin + klf64 + kllong + O1 + fq + klcs + k5ro = 16319 (R2: 13, R4: 173, R5: 189, 2026-11-08: 447, 2026-11-12: 8127, 2026-11-13: 16319); anything
 else, sm_120 included: 0), checks that a forced set (imd_test_set_seq) is what a plan reports, that -1 restores the class default, and that the
 invalid sets (the Q1 bit without the E1 bit, the KL bits 16 / 32 / 64 are valid in every combination (issue 23: all 48 sets are forced and read back), bit 128 (k5fin) without F1, bit 8 (the limb CRT is a class default only) and out of range) are rejected. The K5 CRT hook is tri-state (-1 follow
 the plan's set, 0 integer, 1 limbs): what the plan's K5 runs (imd_test_plan_crt) is pinned for the default, each forced value, and a forced set 0..7 (integer unless the hook forces limbs). A seq run that silently ran the default would
