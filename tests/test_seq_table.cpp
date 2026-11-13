@@ -1,5 +1,5 @@
 // Issue 21 / R2: the per-device-class instruction-sequence defaults of src/host/seq_config.hpp, checked without CUDA (the header is CUDA-free).
-// sm_90 (H100, H200) = E1 + Q1 + F1 + the binary64-limb CRT + klwarp + klload + k5fin + klf64 = 447 (R2: 13, R4: 173, R5: 189, issue 21 2026-11-08: 447; klshape stays off); sm_89 (RTX 4090) = E1 = 1; sm_120 and every class
+// sm_90 (H100, H200) = E1 + Q1 + F1 + the binary64-limb CRT + klwarp + klload + k5fin + klf64 + kllong + O1 + fq + klcs = 8127 (R2: 13, R4: 173, R5: 189, issue 21 2026-11-08: 447, 2026-11-12: 8127; klshape stays off); sm_89 (RTX 4090) = E1 = 1; sm_120 and every class
 // not listed = 0 (the limb CRT is slower on 1/64-rate FP64 cards). With IMMERDINK_SEQ_TWINS=OFF (IMD_NO_SEQ_TWINS) the F1 bit is not a supported set and a class
 // default is masked to what the build can run. Also the forcing rules: the hooks force any combination of the bits 1 2 4 16 32 64 and 128 + F1 (a forced set has no limb-CRT bit; Q1 needs E1), and the K5 hook's
 // three states (-1 follow the set, 0 integer, 1 limb) pick the CRT variant. CPU only.
@@ -24,10 +24,10 @@ int main() {
   CHECK(seq_default_for(9, 0) == (kSeqEmit | kSeqLimbCrt));   // 9: F1, klwarp, klload and k5fin are not compiled
   CHECK(!seq_valid(kSeqFinish) && !seq_valid(3) && seq_valid(kSeqEmit) && seq_valid(0));
 #else
-  CHECK(seq_default_for(9, 0) == 447);
-  CHECK(seq_default_for(9, 0) == (kSeqEmit | kSeqQuant | kSeqFinish | kSeqLimbCrt | kSeqKlWarp | kSeqKlLoad | kSeqK5Fin | kSeqKlF64));
+  CHECK(seq_default_for(9, 0) == 8127);
+  CHECK(seq_default_for(9, 0) == (kSeqEmit | kSeqQuant | kSeqFinish | kSeqLimbCrt | kSeqKlWarp | kSeqKlLoad | kSeqK5Fin | kSeqKlF64 | kSeqKlLong | kSeqOffset | kSeqFloatQ | kSeqKlCs));
   CHECK((seq_default_for(9, 0) & kSeqKlShape) == 0);   // klshape (slower) stays off; klwarp is on since R5 (docs/NOTES-26.md)
-  CHECK((seq_default_for(9, 0) & kSeqQuant) != 0 && seq_valid(seq_default_for(9, 0) & ~kSeqLimbCrt));   // Q1 + klf64 on sm_90 since 2026-11-08; the row minus the limb-CRT bit is a forceable set (its twin, 439)
+  CHECK((seq_default_for(9, 0) & kSeqQuant) != 0 && seq_valid(seq_default_for(9, 0) & ~kSeqLimbCrt));   // Q1 + klf64 on sm_90 since 2026-11-08; the row minus the limb-CRT bit is a forceable set (its twin, 8119)
   // every combination of the bits 1, 2, 4, 16, 32, 64 (issue 23: the KL cuts are independent of the emitter set) is a set unless Q1 lacks E1; with 128 (k5fin) it needs F1 too
   for (int b = 0; b < 256; ++b) {
     const bool bit8 = (b & kSeqLimbCrt) != 0;
@@ -68,21 +68,21 @@ int main() {
   CHECK(kSeqKlLong == 512 && (kSeqKl & kSeqKlLong) == 0 && seq_kl_kb(kSeqKlLong) == 0 && seq_kl_kb(kSeqKlLong | kSeqKlWarp) == 1);
   CHECK(seq_kl_direct(kSeqKlLoad, 1) && seq_kl_direct(kSeqKlLoad, 2) && !seq_kl_direct(kSeqKlLoad, 3) && !seq_kl_direct(kSeqKlLong, 2) &&
         seq_kl_direct(kSeqKlLong, 3) && seq_kl_direct(kSeqKlLong, 98) && !seq_kl_direct(447, 8) && seq_kl_direct(447, 2));
-  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqKlLong) == 0);   // off in every row until a class has measured it
+  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqKlLong) == 0 || (c.cc_major == 9 && c.cc_minor == 0));   // on in the sm_90 row only (k15e, 2026-11-12)
   CHECK(seq_pack_s(kSeqKlWarp | kSeqKlLoad | kSeqKlShape, 2) == 0 && seq_pack_s(kSeqEmit | kSeqKl, 2) == 1 && seq_pack_s(kSeqEmit | kSeqQuant | kSeqKl, 2) == 3);
   // O1 (issue 21, task 17): bit 1024, emitter S bit 4 at W = 2 only (5 = E1 + O1, 7 = E1 + Q1 + O1); nothing without E1; W = 3 runs E1 / E1 + nothing
   CHECK(kSeqOffset == 1024 && (kSeqOffset & (kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqK5Fin | 15)) == 0);
   CHECK(seq_pack_s(kSeqEmit | kSeqOffset, 2) == 5 && seq_pack_s(kSeqEmit | kSeqQuant | kSeqOffset, 2) == 7 && seq_pack_s(kSeqEmit | kSeqOffset, 3) == 1 &&
         seq_pack_s(kSeqEmit | kSeqQuant | kSeqOffset, 3) == 1 && seq_pack_s(kSeqOffset, 2) == 0 && seq_pack_s(447 | kSeqOffset, 2) == 7);
   CHECK(seq_kl_kb(kSeqOffset) == 0 && seq_kl_kb(447 | kSeqOffset) == seq_kl_kb(447) && !seq_kl_direct(kSeqOffset, 8));
-  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqOffset) == 0);   // off in every row until a class has measured it
+  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqOffset) == 0 || (c.cc_major == 9 && c.cc_minor == 0));   // on in the sm_90 row only (k15e, 2026-11-12)
   // fq (issue 21, task 18): bit 2048, emitter S bit 8 on top of O1 at W = 2 only (13 = E1 + O1 + fq, 15 = E1 + Q1 + O1 + fq); nothing without O1
   CHECK(kSeqFloatQ == 2048 && (kSeqFloatQ & (kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqK5Fin | kSeqOffset | 15)) == 0);
   CHECK(seq_pack_s(kSeqEmit | kSeqOffset | kSeqFloatQ, 2) == 13 && seq_pack_s(kSeqEmit | kSeqQuant | kSeqOffset | kSeqFloatQ, 2) == 15 &&
         seq_pack_s(kSeqEmit | kSeqOffset | kSeqFloatQ, 3) == 1 && seq_pack_s(kSeqEmit | kSeqFloatQ, 2) == 1 && seq_pack_s(kSeqFloatQ, 2) == 0 &&
         seq_pack_s(447 | kSeqOffset | kSeqFloatQ, 2) == 15);
   CHECK(seq_kl_kb(kSeqFloatQ) == 0 && seq_kl_kb(447 | kSeqOffset | kSeqFloatQ) == seq_kl_kb(447) && !seq_kl_direct(kSeqFloatQ, 8));
-  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqFloatQ) == 0);   // off in every row until a class has measured it
+  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqFloatQ) == 0 || (c.cc_major == 9 && c.cc_minor == 0));   // on in the sm_90 row only (k15e, 2026-11-12)
   // klcs (issue 21, task 20): bit 4096, Kb bit 8 (the launch keeps it on Kb 7 only); no emitter or direct-load effect; no dependency
   CHECK(kSeqKlCs == 4096 && (kSeqKlCs & (kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqK5Fin | kSeqOffset | kSeqFloatQ | 15)) == 0);
   CHECK(seq_kl_kb(kSeqKlCs) == 8 && seq_kl_kb(4023 | kSeqKlCs) == (seq_kl_kb(4023) | 8) && seq_kl_kb(4023) == 7);
@@ -93,7 +93,7 @@ int main() {
 #else
   CHECK(!seq_valid(kSeqKlCs));
 #endif
-  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqKlCs) == 0);   // off in every row until a class has measured it
+  for (const SeqClass& c : kSeqClasses) CHECK((c.bits & kSeqKlCs) == 0 || (c.cc_major == 9 && c.cc_minor == 0));   // on in the sm_90 row only (k15e, 2026-11-12)
 #ifndef IMD_NO_SEQ_TWINS   // (seq_effective masks a forced set to the supported bits: with the twins off only E1 is left)
   CHECK(seq_effective(13, 17) == 17 && seq_effective(13, 113) == 113 && seq_effective(13, -1) == 13 && (seq_effective(13, 125) & kSeqLimbCrt) == 0);
 #endif

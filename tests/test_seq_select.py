@@ -3,7 +3,7 @@
 
     python3 tests/test_seq_select.py [--lib build/libimmerdink.so]
 
-Pins the per-class defaults against this GPU's compute capability (sm_89: E1 = 1; sm_90: E1 + Q1 + F1 + limb CRT + klwarp + klload + k5fin + klf64 = 447 (R2: 13, R4: 173, R5: 189, 2026-11-08: 447); anything
+Pins the per-class defaults against this GPU's compute capability (sm_89: E1 = 1; sm_90: E1 + Q1 + F1 + limb CRT + klwarp + klload + k5fin + klf64 + kllong + O1 + fq + klcs = 8127 (R2: 13, R4: 173, R5: 189, 2026-11-08: 447, 2026-11-12: 8127); anything
 else, sm_120 included: 0), checks that a forced set (imd_test_set_seq) is what a plan reports, that -1 restores the class default, and that the
 invalid sets (the Q1 bit without the E1 bit, the KL bits 16 / 32 / 64 are valid in every combination (issue 23: all 48 sets are forced and read back), bit 128 (k5fin) without F1, bit 8 (the limb CRT is a class default only) and out of range) are rejected. The K5 CRT hook is tri-state (-1 follow
 the plan's set, 0 integer, 1 limbs): what the plan's K5 runs (imd_test_plan_crt) is pinned for the default, each forced value, and a forced set 0..7 (integer unless the hook forces limbs). A seq run that silently ran the default would
@@ -19,7 +19,7 @@ sys.path.insert(0, HERE)
 import harness as hz  # noqa: E402
 
 LIMB_CRT = 8
-DEFAULTS = {(8, 9): 1, (9, 0): 1 | 2 | 4 | LIMB_CRT | 16 | 32 | 128 | 256}   # keep equal to kSeqClasses in src/host/seq_config.hpp (tests/test_seq_table.cpp checks the same rows without a GPU)
+DEFAULTS = {(8, 9): 1, (9, 0): 1 | 2 | 4 | LIMB_CRT | 16 | 32 | 128 | 256 | 512 | 1024 | 2048 | 4096}   # keep equal to kSeqClasses in src/host/seq_config.hpp (tests/test_seq_table.cpp checks the same rows without a GPU)
 
 
 def main():
@@ -38,7 +38,7 @@ def main():
     cuda.check(cuda.rt.cudaDeviceGetAttribute(C.byref(minor), 76, dev), "cc minor")
     want_default = DEFAULTS.get((major.value, minor.value), 0)
     if args.no_seq_twins:
-        want_default &= ~(2 | 4 | 16 | 32 | 128)   # the F1 / Q1 / k5fin kernels are not compiled: the class default is masked
+        want_default &= 1 | LIMB_CRT   # only E1 is compiled (kSeqSupported): the class default is masked to E1 + the limb CRT
     T = {X: hz.make_tensor(e, hz.dense(e), l) for X, e, l in
          (("A", [16, 32], [1, 3]), ("B", [24, 32], [2, 3]), ("C", [16, 24], [1, 2]))}
     st, plan = lib.plan_create(T["A"], T["B"], T["C"], 8)

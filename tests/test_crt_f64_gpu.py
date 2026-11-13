@@ -21,7 +21,7 @@ import test_output_hashes as T  # noqa: E402
 
 
 LIMB_CRT_CLASSES = {(9, 0)}
-# Classes whose default set runs k5fin: the limb CRT + F1 (bit 4) + k5fin (bit 128). sm_90 since R4 (91697ae, set 173; now 447).
+# Classes whose default set runs k5fin: the limb CRT + F1 (bit 4) + k5fin (bit 128). sm_90 since R4 (91697ae, set 173; 447 on 2026-11-08; now 8127).
 K5FIN_DEFAULT_CLASSES = {(9, 0)}
 
 
