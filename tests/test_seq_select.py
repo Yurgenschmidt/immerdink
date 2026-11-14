@@ -19,7 +19,7 @@ sys.path.insert(0, HERE)
 import harness as hz  # noqa: E402
 
 LIMB_CRT = 8
-DEFAULTS = {(8, 9): 1, (9, 0): 1 | 2 | 4 | LIMB_CRT | 16 | 32 | 128 | 256 | 512 | 1024 | 2048 | 4096}   # keep equal to kSeqClasses in src/host/seq_config.hpp (tests/test_seq_table.cpp checks the same rows without a GPU)
+DEFAULTS = {(8, 9): 1, (9, 0): 1 | 2 | 4 | LIMB_CRT | 16 | 32 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192}   # keep equal to kSeqClasses in src/host/seq_config.hpp (tests/test_seq_table.cpp checks the same rows without a GPU)
 
 
 def main():
