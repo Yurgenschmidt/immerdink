@@ -32,6 +32,11 @@
 // FP64 arithmetic: a centred quotient by DFMA + a magic DADD, exact limb remainders, the Boldo-Melquiond round-to-odd sum of three doubles, 2^e by an
 // exponent add. Elements near +-P/2 (2^-37 of uniform values), subnormal or overflowing results take today's finish. Bit-identical. Needs k5fin (so F1);
 // N <= 17 (N = 18..20 keep the k5fin kernels). FP64 pipe at full rate: sm_90 / sm_100 only. On in the sm_90 row since k17 (2026-11-13); off elsewhere.
+// Bits 16384 'kff64' and 32768 'kfaff' (issue 21 task 28): the fixed part of the fused small-k pack KF (k_hat <= 1024), from the H200 KF source
+// counters (k16 job 15566591, r_lowk: per element ~33 descriptor instructions, ~20 of them the per-tile table of k offsets by division, ~36 tile load,
+// ~30 gamma scan and ~65 exact square sum, ~104 emit). kff64 = klf64's binary64 square sum with its rigorous filter, for KF (FP64 pipe: sm_90 only;
+// the tile falls back to the exact integers where the filter cannot decide). kfaff = the k offsets as h * stride when the K class is one fused mode
+// (integer identity; any card). Both bit-identical; the KF twins exist for the sm_90 emitter sets only (seq_kf). Off in every class row until measured.
 // Bits 16, 32, 64 (issue 23, docs/NOTES-23.md) are cuts of the FIXED part of the large-row pack KL (everything that does not scale with N), each
 // independent of the emitter set and of the others; all off in every class row until the Hopper duels decide:
 //   kSeqKlWarp  'klwarp'   row-wide scalar work once per row / tile instead of by every thread / warp (largest_u, tile row setup, cross-warp combines)
@@ -61,7 +66,9 @@ constexpr int kSeqOffset = 1024;  // issue 21 'O1': the offset-binary emitter in
 constexpr int kSeqFloatQ = 2048;  // issue 21 'fq': O1's quotient in binary32, one FFMA (needs O1; W = 2)
 constexpr int kSeqKlCs = 4096;  // issue 21 task 20 'klcs': KL's R stores evict-first (sm_90 long rows)
 constexpr int kSeqK5Ro = 8192;  // issue 21 'k5ro': K5's finish in FP64 with a round-to-odd sum (needs k5fin; N <= 17)
-constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqOffset | kSeqFloatQ | kSeqKlCs;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
+constexpr int kSeqKfF64 = 16384;  // issue 21 task 28 'kff64': KF's gamma from the high words and S filtered in binary64 (FP64 pipe)
+constexpr int kSeqKfAff = 32768;  // issue 21 task 28 'kfaff': KF's k offsets as h * stride for a K class of one mode
+constexpr int kSeqAll = 7 | kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqOffset | kSeqFloatQ | kSeqKlCs | kSeqKfF64 | kSeqKfAff;   // the bits the hooks can force besides k5fin (never kSeqLimbCrt: the K5 hook forces the CRT)
 // The sets this build can run: with IMMERDINK_SEQ_TWINS=OFF (IMD_NO_SEQ_TWINS) the Q1 / F1 / KL-bit / k5fin kernel twins are not compiled and the
 // hooks refuse them.
 #ifdef IMD_NO_SEQ_TWINS
@@ -71,6 +78,8 @@ constexpr int kSeqSupported = kSeqAll | kSeqK5Fin | kSeqK5Ro;
 #endif
 // What a class default may contain in this build: the supported sequences, and the limb CRT (its kernels are not twins; they are always compiled).
 constexpr int kSeqDefaultMask = kSeqSupported | kSeqLimbCrt;
+// ExecPlan::seq (host/plan_data.hpp) holds a class default in 16 bits (in the padding after `trunc`): a bit above 32768 needs that field widened first.
+static_assert(kSeqDefaultMask <= 0xFFFF, "ExecPlan::seq is 16 bits: widen it before adding a sequence bit above 32768");
 // What a forced set (the hooks) may contain: the supported sequences; never the limb-CRT bit (the K5 hook forces the CRT).
 constexpr int kSeqForceMask = kSeqSupported;
 
@@ -131,6 +140,10 @@ constexpr int seq_kl_kb(int bits) {
          ((bits & kSeqKlCs) ? 8 : 0);  // klcs: the launch keeps it only on Kb 7 (E = 4, W = 2)
 }
 constexpr bool seq_kl_shape(int bits) { return (bits & kSeqKlShape) != 0; }
+// The KF kernel's template value Kf (bit 0 kff64, bit 1 kfaff). The twins exist for the sm_90 emitter sets only (pack S = 15 at W = 2, S = 1 at
+// W = 3: E1 + Q1 + O1 + fq, resp. E1); elsewhere the launch drops the bits (the set still runs, with the shipped KF).
+constexpr int seq_kf(int bits) { return ((bits & kSeqKfF64) ? 1 : 0) | ((bits & kSeqKfAff) ? 2 : 0); }
+constexpr bool seq_kf_twin(int W, int S) { return (W == 2 && S == 15) || (W == 3 && S == 1); }
 // Whether a KL launch takes the direct loads (Kb bit 1), before the operand's own gates (unit-stride k along k-bar, aligned base):
 // klload for the rows held on chip (nc <= 2), kllong for the longer rows.
 constexpr bool seq_kl_direct(int bits, int64_t nc) { return (bits & (nc > 2 ? kSeqKlLong : kSeqKlLoad)) != 0; }

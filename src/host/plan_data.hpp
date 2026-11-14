@@ -44,7 +44,7 @@ struct ExecPlan {
   int64_t m = 0, n = 0, k = 0, b = 0, k_hat = 0, n_hat = 0;  // post-swap GEMM view
   int N = 0, g = 0;      // number of moduli, residue group size in [1, N]
   bool trunc = false;    // rounding = TRUNC
-  uint16_t seq = 0;      // issue 21: the instruction-sequence set of the device class (host/seq_config.hpp kSeq*, 14 bits since k5ro), set by imd_plan_create; 0 = baseline. (In the padding after trunc: sizeof(ExecPlan) is unchanged.)
+  uint16_t seq = 0;      // issue 21: the instruction-sequence set of the device class (host/seq_config.hpp kSeq*, 16 bits since kfaff: full; seq_config.hpp static_asserts that the class defaults fit), set by imd_plan_create; 0 = baseline. (In the padding after trunc: sizeof(ExecPlan) is unchanged.)
   // v1.13 §4b: the plan's K alignment A (16 or 64), resolved once by libimmerdink_host
   // (analysis.hpp Analysis::k_align; plan_data), k_hat = ceil(k)_A. Here, not in K4Plan:
   // sizeof(K4Plan) is kK4PlanBytes (plan host bytes). libimmerdink never resolves A itself.

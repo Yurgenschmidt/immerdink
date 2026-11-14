@@ -1259,7 +1259,13 @@ def suite_klf64(lib, cuda, verbose):
             # review 2026-11-08: tiles of G <= 32 threads per row (the leader-lane filter branch); run_case forces KL
             # (fused modes 2 / 3), k_hat <= 256 along k-bar and k_hat in (256, 2048] with the 64-row tiles of mode 3
             (14, 11, 200, 14, 0, "RN", True, True),
-            (10, 12, 700, 12, 0, "TRUNC", True, False)):
+            (10, 12, 700, 12, 0, "TRUNC", True, False),
+            # issue 21 task 28 (kff64): KF's rows (k_hat <= 1024; fmodes -1 / 1: KF with 4 and 16 values per thread): two warps per row
+            # (k_hat 1024), a row within a warp (k_hat 64), N = 20 (W = 3), B read side by side
+            (11, 13, 1024, 14, 0, "RN", True, True),
+            (9, 8, 1000, 16, 2, "TRUNC", True, False),
+            (12, 10, 64, 14, 0, "RN", True, True),
+            (8, 9, 900, 20, 0, "RN", True, True)):
         plan = o.Plan(N, k, rnd)
         A, B, C = matrix(rng, m, n, k, a_kfast=a_kf, b_kfast=b_kf)
         TA = klf64_operand(rng, plan, m, k, 0)

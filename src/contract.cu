@@ -1396,8 +1396,17 @@ __device__ __forceinline__ u128 shfl_xor_u128(u128 v, int d) {
 #else
 #define IMD_KF_BOUNDS __launch_bounds__(kThreads)
 #endif
-template <int Cap, int E, int W, int Seq = 0>  // W: v1.14 §3.4.1 pack_words(N); Seq: sequence set
+// Issue 21 task 28: KF's fixed-part bits (template value Kf; host/seq_config.hpp seq_kf):
+//   kKfF64 'kff64' (sm_90): klf64's sigma for KF: gamma from the high words, S as a binary64 sum decided by the rigorous filter
+//                    numerics.cuh largest_u_filtered (docs/NOTES-21-klf64.md: the proof does not depend on the summation order or on
+//                    where the row lives), and the exact K1 integers below for a tile with an undecided, non-finite or subnormal row
+//                    (block-uniform). Same sigma and flag, so the same bytes.
+//   kKfAff 'kfaff': a K class of one fused mode (the usual GEMM) gives the k offsets as h * stride: no per-tile table of k0_offset
+//                    divisions (step 1) and no shared-memory lookup per element (step 2). Integer identity, same loads.
+constexpr int kKfF64 = 1, kKfAff = 2;
+template <int Cap, int E, int W, int Seq = 0, int Kf = 0>  // W: v1.14 §3.4.1 pack_words(N); Seq: sequence set; Kf: the bits above
 __global__ void IMD_KF_BOUNDS kf_scale_pack(const __grid_constant__ FusedArgs<Cap> a) {
+  constexpr bool kF64 = (Kf & kKfF64) != 0, kAff = (Kf & kKfAff) != 0;
   constexpr int kLgE = E == 16 ? 4 : 2, kTE = kThreads * E, kLgTE = 8 + kLgE;
   constexpr int kRowsMax = kTE / 16;  // th for tk = 16
   // 47.5 KB of static shared memory with E = 16 (the 48 KB limit): the output row offsets are
@@ -1409,6 +1418,7 @@ __global__ void IMD_KF_BOUNDS kf_scale_pack(const __grid_constant__ FusedArgs<Ca
   __shared__ int s_wg[kThreads / 32];
   __shared__ unsigned s_wf[kThreads / 32];
   __shared__ u128 s_ws[kThreads / 32];
+  __shared__ double s_wd[kF64 ? kThreads / 32 : 1];  // kff64: per warp square sums
   const int tid = threadIdx.x;
   const int lg_tk = a.lg_tk, tk = 1 << lg_tk, lg_th = kLgTE - lg_tk, th = 1 << lg_th;
   const int pitch = tk + tk / kVec + 1, G = tk / E;  // G lanes per row: G | 32 or 32 | G
@@ -1432,7 +1442,11 @@ __global__ void IMD_KF_BOUNDS kf_scale_pack(const __grid_constant__ FusedArgs<Ca
         s_base[tid] = k0_offset(a.d, 3, x, lam) + k0_offset(a.d, x, x, r);
       }
     }
-    for (int hl = tid; hl < tk; hl += kThreads) s_vk[hl] = hl < a.k ? k0_offset(a.d, 2, x, hl) : 0;
+    // kfaff: one K mode, v_k[h] = h * stride (block-uniform; k0_offset of a single mode is exactly this for h < k)
+    const bool aff = kAff && a.d.count[2] == 1;
+    const int64_t kst = aff ? a.d.stride[a.d.first[2]][x] : 0;
+    if (!aff)
+      for (int hl = tid; hl < tk; hl += kThreads) s_vk[hl] = hl < a.k ? k0_offset(a.d, 2, x, hl) : 0;
     __syncthreads();
     // 2. coalesced read into shared memory (zero outside the operand)
     const double* X = a.X[x];
@@ -1443,7 +1457,7 @@ __global__ void IMD_KF_BOUNDS kf_scale_pack(const __grid_constant__ FusedArgs<Ca
       const int dl = along ? (q & (th - 1)) : (q >> lg_tk);
       const int hl = along ? (q >> lg_th) : (q & (tk - 1));
       tile[dl * pitch + hl + hl / kVec] =
-          s_valid[dl] && hl < a.k ? to_bits(X[s_base[dl] + s_vk[hl]]) : 0;
+          s_valid[dl] && hl < a.k ? to_bits(X[s_base[dl] + (kAff && aff ? hl * kst : s_vk[hl])]) : 0;
     }
     __syncthreads();
     // 3. K1 per row over its G lanes
@@ -1454,6 +1468,61 @@ __global__ void IMD_KF_BOUNDS kf_scale_pack(const __grid_constant__ FusedArgs<Ca
     for (int e = 0; e < E; ++e) bits[e] = src[e];
     int gmax = INT_MIN;
     unsigned fl = 0;
+    int sigma = 0;
+    const int Gw = G < 32 ? G : 32, warp = tid / 32, lane = tid & 31;
+    const int w0 = (dl * G) / 32, nw = G / 32;  // the row's warps (G > 32)
+    bool exact = true;  // block-uniform: the exact K1 integers below run (always without kff64)
+    if constexpr (kF64) {
+      // kff64 (as KL's klf64): max |high word| (sign masked) and the OR of the low words: a non-finite entry has |hi| >= 0x7FF00000, a
+      // finite one less, so fl is exact; when the max is a normal number's, gamma is its exponent field - 1023.
+      uint32_t ghi = 0, lor = 0;
+#pragma unroll
+      for (int e = 0; e < E; ++e) {
+        ghi = max(ghi, static_cast<uint32_t>(bits[e] >> 32) & 0x7FFFFFFFu);
+        lor |= static_cast<uint32_t>(bits[e]);
+      }
+      for (int o = Gw / 2; o > 0; o /= 2) {
+        ghi = max(ghi, __shfl_xor_sync(0xffffffffu, ghi, o));
+        lor |= __shfl_xor_sync(0xffffffffu, lor, o);
+      }
+      if (G > 32) {  // block-uniform; every warp of the row combines the row's warps in the same order
+        if (lane == 0) s_wg[warp] = static_cast<int>(ghi), s_wf[warp] = lor;
+        __syncthreads();
+        for (int w = w0; w < w0 + nw; ++w) ghi = max(ghi, static_cast<uint32_t>(s_wg[w])), lor |= s_wf[w];
+      }
+      // Row classes: normal max -> filtered; all entries +-0 (and the invalid rows, zero in the tile) -> sigma 0, as the exact path;
+      // otherwise (a non-finite entry, or the largest finite entry subnormal: [5e-324] has hi = 0) -> the exact path.
+      fl = ghi >= 0x7FF00000u ? 1u : 0u;
+      const bool normal = fl == 0 && ghi >= 0x00100000u;
+      bool need = !normal && (ghi != 0 || lor != 0);
+      if (normal) gmax = static_cast<int>(ghi >> 20) - 1023;
+      // y = x 2^(30 - gamma) by two exact power-of-two multiplies (s1, s2 in [-497, 526]), acc = fma(y, y, acc); every op _rn
+      const int s = normal ? 30 - gmax : 0, s1 = s >> 1;
+      const double f1 = pow2_double(s1), f2 = pow2_double(s - s1);
+      double acc = 0.0;
+      if (normal) {
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+          const double y = __dmul_rn(__dmul_rn(__longlong_as_double(static_cast<long long>(bits[e])), f1), f2);
+          acc = __fma_rn(y, y, acc);
+        }
+      }
+      // xor butterflies: both partners add the same two doubles (commutative), so every lane of a row piece ends with the same bits
+      for (int o = Gw / 2; o > 0; o /= 2) acc = __dadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
+      if (G > 32) {  // s_wd is not s_wg / s_wf: no barrier needed between the two combines
+        if (lane == 0) s_wd[warp] = acc;
+        __syncthreads();
+        acc = 0.0;
+        for (int w = w0; w < w0 + nw; ++w) acc = __dadd_rn(acc, s_wd[w]);
+      }
+      int u = 0;
+      if ((lane & (Gw - 1)) == 0 && normal && !largest_u_filtered(acc, a.k_hat, a.lhs_shift, a.rhs, a.rhs_bits, &u)) need = true;
+      sigma = __shfl_sync(0xffffffffu, normal ? u - gmax : 0, lane & ~(Gw - 1));
+      // also the barrier between the reads of s_wg / s_wf / s_wd above and the exact path's writes
+      exact = __syncthreads_or(need) != 0;
+    }
+    if (exact) {  // block-uniform
+    gmax = INT_MIN, fl = 0;
 #pragma unroll
     for (int e = 0; e < E; ++e) {
       if (non_finite(bits[e])) fl = 1;
@@ -1462,12 +1531,10 @@ __global__ void IMD_KF_BOUNDS kf_scale_pack(const __grid_constant__ FusedArgs<Ca
     // Reduce over the row's lanes: within the warp (Gw = min(G, 32) lanes), then, for rows
     // wider than a warp (G = 64 .. 256: E = 4 with tk >= 256, E = 16 with tk = 1024), over the row's warps in
     // shared memory, combined by every thread in the same order (max, or, exact u128 sum).
-    const int Gw = G < 32 ? G : 32, warp = tid / 32, lane = tid & 31;
     for (int o = Gw / 2; o > 0; o /= 2) {
       gmax = max(gmax, __shfl_xor_sync(0xffffffffu, gmax, o));
       fl |= __shfl_xor_sync(0xffffffffu, fl, o);
     }
-    const int w0 = (dl * G) / 32, nw = G / 32;  // the row's warps (G > 32)
     if (G > 32) {
       if (lane == 0) s_wg[warp] = gmax, s_wf[warp] = fl;
       __syncthreads();
@@ -1488,10 +1555,11 @@ __global__ void IMD_KF_BOUNDS kf_scale_pack(const __grid_constant__ FusedArgs<Ca
     }
     // sigma by the first lane of the row's piece in this warp (the 256-bit compare once per
     // row and warp), then broadcast within the warp.
-    int sigma = 0;
+    sigma = 0;
     if ((lane & (Gw - 1)) == 0 && gmax != INT_MIN)
       sigma = largest_u(S, a.lhs_shift, a.rhs, a.rhs_bits) - gmax;
     sigma = __shfl_sync(0xffffffffu, sigma, lane & ~(Gw - 1));
+    }  // exact
     const bool valid = s_valid[dl];
     // 4. part 0 stores sigma and the flag (range certified, cert_shift_range)
     if (valid && blockIdx.y == 0 && (tid & (G - 1)) == 0) {
@@ -1572,10 +1640,24 @@ imd_status_t launch_kf(const ExecPlan& p, const double* A, const double* B, void
   if (small) tiles = tiles_for(10);
   const dim3 grid(blocks_for(tiles, 1), pack_split(tiles, a.gsize, p.sms));
   const bool w2 = pack_words(p.N) == 2;  // v1.14 §3.4.1
+  // Issue 21 task 28: the KF twins (kff64, kfaff) for the sm_90 emitter sets and the small descriptor capacity only (seq_kf_twin)
+  const int kf = (kSeqSupported & (kSeqKfF64 | kSeqKfAff)) != 0 && Cap == kK0SmallModes ? seq_kf(seq_bits(p)) : 0;
   const auto run = [&](auto E, auto W) {
     with_pack_seq<decltype(W)::value>(p, [&](auto S) {
-      kf_scale_pack<Cap, decltype(E)::value, decltype(W)::value, decltype(S)::value>
-          <<<grid, kThreads, 0, stream>>>(a);
+      constexpr int kE = decltype(E)::value, kW = decltype(W)::value, kS = decltype(S)::value;
+      [[maybe_unused]] const int ran = seq_kf_twin(kW, kS) ? kf : 0;
+#ifdef IMD_BUILD_TEST_HOOKS
+      test_note_kf_launch(kE, ran);
+#endif
+      if constexpr (seq_kf_twin(kW, kS) && Cap == kK0SmallModes && (kSeqSupported & (kSeqKfF64 | kSeqKfAff)) != 0) {
+        switch (kf) {
+          case 1: kf_scale_pack<Cap, kE, kW, kS, 1><<<grid, kThreads, 0, stream>>>(a); return;
+          case 2: kf_scale_pack<Cap, kE, kW, kS, 2><<<grid, kThreads, 0, stream>>>(a); return;
+          case 3: kf_scale_pack<Cap, kE, kW, kS, 3><<<grid, kThreads, 0, stream>>>(a); return;
+          default: break;
+        }
+      }
+      kf_scale_pack<Cap, kE, kW, kS><<<grid, kThreads, 0, stream>>>(a);
     });
   };
   using I4 = std::integral_constant<int, 4>;
@@ -2348,6 +2430,13 @@ void test_note_kl_launch(int E, int kb) { g_kl_launches[E == 4 ? 0 : E == 8 ? 1 
 void test_kl_launch_counts(bool reset, int64_t* out) {
   for (int e = 0; e < 3; ++e)
     for (int k = 0; k < 16; ++k) out[16 * e + k] = reset ? g_kl_launches[e][k].exchange(0) : g_kl_launches[e][k].load();
+}
+// Issue 21 task 28: KF launches by [E = 4 / 16][Kf 0..3: bit 0 kff64, bit 1 kfaff], counted in test builds (a forced bit that ran the shipped KF shows as Kf 0).
+static std::atomic<int64_t> g_kf_launches[2][4];
+void test_note_kf_launch(int E, int kf) { g_kf_launches[E == 4 ? 0 : 1][kf & 3].fetch_add(1, std::memory_order_relaxed); }
+void test_kf_launch_counts(bool reset, int64_t* out) {
+  for (int e = 0; e < 2; ++e)
+    for (int k = 0; k < 4; ++k) out[4 * e + k] = reset ? g_kf_launches[e][k].exchange(0) : g_kf_launches[e][k].load();
 }
 // The section timers (IMD_KL_TIMERS, see kl_scale_pack): copies the device sums to out[0..n) (n <= kKltSlots) and optionally zeroes them. Returns the slot count,
 // or -1 in a build without the knob.

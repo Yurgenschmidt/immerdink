@@ -182,6 +182,9 @@ void test_k5_launch_counts(bool reset, int64_t* out);
 // slot count, -1 in a build without the knob, -2 on a CUDA error.
 void test_note_kl_launch(int E, int kb);
 void test_kl_launch_counts(bool reset, int64_t* out);
+// Issue 21 task 28: KF kernel launches (int64[8]: [E = 4 / 16][Kf 0..3: bit 0 kff64, bit 1 kfaff]; optionally zeroes them).
+void test_note_kf_launch(int E, int kf);
+void test_kf_launch_counts(bool reset, int64_t* out);
 int test_kl_timers(bool reset, unsigned long long* out, int n);
 // Issue 23: launches of the k5fin kernels (seq bit 128) since the last reset, [variant 0 / 1 / 2 / 3 as above], then [4 + variant] those that ran the k5ro
 // finish (issue 21, seq bit 8192; also counted in [variant]); test_note_k5_fin_launch is called by launch_k5 only when one runs.

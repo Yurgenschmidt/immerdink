@@ -87,7 +87,8 @@ int main() {
   CHECK(kSeqKlCs == 4096 && (kSeqKlCs & (kSeqKl | kSeqKlF64 | kSeqKlLong | kSeqK5Fin | kSeqOffset | kSeqFloatQ | 15)) == 0);
   CHECK(seq_kl_kb(kSeqKlCs) == 8 && seq_kl_kb(4023 | kSeqKlCs) == (seq_kl_kb(4023) | 8) && seq_kl_kb(4023) == 7);
   CHECK(seq_pack_s(4023 | kSeqKlCs, 2) == seq_pack_s(4023, 2) && !seq_kl_direct(kSeqKlCs, 8) && seq_kl_direct(4023 | kSeqKlCs, 8));
-  CHECK(!seq_valid(16384) && !seq_valid(16384 | 4023));
+  CHECK(!seq_valid(65536) && !seq_valid(65536 | 4023));   // beyond the 16 bits (16384 kff64 and 32768 kfaff are sets since task 28)
+  CHECK(seq_valid(16384 | 4023) && seq_valid(32768 | 8192 | 4023) && !seq_valid(16384 | 8192));
 #ifndef IMD_NO_SEQ_TWINS
   CHECK(seq_valid(kSeqKlCs) && seq_valid(4023 | kSeqKlCs));
 #else

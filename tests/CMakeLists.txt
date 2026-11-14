@@ -314,7 +314,8 @@ if(Python3_FOUND)
     # Issue 21 O1 (1024, task 17): on E1 alone (1025, the sm_89 shape), on the sm_90 twin (1463 = 439 + 1024) and with kllong too (1975 = 951 + 1024).
     # Issue 21 fq (2048, task 18, needs O1): the same three shapes, 3073, 3511, 4023.
     # Issue 21 task 20 klcs (4096) on the sm_90 long-row set 4023: 8119.
-    foreach(seq 17 33 65 113 112 273 305 272 513 529 785 951 1025 1463 1975 3073 3511 4023 8119)
+    # Issue 21 task 28: the KF twins (kff64 16384 + kfaff 32768) on the sm_90 twin set 8119: 57271; kfaff alone on it: 40887.
+    foreach(seq 17 33 65 113 112 273 305 272 513 529 785 951 1025 1463 1975 3073 3511 4023 8119 57271 40887)
       foreach(suite e2e tensor eps)
         add_test(NAME contract_${suite}_kl${seq}
                  COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
@@ -329,7 +330,8 @@ if(Python3_FOUND)
                            ENVIRONMENT "IMD_TEST_SEQ=${seq}")
     endforeach()
     # Issue 21: the threshold rows (suite klf64: square sums on and next to the sigma thresholds, the exact fallback) under the klf64 sets and the default set.
-    foreach(seq -1 273 305 272 437 439 785 951 1463 3511)
+    # Issue 21 task 28: the same threshold rows through KF (k_hat <= 1024) under the KF twins: 8119 + kff64 (24503), + kff64 + kfaff (57271), and 3511 + kff64 (19895).
+    foreach(seq -1 273 305 272 437 439 785 951 1463 3511 24503 57271 19895)
       add_test(NAME contract_klf64_seq${seq}
                COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"
                        --lib "$<TARGET_FILE:immerdink>" --shim "${shim}" --suite klf64 -v)
@@ -358,6 +360,11 @@ if(Python3_FOUND)
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_kl_bits.py" --lib "$<TARGET_FILE:immerdink>"
                    ${_seq_twin_arg})
   set_tests_properties(kl_bits PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800)
+  # Issue 21 task 28: every combination of the KF bits (kff64, kfaff) over emitter sets with and without a KF twin, bit-identical, with the KF launch counter.
+  add_test(NAME kf_bits
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_kf_bits.py" --lib "$<TARGET_FILE:immerdink>"
+                   ${_seq_twin_arg})
+  set_tests_properties(kf_bits PROPERTIES RESOURCE_LOCK gpu TIMEOUT 1800)
   # Issue 21 klstrided: the sm_90 class's KL rule (forced with imd_test_set_fused(6) on any device) is bit-identical to KL for both operands.
   add_test(NAME kl_strided
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_kl_strided.py" --lib "$<TARGET_FILE:immerdink>")
