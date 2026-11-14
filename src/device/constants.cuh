@@ -19,6 +19,7 @@ static __constant__ PackEmitTable c_pack_emit = kPackEmit;      // issue 21 sequ
 static __constant__ PackEmitTableO c_pack_emit_o = kPackEmitO;  // issue 21 sequence O1 (device/residue.hpp), W = 2
 static __constant__ PackEmitTableF c_pack_emit_f = kPackEmitF;  // issue 21 sequence FQ (device/residue.hpp), W = 2
 static __constant__ imd::constants::F64Crt c_f64crt = imd::constants::kF64Crt;   // issue 21: CRT sums in binary64 limbs
+static __constant__ FoldTable c_fold = kFold;                   // issue 58: mod_p_fold constants (device/modp.hpp)
 
 // §3.5 exact non-negative v mod p_l for v in [epi_vmin[l], epi_vmax[l]] (cert_barrett):
 // p = 256 by mask, otherwise bias + umulhi64.
