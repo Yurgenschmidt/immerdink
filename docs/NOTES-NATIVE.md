@@ -119,6 +119,40 @@ Following "many device-specific solutions, selected per device class":
 - Later: CUTLASS's FP64 SYRK / SYR2K on sm_90 for self-contractions (ROADMAP D3, symmetry
   exploration), only if that work asks for it.
 
+### 4.5 Planning API: memory and speed reported to ehrenfest (requirement)
+
+**Requirement (Eric, 2026-11-16).** ehrenfest plans around memory and speed, so a NATIVE
+configuration must report its footprint and predicted performance through the same GPU-free
+planning API that EMULATE configurations already use, with nothing NATIVE-specific for the
+caller to learn. A NATIVE path that runs but cannot be planned for does not meet issue #75.
+
+What the host library (`libimmerdink_host`, no CUDA) already reports per configuration, and
+what NATIVE adds:
+
+| quantity | where today (EMULATE) | NATIVE |
+|---|---|---|
+| exact workspace bytes | `imd_workspace_size`, `imd_perf_t.workspace_bytes` | the §4.2 regions: 0 in place; packed operands `8·b·rows·k̂_s` per packed operand, plus vec (k̂_s = the slab length, k without slabs) |
+| plan device bytes | `imd_plan_bytes` | as today (vec with `IMD_VEC_RESIDENT`) |
+| total bytes, budget feasibility | `imd_perf_candidate_t.total_bytes`, `budget_bytes` | the same fields |
+| predicted time, interval, power | `imd_perf_predict` (`time_s`, `time_lo_s`/`hi_s`, `power_w`) | a NATIVE phase set: K0, pack A/B per slab, GEMM per slab |
+| FLOPs and rate | `flops_eq` = 2bmnk, `tflops_eq` | the same 2bmnk (real FLOPs here), so rates compare directly |
+| error bound | `err_bound` (§6f) | γ_k (and the slab term of §4.2) in the request's metric |
+| plan-time status | `status`, `dispatch` | `IMD_DISPATCH_NATIVE` |
+
+Additions to the API (to be versioned as a host API bump, additive only):
+- `imd_options_t`: `mode = IMD_NATIVE` and a slab length `k_slab` (0 = no slabs).
+- `imd_perf_rank`: NATIVE as a candidate kind next to the N × g × vec × pack grid, with a list
+  of slab lengths to try (or "the smallest footprint that fits `budget_bytes`"), so one ranking
+  shows emulated and native candidates with their bytes, time and error side by side. The
+  ranking only reports: ehrenfest still chooses.
+- The perf model gets NATIVE classes (pack, GEMM) with a per-card calibration (sm_90 first).
+  Until calibrated on a card, the prediction is the roofline bound
+  max(bytes / DRAM BW, 2bmnk / FP64 peak), flagged as uncalibrated, the same way other
+  uncalibrated cards are flagged (DESIGN §6h).
+
+Workspace exactness for NATIVE goes into the same certificate as today (`cert_workspace`), so
+the bytes ehrenfest is told are the bytes the call uses.
+
 ## 5. Spec, proof and test impact
 
 - **TLA+.** `IndexMap`: the new mode and its dispatch rules (NATIVE vs DIRECT vs K-empty, and
@@ -153,7 +187,7 @@ Following "many device-specific solutions, selected per device class":
 
 ## 7. Plan and gates
 
-1. Answer §6: Q1 and Q3 decided by Eric (2026-11-16); Q2, Q4, Q5 to the independent reviewer.
+1. Answer §6: Q1 and Q3 decided by Eric (2026-11-16); Q2, Q4, Q5 and the §4.5 API shape to the independent reviewer.
 2. TLA+ for §5, then DESIGN text.
 3. Kernel and tests, locally on the 4090 for correctness only (FP64 is 1/64 there, so no
    timing locally).
