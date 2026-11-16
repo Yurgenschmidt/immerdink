@@ -67,11 +67,11 @@ Native FP64 is **not** correctly rounded, unlike the emulated path (DESIGN §3.7
   β·C₀ term is rounded S times (a γ_S·|β·C₀| term) and α ≠ 1 is applied S times. This is
   exactly DESIGN §3.8's K-segmentation composition (PROOFS L7), including its subnormal-band
   hazard (a slab product may be subnormal while x is not: carry the absolute term). The §6f
-  estimator gets the L7 form for slabbed NATIVE.
+  estimator gets the L7 form for slabbed HWGEMM.
 - **Bit identity with DIRECT (hypothesis to test).** Khattak and Mikaitis (arXiv:2512.07004,
   §4.1.2, Table 3) model FP64 DMMA as a sequential IEEE fma chain with round-to-nearest-even,
   tested on A100 and listed for H100 / H200 / B200 / RTX PRO 6000. If that holds, an unslabbed
-  NATIVE tile with the accumulator started at +0, K ascending, no sliced-K (warp K = CTA K), no
+  HWGEMM tile with the accumulator started at +0, K ascending, no sliced-K (warp K = CTA K), no
   split-K and the `store_out` epilogue gives **exactly DIRECT's bits** (`native_dot`,
   `src/contract.cu`). The first kernel test is a bit compare against DIRECT. If it holds, the
   non-finite caveat below disappears for unslabbed calls.
@@ -91,11 +91,11 @@ Native FP64 is **not** correctly rounded, unlike the emulated path (DESIGN §3.7
 
 Same plan, same workspace query, same stream-ordered, graph-capture-safe call, no allocation
 and no host sync inside `imd_contract` (DESIGN §4, kernel-scope rules); large-shared-memory
-attributes are set at plan creation. New `mode = IMD_NATIVE` (Q1), dispatch `NATIVE`. K-empty
+attributes are set at plan creation. New `mode = IMD_HWGEMM` (Q1), dispatch `HWGEMM`. K-empty
 contractions keep `k_direct` (k = 1 is one fma); k = 0 and α = 0 keep the β-only kernel, run
 once, never per slab.
 
-**Int8 packs.** A NATIVE plan follows DIRECT's rule exactly: a matching int8 pack is accepted
+**Int8 packs.** A HWGEMM plan follows DIRECT's rule exactly: a matching int8 pack is accepted
 and ignored (the mode is not in the pack key, DESIGN §6b), the kernel reads `data`. No new spec.
 
 ### 4.2 Operand access (decided: reviewer, Q2)
@@ -133,7 +133,7 @@ CUTLASS's batched GEMM. A multi-mode batch reads its base offsets from the λ sc
 over λ** (b launches would kill t_batch). grid.z ≤ 65535: chunk b deterministically.
 
 **Output.** An affine C with a unit stride takes a plain strided store (swap A / B if C is
-transposed); otherwise the epilogue stores through `c_row` / `c_col`. Both use NATIVE's own
+transposed); otherwise the epilogue stores through `c_row` / `c_col`. Both use HWGEMM's own
 output functor with `store_out`'s rounding, **not** CUTLASS's `LinearCombination`
 (fma(α, acc, β·C) rounds differently).
 
@@ -146,8 +146,8 @@ In-place operands need no workspace, so a fully affine call never slabs for memo
 k > 2³¹ − 1, below). Slab 1 uses the caller's β with the C-not-read rule (β = 0: C is not
 read); slabs 2..S use β = 1. k = 0 and K-empty never slab.
 
-**Limits** (IndexMap status row 5 for NATIVE): m, n̂ ≤ 2³¹ − 1 and **k ≤ 2³¹ − 1** per GEMM
-(GemmCoord is int32; NATIVE does not chunk K, so a longer k must use slabs or is
+**Limits** (IndexMap status row 5 for HWGEMM): m, n̂ ≤ 2³¹ − 1 and **k ≤ 2³¹ − 1** per GEMM
+(GemmCoord is int32; HWGEMM does not chunk K, so a longer k must use slabs or is
 NOT_SUPPORTED); n-tiles ≤ 65535 on grid.y (or swap); batch chunks ≤ 65535 on grid.z; int32
 index vectors for main-loop gather.
 
@@ -184,17 +184,17 @@ question. The build is cross-compiled locally or on the compute node, never the 
 
 ### 4.5 Planning API: memory and speed reported to ehrenfest (requirement)
 
-**Requirement (Eric, 2026-11-16).** ehrenfest plans around memory and speed, so a NATIVE
+**Requirement (Eric, 2026-11-16).** ehrenfest plans around memory and speed, so a HWGEMM
 configuration reports its footprint and predicted performance through the same GPU-free
-planning API (`libimmerdink_host`) that EMULATE configurations use. A NATIVE path that runs but
+planning API (`libimmerdink_host`) that EMULATE configurations use. A HWGEMM path that runs but
 cannot be planned for does not meet issue #75.
 
-| quantity | today (EMULATE) | NATIVE |
+| quantity | today (EMULATE) | HWGEMM |
 |---|---|---|
 | exact workspace bytes | `imd_workspace_size`, `imd_perf_t.workspace_bytes` | §4.2: packed operands only, `8·b·rows·k̂_slab` each, plus vec when needed; 0 when fully affine |
 | plan device bytes | `imd_plan_bytes` | as today |
 | total bytes, budget | `imd_perf_candidate_t.total_bytes`, `budget_bytes` | the same fields |
-| time, interval, power | `imd_perf_predict` | NATIVE phases (below) |
+| time, interval, power | `imd_perf_predict` | HWGEMM phases (below) |
 | FLOPs and rate | `flops_eq` = 2bmnk, `tflops_eq` | the same 2bmnk (real FLOPs), so rates compare directly |
 | error bound | `err_bound` (§6f) | γ_k, with the L7 slab form (§3) |
 | status | `status`, `dispatch` | `IMD_DISPATCH_NATIVE` |
@@ -202,56 +202,100 @@ cannot be planned for does not meet issue #75.
 API changes (reviewer's verdict):
 1. **`imd_options_t` grows: an ABI break, not additive.** It has no struct_size (as at v1.2 and
    v1.5), so callers rebuild and ehrenfest's ctypes mirror changes. Add `int64_t k_slab` (k is
-   int64; keeps 8-byte alignment). `k_slab ≠ 0` outside NATIVE is INVALID_VALUE.
+   int64; keeps 8-byte alignment). `k_slab ≠ 0` outside HWGEMM is INVALID_VALUE.
 2. **Phases.** `imd_perf_phase_t` and `IMD_PERF_MAX_PHASES` = 16 are frozen, so a slabbed call
-   gets one phase per kind with `launches` = S: K0 (if any), NATIVE_PACK_A, NATIVE_PACK_B,
-   NATIVE_GEMM, CALL (≤ 5 for any S). New phase and kernel ids are additive; the `ops` comment
-   says FP64 flops for NATIVE.
+   gets one phase per kind with `launches` = S: K0 (if any), HWGEMM_PACK_A, HWGEMM_PACK_B,
+   HWGEMM_GEMM, CALL (≤ 5 for any S). New phase and kernel ids are additive; the `ops` comment
+   says FP64 flops for HWGEMM.
 3. **Calibration slots.** 96 = 16 classes × 6; classes 12–14 are free and class 15 has slots
-   0–4 (slot 95 is `warm.kl_drop`). NATIVE gets about three classes (pack, one or two GEMM);
+   0–4 (slot 95 is `warm.kl_drop`). HWGEMM gets about three classes (pack, one or two GEMM);
    the tile configuration is a feature, not a class per tile. More would need a new
    calibration struct.
 4. **FP64 peak.** Append `peak_fp64_tc_flops_per_s` (optional key, struct_size versioned):
    today's `peak_fp64_flops_per_s` is ambiguous between CUDA-core (DIRECT, ~34 TFLOPS on H100
    SXM) and tensor-core (~67).
 5. **Uncalibrated cards.** The roofline fallback max(bytes / BW, 2bmnk / FP64-TC peak) is a
-   lower bound, so ranked next to calibrated EMULATE fits it favours NATIVE. Append an
+   lower bound, so ranked next to calibrated EMULATE fits it favours HWGEMM. Append an
    `uncalibrated` flag to `imd_perf_t` and `imd_perf_candidate_t` (versioned) and document the
    bias.
 6. **Ranking.** Opt-in through appended request fields (a modes mask, a list of slab lengths).
-   NATIVE candidates appear only when both the request's struct_size and `candidate_size` are
+   HWGEMM candidates appear only when both the request's struct_size and `candidate_size` are
    new enough (an old caller would otherwise see N = 0 and no mode). Mode and `k_slab` join the
    deterministic tie order. With a budget, the candidate is the **largest `k_slab` that fits**
-   (fewest slabs, fastest). N, g and pack modes do not apply to NATIVE (PACK_NONE only); vec
+   (fewest slabs, fastest). N, g and pack modes do not apply to HWGEMM (PACK_NONE only); vec
    mode does unless the call is fully affine. The ranking only reports: ehrenfest chooses.
 
-Workspace exactness for NATIVE goes into `cert_workspace`, so the bytes ehrenfest is told are
+Workspace exactness for HWGEMM goes into `cert_workspace`, so the bytes ehrenfest is told are
 the bytes the call uses.
+
+### 4.6 Other element types: FP32 later (Eric, 2026-11-16)
+
+Eric wants native FP32 contractions considered too, so v1 is FP64-only but must not paint
+FP32 into a corner. That is why the mode is named for *how* it computes, not the type:
+`IMD_HWGEMM` means "the hardware's own GEMM arithmetic for the call's element type" (the name
+`IMD_NATIVE` was dropped: `IMD_PLAN_NATIVE` and `IMD_CODE_NATIVE` already mean something else, §6h).
+The element type is a separate axis of the plan; the mode does not change with it.
+
+**What FP32 means on the hardware.** Hopper and Ada have no IEEE FP32 tensor-core instruction,
+so "native FP32" is one of several arithmetics with different accuracy (H100 SXM dense
+datasheet peaks, to be checked per card):
+
+| arithmetic | accuracy | H100 peak |
+|---|---|---|
+| SIMT FFMA (CUDA cores) | IEEE FP32, γ_k with u = 2⁻²⁴ | ≈ 67 TFLOPS |
+| 3×TF32 tensor cores (CUTLASS) | close to FP32 (operands split into 2 TF32 parts, 3 products) | ≈ 495/3 TFLOPS |
+| TF32 tensor cores | inputs rounded to 10 mantissa bits: **not** FP32-accurate | ≈ 495 TFLOPS |
+| Ozaki-style emulation on INT8 | FP32-accurate with enough moduli | INT8-bound |
+
+So FP32 needs an accuracy choice, not just a type: the default must be FP32-accurate (FFMA or
+3×TF32, chosen per shape like the FP64 tile rule) and TF32 must be an explicit opt-in, never a
+silent default (cuBLAS's `CUBLAS_COMPUTE_32F_FAST_TF32` is the precedent). Which of these is
+worth building, and whether ehrenfest needs FP32 at all, is open until there is a use case.
+
+**What carries over unchanged.** The lowering (§5 of DESIGN), the in-place-or-packed rule (the
+pack region becomes 4·b·rows·k̂ bytes), k-slabs, the `store_out` epilogue, the `HwGemmPipeline`
+spec (it has no element width) and every planning-API field (bytes, `flops_eq`, time; the
+error bound takes the arithmetic's unit roundoff).
+
+**Decided now, so FP32 is additive later** (the §4.5 ABI break is the moment to do it):
+1. `imd_options_t` gains `struct_size` (first member) as well as `k_slab`, so later fields do
+   not break the ABI again.
+2. It also gains `int32_t dtype` (`IMD_F64` = 0, the default) and `int32_t compute`
+   (`IMD_COMPUTE_DEFAULT` = 0, meaning "accurate for the type"). Any other value is
+   NOT_SUPPORTED until it is implemented.
+3. `imd_contract` keeps its `double*` signature for FP64; another type gets its own typed entry
+   point (for example `imd_contract_f32` with `float` α, β), not a `void*` form of the FP64 call.
+4. The IndexMap sizing takes the element width as a parameter (8 today), so a 4-byte type is a
+   new model, not a new spec.
+5. Calibration classes and kernel ids are per (type, arithmetic); the FP64 ones come first.
+
+FP32 *emulated* by Ozaki in EMULATE mode is a separate question (it is the same dtype axis
+with mode EMULATE) and is not proposed here.
 
 ## 5. Spec, proof and test impact
 
 - **TLA+.**
-  - `IndexMap`: mode NATIVE; dispatch (NATIVE / DIRECT / K-empty / SCALE / NOOP); per-operand
-    in-place-or-packed as a pure function of the lowering; status row 5's NATIVE limits (§4.2
+  - `IndexMap`: mode HWGEMM; dispatch (HWGEMM / DIRECT / K-empty / SCALE / NOOP); per-operand
+    in-place-or-packed as a pure function of the lowering; status row 5's HWGEMM limits (§4.2
     Limits; the RN κ acceptance does not apply); the reads and contributions of the packed and
     in-place paths equal the einsum's; `k_slab` validity.
-  - A new module `NativePipeline` (as `K4Align` and `WgmmaPipeline` are separate): K0 (if
+  - A new module `HwGemmPipeline` (as `K4Align` and `WgmmaPipeline` are separate): K0 (if
     any), per slab pack(s) then GEMM, version tags on the pack buffers and C: no stale read of
     a pack buffer, slab s + 1's pack after slab s's GEMM (WAR), the caller's β applied exactly
     once and α on every slab, C's original value never read when β = 0, every K position
     folded into C exactly once; the workspace regions in `LayoutExact` form.
   - `HostAPI`: no change (DIRECT's pack rule, §4.1).
 - **Proof.** None new for the γ_k part; the slab composition reuses PROOFS L7 (cite it for
-  NATIVE in DESIGN).
+  HWGEMM in DESIGN).
 - **Tests.** Bit compare against DIRECT (§3 hypothesis); the γ / L7 bound against the oracle on
   random and wide-range data; non-finite (NaN-ness) and subnormal cases per instruction; run-to-
   run identity; graph capture; workspace exactness (`cert_workspace`); the full contract suite
-  in NATIVE mode, with and without slabs, affine and packed operands.
+  in HWGEMM mode, with and without slabs, affine and packed operands.
 - **Performance model.** The §4.5 phases and classes, calibrated on sm_90.
 
 ## 6. Decisions
 
-- **Q1 (Eric):** new mode `IMD_NATIVE`; `IMD_DIRECT` stays the sequential canonical-order
+- **Q1 (Eric):** new mode `IMD_HWGEMM`; `IMD_DIRECT` stays the sequential canonical-order
   reference.
 - **Q2 (reviewer: accept with changes):** per-operand in place or packed; fully affine is the
   primary path; main-loop gather a planned follow-up chosen by the perf model; affine2 dropped;
@@ -259,13 +303,15 @@ the bytes the call uses.
 - **Q3 (Eric):** k-slabs in v1.
 - **Q4 (reviewer: accept 16×8×4 behind a gate):** §4.3's embers measurement decides; tile rule
   per shape is a deliverable.
-- **Q5 (reviewer: defer):** reusable FP64 packs later; NATIVE accepts and ignores int8 packs
+- **Q6 (Eric, 2026-11-16):** rename the mode to `IMD_HWGEMM` and keep FP32 in view (§4.6):
+  `struct_size`, `dtype` and `compute` go into the same `imd_options_t` break as `k_slab`.
+- **Q5 (reviewer: defer):** reusable FP64 packs later; HWGEMM accepts and ignores int8 packs
   like DIRECT.
 - **§4.5 (reviewer: sound in intent, with changes 1–6).**
 
 ## 7. Plan and gates
 
-1. TLA+ for §5 (IndexMap changes, `NativePipeline`), then DESIGN text.
+1. TLA+ for §5 (IndexMap changes, `HwGemmPipeline`), then DESIGN text.
 2. In parallel, GPU-free: count affine operands on ehrenfest's real descriptors (`imd_lowering`).
 3. The Q4 gate: one embers session on H100 / H200 (§4.3).
 4. Kernel and tests, locally on the 4090 for correctness only.

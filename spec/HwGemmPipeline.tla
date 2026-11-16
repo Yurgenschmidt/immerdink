@@ -1,9 +1,9 @@
----------------------------- MODULE NativePipeline ----------------------------
+---------------------------- MODULE HwGemmPipeline ----------------------------
 (***************************************************************************)
-(* The launch sequence of one IMD_NATIVE imd_contract call (issue #75,     *)
-(* docs/NOTES-NATIVE.md §4.2) and its workspace layout.                    *)
+(* The launch sequence of one IMD_HWGEMM imd_contract call (issue #75,     *)
+(* docs/NOTES-HWGEMM.md §4.2) and its workspace layout.                    *)
 (*                                                                         *)
-(* A NATIVE call computes C <- alpha * A B + beta * C with FP64 tensor-core *)
+(* An HWGEMM call computes C <- alpha * A B + beta * C with the hardware's *)
 (* GEMMs. Each operand X in {A, B} is either read IN PLACE (it is affine)  *)
 (* or PACKED: a gather kernel copies it, K-contiguous, into a workspace    *)
 (* buffer first. With k-slabs the contracted index K = 0..K-1 is cut into  *)
