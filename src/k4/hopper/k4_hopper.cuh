@@ -11,6 +11,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "k4/hopper/gemm_ping_free.hpp"
 #include "cutlass/epilogue/collective/detail.hpp"
 #include "cute/tensor.hpp"
 
@@ -142,20 +143,29 @@ class K4ModEpilogue {
   Params params;
 };
 
+// Schedule tag: ping-pong whose epilogues are NOT ordered (gemm_ping_free.hpp, issue 58 candidate B). The mainloop is CUTLASS's
+// ping-pong mainloop; only the kernel differs.
+struct PingFree {};
+
 // One Hopper K4 kernel: tile, cluster, schedule, epilogue body.
 template <class Tile, class Cluster, class Sched, bool kAdd, bool kFast>
 struct Variant {
+  static constexpr bool kPingFree = cute::is_same_v<Sched, PingFree>;
+  using BuildSched = cute::conditional_t<kPingFree, cutlass::gemm::KernelTmaWarpSpecializedPingpong, Sched>;
   using Epi = cutlass::epilogue::collective::detail::Sm90TmaWarpSpecializedAdapter<K4ModEpilogue<kAdd, kFast>>;
+  // GemmPingFree is safe only because the epilogue shares nothing between the warpgroups: no shared memory
+  static_assert(!kPingFree || sizeof(typename Epi::SharedStorage) <= 1, "PingFree needs an epilogue without shared memory");
   using Main = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, int8_t, cutlass::layout::RowMajor, 16, int8_t,
       cutlass::layout::ColumnMajor, 16, int32_t, Tile, Cluster,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epi::SharedStorage))>,
-      Sched>::CollectiveOp;
+      BuildSched>::CollectiveOp;
   // a K tile of 128 int8 = 128 bytes is one SW128 atom wide: the layout the TMA writes (SWIZZLE_128B) and the wgmma descriptor reads
   static_assert(cute::size<2>(Tile{}) != 128 || (cute::is_same_v<typename Main::SmemLayoutAtomA, cute::GMMA::Layout_K_SW128_Atom<int8_t>> &&
                                                   cute::is_same_v<typename Main::SmemLayoutAtomB, cute::GMMA::Layout_K_SW128_Atom<int8_t>>),
                 "a 128-wide K tile must use the 128-byte swizzle");
-  using Kernel = cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, Main, Epi>;
+  using Kernel = cute::conditional_t<kPingFree, cutlass::gemm::kernel::GemmPingFree<cute::Shape<int, int, int, int>, Main, Epi>,
+                                     cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, Main, Epi>>;
 };
 
 }  // namespace imd::hopper

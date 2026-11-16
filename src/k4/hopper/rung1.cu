@@ -119,6 +119,7 @@ using namespace imd::hopper;
 namespace cg = cutlass::gemm;
 using Coop = cg::KernelTmaWarpSpecializedCooperative;
 using Ping = cg::KernelTmaWarpSpecializedPingpong;
+using PingF = imd::hopper::PingFree;   // ping-pong, epilogues not ordered (issue 58 candidate B)
 using cute::Int;
 using cute::Shape;
 using _1 = Int<1>;
@@ -1175,6 +1176,9 @@ const Entry kEntries[] = {
     IMD_ROW("f_128x256x128_1x2_coop", 9, Kind::Fast, true, true, false, T128x256, C12, Coop),
     IMD_ROW("f_128x256x128_1x1_coop", 9, Kind::Fast, true, true, false, T128x256, C11, Coop),
     IMD_ROW("f_128x128x128_1x1_ping", 9, Kind::Fast, true, true, false, T128x128, C11, Ping),
+    IMD_ROW("f_128x128x128_1x1_pingf", 9, Kind::Fast, true, true, false, T128x128, C11, PingF),
+    IMD_ROW("f_128x128x128_2x1_pingf", 9, Kind::Fast, true, true, false, T128x128, C21, PingF),
+    IMD_ROW("f_128x128x128_2x1_ping", 9, Kind::Fast, false, false, false, T128x128, C21, Ping),
     IMD_ROW("f_128x256x128_2x1_coop", 9, Kind::Fast, false, true, false, T128x256, C21, Coop),
     IMD_ROW("f_128x256x64_1x2_coop", 9, Kind::Fast, false, false, false, T128x256k64, C12, Coop),
     IMD_ROW("g_256x128x128_2x1_coop", 9, Kind::Generic, false, false, false, T256x128, C21, Coop),
