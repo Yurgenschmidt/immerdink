@@ -49,7 +49,7 @@ if command -v cuobjdump >/dev/null; then
         if (call > 0) st = "CALL?"
         printf "%-8s IGMMA %3d  WARPGROUP.DEPBAR %3d  CALL %d  peak wgmma-n%s wg%s stages%s\n", st, ig, dep, call, a[1], a[2], a[3]
       } else {
-        match(name, /MMA_64x[0-9]+x32/); n = substr(name, RSTART + 4, RLENGTH - 7); match(name, /K4ModEpilogueILb0ELb[01]/); f = substr(name, RSTART + RLENGTH - 1, 1) == "1" ? "fast" : "generic"; sc = (name ~ /Pingpong/) ? "ping" : "coop"
+        match(name, /MMA_64x[0-9]+x32/); n = substr(name, RSTART + 4, RLENGTH - 7); match(name, /K4ModEpilogueILb0ELb[01]/); f = substr(name, RSTART + RLENGTH - 1, 1) == "1" ? "fast" : "generic"; sc = (name ~ /GemmPingFree/) ? "pingf" : ((name ~ /Pingpong/) ? "ping" : "coop")
         printf "%-8s IGMMA %3d  WARPGROUP.DEPBAR %3d  CALL %d  %s wgmma-%s %s\n", st, ig, dep, call, sc, n, f } } }
     END { if (name != "") report() }' > "$out/sass_counts.txt"
   cat "$out/sass_counts.txt"
