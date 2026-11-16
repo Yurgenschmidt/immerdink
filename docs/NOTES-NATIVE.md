@@ -137,13 +137,14 @@ Following "many device-specific solutions, selected per device class":
 
 ## 6. Open questions
 
-- **Q1. New mode or upgrade DIRECT?** Recommendation: a new mode (`IMD_NATIVE`), keeping
+- **Q1. New mode or upgrade DIRECT?** **Decided (Eric, 2026-11-16): new mode `IMD_NATIVE`.**
+  Recommendation was: a new mode (`IMD_NATIVE`), keeping
   `IMD_DIRECT` as the sequential, canonical-order reference (its bits are what the oracle and
   the flagged-row path in K5 match). Alternative: make DIRECT tiled and lose that reference.
 - **Q2. Operand access.** Recommendation: B (pack) + A (affine) from §4.2, C only if B's pack
   cost shows up on real shapes.
 - **Q3. K-slab option** in the first version, or only once a memory-tight caller appears?
-  Recommendation: in the first version; ehrenfest already states memory limits.
+  **Decided (Eric, 2026-11-16): in the first version.** Recommendation was: in the first version; ehrenfest already states memory limits.
 - **Q4. sm_90 instruction shape.** Is the 2.x 16×8×4 DMMA enough to reach ≥ 90 % of cuBLAS
   DGEMM on H100 / H200? To settle by reading (CUTLASS profiler data, NVIDIA's Hopper tuning
   guide) and one short embers session, not by guessing.
@@ -152,7 +153,7 @@ Following "many device-specific solutions, selected per device class":
 
 ## 7. Plan and gates
 
-1. Answer §6 (independent reviewer, then Eric for Q1 and Q3).
+1. Answer §6: Q1 and Q3 decided by Eric (2026-11-16); Q2, Q4, Q5 to the independent reviewer.
 2. TLA+ for §5, then DESIGN text.
 3. Kernel and tests, locally on the 4090 for correctness only (FP64 is 1/64 there, so no
    timing locally).
