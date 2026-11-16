@@ -116,7 +116,7 @@ class K4ModEpilogue {
         for (int i = 0; i < kN / 2; ++i) r[i] = acc(rep * (kN / 2) + i);
         imd::kernels::HopperEpilogue::run<kN, kAdd>(r, warp, lane, row0 + 64 * (wg + kWG * rep), col0, plane,
                                                     params.ldw, M, N, mod, imd::device::c_tables.epi_bias[l],
-                                                    imd::device::c_tables.epi_magic[l]);
+                                                    imd::device::c_tables.epi_magic[l], imd::device::c_fold.f[l]);
       }
     } else {
       // generic: one byte per accumulator at its CuTe coordinate

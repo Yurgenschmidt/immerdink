@@ -20,7 +20,12 @@
 
 namespace imd::kernels {
 
+#ifndef IMD_K4_EPI_FOLD
+#  define IMD_K4_EPI_FOLD 1  // issue 58: 0 builds the Barrett reduction (for A/B timing)
+#endif
+
 struct HopperEpilogue {
+  static constexpr bool kFoldEpi = IMD_K4_EPI_FOLD != 0;
   // In-quad 4 x 4 transpose of 32-bit words (k4_gemm.cuh quad_transpose).
   __device__ static void quad_transpose(uint32_t (&w)[4], int t) {
 #pragma unroll
@@ -46,22 +51,24 @@ struct HopperEpilogue {
   //   plane    the modulus' u8 plane (row stride ldw), m / n  the output extent (rows beyond m and
   //            columns beyond n are not stored; n is a multiple of 16, as in K4)
   //   mod / neg_p / bias / magic  the §3.5 constants of the modulus (neg_p, bias, magic unused when p = 256)
+  //   fold     the issue-58 mod_p_fold constants of the modulus (c_fold.f[l]); used instead of the Barrett
+  //            reduction when IMD_K4_EPI_FOLD is 1 (the default): same residue, one fmaheavy instruction instead of four
   template <int kN, bool kAdd>
   __device__ static void run(const int32_t (&acc)[kN / 2], int warp, int lane, int row0, int col0,
                              uint8_t* plane, int64_t ldw, int m, int n, uint32_t mod, uint32_t bias,
-                             uint64_t magic) {
+                             uint64_t magic, imd::device::FoldConsts fold) {
     static_assert(kN % 64 == 0 && kN <= 256, "the epilogue works on 64-column groups");
     if (mod == 256u)
-      body<kN, kAdd, true>(acc, warp, lane, row0, col0, plane, ldw, m, n, 0u, 0u, 0u);
+      body<kN, kAdd, true>(acc, warp, lane, row0, col0, plane, ldw, m, n, 0u, 0u, 0u, fold);
     else
-      body<kN, kAdd, false>(acc, warp, lane, row0, col0, plane, ldw, m, n, 0u - mod, bias, magic);
+      body<kN, kAdd, false>(acc, warp, lane, row0, col0, plane, ldw, m, n, 0u - mod, bias, magic, fold);
   }
 
  private:
   template <int kN, bool kAdd, bool k256>
   __device__ static void body(const int32_t (&acc)[kN / 2], int warp, int lane, int row0, int col0,
                               uint8_t* plane, int64_t ldw, int m, int n, uint32_t neg_p, uint32_t bias,
-                              uint64_t magic) {
+                              uint64_t magic, [[maybe_unused]] imd::device::FoldConsts fold) {
     const int g = lane >> 2, t = lane & 3;
 #pragma unroll
     for (int c = 0; c < kN / 64; ++c) {
@@ -105,6 +112,8 @@ struct HopperEpilogue {
             const int32_t x = v[2 * k + (e >> 1)][e & 1];
             if constexpr (k256)
               q[e] = static_cast<uint32_t>(x) & 255u;
+            else if constexpr (kFoldEpi)
+              q[e] = imd::device::mod_p_fold(x, bias, fold, 0u - neg_p);
             else
               q[e] = imd::device::mod_p_barrett_neg(x, neg_p, bias, magic);
           }
