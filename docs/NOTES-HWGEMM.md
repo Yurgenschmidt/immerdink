@@ -146,10 +146,22 @@ In-place operands need no workspace, so a fully affine call never slabs for memo
 k > 2³¹ − 1, below). Slab 1 uses the caller's β with the C-not-read rule (β = 0: C is not
 read); slabs 2..S use β = 1. k = 0 and K-empty never slab.
 
-**Limits** (IndexMap status row 5 for HWGEMM): m, n̂ ≤ 2³¹ − 1 and **k ≤ 2³¹ − 1** per GEMM
-(GemmCoord is int32; HWGEMM does not chunk K, so a longer k must use slabs or is
-NOT_SUPPORTED); n-tiles ≤ 65535 on grid.y (or swap); batch chunks ≤ 65535 on grid.z; int32
-index vectors for main-loop gather.
+**Limits** (IndexMap status row 5 for HWGEMM): m, n ≤ 2³¹ − 1 (HWGEMM does not pad n, so n, not
+n̂) and **k ≤ 2³¹ − 1** per GEMM (GemmCoord is int32; HWGEMM does not chunk K, so a longer k
+needs slabs; without them it is INVALID_VALUE, like row 5 in EMULATE); n-tiles ≤ 65535 on grid.y
+(or swap); batch chunks ≤ 65535 on grid.z; int32 index vectors for main-loop gather.
+
+**Settled by the IndexMap spec (2026-11-16).**
+- Affinity of an operand is decided by fusing over *that operand's own* strides.
+- The batch is one decision per call: a single fused λ mode over all its carriers gives
+  per-operand batch strides (negative and 0 allowed); otherwise per-λ offsets come from the λ
+  scatter vectors, so vec is needed even when A, B and C are all affine.
+- When vec is needed it is sized as the whole §4a vec region (conservative, simple).
+- Int8 packs are ignored, so they never change affinity or the workspace size.
+- A workspace size of 0 keeps the existing rule: a null ws is fine, a misaligned non-null ws is
+  still MISALIGNED.
+- Leading dimensions CUTLASS gets (ld 0 for a broadcast, empty groups) are a kernel-test item,
+  not a spec claim.
 
 ### 4.3 The GEMM (decided: reviewer, Q4)
 

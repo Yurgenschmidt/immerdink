@@ -1,4 +1,4 @@
-# immerdink — design (v1.20)
+# immerdink — design (v1.21, design stage of §6i)
 
 This is the single source of truth for *what* v1 computes and *how*.
 - TLA+ specs in `spec/` check the claims marked **[spec: X]** (see `spec/README.md`).
@@ -102,6 +102,12 @@ before) is now the optional key `warm.kl_drop` (§6c.9), so a hand-built `imd_pe
 zero `param`.
 The change lists are at the end.
 v1.20 (§6h, issue 18, docs/NOTES-18.md) adds the device class, the table-set selection rule and the plan status on host API 14: what the library knows about the GPU it runs on, which fitted constants it uses for it, and whether it can run there at all. No semantic, layout, launch, pack-format or TLA+ change; results are bit-identical on every card that runs. Changed text is marked **[v1.20]**.
+
+v1.21 (§6i, issue #75, docs/NOTES-HWGEMM.md) specifies a hardware-GEMM mode, `IMD_HWGEMM` (FP64 tensor cores first), at the design
+stage: per-operand in-place or packed operand access, optional k-slabs, the `store_out` epilogue, its accuracy and
+reproducibility contract, and the planning-API reporting ehrenfest needs (footprint, predicted time and FLOPs,
+error bound). Spec: `HwGemmPipeline` (new) and `IndexMap` (HWGEMM dispatch, in-place addressing, sizing, limits).
+Not implemented yet: no library, API or layout change until §6i's gates pass. Changed text is marked **[v1.21]**.
 
 Sources:
 - Ozaki–Uchino–Imamura, arXiv:2504.08009 v4 [OZ2].
@@ -958,6 +964,9 @@ Properties checked by **[spec: Pipeline]**:
   `mode = DIRECT`.
 - K-empty → DIRECT is **documented dispatch by descriptor**, not a hidden switch.
 - No cuTENSOR/cuBLAS runtime dependency.
+- **[v1.21]** DIRECT stays the sequential, canonical-order reference. The tensor-core native
+  path is a separate mode, `IMD_HWGEMM` (§6i); K-empty contractions dispatch DIRECT in every
+  mode.
 
 ---
 
@@ -5866,6 +5875,87 @@ calibration, which is per card (issue 23); for a borrowed table set the plan is 
 **6h.6 Limits.** At most `IMD_K4_CONFIG_COUNT` = 4 K4 configurations, each with launch parameters within
 `kK4BlobBytes` = 256 bytes. **Build.** `IMMERDINK_CUDA_ARCHS`, `IMMERDINK_EMBED_PTX` (CMakeLists.txt).
 
+### 6i. Hardware GEMM mode `IMD_HWGEMM` (FP64 tensor cores first) **[v1.21: design stage; issue #75]**
+
+*What and why.* On Hopper the FP64 tensor cores (DMMA) reach about 67 TFLOPS, and native DGEMM
+beats every emulator, immerdink included, by 1.7–1.9× on small and batched shapes. `IMD_HWGEMM`
+runs a contraction as native FP64 tensor-core GEMMs over the same lowering (§5), workspace model
+(§4a) and stream rules (§4) as EMULATE. The caller (ehrenfest) chooses the mode; immerdink
+reports the cost of each choice (§6i.5) and never switches modes itself. Full reasoning, the
+review record and the predictions: docs/NOTES-HWGEMM.md.
+
+**6i.1 Dispatch.** NOOP (b·m·n = 0), SCALE (k = 0 or α = 0: the β-only kernel, once), DIRECT
+(K-empty, k = 1), else HWGEMM. Int8 packs: accepted and ignored, exactly as DIRECT (§6b).
+The RN κ policy (§3.2) does not apply. **[spec: IndexMap]**
+
+**6i.2 Operand access.** Per post-swap operand X, a pure function of the lowering, reported in
+`imd_lowering_t`:
+- **in place** if X is *affine*: one fused mode in its row group and one in K, stride exactly
+  +1 in one of them and ≥ 0 in the other; CUTLASS reads it with those strides;
+- **packed** otherwise: a gather kernel writes X K-contiguous into an FP64 workspace region of
+  b·rows·k̂ values (k̂ = k, or the slab length, rounded up to the GEMM K tile; rows = m or n,
+  unpadded); the GEMM reads only positions h < k.
+- Batch (one decision per call): one fused batch mode → a per-operand stride (0 = broadcast);
+  several → per-λ base offsets from the λ scatter vectors (so K0 runs), read once per CTA (no
+  host loop over λ).
+- C: affine with a unit stride → strided store; otherwise through `c_row` / `c_col`.
+- K0 runs only if some operand is packed, C is scattered or the batch has several modes, and
+  `vec_mode` is GENERATE. A fully
+  affine call has workspace 0 and one launch. **[spec: IndexMap InPlaceExact, InPlaceUnitStride, HwAffineNoWs; HwGemmPipeline]**
+
+**6i.3 K-slabs.** Option `k_slab` (0 = none; quantized to the GEMM K tile; INVALID_VALUE
+outside HWGEMM). Per slab s, on one stream: the packs of slab s, then GEMM(s). Slab 0's
+epilogue uses the caller's β (β = 0: C is not read); later slabs use β = 1; α applies to each
+slab's sum. Packed regions are sized by the largest slab and reused. **[spec: HwGemmPipeline
+ResultExact, NoBadStep, SlabsPartition]**
+
+**6i.4 Accuracy and reproducibility.**
+- Without slabs: |D − x| ≤ γ_k·(|a||b|)_ij (any summation order; the §6f no-underflow
+  hypothesis or its absolute term), then §3.7's α / β via `store_out`, not CUTLASS's
+  LinearCombination. Not correctly rounded.
+- With S slabs: the §3.8 K-segmentation composition (PROOFS L7): γ_k still bounds each sum's
+  error; the β·C₀ term is rounded S times and α is applied S times; the absolute term covers
+  subnormal slab products.
+- Reproducible bit for bit for the same plan, `k_slab`, tile configuration and binary; no
+  split-K. Hypothesis to test first: an unslabbed HWGEMM tile (accumulator from +0, ascending K,
+  no sliced-K) equals DIRECT bit for bit, if DMMA is a sequential IEEE fma chain
+  (Khattak–Mikaitis, arXiv:2512.07004).
+- Non-finite values propagate per IEEE (tests compare NaN-ness); subnormals: a per-card test
+  per DMMA instruction used.
+
+**6i.5 Planning API (requirement).** Everything ehrenfest needs to plan memory and speed comes
+from `libimmerdink_host`, GPU-free, through the existing fields: exact `workspace_bytes`,
+`plan_device_bytes`, `total_bytes` against `budget_bytes`; `time_s` with its interval and
+power; `flops_eq` = 2bmnk and `tflops_eq`; `err_bound` (γ_k, L7 form with slabs); dispatch
+`IMD_DISPATCH_NATIVE`. Changes, by the independent review of 2026-11-16:
+- `imd_options_t` gains `int64_t k_slab`, plus `struct_size`, `dtype` and `compute` (§6i.8): an
+  **ABI break** (the struct has no struct_size today), the last one for this struct;
+- HWGEMM phases are one per kind with `launches` = S (K0, HWGEMM_PACK_A, HWGEMM_PACK_B,
+  HWGEMM_GEMM, call term): ≤ 5 of the frozen `IMD_PERF_MAX_PHASES`;
+- about three calibration classes (12–14 free); `peak_fp64_tc_flops_per_s` appended;
+- an `uncalibrated` flag on `imd_perf_t` and `imd_perf_candidate_t` (the roofline fallback is a
+  lower bound, so it favours HWGEMM in a ranking);
+- `imd_perf_rank`: HWGEMM candidates opt-in (a modes mask and slab lengths in appended request
+  fields), only for callers whose struct sizes know them; with a budget, the largest `k_slab`
+  that fits. The ranking reports; the caller chooses.
+Workspace exactness for HWGEMM joins `cert_workspace`.
+
+**6i.6 Limits.** m, n ≤ 2³¹ − 1 and k (or `k_slab`) ≤ 2³¹ − 1 per GEMM (CUTLASS GemmCoord;
+INVALID_VALUE, like row 5);
+n-tiles ≤ 65535 on grid.y (or swap); batch chunks of ≤ 65535 on grid.z. **[spec: IndexMap]**
+
+**6i.7 Kernels per device class.** CUTLASS 2.x FP64 tensor-op GEMMs: `arch::Sm90` 16×8×4 on
+sm_90 (and sm_120 if it compiles there), `arch::Sm80` 8×8×4 on sm_80 / sm_89 (a different
+kernel). Only sm_90 is tuned (a per-shape tile rule) and calibrated; the others are for
+correctness. Gate before kernel tuning: one embers session comparing CUTLASS's d1684 kernels with
+cuBLAS (NOTES-HWGEMM §4.3).
+
+**6i.8 Element types.** v1 is FP64. The mode names the arithmetic source, not the type: a later
+FP32 is the same mode with `dtype = IMD_F32` and a `compute` choice (FP32-accurate by default:
+FFMA or 3×TF32; TF32 only as an explicit opt-in) and its own typed `imd_contract_f32`. The
+§6i.5 ABI break also adds `struct_size`, `dtype` and `compute` to `imd_options_t` so that FP32
+is additive. Details: NOTES-HWGEMM §4.6.
+
 ## 7. What was considered and rejected
 
 | Option | Why not |
@@ -6858,3 +6948,11 @@ decisions (IR1–IR29, NOTES-C1 §5.3).
   creation with `NOT_SUPPORTED`; an emulated plan on a foreign architecture no longer reports `CUDA_ERROR`.
 - Tests: `host_devices`, `device_kernel_sites`, `device_status`, `device_status_eager`; `tools/device_status_check.sh`
   (three builds on the 4090: native, PTX-only, foreign architecture).
+
+## v1.21 (§6i `IMD_HWGEMM`, design stage; issue #75; spec: HwGemmPipeline new, IndexMap extended; no library, API, layout or pack-format change yet)
+
+- §6i: the native FP64 tensor-core mode: dispatch, per-operand in-place / packed access, k-slabs, accuracy and
+  reproducibility contract, planning-API reporting, limits, kernels per device class.
+- §4 "DIRECT path": DIRECT stays the reference; HWGEMM is a separate mode.
+- Decisions: Eric (Q1 new mode, Q3 slabs in v1); the independent reviewer (Q2, Q4, Q5, the §6i.5 API shape),
+  recorded in docs/NOTES-HWGEMM.md §6.

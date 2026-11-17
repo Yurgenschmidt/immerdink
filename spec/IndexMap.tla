@@ -215,6 +215,45 @@
 (*  "PackNoTail"       packs without the zeroed tail                       *)
 (*  "PackPartnerOnly"  no partner-only policy (POSITIVE: the key suffices) *)
 (*  "PackOrderCheck"   no _ORDER check (POSITIVE: the key suffices)        *)
+(*                                                                         *)
+(* IMD_HWGEMM (docs/NOTES-HWGEMM §2, §4.1, §4.2; Execs mode "HWGEMM"):    *)
+(* native FP64 tensor-core GEMM over the SAME lowering (post-swap roles,   *)
+(* canonical orders, fusion). Dispatch: NOOP, SCALE, DIRECT (K-empty,      *)
+(* k = 1), else HWGEMM. Per operand X in {A, B} (GEMM view rows x K: A's   *)
+(* I x K, B's J x K), a pure function of the lowering (HwView): IN PLACE  *)
+(* iff X is AFFINE: fused over X's strides alone (FuseModes, in the        *)
+(* lowering's canonical order) each of rows and K is empty or ONE mode,    *)
+(* both strides >= 0, and one of them is exactly +1 (an empty group is a   *)
+(* free unit dimension); the kernel then reads X through a CUTLASS layout  *)
+(* (ROW: K contiguous, ld = row stride; COL: rows contiguous, ld = K       *)
+(* stride) at base + bat_X(λ) + layout(row, h). Otherwise PACKED: an FP64  *)
+(* gather into a K-contiguous workspace buffer, rows unpadded, K padded to *)
+(* k̂ = ceil_Q(k) (A at (λ·m + i)·k̂ + h, B at (λ·n + j)·k̂ + h), the GEMM   *)
+(* reading only h < k. C (rows I x cols J): affine -> strided store        *)
+(* through its layout, else through off_C (c_row / c_col). Batch: one      *)
+(* fused L mode (all carriers) -> per-tensor stride (any sign, 0 = broad-  *)
+(* cast), else per-λ base offsets from the L scatter vectors. Sizing: the  *)
+(* vec region iff an operand is packed, C is scattered or the batch has    *)
+(* several fused modes (the λ offsets live in vec), plus per packed        *)
+(* operand a region PA = b·m·k̂ / PB = b·n·k̂ (HwElemBytes, 8 for FP64);    *)
+(* fully affine -> 0. Status row 5 for HWGEMM (non-empty output,          *)
+(* k >= 2): m, n, k <=                                                    *)
+(* GemmMax (no n̂ padding; GemmCoord is int32 and HWGEMM does not chunk K   *)
+(* here: K-slabs are HwGemmPipeline's, out of scope, so a longer k is      *)
+(* INVALID_VALUE in this scaled model). The RN kappa policy does not apply *)
+(* (EMULATE only). Int8 packs: accepted and ignored as in DIRECT (the      *)
+(* packed models use EMULATE / DIRECT only, see the ASSUME at the end).    *)
+(* Claims: every claim above in HWGEMM mode, plus InPlaceExact (the in-    *)
+(* place / affine-store address formula reproduces off_X on the whole      *)
+(* box), InPlaceUnitStride, HwAffineNoWs (fully affine: workspace 0).      *)
+(* HWGEMM rules a negative model drops:                                    *)
+(*  "AffineNoUnit"     in place without a unit stride (the layout guessed  *)
+(*                     from the smaller stride, assumed to be 1)           *)
+(*  "AffineMultiMode"  a group of several fused modes treated as one, with *)
+(*                     its first mode's stride                             *)
+(*  "HwGemmKappa"      the kappa >= T policy also applied in HWGEMM        *)
+(*  "HwGemmLimitNoK"   row 5 for HWGEMM without k <= GemmMax               *)
+(*  "HwGemmWsPadN"     PB sized with n̂ = ceil_Q(n) rows instead of n       *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, Bags, TLC
 
@@ -234,7 +273,8 @@ CONSTANTS
     MustCover,       \* names of coverage descriptors (defined in MC) that
                      \*   this model must enumerate AND accept (ASSUME in MC)
     Execs,           \* set of execute-time argument records (see XDef)
-    GemmMax,         \* CUTLASS GemmCoord limit on m and nh (real 2^31 - 1)
+    GemmMax,         \* CUTLASS GemmCoord limit on m and nh; HWGEMM: m, n
+                     \*   and k (real 2^31 - 1)
     AlignWS,         \* workspace region alignment (real 256 bytes)
     Packing,         \* D1: the caller's operands packed: "none" | "A" | "B" | "AB"
     PackEnum         \* D1: the packs enumerated: "plan" (the plan's classes,
@@ -250,9 +290,11 @@ VARIABLES
     ein,    \* the einsum reference (a record), or "none" if rejected
     el,     \* el[X] = Elems(desc, X), cached
     xa,     \* the plan option and imd_contract arguments (an Execs record)
-    pk      \* D1: the packs the plan is created with (NoPk: imd_plan_create)
+    pk,     \* D1: the packs the plan is created with (NoPk: imd_plan_create)
+    wz      \* the workspace sizes of (desc, xa, pk), cached: [si |-> as built,
+            \*   sd |-> DESIGN, cells |-> the sized cells per region]
 
-vars == <<desc, st, low, ein, el, xa, pk>>
+vars == <<desc, st, low, ein, el, xa, pk, wz>>
 
 -----------------------------------------------------------------------------
 (* Helpers *)
@@ -296,7 +338,7 @@ MkBag(P, F) == [t \in {F[p] : p \in P} |-> Cardinality({p \in P : F[p] = t})]
 \* ExtentSet, so the ASSUMEs in MC_IndexMap may evaluate descriptors whose
 \* extents lie outside the enumerated ExtentSet (e.g. extent 3 witnesses in
 \* an extent-2 model) without truncating their index boxes.
-MaxIdx(d) == SetMax(UNION {{d[X].e[p] : p \in 1..Len(d[X].e)} : X \in Tens} \cup {1}) - 1
+MaxIdx(d) == SetMax((UNION {{d[X].e[p] : p \in 1..Len(d[X].e)} : X \in Tens}) \cup {1}) - 1
 
 \* Address sentinel for a nonzero product that lands in an unscattered
 \* (padding) column of the u8 plane. Must never appear (EinsumPreserved).
@@ -582,6 +624,46 @@ OrdInfo(d, sw, od, pks) ==
          packKey |-> packKey, keyEq |-> keyEq, partnerOnly |-> partnerOnly,
          orderAgree |-> orderAgree, mis |-> mis]
 
+\* IMD_HWGEMM (NOTES-HWGEMM §2 "Affine operand", §4.2): the per-tensor
+\* access decision, a pure function of the lowering oi (post-swap roles,
+\* canonical orders). X's view of group g: the lowering's canonical order
+\* of g, fused over X's strides ALONE (a label X lacks is a mode (e, 0)).
+HwFm(oi, X, g) ==
+    FuseModes([t \in 1..Len(oi.ord[g]) |-> <<oi.ext[oi.ord[g][t]], oi.ms[X, oi.ord[g][t]]>>])
+\* X's 2-D view with first index in group rg (rows) and second in kg (K for
+\* an operand, J for C). Affine: each group empty or one fused mode, both
+\* strides >= 0, one of them +1 (an empty group is a free unit dimension).
+\* The CUTLASS layout: ROW (second index contiguous, ld = first stride) or
+\* COL (first index contiguous, ld = second stride).
+\* Drop "AffineMultiMode": several modes taken as one, with the first's
+\* stride. Drop "AffineNoUnit": no unit stride needed; the layout is
+\* guessed from the smaller stride, which the kernel assumes to be 1.
+HwAcc(oi, X, rg, kg) ==
+    LET fr == HwFm(oi, X, rg)  fk == HwFm(oi, X, kg)
+        sv(f) == IF f = <<>> THEN 0 ELSE f[1][2]
+        sr == sv(fr)  sk == sv(fk)
+        one  == (Len(fr) <= 1 /\ Len(fk) <= 1) \/ Drop = "AffineMultiMode"
+        unit == fr = <<>> \/ fk = <<>> \/ sr = 1 \/ sk = 1
+        lay  == IF fk = <<>> \/ sk = 1 THEN "ROW"
+                ELSE IF fr = <<>> \/ sr = 1 THEN "COL"
+                ELSE IF sr <= sk THEN "COL" ELSE "ROW"
+    IN  [aff |-> one /\ sr >= 0 /\ sk >= 0 /\ (unit \/ Drop = "AffineNoUnit"),
+         lay |-> lay, ld |-> IF lay = "ROW" THEN sr ELSE sk, fr |-> fr, fk |-> fk]
+\* Address of (first, second) in an affine view (without base and batch).
+Addr2(acc, r, c) == IF acc.lay = "ROW" THEN r * acc.ld + c ELSE r + c * acc.ld
+\* The batch: one fused L mode (the lowering's fusion, all carriers) ->
+\* per-tensor stride bs[X] (any sign, 0 = broadcast); otherwise per-λ base
+\* offsets from the L scatter vectors (a_bat, b_bat, c_bat; in vec).
+\* needVec: K0 copies the scatter vectors (the §4a vec region) iff a pack
+\* gather, C's scatter store or the per-λ batch offsets need them.
+HwView(oi) ==
+    LET A == HwAcc(oi, "A", "I", "K")  B == HwAcc(oi, "B", "J", "K")
+        C == HwAcc(oi, "C", "I", "J")
+        bAff == Len(oi.fused["L"]) <= 1
+    IN  [A |-> A, B |-> B, C |-> C, bAff |-> bAff,
+         bs |-> [X \in Tens |-> IF oi.fused["L"] = <<>> THEN 0 ELSE oi.fused["L"][1].s[X]],
+         needVec |-> ~A.aff \/ ~B.aff \/ ~C.aff \/ ~bAff]
+
 LowerP(d, mode, sw, od, pks) ==
     LET oi   == OrdInfo(d, sw, od, pks)
         labs == oi.labs  ext == oi.ext  grp == oi.grp  sz == oi.sz
@@ -613,7 +695,8 @@ LowerP(d, mode, sw, od, pks) ==
         ca(t) == IF pkA THEN PRead(pg["A"], qa(t)) ELSE bufA[(t[1] * m + t[2]) * kh + t[4]]
         cb(t) == IF pkB THEN PRead(pg["B"], qb(t)) ELSE bufB[(t[1] * nh + t[3]) * kh + t[4]]
         kind == IF b * m * n = 0 THEN "NOOP" ELSE IF k = 0 THEN "SCALE"
-                ELSE IF mode = "DIRECT" \/ grp["K"] = {} THEN "DIRECT" ELSE "GEMM"
+                ELSE IF mode = "DIRECT" \/ grp["K"] = {} THEN "DIRECT"
+                ELSE IF mode = "HWGEMM" THEN "HWGEMM" ELSE "GEMM"
         \* K4 over the padded box; K5 scatters columns j < n only.
         gdom == {<<lam, i, j, h>> : lam \in 0..(b - 1), i \in 0..(m - 1),
                                      j \in 0..(nh - 1), h \in 0..(kh - 1)}
@@ -627,8 +710,36 @@ LowerP(d, mode, sw, od, pks) ==
         \* DIRECT: native sum over the canonical k-bar order, no padding.
         ddom == {<<lam, i, j, h>> : lam \in 0..(b - 1), i \in 0..(m - 1),
                                      j \in 0..(n - 1), h \in 0..(k - 1)}
+        \* IMD_HWGEMM (NOTES-HWGEMM §4.2): in-place operands through their
+        \* layout, packed ones from the FP64 gather (A: bufA's layout, the
+        \* same b·m·k̂ cells; B: rows UNPADDED, b·n·k̂), only h < k read; C
+        \* through its layout when affine, else off_C. Int8 packs ignored.
+        nv == HwView(oi)
+        hwB == [q \in 0..(b * n * kh - 1) |->
+                   LET lam == q \div (n * kh)  j == (q \div kh) % n  h == q % kh
+                   IN  IF h < k THEN Cell(offB(lam, h, j)) ELSE Pad]
+        bat(X, lam) == IF nv.bAff THEN lam * nv.bs[X] ELSE vec[X, "L"][lam]
+        ipA(lam, i, h) == d.A.base + bat("A", lam) + Addr2(nv.A, i, h)
+        ipB(lam, h, j) == d.B.base + bat("B", lam) + Addr2(nv.B, j, h)
+        ipC(lam, i, j) == d.C.base + bat("C", lam) + Addr2(nv.C, i, j)
+        nrA(lam, i, h) == IF nv.A.aff THEN ipA(lam, i, h) ELSE bufA[(lam * m + i) * kh + h][2]
+        nrB(lam, h, j) == IF nv.B.aff THEN ipB(lam, h, j) ELSE hwB[(lam * n + j) * kh + h][2]
+        nwC(lam, i, j) == IF nv.C.aff THEN ipC(lam, i, j) ELSE offC(lam, i, j)
+        \* InPlaceExact's right-hand side, per tensor, on the whole box.
+        inExact == [X \in Tens |->
+                      IF kind # "HWGEMM" THEN TRUE ELSE
+                      CASE X = "A" -> \A lam \in 0..(b - 1), i \in 0..(m - 1), h \in 0..(k - 1) :
+                                         ipA(lam, i, h) = offA(lam, i, h)
+                        [] X = "B" -> \A lam \in 0..(b - 1), j \in 0..(n - 1), h \in 0..(k - 1) :
+                                         ipB(lam, h, j) = offB(lam, h, j)
+                        [] X = "C" -> \A lam \in 0..(b - 1), i \in 0..(m - 1), j \in 0..(n - 1) :
+                                         ipC(lam, i, j) = offC(lam, i, j)]
         contrib == CASE kind = "GEMM"
                           -> MkBag(nz, [t \in nz |-> <<cadr(t), ca(t)[2], cb(t)[2]>>])
+                     [] kind = "HWGEMM"
+                          -> MkBag(ddom, [t \in ddom |-> <<nwC(t[1], t[2], t[3]),
+                                                           nrA(t[1], t[2], t[4]),
+                                                           nrB(t[1], t[4], t[3])>>])
                      [] kind = "DIRECT"
                           -> MkBag(ddom, [t \in ddom |-> <<offC(t[1], t[2], t[3]),
                                                            offA(t[1], t[2], t[4]),
@@ -636,14 +747,19 @@ LowerP(d, mode, sw, od, pks) ==
                      [] OTHER -> EmptyBag
         wdom == {<<lam, i, j>> : lam \in 0..(b - 1), i \in 0..(m - 1), j \in 0..(n - 1)}
         writes == IF kind = "NOOP" THEN EmptyBag
+                  ELSE IF kind = "HWGEMM" THEN MkBag(wdom, [w \in wdom |-> nwC(w[1], w[2], w[3])])
                   ELSE MkBag(wdom, [w \in wdom |-> offC(w[1], w[2], w[3])])
         \* the elements a GEMM reads: a packed operand's are those imd_pack read
         cells(bf) == {bf[q][2] : q \in {q \in DOMAIN bf : ~bf[q][1]}}
         readsA == CASE kind = "GEMM"   -> IF pkA THEN cells(pg["A"]) ELSE cells(bufA)
                     [] kind = "DIRECT" -> {offA(t[1], t[2], t[4]) : t \in ddom}
+                    [] kind = "HWGEMM" -> IF nv.A.aff THEN {ipA(t[1], t[2], t[4]) : t \in ddom}
+                                          ELSE cells(bufA)
                     [] OTHER           -> {}
         readsB == CASE kind = "GEMM"   -> IF pkB THEN cells(pg["B"]) ELSE cells(bufB)
                     [] kind = "DIRECT" -> {offB(t[1], t[4], t[3]) : t \in ddom}
+                    [] kind = "HWGEMM" -> IF nv.B.aff THEN {ipB(t[1], t[4], t[3]) : t \in ddom}
+                                          ELSE cells(hwB)
                     [] OTHER           -> {}
         \* D1 pack cells K4 reads (every row j < n̂ in role B)
         pread == [R \in oi.proles |-> IF R = "A" THEN {qa(t) : t \in gdom} ELSE {qb(t) : t \in gdom}]
@@ -663,7 +779,8 @@ LowerP(d, mode, sw, od, pks) ==
          ord15 |-> oi.ord15, proles |-> oi.proles, adopted |-> oi.adopted, pR |-> oi.pR,
          pg |-> pg, pread |-> pread, gatherEq |-> gatherEq, keyEq |-> oi.keyEq,
          slotKey |-> oi.slotKey, packKey |-> oi.packKey, partnerOnly |-> oi.partnerOnly,
-         orderAgree |-> oi.orderAgree, mis |-> oi.mis]
+         orderAgree |-> oi.orderAgree, mis |-> oi.mis,
+         hw |-> nv, hwB |-> hwB, inExact |-> inExact]
 
 -----------------------------------------------------------------------------
 (* Einsum reference (DESIGN §1).                                          *)
@@ -735,11 +852,13 @@ DispKind(u, mode) ==
     IF u.b * u.m * u.n = 0 THEN "NOOP"
     ELSE IF u.k = 0 THEN "SCALE"
     ELSE IF mode = "DIRECT" \/ u.kempty THEN "DIRECT"
+    ELSE IF mode = "HWGEMM" THEN "HWGEMM"
     ELSE "GEMM"
 
 \* §4a regions (one modulus plane, N = g = 1) as element counts, and their
 \* element widths in bytes.
-RegNames == {"sA", "sB", "fA", "fB", "vec", "RA", "RB", "W"}
+\* PA, PB: IMD_HWGEMM's FP64 pack buffers (0 in EMULATE and DIRECT).
+RegNames == {"sA", "sB", "fA", "fB", "vec", "RA", "RB", "W", "PA", "PB"}
 RegCells(u, r) ==
     CASE r \in {"sA", "fA"} -> u.b * u.m
       [] r \in {"sB", "fB"} -> u.b * u.n
@@ -747,33 +866,63 @@ RegCells(u, r) ==
       [] r = "RA"           -> u.b * u.m * CeilQ(u.k)
       [] r = "RB"           -> u.b * CeilQ(u.n) * CeilQ(u.k)
       [] r = "W"            -> u.b * u.m * CeilQ(u.n)
-RegWidth(r) == CASE r \in {"sA", "sB"} -> 2 [] r = "vec" -> 8 [] OTHER -> 1
+      [] r = "PA"           -> u.b * u.m * CeilQ(u.k)
+      [] r = "PB"           -> u.b * (IF Drop = "HwGemmWsPadN" THEN CeilQ(u.n) ELSE u.n) * CeilQ(u.k)
+\* HWGEMM's packed-operand element width in bytes (FP64: 8). A model of
+\* another element type (docs/NOTES-HWGEMM §4.6, e.g. FP32: 4) overrides
+\* it in its cfg (`HwElemBytes <- HwW4`); nothing else depends on it.
+HwElemBytes == 8
+RegWidth(r) == CASE r \in {"sA", "sB"} -> 2 [] r = "vec" -> 8
+                 [] r \in {"PA", "PB"} -> HwElemBytes [] OTHER -> 1
 \* §4a: 0 for an empty output; only vec for DIRECT, K-empty and k = 0.
 \* D1 (§6b.6): sX, fX, RX of a packed post-swap role X ∈ pr have 0 bytes.
 PackedRegs(pr) == UNION {IF X = "A" THEN {"sA", "fA", "RA"} ELSE {"sB", "fB", "RB"} : X \in pr}
 SizedCellsP(u, mode, pr) ==
     LET kd == DispKind(u, mode) IN
     [r \in RegNames |-> CASE kd = "NOOP" -> 0
+                          [] r \in {"PA", "PB"} -> 0
                           [] kd = "GEMM" -> IF r \in PackedRegs(pr) THEN 0 ELSE RegCells(u, r)
                           [] OTHER       -> IF r = "vec" THEN RegCells(u, r) ELSE 0]
 SizedCells(u, mode) == SizedCellsP(u, mode, {})
+\* IMD_HWGEMM (NOTES-HWGEMM §4.2): vec iff HwView says the scatter vectors
+\* are needed, PA / PB per packed operand (post-swap roles, from the
+\* lowering's orders: imd_workspace_size builds the same HwView), every
+\* EMULATE region 0. NOOP / SCALE / DIRECT as in SizedCellsP.
+HwCells(d) ==
+    LET u == PDims(d)  nv == HwView(OrdInfoTop(d, NoPk)) IN
+    [r \in RegNames |-> CASE r = "vec" -> IF nv.needVec THEN RegCells(u, r) ELSE 0
+                          [] r = "PA"  -> IF nv.A.aff THEN 0 ELSE RegCells(u, r)
+                          [] r = "PB"  -> IF nv.B.aff THEN 0 ELSE RegCells(u, r)
+                          [] OTHER     -> 0]
+HwDisp(d, mode) == DispKind(PDims(d), mode) = "HWGEMM"
+\* The sized cells of a call (pr: D1's packed post-swap roles).
+SizedCellsX(d, mode, pr) == IF HwDisp(d, mode) THEN HwCells(d) ELSE SizedCellsP(SDims(d), mode, pr)
 AlignUp(x) == ((x + AlignWS - 1) \div AlignWS) * AlignWS
-WsSizeU(u, mode) ==
-    LET c == SizedCells(u, mode) IN
-    SumOver(RegNames, [r \in RegNames |-> AlignUp(c[r] * RegWidth(r))])
-WsSizeImpl(d, mode)   == WsSizeU(SDims(d), mode)   \* imd_workspace_size as built
-WsSizeDesign(d, mode) == WsSizeU(PDims(d), mode)   \* DESIGN §4a
+WsSizeC(c) == SumOver(RegNames, [r \in RegNames |-> AlignUp(c[r] * RegWidth(r))])
+WsSizeU(u, mode) == WsSizeC(SizedCells(u, mode))
+\* imd_workspace_size as built, and DESIGN §4a (NOTES-HWGEMM §4.2 for HWGEMM).
+WsSizeImpl(d, mode)   == IF HwDisp(d, mode) THEN WsSizeC(HwCells(d)) ELSE WsSizeU(SDims(d), mode)
+WsSizeDesign(d, mode) == IF HwDisp(d, mode) THEN WsSizeC(HwCells(d)) ELSE WsSizeU(PDims(d), mode)
 
 \* §5 row 5, the CUTLASS GemmCoord limit (scaled: GemmMax). It applies
 \* exactly when the emulated GEMM runs: EMULATE mode, a non-empty output
 \* and k >= 2 (k = 0: C <- beta*C; k = 1: K-empty, dispatched to DIRECT),
 \* the same condition as the RN acceptance rule (orchestrator, M1).
-LimitApplies(d, x) == /\ x.mode = "EMULATE" \/ Drop = "GemmLimitDirect"
+\* IMD_HWGEMM (NOTES-HWGEMM §4.2 "Limits"): the same scope with mode HWGEMM,
+\* and m, n (no n̂: HWGEMM does not pad n) and k <= GemmMax (GemmCoord is
+\* int32 and this module's HWGEMM does not chunk K; the k-slab option of
+\* NOTES-HWGEMM §4.2, which would lift the k limit, is HwGemmPipeline's and
+\* out of scope here, so a longer k is INVALID_VALUE in this scaled model).
+LimitApplies(d, x) == /\ \/ x.mode \in {"EMULATE", "HWGEMM"}
+                         \/ Drop = "GemmLimitDirect" /\ x.mode = "DIRECT"
                       /\ ~EmptyOut(d) \/ Drop = "GemmLimitEmpty"
                       /\ UDims(d).k >= 2 \/ Drop = "GemmLimitK"
-LimitExceeded(d)   == LET u == SDims(d) IN
-                      \/ u.m > GemmMax
-                      \/ (IF Drop = "GemmLimitN" THEN u.n ELSE CeilQ(u.n)) > GemmMax
+LimitExceeded(d, x) == LET u == SDims(d) IN
+                       IF x.mode = "HWGEMM"
+                       THEN \/ u.m > GemmMax \/ u.n > GemmMax
+                            \/ Drop # "HwGemmLimitNoK" /\ u.k > GemmMax
+                       ELSE \/ u.m > GemmMax
+                            \/ (IF Drop = "GemmLimitN" THEN u.n ELSE CeilQ(u.n)) > GemmMax
 
 \* §3.2 "RN acceptance", accuracy policy: plan time rejects kappa >= T,
 \* kappa = ceil(sqrt(k)) exact (NOT_SUPPORTED, "N too small for this k"),
@@ -783,7 +932,10 @@ LimitExceeded(d)   == LET u == SDims(d) IN
 \* imd_plan_create) it is checked after every §5 plan-time row, so it is
 \* the last plan-time status. imd_workspace_size never applies it (§6).
 CeilSqrt(x)  == CHOOSE c \in 0..x : c * c >= x /\ (c = 0 \/ (c - 1) * (c - 1) < x)
-KappaApplies(d, x) == /\ x.mode = "EMULATE" \/ Drop = "KappaDirect"
+\* (NOTES-HWGEMM §4.2: not in HWGEMM either; Drop "HwGemmKappa" applies it.)
+KappaApplies(d, x) == /\ \/ x.mode = "EMULATE"
+                         \/ Drop = "KappaDirect" /\ x.mode = "DIRECT"
+                         \/ Drop = "HwGemmKappa" /\ x.mode = "HWGEMM"
                       /\ ~EmptyOut(d) \/ Drop = "KappaEmpty"
                       /\ PDims(d).k >= 2 \/ Drop = "KappaK"
                       /\ x.rn \/ Drop = "KappaTrunc"
@@ -836,7 +988,7 @@ Packings(d, x) ==
 (* §6). Addresses are in BYTES: element a of tensor X occupies            *)
 (* [8a + mis[X], 8a + mis[X] + 8), mis[X] in 0..7 = misalignment of X's   *)
 (* pointer. An Execs record is                                             *)
-(*   [mode |-> "EMULATE" | "DIRECT",                                       *)
+(*   [mode |-> "EMULATE" | "DIRECT" | "HWGEMM",                            *)
 (*    nul  |-> subset of {"A", "B", "C", "ws"}: null pointers,             *)
 (*    a0   |-> alpha = 0 (only the §6 null rule depends on it here),       *)
 (*    rn   |-> rounding = RN (the §3.2 kappa policy applies to RN only),   *)
@@ -858,15 +1010,21 @@ BHull(d, x, X) ==
     LET iv == Interval(d, X) IN
     IF iv[1] = iv[2] THEN <<0, 0>>
     ELSE <<8 * iv[1] + x.mis[X], 8 * iv[2] + x.mis[X]>>
-WsAddr(d, x) ==
+\* The *S forms take the sizes as arguments (sd = WsSizeDesign, si =
+\* WsSizeImpl), so a caller computes each size once (HWGEMM's HwCells
+\* rebuilds the lowering's orders; TLC does not memoize operator calls).
+WsAddrS(d, x, sd) ==
     LET a == x.wsp[1] IN
     IF a = "far" THEN FarWs
     ELSE IF x.wsp[2] = "after" THEN BHull(d, x, a)[2] + x.wsp[3]
-    ELSE BHull(d, x, a)[1] - WsSizeDesign(d, x.mode) + x.wsp[3]
-WsBytesArg(d, x) == Max(0, WsSizeDesign(d, x.mode) + x.dws)       \* ws_bytes (size_t)
+    ELSE BHull(d, x, a)[1] - sd + x.wsp[3]
+WsBytesArgS(d, x, sd) == Max(0, sd + x.dws)                      \* ws_bytes (size_t)
+WsRangeS(d, x, sd, si) == <<WsAddrS(d, x, sd), WsAddrS(d, x, sd) + si>>
+WsAddr(d, x)     == WsAddrS(d, x, WsSizeDesign(d, x.mode))
+WsBytesArg(d, x) == WsBytesArgS(d, x, WsSizeDesign(d, x.mode))
 \* [ws, ws + workspace_size): the bytes the call actually uses.
-WsRange(d, x)    == <<WsAddr(d, x), WsAddr(d, x) + WsSizeImpl(d, x.mode)>>
-WsRangeD(d, x)   == <<WsAddr(d, x), WsAddr(d, x) + WsSizeDesign(d, x.mode)>>
+WsRange(d, x)    == WsRangeS(d, x, WsSizeDesign(d, x.mode), WsSizeImpl(d, x.mode))
+WsRangeD(d, x)   == LET sd == WsSizeDesign(d, x.mode) IN WsRangeS(d, x, sd, sd)
 
 CAliasB(d, x) == \/ Intersect(BHull(d, x, "C"), BHull(d, x, "A"))
                  \/ Intersect(BHull(d, x, "C"), BHull(d, x, "B"))
@@ -878,7 +1036,8 @@ NullBad(d, x, sz) ==
     \/ "C" \in x.nul
     \/ {"A", "B"} \cap x.nul # {} /\ ~x.a0 /\ UDims(d).k # 0
     \/ "ws" \in x.nul /\ sz > 0
-MisAl(d, x)   == (\E X \in Tens : x.mis[X] # 0) \/ WsAddr(d, x) % AlignWS # 0
+MisAlS(d, x, sd) == (\E X \in Tens : x.mis[X] # 0) \/ WsAddrS(d, x, sd) % AlignWS # 0
+MisAl(d, x)   == MisAlS(d, x, WsSizeDesign(d, x.mode))
 
 -----------------------------------------------------------------------------
 (* Status: the implementation chain. Plan time (imd_plan_create, §5 rows  *)
@@ -893,7 +1052,7 @@ BaseStatus(d, x, off) ==
           ELSE IF on("COnly") /\ COnlyBig(d)                        THEN "NOT_SUPPORTED"
           ELSE IF on("CStride") /\ ~Empty(d, "C") /\ ~StrideRule(d, "C")
                                                                     THEN "INVALID_VALUE"
-          ELSE IF on("GemmLimit") /\ LimitApplies(d, x) /\ LimitExceeded(d)
+          ELSE IF on("GemmLimit") /\ LimitApplies(d, x) /\ LimitExceeded(d, x)
                                                                     THEN "INVALID_VALUE"
           ELSE "SUCCESS"
 
@@ -912,18 +1071,20 @@ StatusXP(d, x, p, off) ==
           ELSE IF pm  THEN "PACK_MISMATCH"
           ELSE IF kap THEN "NOT_SUPPORTED"
           ELSE "SUCCESS"
-        wsr == IF Drop = "WsRangeBytes" THEN <<WsAddr(d, x), WsAddr(d, x) + WsBytesArg(d, x)>>
-               ELSE WsRange(d, x)
+        si  == WsSizeImpl(d, x.mode)
+        sd  == IF HwDisp(d, x.mode) THEN si ELSE WsSizeDesign(d, x.mode)
+        wsr == IF Drop = "WsRangeBytes" THEN <<WsAddrS(d, x, sd), WsAddrS(d, x, sd) + WsBytesArgS(d, x, sd)>>
+               ELSE WsRangeS(d, x, sd, si)
         cNull  == <<on("Null") /\ CASE Drop = "NullStrict" -> x.nul # {}
                                      [] Drop = "NullWsLax"  ->
                                           NullBad(d, [x EXCEPT !.nul = @ \ {"ws"}], 0)
-                                     [] OTHER -> NullBad(d, x, WsSizeImpl(d, x.mode)),
+                                     [] OTHER -> NullBad(d, x, si),
                     "INVALID_VALUE">>
         cEmpty == <<EmptyOut(d), "SUCCESS">>
         cAlias == <<(on("Aliasing") /\ CAliasB(d, x)) \/ (on("WsAlias") /\ WsHitR(d, x, wsr)),
                     "ALIASING">>
-        cMis   == <<on("Misaligned") /\ MisAl(d, x), "MISALIGNED">>
-        cIns   == <<on("Insufficient") /\ WsBytesArg(d, x) < WsSizeImpl(d, x.mode),
+        cMis   == <<on("Misaligned") /\ MisAlS(d, x, sd), "MISALIGNED">>
+        cIns   == <<on("Insufficient") /\ WsBytesArgS(d, x, sd) < si,
                     "INSUFFICIENT_WORKSPACE">>
         chk == CASE Drop = "OrderNullEmpty"   -> <<cEmpty, cNull, cAlias, cMis, cIns>>
                  [] Drop = "OrderEmptyLast"   -> <<cNull, cAlias, cMis, cIns, cEmpty>>
@@ -983,6 +1144,10 @@ Init ==
              THEN LowerTopP(desc, xa.mode, pk) ELSE "none"
     /\ ein = IF st = "SUCCESS" /\ ExtentsConsistent(desc) THEN Einsum(desc) ELSE "none"
     /\ el  = [X \in Tens |-> Elems(desc, X)]
+    /\ wz  = IF HwDisp(desc, xa.mode)
+             THEN LET c == HwCells(desc) IN [si |-> WsSizeC(c), sd |-> WsSizeC(c), cells |-> c]
+             ELSE [si |-> WsSizeImpl(desc, xa.mode), sd |-> WsSizeDesign(desc, xa.mode),
+                   cells |-> SizedCellsX(desc, xa.mode, PRolesOf(desc, pk))]
 
 Next == UNCHANGED vars
 Spec == Init /\ [][Next]_vars
@@ -1043,7 +1208,7 @@ AccessInBounds ==
 \* The gather (or the DIRECT kernel) reads exactly the elements the einsum
 \* uses (no more, no less).
 ReadsExact ==
-    ok /\ low.kind \in {"GEMM", "DIRECT"} =>
+    ok /\ low.kind \in {"GEMM", "DIRECT", "HWGEMM"} =>
         low.readsA = ein.reads[RoleA] /\ low.readsB = ein.reads[RoleB]
 
 \* DESIGN §5 zero extents + §3.7 read rules: empty I/J/L -> no-op (nothing
@@ -1144,21 +1309,23 @@ KappaReject(d, x) ==
 \* RN acceptance. (Its condition is the key check of each packed slot; the
 \* table checks its PLACE in the precedence.)
 ReasonsP(d, x, p) ==
-    LET u == PDims(d) IN
+    LET u == PDims(d)  sd == WsSizeDesign(d, x.mode) IN
     << <<"Extents",   ~ExtentsConsistent(d),                     "INVALID_VALUE">>,
        <<"RepeatC",   RepeatedC(d),                              "NOT_SUPPORTED">>,
        <<"COnly",     COnlyBig(d),                               "NOT_SUPPORTED">>,
        <<"CStride",   ~Empty(d, "C") /\ ~StrideRule(d, "C"),     "INVALID_VALUE">>,
-       <<"GemmLimit", x.mode = "EMULATE" /\ ~EmptyOut(d) /\ u.k >= 2
-                      /\ (u.m > GemmMax \/ CeilQ(u.n) > GemmMax), "INVALID_VALUE">>,
+       <<"GemmLimit", ~EmptyOut(d) /\ u.k >= 2
+                      /\ \/ x.mode = "EMULATE" /\ (u.m > GemmMax \/ CeilQ(u.n) > GemmMax)
+                         \/ x.mode = "HWGEMM" /\ (u.m > GemmMax \/ u.n > GemmMax \/ u.k > GemmMax),
+                                                                 "INVALID_VALUE">>,
        <<"PackCheck", PackMis(d, p),                             "PACK_MISMATCH">>,
        <<"Kappa",     KappaReject(d, x),                         "NOT_SUPPORTED">>,
-       <<"Null",      NullBad(d, x, WsSizeDesign(d, x.mode)),    "INVALID_VALUE">>,
+       <<"Null",      NullBad(d, x, sd),                         "INVALID_VALUE">>,
        <<"-",         EmptyOut(d),                               "SUCCESS">>,
        <<"Aliasing",  CAliasB(d, x),                             "ALIASING">>,
-       <<"WsAlias",   WsHitR(d, x, WsRangeD(d, x)),              "ALIASING">>,
-       <<"Misaligned", MisAl(d, x),                              "MISALIGNED">>,
-       <<"Insufficient", WsBytesArg(d, x) < WsSizeDesign(d, x.mode),
+       <<"WsAlias",   WsHitR(d, x, WsRangeS(d, x, sd, sd)),      "ALIASING">>,
+       <<"Misaligned", MisAlS(d, x, sd),                         "MISALIGNED">>,
+       <<"Insufficient", WsBytesArgS(d, x, sd) < sd,
                                                        "INSUFFICIENT_WORKSPACE">> >>
 \* The status of the FIRST enabled reason that fires; SUCCESS if none.
 ExpectedStatusP(d, x, p) ==
@@ -1298,7 +1465,12 @@ UsedCells ==
            CASE kd = "NOOP"   -> 0
              [] r \in {"sA", "fA"} -> gemm(r, low.b * low.m)
              [] r \in {"sB", "fB"} -> gemm(r, low.b * low.n)
-             [] r = "vec" -> SumOver(pairs, [p \in pairs |-> Cardinality(DOMAIN low.vec[p])])
+             \* HWGEMM: K0 runs only when the scatter vectors are needed; the
+             \* FP64 gather of a packed operand fills its whole buffer.
+             [] r = "vec" -> IF kd = "HWGEMM" /\ ~low.hw.needVec THEN 0
+                             ELSE SumOver(pairs, [p \in pairs |-> Cardinality(DOMAIN low.vec[p])])
+             [] r = "PA"  -> IF kd = "HWGEMM" /\ ~low.hw.A.aff THEN Cardinality(DOMAIN low.bufA) ELSE 0
+             [] r = "PB"  -> IF kd = "HWGEMM" /\ ~low.hw.B.aff THEN Cardinality(DOMAIN low.hwB) ELSE 0
              [] r = "RA"  -> gemm(r, Cardinality(DOMAIN low.bufA))
              [] r = "RB"  -> gemm(r, Cardinality(DOMAIN low.bufB))
              [] r = "W"   -> gemm(r, low.b * low.m * low.nh)]
@@ -1314,18 +1486,20 @@ DispatchByDescriptor ==
 \* §4a "workspace_size" covers every element the call uses, region by
 \* region (a region overrun corrupts the next region or runs past the end).
 WorkspaceFits ==
-    ok => \A r \in RegNames : UsedCells[r] <= SizedCellsP(SDims(desc), xa.mode, PRolesOf(desc, pk))[r]
+    ok => \A r \in RegNames : UsedCells[r] <= wz.cells[r]
 
 \* §4a is EXACT: each region is exactly what is used (and so, with the
 \* swap, §4a's m and n are the post-swap ones; D1 §6b.6: a packed role's
 \* sX, fX, RX are 0, on the post-swap role).
 WorkspaceExact ==
-    ok => UsedCells = SizedCellsP(SDims(desc), xa.mode, PRolesOf(desc, pk))
+    ok => UsedCells = wz.cells
 
 \* §4 launch limits / §5 row 5: every CUTLASS GEMM that is launched has
 \* m <= GemmMax and nh <= GemmMax (GemmCoord is int).
+\* HWGEMM (NOTES-HWGEMM §4.2 "Limits"): m, n and k <= GemmMax.
 GemmDimsFit ==
-    ok /\ low.kind = "GEMM" => low.m <= GemmMax /\ low.nh <= GemmMax
+    /\ ok /\ low.kind = "GEMM" => low.m <= GemmMax /\ low.nh <= GemmMax
+    /\ ok /\ low.kind = "HWGEMM" => low.m <= GemmMax /\ low.n <= GemmMax /\ low.k <= GemmMax
 
 \* §5 row 5 scope: a call that runs no CUTLASS GEMM (DIRECT mode, an empty
 \* output, k = 0, or K-empty with k = 1) is never rejected because of the
@@ -1348,8 +1522,38 @@ KappaAccepted ==
 \* N, T >= 180, so there it is implied by kappa < T; the model uses T = 1
 \* to show the clause is still the right one (no GEMM runs at k = 1).
 KappaScope ==
-    (xa.mode = "DIRECT" \/ EmptyOut(desc) \/ PDims(desc).k < 2 \/ ~xa.rn) =>
+    (xa.mode \in {"DIRECT", "HWGEMM"} \/ EmptyOut(desc) \/ PDims(desc).k < 2 \/ ~xa.rn) =>
         st = StatusXP(desc, xa, pk, {Drop, "Kappa"})
+
+-----------------------------------------------------------------------------
+(* IMD_HWGEMM (NOTES-HWGEMM §4.2): in-place operands, affine C.            *)
+
+\* For every tensor the plan declares affine (an operand read in place, a C
+\* stored through its layout), the CUTLASS address base + bat(λ) +
+\* layout(row, col) reproduces the lowering's off_X(λ, row, col) on the
+\* whole box (rows, and K positions h < k, never the padding). With
+\* EinsumPreserved, ReadsExact and ScatterExactlyOnce / ScatterCoversC
+\* (which also run on HWGEMM) this is "the in-place path computes the
+\* einsum".
+InPlaceExact ==
+    ok /\ low.kind = "HWGEMM" => \A X \in Tens : low.hw[X].aff => low.inExact[X]
+
+\* The layout's implicit unit stride IS the tensor's: ROW's second group
+\* (COL's first) is empty or one fused mode of stride exactly +1.
+InPlaceUnitStride ==
+    ok /\ low.kind = "HWGEMM" =>
+        \A X \in Tens : low.hw[X].aff =>
+            LET u == IF low.hw[X].lay = "ROW" THEN low.hw[X].fk ELSE low.hw[X].fr
+            IN  u = <<>> \/ (Len(u) = 1 /\ u[1][2] = 1)
+
+\* NOTES-HWGEMM §4.2 "Fully affine A, B and C ... workspace 0".
+HwAffineNoWs ==
+    (ok /\ low.kind = "HWGEMM" /\ ~low.hw.needVec) => wz.sd = 0
+
+\* Expected to FAIL (witness model): an accepted HWGEMM call with one
+\* operand in place and the other packed is enumerated.
+HwGemmNotMixed ==
+    ~(ok /\ low.kind = "HWGEMM" /\ low.hw.A.aff # low.hw.B.aff)
 
 -----------------------------------------------------------------------------
 (* imd_contract execute-time checks (DESIGN §5 rows 6-7, §6).             *)
@@ -1361,8 +1565,8 @@ KappaScope ==
 NoNullDeref ==
     ok /\ low.kind # "NOOP" =>
         /\ "C" \notin xa.nul
-        /\ WsSizeImpl(desc, xa.mode) > 0 => "ws" \notin xa.nul
-        /\ low.kind \in {"GEMM", "DIRECT"} /\ ~xa.a0 => {"A", "B"} \cap xa.nul = {}
+        /\ wz.si > 0 => "ws" \notin xa.nul
+        /\ low.kind \in {"GEMM", "DIRECT", "HWGEMM"} /\ ~xa.a0 => {"A", "B"} \cap xa.nul = {}
 
 \* §4 / §5 row 6: the workspace bytes the call uses, [ws, ws +
 \* workspace_size), share no byte with any element of A, B or C (the GEMM
@@ -1370,25 +1574,25 @@ NoNullDeref ==
 ElemBytesHit(x, X, a, r) == LET lo == 8 * a + x.mis[X] IN lo < r[2] /\ r[1] < lo + 8
 WsNoAlias ==
     ok /\ low.kind # "NOOP" =>
-        LET r == WsRangeD(desc, xa) IN
+        LET r == WsRangeS(desc, xa, wz.sd, wz.sd) IN
         \A X \in Tens : \A a \in el[X] : ~ElemBytesHit(xa, X, a, r)
 
 \* §5 row 6 soundness: ALIASING is reported only when C's byte hull meets
 \* A's or B's, or [ws, ws + workspace_size) meets a byte hull (the tests
 \* are conservative hull tests, never "more" than that).
 AliasingSound ==
-    st = "ALIASING" => CAliasB(desc, xa) \/ WsHitR(desc, xa, WsRangeD(desc, xa))
+    st = "ALIASING" => CAliasB(desc, xa) \/ WsHitR(desc, xa, WsRangeS(desc, xa, wz.sd, wz.sd))
 
 \* §5 row 7: an accepted call that touches memory sees 8-byte aligned A,
 \* B, C and an AlignWS-aligned workspace (so every region offset of §4a,
 \* a multiple of AlignWS, is aligned in absolute terms).
 AlignedAccess ==
     ok /\ low.kind # "NOOP" =>
-        (\A X \in Tens : xa.mis[X] = 0) /\ WsAddr(desc, xa) % AlignWS = 0
+        (\A X \in Tens : xa.mis[X] = 0) /\ WsAddrS(desc, xa, wz.sd) % AlignWS = 0
 
 \* §6 5: an accepted call has ws_bytes >= workspace_size (DESIGN §4a).
 WsSufficient ==
-    ok => WsBytesArg(desc, xa) >= WsSizeDesign(desc, xa.mode)
+    ok => WsBytesArgS(desc, xa, wz.sd) >= wz.sd
 
 -----------------------------------------------------------------------------
 (* D1 packed operands (DESIGN §6b.2, §6b.5): the adopted lowering and the  *)
@@ -1512,16 +1716,22 @@ ASSUME Drop \in {"none", "Extents", "RepeatC", "COnly", "CStride", "Aliasing",
                  \* D1
                  "PackFuseDefault", "KeyNoStrides", "KeyFuseCarriers", "PackNoAdopt",
                  "PackNoAdoptLower", "PackAfterKappa", "PackBStrideNh", "PackNoTail",
-                 "PackPartnerOnly", "PackOrderCheck"}
+                 "PackPartnerOnly", "PackOrderCheck",
+                 \* IMD_HWGEMM
+                 "AffineNoUnit", "AffineMultiMode", "HwGemmKappa", "HwGemmLimitNoK",
+                 "HwGemmWsPadN"}
 ASSUME Packing \in {"none", "A", "B", "AB"} /\ PackEnum \in {"plan", "classes", "strides", "all"}
 \* imd_contract_packed's execute-time checks are not modelled here: a packed
 \* model uses default execute arguments (workspace far away and large enough).
+\* HWGEMM with int8 packs (accepted and ignored, as DIRECT) is not
+\* enumerated: whether a HWGEMM plan adopts the pack's orders is open
+\* (see HwCells: sizing assumes it does not).
 ASSUME Packing # "none" =>
-          \A x \in Execs : x.nul = {} /\ x.wsp[1] = "far" /\ x.dws >= 0
+          \A x \in Execs : x.mode # "HWGEMM" /\ x.nul = {} /\ x.wsp[1] = "far" /\ x.dws >= 0
                            /\ x.mis = [X \in Tens |-> 0]
 ASSUME GemmMax >= 1 /\ AlignWS >= 8 /\ AlignWS % 8 = 0
 ASSUME \A x \in Execs :
-          /\ x.mode \in {"EMULATE", "DIRECT"}
+          /\ x.mode \in {"EMULATE", "DIRECT", "HWGEMM"}
           /\ x.nul \subseteq {"A", "B", "C", "ws"} /\ x.a0 \in BOOLEAN
           /\ x.rn \in BOOLEAN /\ x.tn \in Nat /\ x.tn >= 1
           /\ x.mis \in [Tens -> 0..7]
