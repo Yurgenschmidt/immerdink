@@ -94,7 +94,7 @@ static void run_mma(int sms) {
   CK(cudaMemset(in, 0, 64 * sizeof(double)));
   const int iters = 4096;
   for (int kind = 0; kind < 4; ++kind) {
-    for (int warps = 4; warps <= 16; warps *= 2) {   // warps per block, 1 block per SM x 4
+    for (int warps = 4; warps <= 8; warps *= 2) {    // warps per block (16 warps x 44+ FP64 registers exceeds the register file)
       int blocks = sms * 4, threads = 32 * warps;
       auto f = [&] {
         switch (kind) {
