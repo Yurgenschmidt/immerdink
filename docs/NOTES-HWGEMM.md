@@ -75,6 +75,13 @@ Native FP64 is **not** correctly rounded, unlike the emulated path (DESIGN §3.7
   split-K and the `store_out` epilogue gives **exactly DIRECT's bits** (`native_dot`,
   `src/contract.cu`). The first kernel test is a bit compare against DIRECT. If it holds, the
   non-finite caveat below disappears for unslabbed calls.
+  **Confirmed on sm_89 (RTX 4090, 2026-11-17; `bench/hwgemm_bitid.cu`):** every `mma.sync`
+  m8n8k4 f64 result equals the ascending fma chain from +0 on uniform, wide-exponent,
+  cancelling, subnormal-product and signed-zero inputs (no flush to zero). The test
+  discriminates: the reversed-order and one-rounding-per-instruction models mismatch on
+  1–74 % of outputs. CUTLASS's Sm80 8×8×4 `device::Gemm` (64×64×16, 3 stages, TN and NN, k up
+  to 4097 with a partial last K tile) is bit-identical to DIRECT's chain on every output.
+  sm_90 (m16n8k4 in the Sm90 kernel) is checked by the same program in the PACE gate.
 - **Reproducibility.** Bit-identical run to run for the same plan, `k_slab`, tile configuration
   and binary. Slabbed results are deterministic for a fixed `k_slab` but differ from unslabbed
   ones. No split-K of any kind by default (CUTLASS's serial split-K is deterministic but breaks

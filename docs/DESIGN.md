@@ -5917,9 +5917,10 @@ ResultExact, NoBadStep, SlabsPartition]**
   error; the β·C₀ term is rounded S times and α is applied S times; the absolute term covers
   subnormal slab products.
 - Reproducible bit for bit for the same plan, `k_slab`, tile configuration and binary; no
-  split-K. Hypothesis to test first: an unslabbed HWGEMM tile (accumulator from +0, ascending K,
-  no sliced-K) equals DIRECT bit for bit, if DMMA is a sequential IEEE fma chain
-  (Khattak–Mikaitis, arXiv:2512.07004).
+  split-K. An unslabbed HWGEMM tile (accumulator from +0, ascending K, no sliced-K) equals DIRECT
+  bit for bit if DMMA is a sequential IEEE fma chain (Khattak–Mikaitis, arXiv:2512.07004):
+  confirmed on sm_89 for the instruction and the CUTLASS Sm80 kernel (`bench/hwgemm_bitid.cu`,
+  NOTES-HWGEMM §3); sm_90 pending.
 - Non-finite values propagate per IEEE (tests compare NaN-ness); subnormals: a per-card test
   per DMMA instruction used.
 
