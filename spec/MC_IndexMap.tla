@@ -180,6 +180,29 @@
 (*  neg_pack_after_kappa                             StatusCorrect         *)
 (*  neg_pack_b_stride                                EinsumPreserved       *)
 (*  neg_pack_no_tail                                 PackNoOOB             *)
+(*                                                                         *)
+(* IMD_HWGEMM (docs/NOTES-HWGEMM §4.2; coverage CovN "hw*", Execs with    *)
+(* mode "HWGEMM"). Each positive model reruns an EMULATE model's space in *)
+(* HWGEMM mode with every claim plus InPlaceExact, InPlaceUnitStride,     *)
+(* HwAffineNoWs:                                                           *)
+(*  pos_hwgemm_fusion   strides -2..2: in place / packed per operand      *)
+(*                  (negative, zero, no unit stride, two modes over one   *)
+(*                  operand), broadcast and negative batch strides.        *)
+(*  pos_hwgemm_w4   the same space (B rank 1) with HwElemBytes = 4.       *)
+(*  pos_hwgemm_extents  NOOP / SCALE / DIRECT in HWGEMM mode, a two-mode  *)
+(*                  batch through vec.                                     *)
+(*  pos_hwgemm_ext3     extents {2,3}: k̂ padding of the pack, ld 0 / 3, an *)
+(*                  operand affine over its own strides only.              *)
+(*  pos_hwgemm_swap / _cstride   swapped lowerings; C stored through its  *)
+(*                  layout or through off_C.                               *)
+(*  pos_hwgemm_limit    row 5: n = 3 accepted at GemmMax = 3 (no n̂), k = 3 *)
+(*                  ON, k = 4 rejected, DIRECT exempt.                     *)
+(*  pos_hwgemm_kappa    kappa exempt in HWGEMM.                           *)
+(*  pos_hwgemm_contract §6 checks; workspace 0 lets a null ws through.    *)
+(*  neg_hwgemm_affine_nounit / _multimode   InPlaceExact                  *)
+(*  neg_hwgemm_kappa    KappaScope;  neg_hwgemm_limit_nok  GemmDimsFit    *)
+(*  neg_hwgemm_ws_pad_n WorkspaceExact (PadQ = 4)                         *)
+(*  neg_hwgemm_witness_mixed  HwGemmNotMixed: a mixed call is reachable.   *)
 (***************************************************************************)
 EXTENDS IndexMap
 
@@ -240,6 +263,15 @@ ExOrder   == {Ex("EMULATE", nl, ms, wp, dw) :
 ExK(md, r, t) == [XDef EXCEPT !.mode = md, !.rn = r, !.tn = t]
 ExKappa   == {ExK("EMULATE", TRUE, t) : t \in 1..3}
              \cup {ExK("DIRECT", TRUE, 1), ExK("EMULATE", FALSE, 1)}
+\* IMD_HWGEMM (NOTES-HWGEMM §4): mode HWGEMM alone, the three modes, the
+\* kappa set plus HWGEMM+RN at T = 1 (exempt), the §6 order set in HWGEMM.
+XHwGemm   == [XDef EXCEPT !.mode = "HWGEMM"]
+XHwSet   == {XHwGemm}
+ExModes3  == {XDef, XDirect, XHwGemm}
+ExKappaN  == ExKappa \cup {ExK("HWGEMM", TRUE, 1)}
+\* A 4-byte element type for HWGEMM's pack regions (NOTES-HWGEMM §4.6, FP32).
+HwW4      == 4
+ExOrderN  == {[x EXCEPT !.mode = "HWGEMM"] : x \in ExOrder}
 
 -----------------------------------------------------------------------------
 (* Boundary sentinels (constant-level; TLC evaluates them as ASSUMEs).     *)
@@ -554,10 +586,76 @@ CovX == [
   nullalias |-> <<DDot(1), XE({"C"}, Mis0, <<"far", "after", 0>>, 0), "INVALID_VALUE">>,
   ordok    |-> <<DDot(5), XE({}, Mis0, <<"far", "after", 0>>, 0), "SUCCESS">>
 ]
+\* IMD_HWGEMM coverage (NOTES-HWGEMM §4.2): <<descriptor, Execs record,
+\* status, <<A in place, B in place, C affine, needVec>>>> in POST-swap
+\* roles; the last part is checked only when the call is accepted.
+WDotN   == D(T(0, <<1, 2>>, <<2, 2>>, <<1, 2>>), T(0, <<1, 2>>, <<2, 2>>, <<1, 2>>), Scalar(100))
+WMix    == D(T(0, <<1, 2>>, <<2, 2>>, <<-1, 2>>), T(0, <<2>>, <<2>>, <<1>>), T(100, <<1>>, <<2>>, <<1>>))
+WNoUnit == D(T(0, <<1, 2>>, <<2, 2>>, <<2, 0>>), T(0, <<2>>, <<2>>, <<1>>), T(100, <<1>>, <<2>>, <<1>>))
+WMulti  == D(T(0, <<1, 2>>, <<2, 2>>, <<1, 1>>), T(0, <<1, 2>>, <<2, 2>>, <<1, 2>>), Scalar(100))
+WBcast  == D(T(0, <<1, 2>>, <<2, 2>>, <<0, 1>>), T(0, <<1, 2>>, <<2, 2>>, <<-2, 1>>),
+             T(100, <<1>>, <<2>>, <<1>>))
+WBat2   == D(T(0, <<1, 2, 3>>, <<2, 2, 2>>, <<1, 2, 4>>), T(0, <<1, 2, 3>>, <<2, 2, 2>>, <<1, 2, 4>>),
+             T(100, <<1, 3>>, <<2, 2>>, <<1, 2>>))
+WPerOp  == D(T(0, <<1, 2>>, <<3, 2>>, <<1, 3>>), T(0, <<1>>, <<3>>, <<1>>), Scalar(50))
+WCNeg   == D(T(0, <<1, 2>>, <<2, 2>>, <<1, 2>>), T(0, <<2>>, <<2>>, <<1>>), T(50, <<1>>, <<2>>, <<-1>>))
+CovN == [
+  \* dot, A and B dense: one fused K mode each, all affine, workspace 0.
+  hwdot    |-> <<WDotN, XHwGemm, "SUCCESS", <<TRUE, TRUE, TRUE, FALSE>>>>,
+  \* C[1] = sum_2 A[1,2] B[2], A strides (-1, 2): swapped (C's fastest mode
+  \* is I); post-swap A = the caller's B (in place), post-swap B = the
+  \* caller's A (negative stride: packed). One in place, one packed.
+  hwmix    |-> <<WMix, XHwGemm, "SUCCESS", <<TRUE, FALSE, TRUE, TRUE>>>>,
+  \* the same with A strides (2, 0): no unit stride -> packed.
+  hwnounit |-> <<WNoUnit, XHwGemm, "SUCCESS", <<TRUE, FALSE, TRUE, TRUE>>>>,
+  \* dot with A strides (1, 1): two K modes over A (1 # 1*2) -> packed;
+  \* B (1, 2) fuses to one mode -> in place.
+  hwmulti  |-> <<WMulti, XHwGemm, "SUCCESS", <<FALSE, TRUE, TRUE, TRUE>>>>,
+  \* batch label 1 with stride 0 in A (broadcast) and -2 in B: one fused L
+  \* mode, per-tensor batch strides 0 and -2: all affine, workspace 0.
+  hwbcast  |-> <<WBcast, XHwGemm, "SUCCESS", <<TRUE, TRUE, TRUE, FALSE>>>>,
+  \* two L labels (1, 3) that do not fuse in A, B (strides 1, 4): per-λ
+  \* offsets from vec; operands and C affine.
+  hwbat2   |-> <<WBat2, XHwGemm, "SUCCESS", <<TRUE, TRUE, TRUE, TRUE>>>>,
+  \* extent 3 (ext3rule, swapped): A' = B[3] with the post-swap B-only K
+  \* label (stride 0: COL, ld 0), B' COL ld 3, C ROW ld 3; k = 3, k̂ = 4.
+  hw3      |-> <<Cov.ext3rule, XHwGemm, "SUCCESS", <<TRUE, TRUE, TRUE, FALSE>>>>,
+  \* extent 3, K = {1 (e 3, A and B), 2 (e 2, A only)}: A's modes fuse over A
+  \* alone ((3,1),(2,3) -> (6,1): in place) but not over all carriers (B
+  \* has stride 0 for label 2); B = (3,1),(2,0): two modes -> packed, k = 6.
+  hw3perop |-> <<WPerOp, XHwGemm, "SUCCESS", <<TRUE, FALSE, TRUE, TRUE>>>>,
+  \* role swap at extent 3 (swap3): all affine.
+  hwswap3  |-> <<Cov.swap3, XHwGemm, "SUCCESS", <<TRUE, TRUE, TRUE, FALSE>>>>,
+  \* C stride -1 (swapped): C stored through off_C, operands in place.
+  hwcneg   |-> <<WCNeg, XHwGemm, "SUCCESS", <<TRUE, TRUE, FALSE, TRUE>>>>,
+  \* row 5 for HWGEMM, GemmMax = 3 (pos_native_limit): n = 3 accepted (no
+  \* n̂ = 4 as in EMULATE), the swapped one too; k = 3 ON, k = 4 rejected;
+  \* DIRECT exempt.
+  hwlimn3  |-> <<DLn3, XHwGemm, "SUCCESS", <<TRUE, TRUE, TRUE, FALSE>>>>,
+  hwlimsw  |-> <<DLswap, XHwGemm, "SUCCESS", <<TRUE, TRUE, TRUE, FALSE>>>>,
+  hwlimk3  |-> <<DK1(3), XHwGemm, "SUCCESS", <<TRUE, TRUE, TRUE, FALSE>>>>,
+  hwlimk4  |-> <<DK2(2, 2), XHwGemm, "INVALID_VALUE", <<>>>>,
+  hwlimk4d |-> <<DK2(2, 2), XDirect, "SUCCESS", <<>>>>,
+  \* kappa: HWGEMM + RN with kappa(6) = 3 >= T = 1 is exempt.
+  hwkap    |-> <<DK2(2, 3), ExK("HWGEMM", TRUE, 1), "SUCCESS", <<TRUE, TRUE, TRUE, FALSE>>>>,
+  \* §6 null rule: a fully affine dot has workspace_size 0, so a null ws is
+  \* accepted (EMULATE: INVALID_VALUE, nullws); a null A is not.
+  hwnullws |-> <<DDot(5), [XHwGemm EXCEPT !.nul = {"ws"}], "SUCCESS", <<TRUE, TRUE, TRUE, FALSE>>>>,
+  hwnullA  |-> <<DDot(5), [XHwGemm EXCEPT !.nul = {"A"}], "INVALID_VALUE", <<>>>>
+]
 \* D1 witnesses (see the end of this module).
 PkCovNames == {"pk_dot", "pk_tr", "pk_kappa", "pk_rb", "pk_order", "pk_cls", "pk_po0",
                "pk_conly0"}
-ASSUME MustCover \subseteq DOMAIN Cov \cup DOMAIN CovX \cup PkCovNames
+ASSUME MustCover \subseteq DOMAIN Cov \cup DOMAIN CovX \cup DOMAIN CovN \cup PkCovNames
+ASSUME \A c \in MustCover \cap DOMAIN CovN :
+          LET d == CovN[c][1]  x == CovN[c][2]  L == LowerTop(d, x.mode) IN
+          /\ InSpace(d) /\ x \in Execs
+          /\ FullStatus(d, x) = CovN[c][3] /\ ExpectedStatus(d, x) = CovN[c][3]
+          /\ CovN[c][3] = "SUCCESS" /\ x.mode = "HWGEMM" =>
+               /\ L.kind = "HWGEMM"
+               /\ <<L.hw.A.aff, L.hw.B.aff, L.hw.C.aff, L.hw.needVec>> = CovN[c][4]
+               /\ L.contrib = (IF L.swap THEN SwapTriples(Einsum(d).bag) ELSE Einsum(d).bag)
+               /\ ~L.hw.needVec => WsSizeDesign(d, x.mode) = 0
 \* The null-ws boundary: an empty output needs no workspace, a dot does.
 ASSUME WsSizeDesign(DEmpty, "EMULATE") = 0 /\ WsSizeDesign(DDot(5), "EMULATE") > 0
 ASSUME \A c \in MustCover \cap DOMAIN Cov : InSpace(Cov[c]) /\ Status(Cov[c]) = "SUCCESS"
@@ -758,4 +856,34 @@ ASSUME "pk_order" \in MustCover =>
          /\ StP(WD12, PkAB(PFwd, PBRev)) = "PACK_MISMATCH"
          /\ OkP(WD12, PkAB(PFwd, PBFwd))
          /\ OkP(WD12, PkAB(PRev, PBRev))
+
+\* The packed-operand width reaches the byte size: WMix (post-swap B
+\* packed, b = 1, n = 2, k = k̂ = 2 at PadQ = 2 -> 4 cells) needs vec (13
+\* scatter-vector cells: 104 bytes, 112 aligned) plus PB = 4 * HwElemBytes.
+ASSUME "hwmix" \in MustCover /\ PadQ = 2 /\ AlignWS = 16 =>
+         WsSizeDesign(WMix, "HWGEMM") = 112 + AlignUp(4 * HwElemBytes)
+
+-----------------------------------------------------------------------------
+(* IMD_HWGEMM negative models: each Drop's failure pinned to its witness   *)
+(* (CovN gives the design's handling of the same descriptor).              *)
+
+\* "AffineNoUnit": WNoUnit's post-swap B (rows stride 2, K stride 0) is
+\* declared in place as ROW with ld 2 (2 > 0: K assumed unit): the kernel
+\* reads 2j + h instead of 2j.
+ASSUME Drop = "AffineNoUnit" =>
+         LET L == LowerTop(WNoUnit, "HWGEMM") IN
+         FullStatus(WNoUnit, XHwGemm) = "SUCCESS" /\ L.hw.B.aff /\ ~L.inExact["B"]
+\* "AffineMultiMode": WMulti's A (K modes (2,1), (2,1)) taken as one mode of
+\* stride 1: h = 2 (k1 = 0, k2 = 1) read at 2 instead of 1.
+ASSUME Drop = "AffineMultiMode" =>
+         LET L == LowerTop(WMulti, "HWGEMM") IN
+         FullStatus(WMulti, XHwGemm) = "SUCCESS" /\ L.hw.A.aff /\ ~L.inExact["A"]
+\* "HwGemmWsPadN" (model with PadQ = 4): WMix's packed post-swap B has n = 2
+\* rows, sized as n̂ = 4.
+ASSUME Drop = "HwGemmWsPadN" =>
+         HwCells(WMix)["PB"] # Cardinality(DOMAIN LowerTop(WMix, "HWGEMM").hwB)
+\* "HwGemmLimitNoK" (model with GemmMax = 3): a k = 4 HWGEMM GEMM accepted.
+ASSUME Drop = "HwGemmLimitNoK" => FullStatus(DK2(2, 2), XHwGemm) = "SUCCESS"
+\* "HwGemmKappa": HWGEMM + RN with kappa(6) = 3 >= T = 1 rejected.
+ASSUME Drop = "HwGemmKappa" => FullStatus(DK2(2, 3), ExK("HWGEMM", TRUE, 1)) = "NOT_SUPPORTED"
 =============================================================================
