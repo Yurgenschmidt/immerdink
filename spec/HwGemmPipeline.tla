@@ -18,8 +18,17 @@
 (*                  slab >0: beta = 1 (C read, the earlier slabs kept)     *)
 (*                  alpha is applied to the slab's own sum, every slab.    *)
 (* K0 (the scatter-vector kernel) runs first iff some kernel needs the     *)
-(* vectors (a packed operand's gather or a scattered C store) and they are *)
-(* not plan-resident (IMD_VEC_RESIDENT).                                   *)
+(* vectors (a packed operand's gather, a scattered C store, or the GEMM's  *)
+(* per-lambda base offsets of a multi-mode batch) and they are not         *)
+(* plan-resident (IMD_VEC_RESIDENT).                                       *)
+(*                                                                         *)
+(* K tail (stage 2, DESIGN §6i.4): when BOTH operands are packed, each     *)
+(* slab's packs also write the pad cells of their buffer (A: -0, B: +0;    *)
+(* positions len..RoundQ(len)-1 of the slab) and the GEMM runs on the      *)
+(* padded length, reading the pads too (exact: x + (-0) = x). Otherwise    *)
+(* the GEMM runs on the slab's true length and reads no pad. Pads are      *)
+(* tagged <<s, Pad>>: written by slab s's own pack (the buffer is reused,  *)
+(* so a stale pad of an earlier slab is real data of that slab).           *)
 (*                                                                         *)
 (* Rows and columns are independent, so ONE row of A, ONE column of B and  *)
 (* ONE output element stand for all (as in Pipeline's tags). Values are    *)
@@ -54,6 +63,7 @@ CONSTANTS K,        \* contracted length (positions 0..K-1)
           Q,        \* GEMM K tile: the pack buffer width is L rounded up to Q
           PkA, PkB, \* operand packed (TRUE) or read in place (FALSE)
           CScatter, \* C stored through its scatter vectors (not affine)
+          MultiBat, \* the batch has several modes: the GEMM reads per-lambda offsets from the vectors
           VecRes,   \* IMD_VEC_RESIDENT: the vectors are in plan memory, no K0
           Beta0,    \* the caller's beta is 0
           AlignWS,  \* workspace region alignment (bytes; real 256)
@@ -61,7 +71,7 @@ CONSTANTS K,        \* contracted length (positions 0..K-1)
           Mut       \* "none" or the name of a mutant
 
 ASSUME K \in 1..4 /\ L \in 1..4 /\ Q \in 1..4 /\ AlignWS \in 1..64 /\ VecBytes \in 1..64
-ASSUME PkA \in BOOLEAN /\ PkB \in BOOLEAN /\ CScatter \in BOOLEAN
+ASSUME PkA \in BOOLEAN /\ PkB \in BOOLEAN /\ CScatter \in BOOLEAN /\ MultiBat \in BOOLEAN
 ASSUME VecRes \in BOOLEAN /\ Beta0 \in BOOLEAN
 
 Ops   == {"A", "B"}
@@ -75,8 +85,17 @@ End(s)   == IF Mut = "slab_last_full" THEN Start(s) + L
 SlabPos(s) == Start(s)..(End(s) - 1)
 Lhat  == ((L + Q - 1) \div Q) * Q                 \* pack buffer cells per row
 Junk  == <<-1, -1>>
+Pad   == -2                                       \* second component of a pad tag <<s, Pad>>
+RoundQ(x) == ((x + Q - 1) \div Q) * Q
+SLen(s) == End(s) - Start(s)                     \* true length of slab s
+\* the GEMM runs on the padded length (and so the packs write pads) iff both operands are packed
+PadOn  == (PkA /\ PkB) \/ Mut = "khat_with_inplace"
+PadCells(s) == IF PadOn THEN SLen(s)..(RoundQ(SLen(s)) - 1) ELSE {}
+\* the cells a pack launch of slab s writes as pads
+PackPads(s) == IF Mut = "pads_not_written" \/ (Mut = "pad_last_slab_stale" /\ s > 0) THEN {}
+               ELSE IF PkA /\ PkB THEN PadCells(s) ELSE {}
 
-NeedVec == (PkA \/ PkB \/ CScatter)
+NeedVec == (PkA \/ PkB \/ CScatter \/ (MultiBat /\ Mut # "needvec_no_multibat"))
 
 \* ------------------------------------------------------------ launches --
 \* A launch: [kind, slab, op, st (stream)]. The design: one stream.
@@ -143,8 +162,9 @@ vars == <<vec, buf, todo, rd, c, cInit, bad>>
 StepsOf(i) ==
     LET l == Launches[i] IN
     CASE l.kind = "k0"   -> {<<"v", 0>>}
-      [] l.kind = "pack" -> {<<"w", h>> : h \in SlabPos(l.slab)}
-      [] l.kind = "gemm" -> {<<"r", h>> : h \in SlabPos(l.slab)} \cup {<<"e", 0>>}
+      [] l.kind = "pack" -> {<<"w", h>> : h \in SlabPos(l.slab)} \cup {<<"p", q>> : q \in PackPads(l.slab)}
+      [] l.kind = "gemm" -> {<<"r", h>> : h \in SlabPos(l.slab)} \cup {<<"z", q>> : q \in PadCells(l.slab)}
+                            \cup {<<"e", 0>>}
 
 Init ==
   /\ vec = VecRes
@@ -177,6 +197,28 @@ PackStep(i, h) ==
   /\ todo' = [todo EXCEPT ![i] = @ \ {<<"w", h>>}]
   /\ UNCHANGED <<vec, rd, c, cInit>>
 
+\* a pack writes pad cell q of its buffer (tag <<slab, Pad>>)
+PadStep(i, q) ==
+  LET l == Launches[i]  addr == Off(l.op) + 8 * q IN
+  /\ l.kind = "pack" /\ <<"p", q>> \in todo[i]
+  /\ buf' = [buf EXCEPT ![l.op] = IF q \in DOMAIN @ THEN [@ EXCEPT ![q] = <<l.slab, Pad>>] ELSE @]
+  /\ bad' = bad \cup (IF addr < Off(l.op) \/ addr + 8 > Off(l.op) + PkSz(l.op) \/ q \notin DOMAIN buf[l.op]
+                      THEN {"pack_outside_region"} ELSE {})
+  /\ todo' = [todo EXCEPT ![i] = @ \ {<<"p", q>>}]
+  /\ UNCHANGED <<vec, rd, c, cInit>>
+
+\* a GEMM on the padded length reads pad cell q of both operands: each must be a packed
+\* buffer holding this slab's pad (an in-place operand has no cell there: it would read past k)
+PadRead(i, q) ==
+  LET l == Launches[i] IN
+  /\ l.kind = "gemm" /\ <<"z", q>> \in todo[i]
+  /\ bad' = bad \cup (IF \E x \in Ops : ~Pk(x) THEN {"inplace_read_past_k"} ELSE {})
+                \cup (IF \E x \in Ops : Pk(x) /\ (q \notin DOMAIN buf[x] \/ buf[x][q] # <<l.slab, Pad>>)
+                      THEN {"stale_pad"} ELSE {})
+                \cup (IF MultiBat /\ ~vec THEN {"gemm_reads_junk_vec"} ELSE {})
+  /\ todo' = [todo EXCEPT ![i] = @ \ {<<"z", q>>}]
+  /\ UNCHANGED <<vec, buf, rd, c, cInit>>
+
 \* a GEMM reads position h of both operands: from the buffer (must hold <<s, h>>) or in place
 OkRead(x, s, h) == ~Pk(x) \/ (h - Start(s) \in DOMAIN buf[x] /\ buf[x][h - Start(s)] = <<s, h>>)
 ReadStep(i, h) ==
@@ -185,6 +227,7 @@ ReadStep(i, h) ==
   /\ rd' = [rd EXCEPT ![i] = @ \cup {h}]
   /\ bad' = bad \cup (IF \A x \in Ops : OkRead(x, l.slab, h) THEN {} ELSE {"stale_read"})
                 \cup (IF h >= K THEN {"read_past_k"} ELSE {})
+                \cup (IF MultiBat /\ ~vec THEN {"gemm_reads_junk_vec"} ELSE {})
   /\ todo' = [todo EXCEPT ![i] = @ \ {<<"r", h>>}]
   /\ UNCHANGED <<vec, buf, c, cInit>>
 
@@ -212,6 +255,7 @@ Next ==
   \/ \E i \in LIdx : MayRun(i) /\
        \/ K0Step(i)
        \/ \E h \in 0..(K + L) : PackStep(i, h) \/ ReadStep(i, h)
+       \/ \E q \in 0..(RoundQ(L) - 1) : PadStep(i, q) \/ PadRead(i, q)
        \/ Epi(i)
   \/ Done /\ UNCHANGED vars
 

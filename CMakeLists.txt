@@ -194,7 +194,8 @@ message(STATUS "Hopper wgmma K4 backend: ${IMD_K4_WGMMA_ENABLED} (IMMERDINK_K4_W
 # one file per architecture family (src/hwgemm/).
 add_library(immerdink SHARED src/api.cpp src/device_state.cpp src/contract.cu src/gemm_k4.cu
   src/k4/k4_cfg0.cu src/k4/k4_cfg1.cu src/k4/k4_cfg2.cu src/k4/k4_cfg3.cu
-  src/hwgemm.cu src/hwgemm/hw_sm80.cu src/hwgemm/hw_sm90.cu)
+  src/hwgemm.cu src/hwgemm/hw_sm80.cu src/hwgemm/hw_sm90.cu
+  src/hwgemm/hw_own_sm80.cu src/hwgemm/hw_own_sm90.cu)
 if(IMD_K4_WGMMA_ENABLED)
   # The wgmma instructions exist in sm_90a code only (not in "90"): the kernels are compiled for 90a-real in an object library of
   # their own and linked into libimmerdink, whatever architectures the rest is built for. On any other device the image is simply

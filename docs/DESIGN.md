@@ -5875,7 +5875,7 @@ calibration, which is per card (issue 23); for a borrowed table set the plan is 
 **6h.6 Limits.** At most `IMD_K4_CONFIG_COUNT` = 4 K4 configurations, each with launch parameters within
 `kK4BlobBytes` = 256 bytes. **Build.** `IMMERDINK_CUDA_ARCHS`, `IMMERDINK_EMBED_PTX` (CMakeLists.txt).
 
-### 6i. Hardware GEMM mode `IMD_HWGEMM` (FP64 tensor cores first) **[v1.21; issue #75: stage 1 implemented]**
+### 6i. Hardware GEMM mode `IMD_HWGEMM` (FP64 tensor cores first) **[v1.21; issue #75: stages 1 and 2 implemented]**
 
 *What and why.* On Hopper the FP64 tensor cores (DMMA) reach about 67 TFLOPS, and native DGEMM
 beats every emulator, immerdink included, by 1.7–1.9× on small and batched shapes. `IMD_HWGEMM`
@@ -5886,8 +5886,9 @@ review record and the predictions: docs/NOTES-HWGEMM.md.
 
 *Implementation stages.* Stage 1 (host API 15): the mode, its dispatch and fully affine calls
 (both operands in place, an affine C, at most one fused batch mode): workspace 0, one GEMM
-launch per chunk (§6i.6), no K0. Every other HWGEMM call is NOT_SUPPORTED (`imd_workspace_size`
-and plan creation) until stage 2 (the FP64 packs, the scattered C store and per-λ offsets).
+launch per chunk (§6i.6), no K0. Stage 2: every other call (a packed operand, a scattered C,
+a multi-mode batch), without slabs: workspace `vec`, `PA`, `PB` (§6i.2), K0 when needed, one
+FP64 pack launch per packed operand, then the own GEMM kernel (§6i.7).
 `k_slab`, the `imd_options_t` additions and the performance model (§6i.3, §6i.5) are later
 stages; until then `imd_perf_predict` returns NOT_SUPPORTED for a HWGEMM call. Code:
 `src/hwgemm.cu`, `src/hwgemm/`; tests: `tests/test_hwgemm.py` (bit-exact against DIRECT).
@@ -5902,14 +5903,18 @@ The RN κ policy (§3.2) does not apply. **[spec: IndexMap]**
 - **in place** if X is *affine*: one fused mode in its row group and one in K, stride exactly
   +1 in one of them and ≥ 0 in the other; CUTLASS reads it with those strides;
 - **packed** otherwise: a gather kernel writes X K-contiguous into an FP64 workspace region of
-  b·rows·k̂ values (k̂ = k, or the slab length, rounded up to the GEMM K tile; rows = m or n,
-  unpadded); the GEMM reads only positions h < k.
+  b·rows·k̂ values (k̂ = k, or the slab length, rounded up to HWGEMM's K quantum 16, the K tile
+  of every §6i.7 kernel, not EMULATE's k_align; rows = m or n, unpadded): region `PA`
+  (`IMD_REGION_PA` = 8) for the GEMM's A and `PB` (= 9) for its B, after `vec`, 256-aligned,
+  every EMULATE region absent. The GEMM reads positions h < k, or all k̂ when both operands
+  are packed (§6i.4).
 - Batch (one decision per call): one fused batch mode → a per-operand stride (0 = broadcast);
   several → per-λ base offsets from the λ scatter vectors (so K0 runs), read once per CTA (no
   host loop over λ).
 - C: affine with a unit stride → strided store; otherwise through `c_row` / `c_col`.
-- K0 runs only if some operand is packed, C is scattered or the batch has several modes, and
-  `vec_mode` is GENERATE. A fully
+- K0 runs only if some operand is packed, C is scattered or the batch has several modes (the
+  GEMM then reads the per-λ offsets: mutant needvec_no_multibat), and `vec_mode` is GENERATE.
+  A fully
   affine call has workspace 0 and one launch. **[spec: IndexMap InPlaceExact, InPlaceUnitStride, HwAffineNoWs; HwGemmPipeline]**
 
 **6i.3 K-slabs.** Option `k_slab` (0 = none; quantized to the GEMM K tile; INVALID_VALUE
@@ -5938,10 +5943,12 @@ ResultExact, NoBadStep, SlabsPartition]**
   carries E's zero sign only when β·C is a zero). Measured on sm_89 (stage-1 tests: −0 kept at
   k = 16, 32; +0 at k = 2, 4, 15, 17); not yet probed on sm_90. Tests compare bits with
   NaN == NaN and +0 == −0 (`tests/test_hwgemm.py` counts the zero-sign differences). Slabs
-  (`k_slab` quantized to K_t) leave a residue in the last slab only. Later, where an operand is
-  packed (stage 2), the pack can pad A's K tail with −0.0 and B's with +0.0 and the GEMM run on
-  k rounded up to K_t: x + (−0) = x for every x, so that path is exact at no cost (independent
-  review, 2026-11-17).
+  (`k_slab` quantized to K_t) leave a residue in the last slab only. Stage 2: when BOTH operands
+  are packed, each slab's packs also write their K tail (A: −0.0, B: +0.0) and the GEMM runs on
+  k̂: every tail product is −0 and x + (−0) = x for every x, so that path matches DIRECT's zero
+  signs at no cost (independent review, 2026-11-17). With one operand in place there is no tail
+  to read beyond k, and the GEMM runs on k (the residue rule above). **[spec: HwGemmPipeline
+  PadOn, PadStep, PadRead; mutants pads_not_written, pad_last_slab_stale, khat_with_inplace]**
 - Non-finite values propagate per IEEE (tests compare NaN-ness); subnormals: a per-card test
   per DMMA instruction used.
 
@@ -5963,7 +5970,8 @@ power; `flops_eq` = 2bmnk and `tflops_eq`; `err_bound` (γ_k, L7 form with slabs
 Workspace exactness for HWGEMM joins `cert_workspace`.
 
 **6i.6 Limits.** m, n ≤ 2³¹ − 1 and k (or `k_slab`) ≤ 2³¹ − 1 per GEMM (CUTLASS GemmCoord;
-INVALID_VALUE, like row 5). Launch chunks: batches in chunks of ≤ 65535 (grid.z) and C's
+INVALID_VALUE, like row 5); when both operands are packed the GEMM's K extent is k̂, so k̂ ≤
+2³¹ − 1 (k ≤ 2³¹ − 16). Launch chunks: batches in chunks of ≤ 65535 (grid.z) and C's
 columns (after the C^T swap of a column-major C) in chunks of 65535 · 64 (≤ 65535 tiles on
 grid.y for every tile width), so `kernel_launches` = ⌈b / 65535⌉ · ⌈cols / (65535 · 64)⌉
 whatever the tile. **[spec: IndexMap]**
@@ -5979,6 +5987,15 @@ fixed at plan creation (reproducibility): the provisional rule `hwgemm_tile` (64
 ≤ 64; 64×128 when 128×128 tiles would fill fewer than half the SMs; else 128×128), fitted to
 the six gate shapes, or the benchmark hook `imd_prof_set_hw_tile`. The per-shape rule is the
 tuning stage's deliverable. Gate (NOTES-HWGEMM §4.3): passed on H100 except sq8192 (89 %).
+Stage 2 (calls that are not fully affine) runs an immerdink-owned kernel (`src/hwgemm/hw_own.cuh`)
+on the same tiles: CUTLASS's `threadblock::DefaultMma`, the exact mainloop `GemmUniversal`
+instantiates, called the same way (so the sums are the same bits: `tests/test_hwgemm.py` suite
+`own` compares it with stage 1 on every tile and layout pair), with the batch base read per CTA
+(a stride or the λ vector) and a register-only epilogue that stores each accumulator through
+`c_bat[λ] + c_row[i] + c_col[j]` (or C's strides) with §3.7 `store_out`. No C^T swap (the
+store is per element), so its launches are ⌈b / 65535⌉ · ⌈n / (65535 · 64)⌉ plus K0 and the
+packs. The FP64 pack (`hw_pack_kernel`) is one thread per packed element, writes coalesced, reads
+through the vectors; not yet tuned (NOTES-HWGEMM §4.2's smem transpose is the next step).
 
 **6i.8 Element types.** v1 is FP64. The mode names the arithmetic source, not the type: a later
 FP32 is the same mode with `dtype = IMD_F32` and a `compute` choice (FP32-accurate by default:

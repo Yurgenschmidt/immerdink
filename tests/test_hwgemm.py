@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""IMD_HWGEMM stage 1 (DESIGN v1.21 §6i, issue #75): bit-exact GPU tests against DIRECT.
+"""IMD_HWGEMM stages 1 and 2 (DESIGN v1.21 §6i, issue #75): bit-exact GPU tests against DIRECT.
 
     python3 tests/test_hwgemm.py [--lib build/libimmerdink.so] [--quick]
 
@@ -14,9 +14,11 @@ Each case builds strided A, B, C descriptors, fills them with mixed data (wide e
 signed zeros, subnormals, and in some cases Inf / NaN), runs a DIRECT plan and a HWGEMM plan
 on identical inputs and compares the whole C buffers (the sign of a zero element may differ
 when k is not a multiple of the K tile: §6i.4; those elements are counted and reported). It also checks the plan-level
-contract of stage 1: workspace 0 and dispatch HWGEMM for fully affine calls, NOT_SUPPORTED
-for the others (packed operands, scattered C, multi-mode batch: the pack stage), DIRECT /
-SCALE dispatch for K-empty and k = 0, and the batch / column chunking.
+contract: workspace 0 and dispatch HWGEMM for fully affine calls, DIRECT / SCALE dispatch for
+K-empty and k = 0, and the batch / column chunking. Stage 2 (suite stage2): packed operands,
+scattered C and multi-mode batches against DIRECT (zero signs exact when both operands are
+packed: §6i.4's -0 pads); suite own: the own kernel against stage 1's CUTLASS kernel, bit for
+bit.
 """
 
 import argparse
@@ -46,6 +48,8 @@ def setup_hooks(lib):
     L.imd_test_set_hw_tile.restype = C.c_int
     L.imd_test_plan_hw_tile.argtypes = [C.c_void_p, C.POINTER(C.c_int32)]
     L.imd_test_plan_hw_tile.restype = C.c_int
+    L.imd_test_set_hw_own.argtypes = [C.c_int32]
+    L.imd_test_set_hw_own.restype = None
 
 
 def plan_tile(lib, plan):
@@ -113,13 +117,15 @@ def mixed(rng, n, specials=False):
 ZERO_SIGN = {"elements": 0}   # zero elements whose sign differs (§6i.4 allowance), counted
 
 
-def bit_mismatches(got, want):
+def bit_mismatches(got, want, exact_zero=False):
     """Indices where got and want differ in bits, with NaN == NaN (any payload) and, per
     DESIGN §6i.4, +0 == -0: CUTLASS zero-fills a partial K tile with +0 * +0 products, and
     -0 + (+0) = +0, so a zero sum that DIRECT returns as -0 may come back as +0 when k is
     not a multiple of the kernel's K tile (every other value is unchanged by x + (+0))."""
     gb, wb = got.view(np.uint64), want.view(np.uint64)
     zs = (gb != wb) & (got == 0) & (want == 0)
+    if exact_zero:  # both operands packed: the -0 / +0 K-tail pads keep the sign (§6i.4)
+        zs[:] = False
     ZERO_SIGN["elements"] += int(np.count_nonzero(zs))
     return np.nonzero((gb != wb) & ~(np.isnan(got) & np.isnan(want)) & ~zs)[0]
 
@@ -129,9 +135,14 @@ def bit_mismatches(got, want):
 # ---------------------------------------------------------------------------------------
 
 def run_case(lib, cuda, name, A, B, Cd, alphas_betas, rng, expect="HWGEMM", launches=None,
-             specials=False, tiles=(-1,), c_fill_nan=False, verbose=False):
+             specials=False, tiles=(-1,), c_fill_nan=False, verbose=False, affine=True,
+             exact_zero=False, own=False):
     """Plans DIRECT and HWGEMM for (A, B, C); expect = HWGEMM / DIRECT / SCALE (dispatch of
-    the HWGEMM plan) or NOT_SUPPORTED (plan creation). Compares every (alpha, beta)."""
+    the HWGEMM plan) or NOT_SUPPORTED (plan creation). Compares every (alpha, beta).
+    affine = False: a stage-2 call (packs, scattered C or a multi-mode batch: workspace may be
+    nonzero). exact_zero: zero signs must match too. own: the reference is the same HWGEMM
+    plan on stage 1's CUTLASS kernel and the tested run uses the own kernel (hook), bit for
+    bit including zero signs."""
     st, ws = lib.workspace_size(A.t, B.t, Cd.t, 14, mode=HWGEMM)
     if expect == "NOT_SUPPORTED":
         if st != "NOT_SUPPORTED":
@@ -142,7 +153,7 @@ def run_case(lib, cuda, name, A, B, Cd, alphas_betas, rng, expect="HWGEMM", laun
         return 0
     if st != "SUCCESS":
         raise Fail(f"{name}: workspace_size {st}")
-    if expect == "HWGEMM" and ws != 0:
+    if expect == "HWGEMM" and affine and ws != 0:
         raise Fail(f"{name}: HWGEMM workspace {ws} bytes, want 0 (fully affine)")
     st, wsd = lib.workspace_size(A.t, B.t, Cd.t, 14, mode=hz.DIRECT)
     assert st == "SUCCESS", st
@@ -175,20 +186,26 @@ def run_case(lib, cuda, name, A, B, Cd, alphas_betas, rng, expect="HWGEMM", laun
                     raise Fail(f"{name}: {expect} plan reports tile {got_tile}")
                 for alpha, beta in alphas_betas:
                     want, got = np.empty(lc), np.empty(lc)
-                    for plan, out, wsb in ((pd, want, wsd), (ph, got, ws)):
+                    runs = (((ph, want, ws, 0), (ph, got, ws, 1)) if own
+                            else ((pd, want, wsd, 0), (ph, got, ws, 0)))
+                    for plan, out, wsb, own_on in runs:
                         cuda.upload(dC, hC0)
-                        s = lib.contract(plan, alpha, off(dA, ba), off(dB, bb), beta, off(dC, bc),
-                                         dW if wsb else None, wsb)
+                        lib.lib.imd_test_set_hw_own(own_on)
+                        try:
+                            s = lib.contract(plan, alpha, off(dA, ba), off(dB, bb), beta,
+                                             off(dC, bc), dW if wsb else None, wsb)
+                        finally:
+                            lib.lib.imd_test_set_hw_own(0)
                         if s != "SUCCESS":
                             raise Fail(f"{name}: contract {s} (alpha {alpha}, beta {beta})")
                         cuda.sync()
                         cuda.download(out, dC)
-                    bad = bit_mismatches(got, want)
+                    bad = bit_mismatches(got, want, exact_zero=exact_zero or own)
                     if len(bad):
                         i = bad[0]
                         raise Fail(f"{name} tile {TILES.get(got_tile, got_tile)} alpha {alpha} "
                                    f"beta {beta}: {len(bad)} of {lc} elements differ, first at "
-                                   f"{i}: {got[i]!r} vs DIRECT {want[i]!r}")
+                                   f"{i}: {got[i]!r} vs {'stage 1' if own else 'DIRECT'} {want[i]!r}")
                     compared += lc
             finally:
                 lib.plan_destroy(ph)
@@ -291,18 +308,91 @@ def suite_tensor(lib, cuda, rng, ab, quick, verbose):
     A = Desc([I1, K1, K2], [6, 4, 5], [1, 7, 40])
     B = Desc([K1, K2, J1], [4, 5, 3], strides([4, 5, 3], [0, 1, 2]))
     Cd = Desc([I1, J1], [6, 3], [3, 1])
-    run_case(lib, cuda, "A not affine", A, B, Cd, ab, rng, expect="NOT_SUPPORTED")
+    n += run_case(lib, cuda, "A not affine", A, B, Cd, ab, rng, affine=False, verbose=verbose)
     # not affine: negative K stride
     A = Desc([I1, K1], [6, 9], [9, -1])
     B = Desc([K1, J1], [9, 3], [3, 1])
     Cd = Desc([I1, J1], [6, 3], [3, 1])
-    run_case(lib, cuda, "negative K stride", A, B, Cd, ab, rng, expect="NOT_SUPPORTED")
+    n += run_case(lib, cuda, "negative K stride", A, B, Cd, ab, rng, affine=False,
+                  verbose=verbose)
     # not affine: two batch modes that do not fuse
     # (A's gap of 1 before mode L keeps (L, L+1) from fusing into one batch mode)
     A = Desc([L, L + 1, I1, K1], [2, 3, 4, 5], strides([2, 3, 4, 5], [3, 2, 1, 0], gap={0: 1}))
     B = Desc([L + 1, L, K1, J1], [3, 2, 5, 6], strides([3, 2, 5, 6], [3, 2, 0, 1]))
     Cd = Desc([L, L + 1, I1, J1], [2, 3, 4, 6], strides([2, 3, 4, 6], [3, 2, 1, 0]))
-    run_case(lib, cuda, "multi-mode batch", A, B, Cd, ab, rng, expect="NOT_SUPPORTED")
+    n += run_case(lib, cuda, "multi-mode batch", A, B, Cd, ab, rng, affine=False,
+                  verbose=verbose)
+    return n
+
+
+def suite_stage2(lib, cuda, rng, ab, quick, verbose, cc_major):
+    """Stage 2 (§6i.2): packed operands (one or both; both: GEMM on k_hat with -0 / +0 pads,
+    zero signs exact), scattered C, multi-mode batches, their combinations, every tile, with
+    k on and off the K tile."""
+    I1, J1, K1, K2, L = 1, 2, 3, 4, 6
+    tiles = (0, 1, 2) if cc_major >= 9 else (2,)
+    n = 0
+    shapes = [(6, 3, 9, 1), (70, 33, 17, 1), (130, 200, 64, 2)]
+    if not quick:
+        shapes += [(257, 129, 1001, 1), (65, 66, 2, 3)]
+    for (i_, j_, k_, b_) in shapes:
+        ext = dict(i=i_, j=j_, k=k_)
+        # A packed: no unit stride (i stride 2, k stride 2 i_ + 1)
+        pa = [2, 2 * i_ + 1]
+        # B packed: K stride 3, J stride 3 k_ + 2
+        pb = [3, 3 * k_ + 2]
+        # C scattered: i stride 2, j stride 2 i_ + 3
+        pc = [2, 2 * i_ + 3]
+        for what, sa, sb, sc in (("A packed", pa, None, None), ("B packed", None, pb, None),
+                                 ("both packed", pa, pb, None), ("C scattered", None, None, pc),
+                                 ("all three", pa, pb, pc)):
+            def mk(labels, ex, st, fallback):
+                if b_ > 1:  # batch outermost, stride past the matrix
+                    span = 1 + sum(abs(x) * (e - 1) for x, e in zip(st or fallback, ex))
+                    return Desc([L] + labels, [b_] + ex, [span + 5] + list(st or fallback))
+                return Desc(labels, ex, list(st or fallback))
+            A = mk([I1, K1], [i_, k_], [pa[0], pa[1]] if sa else None, [k_, 1])
+            B = mk([K1, J1], [k_, j_], [pb[0], pb[1]] if sb else None, [j_, 1])
+            Cd = mk([I1, J1], [i_, j_], [pc[0], pc[1]] if sc else None, [j_, 1])
+            n += run_case(lib, cuda, f"{what} {i_}x{j_}x{k_} b{b_}", A, B, Cd, ab, rng,
+                          affine=False, exact_zero=bool(sa and sb), tiles=tiles, verbose=verbose)
+    # multi-mode batch (A in place, offsets from the vectors) with B packed and C scattered
+    A = Desc([L, L + 1, I1, K1], [2, 3, 40, 21], strides([2, 3, 40, 21], [3, 2, 1, 0], gap={0: 1}))
+    B = Desc([L + 1, L, K1, J1], [3, 2, 21, 35], [3 * 21 * 35 * 2 + 7, 21 * 35 + 1, 1, 21 + 2])
+    Cd = Desc([L, L + 1, I1, J1], [2, 3, 40, 35], strides([2, 3, 40, 35], [2, 3, 1, 0]))
+    n += run_case(lib, cuda, "multi-batch + B packed + C cols", A, B, Cd, ab, rng, affine=False,
+                  tiles=tiles, verbose=verbose)
+    # K split over two non-fusable modes in both operands (both packed), specials
+    A = Desc([I1, K1, K2], [33, 4, 5], [1, 37, 160])
+    B = Desc([K1, K2, J1], [4, 5, 19], [1, 9, 47])
+    Cd = Desc([I1, J1], [33, 19], [19, 1])
+    n += run_case(lib, cuda, "two K modes, both packed, specials", A, B, Cd, ab, rng,
+                  affine=False, exact_zero=True, specials=True, verbose=verbose)
+    n += run_case(lib, cuda, "both packed, beta 0, C NaN", A, B, Cd,
+                  [(1.0, 0.0), (0.0, 0.0)], rng, affine=False, exact_zero=True,
+                  c_fill_nan=True, verbose=verbose)
+    # multi-mode batch beyond one grid.z
+    A = Desc([L, L + 1, I1, K1], [7, 10001, 2, 3], [1, 8, 7 * 10001 * 8, 7 * 10001 * 8 * 2 + 1])
+    B = Desc([L, L + 1, K1, J1], [7, 10001, 3, 2], strides([7, 10001, 3, 2], [3, 2, 1, 0]))
+    Cd = Desc([L, L + 1, I1, J1], [7, 10001, 2, 2], strides([7, 10001, 2, 2], [3, 2, 1, 0]))
+    n += run_case(lib, cuda, "70007 batches, A packed", A, B, Cd, [(1.0, 0.0), (3.0, -2.0)], rng,
+                  affine=False, verbose=verbose)
+    return n
+
+
+def suite_own(lib, cuda, rng, ab, quick, verbose, cc_major):
+    """The own kernel (hw_own.cuh) on fully affine calls equals stage 1's CUTLASS
+    GemmUniversal bit for bit (zero signs included) on every tile and layout pair: the probe
+    of the epilogue's accumulator coordinates."""
+    tiles = (0, 1, 2) if cc_major >= 9 else (2,)
+    n = 0
+    for (i_, j_, k_, b_) in ((64, 64, 16, 1), (129, 65, 33, 1), (200, 136, 333, 3)):
+        for la in "rc":
+            for lb in "rc":
+                for lc in "rc":
+                    A, B, Cd = gemm_case(i_, j_, k_, b_, la, lb, lc, batch=b_ > 1)
+                    n += run_case(lib, cuda, f"own {i_}x{j_}x{k_} b{b_} A{la} B{lb} C{lc}", A, B,
+                                  Cd, ab, rng, tiles=tiles, own=True, verbose=verbose)
     return n
 
 
@@ -350,7 +440,9 @@ def main():
     total, failed = 0, []
     suites = [("layouts", suite_layouts), ("values", suite_values), ("tensor", suite_tensor),
               ("chunks", suite_chunks),
-              ("tiles", lambda *a: suite_tiles(*a, cc_major=cc))]
+              ("tiles", lambda *a: suite_tiles(*a, cc_major=cc)),
+              ("own", lambda *a: suite_own(*a, cc_major=cc)),
+              ("stage2", lambda *a: suite_stage2(*a, cc_major=cc))]
     for name, fn in suites:
         try:
             got = fn(lib, cuda, rng, ab, args.quick, args.verbose)

@@ -155,7 +155,9 @@ enum {
   IMD_REGION_RA = 5,  /* int8 residues of A, one group */
   IMD_REGION_RB = 6,  /* int8 residues of B, one group */
   IMD_REGION_W = 7,   /* u8 products, all N planes     */
-  IMD_REGION_COUNT = 8
+  IMD_REGION_PA = 8,  /* fp64 packed A (IMD_HWGEMM; host API 15) */
+  IMD_REGION_PB = 9,  /* fp64 packed B (IMD_HWGEMM; host API 15) */
+  IMD_REGION_COUNT = 10
 };
 typedef struct {
   uint64_t offset; /* bytes from the workspace base; 256-aligned */
@@ -170,7 +172,8 @@ IMD_API imd_status_t imd_workspace_layout(const imd_tensor_t* A, const imd_tenso
                                           imd_region_t* regions, int32_t capacity,
                                           int32_t* num_regions, size_t* total);
 
-/* Static name of a region index ("sA", "sB", "fA", "fB", "vec", "RA", "RB", "W"), or NULL. */
+/* Static name of a region index ("sA", "sB", "fA", "fB", "vec", "RA", "RB", "W", "PA", "PB"),
+ * or NULL. */
 IMD_API const char* imd_region_name(int32_t region);
 
 /* What imd_plan_create would allocate for these arguments, without a plan or a GPU:

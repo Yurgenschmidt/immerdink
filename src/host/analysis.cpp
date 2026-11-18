@@ -29,11 +29,18 @@ bool hw_runs(const imd_options_t& o, const Lowered& lw) {
 }
 
 // The §4a layout of an analysis (packed: §6b.6 roles). HWGEMM (§6i.2, spec IndexMap HwCells):
-// a fully affine call has no workspace (analyze rejects the others in this stage); NOOP,
-// SCALE and K-empty calls size as in DIRECT.
+// vec iff the scatter vectors are needed, PA / PB per non-affine operand (a fully affine call
+// has no workspace); NOOP, SCALE and K-empty calls size as in DIRECT.
 std::optional<WorkspaceLayout> mode_layout(const Analysis& an, int32_t packed) {
   const Lowered& lw = an.lowered;
-  if (hw_runs(an.options, lw)) return WorkspaceLayout{};
+  if (hw_runs(an.options, lw)) {
+    const HwView& v = an.hw;  // acc[0] / acc[1]: the post-swap A / B
+    HwWorkspaceShape h;
+    h.m = lw.m, h.n = lw.n, h.k = lw.k, h.b = lw.b;
+    h.need_vec = v.need_vec, h.vec_resident = an.options.vec_mode == IMD_VEC_RESIDENT;
+    h.pack_a = !v.acc[0].affine, h.pack_b = !v.acc[1].affine;
+    return hw_workspace_layout(h);
+  }
   return workspace_layout({lw.m, lw.n, lw.k, lw.b, an.options.num_moduli,
                            an.options.residue_group, an.options.mode != IMD_EMULATE,
                            an.options.vec_mode == IMD_VEC_RESIDENT, packed, an.k_align});
@@ -124,13 +131,15 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
   // v1.13 §4b.5: the one resolution of A for this analysis, from the API call's one hook
   // snapshot `sel`; passed explicitly from here on.
   out->k_align = sel.of(lw.k);
-  // v1.21 §6i.6 row 5 for HWGEMM, then its access view (§6i.2). Stage 1 (issue #75) runs
-  // fully affine calls only: a packed operand, a scattered C or a multi-mode batch is
-  // NOT_SUPPORTED until the FP64 pack stage.
+  // v1.21 §6i.6 row 5 for HWGEMM, then its access view (§6i.2): fully affine calls run on
+  // CUTLASS's GemmUniversal (stage 1), the others on the own kernel with packs (stage 2).
   if (hw_runs(out->options, lw)) {
     if (!hw_dims_ok(lw)) return IMD_STATUS_INVALID_VALUE;
     out->hw = hw_view(lw);
-    if (!out->hw.fully_affine()) return IMD_STATUS_NOT_SUPPORTED;
+    // §6i.6: with both operands packed the GEMM's K extent is k_hat = ceil(k)_16
+    if (!out->hw.acc[0].affine && !out->hw.acc[1].affine &&
+        (lw.k + kHwQ - 1) / kHwQ * kHwQ > INT32_MAX)
+      return IMD_STATUS_INVALID_VALUE;
   }
   const auto layout = mode_layout(*out, 0);
   if (!layout) return IMD_STATUS_INVALID_VALUE;
@@ -359,7 +368,8 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
     // padded row, so KF writes the zeros [k, k_hat). Unreachable (kf_lg_tk rounds up).
     if (e.fused && (int64_t{1} << kf_lg_tk(e.k_hat)) < e.k_hat) return IMD_STATUS_INVALID_VALUE;
   }
-  if (e.path != Path::kNoop && e.path != Path::kHwGemm) {  // HWGEMM stage 1: no vectors
+  // HWGEMM (§6i.2): the vectors only when a pack, C's scattered store or per-lambda offsets need them
+  if (e.path != Path::kNoop && !(e.path == Path::kHwGemm && e.hw.fully_affine())) {
     // §5 step 10 (v1.2): the fused-mode descriptor K0 generates the vectors from.
     e.vec_count = scatter_vector_count(lw);
     for (int g = 0; g < 4; ++g) {
@@ -382,8 +392,15 @@ int64_t plan_launches(const ExecPlan& e, bool fused, int32_t fused_large, bool r
                       int64_t k4_launches) {
   if (e.path == Path::kNoop) return 0;
   if (e.path == Path::kHwGemm) {  // §6i.6: one GEMM per chunk of 65535 batches x 65535*64 columns
-    const int64_t cols = e.hw.acc[2].row ? e.n : e.m;  // hwgemm.cu: C column-major -> C^T
-    return ((e.b + 65534) / 65535) * ((cols + 65535 * 64 - 1) / (65535 * 64));
+    // Stage 1 (fully affine, CUTLASS GemmUniversal): a column-major C runs as C^T. Stage 2 (the
+    // own kernel, hw_own.cuh): K0 when the vectors are needed and not resident, one pack per
+    // packed operand, then the GEMM chunks over C's own columns.
+    if (e.hw.fully_affine()) {
+      const int64_t cols = e.hw.acc[2].row ? e.n : e.m;  // hwgemm.cu: C column-major -> C^T
+      return ((e.b + 65534) / 65535) * ((cols + 65535 * 64 - 1) / (65535 * 64));
+    }
+    return (resident ? 0 : 1) + (e.hw.acc[0].affine ? 0 : 1) + (e.hw.acc[1].affine ? 0 : 1) +
+           ((e.b + 65534) / 65535) * ((e.n + 65535 * 64 - 1) / (65535 * 64));
   }
   const int64_t k0 = resident ? 0 : 1;
   if (!emulates(e)) return k0 + 1;  // DIRECT, K-empty or k = 0: K0 + one kernel

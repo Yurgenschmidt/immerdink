@@ -108,7 +108,7 @@ imd_status_t imd_workspace_size(const imd_tensor_t* A, const imd_tensor_t* B,
 
 const char* imd_region_name(int32_t region) {
   static const char* const kNames[IMD_REGION_COUNT] = {"sA", "sB", "fA", "fB",
-                                                       "vec", "RA", "RB", "W"};
+                                                       "vec", "RA", "RB", "W", "PA", "PB"};
   return region >= 0 && region < IMD_REGION_COUNT ? kNames[region] : nullptr;
 }
 
@@ -178,7 +178,7 @@ imd_status_t lowering_impl(const imd_tensor_t* A, const imd_tensor_t* B, const i
                  : imd::detail::emulates(e)   ? IMD_DISPATCH_EMULATE
                  : e.path == Path::kHwGemm    ? IMD_DISPATCH_HWGEMM
                                               : IMD_DISPATCH_DIRECT;
-    if (e.path != Path::kNoop && e.path != Path::kHwGemm)  // v1.21: fully affine HWGEMM has none
+    if (e.path != Path::kNoop && !(e.path == Path::kHwGemm && e.hw.fully_affine()))  // §6i.2
       r.vec_entries = imd::detail::scatter_vector_count(lw);
     if (r.dispatch == IMD_DISPATCH_EMULATE) {
       r.num_groups = (e.N + e.g - 1) / e.g;

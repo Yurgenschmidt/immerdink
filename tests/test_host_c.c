@@ -58,10 +58,11 @@ int main(void) {
         IMD_STATUS_SUCCESS);
   CHECK(nreg == IMD_REGION_COUNT && total == 30720);
   {
-    const uint64_t want[IMD_REGION_COUNT] = {102, 198, 51, 99, 952, 1632, 4608, 22032};
+    /* PA, PB (IMD_HWGEMM's packs): absent in EMULATE (offset 0, bytes 0) */
+    const uint64_t want[IMD_REGION_COUNT] = {102, 198, 51, 99, 952, 1632, 4608, 22032, 0, 0};
     uint64_t off = 0;
     for (int r = 0; r < IMD_REGION_COUNT; ++r) {
-      CHECK(reg[r].offset == off && reg[r].bytes == want[r]);
+      CHECK(reg[r].offset == (want[r] ? off : 0) && reg[r].bytes == want[r]);
       off += (want[r] + 255) / 256 * 256;
     }
     CHECK(off == total);

@@ -60,6 +60,17 @@ __global__ void __launch_bounds__(256) hw_beta_kernel(double* C, int64_t m, int6
   }
 }
 
+// §6i.2 FP64 pack: one thread per output element, h fastest (coalesced writes; the source
+// reads follow the operand's own strides). The K tail [k, k_hat) gets `pad`.
+__global__ void __launch_bounds__(256) hw_pack_kernel(HwPackCall c) {
+  const int64_t total = c.b * c.rows * c.k_hat;
+  for (int64_t idx = blockIdx.x * int64_t{blockDim.x} + threadIdx.x; idx < total;
+       idx += int64_t{gridDim.x} * blockDim.x) {
+    const int64_t h = idx % c.k_hat, t = idx / c.k_hat, r = t % c.rows, lam = t / c.rows;
+    c.dst[idx] = h < c.k ? c.src[c.bat[lam] + c.row[r] + c.kk[h]] : c.pad;
+  }
+}
+
 template <class Kernel>
 cudaError_t versions_of(Kernel kernel, int32_t* binary, int32_t* ptx) {
   cudaFuncAttributes a{};
@@ -75,6 +86,9 @@ cudaError_t hw_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) {
     case 0: return versions_of(hw_beta_kernel, binary, ptx);
     case 1: return hw_sm80_versions(binary, ptx);
     case 2: return hw_sm90_versions(binary, ptx);
+    case 3: return versions_of(hw_pack_kernel, binary, ptx);
+    case 4: return hw_own_sm80_versions(binary, ptx);
+    case 5: return hw_own_sm90_versions(binary, ptx);
     default: return cudaErrorInvalidValue;
   }
 }
@@ -104,6 +118,32 @@ imd_status_t hwgemm_enqueue(const HwGemmCall& call, cudaStream_t stream) {
   if (c.tile < 0) c.tile = hwgemm_tile(c.m, c.n, c.b, sm90 ? 9 : 8, di.sms);
   if (!sm90 && c.tile != kHw64x64) return IMD_STATUS_INVALID_VALUE;
   return sm90 ? hw_sm90_run(c, stream) : hw_sm80_run(c, stream);
+}
+
+int& hw_own_override() {
+  static int v = 0;
+  return v;
+}
+
+imd_status_t hwgemm_pack(const HwPackCall& c, cudaStream_t stream) {
+  const int64_t total = c.b * c.rows * c.k_hat;
+  if (total == 0) return IMD_STATUS_SUCCESS;
+  const int64_t blocks = ceil_div(total, 256);
+  const unsigned grid = static_cast<unsigned>(blocks < 65535 * 8 ? blocks : 65535 * 8);
+  hw_pack_kernel<<<grid, 256, 0, stream>>>(c);
+  return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
+}
+
+imd_status_t hwgemm_own_enqueue(const HwOwnCall& call, cudaStream_t stream) {
+  if (call.b == 0 || call.m == 0 || call.n == 0) return IMD_STATUS_SUCCESS;
+  DevInfo di;
+  if (!dev_info(&di)) return IMD_STATUS_CUDA_ERROR;
+  const bool sm90 = di.major >= 9 && hw_sm90_usable();
+  if (!sm90 && di.major < 8) return IMD_STATUS_NOT_SUPPORTED;
+  HwOwnCall c = call;
+  if (c.tile < 0) c.tile = hwgemm_tile(c.m, c.n, c.b, sm90 ? 9 : 8, di.sms);
+  if (!sm90 && c.tile != kHw64x64) return IMD_STATUS_INVALID_VALUE;
+  return sm90 ? hw_own_sm90_run(c, stream) : hw_own_sm80_run(c, stream);
 }
 
 }  // namespace imd::detail

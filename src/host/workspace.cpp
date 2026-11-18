@@ -16,7 +16,50 @@ std::optional<uint64_t> product(Ts... xs) {
   return r;
 }
 
+// Cumulative 256-aligned offsets over the present regions (nullopt entries and 0 are absent).
+std::optional<WorkspaceLayout> place(const std::optional<uint64_t> (&bytes)[static_cast<int>(Region::count)]) {
+  WorkspaceLayout L;
+  uint64_t off = 0;
+  for (int r = 0; r < static_cast<int>(Region::count); ++r) {
+    if (!bytes[r] || *bytes[r] == 0) continue;
+    L.offset[r] = off;
+    L.bytes[r] = *bytes[r];
+    uint64_t aligned = 0;
+    if (!align_u64(*bytes[r], imd::constants::kRegionAlign, &aligned) || !add_u64(off, aligned, &off))
+      return std::nullopt;
+  }
+  L.total = off;
+  return L;
+}
+
+std::optional<uint64_t> vec_bytes(int64_t m, int64_t n, int64_t k, int64_t b) {
+  // vec = 8 (2m + 2n + 2k + 3b)
+  const std::optional<uint64_t> terms[4] = {product(2, m), product(2, n), product(2, k), product(3, b)};
+  uint64_t vec = 0;
+  for (const auto& t : terms)
+    if (!t || !add_u64(vec, *t, &vec)) return std::nullopt;
+  if (!mul_u64(vec, 8, &vec)) return std::nullopt;
+  return vec;
+}
+
 }  // namespace
+
+std::optional<WorkspaceLayout> hw_workspace_layout(const HwWorkspaceShape& s) {
+  if (s.b == 0 || s.m == 0 || s.n == 0) return WorkspaceLayout{};
+  const uint64_t k_hat = (static_cast<uint64_t>(s.k) + (kHwQ - 1)) / kHwQ * kHwQ;  // k < 2^63
+  std::optional<uint64_t> bytes[static_cast<int>(Region::count)] = {};
+  // Sized whenever needed, even when resident: an overflowing vec is INVALID_VALUE either way.
+  if (s.need_vec) {
+    const auto v = vec_bytes(s.m, s.n, s.k, s.b);
+    if (!v) return std::nullopt;
+    if (!s.vec_resident) bytes[static_cast<int>(Region::vec)] = v;
+  }
+  if (s.pack_a && !(bytes[static_cast<int>(Region::PA)] = product(8, s.b, s.m, k_hat)))
+    return std::nullopt;
+  if (s.pack_b && !(bytes[static_cast<int>(Region::PB)] = product(8, s.b, s.n, k_hat)))
+    return std::nullopt;
+  return place(bytes);
+}
 
 std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s) {
   namespace c = imd::constants;
@@ -24,7 +67,6 @@ std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s) {
   if (s.k_align != kKAlign16 && s.k_align != kKAlign64) return std::nullopt;
   if (s.b == 0 || s.m == 0 || s.n == 0) return L;  // empty output: no-op
 
-  const uint64_t kAlign = c::kRegionAlign;
   // k_hat = ceil(k)_A (k_hat.hpp, A = the plan's resolved k_align), n_hat = ceil(n)_16; k, n <
   // 2^63 so these cannot overflow uint64.
   uint64_t k_hat = 0;
@@ -32,13 +74,8 @@ std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s) {
     return std::nullopt;
   const uint64_t n_hat = (static_cast<uint64_t>(s.n) + (c::kNAlign - 1)) & ~uint64_t{c::kNAlign - 1};
 
-  // vec = 8 (2m + 2n + 2k + 3b)
-  std::optional<uint64_t> vec_terms[4] = {product(2, s.m), product(2, s.n), product(2, s.k),
-                                          product(3, s.b)};
-  uint64_t vec = 0;
-  for (const auto& t : vec_terms)
-    if (!t || !add_u64(vec, *t, &vec)) return std::nullopt;
-  if (!mul_u64(vec, 8, &vec)) return std::nullopt;
+  const auto vec = vec_bytes(s.m, s.n, s.k, s.b);
+  if (!vec) return std::nullopt;
 
   std::optional<uint64_t> bytes[static_cast<int>(Region::count)] = {};
   if (s.direct || s.k <= 1) {
@@ -54,8 +91,8 @@ std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s) {
     bytes[static_cast<int>(Region::RA)] = product(g, s.b, s.m, k_hat);
     bytes[static_cast<int>(Region::RB)] = product(g, s.b, n_hat, k_hat);
     bytes[static_cast<int>(Region::W)] = product(N, s.b, s.m, n_hat);
-    for (const auto& x : bytes)
-      if (!x) return std::nullopt;
+    for (int r = 0; r <= static_cast<int>(Region::W); ++r)  // PA, PB: HWGEMM only
+      if (!bytes[r]) return std::nullopt;
   }
   // v1.2 IMD_VEC_RESIDENT: the vectors are plan memory; still sized above, so an
   // overflowing vec is INVALID_VALUE in both modes (the plan would need those bytes).
@@ -67,17 +104,7 @@ std::optional<WorkspaceLayout> workspace_layout(const WorkspaceShape& s) {
   if (s.packed & 2)
     for (const Region r : {Region::sB, Region::fB, Region::RB}) bytes[static_cast<int>(r)] = std::nullopt;
 
-  uint64_t off = 0;
-  for (int r = 0; r < static_cast<int>(Region::count); ++r) {
-    if (!bytes[r] || *bytes[r] == 0) continue;  // absent (regions are never empty here)
-    L.offset[r] = off;
-    L.bytes[r] = *bytes[r];
-    uint64_t aligned = 0;
-    if (!align_u64(*bytes[r], kAlign, &aligned) || !add_u64(off, aligned, &off))
-      return std::nullopt;
-  }
-  L.total = off;
-  return L;
+  return place(bytes);
 }
 
 }  // namespace imd::detail

@@ -51,7 +51,7 @@ STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT
 # imd_lowering_t.pack_mismatch reasons (IMD_PACK_MISMATCH_*, DESIGN v1.7 §6b.5)
 PACK_MISMATCH = ["NONE", "FORMAT", "MODULI", "ROUNDING", "CLASSES", "EXTENTS", "STRIDES", "ORDER"]
 _ORDER = {"AUTO": 0, "GIVEN": 1}
-REGIONS = ["sA", "sB", "fA", "fB", "vec", "RA", "RB", "W"]
+REGIONS = ["sA", "sB", "fA", "fB", "vec", "RA", "RB", "W", "PA", "PB"]
 DISPATCH = ["NOOP", "EMULATE", "DIRECT", "SCALE", "HWGEMM"]  # HWGEMM: host API 15
 _ROUNDING = {"RN": 0, "TRUNC": 1}
 _MODE = {"EMULATE": 0, "DIRECT": 1, "HWGEMM": 2}  # HWGEMM: host API 15 (DESIGN §6i)

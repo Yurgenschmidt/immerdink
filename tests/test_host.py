@@ -120,11 +120,11 @@ class Direct:
         return st, out.value
 
     def layout(self, descs, opts):
-        buf = (C.c_uint64 * 16)()
+        buf = (C.c_uint64 * 20)()
         cnt, tot = C.c_int32(0), C.c_size_t(0)
-        st = self.lib.imd_workspace_layout(*self._args(descs, opts), buf, C.c_int32(8),
+        st = self.lib.imd_workspace_layout(*self._args(descs, opts), buf, C.c_int32(10),
                                            C.byref(cnt), C.byref(tot))
-        return st, tot.value, [(buf[2 * r], buf[2 * r + 1]) for r in range(8)]
+        return st, tot.value, [(buf[2 * r], buf[2 * r + 1]) for r in range(10)]
 
     def plan_bytes(self, descs, opts):
         d, h = C.c_size_t(0), C.c_size_t(0)
@@ -163,12 +163,12 @@ class Direct:
 
     def layout_packed(self, descs, opts, packing):
         pk, keep = self._packing(packing)
-        buf = (C.c_uint64 * 16)()
+        buf = (C.c_uint64 * 20)()
         cnt, tot = C.c_int32(0), C.c_size_t(0)
         st = self.lib.imd_workspace_layout_packed(*self._args(descs, opts), pk, buf,
-                                                  C.c_int32(8), C.byref(cnt), C.byref(tot))
+                                                  C.c_int32(10), C.byref(cnt), C.byref(tot))
         del keep
-        return st, tot.value, [(buf[2 * r], buf[2 * r + 1]) for r in range(8)]
+        return st, tot.value, [(buf[2 * r], buf[2 * r + 1]) for r in range(10)]
 
     def lowering(self, descs, opts, size=V7, sm_count=0, packing=None, table_id=0):
         """imd_lowering (imd_lowering_packed with `packing`) into a raw struct of `size`
@@ -436,7 +436,7 @@ def check_case(direct, descs, opts, what):
         if host.workspace_size(descs, **kw) != ws:
             raise Fail(f"{what}: wrapper workspace_size differs")
         L = host.workspace_layout(descs, **kw)
-        if L.total != lay_tot or L.regions != {host.REGIONS[r]: lay[r] for r in range(8)
+        if L.total != lay_tot or L.regions != {host.REGIONS[r]: lay[r] for r in range(10)
                                                if lay[r][1]}:
             raise Fail(f"{what}: wrapper workspace_layout differs")
     if pb_st == 0 and host.plan_bytes(descs, **kw) != (pdev, phost):
@@ -2666,6 +2666,7 @@ def suite_plan(args):
             v = list(buf)[:cnt.value]
             path, sw, m, n, k, b, nh, kh, N, g, total = v[:11]
             regs = [(v[11 + 2 * r], v[12 + 2 * r]) for r in range(8)]
+            regs += [(v[41 + 2 * r], v[42 + 2 * r]) for r in range(2)]   # PA, PB (issue #75 stage 2)
             dev, store, add, launches, hbytes, fused, kernels = v[27:34]
             cfg, k4p_cfg, sms, fused_large = v[34:38]
             _, ltot, lay = direct.layout(descs, co)
@@ -2757,6 +2758,7 @@ def suite_plan(args):
                         v = list(buf)[:cnt.value]
                         path, sw, m, n, k, b, nh, kh, NN, gg, total = v[:11]
                         regs = [(v[11 + 2 * r], v[12 + 2 * r]) for r in range(8)]
+                        regs += [(v[41 + 2 * r], v[42 + 2 * r]) for r in range(2)]   # PA, PB (issue #75 stage 2)
                         dev, store, add, launches, hbytes, fused, kernels = v[27:34]
                         fused_large, slots, pbA, pbB = v[37:41]
                         _, ltot, lay = direct.layout_packed(descs, co, specs)
