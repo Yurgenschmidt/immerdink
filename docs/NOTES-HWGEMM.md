@@ -81,7 +81,11 @@ Native FP64 is **not** correctly rounded, unlike the emulated path (DESIGN §3.7
   discriminates: the reversed-order and one-rounding-per-instruction models mismatch on
   1–74 % of outputs. CUTLASS's Sm80 8×8×4 `device::Gemm` (64×64×16, 3 stages, TN and NN, k up
   to 4097 with a partial last K tile) is bit-identical to DIRECT's chain on every output.
-  sm_90 (m16n8k4 in the Sm90 kernel) is checked by the same program in the PACE gate.
+  **Confirmed on sm_90 (H100 and H200, PACE embers/inferno, 2026-11-17)** by the same program
+  built with `-DBITID_SM90`: the m16n8k4 instruction and CUTLASS's Sm90 16×8×4 `device::Gemm`
+  equal the chain on every input family, layout and shape. cuBLAS 13.08 DGEMM was also bitwise
+  equal to CUTLASS on all gate shapes, but cuBLAS does not promise its reduction order, so this
+  is an observation, not a contract.
 - **Reproducibility.** Bit-identical run to run for the same plan, `k_slab`, tile configuration
   and binary. Slabbed results are deterministic for a fixed `k_slab` but differ from unslabbed
   ones. No split-K of any kind by default (CUTLASS's serial split-K is deterministic but breaks
@@ -191,6 +195,24 @@ the t_batch shape, TFLOPS first, plus a ~50-line register-only mma.sync loop com
 k8 and k16. Rule: if k4 reaches ≥ 95 % of the measured DMMA peak and the best d1684 kernel
 ≥ 90 % of cuBLAS on large squares, keep 16×8×4; a small-shape gap is then a tile / split-K
 question. The build is cross-compiled locally or on the compute node, never the login node.
+
+**Gate result (2026-11-17, `bench/hwgemm_gate.cu`; H100 inferno job 15791244, H200 pending).**
+The gate used a hand-written microbenchmark and CUTLASS `device::Gemm` / `GemmBatched` instead
+of `cutlass_profiler` (faster to build; same kernels).
+- Instruction (8 warps/block): m8n8k4 33.5 TFLOPS (half peak), m16n8k4 66.6, m16n8k8 67.0,
+  m16n8k16 67.2. k4 is at ≈ 99 % of k16, so **keep 16×8×4**; the Sm80 kernel on Hopper would be
+  capped at half peak, so the Sm90 kernel is required there.
+- GEMM, best CUTLASS configuration / cuBLAS: sq1024 92–93 %, sq2048 95–96 %, sq4096 95–99 %,
+  sq8192 **88–89 %** (49 vs 55 TFLOPS), t_batch 98–99 %, s_batch 96–102 %. Best tile: 128×128
+  (warp 32×64, 4 stages) from sq2048 up and on t_batch; 64×128 at sq1024; 64×64 on s_batch.
+  128×128 with 64×64 warp tiles runs at ≈ 8 TFLOPS (register spills, inferred) and is dropped.
+- **The prediction was wrong in where the gap lies:** small shapes and batches are close to
+  cuBLAS; the gap is on the largest square. Hypotheses, unmeasured: threadblock rasterization
+  (L2 reuse at 8192², the gate used CUTLASS's default identity swizzle) and a larger tile
+  (128×256 or 256×128). These are tile-rule work, not a reason to change the instruction or
+  library. **Decision (Eric, 2026-11-17): stay with CUTLASS** (order control for the DIRECT
+  bit identity and the K-slab contract, epilogue fusion for scattered C, exact workspace
+  accounting, no cuBLAS dependency).
 
 ### 4.4 Per hardware class
 

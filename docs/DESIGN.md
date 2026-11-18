@@ -5920,7 +5920,7 @@ ResultExact, NoBadStep, SlabsPartition]**
   split-K. An unslabbed HWGEMM tile (accumulator from +0, ascending K, no sliced-K) equals DIRECT
   bit for bit if DMMA is a sequential IEEE fma chain (Khattak–Mikaitis, arXiv:2512.07004):
   confirmed on sm_89 for the instruction and the CUTLASS Sm80 kernel (`bench/hwgemm_bitid.cu`,
-  NOTES-HWGEMM §3); sm_90 pending.
+  NOTES-HWGEMM §3) and on sm_90 (H100, H200) for m16n8k4 and the CUTLASS Sm90 kernel.
 - Non-finite values propagate per IEEE (tests compare NaN-ness); subnormals: a per-card test
   per DMMA instruction used.
 
