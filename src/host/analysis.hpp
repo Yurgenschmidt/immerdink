@@ -35,6 +35,7 @@ struct Analysis {
   Lowered lowered;
   WorkspaceLayout layout;
   PackedSlots packed;       // v1.7: none unless analyze_packed found packs
+  HwView hw;                // v1.21 §6i.2: HWGEMM's access view (set when the GEMM runs)
 };
 
 // imd_workspace_size's status: null arguments and options (INVALID_VALUE), the §5 legality

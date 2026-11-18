@@ -111,4 +111,29 @@ IMD_HOST_INTERNAL PackPivot pack_pivot(const Lowered& lw, int X);
 // put each group's smallest |s_C| first, so the first fused modes are compared.
 IMD_HOST_INTERNAL bool k5_batch_fastest(const Lowered& lw);
 
+// DESIGN v1.21 §6i.2 (spec/IndexMap.tla HwFm, HwAcc, HwView): IMD_HWGEMM's per-tensor access,
+// a pure function of the lowering (post-swap roles, canonical orders). X's view of a group is
+// the group's canonical label order fused over X's strides ALONE (a label X lacks has stride
+// 0 there). X's 2-D view (A: I x K, B: J x K, C: I x J) is AFFINE iff each of its two groups
+// is empty or one fused mode, both strides are >= 0 and one of them is exactly +1 (an empty
+// group is a free unit dimension). Layout: ROW (second index contiguous, ld = first stride)
+// if the second group is empty or has stride 1, else COL (first index contiguous, ld = the
+// second stride) if the first is empty or has stride 1, else (not affine) the smaller stride.
+struct HwAccess {
+  bool affine = false;
+  bool row = true;  // ROW: (r, c) at r * ld + c; COL: r + c * ld
+  int64_t ld = 0;
+};
+struct HwView {
+  HwAccess acc[3];              // post-swap A (I x K), B (J x K), C (I x J)
+  bool batch_affine = false;    // at most one fused L mode (the lowering's fusion)
+  int64_t bstride[3] = {0, 0, 0};  // that mode's stride per tensor (0 without L modes)
+  bool need_vec = true;         // a pack, C's scatter store or per-lambda offsets need vec
+  bool fully_affine() const { return !need_vec; }
+};
+IMD_HOST_INTERNAL HwView hw_view(const Lowered& lw);
+
+// §6i.6 row 5 for HWGEMM (non-empty output, k >= 2): m, n, k <= 2^31 - 1.
+IMD_HOST_INTERNAL bool hw_dims_ok(const Lowered& lw);
+
 }  // namespace imd::detail

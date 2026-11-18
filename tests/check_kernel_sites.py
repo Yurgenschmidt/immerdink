@@ -35,6 +35,11 @@ for d, _, files in os.walk(os.path.join(root, "src")):
 contract = read("src/contract.cu")
 # the checked list: the kernels named in occupancy_of(...) / versions_of(...) calls and the K5 template
 checked = {m.group(1) for m in re.finditer(r"(?:occupancy_of|versions_of)\(\s*([A-Za-z_0-9]+)", contract)}
+# DESIGN §6i.7: the HWGEMM module's own list (src/hwgemm.cu hw_kernel_versions, called from
+# extra_kernel_versions); its CUTLASS GEMMs launch inside CUTLASS (no <<< site here)
+hw = read("src/hwgemm.cu")
+if "hw_kernel_versions(index - 14" in contract:
+    checked |= {m.group(1) for m in re.finditer(r"versions_of\(\s*([A-Za-z_0-9]+)", hw)}
 checked |= {"k4_kernel"} if "k4_kernel<G, false>" in read("src/k4/k4_cfg.cuh") and \
     "cudaFuncGetAttributes(&a, store)" in read("src/k4/k4_cfg.cuh") else set()
 

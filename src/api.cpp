@@ -17,6 +17,7 @@
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink.h"
 #include "host/k4_wgmma.hpp"
+#include "hwgemm.hpp"
 #include "k4/k4_ops.hpp"
 #include "plan.hpp"
 #if defined(IMMERDINK_PROFILE) && IMMERDINK_PROFILE
@@ -231,7 +232,15 @@ imd_status_t plan_create(imd_handle_t handle, const imd_tensor_t* A, const imd_t
         return st;
       p->info.k4_config = e.k4_config;
     }
-    if (e.path != imd::detail::Path::kNoop && an.options.vec_mode == IMD_VEC_RESIDENT) {
+    if (e.path == imd::detail::Path::kHwGemm) {
+      // v1.21 §6i.7: the tile, fixed for the plan's life (reproducibility, §6i.4): the
+      // provisional rule for this device's class and SM count, or the benchmark hook.
+      e.hw_tile = imd::detail::hw_tile_override() >= 0
+                      ? imd::detail::hw_tile_override()
+                      : imd::detail::hwgemm_tile(e.m, e.n, e.b, p->info.device.cc_major, e.sms);
+    }
+    if (e.path != imd::detail::Path::kNoop && e.path != imd::detail::Path::kHwGemm &&
+        an.options.vec_mode == IMD_VEC_RESIDENT) {
       // §4 K0 v1.2 IMD_VEC_RESIDENT: build the vectors once in plan-owned device memory
       // (freed by the plan), on this thread's default stream, and wait for them.
       e.vec_resident = true;
@@ -467,6 +476,18 @@ IMD_API int imd_prof_plan_dims(imd_plan_t plan, int64_t* out) {
 IMD_API int imd_prof_plan_k4(imd_plan_t plan, int32_t* config) {
   if (plan == nullptr || config == nullptr) return 1;
   *config = plan->exec.k4 ? plan->exec.k4_config : -1;
+  return 0;
+}
+// Benchmark / test hooks (v1.21 §6i.7): the HWGEMM tile a plan runs (hwgemm.hpp HwTile; -1
+// without the HWGEMM GEMM), and the tile every later HWGEMM plan runs (-1: the rule).
+IMD_API int imd_prof_plan_hw_tile(imd_plan_t plan, int32_t* tile) {
+  if (plan == nullptr || tile == nullptr) return 1;
+  *tile = plan->exec.path == imd::detail::Path::kHwGemm ? plan->exec.hw_tile : -1;
+  return 0;
+}
+IMD_API int imd_prof_set_hw_tile(int32_t tile) {
+  if (tile < -1 || tile >= imd::detail::kHwTileCount) return 1;
+  imd::detail::hw_tile_override() = tile;
   return 0;
 }
 IMD_API int imd_prof_set_k4_config(int32_t config) {

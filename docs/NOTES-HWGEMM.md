@@ -81,6 +81,13 @@ Native FP64 is **not** correctly rounded, unlike the emulated path (DESIGN §3.7
   discriminates: the reversed-order and one-rounding-per-instruction models mismatch on
   1–74 % of outputs. CUTLASS's Sm80 8×8×4 `device::Gemm` (64×64×16, 3 stages, TN and NN, k up
   to 4097 with a partial last K tile) is bit-identical to DIRECT's chain on every output.
+  **Caveat found by the stage-1 kernel tests (2026-11-17):** the sign of a zero. The bench's
+  data never produced a −0 sum, but DIRECT can: when a negative product underflows to −0 and
+  every other term is a zero. CUTLASS zero-fills a partial K tile, so the GEMM then adds
+  +0·+0 products, and −0 + (+0) = +0. Probe (`a = [−5e−324, −0, …]`, `b = [0.25, 1, …]`):
+  DIRECT −0 at every k; HWGEMM +0 at k = 2, 4, 15, 17 and −0 at k = 16, 32 (K tile 16).
+  Subnormals are not flushed. DESIGN §6i.4 now states identity up to the sign of a zero
+  element when k mod K_t ≠ 0.
   **Confirmed on sm_90 (H100 and H200, PACE embers/inferno, 2026-11-17)** by the same program
   built with `-DBITID_SM90`: the m16n8k4 instruction and CUTLASS's Sm90 16×8×4 `device::Gemm`
   equal the chain on every input family, layout and shape. cuBLAS 13.08 DGEMM was also bitwise

@@ -1483,6 +1483,7 @@ int32_t dispatch_of(const ExecPlan& e) {
   return e.path == Path::kNoop ? IMD_DISPATCH_NOOP
          : e.k == 0            ? IMD_DISPATCH_SCALE
          : emulates(e)         ? IMD_DISPATCH_EMULATE
+         : e.path == Path::kHwGemm ? IMD_DISPATCH_HWGEMM
                                : IMD_DISPATCH_DIRECT;
 }
 
@@ -1497,6 +1498,9 @@ imd_status_t predict_contract(const imd_tensor_t* A, const imd_tensor_t* B, cons
     return st;
   ExecPlan e;
   if (const imd_status_t st = plan_data(an, &e); st != IMD_STATUS_SUCCESS) return st;
+  // v1.21 §6i.5: the HWGEMM phases and calibration classes come with the model stage (issue
+  // #75); until then a HWGEMM call has no prediction.
+  if (e.path == Path::kHwGemm) return IMD_STATUS_NOT_SUPPORTED;
   PerfPhases P;
   perf_contract_phases(an, e, q.flags, emulates(e) ? q.k4 : -1, cal, &P);
   r->dispatch = dispatch_of(e);

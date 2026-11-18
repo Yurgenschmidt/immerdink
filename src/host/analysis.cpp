@@ -18,9 +18,25 @@ namespace c = imd::constants;
 bool options_ok(const imd_options_t& o) {
   return o.num_moduli >= c::kNMin && o.num_moduli <= c::kNMax && o.residue_group >= 0 &&
          o.residue_group <= o.num_moduli && (o.rounding == IMD_RN || o.rounding == IMD_TRUNC) &&
-         (o.mode == IMD_EMULATE || o.mode == IMD_DIRECT) &&
+         (o.mode == IMD_EMULATE || o.mode == IMD_DIRECT || o.mode == IMD_HWGEMM) &&
          (o.vec_mode == IMD_VEC_GENERATE || o.vec_mode == IMD_VEC_RESIDENT) &&
          (o.k4_tune == IMD_K4_TUNE_OFF || o.k4_tune == IMD_K4_TUNE_ON);
+}
+
+// v1.21 §6i: the HWGEMM GEMM runs (HWGEMM mode, non-empty output, k >= 2).
+bool hw_runs(const imd_options_t& o, const Lowered& lw) {
+  return o.mode == IMD_HWGEMM && !lw.empty_output() && lw.k >= 2;
+}
+
+// The §4a layout of an analysis (packed: §6b.6 roles). HWGEMM (§6i.2, spec IndexMap HwCells):
+// a fully affine call has no workspace (analyze rejects the others in this stage); NOOP,
+// SCALE and K-empty calls size as in DIRECT.
+std::optional<WorkspaceLayout> mode_layout(const Analysis& an, int32_t packed) {
+  const Lowered& lw = an.lowered;
+  if (hw_runs(an.options, lw)) return WorkspaceLayout{};
+  return workspace_layout({lw.m, lw.n, lw.k, lw.b, an.options.num_moduli,
+                           an.options.residue_group, an.options.mode != IMD_EMULATE,
+                           an.options.vec_mode == IMD_VEC_RESIDENT, packed, an.k_align});
 }
 
 // Little-endian multi-word unsigned integers for the plan-time constants of §3.2.
@@ -108,11 +124,15 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
   // v1.13 §4b.5: the one resolution of A for this analysis, from the API call's one hook
   // snapshot `sel`; passed explicitly from here on.
   out->k_align = sel.of(lw.k);
-  const auto layout = workspace_layout({lw.m, lw.n, lw.k, lw.b, out->options.num_moduli,
-                                        out->options.residue_group,
-                                        out->options.mode == IMD_DIRECT,
-                                        out->options.vec_mode == IMD_VEC_RESIDENT, 0,
-                                        out->k_align});
+  // v1.21 §6i.6 row 5 for HWGEMM, then its access view (§6i.2). Stage 1 (issue #75) runs
+  // fully affine calls only: a packed operand, a scattered C or a multi-mode batch is
+  // NOT_SUPPORTED until the FP64 pack stage.
+  if (hw_runs(out->options, lw)) {
+    if (!hw_dims_ok(lw)) return IMD_STATUS_INVALID_VALUE;
+    out->hw = hw_view(lw);
+    if (!out->hw.fully_affine()) return IMD_STATUS_NOT_SUPPORTED;
+  }
+  const auto layout = mode_layout(*out, 0);
   if (!layout) return IMD_STATUS_INVALID_VALUE;
   if (layout->total > SIZE_MAX) return IMD_STATUS_INVALID_VALUE;
   out->layout = *layout;
@@ -150,11 +170,7 @@ imd_status_t match_packs(const imd_tensor_t* A, const imd_tensor_t* B,
   }
   // §6b.6: the workspace without sX, fX, RX of the packed roles (no overflow: the in-line
   // layout of the same shape fitted).
-  const auto layout = workspace_layout({lw.m, lw.n, lw.k, lw.b, out->options.num_moduli,
-                                        out->options.residue_group,
-                                        out->options.mode == IMD_DIRECT,
-                                        out->options.vec_mode == IMD_VEC_RESIDENT, ps.role,
-                                        out->k_align});
+  const auto layout = mode_layout(*out, ps.role);
   if (!layout) return IMD_STATUS_INVALID_VALUE;
   out->layout = *layout;
   const auto mismatch = [&](int32_t reason) {
@@ -303,8 +319,10 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
   e.trunc = !rn;
   e.layout = an.layout;
   e.path = lw.empty_output()                                ? Path::kNoop
-           : (an.options.mode == IMD_DIRECT || lw.k == 1) ? Path::kDirect
+           : hw_runs(an.options, lw)                       ? Path::kHwGemm
+           : (an.options.mode != IMD_EMULATE || lw.k <= 1) ? Path::kDirect
                                                           : Path::kGemm;
+  e.hw = an.hw;
   // v1.13 §4b.5: A from the analysis (resolved once), for a plan with residue rows; 16 for
   // NOOP, SCALE (k = 0), DIRECT and K-empty, whatever the hook says.
   e.k_align = emulates(e) ? an.k_align : kKAlign16;
@@ -341,7 +359,7 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
     // padded row, so KF writes the zeros [k, k_hat). Unreachable (kf_lg_tk rounds up).
     if (e.fused && (int64_t{1} << kf_lg_tk(e.k_hat)) < e.k_hat) return IMD_STATUS_INVALID_VALUE;
   }
-  if (e.path != Path::kNoop) {
+  if (e.path != Path::kNoop && e.path != Path::kHwGemm) {  // HWGEMM stage 1: no vectors
     // §5 step 10 (v1.2): the fused-mode descriptor K0 generates the vectors from.
     e.vec_count = scatter_vector_count(lw);
     for (int g = 0; g < 4; ++g) {
@@ -363,6 +381,10 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
 int64_t plan_launches(const ExecPlan& e, bool fused, int32_t fused_large, bool resident,
                       int64_t k4_launches) {
   if (e.path == Path::kNoop) return 0;
+  if (e.path == Path::kHwGemm) {  // §6i.6: one GEMM per chunk of 65535 batches x 65535*64 columns
+    const int64_t cols = e.hw.acc[2].row ? e.n : e.m;  // hwgemm.cu: C column-major -> C^T
+    return ((e.b + 65534) / 65535) * ((cols + 65535 * 64 - 1) / (65535 * 64));
+  }
   const int64_t k0 = resident ? 0 : 1;
   if (!emulates(e)) return k0 + 1;  // DIRECT, K-empty or k = 0: K0 + one kernel
   const int64_t groups = (e.N + e.g - 1) / e.g;

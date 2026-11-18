@@ -27,7 +27,7 @@ extern "C" {
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
  * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 14 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+#define IMD_HOST_API_VERSION 15 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
@@ -64,7 +64,10 @@ extern "C" {
                                   14: device classes and per-GPU table sets (issue 18, docs/NOTES-18.md):
                                       imd_device_class_t, imd_device_select, imd_device_select_rows,
                                       imd_kernel_code_kind, imd_plan_status_of, *_name functions,
-                                      IMD_TABLE_*, imd_lowering_t table_id (v7) */
+                                      IMD_TABLE_*, imd_lowering_t table_id (v7);
+                                  15: the hardware GEMM mode (§6i v1.21, issue #75): IMD_HWGEMM,
+                                      IMD_DISPATCH_HWGEMM (first stage: fully affine calls;
+                                      the others are NOT_SUPPORTED until the pack stage) */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -82,9 +85,11 @@ typedef enum {
                                   the plan's packed slots */
 } imd_status_t;
 
-/* Options: rounding (§3.3) and mode (§4 DIRECT path). */
+/* Options: rounding (§3.3) and mode (§4 DIRECT path, §6i hardware GEMM). IMD_HWGEMM (v15):
+ * the device's own FP64 GEMM arithmetic (tensor cores where it has them); num_moduli,
+ * residue_group and rounding are checked but unused, as in DIRECT. */
 enum { IMD_RN = 0, IMD_TRUNC = 1 };
-enum { IMD_EMULATE = 0, IMD_DIRECT = 1 };
+enum { IMD_EMULATE = 0, IMD_DIRECT = 1, IMD_HWGEMM = 2 };
 /* Where the scatter vectors live (DESIGN v1.2 §4 K0, §4a, §6):
  *   IMD_VEC_GENERATE  (default) generated on the device by every imd_contract into the
  *                     workspace; the plan owns no device or pinned memory;
@@ -119,7 +124,7 @@ typedef struct {
   int32_t num_moduli;    /* N, 2..20                        */
   int32_t residue_group; /* g, 0 = N; the workspace/speed knob (§4a, §6a) */
   int32_t rounding;      /* IMD_RN (default) | IMD_TRUNC     */
-  int32_t mode;          /* IMD_EMULATE | IMD_DIRECT         */
+  int32_t mode;          /* IMD_EMULATE | IMD_DIRECT | IMD_HWGEMM (v15) */
   int32_t vec_mode;      /* IMD_VEC_GENERATE (0) | IMD_VEC_RESIDENT (v1.2) */
   int32_t k4_tune;       /* IMD_K4_TUNE_OFF (0) | IMD_K4_TUNE_ON (v1.5)     */
 } imd_options_t;
@@ -184,10 +189,12 @@ IMD_API imd_status_t imd_plan_bytes(const imd_tensor_t* A, const imd_tensor_t* B
  *   NOOP     empty output (b m n = 0): nothing;
  *   EMULATE  the emulated pipeline K0-K5 (EMULATE mode, k >= 2);
  *   DIRECT   K0 and the native FP64 kernel (DIRECT mode, or K-empty: k = 1);
- *   SCALE    k = 0 (a zero-extent contracted label): K0 and one kernel, C <- beta C.
+ *   SCALE    k = 0 (a zero-extent contracted label): K0 and one kernel, C <- beta C;
+ *   HWGEMM   (v15) HWGEMM mode, k >= 2: the hardware FP64 GEMM (§6i); a fully affine call
+ *            is one GEMM launch per <= 65535 batches and needs no workspace.
  * (A call with alpha = 0 also runs only K0 and the beta kernel; that is per call.) */
 enum { IMD_DISPATCH_NOOP = 0, IMD_DISPATCH_EMULATE = 1, IMD_DISPATCH_DIRECT = 2,
-       IMD_DISPATCH_SCALE = 3 };
+       IMD_DISPATCH_SCALE = 3, IMD_DISPATCH_HWGEMM = 4 };
 
 /* The lowering summary (§5 GEMM view, §4 dispatch and launch structure, §4a sizes), the
  * input of a later performance model. Versioned by struct_size (§6a): the caller sets

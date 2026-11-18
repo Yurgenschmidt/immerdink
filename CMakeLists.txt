@@ -190,8 +190,11 @@ message(STATUS "Hopper wgmma K4 backend: ${IMD_K4_WGMMA_ENABLED} (IMMERDINK_K4_W
 # Test-only hooks (src/test_hooks.cpp: launch-limit override, lowering dump) are built only
 # with IMMERDINK_BUILD_TESTS=ON, and the benchmark phase marks (src/profile.cpp) only with
 # IMMERDINK_PROFILE=ON; a production build exports neither.
+# v1.21 (§6i): the hardware GEMM mode's dispatcher (hwgemm.cu) and its CUTLASS FP64 kernels,
+# one file per architecture family (src/hwgemm/).
 add_library(immerdink SHARED src/api.cpp src/device_state.cpp src/contract.cu src/gemm_k4.cu
-  src/k4/k4_cfg0.cu src/k4/k4_cfg1.cu src/k4/k4_cfg2.cu src/k4/k4_cfg3.cu)
+  src/k4/k4_cfg0.cu src/k4/k4_cfg1.cu src/k4/k4_cfg2.cu src/k4/k4_cfg3.cu
+  src/hwgemm.cu src/hwgemm/hw_sm80.cu src/hwgemm/hw_sm90.cu)
 if(IMD_K4_WGMMA_ENABLED)
   # The wgmma instructions exist in sm_90a code only (not in "90"): the kernels are compiled for 90a-real in an object library of
   # their own and linked into libimmerdink, whatever architectures the rest is built for. On any other device the image is simply

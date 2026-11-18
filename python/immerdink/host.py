@@ -52,9 +52,9 @@ STATUS = ["SUCCESS", "INVALID_VALUE", "NOT_SUPPORTED", "ALIASING", "INSUFFICIENT
 PACK_MISMATCH = ["NONE", "FORMAT", "MODULI", "ROUNDING", "CLASSES", "EXTENTS", "STRIDES", "ORDER"]
 _ORDER = {"AUTO": 0, "GIVEN": 1}
 REGIONS = ["sA", "sB", "fA", "fB", "vec", "RA", "RB", "W"]
-DISPATCH = ["NOOP", "EMULATE", "DIRECT", "SCALE"]
+DISPATCH = ["NOOP", "EMULATE", "DIRECT", "SCALE", "HWGEMM"]  # HWGEMM: host API 15
 _ROUNDING = {"RN": 0, "TRUNC": 1}
-_MODE = {"EMULATE": 0, "DIRECT": 1}
+_MODE = {"EMULATE": 0, "DIRECT": 1, "HWGEMM": 2}  # HWGEMM: host API 15 (DESIGN §6i)
 _VEC = {"GENERATE": 0, "RESIDENT": 1}
 K4_CONFIGS = ["128x256", "128x128", "64x128", "64x64"]  # IMD_K4_* tiles (DESIGN v1.5 §4)
 # Performance model (DESIGN v1.8 §6c): IMD_PERF_CLASS_* key prefixes, IMD_PERF_PHASE_* names
@@ -574,7 +574,7 @@ def _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing=N
 
 # ------------------------------------------------------------------------------------------
 # Queries (DESIGN §6a). Options: N (2..20), g (1..N; 0 = N), rounding "RN" | "TRUNC",
-# mode "EMULATE" | "DIRECT", vec_mode "GENERATE" | "RESIDENT".
+# mode "EMULATE" | "DIRECT" | "HWGEMM", vec_mode "GENERATE" | "RESIDENT".
 
 def workspace_size(spec, extents=None, *, strides=None, N, g=0, rounding="RN",
                    mode="EMULATE", vec_mode="GENERATE", packing=None, lib=None):

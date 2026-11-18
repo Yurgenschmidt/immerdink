@@ -176,8 +176,10 @@ imd_status_t lowering_impl(const imd_tensor_t* A, const imd_tensor_t* B, const i
     r.dispatch = e.path == Path::kNoop        ? IMD_DISPATCH_NOOP
                  : e.k == 0                   ? IMD_DISPATCH_SCALE
                  : imd::detail::emulates(e)   ? IMD_DISPATCH_EMULATE
+                 : e.path == Path::kHwGemm    ? IMD_DISPATCH_HWGEMM
                                               : IMD_DISPATCH_DIRECT;
-    if (e.path != Path::kNoop) r.vec_entries = imd::detail::scatter_vector_count(lw);
+    if (e.path != Path::kNoop && e.path != Path::kHwGemm)  // v1.21: fully affine HWGEMM has none
+      r.vec_entries = imd::detail::scatter_vector_count(lw);
     if (r.dispatch == IMD_DISPATCH_EMULATE) {
       r.num_groups = (e.N + e.g - 1) / e.g;
       const imd::detail::K4Counts kc =

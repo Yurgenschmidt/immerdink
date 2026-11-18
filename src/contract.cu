@@ -29,6 +29,7 @@
 #include "device/constants.cuh"
 #include "host/analysis.hpp"  // kFusedKHatMax
 #include "host/seq_config.hpp"
+#include "hwgemm.hpp"
 #include "kernels/numerics.cuh"
 #include "kernels/pack_emitter.cuh"
 #include "plan.hpp"
@@ -2507,6 +2508,20 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
                               double beta, double* C, void* ws, cudaStream_t stream,
                               const void* const* packed) {
   if (p.path == Path::kNoop) return IMD_STATUS_SUCCESS;
+  if (p.path == Path::kHwGemm) {  // v1.21 §6i (stage 1: fully affine, no workspace, no K0)
+    HwGemmCall hc;
+    hc.m = p.m, hc.n = p.n, hc.k = p.k, hc.b = p.b;
+    hc.A = {A, p.hw.acc[0].ld, p.hw.acc[0].row, p.hw.bstride[0]};
+    hc.B = {B, p.hw.acc[1].ld, p.hw.acc[1].row, p.hw.bstride[1]};
+    hc.C = C, hc.ldc = p.hw.acc[2].ld, hc.c_j_contig = p.hw.acc[2].row;
+    hc.c_bstride = p.hw.bstride[2];
+    hc.alpha = alpha, hc.beta = beta;
+    hc.tile = p.hw_tile;
+    IMD_PROF(stream, "begin");
+    const imd_status_t st = alpha == 0.0 ? hwgemm_beta(hc, stream) : hwgemm_enqueue(hc, stream);
+    IMD_PROF(stream, alpha == 0.0 ? "HWGEMM beta-only" : "HWGEMM gemm");
+    return st;
+  }
   // v1.13 §4b.5 (hygiene): the K4 operand-pointer check (debug builds, test hook) of the whole
   // call, before anything is queued: a violation fails the call with nothing launched.
   K4Operands k4o{};
@@ -2859,6 +2874,7 @@ cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) 
     case 11: return versions_of(k23_pack_cap<2, 1>, binary, ptx);  // issue 21: the E1 K2/K3 instance held to 4 CTAs per SM
     case 12: return k5f_versions<true>(binary, ptx);   // issue 23: the k5fin K5 kernels (one n and one batch-fastest instance; same module as the shipped K5)
     case 13: return k5f_versions<false>(binary, ptx);
+    case 14: case 15: case 16: return hw_kernel_versions(index - 14, binary, ptx);  // DESIGN §6i.7
     default: return cudaErrorInvalidValue;
   }
 }

@@ -5875,7 +5875,7 @@ calibration, which is per card (issue 23); for a borrowed table set the plan is 
 **6h.6 Limits.** At most `IMD_K4_CONFIG_COUNT` = 4 K4 configurations, each with launch parameters within
 `kK4BlobBytes` = 256 bytes. **Build.** `IMMERDINK_CUDA_ARCHS`, `IMMERDINK_EMBED_PTX` (CMakeLists.txt).
 
-### 6i. Hardware GEMM mode `IMD_HWGEMM` (FP64 tensor cores first) **[v1.21: design stage; issue #75]**
+### 6i. Hardware GEMM mode `IMD_HWGEMM` (FP64 tensor cores first) **[v1.21; issue #75: stage 1 implemented]**
 
 *What and why.* On Hopper the FP64 tensor cores (DMMA) reach about 67 TFLOPS, and native DGEMM
 beats every emulator, immerdink included, by 1.7–1.9× on small and batched shapes. `IMD_HWGEMM`
@@ -5884,8 +5884,17 @@ runs a contraction as native FP64 tensor-core GEMMs over the same lowering (§5)
 reports the cost of each choice (§6i.5) and never switches modes itself. Full reasoning, the
 review record and the predictions: docs/NOTES-HWGEMM.md.
 
-**6i.1 Dispatch.** NOOP (b·m·n = 0), SCALE (k = 0 or α = 0: the β-only kernel, once), DIRECT
-(K-empty, k = 1), else HWGEMM. Int8 packs: accepted and ignored, exactly as DIRECT (§6b).
+*Implementation stages.* Stage 1 (host API 15): the mode, its dispatch and fully affine calls
+(both operands in place, an affine C, at most one fused batch mode): workspace 0, one GEMM
+launch per chunk (§6i.6), no K0. Every other HWGEMM call is NOT_SUPPORTED (`imd_workspace_size`
+and plan creation) until stage 2 (the FP64 packs, the scattered C store and per-λ offsets).
+`k_slab`, the `imd_options_t` additions and the performance model (§6i.3, §6i.5) are later
+stages; until then `imd_perf_predict` returns NOT_SUPPORTED for a HWGEMM call. Code:
+`src/hwgemm.cu`, `src/hwgemm/`; tests: `tests/test_hwgemm.py` (bit-exact against DIRECT).
+
+**6i.1 Dispatch.** NOOP (b·m·n = 0), SCALE (k = 0 or α = 0: the β-only kernel, once; on a
+fully affine call, which has no scatter vectors, a strided β-only kernel with the same
+operations), DIRECT (K-empty, k = 1), else HWGEMM. Int8 packs: accepted and ignored, exactly as DIRECT (§6b).
 The RN κ policy (§3.2) does not apply. **[spec: IndexMap]**
 
 **6i.2 Operand access.** Per post-swap operand X, a pure function of the lowering, reported in
@@ -5920,7 +5929,19 @@ ResultExact, NoBadStep, SlabsPartition]**
   split-K. An unslabbed HWGEMM tile (accumulator from +0, ascending K, no sliced-K) equals DIRECT
   bit for bit if DMMA is a sequential IEEE fma chain (Khattak–Mikaitis, arXiv:2512.07004):
   confirmed on sm_89 for the instruction and the CUTLASS Sm80 kernel (`bench/hwgemm_bitid.cu`,
-  NOTES-HWGEMM §3) and on sm_90 (H100, H200) for m16n8k4 and the CUTLASS Sm90 kernel.
+  NOTES-HWGEMM §3) and on sm_90 (H100, H200) for m16n8k4 and the CUTLASS Sm90 kernel,
+  **except possibly the sign of a zero element of D when k mod K_t ≠ 0** (K_t: the kernel's K
+  tile, 16 for every stage-1 configuration). CUTLASS zero-fills the K residue, so the tile adds
+  +0·+0 products, and x + (+0) = x for every x except −0 + (+0) = +0. DIRECT (which starts from
+  +0) returns −0 only when a negative product underflows to −0 and every other term is a zero
+  too. After §3.7's α / β the difference stays confined to zero elements of C (fma(β, C, E)
+  carries E's zero sign only when β·C is a zero). Measured on sm_89 (stage-1 tests: −0 kept at
+  k = 16, 32; +0 at k = 2, 4, 15, 17); not yet probed on sm_90. Tests compare bits with
+  NaN == NaN and +0 == −0 (`tests/test_hwgemm.py` counts the zero-sign differences). Slabs
+  (`k_slab` quantized to K_t) leave a residue in the last slab only. Later, where an operand is
+  packed (stage 2), the pack can pad A's K tail with −0.0 and B's with +0.0 and the GEMM run on
+  k rounded up to K_t: x + (−0) = x for every x, so that path is exact at no cost (independent
+  review, 2026-11-17).
 - Non-finite values propagate per IEEE (tests compare NaN-ness); subnormals: a per-card test
   per DMMA instruction used.
 
@@ -5928,7 +5949,7 @@ ResultExact, NoBadStep, SlabsPartition]**
 from `libimmerdink_host`, GPU-free, through the existing fields: exact `workspace_bytes`,
 `plan_device_bytes`, `total_bytes` against `budget_bytes`; `time_s` with its interval and
 power; `flops_eq` = 2bmnk and `tflops_eq`; `err_bound` (γ_k, L7 form with slabs); dispatch
-`IMD_DISPATCH_NATIVE`. Changes, by the independent review of 2026-11-16:
+`IMD_DISPATCH_HWGEMM` (= 4, host API 15). Changes, by the independent review of 2026-11-16:
 - `imd_options_t` gains `int64_t k_slab`, plus `struct_size`, `dtype` and `compute` (§6i.8): an
   **ABI break** (the struct has no struct_size today), the last one for this struct;
 - HWGEMM phases are one per kind with `launches` = S (K0, HWGEMM_PACK_A, HWGEMM_PACK_B,
@@ -5942,14 +5963,22 @@ power; `flops_eq` = 2bmnk and `tflops_eq`; `err_bound` (γ_k, L7 form with slabs
 Workspace exactness for HWGEMM joins `cert_workspace`.
 
 **6i.6 Limits.** m, n ≤ 2³¹ − 1 and k (or `k_slab`) ≤ 2³¹ − 1 per GEMM (CUTLASS GemmCoord;
-INVALID_VALUE, like row 5);
-n-tiles ≤ 65535 on grid.y (or swap); batch chunks of ≤ 65535 on grid.z. **[spec: IndexMap]**
+INVALID_VALUE, like row 5). Launch chunks: batches in chunks of ≤ 65535 (grid.z) and C's
+columns (after the C^T swap of a column-major C) in chunks of 65535 · 64 (≤ 65535 tiles on
+grid.y for every tile width), so `kernel_launches` = ⌈b / 65535⌉ · ⌈cols / (65535 · 64)⌉
+whatever the tile. **[spec: IndexMap]**
 
-**6i.7 Kernels per device class.** CUTLASS 2.x FP64 tensor-op GEMMs: `arch::Sm90` 16×8×4 on
-sm_90 (and sm_120 if it compiles there), `arch::Sm80` 8×8×4 on sm_80 / sm_89 (a different
-kernel). Only sm_90 is tuned (a per-shape tile rule) and calibrated; the others are for
-correctness. Gate before kernel tuning: one embers session comparing CUTLASS's d1684 kernels with
-cuBLAS (NOTES-HWGEMM §4.3).
+**6i.7 Kernels per device class.** CUTLASS 2.x FP64 tensor-op GEMMs (`GemmUniversal`, batched
+mode, identity swizzle, alignment 1) with the library's own epilogue operator (§3.7 store_out,
+not LinearCombination): `arch::Sm90` 16×8×4 on cc ≥ 9 (when the kernels carry sm_90+ code:
+`ptxVersion` ≥ 90), `arch::Sm80` 8×8×4 on sm_80 / sm_89 (a different kernel). One instantiation
+per (tile, A layout, B layout); C is always row-major in the kernel (a column-major C runs as
+C^T = B^T A^T, the same K order). Tiles on sm_90: 128×128 (warp 32×64), 64×128 (warp 32×64),
+64×64 (warp 32×32), 4 stages; sm_80 / sm_89: 64×64 only (correctness, not tuned). The tile is
+fixed at plan creation (reproducibility): the provisional rule `hwgemm_tile` (64×64 when m or n
+≤ 64; 64×128 when 128×128 tiles would fill fewer than half the SMs; else 128×128), fitted to
+the six gate shapes, or the benchmark hook `imd_prof_set_hw_tile`. The per-shape rule is the
+tuning stage's deliverable. Gate (NOTES-HWGEMM §4.3): passed on H100 except sq8192 (89 %).
 
 **6i.8 Element types.** v1 is FP64. The mode names the arithmetic source, not the type: a later
 FP32 is the same mode with `dtype = IMD_F32` and a `compute` choice (FP32-accurate by default:

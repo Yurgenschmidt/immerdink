@@ -315,7 +315,8 @@ def tensors():
     # Options.
     for name, (N, g, rnd, mode) in (("N1", (1, 0, RN, EMULATE)), ("N21", (21, 0, RN, EMULATE)),
                                     ("g_neg", (9, -1, RN, EMULATE)), ("g_big", (9, 10, RN, EMULATE)),
-                                    ("rounding2", (9, 0, 2, EMULATE)), ("mode2", (9, 0, RN, 2))):
+                                    ("rounding2", (9, 0, 2, EMULATE)), ("mode3", (9, 0, RN, 3)),
+                                    ("mode_neg", (9, 0, RN, -1))):  # mode 2 = IMD_HWGEMM (API 15)
         add(f"opt_{name}", *matrix(5, 6, 7, 1), N=N, g=g, rnd=rnd, mode=mode, want=(INVALID,))
     add("opt_vec2", *matrix(5, 6, 7, 1), N=9, vec=2, want=(INVALID,))
     add("opt_vec_neg", *matrix(5, 6, 7, 1), N=9, vec=-1, want=(INVALID,))

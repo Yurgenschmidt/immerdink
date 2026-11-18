@@ -136,6 +136,7 @@
 #include "host/index_map.hpp"
 #include "host/k4_wgmma.hpp"
 #include "host/seq_config.hpp"
+#include "hwgemm.hpp"
 #include "k4/hopper/k4_wgmma_ops.hpp"
 #include "plan.hpp"
 
@@ -414,6 +415,21 @@ IMD_API int imd_test_kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out)
       (kernel >= IMD_PERF_KERNEL_K4 && kernel < IMD_PERF_KERNEL_K5))
     return 1;
   return imd::detail::kernel_occupancy_w(kernel, w, out) == cudaSuccess ? 0 : 1;
+}
+
+
+// IMD_HWGEMM (DESIGN v1.21 §6i.7): the tile a plan runs (hwgemm.hpp HwTile; -1 when the plan
+// has no HWGEMM GEMM) and the tile every later HWGEMM plan runs (-1: the rule). Twins of the
+// IMMERDINK_PROFILE hooks imd_prof_plan_hw_tile / imd_prof_set_hw_tile (tests/test_hwgemm.py).
+IMD_API int imd_test_plan_hw_tile(imd_plan_t plan, int32_t* tile) {
+  if (plan == nullptr || tile == nullptr) return 1;
+  *tile = plan->exec.path == imd::detail::Path::kHwGemm ? plan->exec.hw_tile : -1;
+  return 0;
+}
+IMD_API int imd_test_set_hw_tile(int32_t tile) {
+  if (tile < -1 || tile >= imd::detail::kHwTileCount) return 1;
+  imd::detail::hw_tile_override() = tile;
+  return 0;
 }
 
 }  // extern "C"
