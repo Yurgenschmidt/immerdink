@@ -46,7 +46,8 @@ std::optional<uint64_t> vec_bytes(int64_t m, int64_t n, int64_t k, int64_t b) {
 
 std::optional<WorkspaceLayout> hw_workspace_layout(const HwWorkspaceShape& s) {
   if (s.b == 0 || s.m == 0 || s.n == 0) return WorkspaceLayout{};
-  const uint64_t k_hat = (static_cast<uint64_t>(s.k) + (kHwQ - 1)) / kHwQ * kHwQ;  // k < 2^63
+  const int64_t len = s.slab > 0 && s.slab < s.k ? s.slab : s.k;  // one slab's K extent
+  const uint64_t k_hat = (static_cast<uint64_t>(len) + (kHwQ - 1)) / kHwQ * kHwQ;  // < 2^63
   std::optional<uint64_t> bytes[static_cast<int>(Region::count)] = {};
   // Sized whenever needed, even when resident: an overflowing vec is INVALID_VALUE either way.
   if (s.need_vec) {

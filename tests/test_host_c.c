@@ -34,19 +34,42 @@ int main(void) {
   const int64_t eC[3] = {17, 33, 3}, sC[3] = {99, 3, 1};
   const int32_t lA[3] = {1, 3, 4}, lB[3] = {3, 2, 4}, lC[3] = {1, 2, 4};
   const imd_tensor_t A = {3, eA, sA, lA}, B = {3, eB, sB, lB}, C = {3, eC, sC, lC};
-  const imd_options_t opt = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
-  const imd_options_t res = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT, IMD_K4_TUNE_OFF};
+  const imd_options_t opt = {sizeof(imd_options_t), 9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
+  const imd_options_t res = {sizeof(imd_options_t), 9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_RESIDENT, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
 
   CHECK(imd_host_api_version() == IMD_HOST_API_VERSION);
   CHECK(sizeof(imd_lowering_t) == 200 && IMD_HOST_API_VERSION >= 14);
   CHECK(offsetof(imd_lowering_t, k_align) == 184 && offsetof(imd_lowering_t, reserved6) == 188);
   CHECK(IMD_PACK_FORMAT_A16 == 1 && IMD_PACK_FORMAT_A64 == 2 && IMD_PACK_FORMAT == 2);
-  CHECK(sizeof(imd_options_t) == 24);
+  CHECK(sizeof(imd_options_t) == 48);  /* host API 16 */
   CHECK(sizeof(imd_pack_desc_t) == 72 && sizeof(imd_pack_layout_t) == 136);
 
   size_t bytes = 0;
   CHECK(imd_workspace_size(&A, &B, &C, &opt, &bytes) == IMD_STATUS_SUCCESS);
   CHECK(bytes == 30720);
+  { /* host API 16 (DESIGN §6i.5): options read through struct_size */
+    struct { imd_options_t o; int64_t later[2]; } big;
+    imd_options_t o = opt;
+    o.struct_size = 24; /* a version-15 caller: its first field is num_moduli */
+    CHECK(imd_workspace_size(&A, &B, &C, &o, &bytes) == IMD_STATUS_INVALID_VALUE);
+    o = opt, o.dtype = 1;
+    CHECK(imd_workspace_size(&A, &B, &C, &o, &bytes) == IMD_STATUS_NOT_SUPPORTED);
+    o = opt, o.compute = 1;
+    CHECK(imd_workspace_size(&A, &B, &C, &o, &bytes) == IMD_STATUS_NOT_SUPPORTED);
+    o = opt, o.reserved0 = 1;
+    CHECK(imd_workspace_size(&A, &B, &C, &o, &bytes) == IMD_STATUS_INVALID_VALUE);
+    o = opt, o.k_slab = 16; /* k_slab outside IMD_HWGEMM */
+    CHECK(imd_workspace_size(&A, &B, &C, &o, &bytes) == IMD_STATUS_INVALID_VALUE);
+    o = opt, o.mode = IMD_HWGEMM, o.k_slab = -1;
+    CHECK(imd_workspace_size(&A, &B, &C, &o, &bytes) == IMD_STATUS_INVALID_VALUE);
+    o.k_slab = 1; /* rounds up to 16 >= k = 5: one slab */
+    CHECK(imd_workspace_size(&A, &B, &C, &o, &bytes) == IMD_STATUS_SUCCESS);
+    memset(&big, 0, sizeof big);
+    big.o = opt, big.o.struct_size = sizeof big; /* a later header, its extra fields 0 */
+    CHECK(imd_workspace_size(&A, &B, &C, &big.o, &bytes) == IMD_STATUS_SUCCESS && bytes == 30720);
+    big.later[1] = 1;
+    CHECK(imd_workspace_size(&A, &B, &C, &big.o, &bytes) == IMD_STATUS_NOT_SUPPORTED);
+  }
 
   /* §4a table: sA 102, sB 198, fA 51, fB 99, vec 952, RA 2*3*17*16, RB 2*3*48*16,
    * W 9*3*17*48, at cumulative 256-aligned offsets. */
@@ -128,8 +151,8 @@ int main(void) {
     CHECK(imd_lowering(&A, &B, &C, &opt, &l2) == IMD_STATUS_INVALID_VALUE);
     CHECK(l2.m == -7);
     /* k4_tune is validated like every option; ON changes no host query. */
-    const imd_options_t tune = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_ON};
-    const imd_options_t badt = {9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, 2};
+    const imd_options_t tune = {sizeof(imd_options_t), 9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_ON, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
+    const imd_options_t badt = {sizeof(imd_options_t), 9, 2, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, 2, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
     size_t b2 = 0;
     CHECK(imd_workspace_size(&A, &B, &C, &tune, &b2) == IMD_STATUS_SUCCESS && b2 == 30720);
     CHECK(imd_workspace_size(&A, &B, &C, &badt, &b2) == IMD_STATUS_INVALID_VALUE);
@@ -184,8 +207,8 @@ int main(void) {
     const int64_t ec[2] = {4, 16}, sc[2] = {16, 1};
     const int32_t la[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
     const imd_tensor_t a = {2, ea, sa, la}, b = {2, eb, sb, lb}, c = {2, ec, sc, lc};
-    const imd_options_t rn = {2, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
-    const imd_options_t tr = {2, 0, IMD_TRUNC, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    const imd_options_t rn = {sizeof(imd_options_t), 2, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
+    const imd_options_t tr = {sizeof(imd_options_t), 2, 0, IMD_TRUNC, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
     CHECK(imd_workspace_size(&a, &b, &c, &rn, &bytes) == IMD_STATUS_SUCCESS);
     CHECK(imd_plan_bytes(&a, &b, &c, &rn, &dev, &host) == IMD_STATUS_NOT_SUPPORTED);
     CHECK(imd_plan_bytes(&a, &b, &c, &tr, &dev, &host) == IMD_STATUS_SUCCESS);
@@ -225,7 +248,7 @@ int main(void) {
     const int64_t eb[3] = {200, 3, 2}, sb[3] = {6, 2, 1};
     const int64_t ec[3] = {1000, 3, 2}, sc[3] = {6, 2, 1};
     const imd_tensor_t a = {3, ea, sa, lA}, b = {3, eb, sb, lB}, c = {3, ec, sc, lC};
-    const imd_options_t o = {20, 7, IMD_TRUNC, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    const imd_options_t o = {sizeof(imd_options_t), 20, 7, IMD_TRUNC, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
     imd_region_t r8[IMD_REGION_COUNT];
     int32_t n8 = 0;
     size_t t8 = 0;
@@ -240,7 +263,7 @@ int main(void) {
     CHECK(imd_lowering(&a, &b, &c, &o, &lw) == IMD_STATUS_SUCCESS);
     CHECK(lw.k == 200 && lw.k_hat == 256 && lw.k_align == 64 && lw.fused == 1);
     /* DIRECT: no residue rows, A = 16 whatever k */
-    const imd_options_t d = {20, 7, IMD_TRUNC, IMD_DIRECT, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    const imd_options_t d = {sizeof(imd_options_t), 20, 7, IMD_TRUNC, IMD_DIRECT, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
     memset(&lw, 0, sizeof lw);
     lw.struct_size = sizeof lw;
     CHECK(imd_lowering(&a, &b, &c, &d, &lw) == IMD_STATUS_SUCCESS);
@@ -921,8 +944,8 @@ int main(void) {
       CHECK(c->status == IMD_STATUS_SUCCESS && c->feasible == 1);
       if (i > 0) CHECK(cand[i - 1].time_s <= c->time_s);
       CHECK(c->raw_rank == i && c->time_lo_s <= c->time_s && c->time_s <= c->time_hi_s);
-      const imd_options_t o = {c->num_moduli, c->residue_group, IMD_RN, IMD_EMULATE, c->vec_mode,
-                               IMD_K4_TUNE_OFF};
+      const imd_options_t o = {sizeof(imd_options_t), c->num_moduli, c->residue_group, IMD_RN, IMD_EMULATE, c->vec_mode,
+                               IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
       size_t ws = 0, pdev = 0;
       if (c->packed == 0) {
         CHECK(imd_workspace_size(&A, &B, &C, &o, &ws) == 0 && ws == c->workspace_bytes);

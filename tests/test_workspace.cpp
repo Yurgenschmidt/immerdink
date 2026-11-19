@@ -59,6 +59,7 @@ bool read_case(std::istream& in, Case* c) {
   for (;;) {
     in >> tok;
     if (tok == "opts") {
+      c->opts.struct_size = sizeof(imd_options_t);
       in >> c->opts.num_moduli >> c->opts.residue_group >> c->opts.rounding >> c->opts.mode >>
           c->opts.vec_mode;
     } else if (tok == "tensor") {
@@ -184,7 +185,7 @@ void check_null_arguments() {
   const int64_t e[2] = {3, 4}, eb[2] = {4, 4}, s[2] = {4, 1};
   const int32_t li[2] = {1, 3}, lb[2] = {3, 2}, lc[2] = {1, 2};
   const imd_tensor_t A{2, e, s, li}, B{2, eb, s, lb}, C{2, e, s, lc};
-  const imd_options_t o{9, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+  const imd_options_t o{sizeof(imd_options_t), 9, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
   size_t bytes = 0;
   Case c;
   c.name = "null_arguments";

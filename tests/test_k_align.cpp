@@ -62,6 +62,7 @@ struct Gemm {
 
 imd_options_t opts(int N = 9, int32_t mode = IMD_EMULATE) {
   imd_options_t o{};
+  o.struct_size = sizeof(imd_options_t);
   o.num_moduli = N;
   o.residue_group = 0;
   o.rounding = IMD_RN;

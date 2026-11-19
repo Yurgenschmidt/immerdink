@@ -5887,10 +5887,11 @@ review record and the predictions: docs/NOTES-HWGEMM.md.
 *Implementation stages.* Stage 1 (host API 15): the mode, its dispatch and fully affine calls
 (both operands in place, an affine C, at most one fused batch mode): workspace 0, one GEMM
 launch per chunk (§6i.6), no K0. Stage 2: every other call (a packed operand, a scattered C,
-a multi-mode batch), without slabs: workspace `vec`, `PA`, `PB` (§6i.2), K0 when needed, one
-FP64 pack launch per packed operand, then the own GEMM kernel (§6i.7).
-`k_slab`, the `imd_options_t` additions and the performance model (§6i.3, §6i.5) are later
-stages; until then `imd_perf_predict` returns NOT_SUPPORTED for a HWGEMM call. Code:
+a multi-mode batch): workspace `vec`, `PA`, `PB` (§6i.2), K0 when needed, one
+FP64 pack launch per packed operand, then the own GEMM kernel (§6i.7). Host API 16: the
+`imd_options_t` ABI break (`struct_size`, `dtype`, `compute`, `k_slab`; §6i.5, §6i.8) and
+K-slabs on both paths (§6i.3). The performance model (§6i.5) is the next stage; until then
+`imd_perf_predict` returns NOT_SUPPORTED for a HWGEMM call. Code:
 `src/hwgemm.cu`, `src/hwgemm/`; tests: `tests/test_hwgemm.py` (bit-exact against DIRECT).
 
 **6i.1 Dispatch.** NOOP (b·m·n = 0), SCALE (k = 0 or α = 0: the β-only kernel, once; on a
@@ -5917,10 +5918,16 @@ The RN κ policy (§3.2) does not apply. **[spec: IndexMap]**
   A fully
   affine call has workspace 0 and one launch. **[spec: IndexMap InPlaceExact, InPlaceUnitStride, HwAffineNoWs; HwGemmPipeline]**
 
-**6i.3 K-slabs.** Option `k_slab` (0 = none; quantized to the GEMM K tile; INVALID_VALUE
-outside HWGEMM). Per slab s, on one stream: the packs of slab s, then GEMM(s). Slab 0's
-epilogue uses the caller's β (β = 0: C is not read); later slabs use β = 1; α applies to each
-slab's sum. Packed regions are sized by the largest slab and reused. **[spec: HwGemmPipeline
+**6i.3 K-slabs.** Option `k_slab` (0 = none; INVALID_VALUE when negative or outside HWGEMM).
+The slab length is L = ⌈k_slab⌉₁₆ (the K tile), or k when that reaches k; slab s covers the
+canonical K positions [sL, min((s+1)L, k)), S = ⌈k/L⌉. Per slab s, on one stream: the packs of
+slab s, then GEMM(s); a fully affine call runs one GemmUniversal per slab with A and B offset
+to the slab's first K position. Slab 0's epilogue uses the caller's β (β = 0: C is not read);
+later slabs use β = 1; α applies to each slab's sum; α = 0 is the β-only kernel, once. Packed
+regions are sized by the largest slab (8·b·rows·⌈L⌉₁₆ bytes) and reused; the vectors still
+describe all of k. `kernel_launches` = K0 + S·(packs + GEMM chunks). Tests: the DIRECT slab
+chain bit for bit (`tests/test_hwgemm.py` suite slabs), exact bytes
+(`tests/test_hw_workspace.py`). **[spec: HwGemmPipeline
 ResultExact, NoBadStep, SlabsPartition]**
 
 **6i.4 Accuracy and reproducibility.**
@@ -5958,7 +5965,10 @@ from `libimmerdink_host`, GPU-free, through the existing fields: exact `workspac
 power; `flops_eq` = 2bmnk and `tflops_eq`; `err_bound` (γ_k, L7 form with slabs); dispatch
 `IMD_DISPATCH_HWGEMM` (= 4, host API 15). Changes, by the independent review of 2026-11-16:
 - `imd_options_t` gains `int64_t k_slab`, plus `struct_size`, `dtype` and `compute` (§6i.8): an
-  **ABI break** (the struct has no struct_size today), the last one for this struct;
+  **ABI break** (host API 16; the struct had no struct_size), the last one for this struct.
+  Done: `struct_size` is first; the library reads that many bytes, INVALID_VALUE below its own
+  48 (a version-15 caller passes N there), NOT_SUPPORTED for a larger struct whose extra bytes
+  are not zero, and for `dtype` ≠ `IMD_F64` or `compute` ≠ `IMD_COMPUTE_DEFAULT`;
 - HWGEMM phases are one per kind with `launches` = S (K0, HWGEMM_PACK_A, HWGEMM_PACK_B,
   HWGEMM_GEMM, call term): ≤ 5 of the frozen `IMD_PERF_MAX_PHASES`;
 - about three calibration classes (12–14 free); `peak_fp64_tc_flops_per_s` appended;

@@ -390,6 +390,121 @@ def suite_stage2(lib, cuda, rng, ab, quick, verbose, cc_major):
     return n
 
 
+def run_slab_case(lib, cuda, name, A, B, Cd, kmode, k_slab, L, alphas_betas, rng, tiles=(-1,),
+                  exact_zero=False, verbose=False):
+    """K slabs (host API 16, DESIGN §6i.3): HWGEMM with k_slab against the slab chain written
+    out with DIRECT, one plan per slab on the sub-descriptors of A and B (K mode `kmode`, one
+    per operand: its index in A and in B) from K position h0 = s L: slab 0 with the caller's
+    beta, the later slabs with beta = 1, alpha on each (alpha = 0: the beta-only call, once).
+    Bit-identical (zero signs when exact_zero). Also: workspace_size(k_slab) <= unslabbed."""
+    ia, ib = kmode
+    k = A.extent[ia]
+    st, ws = lib.workspace_size(A.t, B.t, Cd.t, 14, mode=HWGEMM, k_slab=k_slab)
+    if st != "SUCCESS":
+        raise Fail(f"{name}: workspace_size(k_slab {k_slab}) {st}")
+    st, ws1 = lib.workspace_size(A.t, B.t, Cd.t, 14, mode=HWGEMM)
+    assert st == "SUCCESS", st
+    if ws > ws1:
+        raise Fail(f"{name}: slabbed workspace {ws} > unslabbed {ws1}")
+    slabs = []
+    for h0 in range(0, k, L):
+        ln = min(L, k - h0)
+        ea, eb = list(A.extent), list(B.extent)
+        ea[ia], eb[ib] = ln, ln
+        sa, sb = Desc(A.labels, ea, A.stride), Desc(B.labels, eb, B.stride)
+        st, wsd = lib.workspace_size(sa.t, sb.t, Cd.t, 14, mode=hz.DIRECT)
+        assert st == "SUCCESS", st
+        slabs.append((h0, sa, sb, wsd))
+    la, ba = A.span()
+    lb, bb = B.span()
+    lc, bc = Cd.span()
+    hA, hB, hC0 = mixed(rng, la), mixed(rng, lb), mixed(rng, lc)
+    wmax = max([ws, 256] + [w for _, _, _, w in slabs])
+    dA, dB, dC, dW = cuda.malloc(8 * la), cuda.malloc(8 * lb), cuda.malloc(8 * lc), cuda.malloc(wmax)
+    cuda.upload(dA, hA)
+    cuda.upload(dB, hB)
+    off = lambda p, base: C.c_void_p(p.value + 8 * base)  # noqa: E731
+    compared, plans = 0, []
+    try:
+        for h0, sa, sb, wsd in slabs:
+            st, pd = lib.plan_create(sa.t, sb.t, Cd.t, 14, mode=hz.DIRECT)
+            assert st == "SUCCESS", f"{name}: DIRECT slab plan {st}"
+            plans.append((pd, h0, wsd))
+        for tile in tiles:
+            lib.lib.imd_test_set_hw_tile(tile)
+            st, ph = lib.plan_create(A.t, B.t, Cd.t, 14, mode=HWGEMM, k_slab=k_slab)
+            lib.lib.imd_test_set_hw_tile(-1)
+            if st != "SUCCESS":
+                raise Fail(f"{name}: HWGEMM plan (k_slab {k_slab}) {st}")
+            try:
+                for alpha, beta in alphas_betas:
+                    want, got = np.empty(lc), np.empty(lc)
+                    cuda.upload(dC, hC0)
+                    for s, (pd, h0, wsd) in enumerate(plans if alpha != 0.0 else plans[:1]):
+                        r = lib.contract(pd, alpha, off(dA, ba + h0 * A.stride[ia]),
+                                         off(dB, bb + h0 * B.stride[ib]), beta if s == 0 else 1.0,
+                                         off(dC, bc), dW if wsd else None, wsd)
+                        assert r == "SUCCESS", f"{name}: DIRECT slab {s}: {r}"
+                    cuda.sync()
+                    cuda.download(want, dC)
+                    cuda.upload(dC, hC0)
+                    r = lib.contract(ph, alpha, off(dA, ba), off(dB, bb), beta, off(dC, bc),
+                                     dW if ws else None, ws)
+                    if r != "SUCCESS":
+                        raise Fail(f"{name}: contract {r} (alpha {alpha}, beta {beta})")
+                    cuda.sync()
+                    cuda.download(got, dC)
+                    bad = bit_mismatches(got, want, exact_zero=exact_zero)
+                    if len(bad):
+                        i = bad[0]
+                        raise Fail(f"{name} k_slab {k_slab} tile {tile} alpha {alpha} beta {beta}: "
+                                   f"{len(bad)} of {lc} elements differ, first at {i}: "
+                                   f"{got[i]!r} vs DIRECT slab chain {want[i]!r}")
+                    compared += lc
+            finally:
+                lib.plan_destroy(ph)
+    finally:
+        for pd, _, _ in plans:
+            lib.plan_destroy(pd)
+        for p in (dA, dB, dC, dW):
+            cuda.free(p)
+    if verbose:
+        print(f"  ok  {name} (k_slab {k_slab}, {len(slabs)} slabs): {compared} elements")
+    return compared
+
+
+def suite_slabs(lib, cuda, rng, ab, quick, verbose, cc_major):
+    """K slabs (§6i.3) on both paths: stage 1 (fully affine, one GemmUniversal per slab, A and
+    B from the slab's first K position) and stage 2 (per slab the packs into the slab-sized
+    PA / PB, then the own GEMM), against the DIRECT slab chain; k_slab rounded up to 16 and
+    a last slab shorter than L."""
+    I1, J1, K1, L = 1, 2, 3, 6
+    tiles = (0, 2) if cc_major >= 9 else (2,)
+    n = 0
+    for (i_, j_, k_, b_) in [(70, 33, 100, 1), (130, 65, 257, 2)][: 1 if quick else 2]:
+        def mk(labels, ex, st):
+            if b_ > 1:
+                span = 1 + sum(abs(x) * (e - 1) for x, e in zip(st, ex))
+                return Desc([L] + labels, [b_] + ex, [span + 5] + list(st))
+            return Desc(labels, ex, list(st))
+        ka = 1 if b_ == 1 else 2  # index of K in A (I1, K1) / B (K1, J1), after the batch mode
+        kb = 0 if b_ == 1 else 1
+        aff_a, aff_b, aff_c = [k_, 1], [1, k_], [j_, 1]       # A row, B col (K fastest), C row
+        pa, pb, pc = [2, 2 * i_ + 1], [3, 3 * k_ + 2], [2, 2 * i_ + 3]
+        for what, sa, sb, sc, ez in (("affine", aff_a, aff_b, aff_c, False),
+                                     ("A packed", pa, aff_b, aff_c, False),
+                                     ("both packed", pa, pb, aff_c, True),
+                                     ("both packed, C scattered", pa, pb, pc, True)):
+            A = mk([I1, K1], [i_, k_], sa)
+            B = mk([K1, J1], [k_, j_], sb)
+            Cd = mk([I1, J1], [i_, j_], sc)
+            for k_slab, Lr in ((16, 16), (40, 48)):
+                n += run_slab_case(lib, cuda, f"slabs {what} {i_}x{j_}x{k_} b{b_}", A, B, Cd,
+                                   (ka, kb), k_slab, Lr, ab, rng, tiles=tiles, exact_zero=ez,
+                                   verbose=verbose)
+    return n
+
+
 def suite_own(lib, cuda, rng, ab, quick, verbose, cc_major):
     """The own kernel (hw_own.cuh) on fully affine calls equals stage 1's CUTLASS
     GemmUniversal bit for bit (zero signs included) on every tile and layout pair: the probe
@@ -460,7 +575,8 @@ def main():
               ("chunks", suite_chunks),
               ("tiles", lambda *a: suite_tiles(*a, cc_major=cc)),
               ("own", lambda *a: suite_own(*a, cc_major=cc)),
-              ("stage2", lambda *a: suite_stage2(*a, cc_major=cc))]
+              ("stage2", lambda *a: suite_stage2(*a, cc_major=cc)),
+              ("slabs", lambda *a: suite_slabs(*a, cc_major=cc))]
     for name, fn in suites:
         try:
             got = fn(lib, cuda, rng, ab, args.quick, args.verbose)

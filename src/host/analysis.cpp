@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <utility>
 #include <vector>
 
 #include "checked.hpp"
+
 #include "k_hat.hpp"
 #include "immerdink/detail/constants.hpp"
 
@@ -16,7 +18,7 @@ namespace {
 namespace c = imd::constants;
 
 bool options_ok(const imd_options_t& o) {
-  return o.num_moduli >= c::kNMin && o.num_moduli <= c::kNMax && o.residue_group >= 0 &&
+  return o.k_slab >= 0 && (o.k_slab == 0 || o.mode == IMD_HWGEMM) && o.num_moduli >= c::kNMin && o.num_moduli <= c::kNMax && o.residue_group >= 0 &&
          o.residue_group <= o.num_moduli && (o.rounding == IMD_RN || o.rounding == IMD_TRUNC) &&
          (o.mode == IMD_EMULATE || o.mode == IMD_DIRECT || o.mode == IMD_HWGEMM) &&
          (o.vec_mode == IMD_VEC_GENERATE || o.vec_mode == IMD_VEC_RESIDENT) &&
@@ -39,6 +41,7 @@ std::optional<WorkspaceLayout> mode_layout(const Analysis& an, int32_t packed) {
     h.m = lw.m, h.n = lw.n, h.k = lw.k, h.b = lw.b;
     h.need_vec = v.need_vec, h.vec_resident = an.options.vec_mode == IMD_VEC_RESIDENT;
     h.pack_a = !v.acc[0].affine, h.pack_b = !v.acc[1].affine;
+    h.slab = hw_slab_len(an.options.k_slab, lw.k);
     return hw_workspace_layout(h);
   }
   return workspace_layout({lw.m, lw.n, lw.k, lw.b, an.options.num_moduli,
@@ -107,6 +110,19 @@ int big_bitlen(const Big& x) {
 
 }  // namespace
 
+imd_status_t read_options(const imd_options_t* in, imd_options_t* out) {
+  if (in == nullptr || in->struct_size < sizeof(imd_options_t)) return IMD_STATUS_INVALID_VALUE;
+  // a later header's options: honoured only while every field this library lacks is zero
+  const unsigned char* extra = reinterpret_cast<const unsigned char*>(in) + sizeof(imd_options_t);
+  for (uint32_t i = 0; i < in->struct_size - sizeof(imd_options_t); ++i)
+    if (extra[i] != 0) return IMD_STATUS_NOT_SUPPORTED;
+  std::memcpy(out, in, sizeof(imd_options_t));
+  out->struct_size = sizeof(imd_options_t);
+  if (out->dtype != IMD_F64 || out->compute != IMD_COMPUTE_DEFAULT) return IMD_STATUS_NOT_SUPPORTED;
+  if (out->reserved0 != 0) return IMD_STATUS_INVALID_VALUE;
+  return IMD_STATUS_SUCCESS;
+}
+
 imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_tensor_t* C,
                      const imd_options_t* options, Analysis* out) {
   return analyze(A, B, C, options, k_align_sel(), out);
@@ -116,8 +132,9 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
                      const imd_options_t* options, const KAlignSel& sel, Analysis* out) {
   if (A == nullptr || B == nullptr || C == nullptr || options == nullptr)
     return IMD_STATUS_INVALID_VALUE;
-  if (!options_ok(*options)) return IMD_STATUS_INVALID_VALUE;
-  out->options = *options;
+  if (const imd_status_t st = read_options(options, &out->options); st != IMD_STATUS_SUCCESS)
+    return st;
+  if (!options_ok(out->options)) return IMD_STATUS_INVALID_VALUE;
   if (out->options.residue_group == 0) out->options.residue_group = out->options.num_moduli;
 
   if (const imd_status_t st = lower(*A, *B, *C, &out->lowered); st != IMD_STATUS_SUCCESS)
@@ -134,11 +151,12 @@ imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B, const imd_ten
   // v1.21 §6i.6 row 5 for HWGEMM, then its access view (§6i.2): fully affine calls run on
   // CUTLASS's GemmUniversal (stage 1), the others on the own kernel with packs (stage 2).
   if (hw_runs(out->options, lw)) {
-    if (!hw_dims_ok(lw)) return IMD_STATUS_INVALID_VALUE;
+    const int64_t slab = hw_slab_len(out->options.k_slab, lw.k);  // §6i.3: one GEMM's K extent
+    if (!hw_dims_ok(lw, slab)) return IMD_STATUS_INVALID_VALUE;
     out->hw = hw_view(lw);
-    // §6i.6: with both operands packed the GEMM's K extent is k_hat = ceil(k)_16
+    // §6i.6: with both operands packed the GEMM's K extent is k_hat = ceil(slab)_16
     if (!out->hw.acc[0].affine && !out->hw.acc[1].affine &&
-        (lw.k + kHwQ - 1) / kHwQ * kHwQ > INT32_MAX)
+        (slab + kHwQ - 1) / kHwQ * kHwQ > INT32_MAX)
       return IMD_STATUS_INVALID_VALUE;
   }
   const auto layout = mode_layout(*out, 0);
@@ -332,6 +350,7 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
            : (an.options.mode != IMD_EMULATE || lw.k <= 1) ? Path::kDirect
                                                           : Path::kGemm;
   e.hw = an.hw;
+  if (e.path == Path::kHwGemm) e.hw_slab = hw_slab_len(an.options.k_slab, lw.k);
   // v1.13 §4b.5: A from the analysis (resolved once), for a plan with residue rows; 16 for
   // NOOP, SCALE (k = 0), DIRECT and K-empty, whatever the hook says.
   e.k_align = emulates(e) ? an.k_align : kKAlign16;
@@ -396,12 +415,15 @@ int64_t plan_launches(const ExecPlan& e, bool fused, int32_t fused_large, bool r
     // Stage 1 (fully affine, CUTLASS GemmUniversal): a column-major C runs as C^T. Stage 2 (the
     // own kernel, hw_own.cuh): K0 when the vectors are needed and not resident, one pack per
     // packed operand, then the GEMM chunks over C's own columns.
+    // §6i.3: S slabs, each its packs then its GEMM chunks (one stream).
+    const int64_t S = e.hw_slabs();
     if (e.hw.fully_affine()) {
       const int64_t cols = e.hw.acc[2].row ? e.n : e.m;  // hwgemm.cu: C column-major -> C^T
-      return ((e.b + 65534) / 65535) * ((cols + 65535 * 64 - 1) / (65535 * 64));
+      return S * ((e.b + 65534) / 65535) * ((cols + 65535 * 64 - 1) / (65535 * 64));
     }
-    return (resident ? 0 : 1) + (e.hw.acc[0].affine ? 0 : 1) + (e.hw.acc[1].affine ? 0 : 1) +
-           ((e.b + 65534) / 65535) * ((e.n + 65535 * 64 - 1) / (65535 * 64));
+    return (resident ? 0 : 1) +
+           S * ((e.hw.acc[0].affine ? 0 : 1) + (e.hw.acc[1].affine ? 0 : 1) +
+                ((e.b + 65534) / 65535) * ((e.n + 65535 * 64 - 1) / (65535 * 64)));
   }
   const int64_t k0 = resident ? 0 : 1;
   if (!emulates(e)) return k0 + 1;  // DIRECT, K-empty or k = 0: K0 + one kernel

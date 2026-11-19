@@ -36,11 +36,14 @@ def up(x, q):
     return (x + q - 1) // q * q
 
 
-def expect(m, n, k, b, vec, pa, pb):
-    """{region: (offset, bytes)} and total for the HWGEMM layout of a lowered m, n, k, b."""
+def expect(m, n, k, b, vec, pa, pb, slab=None):
+    """{region: (offset, bytes)} and total for the HWGEMM layout of a lowered m, n, k, b.
+    slab: the K-slab length L (§6i.3): the packs hold one slab, ceil(L)_16 columns; the
+    vectors still describe all of k."""
+    kp = k if slab is None else min(slab, k)
     sizes = [("vec", 8 * (2 * m + 2 * n + 2 * k + 3 * b) if vec else 0),
-             ("PA", 8 * b * m * up(k, HWQ) if pa else 0),
-             ("PB", 8 * b * n * up(k, HWQ) if pb else 0)]
+             ("PA", 8 * b * m * up(kp, HWQ) if pa else 0),
+             ("PB", 8 * b * n * up(kp, HWQ) if pb else 0)]
     regs, off = {}, 0
     for name, nb in sizes:
         if nb:
@@ -87,6 +90,22 @@ CASES = [
      True, "RESIDENT"),
 ]
 
+# K slabs (host API 16, DESIGN §6i.3): (name, spec, extents, strides, packs, vec, k_slab, L) with
+# L the slab length the library must use: k_slab rounded up to 16, capped at k.
+SLAB_CASES = [
+    ("slab_both_16", "ik,jk->ij", dict(i=5, j=6, k=100), ([2, 10], [2, 12], None), (True, True),
+     True, 16, 16),
+    ("slab_both_round", "ik,jk->ij", dict(i=5, j=6, k=100), ([2, 10], [2, 12], None), (True, True),
+     True, 17, 32),
+    ("slab_a_1", "ik,jk->ij", dict(i=5, j=6, k=100), ([2, 10], None, None), (True, False), True, 1,
+     16),
+    ("slab_ge_k", "ik,jk->ij", dict(i=5, j=6, k=100), ([2, 10], None, None), (True, False), True,
+     100, 100),
+    ("slab_huge", "ik,jk->ij", dict(i=5, j=6, k=100), ([2, 10], None, None), (True, False), True,
+     1 << 62, 100),
+    ("slab_affine", "ik,jk->ij", dict(i=5, j=6, k=100), None, (False, False), False, 32, 32),
+]
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -123,7 +142,41 @@ def main():
     if not any(seen_swap):
         fails += 1
         print("FAIL  no case exercised the role swap")
-    print(f"{len(CASES) - fails}/{len(CASES)} cases ok")
+    for name, spec, ext, strides, packs, vec, k_slab, L in SLAB_CASES:
+        kw = dict(strides=strides, N=8, mode="HWGEMM", lib=lib)
+        try:
+            lw = host.lowering(spec, ext, k_slab=k_slab, **kw)
+            if lw.status != "SUCCESS" or lw.dispatch != "HWGEMM" or lw.swapped:
+                raise AssertionError(f"lowering {lw.status} / {lw.dispatch} / swap {lw.swapped}")
+            regs, total = expect(lw.m, lw.n, lw.k, lw.b, vec, *packs, slab=L)
+            lay = host.workspace_layout(spec, ext, k_slab=k_slab, **kw)
+            ws = host.workspace_size(spec, ext, k_slab=k_slab, **kw)
+            if lay.regions != regs or lay.total != total or ws != total or \
+                    lw.workspace_bytes != total:
+                raise AssertionError(f"layout {lay.regions} total {lay.total} size {ws}; want "
+                                     f"{regs} total {total}")
+            # launches: K0 (vectors needed) + S (packs + one GEMM chunk)
+            S = -(-lw.k // L)
+            want_l = (1 if vec else 0) + S * (sum(packs) + 1)
+            if lw.kernel_launches != want_l:
+                raise AssertionError(f"kernel_launches {lw.kernel_launches}, want {want_l}")
+            print(f"ok    {name:<18} k={lw.k} k_slab={k_slab} L={L} S={S} workspace {total} B")
+        except (AssertionError, host.ImmerdinkError) as e:
+            fails += 1
+            print(f"FAIL  {name:<18} {e}")
+    # k_slab outside HWGEMM, or negative: INVALID_VALUE
+    for mode, k_slab in (("EMULATE", 16), ("DIRECT", 16), ("HWGEMM", -16)):
+        try:
+            host.workspace_size("ik,jk->ij", dict(i=5, j=6, k=100), N=8, mode=mode, k_slab=k_slab,
+                                lib=lib)
+            fails += 1
+            print(f"FAIL  k_slab {k_slab} in {mode}: accepted")
+        except host.ImmerdinkError as e:
+            if "INVALID_VALUE" not in str(e):
+                fails += 1
+                print(f"FAIL  k_slab {k_slab} in {mode}: {e}")
+    n = len(CASES) + len(SLAB_CASES)
+    print(f"{n - fails}/{n} cases ok")
     return 1 if fails else 0
 
 

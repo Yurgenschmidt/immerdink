@@ -133,7 +133,8 @@ struct HwView {
 };
 IMD_HOST_INTERNAL HwView hw_view(const Lowered& lw);
 
-// §6i.6 row 5 for HWGEMM (non-empty output, k >= 2): m, n, k <= 2^31 - 1.
-IMD_HOST_INTERNAL bool hw_dims_ok(const Lowered& lw);
+// §6i.6 row 5 for HWGEMM (non-empty output, k >= 2): m, n and one GEMM's K extent (the slab
+// length, §6i.3, or k when slab is 0) <= 2^31 - 1.
+IMD_HOST_INTERNAL bool hw_dims_ok(const Lowered& lw, int64_t slab = 0);
 
 }  // namespace imd::detail

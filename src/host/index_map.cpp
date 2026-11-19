@@ -382,8 +382,8 @@ HwView hw_view(const Lowered& lw) {
   return v;
 }
 
-bool hw_dims_ok(const Lowered& lw) {
-  return lw.m <= kInt32Max && lw.n <= kInt32Max && lw.k <= kInt32Max;
+bool hw_dims_ok(const Lowered& lw, int64_t slab) {
+  return lw.m <= kInt32Max && lw.n <= kInt32Max && (slab > 0 ? slab : lw.k) <= kInt32Max;
 }
 
 }  // namespace imd::detail

@@ -26,8 +26,10 @@ extern "C" {
 #endif
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
- * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 15 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+ * or a trailing struct field is added; nothing that exists changes meaning or layout, with
+ * ONE exception: version 16 changed imd_options_t's layout (it had no struct_size; DESIGN
+ * §6i.5), so callers built against 15 or older must be rebuilt. */
+#define IMD_HOST_API_VERSION 16 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
@@ -67,7 +69,10 @@ extern "C" {
                                       IMD_TABLE_*, imd_lowering_t table_id (v7);
                                   15: the hardware GEMM mode (§6i v1.21, issue #75): IMD_HWGEMM,
                                       IMD_DISPATCH_HWGEMM (first stage: fully affine calls;
-                                      the others are NOT_SUPPORTED until the pack stage) */
+                                      the others are NOT_SUPPORTED until the pack stage);
+                                  16: ABI BREAK (§6i.5): imd_options_t gains struct_size (first),
+                                      dtype, compute and k_slab; IMD_REGION_PA / PB; HWGEMM
+                                      packs, scattered C, multi-mode batches and k-slabs */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -120,13 +125,31 @@ typedef struct {
   const int32_t* label;
 } imd_tensor_t;
 
+/* Element type and arithmetic (§6i.8; host API 16). v1 runs FP64 only; any other value is
+ * NOT_SUPPORTED. IMD_COMPUTE_DEFAULT: the accurate arithmetic for the type and mode. */
+enum { IMD_F64 = 0 };
+enum { IMD_COMPUTE_DEFAULT = 0 };
+
+/* Call options. struct_size (host API 16) = sizeof(imd_options_t) of the caller's header:
+ * the library reads that many bytes, rejects a size below version 16's (INVALID_VALUE: a
+ * caller built against an older header passes num_moduli there) and NOT_SUPPORTED for a
+ * larger struct whose bytes beyond its own are not all zero (a later option it cannot honour).
+ * k_slab (§6i.3): 0 = none; else HWGEMM splits K into slabs of k_slab rounded up to 16 (the K
+ * tile), run in order on one stream (slab 0 with the caller's beta, later slabs beta = 1,
+ * alpha per slab), with the packed regions sized by one slab; >= k is one slab; < 0, or
+ * != 0 outside IMD_HWGEMM: INVALID_VALUE. Slabs change the rounding (DESIGN §6i.4). */
 typedef struct {
+  uint32_t struct_size;  /* sizeof(imd_options_t), host API 16 */
   int32_t num_moduli;    /* N, 2..20                        */
   int32_t residue_group; /* g, 0 = N; the workspace/speed knob (§4a, §6a) */
   int32_t rounding;      /* IMD_RN (default) | IMD_TRUNC     */
   int32_t mode;          /* IMD_EMULATE | IMD_DIRECT | IMD_HWGEMM (v15) */
   int32_t vec_mode;      /* IMD_VEC_GENERATE (0) | IMD_VEC_RESIDENT (v1.2) */
   int32_t k4_tune;       /* IMD_K4_TUNE_OFF (0) | IMD_K4_TUNE_ON (v1.5)     */
+  int32_t dtype;         /* IMD_F64 (0)                     (v16) */
+  int32_t compute;       /* IMD_COMPUTE_DEFAULT (0)         (v16) */
+  int32_t reserved0;     /* 0 */
+  int64_t k_slab;        /* 0 = none (v16)                  */
 } imd_options_t;
 
 /* The host query API's version: IMD_HOST_API_VERSION of the library actually loaded. */

@@ -31,9 +31,16 @@ class Tensor(C.Structure):
 
 
 class Options(C.Structure):
-    _fields_ = [("num_moduli", C.c_int32), ("residue_group", C.c_int32),
-                ("rounding", C.c_int32), ("mode", C.c_int32), ("vec_mode", C.c_int32),
-                ("k4_tune", C.c_int32)]   # v1.5 imd_options_t.k4_tune (0 off, 1 on)
+    # host API 16 (DESIGN §6i.5): struct_size first; the constructor fills it, so the
+    # positional order stays (N, g, rounding, mode, vec_mode, k4_tune); dtype, compute and
+    # k_slab by keyword.
+    _fields_ = [("struct_size", C.c_uint32), ("num_moduli", C.c_int32),
+                ("residue_group", C.c_int32), ("rounding", C.c_int32), ("mode", C.c_int32),
+                ("vec_mode", C.c_int32), ("k4_tune", C.c_int32), ("dtype", C.c_int32),
+                ("compute", C.c_int32), ("reserved0", C.c_int32), ("k_slab", C.c_int64)]
+
+    def __init__(self, *args, **kw):
+        super().__init__(C.sizeof(type(self)), *args, **kw)
 
 
 def make_tensor(extent, stride, label):
@@ -459,10 +466,12 @@ class Library:
             self._handle = h
         return self._handle
 
-    def workspace_size(self, A, B, Cc, N, g=0, rounding=RN, mode=EMULATE, vec=VEC_GENERATE):
+    def workspace_size(self, A, B, Cc, N, g=0, rounding=RN, mode=EMULATE, vec=VEC_GENERATE,
+                       k_slab=0):
         out = C.c_size_t(0)
         st = self.lib.imd_workspace_size(C.byref(A), C.byref(B), C.byref(Cc),
-                                         C.byref(Options(N, g, rounding, mode, vec)), C.byref(out))
+                                         C.byref(Options(N, g, rounding, mode, vec, k_slab=k_slab)),
+                                         C.byref(out))
         name = self.lib.imd_status_string(st).decode()
         assert name == "IMD_STATUS_" + STATUS[st], name
         return STATUS[st], out.value
@@ -470,19 +479,20 @@ class Library:
     MAX_PLAN_VEC = 64 << 20   # test guard: scatter-vector bytes (workspace or resident)
 
     def plan_create(self, A, B, Cc, N, g=0, rounding=RN, mode=EMULATE, vec=VEC_GENERATE,
-                    k4_tune=0):
+                    k4_tune=0, k_slab=0):
         """(status, plan handle or None). Test guard: a plan whose scatter vectors
         (8 (2m + 2n + 2k + 3b) bytes) exceed MAX_PLAN_VEC is never created (a descriptor
         that imd_workspace_size rejects fails plan creation before any allocation)."""
-        if self.has_test_hooks and self.workspace_size(A, B, Cc, N, g, rounding, mode, vec)[0] == \
-                "SUCCESS":
+        if self.has_test_hooks and \
+                self.workspace_size(A, B, Cc, N, g, rounding, mode, vec, k_slab)[0] == "SUCCESS":
             st, lw = self.lowering(A, B, Cc)
             if st == "SUCCESS":
                 nvec = 8 * (2 * (lw["m"] + lw["n"] + lw["k"]) + 3 * lw["b"])
                 assert nvec <= self.MAX_PLAN_VEC, f"plan vectors of {nvec} bytes (test guard)"
         plan = C.c_void_p()
         st = self.lib.imd_plan_create(self.handle(), C.byref(A), C.byref(B), C.byref(Cc),
-                                      C.byref(Options(N, g, rounding, mode, vec, k4_tune)),
+                                      C.byref(Options(N, g, rounding, mode, vec, k4_tune,
+                                                      k_slab=k_slab)),
                                       C.byref(plan))
         return STATUS[st], (plan if st == 0 else None)
 

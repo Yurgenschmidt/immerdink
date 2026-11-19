@@ -11,7 +11,7 @@ import threading
 
 from . import host
 
-API_VERSION = 14  # IMD_HOST_API_VERSION needed: packed operands (§6b)
+API_VERSION = 16  # IMD_HOST_API_VERSION needed: imd_options_t with struct_size (§6i.5)
 
 
 class Tensor(C.Structure):          # imd_tensor_t
@@ -20,9 +20,16 @@ class Tensor(C.Structure):          # imd_tensor_t
 
 
 class Options(C.Structure):         # imd_options_t
-    _fields_ = [("num_moduli", C.c_int32), ("residue_group", C.c_int32),
-                ("rounding", C.c_int32), ("mode", C.c_int32), ("vec_mode", C.c_int32),
-                ("k4_tune", C.c_int32)]
+    # host API 16 (DESIGN §6i.5): struct_size first; the constructor fills it, so the
+    # positional order stays (N, g, rounding, mode, vec_mode, k4_tune); dtype, compute and
+    # k_slab by keyword.
+    _fields_ = [("struct_size", C.c_uint32), ("num_moduli", C.c_int32),
+                ("residue_group", C.c_int32), ("rounding", C.c_int32), ("mode", C.c_int32),
+                ("vec_mode", C.c_int32), ("k4_tune", C.c_int32), ("dtype", C.c_int32),
+                ("compute", C.c_int32), ("reserved0", C.c_int32), ("k_slab", C.c_int64)]
+
+    def __init__(self, *args, **kw):
+        super().__init__(C.sizeof(type(self)), *args, **kw)
 
 
 class PackDesc(C.Structure):        # imd_pack_desc_t
@@ -60,7 +67,7 @@ class DeviceInfo(C.Structure):       # imd_device_info_t
                 ("table_id", C.c_int32), ("reserved", C.c_int32)]
 
 
-assert C.sizeof(Tensor) == 32 and C.sizeof(Options) == 24
+assert C.sizeof(Tensor) == 32 and C.sizeof(Options) == 48  # host API 16
 assert C.sizeof(DeviceClass) == 104 and C.sizeof(DeviceSelection) == 24 and C.sizeof(DeviceInfo) == 168
 assert C.sizeof(PackDesc) == 72 and C.sizeof(Packing) == 16 and C.sizeof(Operand) == 32
 

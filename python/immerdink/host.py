@@ -40,7 +40,8 @@ __all__ = ["ImmerdinkError", "HostLibrary", "load", "Desc", "contraction", "work
            "ERR_STATUS", "INFEASIBLE", "PACK_FORMAT", "PACK_FORMAT_A16", "PACK_FORMAT_A64",
            "test_set_k_align", "device_select", "DeviceSelection", "CalibrationError", "CALIB_ERRORS", "CALIB_STRING_FIELDS"]
 
-API_VERSION = 14  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required)
+API_VERSION = 16  # the IMD_HOST_API_VERSION this wrapper was written for (minimum required;
+                  # 16 changed imd_options_t's layout, DESIGN §6i.5)
 # Pack formats (DESIGN v1.13 §4b, host API 9): the format of a pack is that of its k (2 iff
 # k > 96); PACK_FORMAT is the newest format the library writes.
 PACK_FORMAT_A16, PACK_FORMAT_A64 = 1, 2
@@ -118,9 +119,16 @@ class _Tensor(C.Structure):
 
 
 class _Options(C.Structure):
-    _fields_ = [("num_moduli", C.c_int32), ("residue_group", C.c_int32),
-                ("rounding", C.c_int32), ("mode", C.c_int32), ("vec_mode", C.c_int32),
-                ("k4_tune", C.c_int32)]
+    # host API 16 (DESIGN §6i.5): struct_size first; the constructor fills it, so the
+    # positional order stays (N, g, rounding, mode, vec_mode, k4_tune); dtype, compute and
+    # k_slab by keyword.
+    _fields_ = [("struct_size", C.c_uint32), ("num_moduli", C.c_int32),
+                ("residue_group", C.c_int32), ("rounding", C.c_int32), ("mode", C.c_int32),
+                ("vec_mode", C.c_int32), ("k4_tune", C.c_int32), ("dtype", C.c_int32),
+                ("compute", C.c_int32), ("reserved0", C.c_int32), ("k_slab", C.c_int64)]
+
+    def __init__(self, *args, **kw):
+        super().__init__(C.sizeof(type(self)), *args, **kw)
 
 
 class _Region(C.Structure):
@@ -298,7 +306,7 @@ class _Candidate(C.Structure):
 
 assert C.sizeof(_Lowering) == 200  # version 7 (issue 18; v6 = 192, DESIGN v1.13 §4b; v5 = 184)
 assert _Lowering.k_align.offset == 184 and _Lowering.table_id.offset == 192
-assert C.sizeof(_Options) == 24
+assert C.sizeof(_Options) == 48  # host API 16
 assert C.sizeof(_PackDesc) == 72 and C.sizeof(_PackLayout) == 136
 assert C.sizeof(_PerfCalib) == 3744 and _PerfCalib.energy_byte_f_pj.offset == 3672 and \
     _PerfCalib.pack_l2_hit_bytes.offset == 3680 and _PerfCalib.clock_boost_mhz.offset == 3688 and \
@@ -552,9 +560,10 @@ class _PackArg:
 class _Call:
     """C arguments for one query; keeps the arrays alive."""
 
-    def __init__(self, descs, N, g, rounding, mode, vec_mode, packing=None):
+    def __init__(self, descs, N, g, rounding, mode, vec_mode, packing=None, k_slab=0):
         self.t = [_tensor(d) for d in descs]
-        self.o = _Options(int(N), int(g), _ROUNDING[rounding], _MODE[mode], _VEC[vec_mode])
+        self.o = _Options(int(N), int(g), _ROUNDING[rounding], _MODE[mode], _VEC[vec_mode],
+                          k_slab=int(k_slab))
         self.packing = None
         if packing is not None:
             self.pk = [_PackArg(p) if p is not None else None for p in packing]
@@ -567,20 +576,21 @@ class _Call:
         return self.args() + [C.byref(self.packing)]
 
 
-def _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing=None):
+def _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing=None, k_slab=0):
     return load(lib) if not isinstance(lib, HostLibrary) else lib, \
-        _Call(_operands(spec, extents, strides), N, g, rounding, mode, vec_mode, packing)
+        _Call(_operands(spec, extents, strides), N, g, rounding, mode, vec_mode, packing, k_slab)
 
 
 # ------------------------------------------------------------------------------------------
 # Queries (DESIGN §6a). Options: N (2..20), g (1..N; 0 = N), rounding "RN" | "TRUNC",
-# mode "EMULATE" | "DIRECT" | "HWGEMM", vec_mode "GENERATE" | "RESIDENT".
+# mode "EMULATE" | "DIRECT" | "HWGEMM", vec_mode "GENERATE" | "RESIDENT", k_slab (host API 16,
+# HWGEMM only: K slabs of k_slab rounded up to 16; 0 = none; DESIGN §6i.3).
 
 def workspace_size(spec, extents=None, *, strides=None, N, g=0, rounding="RN",
-                   mode="EMULATE", vec_mode="GENERATE", packing=None, lib=None):
+                   mode="EMULATE", vec_mode="GENERATE", packing=None, k_slab=0, lib=None):
     """imd_workspace_size: the exact workspace bytes (DESIGN §4a). packing = (PackSpec or
     None, PackSpec or None) for the caller's A and B: imd_workspace_size_packed (§6b.6)."""
-    h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing)
+    h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing, k_slab)
     out = C.c_size_t(0)
     if packing is None:
         st = h.lib.imd_workspace_size(*call.args(), C.byref(out))
@@ -602,9 +612,9 @@ class Layout:
 
 
 def workspace_layout(spec, extents=None, *, strides=None, N, g=0, rounding="RN",
-                     mode="EMULATE", vec_mode="GENERATE", packing=None, lib=None):
+                     mode="EMULATE", vec_mode="GENERATE", packing=None, k_slab=0, lib=None):
     """imd_workspace_layout: the §4a region table (packing: imd_workspace_layout_packed)."""
-    h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing)
+    h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing, k_slab)
     regs = (_Region * len(REGIONS))()
     count, total = C.c_int32(0), C.c_size_t(0)
     if packing is None:
@@ -621,9 +631,9 @@ def workspace_layout(spec, extents=None, *, strides=None, N, g=0, rounding="RN",
 
 
 def plan_bytes(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",
-               vec_mode="GENERATE", lib=None):
+               vec_mode="GENERATE", k_slab=0, lib=None):
     """imd_plan_bytes: (device, host) bytes a plan for these arguments would hold."""
-    h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib)
+    h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, None, k_slab)
     dev, host = C.c_size_t(0), C.c_size_t(0)
     st = h.lib.imd_plan_bytes(*call.args(), C.byref(dev), C.byref(host))
     if st != 0:
@@ -671,13 +681,13 @@ class Lowering:
 
 
 def lowering(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",
-             vec_mode="GENERATE", sm_count=0, table_id=0, packing=None, lib=None):
+             vec_mode="GENERATE", sm_count=0, table_id=0, packing=None, k_slab=0, lib=None):
     """imd_lowering: the lowering summary. Never raises for a plan-time status: check
     .status ("SUCCESS", "NOT_SUPPORTED", "PACK_MISMATCH", ...) and .lowered. sm_count: the
     target device's SMs for the K4 configuration rule (0: the 128 of the RTX 4090); table_id: the
     fitted table set (IMD_TABLE_*; 0: the RTX 4090's).
     packing = (PackSpec or None, PackSpec or None): imd_lowering_packed (DESIGN §6b)."""
-    h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing)
+    h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing, k_slab)
     r = _Lowering()
     r.struct_size = C.sizeof(_Lowering)
     r.sm_count = int(sm_count)

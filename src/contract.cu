@@ -2537,47 +2537,59 @@ imd_status_t enqueue_hwgemm_own(const ExecPlan& p, double alpha, const double* A
     return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
   }
 
+  // §6i.3 (spec/HwGemmPipeline.tla SlabSeq): slab s covers K positions [s L, min((s+1) L, k));
+  // its packs (into the same PA / PB, sized by one slab, ordered after slab s-1's GEMM on the
+  // one stream) then its GEMM, with the caller's beta on slab 0 and beta = 1 after.
   const bool pack[2] = {!v.acc[0].affine, !v.acc[1].affine};
-  const int64_t k_hat = (p.k + kHwQ - 1) / kHwQ * kHwQ;
-  HwOwnOperand op[2];
-  for (int x = 0; x < 2; ++x) {
-    const double* src = x == 0 ? A : B;
-    const int64_t rows = x == 0 ? p.m : p.n;
-    const int64_t* bat = at(x == 0 ? vo.a_bat : vo.b_bat);
-    if (pack[x]) {
-      HwPackCall pc;
-      pc.src = src, pc.bat = bat;
-      pc.row = at(x == 0 ? vo.a_row : vo.b_col), pc.kk = at(x == 0 ? vo.a_k : vo.b_k);
-      pc.rows = rows, pc.k = p.k, pc.k_hat = k_hat, pc.b = p.b;
-      pc.pad = x == 0 ? -0.0 : 0.0;
-      pc.along_rows = p.pack_along_rows[x], pc.radix = p.pack_radix[x];
-      pc.dst = region<double>(ws, p, x == 0 ? Region::PA : Region::PB);
-      if (const imd_status_t st = hwgemm_pack(pc, stream); st != IMD_STATUS_SUCCESS) return st;
-      IMD_PROF(stream, x == 0 ? "HWGEMM pack A" : "HWGEMM pack B");
-      op[x] = {pc.dst, k_hat, true, rows * k_hat, nullptr};
-    } else {
-      // in place; a multi-mode batch reads its per-lambda offsets from the vectors
-      op[x] = {src, v.acc[x].ld, v.acc[x].row, v.bstride[x], v.batch_affine ? nullptr : bat};
+  const int64_t L = p.hw_slab > 0 && p.hw_slab < p.k ? p.hw_slab : p.k;
+  for (int64_t h0 = 0; h0 < p.k; h0 += L) {
+    const int64_t len = std::min(L, p.k - h0);
+    const int64_t k_hat = (len + kHwQ - 1) / kHwQ * kHwQ;
+    HwOwnOperand op[2];
+    for (int x = 0; x < 2; ++x) {
+      const double* src = x == 0 ? A : B;
+      const int64_t rows = x == 0 ? p.m : p.n;
+      const int64_t* bat = at(x == 0 ? vo.a_bat : vo.b_bat);
+      if (pack[x]) {
+        HwPackCall pc;
+        pc.src = src, pc.bat = bat;
+        pc.row = at(x == 0 ? vo.a_row : vo.b_col);
+        pc.kk = at(x == 0 ? vo.a_k : vo.b_k) + h0;  // the slab's K offsets
+        pc.rows = rows, pc.k = len, pc.k_hat = k_hat, pc.b = p.b;
+        pc.pad = x == 0 ? -0.0 : 0.0;
+        pc.along_rows = p.pack_along_rows[x], pc.radix = p.pack_radix[x];
+        pc.dst = region<double>(ws, p, x == 0 ? Region::PA : Region::PB);
+        if (const imd_status_t st = hwgemm_pack(pc, stream); st != IMD_STATUS_SUCCESS) return st;
+        IMD_PROF(stream, x == 0 ? "HWGEMM pack A" : "HWGEMM pack B");
+        op[x] = {pc.dst, k_hat, true, rows * k_hat, nullptr};
+      } else {
+        // in place, from the slab's first K position; a multi-mode batch reads its per-lambda
+        // offsets from the vectors
+        const int64_t k_step = v.acc[x].row ? 1 : v.acc[x].ld;
+        op[x] = {src + h0 * k_step, v.acc[x].ld, v.acc[x].row, v.bstride[x],
+                 v.batch_affine ? nullptr : bat};
+      }
     }
+    HwOwnCall oc;
+    oc.m = p.m, oc.n = p.n, oc.b = p.b;
+    oc.k = pack[0] && pack[1] ? k_hat : len;
+    oc.A = op[0], oc.B = op[1];
+    oc.C = C;
+    if (v.acc[2].affine) {
+      oc.c_si = v.acc[2].row ? v.acc[2].ld : 1;
+      oc.c_sj = v.acc[2].row ? 1 : v.acc[2].ld;
+    } else {
+      oc.c_row = at(vo.c_row), oc.c_col = at(vo.c_col);
+    }
+    oc.c_bstride = v.bstride[2];
+    if (!v.batch_affine) oc.c_bat = at(vo.c_bat);
+    oc.alpha = alpha, oc.beta = h0 == 0 ? beta : 1.0;
+    oc.tile = p.hw_tile;
+    const imd_status_t st = hwgemm_own_enqueue(oc, stream);
+    IMD_PROF(stream, "HWGEMM own gemm");
+    if (st != IMD_STATUS_SUCCESS) return st;
   }
-  HwOwnCall oc;
-  oc.m = p.m, oc.n = p.n, oc.b = p.b;
-  oc.k = pack[0] && pack[1] ? k_hat : p.k;
-  oc.A = op[0], oc.B = op[1];
-  oc.C = C;
-  if (v.acc[2].affine) {
-    oc.c_si = v.acc[2].row ? v.acc[2].ld : 1;
-    oc.c_sj = v.acc[2].row ? 1 : v.acc[2].ld;
-  } else {
-    oc.c_row = at(vo.c_row), oc.c_col = at(vo.c_col);
-  }
-  oc.c_bstride = v.bstride[2];
-  if (!v.batch_affine) oc.c_bat = at(vo.c_bat);
-  oc.alpha = alpha, oc.beta = beta;
-  oc.tile = p.hw_tile;
-  const imd_status_t st = hwgemm_own_enqueue(oc, stream);
-  IMD_PROF(stream, "HWGEMM own gemm");
-  return st;
+  return IMD_STATUS_SUCCESS;
 }
 
 }  // namespace
@@ -2598,9 +2610,24 @@ imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, 
     hc.alpha = alpha, hc.beta = beta;
     hc.tile = p.hw_tile;
     IMD_PROF(stream, "begin");
-    const imd_status_t st = alpha == 0.0 ? hwgemm_beta(hc, stream) : hwgemm_enqueue(hc, stream);
-    IMD_PROF(stream, alpha == 0.0 ? "HWGEMM beta-only" : "HWGEMM gemm");
-    return st;
+    if (alpha == 0.0) {
+      const imd_status_t st = hwgemm_beta(hc, stream);
+      IMD_PROF(stream, "HWGEMM beta-only");
+      return st;
+    }
+    // §6i.3: one GemmUniversal per slab, A and B from the slab's first K position
+    const int64_t L = p.hw_slab > 0 && p.hw_slab < p.k ? p.hw_slab : p.k;
+    for (int64_t h0 = 0; h0 < p.k; h0 += L) {
+      HwGemmCall sc = hc;
+      sc.k = std::min(L, p.k - h0);
+      sc.A.base = A + h0 * (p.hw.acc[0].row ? 1 : p.hw.acc[0].ld);
+      sc.B.base = B + h0 * (p.hw.acc[1].row ? 1 : p.hw.acc[1].ld);
+      sc.beta = h0 == 0 ? beta : 1.0;
+      const imd_status_t st = hwgemm_enqueue(sc, stream);
+      IMD_PROF(stream, "HWGEMM gemm");
+      if (st != IMD_STATUS_SUCCESS) return st;
+    }
+    return IMD_STATUS_SUCCESS;
   }
   // v1.13 §4b.5 (hygiene): the K4 operand-pointer check (debug builds, test hook) of the whole
   // call, before anything is queued: a violation fails the call with nothing launched.

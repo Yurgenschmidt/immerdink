@@ -75,9 +75,14 @@ class CT(C.Structure):
                 ("label", C.c_void_p)]
 
 
-class CO(C.Structure):
-    _fields_ = [("N", C.c_int32), ("g", C.c_int32), ("rnd", C.c_int32), ("mode", C.c_int32),
-                ("vec", C.c_int32), ("k4_tune", C.c_int32)]
+class CO(C.Structure):   # imd_options_t, host API 16 (struct_size first, filled here)
+    _fields_ = [("struct_size", C.c_uint32), ("N", C.c_int32), ("g", C.c_int32),
+                ("rnd", C.c_int32), ("mode", C.c_int32), ("vec", C.c_int32),
+                ("k4_tune", C.c_int32), ("dtype", C.c_int32), ("compute", C.c_int32),
+                ("reserved0", C.c_int32), ("k_slab", C.c_int64)]
+
+    def __init__(self, *args, **kw):
+        super().__init__(C.sizeof(type(self)), *args, **kw)
 
 
 LOWERING_FIELDS = ["status", "lowered", "dispatch", "swapped", "num_moduli", "residue_group",

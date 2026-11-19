@@ -1555,7 +1555,7 @@ struct Bench {
     };
     std::vector<int32_t> la, lb, lc;
     imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
-    imd_options_t opt{N, 0, IMD_RN, o.mode, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    imd_options_t opt{sizeof(imd_options_t), N, 0, IMD_RN, o.mode, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
     size_t wsb = 0;
     CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
     imd_plan_t plan = nullptr;
@@ -2047,7 +2047,7 @@ struct Bench {
     };
     std::vector<int32_t> la, lb, lc;
     imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
-    imd_options_t opt{N, g, IMD_RN, o.mode, vec_mode, k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF};
+    imd_options_t opt{sizeof(imd_options_t), N, g, IMD_RN, o.mode, vec_mode, k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
     size_t wsb = 0;
     CI(imd_workspace_size(&A, &B, &C, &opt, &wsb));
     imd_lowering_t low{};
@@ -2245,7 +2245,7 @@ struct Bench {
       return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
     };
     imd_tensor_t A = t(c.A, P->la), B = t(c.B, P->lb), C = t(c.C, P->lc);
-    imd_options_t opt{d.N, d.g, IMD_RN, IMD_EMULATE, d.vec, d.k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF};
+    imd_options_t opt{sizeof(imd_options_t), d.N, d.g, IMD_RN, IMD_EMULATE, d.vec, d.k4 == -2 ? IMD_K4_TUNE_ON : IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
     // ka=: the K alignment of this side's sizing, lowering and plan (the host library's test
     // hook, resolved once at plan creation; the plan keeps its A), restored to the run's
     // --k-align afterwards. Times A = 16 against A = 64 interleaved in one process.
@@ -2419,7 +2419,7 @@ struct Bench {
     };
     std::vector<int32_t> la, lb, lc;
     imd_tensor_t A = t(c.A, la), B = t(c.B, lb), C = t(c.C, lc);
-    const imd_options_t opt{N, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+    const imd_options_t opt{sizeof(imd_options_t), N, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
     imd_pack_desc_t desc{};
     desc.struct_size = sizeof desc;
     int32_t labels[64];
@@ -2655,7 +2655,7 @@ struct Bench {
       return imd_tensor_t{int32_t(x.labels.size()), x.extent.data(), x.stride.data(), lab.data()};
     };
     P->A = t(c.A, P->la), P->B = t(c.B, P->lb), P->C = t(c.C, P->lc);
-    P->opt = imd_options_t{N, g, IMD_RN, o.mode, vec_mode, IMD_K4_TUNE_OFF};
+    P->opt = imd_options_t{sizeof(imd_options_t), N, g, IMD_RN, o.mode, vec_mode, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
     CI(imd_workspace_size(&P->A, &P->B, &P->C, &P->opt, &P->wsb));
     CI(imd_plan_create(imd, &P->A, &P->B, &P->C, &P->opt, &P->plan));
     P->ws = DevBuf(P->wsb);

@@ -212,7 +212,9 @@ imd_status_t imd_err_min_moduli(const imd_tensor_t* A, const imd_tensor_t* B, co
     // not depend on N, g or vec_mode). Not the workspace layout: it depends on N and g, and
     // must not reject a shape that is valid at the N found. The §3.2 RN acceptance is the
     // estimate's own +inf at small N.
-    const imd_options_t& o = *options;
+    imd_options_t o;  // host API 16: through struct_size
+    if (const imd_status_t st = read_options(options, &o); st != IMD_STATUS_SUCCESS) return st;
+    if (o.k_slab < 0 || (o.k_slab != 0 && o.mode != IMD_HWGEMM)) return IMD_STATUS_INVALID_VALUE;
     if ((o.rounding != IMD_RN && o.rounding != IMD_TRUNC) ||
         (o.mode != IMD_EMULATE && o.mode != IMD_DIRECT && o.mode != IMD_HWGEMM) ||
         A == nullptr || B == nullptr ||

@@ -35,10 +35,7 @@ int64_t ceil_div(int64_t a, int64_t b) { return (a + b - 1) / b; }
 }  // namespace
 
 int32_t hwgemm_tile(int64_t m, int64_t n, int64_t b, int cc_major, int sms) {
-  if (cc_major < 9) return kHw64x64;
-  if (m <= 64 || n <= 64) return kHw64x64;
-  const int64_t ctas128 = ceil_div(m, 128) * ceil_div(n, 128) * b;
-  return 2 * ctas128 < sms ? kHw64x128 : kHw128x128;
+  return hw_tile_rule(m, n, b, cc_major >= 9, sms);
 }
 
 int& hw_tile_override() {
@@ -169,7 +166,7 @@ bool& hw_own_vec2() {
 imd_status_t hwgemm_pack(const HwPackCall& c, cudaStream_t stream) {
   const int64_t total = c.b * c.rows * c.k_hat;
   if (total == 0) return IMD_STATUS_SUCCESS;
-  if (c.along_rows && c.radix >= 1 && (c.b * c.rows) % c.radix == 0) {
+  if (hw_pack_tiled(c.along_rows, c.radix, c.b, c.rows)) {
     const int64_t tiles = c.radix * ceil_div(c.b * c.rows / c.radix, kPackT) * ceil_div(c.k_hat, kPackT);
     const unsigned grid = static_cast<unsigned>(tiles < 65535 * 8 ? tiles : 65535 * 8);
     hw_pack_rows_kernel<<<grid, dim3(kPackT, kPackRowsY), 0, stream>>>(c);

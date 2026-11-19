@@ -92,6 +92,8 @@ struct ExecPlan {
 
   HwView hw;            // v1.21 §6i.2: kHwGemm's access view (index_map.hpp hw_view)
   int32_t hw_tile = -1; // v1.21 §6i.7: kHwGemm's tile (hwgemm.hpp HwTile; -1 = the rule per call)
+  int64_t hw_slab = 0;  // §6i.3: kHwGemm's slab length L (workspace.hpp hw_slab_len; k: one slab)
+  int64_t hw_slabs() const { return hw_slab > 0 && hw_slab < k ? (k + hw_slab - 1) / hw_slab : 1; }
 
   int sms = 0;                         // SM count of the device at plan creation (K1 grids)
   int64_t l2_bytes = 0;                // L2 bytes of the device at plan creation (K1 rows in flight, issue 21; 0: the reference 72 MiB)

@@ -63,7 +63,7 @@ static_assert(offsetof(imd_lowering_t, packed) == kLoweringV4Size, "imd_lowering
 static_assert(offsetof(imd_lowering_t, k_align) == kLoweringV5Size, "imd_lowering_t v5 layout changed");
 static_assert(offsetof(imd_lowering_t, table_id) == kLoweringV6Size, "imd_lowering_t v6 layout changed");
 static_assert(sizeof(imd_lowering_t) == kLoweringV7Size, "imd_lowering_t v7 layout changed");
-static_assert(sizeof(imd_options_t) == 24, "imd_options_t layout changed");
+static_assert(sizeof(imd_options_t) == 48, "imd_options_t layout changed");
 static_assert(sizeof(imd_region_t) == 16, "imd_region_t layout changed");
 // v1.7 (§6b.5): the version-1 pack structs (64-bit ABI).
 static_assert(sizeof(imd_pack_desc_t) == 72, "imd_pack_desc_t v1 layout changed");

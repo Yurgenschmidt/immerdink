@@ -16,6 +16,7 @@
 #include <cuda_runtime_api.h>
 
 #include "immerdink/immerdink_host.h"
+#include "host/hw_rules.hpp"
 
 namespace imd::detail {
 
@@ -29,7 +30,7 @@ struct HwView2 {
 // Tile configurations (§6i.7). sm_90 (Sm90 16x8x4 kernel): all three; sm_80 / sm_89 (Sm80
 // 8x8x4): kHw64x64 only (correctness, not tuned). Bit-identical to each other and to DIRECT
 // without slabs (§6i.4; bench/hwgemm_bitid.cu).
-enum HwTile : int32_t { kHw128x128 = 0, kHw64x128 = 1, kHw64x64 = 2, kHwTileCount = 3 };
+// HwTile, kHw*: host/hw_rules.hpp (shared with the host library's performance model)
 
 struct HwGemmCall {
   int64_t m = 0, n = 0, k = 0, b = 0;  // each <= 2^31 - 1 (§6i.6, checked at plan time)

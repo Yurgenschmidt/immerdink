@@ -1511,7 +1511,7 @@ imd_status_t predict_contract(const imd_tensor_t* A, const imd_tensor_t* B, cons
   fill_prediction(cal, P, q, r);
   // v8 (§6f): the error estimates of this configuration (the same function as
   // imd_err_estimate); written only into a v8-sized imd_perf_t (finish copies struct_size).
-  const ErrOut eo = err_compute(e.N, options->rounding, r->dispatch, e.k, e.b * e.m * e.n, q.err);
+  const ErrOut eo = err_compute(e.N, an.options.rounding, r->dispatch, e.k, e.b * e.m * e.n, q.err);
   r->err_bound = eo.bound, r->err_typical = eo.typical;
   r->err_status = eo.err_status, r->err_metric = q.err.metric;
   return IMD_STATUS_SUCCESS;
@@ -1736,6 +1736,8 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
                            IMD_PERF_PACK_AB)) != 0 ||
       (req->flags & ~IMD_PERF_BETA_NONZERO) != 0 || !eps_valid(req->eps_fraction))
     return IMD_STATUS_INVALID_VALUE;
+  imd_options_t base_opts;  // host API 16: through struct_size, so each candidate copy is ours
+  if (const imd_status_t st = read_options(base, &base_opts); st != IMD_STATUS_SUCCESS) return st;
   Req q;
   q.flags = req->flags;
   int32_t order = IMD_PERF_ORDER_TIME;  // a version-6 request: the v6 order
@@ -1787,7 +1789,7 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
                                    : pm == IMD_PERF_PACK_A  ? 1
                                    : pm == IMD_PERF_PACK_B  ? 2
                                                             : 3;
-            imd_options_t o = *base;
+            imd_options_t o = base_opts;
             o.num_moduli = N, o.residue_group = g, o.vec_mode = vec;
             Cand cd{};
             imd_perf_candidate_t& c = cd.c;
