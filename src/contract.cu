@@ -2550,6 +2550,7 @@ imd_status_t enqueue_hwgemm_own(const ExecPlan& p, double alpha, const double* A
       pc.row = at(x == 0 ? vo.a_row : vo.b_col), pc.kk = at(x == 0 ? vo.a_k : vo.b_k);
       pc.rows = rows, pc.k = p.k, pc.k_hat = k_hat, pc.b = p.b;
       pc.pad = x == 0 ? -0.0 : 0.0;
+      pc.along_rows = p.pack_along_rows[x], pc.radix = p.pack_radix[x];
       pc.dst = region<double>(ws, p, x == 0 ? Region::PA : Region::PB);
       if (const imd_status_t st = hwgemm_pack(pc, stream); st != IMD_STATUS_SUCCESS) return st;
       IMD_PROF(stream, x == 0 ? "HWGEMM pack A" : "HWGEMM pack B");
@@ -2953,7 +2954,7 @@ cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) 
     case 11: return versions_of(k23_pack_cap<2, 1>, binary, ptx);  // issue 21: the E1 K2/K3 instance held to 4 CTAs per SM
     case 12: return k5f_versions<true>(binary, ptx);   // issue 23: the k5fin K5 kernels (one n and one batch-fastest instance; same module as the shipped K5)
     case 13: return k5f_versions<false>(binary, ptx);
-    case 14: case 15: case 16: case 17: case 18: case 19: return hw_kernel_versions(index - 14, binary, ptx);  // DESIGN §6i.7
+    case 14: case 15: case 16: case 17: case 18: case 19: case 20: return hw_kernel_versions(index - 14, binary, ptx);  // DESIGN §6i.7
     default: return cudaErrorInvalidValue;
   }
 }

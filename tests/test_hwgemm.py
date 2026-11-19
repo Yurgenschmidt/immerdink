@@ -50,6 +50,8 @@ def setup_hooks(lib):
     L.imd_test_plan_hw_tile.restype = C.c_int
     L.imd_test_set_hw_own.argtypes = [C.c_int32]
     L.imd_test_set_hw_own.restype = None
+    L.imd_test_set_hw_own_vec2.argtypes = [C.c_int32]
+    L.imd_test_set_hw_own_vec2.restype = None
 
 
 def plan_tile(lib, plan):
@@ -371,6 +373,14 @@ def suite_stage2(lib, cuda, rng, ab, quick, verbose, cc_major):
     n += run_case(lib, cuda, "both packed, beta 0, C NaN", A, B, Cd,
                   [(1.0, 0.0), (0.0, 0.0)], rng, affine=False, exact_zero=True,
                   c_fill_nan=True, verbose=verbose)
+    # the tiled pack along a row mode that is not the first fused one (pack_pivot radix 7):
+    # C orders I2 before I1, A has I1 fastest (stride 1) and K next (stride 5); not fusable
+    I2 = 5
+    A = Desc([I1, I2, K1], [5, 7, 9], [1, 48, 5])
+    B = Desc([K1, J1], [9, 6], [6, 1])
+    Cd = Desc([I1, I2, J1], [5, 7, 6], [42, 6, 1])
+    n += run_case(lib, cuda, "A packed along its 2nd row mode (radix 7)", A, B, Cd, ab, rng,
+                  affine=False, tiles=tiles, verbose=verbose)
     # multi-mode batch beyond one grid.z
     A = Desc([L, L + 1, I1, K1], [7, 10001, 2, 3], [1, 8, 7 * 10001 * 8, 7 * 10001 * 8 * 2 + 1])
     B = Desc([L, L + 1, K1, J1], [7, 10001, 3, 2], strides([7, 10001, 3, 2], [3, 2, 1, 0]))
@@ -393,6 +403,14 @@ def suite_own(lib, cuda, rng, ab, quick, verbose, cc_major):
                     A, B, Cd = gemm_case(i_, j_, k_, b_, la, lb, lc, batch=b_ > 1)
                     n += run_case(lib, cuda, f"own {i_}x{j_}x{k_} b{b_} A{la} B{lb} C{lc}", A, B,
                                   Cd, ab, rng, tiles=tiles, own=True, verbose=verbose)
+    # the element-wise epilogue store (the paired 16-byte store off: the timing knob)
+    lib.lib.imd_test_set_hw_own_vec2(0)
+    try:
+        A, B, Cd = gemm_case(129, 65, 33, 1, "r", "r", "r", batch=False)
+        n += run_case(lib, cuda, "own 129x65x33 element-wise C stores", A, B, Cd, ab, rng,
+                      tiles=tiles, own=True, verbose=verbose)
+    finally:
+        lib.lib.imd_test_set_hw_own_vec2(1)
     return n
 
 

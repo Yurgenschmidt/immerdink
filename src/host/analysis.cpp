@@ -348,7 +348,8 @@ imd_status_t plan_data(const Analysis& an, ExecPlan* out) {
   // The pack pivots are view data: set before the RN check, so that a NOT_SUPPORTED plan's
   // lowering summary (imd_lowering: fused_large, kernel_launches) follows the issue-21 KL rules
   // like the spec's (tests/test_host.py spec_expect) instead of the default pivot.
-  if (emulated) {
+  // HWGEMM (issue #75): the same pivot picks the FP64 pack's read order (hwgemm.cu).
+  if (emulated || e.path == Path::kHwGemm) {
     for (int x = 0; x < 2; ++x) {
       const PackPivot pv = pack_pivot(lw, x);
       e.pack_along_rows[x] = pv.along_rows;

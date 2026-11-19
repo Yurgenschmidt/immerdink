@@ -93,18 +93,28 @@ struct HwPackCall {
   int64_t rows = 0, k = 0, k_hat = 0, b = 0;
   double pad = 0.0;
   double* dst = nullptr;
+  // host/index_map.hpp pack_pivot: the source's fastest index runs along the packed rows
+  // rho = r + rows * lambda, as rho = lo + radix * d (true: the tiled smem-transpose pack;
+  // false: K is fastest and the element-wise pack's reads are already coalesced)
+  bool along_rows = false;
+  int64_t radix = 1;
 };
 imd_status_t hwgemm_pack(const HwPackCall& c, cudaStream_t stream);
 
 // Test hook (imd_test_set_hw_own): 1 runs fully affine calls through the own kernel too (the
 // bit comparison against stage 1's CUTLASS GemmUniversal); 0 (default): GemmUniversal.
 int& hw_own_override();
+// Test hook (imd_test_set_hw_own_vec2): 1 (default) lets the own kernel's epilogue store a
+// thread's two adjacent C columns as one 16-byte store when C is affine with unit column
+// stride (hw_own.cuh); 0: element-wise stores (the A/B timing; the values are the same).
+bool& hw_own_vec2();
 
 // Device-status coverage (issue 18 D4, src/device_state.cpp): the code versions of one kernel
 // per HWGEMM module: 0 hw_beta_kernel (hwgemm.cu), 1 the Sm80 GEMM (hw_sm80.cu), 2 the Sm90
 // GEMM (hw_sm90.cu), 3 hw_pack_kernel (hwgemm.cu), 4 / 5 the own Sm80 / Sm90 GEMM
-// (hw_own_sm80.cu, hw_own_sm90.cu). cudaErrorInvalidValue for another index.
-constexpr int32_t kHwKernelVersionCount = 6;
+// (hw_own_sm80.cu, hw_own_sm90.cu), 6 hw_pack_rows_kernel (hwgemm.cu). cudaErrorInvalidValue
+// for another index.
+constexpr int32_t kHwKernelVersionCount = 7;
 cudaError_t hw_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx);
 
 }  // namespace imd::detail

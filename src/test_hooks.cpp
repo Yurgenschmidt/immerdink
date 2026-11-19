@@ -437,6 +437,8 @@ IMD_API int imd_test_plan_hw_tile(imd_plan_t plan, int32_t* tile) {
 // Issue #75 stage 2 (hwgemm.hpp hw_own_override): 1 runs fully affine HWGEMM calls through the
 // own kernel (hw_own.cuh) instead of CUTLASS's GemmUniversal (the bit comparison), 0: default.
 IMD_API void imd_test_set_hw_own(int32_t on) { imd::detail::hw_own_override() = on != 0; }
+// The own kernel's paired 16-byte C store (hwgemm.hpp hw_own_vec2): 1 default, 0 off (timing).
+IMD_API void imd_test_set_hw_own_vec2(int32_t on) { imd::detail::hw_own_vec2() = on != 0; }
 
 IMD_API int imd_test_set_hw_tile(int32_t tile) {
   if (tile < -1 || tile >= imd::detail::kHwTileCount) return 1;

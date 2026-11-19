@@ -5941,7 +5941,7 @@ ResultExact, NoBadStep, SlabsPartition]**
   +0) returns −0 only when a negative product underflows to −0 and every other term is a zero
   too. After §3.7's α / β the difference stays confined to zero elements of C (fma(β, C, E)
   carries E's zero sign only when β·C is a zero). Measured on sm_89 (stage-1 tests: −0 kept at
-  k = 16, 32; +0 at k = 2, 4, 15, 17); not yet probed on sm_90. Tests compare bits with
+  k = 16, 32; +0 at k = 2, 4, 15, 17); the same on sm_90 (H100, embers job 15827678). Tests compare bits with
   NaN == NaN and +0 == −0 (`tests/test_hwgemm.py` counts the zero-sign differences). Slabs
   (`k_slab` quantized to K_t) leave a residue in the last slab only. Stage 2: when BOTH operands
   are packed, each slab's packs also write their K tail (A: −0.0, B: +0.0) and the GEMM runs on
@@ -5994,8 +5994,14 @@ instantiates, called the same way (so the sums are the same bits: `tests/test_hw
 (a stride or the λ vector) and a register-only epilogue that stores each accumulator through
 `c_bat[λ] + c_row[i] + c_col[j]` (or C's strides) with §3.7 `store_out`. No C^T swap (the
 store is per element), so its launches are ⌈b / 65535⌉ · ⌈n / (65535 · 64)⌉ plus K0 and the
-packs. The FP64 pack (`hw_pack_kernel`) is one thread per packed element, writes coalesced, reads
-through the vectors; not yet tuned (NOTES-HWGEMM §4.2's smem transpose is the next step).
+packs. The FP64 pack picks its read order with the emulated path's `pack_pivot` (index_map.hpp):
+when the operand's fastest index runs along the packed rows, `hw_pack_rows_kernel` reads 32 x 32
+tiles along the rows, transposes them in shared memory and writes along K; when K is fastest,
+`hw_pack_kernel` (one thread per element, K fastest) already reads coalesced. Cost model: a
+pack moves (sectors read) + (bytes written) at HBM bandwidth; the element-wise pack on a
+row-fastest operand reads one 32-byte sector per 8-byte element (H100: 3.2-3.7 TB/s in sector
+terms, i.e. at the bandwidth limit), the tiled pack reads only the sectors it uses (RTX 4090:
+1.69 ms for a 537 MB A at row stride 2, 0.95 TB/s, as predicted by the model).
 
 **6i.8 Element types.** v1 is FP64. The mode names the arithmetic source, not the type: a later
 FP32 is the same mode with `dtype = IMD_F32` and a `compute` choice (FP32-accurate by default:

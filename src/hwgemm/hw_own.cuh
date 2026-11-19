@@ -31,6 +31,10 @@
 
 namespace imd::kernels {
 
+// Experiment knob (issue #75 own-kernel epilogue): the paired 16-byte store is compiled in;
+// hw_own_vec2() (imd_test_set_hw_own_vec2, default on) switches it at launch for A/B timing.
+constexpr bool kVecStore = true;
+
 template <class Arch, class TB_, class Warp_, class Inst_, int kStages, class LA, class LB>
 struct HwOwn {
   using TB = TB_;
@@ -67,6 +71,7 @@ struct HwOwn {
     int64_t z0;                        // lambda of blockIdx.z = 0
     int j0;                            // column of blockIdx.y = 0
     double alpha, beta;
+    bool vec2;                         // C affine with c_sj == 1 (the paired store may apply)
   };
 
   CUTLASS_DEVICE static double store(Params const& p, double d, double c) {
@@ -105,13 +110,27 @@ struct HwOwn {
         const int64_t ci = cb + (p.c_row ? p.c_row[i] : i * p.c_si);
         CUTLASS_PRAGMA_UNROLL
         for (int nj = 0; nj < kNj; ++nj) {
+          const int j = n0 + warp_n * Warp::kN + nj * 8 + 2 * t;  // even; the pair is (j, j + 1)
+          const int a = (mi + nj * kMi) * kE + 2 * h;
+          double* const dst = p.C + ci + (p.c_col ? p.c_col[j] : j * p.c_sj);
+          if (kVecStore && p.vec2 && j + 1 < p.n &&
+              (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
+            // C affine with unit column stride: one 16-byte store, the same two values
+            double2 o;
+            if (p.beta == 0.0) {
+              o.x = store(p, acc[a], 0.0), o.y = store(p, acc[a + 1], 0.0);
+            } else {
+              const double2 c = *reinterpret_cast<const double2*>(dst);
+              o.x = store(p, acc[a], c.x), o.y = store(p, acc[a + 1], c.y);
+            }
+            *reinterpret_cast<double2*>(dst) = o;
+            continue;
+          }
           CUTLASS_PRAGMA_UNROLL
           for (int e = 0; e < 2; ++e) {
-            const int j = n0 + warp_n * Warp::kN + nj * 8 + 2 * t + e;
-            if (j >= p.n) continue;
-            double* const dst = p.C + ci + (p.c_col ? p.c_col[j] : j * p.c_sj);
-            const double d = acc[(mi + nj * kMi) * kE + 2 * h + e];
-            *dst = store(p, d, p.beta == 0.0 ? 0.0 : *dst);
+            if (j + e >= p.n) continue;
+            double* const de = e == 0 ? dst : p.C + ci + (p.c_col ? p.c_col[j + 1] : (j + 1) * p.c_sj);
+            *de = store(p, acc[a + e], p.beta == 0.0 ? 0.0 : *de);
           }
         }
       }
@@ -158,6 +177,7 @@ imd_status_t HwOwn<Arch, TB, Warp, Inst, S, LA, LB>::launch(const imd::detail::H
   p.m = static_cast<int>(c.m), p.n = static_cast<int>(c.n), p.k = static_cast<int>(c.k);
   p.k_iters = static_cast<int>((c.k + TB::kK - 1) / TB::kK);
   p.alpha = c.alpha, p.beta = c.beta;
+  p.vec2 = c.c_row == nullptr && c.c_col == nullptr && c.c_sj == 1 && imd::detail::hw_own_vec2();
   constexpr int64_t kMaxGrid = 65535;
   const int64_t tiles_m = (c.m + TB::kM - 1) / TB::kM;
   if (tiles_m > INT32_MAX) return IMD_STATUS_INVALID_VALUE;

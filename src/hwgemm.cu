@@ -71,6 +71,42 @@ __global__ void __launch_bounds__(256) hw_pack_kernel(HwPackCall c) {
   }
 }
 
+// The same pack when the source's fastest index runs along the rows (HwPackCall::along_rows):
+// one 32 x 32 tile per step, of rows rho = inner + radix * q (32 consecutive q) and 32
+// consecutive h. Warps read along q (the source's fast index), the tile is transposed through
+// shared memory, and warps write along h (dst rows are k_hat contiguous). Same values as
+// hw_pack_kernel (a copy), only the access order differs.
+constexpr int kPackT = 32, kPackRowsY = 8;
+__global__ void __launch_bounds__(kPackT * kPackRowsY) hw_pack_rows_kernel(HwPackCall c) {
+  __shared__ double tile[kPackT][kPackT + 1];
+  const int64_t Q = c.b * c.rows / c.radix;  // radix is a prefix product of b * rows
+  const int64_t q_tiles = (Q + kPackT - 1) / kPackT, h_tiles = (c.k_hat + kPackT - 1) / kPackT;
+  const int64_t tiles = c.radix * q_tiles * h_tiles;
+  const int tx = threadIdx.x, ty = threadIdx.y;
+  for (int64_t t = blockIdx.x; t < tiles; t += gridDim.x) {
+    const int64_t ht = t % h_tiles, rest = t / h_tiles;
+    const int64_t qt = rest % q_tiles, inner = rest / q_tiles;
+    const int64_t h0 = ht * kPackT, q0 = qt * kPackT;
+    {  // read: lane tx along q, the source's fast index
+      const int64_t q = q0 + tx;
+      if (q < Q) {
+        const int64_t rho = inner + c.radix * q, r = rho % c.rows, lam = rho / c.rows;
+        const int64_t base = c.bat[lam] + c.row[r];
+        for (int y = ty; y < kPackT; y += kPackRowsY) {
+          const int64_t h = h0 + y;
+          if (h < c.k_hat) tile[tx][y] = h < c.k ? c.src[base + c.kk[h]] : c.pad;
+        }
+      }
+    }
+    __syncthreads();
+    for (int y = ty; y < kPackT; y += kPackRowsY) {  // write: lane tx along h
+      const int64_t q = q0 + y, h = h0 + tx;
+      if (q < Q && h < c.k_hat) c.dst[(inner + c.radix * q) * c.k_hat + h] = tile[y][tx];
+    }
+    __syncthreads();
+  }
+}
+
 template <class Kernel>
 cudaError_t versions_of(Kernel kernel, int32_t* binary, int32_t* ptx) {
   cudaFuncAttributes a{};
@@ -89,6 +125,7 @@ cudaError_t hw_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) {
     case 3: return versions_of(hw_pack_kernel, binary, ptx);
     case 4: return hw_own_sm80_versions(binary, ptx);
     case 5: return hw_own_sm90_versions(binary, ptx);
+    case 6: return versions_of(hw_pack_rows_kernel, binary, ptx);
     default: return cudaErrorInvalidValue;
   }
 }
@@ -124,10 +161,20 @@ int& hw_own_override() {
   static int v = 0;
   return v;
 }
+bool& hw_own_vec2() {
+  static bool v = true;
+  return v;
+}
 
 imd_status_t hwgemm_pack(const HwPackCall& c, cudaStream_t stream) {
   const int64_t total = c.b * c.rows * c.k_hat;
   if (total == 0) return IMD_STATUS_SUCCESS;
+  if (c.along_rows && c.radix >= 1 && (c.b * c.rows) % c.radix == 0) {
+    const int64_t tiles = c.radix * ceil_div(c.b * c.rows / c.radix, kPackT) * ceil_div(c.k_hat, kPackT);
+    const unsigned grid = static_cast<unsigned>(tiles < 65535 * 8 ? tiles : 65535 * 8);
+    hw_pack_rows_kernel<<<grid, dim3(kPackT, kPackRowsY), 0, stream>>>(c);
+    return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
+  }
   const int64_t blocks = ceil_div(total, 256);
   const unsigned grid = static_cast<unsigned>(blocks < 65535 * 8 ? blocks : 65535 * 8);
   hw_pack_kernel<<<grid, 256, 0, stream>>>(c);
