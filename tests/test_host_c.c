@@ -431,7 +431,10 @@ int main(void) {
      * prefixes are unchanged); v11: imd_perf_calib_t 3680 (energy_byte_f_pj at 3672); v12:
      * 3688 (pack_l2_hit_bytes at 3680); v13 (DESIGN v1.18 §6c.8): 3744, seven doubles from
      * clock_boost_mhz at 3688 to pack_l2_planes at 3736 */
-    CHECK(sizeof(imd_perf_calib_t) == 3744 && offsetof(imd_perf_calib_t, energy_byte_f_pj) == 3672 &&
+    /* v16 (DESIGN §6i.5): 3760, peak_fp64_tc_flops_per_s at 3744, hw_family at 3752 */
+    CHECK(sizeof(imd_perf_calib_t) == 3760 && offsetof(imd_perf_calib_t, peak_fp64_tc_flops_per_s) == 3744 &&
+          offsetof(imd_perf_calib_t, hw_family) == 3752);
+    CHECK(offsetof(imd_perf_calib_t, energy_byte_f_pj) == 3672 &&
           offsetof(imd_perf_calib_t, pack_l2_hit_bytes) == 3680 && IMD_HOST_API_VERSION >= 13);
     CHECK(offsetof(imd_perf_calib_t, clock_boost_mhz) == 3688 &&
           offsetof(imd_perf_calib_t, power_act_w) == 3696 &&
@@ -445,8 +448,13 @@ int main(void) {
           strcmp(imd_perf_param_name(IMD_PERF_CLASS_KL, 4), "chain") == 0 &&
           IMD_PERF_CLASS_KL * IMD_PERF_MAX_PARAMS + 4 == 16);
     CHECK(sizeof(imd_perf_phase_t) == 96 &&
-          sizeof(imd_perf_t) == 1976 && sizeof(imd_perf_candidate_t) == 192 &&
-          sizeof(imd_perf_rank_request_t) == 96 && sizeof(imd_perf_request_t) == 48);
+          sizeof(imd_perf_t) == 2000 && sizeof(imd_perf_candidate_t) == 232 &&
+          sizeof(imd_perf_rank_request_t) == 120 && sizeof(imd_perf_request_t) == 48);
+    /* v16 (§6i.5): appended HWGEMM fields (v8: 1976, 192, 96) */
+    CHECK(offsetof(imd_perf_t, uncalibrated_phases) == 1976 && offsetof(imd_perf_t, hw_slabs) == 1992 &&
+          offsetof(imd_perf_candidate_t, mode) == 192 && offsetof(imd_perf_candidate_t, hw_slabs) == 224 &&
+          offsetof(imd_perf_rank_request_t, modes) == 96 &&
+          offsetof(imd_perf_rank_request_t, k_slabs) == 104);
     CHECK(offsetof(imd_perf_t, err_bound) == 1952 && offsetof(imd_perf_candidate_t, err_bound) == 168 &&
           offsetof(imd_perf_rank_request_t, accuracy) == 88 &&
           offsetof(imd_perf_request_t, accuracy) == 40);
@@ -939,6 +947,24 @@ int main(void) {
     int32_t nc = 0;
     CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, NULL, 0, &nc) == IMD_STATUS_SUCCESS && nc == 36);
     CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, cand, 64, &nc) == IMD_STATUS_SUCCESS && nc == 36);
+    {
+      /* v16 (§6i.5): a version-8 request ranks EMULATE only and rejects a non-EMULATE base; a
+       * HWGEMM candidate needs a version-16 candidate_size */
+      imd_options_t hw = opt;
+      hw.mode = IMD_HWGEMM;
+      imd_perf_rank_request_t r8 = rr;
+      r8.struct_size = (uint32_t)offsetof(imd_perf_rank_request_t, modes);
+      int32_t n8 = 0;
+      CHECK(imd_perf_rank(&A, &B, &C, &hw, &r8, NULL, NULL, 0, &n8) == IMD_STATUS_INVALID_VALUE);
+      imd_perf_rank_request_t r16 = rr;
+      r16.modes = IMD_PERF_MODE_HWGEMM;
+      r16.candidate_size = (uint32_t)offsetof(imd_perf_candidate_t, mode);
+      CHECK(imd_perf_rank(&A, &B, &C, &opt, &r16, NULL, cand, 64, &n8) == IMD_STATUS_INVALID_VALUE);
+      r16.candidate_size = sizeof(imd_perf_candidate_t);
+      CHECK(imd_perf_rank(&A, &B, &C, &opt, &r16, NULL, cand, 64, &n8) == IMD_STATUS_SUCCESS &&
+            n8 >= 1 && cand[0].mode == IMD_HWGEMM && cand[0].hw_slabs == 1);
+      CHECK(imd_perf_rank(&A, &B, &C, &opt, &rr, NULL, cand, 64, &nc) == IMD_STATUS_SUCCESS && nc == 36);
+    }
     for (int i = 0; i < nc; ++i) {
       const imd_perf_candidate_t* c = &cand[i];
       CHECK(c->status == IMD_STATUS_SUCCESS && c->feasible == 1);

@@ -127,6 +127,38 @@ cudaError_t hw_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) {
   }
 }
 
+namespace {
+template <class Kernel>
+cudaError_t plain_occupancy(Kernel kernel, int threads, int32_t* out, int32_t* binary,
+                            int32_t* ptx) {
+  cudaFuncAttributes a{};
+  cudaError_t e = cudaFuncGetAttributes(&a, reinterpret_cast<const void*>(kernel));
+  if (e != cudaSuccess) return e;
+  *binary = a.binaryVersion, *ptx = a.ptxVersion;
+  int r = 0;
+  e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&r, kernel, threads, 0);
+  if (e != cudaSuccess) return e;
+  out[0] = r, out[1] = a.numRegs, out[2] = static_cast<int32_t>(a.sharedSizeBytes);
+  out[3] = threads;
+  return cudaSuccess;
+}
+}  // namespace
+
+cudaError_t hw_kernel_occupancy(int32_t index, int32_t* out, int32_t* binary, int32_t* ptx) {
+  switch (index) {
+    case 0: return plain_occupancy(hw_pack_kernel, 256, out, binary, ptx);
+    case 1: return plain_occupancy(hw_pack_rows_kernel, kPackT * kPackRowsY, out, binary, ptx);
+    case 2 + kHw128x128: case 2 + kHw64x128: case 2 + kHw64x64: {
+      // Without usable Sm90 kernels only the Sm80 64x64 tile runs (hwgemm_tile): every tile
+      // reports its row (the Sm90 128-row tiles need more shared memory than sm_8x has).
+      const int32_t tile = index - 2;
+      if (!hw_sm90_usable()) return hw_own_sm80_occupancy(out, binary, ptx);
+      return hw_own_sm90_occupancy(tile, out, binary, ptx);
+    }
+    default: return cudaErrorInvalidValue;
+  }
+}
+
 imd_status_t hwgemm_beta(const HwGemmCall& c, cudaStream_t stream) {
   const int64_t total = c.b * c.m * c.n;
   if (total == 0) return IMD_STATUS_SUCCESS;

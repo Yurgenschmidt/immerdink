@@ -331,6 +331,8 @@ def _to_candidate(self):
     return host.Candidate(**{f: getattr(self, f) for f in self._fields})
 
 
+_MODE_NAME = {v: k for k, v in host._MODE.items()}
+
 Candidate = _view_class(
     "Candidate", "imd_perf_candidate_t as a lazy host.Candidate (.to_candidate()).",
     host.Candidate, host._Candidate,
@@ -338,7 +340,8 @@ Candidate = _view_class(
      "packed": lambda s: _PACKED_NAME[s._r.packed], "status": lambda s: STATUS[s._r.status],
      "feasible": lambda s: bool(s._r.feasible), "dispatch": lambda s: DISPATCH[s._r.dispatch],
      "tie": lambda s: bool(s._r.tie),  # v7
-     "err_status": lambda s: host.ERR_STATUS[s._r.err_status]},  # v8
+     "err_status": lambda s: host.ERR_STATUS[s._r.err_status],  # v8
+     "mode": lambda s: _MODE_NAME[s._r.mode]},  # v16 (an imd_mode_t)
     None)
 Candidate.to_candidate = _to_candidate
 

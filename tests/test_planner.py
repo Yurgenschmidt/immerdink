@@ -520,8 +520,9 @@ def check_review_fixes(lib, spec, ext, q):
     else:
         raise Fail("Query.calib is writable")
     # _RANK_EXTRA: the fields after eps_fraction (none in version 6; version 7: the v1.10
-    # ones; version 8: accuracy)
-    if planner._RANK_EXTRA != frozenset({"regime", "cache", "order", "clock_mhz", "accuracy"}):
+    # ones; version 8: accuracy; version 16: modes, k_slabs, hw_flags)
+    if planner._RANK_EXTRA != frozenset({"regime", "cache", "order", "clock_mhz", "accuracy",
+                                         "modes", "k_slab_count", "k_slabs", "hw_flags"}):
         raise Fail(f"_RANK_EXTRA {planner._RANK_EXTRA}")
     # a C array field of a view is an immutable tuple
     @dataclasses.dataclass(frozen=True)

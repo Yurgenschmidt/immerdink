@@ -138,6 +138,9 @@ struct HwOwn {
   }
 
   static cudaError_t versions(int32_t* binary, int32_t* ptx);
+  // v16 (DESIGN §6i.5): the occupancy row (CTAs per SM, registers, shared memory, threads) and
+  // the code versions, for the performance model's kernel.hw_gemm_* lines.
+  static cudaError_t occupancy(int32_t* out, int32_t* binary, int32_t* ptx);
   static imd_status_t launch(const imd::detail::HwOwnCall& c, cudaStream_t stream);
 };
 
@@ -153,6 +156,26 @@ cudaError_t HwOwn<Arch, TB, Warp, Inst, S, LA, LB>::versions(int32_t* binary, in
   const cudaError_t e = cudaFuncGetAttributes(&a, hw_own_kernel<HwOwn>);
   if (e == cudaSuccess) *binary = a.binaryVersion, *ptx = a.ptxVersion;
   return e;
+}
+
+template <class Arch, class TB, class Warp, class Inst, int S, class LA, class LB>
+cudaError_t HwOwn<Arch, TB, Warp, Inst, S, LA, LB>::occupancy(int32_t* out, int32_t* binary,
+                                                               int32_t* ptx) {
+  using K = HwOwn;
+  cudaFuncAttributes a{};
+  cudaError_t e = cudaFuncGetAttributes(&a, hw_own_kernel<K>);
+  if (e != cudaSuccess) return e;
+  *binary = a.binaryVersion, *ptx = a.ptxVersion;
+  if (kSmemBytes > 48 * 1024)
+    e = cudaFuncSetAttribute(hw_own_kernel<K>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             kSmemBytes);
+  int r = 0;
+  if (e == cudaSuccess)
+    e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&r, hw_own_kernel<K>, kThreads, kSmemBytes);
+  if (e != cudaSuccess) return e;
+  out[0] = r, out[1] = a.numRegs, out[2] = static_cast<int32_t>(a.sharedSizeBytes) + kSmemBytes;
+  out[3] = kThreads;
+  return cudaSuccess;
 }
 
 // One call: chunks of <= 65535 batches (grid.z) and <= 65535 column tiles (grid.y), the

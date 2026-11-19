@@ -3723,7 +3723,9 @@ enum { IMD_PERF_KERNEL_K0, IMD_PERF_KERNEL_KF16, IMD_PERF_KERNEL_KF4, IMD_PERF_K
        IMD_PERF_KERNEL_K4 = 10,             /* + IMD_K4_*                                   */
        IMD_PERF_KERNEL_K5 = 14,             /* + 4 (N - 2) + v, v: 0 E = 1, 1 E = 2, 2 E = 4,
                                                3 lambda-fastest                             */
-       IMD_PERF_KERNEL_COUNT = 90 };
+       IMD_PERF_KERNEL_HW_PACK = 90,        /* v16 §6i.5: hw_pack, hw_pack_rows,          */
+       IMD_PERF_KERNEL_HW_GEMM = 92,        /* + HwTile: hw_gemm_128x128 / _64x128 / _64x64 */
+       IMD_PERF_KERNEL_COUNT = 95 };
 typedef struct { int32_t resident, regs, smem_bytes, threads; } imd_perf_kernel_t;
 const char* imd_perf_kernel_name(int32_t kernel);   /* "k0", "kf16", ..., "k5_n14_e4", "k5b_n14" */
 enum { IMD_PERF_BAND_SMALL, IMD_PERF_BAND_MID, IMD_PERF_BAND_LARGE };  /* < 100 us, < 1 ms, >= */
@@ -5890,8 +5892,8 @@ launch per chunk (§6i.6), no K0. Stage 2: every other call (a packed operand, a
 a multi-mode batch): workspace `vec`, `PA`, `PB` (§6i.2), K0 when needed, one
 FP64 pack launch per packed operand, then the own GEMM kernel (§6i.7). Host API 16: the
 `imd_options_t` ABI break (`struct_size`, `dtype`, `compute`, `k_slab`; §6i.5, §6i.8) and
-K-slabs on both paths (§6i.3). The performance model (§6i.5) is the next stage; until then
-`imd_perf_predict` returns NOT_SUPPORTED for a HWGEMM call. Code:
+K-slabs on both paths (§6i.3), and the HWGEMM performance model in the planning API (§6i.5):
+`imd_perf_predict` and `imd_perf_rank` cover HWGEMM. Code:
 `src/hwgemm.cu`, `src/hwgemm/`; tests: `tests/test_hwgemm.py` (bit-exact against DIRECT).
 
 **6i.1 Dispatch.** NOOP (b·m·n = 0), SCALE (k = 0 or α = 0: the β-only kernel, once; on a
@@ -5969,14 +5971,53 @@ power; `flops_eq` = 2bmnk and `tflops_eq`; `err_bound` (γ_k, L7 form with slabs
   Done: `struct_size` is first; the library reads that many bytes, INVALID_VALUE below its own
   48 (a version-15 caller passes N there), NOT_SUPPORTED for a larger struct whose extra bytes
   are not zero, and for `dtype` ≠ `IMD_F64` or `compute` ≠ `IMD_COMPUTE_DEFAULT`;
-- HWGEMM phases are one per kind with `launches` = S (K0, HWGEMM_PACK_A, HWGEMM_PACK_B,
-  HWGEMM_GEMM, call term): ≤ 5 of the frozen `IMD_PERF_MAX_PHASES`;
-- about three calibration classes (12–14 free); `peak_fp64_tc_flops_per_s` appended;
-- an `uncalibrated` flag on `imd_perf_t` and `imd_perf_candidate_t` (the roofline fallback is a
-  lower bound, so it favours HWGEMM in a ranking);
-- `imd_perf_rank`: HWGEMM candidates opt-in (a modes mask and slab lengths in appended request
-  fields), only for callers whose struct sizes know them; with a budget, the largest `k_slab`
-  that fits. The ranking reports; the caller chooses.
+- HWGEMM phases are one per kind (done): K0 (when the vectors are built and not resident),
+  `HWGEMM pack A` / `HWGEMM pack B` (`IMD_PERF_PHASE_HW_PACK_A` = 13, `_B` = 14; launches S),
+  `HWGEMM gemm` (15; launches S × chunks). There is no `call` phase: the GEMM class has its
+  own per-call slot, so the EMULATE call correction (signed, fitted on EMULATE calls) is
+  never applied to HWGEMM. α = 0: K0 (stage 2 only) and the β-only kernel, as SCALE.
+- Two calibration classes (done; class 14 stays free for FP32 compute):
+  `hw_pack` (12): launch, sector (bytes read in 32-byte sectors: the element-wise pack of a
+  source whose fastest index runs along the rows reads one sector per 8-byte element, 4×; the
+  tiled pack and a K-fastest source 1×), write (8·b·rows·Σ⌈len_s⌉₁₆), chain (the grid chain
+  of its launches). `hw_gemm` (13): launch, flop (the padded tiles' flops,
+  2·tm·tn·tiles·Σ⌈len_s⌉₁₆, with the GEMM's own m × n: after the C^T swap of a column-major C
+  on stage 1, unswapped on the own kernel), wave (the idle CTA slots of the last wave, in the
+  same flops; occupancy from `kernel.hw_gemm_<tile>`), byte (DRAM: a packed operand's k̂
+  buffer, an affine operand's source once per batch, or once when broadcast (batch stride 0),
+  C written S times and read S − 1 + [β ≠ 0] times, ×4 for a scattered C's 32-byte sectors),
+  own (flop again on the own kernel: its efficiency against stage 1), call. Time = launch +
+  call + max(flop + wave + own (clock-bound), byte); the pack is the plain sum.
+  Every hw key, band and `kernel.hw_*` row is optional, so every older calibration file
+  still loads and its text round-trips unchanged.
+- Appended calibration fields (done): `peak_fp64_tc_flops_per_s` (0: the card has none, the
+  bound uses `peak_fp64_flops_per_s`) and `hw_family` (80 / 90: the kernel family the HW
+  parameters were measured with; it picks the tile rule, `src/host/hw_rules.hpp`, shared with
+  the device library). 0: the Sm80 rule and the GEMM phase uncalibrated, never a silent tile.
+- Uncalibrated (done): a class whose parameters are all 0 (and the GEMM without `hw_family`)
+  takes the roofline max(bytes / peak DRAM, flops / peak) + launches × `direct.launch`, a
+  LOWER bound. `imd_perf_t.uncalibrated_phases` and `imd_perf_candidate_t.uncalibrated_phases`
+  (bit i: phase i) say so; such a phase's interval is [t, t]. A ranking that mixes them favours
+  HWGEMM: the caller must look at the bits.
+- No power model for HWGEMM (no FP64 tensor-core energy key yet): `power_w` = 0, and SUSTAINED
+  resolves to the top clock. Cache terms as for the other modes (the packs and the GEMM's
+  affine operands read the inputs first).
+- `imd_perf_t` and the candidate report `hw_tile`, the slab length L (`hw_slab`) and the slab
+  count S (`hw_slabs`); `err_bound` for S > 1 is γ_{k + 2(S − 1)} (each slab's sum is rounded
+  into C with α: a conservative form of the L7 chain).
+- `imd_perf_rank` (done): appended request fields `modes` (IMD_PERF_MODE_EMULATE / DIRECT /
+  HWGEMM; 0: the base options' mode), `k_slab_count` + `k_slabs` and `hw_flags`
+  (`IMD_PERF_HW_FIT_SLAB`: with a budget, also the largest multiple-of-16 `k_slab` whose
+  candidate fits: the footprint is affine in L up to 256 bytes of padding per pack (spec/params.py
+  `cert_hw_workspace`), its slope from L = 16 and 32, the closed-form L then stepped by 16 to
+  the largest that fits). The mask overrides base `mode` and
+  `k_slab`; `modes` = 0 and a version-8 request keep the version-8 enumeration (N × g × vec ×
+  packs in the base's mode, EMULATE or DIRECT), except that a HWGEMM base ranks HWGEMM alone
+  (INVALID_VALUE for a version-8 request: its candidates have no HWGEMM fields). DIRECT and
+  HWGEMM ignore N, g and the pack modes; one candidate per vec mode (and per distinct slab
+  length); a fully affine HWGEMM call (no vectors) has one per slab length. A HWGEMM
+  candidate needs a version-16 `candidate_size`. Ties order on mode, then `k_slab`.
+  The ranking reports; the caller chooses.
 Workspace exactness for HWGEMM joins `cert_workspace`.
 
 **6i.6 Limits.** m, n ≤ 2³¹ − 1 and k (or `k_slab`) ≤ 2³¹ − 1 per GEMM (CUTLASS GemmCoord;

@@ -60,16 +60,20 @@ _VEC = {"GENERATE": 0, "RESIDENT": 1}
 K4_CONFIGS = ["128x256", "128x128", "64x128", "64x64"]  # IMD_K4_* tiles (DESIGN v1.5 §4)
 # Performance model (DESIGN v1.8 §6c): IMD_PERF_CLASS_* key prefixes, IMD_PERF_PHASE_* names
 PERF_CLASSES = ["k0", "kf", "kl", "pack", "k4_128x256", "k4_128x128", "k4_64x128", "k4_64x64",
-                "k5", "direct", "beta", "call"]
+                "k5", "direct", "beta", "call", "hw_pack", "hw_gemm"]  # v16: HWGEMM (§6i.5)
 PERF_PHASES = ["K0 vec", "KF fused", "KL A", "KL B", "K2 pack A", "K3 pack B", "K4 gemm",
-               "K5 crt", "DIRECT", "K5 beta-only", "call", "pack prep", "pack KL"]
+               "K5 crt", "DIRECT", "K5 beta-only", "call", "pack prep", "pack KL",
+               "HWGEMM pack A", "HWGEMM pack B", "HWGEMM gemm"]  # v16
 _PERF_MAX_PARAMS, _PERF_PARAM_CAPACITY, _PERF_MAX_PHASES = 6, 96, 16
 _PERF_PARAM_KL_DROP_SLOT = _PERF_PARAM_CAPACITY - 1  # IMD_PERF_PARAM_KL_DROP_SLOT (v1.19, 95)
 _PERF_BETA_NONZERO, _PERF_ALPHA_ZERO = 1, 2
 _PERF_VEC = {"GENERATE": 1, "RESIDENT": 2}
 _PERF_PACK = {"NONE": 1, "A": 2, "B": 4, "AB": 8}
 # v7 (DESIGN v1.10 §6c)
-_PERF_KERNEL_CAPACITY, _PERF_KERNEL_COUNT, _PERF_CLASS_CAPACITY = 128, 90, 16
+_PERF_KERNEL_CAPACITY, _PERF_KERNEL_COUNT, _PERF_CLASS_CAPACITY = 128, 95, 16  # v16: 95
+# v16 (DESIGN §6i.5): imd_perf_rank_request_t.modes bits and hw_flags
+PERF_MODES = {"EMULATE": 1, "DIRECT": 2, "HWGEMM": 4}
+_PERF_HW_FIT_SLAB = 1
 PERF_REGIMES = {"DEFAULT": 0, "BURST": 1, "SUSTAINED": 2}
 PERF_CACHES = {"COLD": 0, "WARM": 1, "REPEAT": 2, "CLEAN": 3}  # v13 (DESIGN v1.18 §6c.8): CLEAN
 PERF_ORDERS = {"TIME": 0, "TIES_BY_FOOTPRINT": 1}
@@ -214,7 +218,10 @@ class _PerfCalib(C.Structure):
                 ("clock_boost_mhz", C.c_double), ("power_act_w", C.c_double),
                 ("power_act_gap_us", C.c_double), ("energy_dram_pj", C.c_double),
                 ("warm_call_ns", C.c_double), ("warm_clean_byte_ns", C.c_double),
-                ("pack_l2_planes", C.c_double)]
+                ("pack_l2_planes", C.c_double),
+                # v16 (DESIGN §6i.5)
+                ("peak_fp64_tc_flops_per_s", C.c_double), ("hw_family", C.c_int32),
+                ("reserved16", C.c_int32)]
 
 
 # The string fields of a calibration and their capacities in bytes, NUL included (the
@@ -273,7 +280,10 @@ class _Perf(C.Structure):
                 ("phase_hi_s", C.c_double * _PERF_MAX_PHASES),
                 # v8
                 ("err_bound", C.c_double), ("err_typical", C.c_double),
-                ("err_status", C.c_int32), ("err_metric", C.c_int32)]
+                ("err_status", C.c_int32), ("err_metric", C.c_int32),
+                # v16 (DESIGN §6i.5)
+                ("uncalibrated_phases", C.c_uint32), ("hw_tile", C.c_int32),
+                ("hw_slab", C.c_int64), ("hw_slabs", C.c_int64)]
 
 
 class _RankRequest(C.Structure):
@@ -285,7 +295,10 @@ class _RankRequest(C.Structure):
                 ("eps_fraction", C.c_double),
                 ("regime", C.c_int32), ("cache", C.c_int32), ("order", C.c_int32),
                 ("reserved", C.c_int32), ("clock_mhz", C.c_double),  # v7
-                ("accuracy", C.POINTER(_ErrRequest))]  # v8
+                ("accuracy", C.POINTER(_ErrRequest)),  # v8
+                ("modes", C.c_int32), ("k_slab_count", C.c_int32),  # v16
+                ("k_slabs", C.POINTER(C.c_int64)), ("hw_flags", C.c_int32),
+                ("reserved16", C.c_int32)]
 
 
 class _Candidate(C.Structure):
@@ -301,17 +314,20 @@ class _Candidate(C.Structure):
                 ("clock_mhz", C.c_double), ("power_w", C.c_double),
                 ("tie", C.c_int32), ("raw_rank", C.c_int32),
                 ("err_bound", C.c_double), ("err_typical", C.c_double),  # v8
-                ("err_status", C.c_int32), ("infeasible", C.c_int32)]
+                ("err_status", C.c_int32), ("infeasible", C.c_int32),
+                ("mode", C.c_int32), ("uncalibrated_phases", C.c_uint32),  # v16
+                ("hw_tile", C.c_int32), ("reserved16", C.c_int32), ("k_slab", C.c_int64),
+                ("hw_slab", C.c_int64), ("hw_slabs", C.c_int64)]
 
 
 assert C.sizeof(_Lowering) == 200  # version 7 (issue 18; v6 = 192, DESIGN v1.13 §4b; v5 = 184)
 assert _Lowering.k_align.offset == 184 and _Lowering.table_id.offset == 192
 assert C.sizeof(_Options) == 48  # host API 16
 assert C.sizeof(_PackDesc) == 72 and C.sizeof(_PackLayout) == 136
-assert C.sizeof(_PerfCalib) == 3744 and _PerfCalib.energy_byte_f_pj.offset == 3672 and \
+assert C.sizeof(_PerfCalib) == 3760 and _PerfCalib.hw_family.offset == 3752 and _PerfCalib.energy_byte_f_pj.offset == 3672 and \
     _PerfCalib.pack_l2_hit_bytes.offset == 3680 and _PerfCalib.clock_boost_mhz.offset == 3688 and \
-    _PerfCalib.pack_l2_planes.offset == 3736 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 1976
-assert C.sizeof(_RankRequest) == 96 and C.sizeof(_Candidate) == 192
+    _PerfCalib.pack_l2_planes.offset == 3736 and C.sizeof(_PerfPhase) == 96 and C.sizeof(_Perf) == 2000
+assert C.sizeof(_RankRequest) == 120 and C.sizeof(_Candidate) == 232
 assert C.sizeof(_PerfRequest) == 48
 assert C.sizeof(_ErrRequest) == 64 and C.sizeof(_Err) == 72
 
@@ -1115,6 +1131,7 @@ class PhasePrediction:
                      # the round-model terms j < 4 and the DRAM term j = 4)
     lo_s: float = 0.0  # v7: the phase's band
     hi_s: float = 0.0
+    uncalibrated: bool = False  # v16: an uncalibrated roofline (a lower bound, lo = hi)
 
 
 @dataclass(frozen=True)
@@ -1147,6 +1164,10 @@ class Prediction:
     err_typical: float = 0.0      # in the request's metric (NORMWISE without accuracy=),
     err_status: str = "UNCHECKED"  # "MET" / "MISSED" with a target; imd_perf_predict_pack: 0
     err_metric: str = "NORMWISE"
+    uncalibrated_phases: int = 0  # v16 (§6i.5): bit i = phases[i] is a roofline lower bound
+    hw_tile: int = -1             # HWGEMM: tile (0 128x128, 1 64x128, 2 64x64), slab length L
+    hw_slab: int = 0              # and slab count S
+    hw_slabs: int = 0
 
     def phase(self, name):
         """The PhasePrediction with this name, or None."""
@@ -1164,7 +1185,8 @@ def _calib_arg(calib):
 def _prediction(r, st):
     phases = tuple(PhasePrediction(PERF_PHASES[p.phase], PERF_CLASSES[p.cls], p.launches,
                                    p.time_s, p.bytes, p.ops, p.bound_s, tuple(p.x),
-                                   r.phase_lo_s[i], r.phase_hi_s[i])
+                                   r.phase_lo_s[i], r.phase_hi_s[i],
+                                   bool(r.uncalibrated_phases >> i & 1))
                    for i, p in enumerate(r.phase[:r.num_phases]))
     reg = {v: k for k, v in PERF_REGIMES.items()}
     cac = {v: k for k, v in PERF_CACHES.items()}
@@ -1174,7 +1196,8 @@ def _prediction(r, st):
                       r.pack_ws_bytes, phases, reg.get(r.regime, "BURST"),
                       cac.get(r.cache, "COLD"), r.clock_mhz, r.power_w, r.warm_bytes,
                       r.time_lo_s, r.time_hi_s, r.err_bound, r.err_typical,
-                      ERR_STATUS[r.err_status], _ERR_METRIC_NAME[r.err_metric])
+                      ERR_STATUS[r.err_status], _ERR_METRIC_NAME[r.err_metric],
+                      r.uncalibrated_phases, r.hw_tile, r.hw_slab, r.hw_slabs)
 
 
 _ERR_METRIC_NAME = {v: k for k, v in ERR_METRICS.items()}
@@ -1187,7 +1210,7 @@ def _eps(eps_fraction):
 def predict(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EMULATE",
             vec_mode="GENERATE", packing=None, beta=False, alpha_zero=False, k4_config=None,
             eps_fraction=None, regime="DEFAULT", cache="COLD", clock_mhz=0.0, accuracy=None,
-            calib=None, lib=None):
+            k_slab=0, calib=None, lib=None):
     """imd_perf_predict: the predicted imd_contract (DESIGN §6c). A plan-time status is
     returned in .status (with zeros); a bad argument raises. packing = (PackSpec or None,
     PackSpec or None): the packed plan. beta: C is read (beta != 0); alpha_zero: the beta-only
@@ -1196,7 +1219,7 @@ def predict(spec, extents=None, *, strides=None, N, g=0, rounding="RN", mode="EM
     DESIGN v1.15 §6c.1). v7: regime "DEFAULT" / "BURST" / "SUSTAINED", cache "COLD" / "WARM" /
     "REPEAT" (v13: "CLEAN", an L2 flushed by reads), clock_mhz > 0: predict at that SM clock. v8: accuracy (an Accuracy): err_bound /
     err_typical in its metric and err_status against its target (None: NORMWISE, no target)."""
-    h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing)
+    h, call = _prep(spec, extents, strides, N, g, rounding, mode, vec_mode, lib, packing, k_slab)
     flags = (_PERF_BETA_NONZERO if beta else 0) | (_PERF_ALPHA_ZERO if alpha_zero else 0)
     req = _PerfRequest(C.sizeof(_PerfRequest), flags,
                        -1 if k4_config is None else int(k4_config), 0, _eps(eps_fraction),
@@ -1259,12 +1282,18 @@ class Candidate:
     err_typical: float = 0.0  # (NORMWISE without accuracy=; inf when status != SUCCESS),
     err_status: str = "UNCHECKED"  # against its target, and why it is infeasible
     infeasible: int = 0      # INFEASIBLE bits: STATUS 1, BUDGET 2, ACCURACY 4
+    mode: str = "EMULATE"    # v16 (§6i.5): the candidate's mode, k_slab, and (HWGEMM) tile,
+    k_slab: int = 0          # slab length L and count S; uncalibrated_phases != 0: time_s is
+    hw_tile: int = -1        # a lower bound
+    hw_slab: int = 0
+    hw_slabs: int = 0
+    uncalibrated_phases: int = 0
 
 
 def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",),
          packs=("NONE",), reuse=1, budget=0, beta=False, rounding="RN", mode="EMULATE",
          eps_fraction=None, order="TIME", regime="DEFAULT", cache="COLD", clock_mhz=0.0,
-         accuracy=None, calib=None, lib=None):
+         accuracy=None, modes=None, k_slabs=(), fit_slab=False, calib=None, lib=None):
     """imd_perf_rank: the candidates N x g x vec mode x packs ranked by predicted time inside a
     device-memory budget (bytes; 0 = none). N: an int or a list of admissible N; g: None
     (every g in 1..N) or a list; packs: any of "NONE", "A", "B", "AB". v7: order "TIME" (the
@@ -1272,8 +1301,14 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
     best first, by footprint; Candidate.tie is set in either order), regime / cache / clock_mhz
     as predict. v8: accuracy (an Accuracy with a target): the candidates whose estimate misses
     the target are infeasible (infeasible bit ACCURACY), so the first candidate, if feasible,
-    is the cheapest configuration that meets the target."""
+    is the cheapest configuration that meets the target. v16 (DESIGN §6i.5): modes, any of
+    "EMULATE", "DIRECT", "HWGEMM" (None: `mode` alone); DIRECT / HWGEMM candidates ignore N, g
+    and packs; k_slabs: the HWGEMM k_slab values (empty: none); fit_slab: also the largest
+    k_slab whose candidate fits `budget`."""
     Ns = [int(N)] if hasattr(N, "__index__") else [int(x) for x in N]
+    mask = 0 if modes is None else sum(PERF_MODES[x] for x in set(modes))
+    slabs = [int(x) for x in k_slabs]
+    sarr = (C.c_int64 * max(len(slabs), 1))(*slabs)
     gs = [] if g is None else ([int(g)] if isinstance(g, int) else [int(x) for x in g])
     h, call = _prep(spec, extents, strides, Ns[0], 0, rounding, mode, "GENERATE", lib)
     narr = (C.c_int32 * max(len(Ns), 1))(*Ns)
@@ -1285,7 +1320,9 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
                        sum(_PERF_PACK[p] for p in set(packs)), int(reuse),
                        _PERF_BETA_NONZERO if beta else 0, int(budget), _eps(eps_fraction),
                        PERF_REGIMES[regime], PERF_CACHES[cache], PERF_ORDERS[order], 0,
-                       float(clock_mhz), _accuracy_ptr(accuracy))
+                       float(clock_mhz), _accuracy_ptr(accuracy), mask, len(slabs),
+                       C.cast(sarr, C.POINTER(C.c_int64)) if slabs else None,
+                       _PERF_HW_FIT_SLAB if fit_slab else 0, 0)
     count = C.c_int32(0)
     if calib is None:
         h.check_shipped_calib()
@@ -1299,6 +1336,7 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
     if st != 0:
         raise ImmerdinkError(st, "imd_perf_rank")
     vec_name = {v: k for k, v in _VEC.items()}
+    mode_name = {v: k for k, v in _MODE.items()}
     return [Candidate(c.num_moduli, c.residue_group, vec_name[c.vec_mode],
                       ["NONE", "A", "B", "AB"][c.packed], STATUS[c.status], bool(c.feasible),
                       c.k4_config, DISPATCH[c.dispatch], c.time_s, c.contract_s, c.pack_s,
@@ -1306,7 +1344,9 @@ def rank(spec, extents=None, *, strides=None, N, g=None, vec_modes=("GENERATE",)
                       c.plan_device_bytes, c.pack_bytes,
                       c.pack_ws_bytes, c.total_bytes, c.kernel_launches, c.time_lo_s,
                       c.time_hi_s, c.clock_mhz, c.power_w, bool(c.tie), c.raw_rank,
-                      c.err_bound, c.err_typical, ERR_STATUS[c.err_status], c.infeasible)
+                      c.err_bound, c.err_typical, ERR_STATUS[c.err_status], c.infeasible,
+                      mode_name[c.mode], c.k_slab, c.hw_tile, c.hw_slab, c.hw_slabs,
+                      c.uncalibrated_phases)
             for c in out[:count.value]]
 
 

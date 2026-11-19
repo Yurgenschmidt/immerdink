@@ -3018,7 +3018,10 @@ cudaError_t kernel_occupancy(int32_t kernel, int32_t* out) {
     case IMD_PERF_KERNEL_BETA: return occupancy_of(k5_beta_only, kThreads, out);
     case IMD_PERF_KERNEL_PACK_PREP: return occupancy_of(kp_prep<kK0SmallModes>, kThreads, out);
     default:
-      if (kernel >= IMD_PERF_KERNEL_K5 && kernel < IMD_PERF_KERNEL_COUNT) {
+      if (kernel >= IMD_PERF_KERNEL_HW_PACK && kernel < IMD_PERF_KERNEL_COUNT)  // v16 (§6i.5)
+        return hw_kernel_occupancy(kernel - IMD_PERF_KERNEL_HW_PACK, out, &g_last_binary,
+                                   &g_last_ptx);
+      if (kernel >= IMD_PERF_KERNEL_K5 && kernel < IMD_PERF_KERNEL_HW_PACK) {
         const int i = kernel - IMD_PERF_KERNEL_K5;
         return k5_occupancy(imd::constants::kNMin + i / 4, i % 4, out);
       }

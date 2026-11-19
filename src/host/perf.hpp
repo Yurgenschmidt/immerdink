@@ -15,8 +15,10 @@ namespace imd::detail {
 // One phase of a call: phase / class ids, launches, the features x (the model is
 // sum_j param[cls * IMD_PERF_MAX_PARAMS + j] x[j], in ns, the clock-bound terms scaled by
 // f_ref / f; K4: max of j != 4 and j = 4), its MEMORY_MODEL §4 bound inputs: DRAM bytes and
-// ops (peak: 0 none, 1 int8 tensor-core ops, 2 FP64 flops), and (v1.10) the input bytes it
-// reads first (the COLD / WARM term).
+// ops (peak: 0 none, 1 int8 tensor-core ops, 2 FP64 flops, 3 v16 FP64 tensor-core flops), and
+// (v1.10) the input bytes it reads first (the COLD / WARM term). v16 (§6i.5): `roofline` marks
+// a phase of an uncalibrated class, timed max(bytes / peak DRAM, ops / peak) + launches x
+// direct.launch, a lower bound.
 struct PerfPhase {
   int32_t phase = 0, cls = 0;
   int64_t launches = 0;
@@ -24,6 +26,7 @@ struct PerfPhase {
   double bytes = 0, ops = 0;
   int peak = 0;
   double in_bytes = 0;  // v1.10: the call's input bytes this phase reads first
+  bool roofline = false;  // v16
 };
 struct PerfPhases {
   PerfPhase ph[IMD_PERF_MAX_PHASES];
@@ -33,6 +36,9 @@ struct PerfPhases {
   // v1.10 (COLD / WARM): the call's input bytes I and its footprint F (inputs + workspace /
   // pack buffers + the output), DESIGN §6c.1 "Cache state".
   double inputs = 0, footprint = 0;
+  // v16 (§6i.5): HWGEMM's tile (-1: not HWGEMM), slab length L and slab count S (0: not HWGEMM)
+  int32_t hw_tile = -1;
+  int64_t hw_slab = 0, hw_slabs = 0;
 };
 
 // The phases of one imd_contract of a SUCCESS plan (analysis `an`, plan data `e`), in launch

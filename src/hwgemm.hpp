@@ -117,5 +117,10 @@ bool& hw_own_vec2();
 // for another index.
 constexpr int32_t kHwKernelVersionCount = 7;
 cudaError_t hw_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx);
+// v16 (DESIGN §6i.5): the occupancy row of performance-model kernel IMD_PERF_KERNEL_HW_PACK +
+// index (0 hw_pack_kernel, 1 hw_pack_rows_kernel, 2 + tile the GEMM tile: the own kernel, the
+// stage-1 mainloop's twin; the Sm90 family where usable, else Sm80's 64x64 for every tile: the
+// only one that runs there) and its code versions.
+cudaError_t hw_kernel_occupancy(int32_t index, int32_t* out, int32_t* binary, int32_t* ptx);
 
 }  // namespace imd::detail

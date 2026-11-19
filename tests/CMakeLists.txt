@@ -79,6 +79,10 @@ if(Python3_FOUND)
   add_test(NAME hwgemm_workspace
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_hw_workspace.py"
                    --host-lib "$<TARGET_FILE:immerdink_host>")
+  # DESIGN v1.21 §6i.5 (issue #75): the IMD_HWGEMM performance model in the planning API. CPU only.
+  add_test(NAME hwgemm_perf
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_hw_perf.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>")
   # DESIGN v1.8 §6c: the performance model (calibration, features, rank). CPU only.
   add_test(NAME host_perf
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_host.py"

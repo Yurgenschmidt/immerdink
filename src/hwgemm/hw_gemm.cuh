@@ -157,6 +157,8 @@ imd_status_t hw_own_sm80_run(const HwOwnCall& c, cudaStream_t stream);  // hw_ow
 imd_status_t hw_own_sm90_run(const HwOwnCall& c, cudaStream_t stream);  // hw_own_sm90.cu
 cudaError_t hw_own_sm80_versions(int32_t* binary, int32_t* ptx);
 cudaError_t hw_own_sm90_versions(int32_t* binary, int32_t* ptx);
+cudaError_t hw_own_sm80_occupancy(int32_t* out, int32_t* binary, int32_t* ptx);  // 64x64
+cudaError_t hw_own_sm90_occupancy(int32_t tile, int32_t* out, int32_t* binary, int32_t* ptx);
 imd_status_t hw_sm90_run(const HwNorm& c, cudaStream_t stream);
 bool hw_sm90_usable();  // the Sm90 kernels carry sm_90+ code (ptxVersion >= 90)
 cudaError_t hw_sm80_versions(int32_t* binary, int32_t* ptx);  // one kernel of each module

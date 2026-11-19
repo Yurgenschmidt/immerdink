@@ -24,6 +24,15 @@ cudaError_t hw_own_sm90_versions(int32_t* binary, int32_t* ptx) {
   return O<64, 64, 32, 32, RM, RM>::versions(binary, ptx);
 }
 
+cudaError_t hw_own_sm90_occupancy(int32_t tile, int32_t* out, int32_t* binary, int32_t* ptx) {
+  switch (tile) {
+    case kHw128x128: return O<128, 128, 32, 64, RM, RM>::occupancy(out, binary, ptx);
+    case kHw64x128: return O<64, 128, 32, 64, RM, RM>::occupancy(out, binary, ptx);
+    case kHw64x64: return O<64, 64, 32, 32, RM, RM>::occupancy(out, binary, ptx);
+    default: return cudaErrorInvalidValue;
+  }
+}
+
 imd_status_t hw_own_sm90_run(const HwOwnCall& c, cudaStream_t stream) {
   switch (c.tile) {
     case kHw128x128: return run_tile<128, 128, 32, 64>(c, stream);

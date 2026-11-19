@@ -17,6 +17,10 @@ cudaError_t hw_own_sm80_versions(int32_t* binary, int32_t* ptx) {
   return O64<RM, RM>::versions(binary, ptx);
 }
 
+cudaError_t hw_own_sm80_occupancy(int32_t* out, int32_t* binary, int32_t* ptx) {
+  return O64<RM, RM>::occupancy(out, binary, ptx);
+}
+
 imd_status_t hw_own_sm80_run(const HwOwnCall& c, cudaStream_t stream) {
   if (c.tile != kHw64x64) return IMD_STATUS_INVALID_VALUE;
   // A ROW = RowMajor; B ROW (K contiguous per column j) = ColumnMajor (hw_gemm.cuh).

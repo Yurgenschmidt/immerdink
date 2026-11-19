@@ -2730,6 +2730,71 @@ def cert_design_text():
     return f"log2P OK; kappa/2 slack < 2^-20 at N=8 only for k <= {k_ok} (~2^{math.log2(k_ok):.1f})"
 
 
+def hw_workspace_regions(m, n, k, b, vec, pa, pb, slab=0):
+    """DESIGN §6i.2 / §6i.3: the IMD_HWGEMM workspace of a lowered m, n, k, b: [(name, offset,
+    end)] and the total. vec: the scatter vectors are in the workspace (needed and not
+    plan-resident); pa / pb: the GEMM's A / B is packed. slab: k_slab (0: none); the packs hold
+    one slab of L = min(ceil16(slab), k) columns rounded up to 16 (k-hat of one slab)."""
+    L = k if slab <= 0 else min(align_up(slab, 16), k)
+    sizes = [("vec", 8 * (2 * m + 2 * n + 2 * k + 3 * b) if vec else 0),
+             ("PA", 8 * b * m * align_up(L, 16) if pa else 0),
+             ("PB", 8 * b * n * align_up(L, 16) if pb else 0)]
+    regs, off = [], 0
+    for name, nb in sizes:
+        if nb:
+            regs.append((name, off, off + nb))
+            off += align_up(nb, REGION_ALIGN)
+    return regs, off
+
+
+@check("§6i.2 HWGEMM workspace")
+def cert_hw_workspace():
+    """IMD_HWGEMM (v1.21 §6i.2-§6i.5): regions disjoint, 256-aligned, in order; a slab never
+    grows the workspace (monotone in L); the footprint is affine in L up to the alignment
+    padding (what imd_perf_rank's IMD_PERF_HW_FIT_SLAB relies on: <= 256 bytes per pack from
+    the line through L = 16 and L = 32); k_slab >= k is no slab. Plus worked examples."""
+    n_cases = 0
+    for m in (1, 5, 17, 100):
+        for n in (1, 6, 33):
+            for k in (2, 15, 16, 17, 100, 1000):
+                for b in (1, 3):
+                    for vec in (False, True):
+                        for pa in (False, True):
+                            for pb in (False, True):
+                                prev = None
+                                packs = int(pa) + int(pb)
+                                r16 = hw_workspace_regions(m, n, k, b, vec, pa, pb, 16)[1]
+                                slope = 8 * b * (m * pa + n * pb)  # bytes per K column
+                                for L in range(16, align_up(k, 16) + 16, 16):
+                                    regs, tot = hw_workspace_regions(m, n, k, b, vec, pa, pb, L)
+                                    end = 0
+                                    for _, o, e in regs:
+                                        need(o % REGION_ALIGN == 0 and o >= end, "hw region order")
+                                        end = e
+                                    need(tot == align_up(end, REGION_ALIGN) or not regs, "hw total")
+                                    need(prev is None or tot >= prev, "hw workspace not monotone in L")
+                                    prev = tot
+                                    Lr = min(L, k)
+                                    lin = r16 + slope * (align_up(Lr, 16) - 16) if k > 16 else r16
+                                    need(abs(tot - lin) <= REGION_ALIGN * packs, "hw not affine in L")
+                                    n_cases += 1
+                                need(hw_workspace_regions(m, n, k, b, vec, pa, pb, k + 1)[1] ==
+                                     hw_workspace_regions(m, n, k, b, vec, pa, pb, 0)[1], "slab >= k")
+    # Worked examples (typed by hand from §6i.2): (5, 6, 100, b 1), vectors, A packed:
+    #  vec 8 (10 + 12 + 200 + 3) = 1800 -> 2048; PA 8*5*112 = 4480 at 2048 -> 4608; total 6656
+    #  k_slab 32: PA 8*5*32 = 1280 at 2048 (a multiple of 256); total 3328
+    #  (40, 30, 500, b 2), no vectors, both packed, k_slab 64: PA 8*2*40*64 = 40960 at 0;
+    #   PB 8*2*30*64 = 30720 at 40960; total 71680
+    worked = [((5, 6, 100, 1, True, True, False, 0), 6656, [("vec", 0, 1800), ("PA", 2048, 6528)]),
+              ((5, 6, 100, 1, True, True, False, 32), 3328, [("vec", 0, 1800), ("PA", 2048, 3328)]),
+              ((40, 30, 500, 2, False, True, True, 64), 71680,
+               [("PA", 0, 40960), ("PB", 40960, 71680)])]
+    for args, want, regs_want in worked:
+        regs, tot = hw_workspace_regions(*args)
+        need(tot == want and regs == regs_want, f"hw worked example {args}: {regs} {tot}")
+    return f"{n_cases} HWGEMM layouts (slab lengths), {len(worked)} worked examples"
+
+
 @check("§4a workspace")
 def cert_workspace():
     """Closed form = sum of aligned regions; regions disjoint, 256-aligned, in order;

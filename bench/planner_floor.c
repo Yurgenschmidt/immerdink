@@ -166,7 +166,7 @@ int main(void) {
     c.rank_n = N;
     c.rreq = (imd_perf_rank_request_t){sizeof c.rreq, sizeof c.cands[0], 1, 0, &c.rank_n, NULL,
                                        IMD_PERF_VEC_GENERATE, IMD_PERF_PACK_NONE, 1, 0, 0, -1.0,
-                                       0, 0, 0, 0, 0.0, NULL};  /* v7: DEFAULT, COLD, TIME */
+                                       0, 0, 0, 0, 0.0, NULL, 0, 0, NULL, 0, 0};  /* v7: DEFAULT, COLD, TIME; v16: base mode */
     memset(&c.acc, 0, sizeof c.acc);
     c.acc.struct_size = sizeof c.acc, c.acc.target = 1e-12;
     printf("%s", name);

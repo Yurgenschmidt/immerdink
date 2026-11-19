@@ -1338,7 +1338,9 @@ def suite_perf_v110(cal, names, rng):
         count += 1
     # (7) occupancy table names
     kn = host.kernel_names()
-    if len(kn) != 90 or kn[0] != "k0" or kn[14] != "k5_n2_e1" or kn[-1] != "k5b_n20" or \
+    if len(kn) != 95 or kn[0] != "k0" or kn[14] != "k5_n2_e1" or kn[89] != "k5b_n20" or \
+            kn[90:] != ["hw_pack", "hw_pack_rows", "hw_gemm_128x128", "hw_gemm_64x128",
+                        "hw_gemm_64x64"] or \
             len(set(kn)) != len(kn):
         raise Fail(f"kernel names {kn[:3]} ... {kn[-3:]}")
     return count
