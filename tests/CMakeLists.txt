@@ -75,6 +75,14 @@ if(Python3_FOUND)
   add_test(NAME host_python
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_host.py"
                    --host-lib "$<TARGET_FILE:immerdink_host>" --suite host -v)
+  # DESIGN v1.21 §6i.2 (issue #75 stage 2): the exact IMD_HWGEMM workspace (vec, PA, PB). CPU only.
+  add_test(NAME hwgemm_workspace
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_hw_workspace.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>")
+  # DESIGN v1.21 §6i.5 (issue #75): the IMD_HWGEMM performance model in the planning API. CPU only.
+  add_test(NAME hwgemm_perf
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_hw_perf.py"
+                   --host-lib "$<TARGET_FILE:immerdink_host>")
   # DESIGN v1.8 §6c: the performance model (calibration, features, rank). CPU only.
   add_test(NAME host_perf
            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_host.py"
@@ -274,6 +282,12 @@ if(Python3_FOUND)
   # contract_highrank (operand ranks 6-12) has hard size guards; run it alone with
   # `tools/test.sh -R contract_highrank`, or skip it with `-E contract_highrank`.
   set(shim "$<TARGET_FILE:imd_alloc_shim>")
+  # IMD_HWGEMM stage 1 (DESIGN §6i, issue #75): bit-exact against DIRECT on the GPU (every
+  # layout, tile, chunking, specials, the stage-1 NOT_SUPPORTED cases).
+  add_test(NAME hwgemm_vs_direct
+           COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_hwgemm.py"
+                   --lib "$<TARGET_FILE:immerdink>")
+  set_tests_properties(hwgemm_vs_direct PROPERTIES RESOURCE_LOCK gpu TIMEOUT 900)
   foreach(suite api stages e2e tensor bigk replay every_n k_align pad_mutation eps)
     add_test(NAME contract_${suite}
              COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_contract.py"

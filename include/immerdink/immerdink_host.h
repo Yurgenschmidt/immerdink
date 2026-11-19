@@ -26,8 +26,10 @@ extern "C" {
 #endif
 
 /* Version of the host query API (§6a "ABI stability"). It grows by one whenever a function
- * or a trailing struct field is added; nothing that exists changes meaning or layout. */
-#define IMD_HOST_API_VERSION 14 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
+ * or a trailing struct field is added; nothing that exists changes meaning or layout, with
+ * ONE exception: version 16 changed imd_options_t's layout (it had no struct_size; DESIGN
+ * §6i.5), so callers built against 15 or older must be rebuilt. */
+#define IMD_HOST_API_VERSION 16 /* 2: imd_lowering_t fused, kernel_launches (§6a v1.4);
                                    3: K4 configurations, imd_options_t.k4_tune,
                                       imd_lowering_t sm_count, k4_config, k4_tune_bytes (v1.5);
                                    4: imd_lowering_t fused_large (v1.6);
@@ -64,7 +66,17 @@ extern "C" {
                                   14: device classes and per-GPU table sets (issue 18, docs/NOTES-18.md):
                                       imd_device_class_t, imd_device_select, imd_device_select_rows,
                                       imd_kernel_code_kind, imd_plan_status_of, *_name functions,
-                                      IMD_TABLE_*, imd_lowering_t table_id (v7) */
+                                      IMD_TABLE_*, imd_lowering_t table_id (v7);
+                                  15: the hardware GEMM mode (§6i v1.21, issue #75): IMD_HWGEMM,
+                                      IMD_DISPATCH_HWGEMM (first stage: fully affine calls;
+                                      the others are NOT_SUPPORTED until the pack stage);
+                                  16: ABI BREAK (§6i.5): imd_options_t gains struct_size (first),
+                                      dtype, compute and k_slab; IMD_REGION_PA / PB; HWGEMM
+                                      packs, scattered C, multi-mode batches and k-slabs;
+                                      the HWGEMM performance model (appended perf fields:
+                                      classes hw_pack / hw_gemm, phases 13..15, kernels
+                                      90..94, uncalibrated_phases, hw tile / slab, the rank
+                                      modes mask and k_slabs) */
 
 typedef enum {
   IMD_STATUS_SUCCESS = 0,
@@ -82,9 +94,11 @@ typedef enum {
                                   the plan's packed slots */
 } imd_status_t;
 
-/* Options: rounding (§3.3) and mode (§4 DIRECT path). */
+/* Options: rounding (§3.3) and mode (§4 DIRECT path, §6i hardware GEMM). IMD_HWGEMM (v15):
+ * the device's own FP64 GEMM arithmetic (tensor cores where it has them); num_moduli,
+ * residue_group and rounding are checked but unused, as in DIRECT. */
 enum { IMD_RN = 0, IMD_TRUNC = 1 };
-enum { IMD_EMULATE = 0, IMD_DIRECT = 1 };
+enum { IMD_EMULATE = 0, IMD_DIRECT = 1, IMD_HWGEMM = 2 };
 /* Where the scatter vectors live (DESIGN v1.2 §4 K0, §4a, §6):
  *   IMD_VEC_GENERATE  (default) generated on the device by every imd_contract into the
  *                     workspace; the plan owns no device or pinned memory;
@@ -115,13 +129,31 @@ typedef struct {
   const int32_t* label;
 } imd_tensor_t;
 
+/* Element type and arithmetic (§6i.8; host API 16). v1 runs FP64 only; any other value is
+ * NOT_SUPPORTED. IMD_COMPUTE_DEFAULT: the accurate arithmetic for the type and mode. */
+enum { IMD_F64 = 0 };
+enum { IMD_COMPUTE_DEFAULT = 0 };
+
+/* Call options. struct_size (host API 16) = sizeof(imd_options_t) of the caller's header:
+ * the library reads that many bytes, rejects a size below version 16's (INVALID_VALUE: a
+ * caller built against an older header passes num_moduli there) and NOT_SUPPORTED for a
+ * larger struct whose bytes beyond its own are not all zero (a later option it cannot honour).
+ * k_slab (§6i.3): 0 = none; else HWGEMM splits K into slabs of k_slab rounded up to 16 (the K
+ * tile), run in order on one stream (slab 0 with the caller's beta, later slabs beta = 1,
+ * alpha per slab), with the packed regions sized by one slab; >= k is one slab; < 0, or
+ * != 0 outside IMD_HWGEMM: INVALID_VALUE. Slabs change the rounding (DESIGN §6i.4). */
 typedef struct {
+  uint32_t struct_size;  /* sizeof(imd_options_t), host API 16 */
   int32_t num_moduli;    /* N, 2..20                        */
   int32_t residue_group; /* g, 0 = N; the workspace/speed knob (§4a, §6a) */
   int32_t rounding;      /* IMD_RN (default) | IMD_TRUNC     */
-  int32_t mode;          /* IMD_EMULATE | IMD_DIRECT         */
+  int32_t mode;          /* IMD_EMULATE | IMD_DIRECT | IMD_HWGEMM (v15) */
   int32_t vec_mode;      /* IMD_VEC_GENERATE (0) | IMD_VEC_RESIDENT (v1.2) */
   int32_t k4_tune;       /* IMD_K4_TUNE_OFF (0) | IMD_K4_TUNE_ON (v1.5)     */
+  int32_t dtype;         /* IMD_F64 (0)                     (v16) */
+  int32_t compute;       /* IMD_COMPUTE_DEFAULT (0)         (v16) */
+  int32_t reserved0;     /* 0 */
+  int64_t k_slab;        /* 0 = none (v16)                  */
 } imd_options_t;
 
 /* The host query API's version: IMD_HOST_API_VERSION of the library actually loaded. */
@@ -150,7 +182,9 @@ enum {
   IMD_REGION_RA = 5,  /* int8 residues of A, one group */
   IMD_REGION_RB = 6,  /* int8 residues of B, one group */
   IMD_REGION_W = 7,   /* u8 products, all N planes     */
-  IMD_REGION_COUNT = 8
+  IMD_REGION_PA = 8,  /* fp64 packed A (IMD_HWGEMM; host API 15) */
+  IMD_REGION_PB = 9,  /* fp64 packed B (IMD_HWGEMM; host API 15) */
+  IMD_REGION_COUNT = 10
 };
 typedef struct {
   uint64_t offset; /* bytes from the workspace base; 256-aligned */
@@ -165,7 +199,8 @@ IMD_API imd_status_t imd_workspace_layout(const imd_tensor_t* A, const imd_tenso
                                           imd_region_t* regions, int32_t capacity,
                                           int32_t* num_regions, size_t* total);
 
-/* Static name of a region index ("sA", "sB", "fA", "fB", "vec", "RA", "RB", "W"), or NULL. */
+/* Static name of a region index ("sA", "sB", "fA", "fB", "vec", "RA", "RB", "W", "PA", "PB"),
+ * or NULL. */
 IMD_API const char* imd_region_name(int32_t region);
 
 /* What imd_plan_create would allocate for these arguments, without a plan or a GPU:
@@ -184,10 +219,12 @@ IMD_API imd_status_t imd_plan_bytes(const imd_tensor_t* A, const imd_tensor_t* B
  *   NOOP     empty output (b m n = 0): nothing;
  *   EMULATE  the emulated pipeline K0-K5 (EMULATE mode, k >= 2);
  *   DIRECT   K0 and the native FP64 kernel (DIRECT mode, or K-empty: k = 1);
- *   SCALE    k = 0 (a zero-extent contracted label): K0 and one kernel, C <- beta C.
+ *   SCALE    k = 0 (a zero-extent contracted label): K0 and one kernel, C <- beta C;
+ *   HWGEMM   (v15) HWGEMM mode, k >= 2: the hardware FP64 GEMM (§6i); a fully affine call
+ *            is one GEMM launch per <= 65535 batches and needs no workspace.
  * (A call with alpha = 0 also runs only K0 and the beta kernel; that is per call.) */
 enum { IMD_DISPATCH_NOOP = 0, IMD_DISPATCH_EMULATE = 1, IMD_DISPATCH_DIRECT = 2,
-       IMD_DISPATCH_SCALE = 3 };
+       IMD_DISPATCH_SCALE = 3, IMD_DISPATCH_HWGEMM = 4 };
 
 /* The lowering summary (§5 GEMM view, §4 dispatch and launch structure, §4a sizes), the
  * input of a later performance model. Versioned by struct_size (§6a): the caller sets
@@ -453,7 +490,16 @@ enum {
   IMD_PERF_CLASS_DIRECT = 9,     /* (direct) native FP64: launch, byte, flop, chain         */
   IMD_PERF_CLASS_BETA = 10,      /* (beta) C <- beta C: launch, byte, chain                 */
   IMD_PERF_CLASS_CALL = 11,      /* (call) per-call correction: call, launch (may be < 0)   */
-  IMD_PERF_CLASS_COUNT = 12
+  /* v16 (DESIGN §6i.5, IMD_HWGEMM). Every key optional: a class whose used slots are all 0 is
+   * UNCALIBRATED and its phases take the roofline max(bytes / peak DRAM, ops / peak) plus the
+   * direct.launch term per launch, a lower bound (imd_perf_t.uncalibrated_phases). */
+  IMD_PERF_CLASS_HW_PACK = 12,   /* (hw_pack) FP64 pack: launch, sector (bytes read in 32-byte
+                                    sectors), write (bytes written), chain                  */
+  IMD_PERF_CLASS_HW_GEMM = 13,   /* (hw_gemm) GEMM: launch, flop (padded-tile FP64 flops),
+                                    wave (flops of the last partial wave), byte, own (flops on
+                                    the own kernel), call; t = launch + call + max(flop + wave +
+                                    own, byte)                                               */
+  IMD_PERF_CLASS_COUNT = 14
 };
 /* Phases (imd_perf_phase_name: the tags of imd_bench's per-phase profile). */
 enum {
@@ -470,7 +516,11 @@ enum {
   IMD_PERF_PHASE_CALL = 10,      /* "call"          */
   IMD_PERF_PHASE_PACK_PREP = 11, /* "pack prep"     */
   IMD_PERF_PHASE_PACK_KL = 12,   /* "pack KL"       */
-  IMD_PERF_PHASE_COUNT = 13
+  IMD_PERF_PHASE_HW_PACK_A = 13, /* "HWGEMM pack A" (v16; launches = S slabs)              */
+  IMD_PERF_PHASE_HW_PACK_B = 14, /* "HWGEMM pack B" (v16)                                  */
+  IMD_PERF_PHASE_HW_GEMM = 15,   /* "HWGEMM gemm"   (v16; launches = S x chunks; the call
+                                    term is its slot 5, no separate call phase)            */
+  IMD_PERF_PHASE_COUNT = 16
 };
 /* imd_perf_request_t.flags, imd_perf_rank_request_t.flags */
 enum { IMD_PERF_BETA_NONZERO = 1, IMD_PERF_ALPHA_ZERO = 2 };
@@ -494,7 +544,12 @@ enum {
   IMD_PERF_KERNEL_K5 = 14,        /* + 4 (N - 2) + v: v = 0 / 1 / 2 j-bar fastest with 1 / 2 / 4
                                      outputs per thread ("k5_n<N>_e<E>"), 3 lambda fastest
                                      ("k5b_n<N>"), N = 2..20                                 */
-  IMD_PERF_KERNEL_COUNT = 90
+  IMD_PERF_KERNEL_HW_PACK = 90,   /* "hw_pack"   HWGEMM element-wise FP64 pack (v16)         */
+  IMD_PERF_KERNEL_HW_PACK_ROWS = 91, /* "hw_pack_rows" HWGEMM tiled pack (v16)                */
+  IMD_PERF_KERNEL_HW_GEMM = 92,   /* + tile (0 128x128, 1 64x128, 2 64x64): "hw_gemm_128x128",
+                                     ... the HWGEMM GEMM, stage 1 and the own kernel (one
+                                     mainloop) (v16). Every v16 kernel key is optional       */
+  IMD_PERF_KERNEL_COUNT = 95
 };
 typedef struct {
   int32_t resident;      /* CTAs per SM (cudaOccupancyMaxActiveBlocksPerMultiprocessor)     */
@@ -601,6 +656,16 @@ typedef struct {
                                on the call phase (key warm.clean_byte)                        */
   double pack_l2_planes;    /* 1: the PACK group working set counts one group's W planes;
                                0: the v1.17 set (key warm.pack_l2_planes, 0 or 1)             */
+  /* ---- v16 (DESIGN §6i.5, IMD_HWGEMM). Optional keys, 0 when absent. A caller with a v13..v15
+   *      struct_size: HWGEMM predictions mark every HW phase uncalibrated. ---- */
+  double peak_fp64_tc_flops_per_s; /* datasheet FP64 tensor-core flops (key
+                               peak_fp64_tc_flops_per_s); 0: the card has none, the HW GEMM's
+                               bound uses peak_fp64_flops_per_s                              */
+  int32_t hw_family;        /* the HWGEMM kernel family the HW parameters were measured with
+                               (key hw_family): 80 (Sm80: 64x64 only), 90 (Sm90 tiles); 0:
+                               unknown, the HW GEMM phase is predicted with the Sm80 rule and
+                               marked uncalibrated                                           */
+  int32_t reserved16;       /* 0                                                             */
 } imd_perf_calib_t;
 
 /* The shipped calibration (RTX 4090, sm_89). out->struct_size must be set; SUCCESS. A
@@ -752,6 +817,12 @@ typedef struct {
   double err_typical;    /* typical estimate (RN EMULATE; else = err_bound)                 */
   int32_t err_status;    /* IMD_ERR_UNCHECKED (no target) / IMD_ERR_MET / IMD_ERR_MISSED    */
   int32_t err_metric;    /* the metric used                                                 */
+  /* ---- v16 (§6i.5) ---- */
+  uint32_t uncalibrated_phases; /* bit i: phase[i] is an uncalibrated roofline (a LOWER bound;
+                            its interval is [time, time]); 0: every phase calibrated       */
+  int32_t hw_tile;       /* HWGEMM: the tile predicted (0 128x128, 1 64x128, 2 64x64); else -1 */
+  int64_t hw_slab;       /* HWGEMM: the slab length L (k without slabs); else 0             */
+  int64_t hw_slabs;      /* HWGEMM: the number of slabs S; else 0                           */
 } imd_perf_t;
 
 /* Predicted imd_contract (packing != NULL: imd_contract_packed of that packed plan). Returns
@@ -774,6 +845,11 @@ IMD_API imd_status_t imd_perf_predict_pack(const imd_pack_desc_t* desc,
 /* Ranking (§6c.3). Masks: */
 enum { IMD_PERF_VEC_GENERATE = 1, IMD_PERF_VEC_RESIDENT = 2 };
 enum { IMD_PERF_PACK_NONE = 1, IMD_PERF_PACK_A = 2, IMD_PERF_PACK_B = 4, IMD_PERF_PACK_AB = 8 };
+/* v16 (§6i.5): the modes a ranking may use (imd_perf_rank_request_t.modes). */
+enum { IMD_PERF_MODE_EMULATE = 1, IMD_PERF_MODE_DIRECT = 2, IMD_PERF_MODE_HWGEMM = 4 };
+/* v16: imd_perf_rank_request_t.hw_flags */
+enum { IMD_PERF_HW_FIT_SLAB = 1 /* add the largest k_slab (a multiple of 16) whose candidate
+                                   fits budget_bytes (needs a budget; skipped if none fits) */ };
 typedef struct {
   uint32_t struct_size;          /* sizeof(imd_perf_rank_request_t)                          */
   uint32_t candidate_size;       /* sizeof(imd_perf_candidate_t) as compiled by the caller   */
@@ -796,6 +872,17 @@ typedef struct {
   const struct imd_err_request_s* accuracy; /* NULL: no error target (NORMWISE reported); a
                                                target > 0 makes the candidates whose estimate
                                                (by basis) exceeds it infeasible             */
+  /* ---- v16 (§6i.5; a struct_size of version 8: modes = EMULATE, base mode EMULATE only) ---- */
+  int32_t modes;                 /* IMD_PERF_MODE_* mask; 0 = the version-8 enumeration in
+                                    the base's mode (a HWGEMM base: HWGEMM alone).
+                                    The mask overrides base->mode and base->k_slab. DIRECT
+                                    and HWGEMM candidates ignore N, g and pack_modes (one per
+                                    vec mode; a fully affine HWGEMM call: one, no vectors).
+                                    A HWGEMM candidate needs candidate_size >= version 16's */
+  int32_t k_slab_count;          /* HWGEMM: entries of k_slabs; 0 = {0} (no slabs)           */
+  const int64_t* k_slabs;        /* k_slab values >= 0 (imd_options_t.k_slab)                */
+  int32_t hw_flags;              /* IMD_PERF_HW_*                                             */
+  int32_t reserved16;            /* 0                                                         */
 } imd_perf_rank_request_t;
 
 typedef struct {
@@ -829,6 +916,15 @@ typedef struct {
   double err_typical;        /* typical estimate (RN EMULATE; else = err_bound)              */
   int32_t err_status;        /* IMD_ERR_UNCHECKED / IMD_ERR_MET / IMD_ERR_MISSED             */
   int32_t infeasible;        /* IMD_PERF_INFEASIBLE_* bits; feasible = (infeasible == 0)     */
+  /* ---- v16 (§6i.5) ---- */
+  int32_t mode;              /* IMD_EMULATE / IMD_DIRECT / IMD_HWGEMM                        */
+  uint32_t uncalibrated_phases; /* the contract prediction's (imd_perf_t); nonzero: time_s is
+                                   a lower bound                                             */
+  int32_t hw_tile;           /* as imd_perf_t (-1: not HWGEMM)                               */
+  int32_t reserved16;        /* 0                                                            */
+  int64_t k_slab;            /* the candidate's imd_options_t.k_slab (0: none)               */
+  int64_t hw_slab;           /* the slab length L it runs with (HWGEMM; else 0)              */
+  int64_t hw_slabs;          /* S (HWGEMM; else 0)                                           */
 } imd_perf_candidate_t;
 
 /* v8: why a candidate is infeasible (imd_perf_candidate_t.infeasible). */
@@ -1008,7 +1104,9 @@ typedef struct {
   int32_t code_kind;               /* IMD_CODE_*: the worst over every kernel checked            */
   int32_t status;                  /* IMD_PLAN_*                                                 */
   int32_t failing_kernel;          /* IMD_PERF_KERNEL_* id (K4 configuration c: IMD_PERF_KERNEL_K4 + c) of the
-                                      first unusable kernel, else -1                             */
+                                      first unusable kernel, else -1 (an id >= IMD_PERF_KERNEL_COUNT:
+                                      a launch without a perf id; host API 16 moved these from 90
+                                      to 95 by appending the HWGEMM kernel ids)                  */
   int32_t cuda_error;              /* the CUDA error of that check (209 no kernel image, 222 PTX
                                       newer than the driver, ...), else 0                        */
   int32_t kernels_checked;

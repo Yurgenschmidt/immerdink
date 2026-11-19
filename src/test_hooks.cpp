@@ -110,7 +110,7 @@
 //   imd_test_plan_sizes(plan, out, cap, count)
 //       What a real plan actually holds and uses, for comparison with libimmerdink_host's
 //       queries (DESIGN §6a; tests/test_host.py): path, swapped, m, n, k, b, n_hat, k_hat,
-//       N, g; workspace total; 8 x (offset, bytes) of its §4a layout; the plan device bytes
+//       N, g; workspace total; 8 x (offset, bytes) of its §4a layout (sA .. W); the plan device bytes
 //       it allocated (0 for a generate plan); the K4 parameter sets (store, add) and the
 //       K4 launches of one call; and its host payload, counted from the live containers:
 //       sizeof(imd_plan_st) + descriptor copies + lowering tables + K0 descriptor + K4Plan
@@ -119,7 +119,8 @@
 //       configuration of its K4 parameters (both -1 without K4) and its SM count; then (v1.6)
 //       its fused_large bit mask (the operands KL scales and packs); then (v1.7) its packed
 //       slots (bit 0 / 1: the caller's A / B) and the pack bytes of the post-swap A and B
-//       (0 for an in-line operand). The host payload includes the copied slot keys. Returns 0,
+//       (0 for an in-line operand); then (issue #75 stage 2) 2 x (offset, bytes) of regions PA, PB.
+//       The host payload includes the copied slot keys. Returns 0,
 //       or 1 for a null argument; *count as above.
 //
 //   imd_test_kernel_occupancy_w(kernel, w, out)
@@ -136,6 +137,7 @@
 #include "host/index_map.hpp"
 #include "host/k4_wgmma.hpp"
 #include "host/seq_config.hpp"
+#include "hwgemm.hpp"
 #include "k4/hopper/k4_wgmma_ops.hpp"
 #include "plan.hpp"
 
@@ -366,7 +368,9 @@ IMD_API int imd_test_plan_sizes(imd_plan_t plan, int64_t* out, int64_t cap, int6
   const imd::detail::ExecPlan& e = plan->exec;
   std::vector<int64_t> v = {static_cast<int64_t>(e.path), e.swapped ? 1 : 0, e.m, e.n, e.k, e.b,
                             e.n_hat, e.k_hat, e.N, e.g, static_cast<int64_t>(e.layout.total)};
-  for (size_t r = 0; r < e.layout.offset.size(); ++r) {
+  // regions sA .. W in their v1.x places; PA, PB (issue #75 stage 2) are appended last
+  const size_t kW = static_cast<size_t>(imd::detail::Region::W);
+  for (size_t r = 0; r <= kW; ++r) {
     v.push_back(static_cast<int64_t>(e.layout.offset[r]));
     v.push_back(static_cast<int64_t>(e.layout.bytes[r]));
   }
@@ -402,6 +406,11 @@ IMD_API int imd_test_plan_sizes(imd_plan_t plan, int64_t* out, int64_t cap, int6
   v.push_back((plan->slot_key[0].empty() ? 0 : 1) | (plan->slot_key[1].empty() ? 0 : 2));
   v.push_back(static_cast<int64_t>(e.pack_bytes[0]));
   v.push_back(static_cast<int64_t>(e.pack_bytes[1]));
+  // issue #75 stage 2: (offset, bytes) of the HWGEMM regions PA, PB
+  for (size_t r = kW + 1; r < e.layout.offset.size(); ++r) {
+    v.push_back(static_cast<int64_t>(e.layout.offset[r]));
+    v.push_back(static_cast<int64_t>(e.layout.bytes[r]));
+  }
   *count = static_cast<int64_t>(v.size());
   if (out != nullptr && *count <= cap)
     for (size_t i = 0; i < v.size(); ++i) out[i] = v[i];
@@ -414,6 +423,27 @@ IMD_API int imd_test_kernel_occupancy_w(int32_t kernel, int32_t w, int32_t* out)
       (kernel >= IMD_PERF_KERNEL_K4 && kernel < IMD_PERF_KERNEL_K5))
     return 1;
   return imd::detail::kernel_occupancy_w(kernel, w, out) == cudaSuccess ? 0 : 1;
+}
+
+
+// IMD_HWGEMM (DESIGN v1.21 §6i.7): the tile a plan runs (hwgemm.hpp HwTile; -1 when the plan
+// has no HWGEMM GEMM) and the tile every later HWGEMM plan runs (-1: the rule). Twins of the
+// IMMERDINK_PROFILE hooks imd_prof_plan_hw_tile / imd_prof_set_hw_tile (tests/test_hwgemm.py).
+IMD_API int imd_test_plan_hw_tile(imd_plan_t plan, int32_t* tile) {
+  if (plan == nullptr || tile == nullptr) return 1;
+  *tile = plan->exec.path == imd::detail::Path::kHwGemm ? plan->exec.hw_tile : -1;
+  return 0;
+}
+// Issue #75 stage 2 (hwgemm.hpp hw_own_override): 1 runs fully affine HWGEMM calls through the
+// own kernel (hw_own.cuh) instead of CUTLASS's GemmUniversal (the bit comparison), 0: default.
+IMD_API void imd_test_set_hw_own(int32_t on) { imd::detail::hw_own_override() = on != 0; }
+// The own kernel's paired 16-byte C store (hwgemm.hpp hw_own_vec2): 1 default, 0 off (timing).
+IMD_API void imd_test_set_hw_own_vec2(int32_t on) { imd::detail::hw_own_vec2() = on != 0; }
+
+IMD_API int imd_test_set_hw_tile(int32_t tile) {
+  if (tile < -1 || tile >= imd::detail::kHwTileCount) return 1;
+  imd::detail::hw_tile_override() = tile;
+  return 0;
 }
 
 }  // extern "C"

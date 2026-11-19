@@ -322,6 +322,13 @@ ProdOver(S, f) == IF S = {} THEN 1
                        IN  f[x] * ProdOver(S \ {x}, f)
 
 CeilQ(x)  == ((x + PadQ - 1) \div PadQ) * PadQ
+\* IMD_HWGEMM's K quantum (DESIGN §6i.2, stage 2): the pack buffers' k̂ is k
+\* rounded up to the GEMM K tile (real: 16 for every §6i.7 configuration),
+\* NOT EMULATE's PadQ (real: k_align, 16 or 64). The models with PadQ = 4
+\* keep the two apart; a model may override it (`HwQ <- ...`).
+HwQ == 2
+HwCeil(x) == ((x + HwQ - 1) \div HwQ) * HwQ
+
 
 LexLt(a, b) == \E t \in DOMAIN a :
                   a[t] < b[t] /\ \A u \in 1..(t - 1) : a[u] = b[u]
@@ -711,19 +718,24 @@ LowerP(d, mode, sw, od, pks) ==
         ddom == {<<lam, i, j, h>> : lam \in 0..(b - 1), i \in 0..(m - 1),
                                      j \in 0..(n - 1), h \in 0..(k - 1)}
         \* IMD_HWGEMM (NOTES-HWGEMM §4.2): in-place operands through their
-        \* layout, packed ones from the FP64 gather (A: bufA's layout, the
-        \* same b·m·k̂ cells; B: rows UNPADDED, b·n·k̂), only h < k read; C
-        \* through its layout when affine, else off_C. Int8 packs ignored.
+        \* layout, packed ones from the FP64 gather (A: b·m·k̂_H cells; B: rows
+        \* UNPADDED, b·n·k̂_H; k̂_H = HwCeil(k), HWGEMM's own K quantum, not
+        \* PadQ), only h < k read; C through its layout when affine, else
+        \* off_C. Int8 packs ignored.
         nv == HwView(oi)
-        hwB == [q \in 0..(b * n * kh - 1) |->
-                   LET lam == q \div (n * kh)  j == (q \div kh) % n  h == q % kh
+        hk == HwCeil(k)
+        hwA == [q \in 0..(b * m * hk - 1) |->
+                   LET lam == q \div (m * hk)  i == (q \div hk) % m  h == q % hk
+                   IN  IF h < k THEN Cell(offA(lam, i, h)) ELSE Pad]
+        hwB == [q \in 0..(b * n * hk - 1) |->
+                   LET lam == q \div (n * hk)  j == (q \div hk) % n  h == q % hk
                    IN  IF h < k THEN Cell(offB(lam, h, j)) ELSE Pad]
         bat(X, lam) == IF nv.bAff THEN lam * nv.bs[X] ELSE vec[X, "L"][lam]
         ipA(lam, i, h) == d.A.base + bat("A", lam) + Addr2(nv.A, i, h)
         ipB(lam, h, j) == d.B.base + bat("B", lam) + Addr2(nv.B, j, h)
         ipC(lam, i, j) == d.C.base + bat("C", lam) + Addr2(nv.C, i, j)
-        nrA(lam, i, h) == IF nv.A.aff THEN ipA(lam, i, h) ELSE bufA[(lam * m + i) * kh + h][2]
-        nrB(lam, h, j) == IF nv.B.aff THEN ipB(lam, h, j) ELSE hwB[(lam * n + j) * kh + h][2]
+        nrA(lam, i, h) == IF nv.A.aff THEN ipA(lam, i, h) ELSE hwA[(lam * m + i) * hk + h][2]
+        nrB(lam, h, j) == IF nv.B.aff THEN ipB(lam, h, j) ELSE hwB[(lam * n + j) * hk + h][2]
         nwC(lam, i, j) == IF nv.C.aff THEN ipC(lam, i, j) ELSE offC(lam, i, j)
         \* InPlaceExact's right-hand side, per tensor, on the whole box.
         inExact == [X \in Tens |->
@@ -754,7 +766,7 @@ LowerP(d, mode, sw, od, pks) ==
         readsA == CASE kind = "GEMM"   -> IF pkA THEN cells(pg["A"]) ELSE cells(bufA)
                     [] kind = "DIRECT" -> {offA(t[1], t[2], t[4]) : t \in ddom}
                     [] kind = "HWGEMM" -> IF nv.A.aff THEN {ipA(t[1], t[2], t[4]) : t \in ddom}
-                                          ELSE cells(bufA)
+                                          ELSE cells(hwA)
                     [] OTHER           -> {}
         readsB == CASE kind = "GEMM"   -> IF pkB THEN cells(pg["B"]) ELSE cells(bufB)
                     [] kind = "DIRECT" -> {offB(t[1], t[4], t[3]) : t \in ddom}
@@ -780,7 +792,7 @@ LowerP(d, mode, sw, od, pks) ==
          pg |-> pg, pread |-> pread, gatherEq |-> gatherEq, keyEq |-> oi.keyEq,
          slotKey |-> oi.slotKey, packKey |-> oi.packKey, partnerOnly |-> oi.partnerOnly,
          orderAgree |-> oi.orderAgree, mis |-> oi.mis,
-         hw |-> nv, hwB |-> hwB, inExact |-> inExact]
+         hw |-> nv, hwA |-> hwA, hwB |-> hwB, inExact |-> inExact]
 
 -----------------------------------------------------------------------------
 (* Einsum reference (DESIGN §1).                                          *)
@@ -866,8 +878,8 @@ RegCells(u, r) ==
       [] r = "RA"           -> u.b * u.m * CeilQ(u.k)
       [] r = "RB"           -> u.b * CeilQ(u.n) * CeilQ(u.k)
       [] r = "W"            -> u.b * u.m * CeilQ(u.n)
-      [] r = "PA"           -> u.b * u.m * CeilQ(u.k)
-      [] r = "PB"           -> u.b * (IF Drop = "HwGemmWsPadN" THEN CeilQ(u.n) ELSE u.n) * CeilQ(u.k)
+      [] r = "PA"           -> u.b * u.m * HwCeil(u.k)
+      [] r = "PB"           -> u.b * (IF Drop = "HwGemmWsPadN" THEN CeilQ(u.n) ELSE u.n) * HwCeil(u.k)
 \* HWGEMM's packed-operand element width in bytes (FP64: 8). A model of
 \* another element type (docs/NOTES-HWGEMM §4.6, e.g. FP32: 4) overrides
 \* it in its cfg (`HwElemBytes <- HwW4`); nothing else depends on it.
@@ -1469,7 +1481,7 @@ UsedCells ==
              \* FP64 gather of a packed operand fills its whole buffer.
              [] r = "vec" -> IF kd = "HWGEMM" /\ ~low.hw.needVec THEN 0
                              ELSE SumOver(pairs, [p \in pairs |-> Cardinality(DOMAIN low.vec[p])])
-             [] r = "PA"  -> IF kd = "HWGEMM" /\ ~low.hw.A.aff THEN Cardinality(DOMAIN low.bufA) ELSE 0
+             [] r = "PA"  -> IF kd = "HWGEMM" /\ ~low.hw.A.aff THEN Cardinality(DOMAIN low.hwA) ELSE 0
              [] r = "PB"  -> IF kd = "HWGEMM" /\ ~low.hw.B.aff THEN Cardinality(DOMAIN low.hwB) ELSE 0
              [] r = "RA"  -> gemm(r, Cardinality(DOMAIN low.bufA))
              [] r = "RB"  -> gemm(r, Cardinality(DOMAIN low.bufB))

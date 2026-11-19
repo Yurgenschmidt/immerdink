@@ -29,6 +29,7 @@
 #include "device/constants.cuh"
 #include "host/analysis.hpp"  // kFusedKHatMax
 #include "host/seq_config.hpp"
+#include "hwgemm.hpp"
 #include "kernels/numerics.cuh"
 #include "kernels/pack_emitter.cuh"
 #include "plan.hpp"
@@ -2501,12 +2502,133 @@ K4Operands k4_operands(const ExecPlan& p, void* ws, const void* const* packed) {
   return o;
 }
 
+// v1.21 §6i.2 stage 2: HWGEMM calls that are not fully affine (and, under the test hook
+// imd_test_set_hw_own, fully affine ones too). Sequence (spec/HwGemmPipeline.tla, unslabbed):
+// K0 when the vectors are needed and not resident; the FP64 pack of each packed operand (its
+// K tail padded: A -0.0, B +0.0); the own GEMM (hw_own.cuh) on k_hat when both operands are
+// packed (the pads are read: exact, §6i.4), else on k. alpha = 0: the beta-only kernel.
+imd_status_t enqueue_hwgemm_own(const ExecPlan& p, double alpha, const double* A, const double* B,
+                                double beta, double* C, void* ws, cudaStream_t stream) {
+  IMD_PROF(stream, "begin");
+  const HwView& v = p.hw;
+  const bool vec_on = v.need_vec;
+  int64_t* vec = nullptr;
+  if (vec_on) {
+    vec = p.vec_resident ? p.vec_dev : region<int64_t>(ws, p, Region::vec);
+    if (!p.vec_resident) {
+      if (const imd_status_t st = k0_generate(p, vec, stream); st != IMD_STATUS_SUCCESS) return st;
+      IMD_PROF(stream, "K0 vec");
+    }
+  }
+  const VecOffsets vo = vec_on ? vec_offsets(p) : VecOffsets{};
+  const auto at = [&](int64_t off) -> const int64_t* { return vec_on ? vec + off : nullptr; };
+
+  if (alpha == 0.0) {  // §3.7 beta-only
+    if (!vec_on) {  // fully affine (test hook): the strided beta-only kernel
+      HwGemmCall hc;
+      hc.m = p.m, hc.n = p.n, hc.b = p.b, hc.C = C, hc.ldc = v.acc[2].ld;
+      hc.c_j_contig = v.acc[2].row, hc.c_bstride = v.bstride[2], hc.beta = beta;
+      return hwgemm_beta(hc, stream);
+    }
+    OutArgs out{};
+    out.C = C, out.c_row = at(vo.c_row), out.c_col = at(vo.c_col), out.c_bat = at(vo.c_bat);
+    out.m = p.m, out.n = p.n, out.k = p.k, out.b = p.b, out.alpha = alpha, out.beta = beta;
+    k5_beta_only<<<blocks_for(p.b * p.m * p.n), kThreads, 0, stream>>>(out);
+    return cudaPeekAtLastError() == cudaSuccess ? IMD_STATUS_SUCCESS : IMD_STATUS_CUDA_ERROR;
+  }
+
+  // §6i.3 (spec/HwGemmPipeline.tla SlabSeq): slab s covers K positions [s L, min((s+1) L, k));
+  // its packs (into the same PA / PB, sized by one slab, ordered after slab s-1's GEMM on the
+  // one stream) then its GEMM, with the caller's beta on slab 0 and beta = 1 after.
+  const bool pack[2] = {!v.acc[0].affine, !v.acc[1].affine};
+  const int64_t L = p.hw_slab > 0 && p.hw_slab < p.k ? p.hw_slab : p.k;
+  for (int64_t h0 = 0; h0 < p.k; h0 += L) {
+    const int64_t len = std::min(L, p.k - h0);
+    const int64_t k_hat = (len + kHwQ - 1) / kHwQ * kHwQ;
+    HwOwnOperand op[2];
+    for (int x = 0; x < 2; ++x) {
+      const double* src = x == 0 ? A : B;
+      const int64_t rows = x == 0 ? p.m : p.n;
+      const int64_t* bat = at(x == 0 ? vo.a_bat : vo.b_bat);
+      if (pack[x]) {
+        HwPackCall pc;
+        pc.src = src, pc.bat = bat;
+        pc.row = at(x == 0 ? vo.a_row : vo.b_col);
+        pc.kk = at(x == 0 ? vo.a_k : vo.b_k) + h0;  // the slab's K offsets
+        pc.rows = rows, pc.k = len, pc.k_hat = k_hat, pc.b = p.b;
+        pc.pad = x == 0 ? -0.0 : 0.0;
+        pc.along_rows = p.pack_along_rows[x], pc.radix = p.pack_radix[x];
+        pc.dst = region<double>(ws, p, x == 0 ? Region::PA : Region::PB);
+        if (const imd_status_t st = hwgemm_pack(pc, stream); st != IMD_STATUS_SUCCESS) return st;
+        IMD_PROF(stream, x == 0 ? "HWGEMM pack A" : "HWGEMM pack B");
+        op[x] = {pc.dst, k_hat, true, rows * k_hat, nullptr};
+      } else {
+        // in place, from the slab's first K position; a multi-mode batch reads its per-lambda
+        // offsets from the vectors
+        const int64_t k_step = v.acc[x].row ? 1 : v.acc[x].ld;
+        op[x] = {src + h0 * k_step, v.acc[x].ld, v.acc[x].row, v.bstride[x],
+                 v.batch_affine ? nullptr : bat};
+      }
+    }
+    HwOwnCall oc;
+    oc.m = p.m, oc.n = p.n, oc.b = p.b;
+    oc.k = pack[0] && pack[1] ? k_hat : len;
+    oc.A = op[0], oc.B = op[1];
+    oc.C = C;
+    if (v.acc[2].affine) {
+      oc.c_si = v.acc[2].row ? v.acc[2].ld : 1;
+      oc.c_sj = v.acc[2].row ? 1 : v.acc[2].ld;
+    } else {
+      oc.c_row = at(vo.c_row), oc.c_col = at(vo.c_col);
+    }
+    oc.c_bstride = v.bstride[2];
+    if (!v.batch_affine) oc.c_bat = at(vo.c_bat);
+    oc.alpha = alpha, oc.beta = h0 == 0 ? beta : 1.0;
+    oc.tile = p.hw_tile;
+    const imd_status_t st = hwgemm_own_enqueue(oc, stream);
+    IMD_PROF(stream, "HWGEMM own gemm");
+    if (st != IMD_STATUS_SUCCESS) return st;
+  }
+  return IMD_STATUS_SUCCESS;
+}
+
 }  // namespace
 
 imd_status_t enqueue_contract(const ExecPlan& p, double alpha, const double* A, const double* B,
                               double beta, double* C, void* ws, cudaStream_t stream,
                               const void* const* packed) {
   if (p.path == Path::kNoop) return IMD_STATUS_SUCCESS;
+  if (p.path == Path::kHwGemm && (!p.hw.fully_affine() || hw_own_override()))
+    return enqueue_hwgemm_own(p, alpha, A, B, beta, C, ws, stream);
+  if (p.path == Path::kHwGemm) {  // v1.21 §6i stage 1: fully affine, no workspace, no K0
+    HwGemmCall hc;
+    hc.m = p.m, hc.n = p.n, hc.k = p.k, hc.b = p.b;
+    hc.A = {A, p.hw.acc[0].ld, p.hw.acc[0].row, p.hw.bstride[0]};
+    hc.B = {B, p.hw.acc[1].ld, p.hw.acc[1].row, p.hw.bstride[1]};
+    hc.C = C, hc.ldc = p.hw.acc[2].ld, hc.c_j_contig = p.hw.acc[2].row;
+    hc.c_bstride = p.hw.bstride[2];
+    hc.alpha = alpha, hc.beta = beta;
+    hc.tile = p.hw_tile;
+    IMD_PROF(stream, "begin");
+    if (alpha == 0.0) {
+      const imd_status_t st = hwgemm_beta(hc, stream);
+      IMD_PROF(stream, "HWGEMM beta-only");
+      return st;
+    }
+    // §6i.3: one GemmUniversal per slab, A and B from the slab's first K position
+    const int64_t L = p.hw_slab > 0 && p.hw_slab < p.k ? p.hw_slab : p.k;
+    for (int64_t h0 = 0; h0 < p.k; h0 += L) {
+      HwGemmCall sc = hc;
+      sc.k = std::min(L, p.k - h0);
+      sc.A.base = A + h0 * (p.hw.acc[0].row ? 1 : p.hw.acc[0].ld);
+      sc.B.base = B + h0 * (p.hw.acc[1].row ? 1 : p.hw.acc[1].ld);
+      sc.beta = h0 == 0 ? beta : 1.0;
+      const imd_status_t st = hwgemm_enqueue(sc, stream);
+      IMD_PROF(stream, "HWGEMM gemm");
+      if (st != IMD_STATUS_SUCCESS) return st;
+    }
+    return IMD_STATUS_SUCCESS;
+  }
   // v1.13 §4b.5 (hygiene): the K4 operand-pointer check (debug builds, test hook) of the whole
   // call, before anything is queued: a violation fails the call with nothing launched.
   K4Operands k4o{};
@@ -2859,6 +2981,7 @@ cudaError_t extra_kernel_versions(int32_t index, int32_t* binary, int32_t* ptx) 
     case 11: return versions_of(k23_pack_cap<2, 1>, binary, ptx);  // issue 21: the E1 K2/K3 instance held to 4 CTAs per SM
     case 12: return k5f_versions<true>(binary, ptx);   // issue 23: the k5fin K5 kernels (one n and one batch-fastest instance; same module as the shipped K5)
     case 13: return k5f_versions<false>(binary, ptx);
+    case 14: case 15: case 16: case 17: case 18: case 19: case 20: return hw_kernel_versions(index - 14, binary, ptx);  // DESIGN §6i.7
     default: return cudaErrorInvalidValue;
   }
 }
@@ -2895,7 +3018,10 @@ cudaError_t kernel_occupancy(int32_t kernel, int32_t* out) {
     case IMD_PERF_KERNEL_BETA: return occupancy_of(k5_beta_only, kThreads, out);
     case IMD_PERF_KERNEL_PACK_PREP: return occupancy_of(kp_prep<kK0SmallModes>, kThreads, out);
     default:
-      if (kernel >= IMD_PERF_KERNEL_K5 && kernel < IMD_PERF_KERNEL_COUNT) {
+      if (kernel >= IMD_PERF_KERNEL_HW_PACK && kernel < IMD_PERF_KERNEL_COUNT)  // v16 (§6i.5)
+        return hw_kernel_occupancy(kernel - IMD_PERF_KERNEL_HW_PACK, out, &g_last_binary,
+                                   &g_last_ptx);
+      if (kernel >= IMD_PERF_KERNEL_K5 && kernel < IMD_PERF_KERNEL_HW_PACK) {
         const int i = kernel - IMD_PERF_KERNEL_K5;
         return k5_occupancy(imd::constants::kNMin + i / 4, i % 4, out);
       }

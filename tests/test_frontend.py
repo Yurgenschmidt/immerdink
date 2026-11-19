@@ -373,7 +373,7 @@ def suite_legality(lib, cuda, verbose):
             ("null arrays", (hz.Tensor(2, None, None, None),) + good[1:], 9, 0, 0, 0),
             ("N = 1", good, 1, 0, 0, 0), ("N = 21", good, 21, 0, 0, 0),
             ("g = N + 1", good, 9, 10, 0, 0), ("g = -1", good, 9, -1, 0, 0),
-            ("rounding 2", good, 9, 0, 2, 0), ("mode 2", good, 9, 0, 0, 2)):
+            ("rounding 2", good, 9, 0, 2, 0), ("mode 3", good, 9, 0, 0, 3)):  # 2 = IMD_HWGEMM
         st_w, _ = lib.workspace_size(*tens, N, g, rnd, mode)
         st_p, plan = lib.plan_create(*tens, N, g, rnd, mode)
         if plan is not None:

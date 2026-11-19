@@ -159,14 +159,14 @@ int main(void) {
     static Ctx c;
     memset(&c, 0, sizeof c);
     c.A = &A.t, c.B = &B.t, c.C = &C.t;
-    c.opt = (imd_options_t){N, g, IMD_RN, IMD_EMULATE, vec, IMD_K4_TUNE_OFF};
+    c.opt = (imd_options_t){sizeof(imd_options_t), N, g, IMD_RN, IMD_EMULATE, vec, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
     c.cal = &cal;
     c.pdesc.struct_size = sizeof c.pdesc;
     const int pst = imd_pack_desc_for(c.A, c.B, c.C, &c.opt, 0, &c.pdesc, c.plabels, MAXR);
     c.rank_n = N;
     c.rreq = (imd_perf_rank_request_t){sizeof c.rreq, sizeof c.cands[0], 1, 0, &c.rank_n, NULL,
                                        IMD_PERF_VEC_GENERATE, IMD_PERF_PACK_NONE, 1, 0, 0, -1.0,
-                                       0, 0, 0, 0, 0.0, NULL};  /* v7: DEFAULT, COLD, TIME */
+                                       0, 0, 0, 0, 0.0, NULL, 0, 0, NULL, 0, 0};  /* v7: DEFAULT, COLD, TIME; v16: base mode */
     memset(&c.acc, 0, sizeof c.acc);
     c.acc.struct_size = sizeof c.acc, c.acc.target = 1e-12;
     printf("%s", name);

@@ -35,6 +35,7 @@ struct Analysis {
   Lowered lowered;
   WorkspaceLayout layout;
   PackedSlots packed;       // v1.7: none unless analyze_packed found packs
+  HwView hw;                // v1.21 §6i.2: HWGEMM's access view (set when the GEMM runs)
 };
 
 // imd_workspace_size's status: null arguments and options (INVALID_VALUE), the §5 legality
@@ -47,6 +48,11 @@ struct Analysis {
 IMD_HOST_INTERNAL imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B,
                                        const imd_tensor_t* C, const imd_options_t* options,
                                        const KAlignSel& sel, Analysis* out);
+// Host API 16 (DESIGN §6i.5): the caller's imd_options_t through its struct_size. INVALID_VALUE
+// below version 16's size (an older caller's struct) or for reserved0 != 0; NOT_SUPPORTED for
+// non-zero bytes beyond this library's struct or a dtype / compute other than F64 / DEFAULT.
+// *out has struct_size = sizeof(imd_options_t). Field values are not range-checked here.
+IMD_HOST_INTERNAL imd_status_t read_options(const imd_options_t* in, imd_options_t* out);
 IMD_HOST_INTERNAL imd_status_t analyze(const imd_tensor_t* A, const imd_tensor_t* B,
                                        const imd_tensor_t* C, const imd_options_t* options,
                                        Analysis* out);

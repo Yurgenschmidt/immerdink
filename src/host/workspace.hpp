@@ -10,7 +10,8 @@
 
 namespace imd::detail {
 
-enum class Region : int { sA, sB, fA, fB, vec, RA, RB, W, count };
+// PA, PB (v1.21 §6i.2, stage 2): IMD_HWGEMM's FP64 pack buffers; 0 bytes in the other modes.
+enum class Region : int { sA, sB, fA, fB, vec, RA, RB, W, PA, PB, count };
 
 struct WorkspaceShape {
   int64_t m = 0, n = 0, k = 0, b = 0;  // lowered GEMM view (after the role swap)
@@ -29,6 +30,34 @@ struct WorkspaceLayout {
   std::array<uint64_t, static_cast<int>(Region::count)> offset{};  // 256-aligned
   std::array<uint64_t, static_cast<int>(Region::count)> bytes{};   // 0 = region absent
 };
+
+// v1.21 §6i.2 (spec/IndexMap.tla HwCells): IMD_HWGEMM's K quantum, the pack buffers' k_hat =
+// ceil(k)_16 (the GEMM's K tile in every §6i.7 configuration; not EMULATE's k_align).
+constexpr int64_t kHwQ = 16;
+
+// §6i.3: the slab length of an IMD_HWGEMM call, imd_options_t.k_slab rounded up to kHwQ, or k
+// (one slab) when k_slab is 0 or the rounded length reaches k. Requires k_slab >= 0, k >= 0.
+constexpr int64_t hw_slab_len(int64_t k_slab, int64_t k) {
+  const int64_t l = k_slab == 0 ? k : (k_slab > INT64_MAX - kHwQ ? INT64_MAX : (k_slab + kHwQ - 1) / kHwQ * kHwQ);
+  return l < k ? l : k;
+}
+// The number of slabs S = ceil(k / L) (1 for k = 0).
+constexpr int64_t hw_slab_count(int64_t k_slab, int64_t k) {
+  const int64_t l = hw_slab_len(k_slab, k);
+  return l == 0 ? 1 : (k + l - 1) / l;
+}
+
+// IMD_HWGEMM's workspace when the GEMM runs (non-empty output, k >= 2): vec iff need_vec and
+// not vec_resident (8 (2m + 2n + 2k + 3b) bytes, as §4a, with the FULL k), PA = 8 b m k_hat
+// iff pack_a, PB = 8 b n k_hat iff pack_b (rows unpadded), k_hat = ceil(slab)_16 (§6i.3: the
+// packed regions hold one slab and are reused), at cumulative 256-aligned offsets in the
+// region order; every EMULATE region absent. nullopt on uint64 overflow.
+struct HwWorkspaceShape {
+  int64_t m = 0, n = 0, k = 0, b = 0;  // lowered GEMM view (post-swap)
+  int64_t slab = 0;                    // hw_slab_len (0: k)
+  bool need_vec = false, vec_resident = false, pack_a = false, pack_b = false;
+};
+IMD_HOST_INTERNAL std::optional<WorkspaceLayout> hw_workspace_layout(const HwWorkspaceShape& s);
 
 // The §4a layout, or nullopt if a size or the total overflows uint64 (-> INVALID_VALUE).
 //   b*m*n = 0                  -> total 0 (no regions)

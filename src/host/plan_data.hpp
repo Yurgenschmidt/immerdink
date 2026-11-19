@@ -36,6 +36,8 @@ enum class Path : int {
   kNoop,    // empty output (b*m*n = 0): nothing is touched
   kGemm,    // EMULATE with k >= 2: K0 K1 (K2 K3 K4)* K5      (alpha = 0 or k = 0 -> kScale)
   kDirect,  // mode DIRECT or K-empty (k = 1 after lowering): K0 + native kernel
+            // (v1.21: also HWGEMM mode with k <= 1)
+  kHwGemm,  // v1.21 §6i: HWGEMM mode, k >= 2: the hardware FP64 GEMM (stage 1: fully affine)
 };
 
 struct ExecPlan {
@@ -87,6 +89,11 @@ struct ExecPlan {
   bool vec_resident = false;
   uint64_t device_bytes = 0;  // §4a "plan device bytes" (vec_dev's size), from plan_data
   int64_t* vec_dev = nullptr;
+
+  HwView hw;            // v1.21 §6i.2: kHwGemm's access view (index_map.hpp hw_view)
+  int32_t hw_tile = -1; // v1.21 §6i.7: kHwGemm's tile (hwgemm.hpp HwTile; -1 = the rule per call)
+  int64_t hw_slab = 0;  // §6i.3: kHwGemm's slab length L (workspace.hpp hw_slab_len; k: one slab)
+  int64_t hw_slabs() const { return hw_slab > 0 && hw_slab < k ? (k + hw_slab - 1) / hw_slab : 1; }
 
   int sms = 0;                         // SM count of the device at plan creation (K1 grids)
   int64_t l2_bytes = 0;                // L2 bytes of the device at plan creation (K1 rows in flight, issue 21; 0: the reference 72 MiB)

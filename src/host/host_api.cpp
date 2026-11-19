@@ -63,7 +63,7 @@ static_assert(offsetof(imd_lowering_t, packed) == kLoweringV4Size, "imd_lowering
 static_assert(offsetof(imd_lowering_t, k_align) == kLoweringV5Size, "imd_lowering_t v5 layout changed");
 static_assert(offsetof(imd_lowering_t, table_id) == kLoweringV6Size, "imd_lowering_t v6 layout changed");
 static_assert(sizeof(imd_lowering_t) == kLoweringV7Size, "imd_lowering_t v7 layout changed");
-static_assert(sizeof(imd_options_t) == 24, "imd_options_t layout changed");
+static_assert(sizeof(imd_options_t) == 48, "imd_options_t layout changed");
 static_assert(sizeof(imd_region_t) == 16, "imd_region_t layout changed");
 // v1.7 (§6b.5): the version-1 pack structs (64-bit ABI).
 static_assert(sizeof(imd_pack_desc_t) == 72, "imd_pack_desc_t v1 layout changed");
@@ -108,7 +108,7 @@ imd_status_t imd_workspace_size(const imd_tensor_t* A, const imd_tensor_t* B,
 
 const char* imd_region_name(int32_t region) {
   static const char* const kNames[IMD_REGION_COUNT] = {"sA", "sB", "fA", "fB",
-                                                       "vec", "RA", "RB", "W"};
+                                                       "vec", "RA", "RB", "W", "PA", "PB"};
   return region >= 0 && region < IMD_REGION_COUNT ? kNames[region] : nullptr;
 }
 
@@ -176,8 +176,10 @@ imd_status_t lowering_impl(const imd_tensor_t* A, const imd_tensor_t* B, const i
     r.dispatch = e.path == Path::kNoop        ? IMD_DISPATCH_NOOP
                  : e.k == 0                   ? IMD_DISPATCH_SCALE
                  : imd::detail::emulates(e)   ? IMD_DISPATCH_EMULATE
+                 : e.path == Path::kHwGemm    ? IMD_DISPATCH_HWGEMM
                                               : IMD_DISPATCH_DIRECT;
-    if (e.path != Path::kNoop) r.vec_entries = imd::detail::scatter_vector_count(lw);
+    if (e.path != Path::kNoop && !(e.path == Path::kHwGemm && e.hw.fully_affine()))  // §6i.2
+      r.vec_entries = imd::detail::scatter_vector_count(lw);
     if (r.dispatch == IMD_DISPATCH_EMULATE) {
       r.num_groups = (e.N + e.g - 1) / e.g;
       const imd::detail::K4Counts kc =

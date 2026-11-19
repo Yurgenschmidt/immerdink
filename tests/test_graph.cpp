@@ -55,7 +55,7 @@ void run(const char* name, std::vector<int64_t> eA, std::vector<int32_t> lA, std
   const imd_tensor_t A{int32_t(eA.size()), eA.data(), sA.data(), lA.data()};
   const imd_tensor_t B{int32_t(eB.size()), eB.data(), sB.data(), lB.data()};
   const imd_tensor_t C{int32_t(eC.size()), eC.data(), sC.data(), lC.data()};
-  const imd_options_t o{N, g, IMD_RN, IMD_EMULATE, vec, IMD_K4_TUNE_OFF};
+  const imd_options_t o{sizeof(imd_options_t), N, g, IMD_RN, IMD_EMULATE, vec, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
   const int64_t nA = count(eA), nB = count(eB), nC = count(eC);
   const auto a = values(nA, 1), b = values(nB, 2), c0 = values(nC, 3);
   size_t wsb = 0;
@@ -121,7 +121,7 @@ void run_packed(const char* name, std::vector<int64_t> eA, std::vector<int32_t> 
   const imd_tensor_t A{int32_t(eA.size()), eA.data(), sA.data(), lA.data()};
   const imd_tensor_t B{int32_t(eB.size()), eB.data(), sB.data(), lB.data()};
   const imd_tensor_t C{int32_t(eC.size()), eC.data(), sC.data(), lC.data()};
-  const imd_options_t o{N, g, IMD_RN, IMD_EMULATE, vec, IMD_K4_TUNE_OFF};
+  const imd_options_t o{sizeof(imd_options_t), N, g, IMD_RN, IMD_EMULATE, vec, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
   const int64_t nA = count(eA), nB = count(eB), nC = count(eC);
   auto a = values(nA, 4), b = values(nB, 5);
   const auto c0 = values(nC, 6);

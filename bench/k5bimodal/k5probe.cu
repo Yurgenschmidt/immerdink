@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
   int64_t ext[2] = {n, n}, sA[2] = {n, 1};
   int32_t la[2] = {0, 2}, lb[2] = {1, 2}, lc[2] = {0, 1};
   imd_tensor_t A{2, ext, sA, la}, B{2, ext, sA, lb}, C{2, ext, sA, lc};
-  imd_options_t opt{N, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF};
+  imd_options_t opt{sizeof(imd_options_t), N, 0, IMD_RN, IMD_EMULATE, IMD_VEC_GENERATE, IMD_K4_TUNE_OFF, IMD_F64, IMD_COMPUTE_DEFAULT, 0, 0};
   imd_region_t reg[8];
   int32_t nreg = 0;
   size_t wsb = 0;

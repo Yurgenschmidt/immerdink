@@ -331,4 +331,59 @@ void build_scatter_vectors(const Lowered& lw, int64_t* out) {
   radix_vec(L, kC, lw.b, out);
 }
 
+namespace {
+
+struct HwMode {
+  int64_t extent = 0, stride = 0;
+};
+
+// spec HwFm: group g's canonical order, fused over tensor X's strides alone.
+std::vector<HwMode> hw_fused(const Lowered& lw, int X, int g) {
+  std::vector<HwMode> f;
+  for (const int32_t label : lw.order[g]) {
+    const LabelInfo* li = find_label(lw, label);
+    const int64_t e = li->extent, s = li->stride[X];
+    int64_t next = 0;
+    if (!f.empty() && mul_i64(f.back().stride, f.back().extent, &next) && next == s)
+      f.back().extent *= e;  // a factor of the group size: no overflow
+    else
+      f.push_back({e, s});
+  }
+  return f;
+}
+
+// spec HwAcc: X's 2-D view with first index in group rg and second in group cg.
+HwAccess hw_access(const Lowered& lw, int X, int rg, int cg) {
+  const std::vector<HwMode> fr = hw_fused(lw, X, rg), fc = hw_fused(lw, X, cg);
+  const int64_t sr = fr.empty() ? 0 : fr.front().stride;
+  const int64_t sc = fc.empty() ? 0 : fc.front().stride;
+  const bool one = fr.size() <= 1 && fc.size() <= 1;
+  const bool unit = fr.empty() || fc.empty() || sr == 1 || sc == 1;
+  HwAccess a;
+  a.row = fc.empty() || sc == 1 ? true : fr.empty() || sr == 1 ? false : sr > sc;
+  a.ld = a.row ? sr : sc;
+  a.affine = one && sr >= 0 && sc >= 0 && unit;
+  return a;
+}
+
+}  // namespace
+
+HwView hw_view(const Lowered& lw) {
+  constexpr int I = static_cast<int>(LabelClass::I), J = static_cast<int>(LabelClass::J),
+                K = static_cast<int>(LabelClass::K), L = static_cast<int>(LabelClass::L);
+  HwView v;
+  v.acc[kA] = hw_access(lw, kA, I, K);
+  v.acc[kB] = hw_access(lw, kB, J, K);
+  v.acc[kC] = hw_access(lw, kC, I, J);
+  v.batch_affine = lw.fused[L].size() <= 1;
+  if (!lw.fused[L].empty())
+    for (int x = 0; x < 3; ++x) v.bstride[x] = lw.fused[L].front().stride[x];
+  v.need_vec = !v.acc[kA].affine || !v.acc[kB].affine || !v.acc[kC].affine || !v.batch_affine;
+  return v;
+}
+
+bool hw_dims_ok(const Lowered& lw, int64_t slab) {
+  return lw.m <= kInt32Max && lw.n <= kInt32Max && (slab > 0 ? slab : lw.k) <= kInt32Max;
+}
+
 }  // namespace imd::detail

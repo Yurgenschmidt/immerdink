@@ -23,6 +23,7 @@
 
 #include "accuracy.hpp"
 #include "analysis.hpp"
+#include "hw_rules.hpp"
 #include "immerdink/detail/constants.hpp"
 #include "immerdink/immerdink_host.h"
 
@@ -46,7 +47,7 @@ constexpr int64_t kK4RowAlign = 32; // format 2's: residue rows of k_hat bytes, 
 
 const char* const kClassNames[IMD_PERF_CLASS_COUNT] = {
     "k0", "kf", "kl", "pack", "k4_128x256", "k4_128x128", "k4_64x128", "k4_64x64",
-    "k5", "direct", "beta", "call"};
+    "k5", "direct", "beta", "call", "hw_pack", "hw_gemm"};
 // Feature names per class (nullptr: the class does not use that slot).
 const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
     {"launch", "byte", "chain", nullptr, nullptr, nullptr},          // k0
@@ -61,6 +62,8 @@ const char* const kParamNames[IMD_PERF_CLASS_COUNT][kP] = {
     {"launch", "byte", "flop", "chain", nullptr, nullptr},           // direct
     {"launch", "byte", "chain", nullptr, nullptr, nullptr},          // beta
     {"call", "launch", nullptr, nullptr, nullptr, nullptr},          // call (signed: a correction)
+    {"launch", "sector", "write", "chain", nullptr, nullptr},        // hw_pack (v16, §6i.5)
+    {"launch", "flop", "wave", "byte", "own", "call"},               // hw_gemm (v16)
 };
 // v1.10: the parameters new in format 2 (a format-1 file has none of them; they are 0 there).
 // v1.17: kf.elem, pack.dram are format-2 parameters too (optional, below).
@@ -73,13 +76,16 @@ constexpr bool kFormat2Param[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, false, true, true, false},    // k5.chain, k5.dram
     {false, false, false, true, false, false},   // direct.chain
     {false, false, true, false, false, false},   // beta.chain
-    {}};
+    {},
+    {true, true, true, true, false, false},      // hw_pack (v16): format 2 only, optional
+    {true, true, true, true, true, true}};       // hw_gemm (v16)
 // v1.17 (§6c.1, §6c.2): the slots the eps path freed hold kf.elem and pack.dram, optional
 // (absent = 0) format-2 parameters written only when non-zero, so a calibration without them
 // predicts and formats exactly as in host API 11.
 constexpr int kKlChainSlot = 4;  // v1.20 (§6c.10): kl.chain, the slot of the retired kl.op_eps
 constexpr bool optional_param(int cl, int j) {
-  return (cl == IMD_PERF_CLASS_KF && j == 4) || (cl == IMD_PERF_CLASS_PACK && j == 3) ||
+  return cl >= IMD_PERF_CLASS_HW_PACK ||  // v16 (§6i.5): every HWGEMM key
+         (cl == IMD_PERF_CLASS_KF && j == 4) || (cl == IMD_PERF_CLASS_PACK && j == 3) ||
          (cl == IMD_PERF_CLASS_KL && j == kKlChainSlot);  // v1.20 (§6c.10)
 }
 // v1.19 (§6c.9, host API 13, no struct growth): the optional key warm.kl_drop, the share of the
@@ -110,16 +116,21 @@ constexpr bool kClockBound[IMD_PERF_CLASS_COUNT][kP] = {
     {false, false, true, true, false, false},    // k5: op, chain
     {false, false, true, true, false, false},    // direct: flop, chain
     {false, false, true, false, false, false},   // beta: chain
-    {false, false, false, false, false, false}}; // call
+    {false, false, false, false, false, false},  // call
+    {false, false, false, true, false, false},   // hw_pack: chain (not the sector / write bytes)
+    {false, true, true, false, true, false}};    // hw_gemm: flop, wave, own (not byte, launch, call)
 const char* const kPhaseNames[IMD_PERF_PHASE_COUNT] = {
     "K0 vec", "KF fused", "KL A", "KL B", "K2 pack A", "K3 pack B", "K4 gemm", "K5 crt",
-    "DIRECT", "K5 beta-only", "call", "pack prep", "pack KL"};
+    "DIRECT", "K5 beta-only", "call", "pack prep", "pack KL", "HWGEMM pack A", "HWGEMM pack B",
+    "HWGEMM gemm"};
 
 static_assert(IMD_PERF_CLASS_COUNT * kP <= IMD_PERF_PARAM_CAPACITY, "param slots");
 static_assert(IMD_PERF_CLASS_COUNT <= IMD_PERF_CLASS_CAPACITY, "band rows");
 static_assert(IMD_PERF_KERNEL_COUNT <= IMD_PERF_KERNEL_CAPACITY, "kernel rows");
-static_assert(IMD_PERF_KERNEL_K5 + 4 * (c::kNMax - c::kNMin + 1) == IMD_PERF_KERNEL_COUNT,
+static_assert(IMD_PERF_KERNEL_K5 + 4 * (c::kNMax - c::kNMin + 1) == IMD_PERF_KERNEL_HW_PACK,
               "K5 kernels: 4 variants per N");
+static_assert(IMD_PERF_KERNEL_HW_GEMM + kHwTileCount == IMD_PERF_KERNEL_COUNT, "HW kernels");
+static_assert(IMD_PERF_CLASS_HW_GEMM * kP + kP <= IMD_PERF_PARAM_KL_DROP_SLOT, "HW param slots");
 static_assert(IMD_PERF_CLASS_K4_128x256 + IMD_K4_64x64 == IMD_PERF_CLASS_K4_64x64,
               "K4 classes follow the IMD_K4_* order");
 
@@ -128,17 +139,21 @@ constexpr uint32_t kCalibV1Size = offsetof(imd_perf_calib_t, kernel);
 constexpr uint32_t kCalibV7Size = offsetof(imd_perf_calib_t, energy_byte_f_pj);  // v7..v10
 constexpr uint32_t kCalibV11Size = offsetof(imd_perf_calib_t, pack_l2_hit_bytes);
 constexpr uint32_t kCalibV12Size = offsetof(imd_perf_calib_t, clock_boost_mhz);
-constexpr uint32_t kCalibV13Size = sizeof(imd_perf_calib_t);
+constexpr uint32_t kCalibV13Size = offsetof(imd_perf_calib_t, peak_fp64_tc_flops_per_s);
+constexpr uint32_t kCalibV16Size = sizeof(imd_perf_calib_t);
 constexpr uint32_t kRequestV1Size = offsetof(imd_perf_request_t, regime);
 constexpr uint32_t kPerfV1Size = offsetof(imd_perf_t, regime);
 constexpr uint32_t kRankRequestV1Size = offsetof(imd_perf_rank_request_t, regime);
 constexpr uint32_t kRankRequestV7Size = offsetof(imd_perf_rank_request_t, accuracy);
-constexpr uint32_t kRankRequestV8Size = sizeof(imd_perf_rank_request_t);
+constexpr uint32_t kRankRequestV8Size = offsetof(imd_perf_rank_request_t, modes);
+constexpr uint32_t kRankRequestV16Size = sizeof(imd_perf_rank_request_t);
 constexpr uint32_t kRequestV7Size = offsetof(imd_perf_request_t, accuracy);
 constexpr uint32_t kRequestV8Size = sizeof(imd_perf_request_t);
 constexpr uint32_t kCandidateV1Size = offsetof(imd_perf_candidate_t, time_lo_s);
 constexpr uint32_t kCandidateV7Size = offsetof(imd_perf_candidate_t, err_bound);
 constexpr uint32_t kPerfV7Size = offsetof(imd_perf_t, err_bound);
+constexpr uint32_t kPerfV8Size = offsetof(imd_perf_t, uncalibrated_phases);
+constexpr uint32_t kCandidateV8Size = offsetof(imd_perf_candidate_t, mode);
 static_assert(sizeof(imd_perf_phase_t) == 96, "imd_perf_phase_t v1 layout changed");
 static_assert(kCalibV1Size == 1232, "imd_perf_calib_t v1 layout changed");
 static_assert(kPerfV1Size == 1648, "imd_perf_t v1 layout changed");
@@ -155,8 +170,13 @@ static_assert(kRankRequestV7Size == 88, "v7 rank request");
 static_assert(kCandidateV7Size == 168, "v7 candidate");
 // v8 (DESIGN §6f): appended accuracy pointer / error fields only.
 static_assert(kRequestV8Size == 48 && kRankRequestV8Size == 96, "v8 requests");
-static_assert(sizeof(imd_perf_t) == kPerfV7Size + 24, "v8 prediction");
-static_assert(sizeof(imd_perf_candidate_t) == 192, "v8 candidate");
+static_assert(kPerfV8Size == kPerfV7Size + 24, "v8 prediction");
+static_assert(kCandidateV8Size == 192, "v8 candidate");
+// v16 (DESIGN §6i.5): appended HWGEMM fields only.
+static_assert(kCalibV16Size == kCalibV13Size + 16, "v16 calib");
+static_assert(sizeof(imd_perf_t) == kPerfV8Size + 24, "v16 prediction");
+static_assert(sizeof(imd_perf_candidate_t) == kCandidateV8Size + 40, "v16 candidate");
+static_assert(kRankRequestV16Size == kRankRequestV8Size + 24, "v16 rank request");
 static_assert(sizeof(imd_err_request_t) == 64 && sizeof(imd_err_t) == 72, "v8 error structs");
 
 template <class F>
@@ -181,9 +201,9 @@ const char* const kKernelFixed[IMD_PERF_KERNEL_K5] = {
 
 // "k5_n<N>_e<E>" / "k5b_n<N>" for N = 2..20: static storage, one string per kernel.
 struct K5Names {
-  char s[IMD_PERF_KERNEL_COUNT - IMD_PERF_KERNEL_K5][16];
+  char s[IMD_PERF_KERNEL_HW_PACK - IMD_PERF_KERNEL_K5][16];
   constexpr K5Names() : s{} {
-    for (int i = 0; i < IMD_PERF_KERNEL_COUNT - IMD_PERF_KERNEL_K5; ++i) {
+    for (int i = 0; i < IMD_PERF_KERNEL_HW_PACK - IMD_PERF_KERNEL_K5; ++i) {
       const int N = c::kNMin + i / 4, v = i % 4;
       char* p = s[i];
       int q = 0;
@@ -201,8 +221,13 @@ struct K5Names {
 };
 constexpr K5Names kK5Names{};
 
+// v16 (§6i.5): the HWGEMM kernels, after the K5 rows.
+const char* const kKernelHw[IMD_PERF_KERNEL_COUNT - IMD_PERF_KERNEL_HW_PACK] = {
+    "hw_pack", "hw_pack_rows", "hw_gemm_128x128", "hw_gemm_64x128", "hw_gemm_64x64"};
+
 const char* kernel_name(int32_t k) {
   if (k < 0 || k >= IMD_PERF_KERNEL_COUNT) return nullptr;
+  if (k >= IMD_PERF_KERNEL_HW_PACK) return kKernelHw[k - IMD_PERF_KERNEL_HW_PACK];
   return k < IMD_PERF_KERNEL_K5 ? kKernelFixed[k] : kK5Names.s[k - IMD_PERF_KERNEL_K5];
 }
 
@@ -221,6 +246,12 @@ imd_perf_kernel_t builtin_kernel(int32_t k) {
     case IMD_PERF_KERNEL_PACK: r.resident = 2; break;
     case IMD_PERF_KERNEL_K0: case IMD_PERF_KERNEL_ZERO_ROWS: case IMD_PERF_KERNEL_DIRECT:
     case IMD_PERF_KERNEL_BETA: case IMD_PERF_KERNEL_PACK_PREP: r.resident = 6; break;
+    // v16 (§6i.5): the HWGEMM packs (256 threads; the tiled one 8.4 KB of shared memory) and
+    // the GEMM tiles (CUTLASS DefaultMma: 128x128 one CTA per SM, the 64-row tiles two)
+    case IMD_PERF_KERNEL_HW_PACK: case IMD_PERF_KERNEL_HW_PACK_ROWS: r.resident = 6; break;
+    case IMD_PERF_KERNEL_HW_GEMM + kHw128x128: r.resident = 1; break;
+    case IMD_PERF_KERNEL_HW_GEMM + kHw64x128: case IMD_PERF_KERNEL_HW_GEMM + kHw64x64:
+      r.resident = 2, r.threads = 128; break;
     default:
       if (k >= IMD_PERF_KERNEL_K4 && k < IMD_PERF_KERNEL_K5) {
         const K4ConfigDesc& d = kK4Configs[k - IMD_PERF_KERNEL_K4];
@@ -246,6 +277,17 @@ void migrate_v7_fields(imd_perf_calib_t* cal) {
   cal->tie_ratio = 1;
   for (auto& b : cal->band_call) b[0] = b[1] = 1;
   for (auto& b : cal->band_class) b[0] = b[1] = 1;
+}
+
+// v16 (§6i.5): the HWGEMM rows a calibration may leave out (every v16 key is optional, and a
+// v7..v13-sized caller's struct has them 0): an absent kernel row (resident 0) is the built-in
+// one, an absent class band ({0, 0}) is 1 (zero width). Idempotent.
+void hw_defaults(imd_perf_calib_t* cal) {
+  for (int k = IMD_PERF_KERNEL_HW_PACK; k < IMD_PERF_KERNEL_COUNT; ++k)
+    if (cal->kernel[k].resident == 0) cal->kernel[k] = builtin_kernel(k);
+  for (int cl = IMD_PERF_CLASS_HW_PACK; cl < IMD_PERF_CLASS_COUNT; ++cl)
+    if (cal->band_class[cl][0] == 0 && cal->band_class[cl][1] == 0)
+      cal->band_class[cl][0] = cal->band_class[cl][1] = 1;
 }
 
 // A true format-1 calibration (DESIGN §6c.2): format 1, every format-2 parameter 0 (format 1
@@ -374,6 +416,106 @@ void add_kl(PerfPhases* P, const imd_perf_calib_t& cal, int32_t phase, double ro
       .in_bytes = 8 * rows * k;
 }
 
+// v16 (DESIGN §6i.5): the HWGEMM phases of a plan with alpha != 0 and k >= 2: K0 (when the
+// vectors are built and not resident), per packed operand one HW_PACK phase (S launches), the
+// HW_GEMM phase (S x chunks launches; its slot 5 is the call term, no CALL phase). Per slab s of
+// K extent len_s the GEMM runs ceil16(len_s) of K (the mainloop's 16-deep K tiles, the pack's
+// zero pad). A class whose parameters are all 0, and the GEMM of a calibration without
+// hw_family, is a roofline (a lower bound).
+bool class_calibrated(const imd_perf_calib_t& cal, int32_t cls) {
+  for (int j = 0; j < kP; ++j)
+    if (cal.param[cls * kP + j] != 0) return true;
+  return false;
+}
+
+void hw_phases(const Analysis& an, const ExecPlan& e, bool beta_read, const imd_perf_calib_t& cal,
+               PerfPhases* out) {
+  PerfPhases& P = *out;
+  const HwView& hv = e.hw;
+  const bool resident = an.options.vec_mode == IMD_VEC_RESIDENT;
+  const bool affine = hv.fully_affine();
+  const double b = dbl(e.b), m = dbl(e.m), n = dbl(e.n);
+  const int64_t S = e.hw_slabs();
+  const int64_t L = S > 1 ? e.hw_slab : e.k;
+  const int64_t last = e.k - (S - 1) * L;
+  const auto c16 = [](int64_t x) { return (x + 15) / 16 * 16; };
+  const double len_sum = dbl(e.k);                                   // sum len_s
+  const double hat_sum = dbl(S - 1) * dbl(c16(L)) + dbl(c16(last));  // sum ceil16(len_s)
+  P.hw_slab = L, P.hw_slabs = S;
+  // The GEMM's own m x n: stage 1 runs C^T (B A^T) for a column-major C; the own kernel does not
+  // swap. The tile: the plan's (a device plan), else the shared rule for the calibration's family.
+  const bool swap = affine && !hv.acc[2].row;
+  const double gm = swap ? n : m, gn = swap ? m : n;
+  const bool sm90 = cal.hw_family == 90;
+  const int32_t tile = e.hw_tile >= 0 ? e.hw_tile
+                                      : hw_tile_rule(swap ? e.n : e.m, swap ? e.m : e.n, e.b, sm90,
+                                                     cal.sm_count);
+  P.hw_tile = tile;
+  const double tm = tile == kHw128x128 ? 128 : 64, tn = tile == kHw64x64 ? 64 : 128;
+  const bool pk[2] = {!hv.acc[0].affine, !hv.acc[1].affine};
+  // An operand broadcast over the batch (its batch stride 0) is read from DRAM once.
+  const bool bcast[2] = {hv.batch_affine && e.b > 1 && hv.bstride[0] == 0,
+                         hv.batch_affine && e.b > 1 && hv.bstride[1] == 0};
+  const double rows[2] = {m, n};
+  if (!affine && !resident) {
+    const double V = dbl(e.vec_count);
+    add_phase(&P, IMD_PERF_PHASE_K0, IMD_PERF_CLASS_K0, 1,
+              {1, 8 * V, grid_chain(cal, IMD_PERF_KERNEL_K0, e.vec_count, 1)}, 8 * V);
+  }
+  const bool pack_cal = class_calibrated(cal, IMD_PERF_CLASS_HW_PACK);
+  double inputs = 0;
+  for (int x = 0; x < 2; ++x) {
+    const double src = 8 * rows[x] * len_sum * (bcast[x] ? 1 : b);  // distinct source bytes
+    inputs += src;
+    if (!pk[x]) continue;
+    // The tiled pack reads the source coalesced; the element-wise one reads along K, a 32-byte
+    // sector per 8-byte element when the source's fastest index runs along the rows.
+    const bool tiled = hw_pack_tiled(e.pack_along_rows[x], e.pack_radix[x], e.b,
+                                     x == 0 ? e.m : e.n);
+    const double sector = (tiled || !e.pack_along_rows[x] ? 1.0 : 4.0) * src;
+    const double written = 8 * b * rows[x] * hat_sum;
+    const int32_t kern = tiled ? IMD_PERF_KERNEL_HW_PACK_ROWS : IMD_PERF_KERNEL_HW_PACK;
+    double chain = 0;
+    const int64_t rb = e.b * (x == 0 ? e.m : e.n);
+    if (S > 1) chain += dbl(S - 1) * grid_chain(cal, kern, rb * c16(L), 1);
+    chain += grid_chain(cal, kern, rb * c16(last), 1);
+    PerfPhase& ph = add_phase(&P, x == 0 ? IMD_PERF_PHASE_HW_PACK_A : IMD_PERF_PHASE_HW_PACK_B,
+                              IMD_PERF_CLASS_HW_PACK, S, {dbl(S), sector, written, chain},
+                              sector + written);
+    ph.in_bytes = src;
+    ph.roofline = !pack_cal;
+  }
+  // The GEMM: per slab the padded tiles' flops, the idle CTA slots of the last wave (in flops),
+  // the DRAM bytes (a packed operand's k-hat buffer, an affine one's source; C written S times
+  // and read S - 1 + [beta != 0] times, 32-byte sectors per element when scattered).
+  const double tiles = b * std::ceil(gm / tm) * std::ceil(gn / tn);
+  const double tile_flops = 2 * tm * tn;
+  const double flop = tiles * tile_flops * hat_sum;
+  const int32_t occ = std::max(1, resident_of(cal, IMD_PERF_KERNEL_HW_GEMM + tile));
+  const double slots = dbl(cal.sm_count) * occ;
+  const double idle = (std::ceil(tiles / slots) * slots - tiles) * tile_flops * hat_sum;
+  double ab = 0;
+  for (int x = 0; x < 2; ++x)
+    ab += pk[x] ? 8 * b * rows[x] * hat_sum : 8 * rows[x] * len_sum * (bcast[x] ? 1 : b);
+  const double csec = hv.acc[2].affine ? 1.0 : 4.0;
+  const double c_rw = dbl(S) + dbl(S - 1) + (beta_read ? 1 : 0);
+  const double cbytes = 8 * b * m * n * c_rw * csec;
+  const double bytes = ab + cbytes;
+  const int64_t chunks = ((e.b + 65534) / 65535) *
+                         (((affine ? (hv.acc[2].row ? e.n : e.m) : e.n) + 65535 * 64 - 1) /
+                          (65535 * 64));
+  const bool gemm_cal = class_calibrated(cal, IMD_PERF_CLASS_HW_GEMM) && cal.hw_family != 0;
+  PerfPhase& g = add_phase(&P, IMD_PERF_PHASE_HW_GEMM, IMD_PERF_CLASS_HW_GEMM, S * chunks,
+                           {dbl(S * chunks), flop, idle, bytes, affine ? 0.0 : flop, 1}, bytes,
+                           flop, 3);
+  g.in_bytes = (pk[0] ? 0 : 8 * m * len_sum * (bcast[0] ? 1 : b)) +
+               (pk[1] ? 0 : 8 * n * len_sum * (bcast[1] ? 1 : b)) +
+               (beta_read ? 8 * b * m * n : 0);
+  g.roofline = !gemm_cal;
+  P.inputs = inputs + (beta_read ? 8 * b * m * n : 0);
+  P.launches = plan_launches(e, false, 0, resident, 0);
+}
+
 }  // namespace
 
 double perf_log2_T(int N) {
@@ -406,12 +548,17 @@ void perf_contract_phases(const Analysis& an, const ExecPlan& e, int32_t flags, 
   };
   P.footprint = static_cast<double>(an.layout.total) + 8 * b * m * n;
   if ((flags & IMD_PERF_ALPHA_ZERO) || e.k == 0) {  // §3.7: K0 and the beta kernel
-    k0();
+    const bool no_vec = e.path == Path::kHwGemm && e.hw.fully_affine();  // v16: no vectors
+    if (!no_vec) k0();
     add_phase(&P, IMD_PERF_PHASE_BETA, IMD_PERF_CLASS_BETA, 1,
               {1, out_bytes, grid_chain(cal, IMD_PERF_KERNEL_BETA, bmn, 1)}, out_bytes)
         .in_bytes = c_in;
     P.inputs = c_in;
-    P.launches = v + 1;
+    P.launches = (no_vec ? 0 : v) + 1;
+  } else if (e.path == Path::kHwGemm) {  // v16 (§6i.5)
+    hw_phases(an, e, beta_read, cal, &P);
+    P.footprint += P.inputs;
+    return;  // the call term is the GEMM's slot 5
   } else if (!emulates(e)) {  // DIRECT dispatch (mode DIRECT or K-empty)
     k0();
     const double bytes = 8 * b * (m * k + n * k) + out_bytes, flops = 2 * b * m * n * k;
@@ -630,6 +777,20 @@ void perf_pack_phases(const PackLowered& pl, const imd_perf_calib_t& cal, PerfPh
 double perf_phase_seconds(const imd_perf_calib_t& cal, const PerfPhase& p, double scale) {
   const double* th = cal.param + p.cls * kP;
   const bool* cb = kClockBound[p.cls];
+  if (p.roofline) {  // v16 (§6i.5): an uncalibrated class, a lower bound
+    const double peak = p.peak == 3 && cal.peak_fp64_tc_flops_per_s > 0
+                            ? cal.peak_fp64_tc_flops_per_s
+                            : cal.peak_fp64_flops_per_s;
+    const double launch = cal.param[IMD_PERF_CLASS_DIRECT * kP] * 1e-9 * dbl(p.launches);
+    return std::max(p.bytes / cal.peak_dram_bytes_per_s, p.ops > 0 ? p.ops / peak * scale : 0.0) +
+           launch;
+  }
+  if (p.cls == IMD_PERF_CLASS_HW_GEMM) {
+    // v16 (§6i.5): launch + call + max(the clock-bound flop terms, the DRAM term).
+    return (th[0] * p.x[0] + th[5] * p.x[5] +
+            std::max((th[1] * p.x[1] + th[2] * p.x[2] + th[4] * p.x[4]) * scale, th[3] * p.x[3])) *
+           1e-9;
+  }
   if (p.cls >= IMD_PERF_CLASS_K4_128x256 && p.cls <= IMD_PERF_CLASS_K4_64x64) {
     // K4: a roofline, max(the A3 round model, the DRAM term).
     double rounds = 0;
@@ -727,6 +888,9 @@ bool calib_valid(const imd_perf_calib_t& c) {
                          c.warm_call_ns, c.warm_clean_byte_ns})
     if (!finite_nonneg(v)) return false;
   if (c.pack_l2_planes != 0 && c.pack_l2_planes != 1) return false;  // v1.18
+  if (!finite_nonneg(c.peak_fp64_tc_flops_per_s)) return false;     // v16
+  if (c.hw_family != 0 && c.hw_family != 80 && c.hw_family != 90) return false;
+  if (c.reserved16 != 0) return false;
   if (c.clock_boost_mhz > 0 && !(c.clock_boost_mhz >= c.clock_eff_mhz)) return false;
   if (c.power_cap_w > 0 && !(c.clock_eff_mhz > 0 && c.clock_min_mhz > 0 &&
                              c.clock_min_mhz <= c.clock_eff_mhz))
@@ -848,7 +1012,8 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
   constexpr int kBandSlot = kScalarSlot + kScalarKeyCount;  // 3 call bands, then the classes
   constexpr int kOptSlot = kBandSlot + 3 + IMD_PERF_CLASS_COUNT;  // the optional keys (kOptKeys)
   constexpr int kRetiredSlot = kOptSlot + kOptKeyCount;           // the retired op_eps keys
-  constexpr int kSeen = kRetiredSlot + kRetiredKeyCount;
+  constexpr int kHwSlot = kRetiredSlot + kRetiredKeyCount;  // v16: peak_fp64_tc, hw_family
+  constexpr int kSeen = kHwSlot + 2;
   int32_t seen[kSeen] = {};   // the line of each key seen (0: not seen)
   int32_t first_v2_line = 0;  // the first line of a format-2-only key
   std::string first_v2_key;
@@ -870,6 +1035,7 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
     }
     if (slot < kScalarSlot) return std::string("kernel.") + kernel_name(slot - kKernelSlot);
     if (slot < kBandSlot) return kScalarKeys[slot - kScalarSlot].key;
+    if (slot >= kHwSlot) return slot == kHwSlot ? "peak_fp64_tc_flops_per_s" : "hw_family";
     if (slot >= kRetiredSlot) return kRetiredKeys[slot - kRetiredSlot];
     if (slot >= kOptSlot) return kOptKeys[slot - kOptSlot].key;
     const int b = slot - kBandSlot;
@@ -915,6 +1081,14 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
       else if (key == "peak_int8_ops_per_s") r.peak_int8_ops_per_s = d, slot = 4;
       else if (key == "peak_fp64_flops_per_s") r.peak_fp64_flops_per_s = d, slot = 5;
       else r.l2_bytes = d, slot = 10;
+    } else if (key == "peak_fp64_tc_flops_per_s") {  // v16 (§6i.5), format 2, optional
+      double d = 0;
+      if (!parse_number(val, &d) || d < 0) return bad("a finite number >= 0");
+      r.peak_fp64_tc_flops_per_s = d, slot = kHwSlot, v2 = true;
+    } else if (key == "hw_family") {
+      int64_t f = 0;
+      if (!parse_int(val, &f) || (f != 0 && f != 80 && f != 90)) return bad("0, 80 or 90");
+      r.hw_family = static_cast<int32_t>(f), slot = kHwSlot + 1, v2 = true;
     } else if (key.substr(0, 7) == "kernel.") {
       const std::string_view nm = key.substr(7);
       for (int k = 0; k < IMD_PERF_KERNEL_COUNT && slot < 0; ++k) {
@@ -1026,8 +1200,11 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
           !optional_param(cl, j) && seen[kFixed + cl * kP + j] == 0)
         return missing(kFixed + cl * kP + j);
   if (f2) {
-    for (int i = kKernelSlot; i < kOptSlot; ++i)  // the keys from kOptSlot on are optional
-      if (seen[i] == 0) return missing(i);
+    for (int i = kKernelSlot; i < kOptSlot; ++i) {  // the keys from kOptSlot on are optional
+      const bool hw = (i >= kKernelSlot + IMD_PERF_KERNEL_HW_PACK && i < kScalarSlot) ||
+                      i >= kBandSlot + 3 + IMD_PERF_CLASS_HW_PACK;  // v16: optional
+      if (seen[i] == 0 && !hw) return missing(i);
+    }
     if (r.power_cap_w > 0 && !(r.clock_eff_mhz > 0 && r.clock_min_mhz > 0 &&
                                r.clock_min_mhz <= r.clock_eff_mhz))
       return calib_fail(err, 0, IMD_PERF_CALIB_ERR_INCONSISTENT, "power.clock_min_mhz",
@@ -1041,6 +1218,7 @@ imd_status_t parse_calib(std::string_view text, imd_perf_calib_t* out, CalibErr*
     for (int k = IMD_PERF_KERNEL_COUNT; k < IMD_PERF_KERNEL_CAPACITY; ++k) r.kernel[k] = {};
     for (int cl = IMD_PERF_CLASS_COUNT; cl < IMD_PERF_CLASS_CAPACITY; ++cl)
       r.band_class[cl][0] = r.band_class[cl][1] = 1;
+    hw_defaults(&r);
   } else {
     migrate_v7_fields(&r);
   }
@@ -1090,6 +1268,12 @@ std::string format_calib(const imd_perf_calib_t& c) {
     append_number(&s, v);
     s += '\n';
   }
+  if (f2 && c.peak_fp64_tc_flops_per_s != 0) {  // v16: only when set (old texts unchanged)
+    s += "peak_fp64_tc_flops_per_s = ";
+    append_number(&s, c.peak_fp64_tc_flops_per_s);
+    s += '\n';
+  }
+  if (f2 && c.hw_family != 0) s += "hw_family = " + std::to_string(c.hw_family) + "\n";
   for (int cl = 0; cl < IMD_PERF_CLASS_COUNT; ++cl)
     for (int j = 0; j < kP; ++j) {
       if (kParamNames[cl][j] == nullptr || (!f2 && kFormat2Param[cl][j])) continue;
@@ -1106,6 +1290,12 @@ std::string format_calib(const imd_perf_calib_t& c) {
        "# bytes per CTA, threads per CTA (measured: imd_bench --methods occupancy).\n";
   for (int k = 0; k < IMD_PERF_KERNEL_COUNT; ++k) {
     const imd_perf_kernel_t& q = c.kernel[k];
+    if (k >= IMD_PERF_KERNEL_HW_PACK) {  // v16: only a row that differs from the built-in one
+      const imd_perf_kernel_t d = builtin_kernel(k);
+      if (q.resident == d.resident && q.regs == d.regs && q.smem_bytes == d.smem_bytes &&
+          q.threads == d.threads)
+        continue;
+    }
     s += "kernel.";
     s += kernel_name(k);
     s += " = " + std::to_string(q.resident) + " " + std::to_string(q.regs) + " " +
@@ -1143,8 +1333,11 @@ std::string format_calib(const imd_perf_calib_t& c) {
     s += '\n';
   };
   for (int i = 0; i < 3; ++i) band(kBandCallKeys[i], c.band_call[i]);
-  for (int cl = 0; cl < IMD_PERF_CLASS_COUNT; ++cl)
+  for (int cl = 0; cl < IMD_PERF_CLASS_COUNT; ++cl) {
+    if (cl >= IMD_PERF_CLASS_HW_PACK && c.band_class[cl][0] == 1 && c.band_class[cl][1] == 1)
+      continue;  // v16: an absent HW band
     band(std::string("band.") + kClassNames[cl], c.band_class[cl]);
+  }
   return s;
 }
 
@@ -1192,6 +1385,7 @@ imd_status_t resolve_calib(const imd_perf_calib_t* in, imd_perf_calib_t* scratch
     cal->format = 1;
   }
   v11_pack_l2(cal, in->struct_size);
+  if (cal->format == 2) hw_defaults(cal);  // v16 rows of a v7..v13-sized (or text-less) struct
   if (!calib_valid(*cal)) return IMD_STATUS_INVALID_VALUE;
   if (cal->format == 1) {
     to_format1_params(cal);
@@ -1369,6 +1563,8 @@ double call_power(const imd_perf_calib_t& cal, const PerfPhases& P, double f, do
                   double t_burst) {
   if (!(cal.power_cap_w > 0) || !(cal.clock_eff_mhz > 0)) return 0;
   double tc = 0, alu = 0, bytes = 0;
+  for (int i = 0; i < P.n; ++i)  // v16 (§6i.5): no power model for HWGEMM (no FP64 TC energy key)
+    if (P.ph[i].cls >= IMD_PERF_CLASS_HW_PACK) return 0;
   for (int i = 0; i < P.n; ++i) {
     const PerfPhase& p = P.ph[i];
     bytes += p.bytes;
@@ -1437,6 +1633,8 @@ int band_class_of(double t) { return t < 100e-6 ? IMD_PERF_BAND_SMALL : t < 1e-3
 void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req& q, imd_perf_t* r) {
   r->num_phases = P.n;
   r->k4_config = P.k4_config;
+  r->uncalibrated_phases = 0;  // v16
+  r->hw_tile = P.hw_tile, r->hw_slab = P.hw_slab, r->hw_slabs = P.hw_slabs;
   r->sm_count = cal.sm_count;
   r->kernel_launches = P.launches;
   int32_t regime = IMD_PERF_REGIME_BURST;
@@ -1452,13 +1650,19 @@ void fill_prediction(const imd_perf_calib_t& cal, const PerfPhases& P, const Req
     o.bytes = p.bytes, o.ops = p.ops;
     const double peak = p.peak == 1 ? cal.peak_int8_ops_per_s
                         : p.peak == 2 ? cal.peak_fp64_flops_per_s
+                        : p.peak == 3 ? (cal.peak_fp64_tc_flops_per_s > 0
+                                             ? cal.peak_fp64_tc_flops_per_s
+                                             : cal.peak_fp64_flops_per_s)
                                       : 0;
     o.bound_s = std::max(p.bytes / cal.peak_dram_bytes_per_s, peak > 0 ? p.ops / peak : 0.0);
     for (int j = 0; j < kP; ++j) o.x[j] = p.x[j];
     const bool call = p.cls == IMD_PERF_CLASS_CALL;
     const double* b = cal.band_class[p.cls];
-    r->phase_lo_s[i] = call ? o.time_s : o.time_s * b[0];
-    r->phase_hi_s[i] = call ? o.time_s : o.time_s * b[1];
+    // v16 (§6i.5): an uncalibrated (roofline) phase is a lower bound, its interval [t, t]
+    const bool point = call || p.roofline;
+    r->phase_lo_s[i] = point ? o.time_s : o.time_s * b[0];
+    r->phase_hi_s[i] = point ? o.time_s : o.time_s * b[1];
+    if (p.roofline) r->uncalibrated_phases |= 1u << i;
     t += o.time_s;
     bound += o.bound_s;
   }
@@ -1483,6 +1687,7 @@ int32_t dispatch_of(const ExecPlan& e) {
   return e.path == Path::kNoop ? IMD_DISPATCH_NOOP
          : e.k == 0            ? IMD_DISPATCH_SCALE
          : emulates(e)         ? IMD_DISPATCH_EMULATE
+         : e.path == Path::kHwGemm ? IMD_DISPATCH_HWGEMM
                                : IMD_DISPATCH_DIRECT;
 }
 
@@ -1507,7 +1712,11 @@ imd_status_t predict_contract(const imd_tensor_t* A, const imd_tensor_t* B, cons
   fill_prediction(cal, P, q, r);
   // v8 (§6f): the error estimates of this configuration (the same function as
   // imd_err_estimate); written only into a v8-sized imd_perf_t (finish copies struct_size).
-  const ErrOut eo = err_compute(e.N, options->rounding, r->dispatch, e.k, e.b * e.m * e.n, q.err);
+  // v16 (§6i.3): a slabbed HWGEMM call rounds each slab's sum into C (S - 1 more additions on
+  // top of the k-term chain, each a rounding at most and one more product rounding by alpha):
+  // gamma_{k + 2 (S - 1)}, a conservative form of the L7 chain.
+  const int64_t k_err = e.path == Path::kHwGemm ? e.k + 2 * (e.hw_slabs() - 1) : e.k;
+  const ErrOut eo = err_compute(e.N, an.options.rounding, r->dispatch, k_err, e.b * e.m * e.n, q.err);
   r->err_bound = eo.bound, r->err_typical = eo.typical;
   r->err_status = eo.err_status, r->err_metric = q.err.metric;
   return IMD_STATUS_SUCCESS;
@@ -1652,6 +1861,7 @@ imd_status_t imd_perf_calib_format(const imd_perf_calib_t* calib, char* buf, siz
   std::memcpy(&c, calib, std::min<size_t>(calib->struct_size, sizeof c));
   if (calib->struct_size < imd::detail::kCalibV7Size && c.format == 2) c.format = 1;
   imd::detail::v11_pack_l2(&c, calib->struct_size);
+  if (c.format == 2) imd::detail::hw_defaults(&c);  // v16: absent HW rows (v7..v13 caller)
   if (!imd::detail::calib_valid(c)) return IMD_STATUS_INVALID_VALUE;
   if (c.format == 1) imd::detail::to_format1_params(&c);
   for (const auto& [p, cap] : {std::pair<const char*, size_t>{c.gpu, sizeof c.gpu},
@@ -1725,13 +1935,44 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
       num_candidates == nullptr || req->struct_size < kRankRequestV1Size || capacity < 0 ||
       (capacity > 0 && (out == nullptr || req->candidate_size < kCandidateV1Size)))
     return IMD_STATUS_INVALID_VALUE;
-  if (req->num_moduli_count < 1 || req->num_moduli == nullptr || req->residue_group_count < 0 ||
+  // v16 (§6i.5): the modes mask (overrides base->mode and base->k_slab). modes = 0 (and a
+  // version-8 request): the version-8 enumeration in the base's mode (EMULATE or DIRECT; N x g
+  // x vec x packs); a HWGEMM base: HWGEMM alone (a version-8 request: INVALID_VALUE).
+  const bool v16 = req->struct_size >= kRankRequestV16Size;
+  int32_t modes = IMD_PERF_MODE_EMULATE;
+  if (v16) {
+    if ((req->modes & ~(IMD_PERF_MODE_EMULATE | IMD_PERF_MODE_DIRECT | IMD_PERF_MODE_HWGEMM)) != 0 ||
+        req->k_slab_count < 0 || (req->k_slab_count > 0 && req->k_slabs == nullptr) ||
+        (req->hw_flags & ~IMD_PERF_HW_FIT_SLAB) != 0 || req->reserved16 != 0)
+      return IMD_STATUS_INVALID_VALUE;
+    for (int32_t i = 0; i < req->k_slab_count; ++i)
+      if (req->k_slabs[i] < 0) return IMD_STATUS_INVALID_VALUE;
+    if (req->modes != 0) {
+      modes = req->modes;
+    } else if (base->struct_size >= sizeof(imd_options_t) && base->mode == IMD_HWGEMM) {
+      modes = IMD_PERF_MODE_HWGEMM;  // EMULATE / DIRECT base: the version-8 enumeration
+    }
+    // A HWGEMM candidate's fields are version 16's.
+    if ((modes & IMD_PERF_MODE_HWGEMM) && capacity > 0 && req->candidate_size < sizeof(imd_perf_candidate_t))
+      return IMD_STATUS_INVALID_VALUE;
+  }
+  const bool emu = (modes & IMD_PERF_MODE_EMULATE) != 0;
+  if ((emu && (req->num_moduli_count < 1 || req->num_moduli == nullptr)) ||
+      req->num_moduli_count < 0 || (req->num_moduli_count > 0 && req->num_moduli == nullptr) ||
+      req->residue_group_count < 0 ||
       (req->residue_group_count > 0 && req->residue_groups == nullptr) || req->reuse < 1 ||
       (req->vec_modes & ~(IMD_PERF_VEC_GENERATE | IMD_PERF_VEC_RESIDENT)) != 0 ||
       (req->pack_modes & ~(IMD_PERF_PACK_NONE | IMD_PERF_PACK_A | IMD_PERF_PACK_B |
                            IMD_PERF_PACK_AB)) != 0 ||
       (req->flags & ~IMD_PERF_BETA_NONZERO) != 0 || !eps_valid(req->eps_fraction))
     return IMD_STATUS_INVALID_VALUE;
+  imd_options_t base_opts;  // host API 16: through struct_size, so each candidate copy is ours
+  if (const imd_status_t st = read_options(base, &base_opts); st != IMD_STATUS_SUCCESS) return st;
+  // v16 review: a version-8 request cannot rank HWGEMM (its candidates have no room for the
+  // HWGEMM fields). modes = 0 keeps the version-8 enumeration for an EMULATE or DIRECT base.
+  if (!v16 && base_opts.mode == IMD_HWGEMM) return IMD_STATUS_INVALID_VALUE;
+  const bool legacy = !v16 || req->modes == 0;
+  const int32_t legacy_mode = base_opts.mode == IMD_DIRECT ? IMD_DIRECT : IMD_EMULATE;
   Req q;
   q.flags = req->flags;
   int32_t order = IMD_PERF_ORDER_TIME;  // a version-6 request: the v6 order
@@ -1764,7 +2005,89 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
       int64_t order;
     };
     std::vector<Cand> cands;
-    for (int32_t ni = 0; ni < req->num_moduli_count; ++ni) {
+    // One candidate of options o (its mode, N, g, vec mode and k_slab set) and packing.
+    const auto eval = [&](imd_options_t o, int32_t packed) -> Cand {
+      Cand cd{};
+      imd_perf_candidate_t& c = cd.c;
+      cd.order = static_cast<int64_t>(cands.size());
+      const bool em = o.mode == IMD_EMULATE || (legacy && o.mode == IMD_DIRECT);
+      c.num_moduli = em ? o.num_moduli : 0, c.residue_group = em ? o.residue_group : 0;
+      c.vec_mode = o.vec_mode, c.packed = packed;
+      c.mode = o.mode, c.k_slab = o.k_slab, c.hw_tile = -1;
+      // The packed operands' descriptors: the unpacked plan's orders (§6b.2).
+      imd_pack_desc_t desc[2];
+      std::vector<int32_t> labels[2];
+      imd_status_t st = IMD_STATUS_SUCCESS;
+      for (int x = 0; x < 2 && st == IMD_STATUS_SUCCESS; ++x) {
+        if (!(packed & (1 << x))) continue;
+        const imd_tensor_t* X = x == 0 ? A : B;
+        labels[x].assign(static_cast<size_t>(std::max(X->rank, 1)), 0);
+        std::memset(&desc[x], 0, sizeof desc[x]);
+        desc[x].struct_size = sizeof desc[x];
+        st = pack_desc_for(A, B, C, &o, sel, x, &desc[x], labels[x].data(),
+                           static_cast<int32_t>(labels[x].size()));
+      }
+      const imd_packing_t packing = {(packed & 1) ? &desc[0] : nullptr,
+                                     (packed & 2) ? &desc[1] : nullptr};
+      imd_perf_t pr;
+      std::memset(&pr, 0, sizeof pr);
+      if (st == IMD_STATUS_SUCCESS)
+        st = predict_contract(A, B, C, &o, packed ? &packing : nullptr, sel, q, cal,
+                              &pr);
+      double pack_s = 0, pack_lo = 0, pack_hi = 0;
+      uint64_t pack_bytes = 0, pack_ws = 0;
+      for (int x = 0; x < 2 && st == IMD_STATUS_SUCCESS; ++x) {
+        if (!(packed & (1 << x))) continue;
+        imd_perf_t pp;
+        std::memset(&pp, 0, sizeof pp);
+        st = predict_pack(desc[x], sel, q, cal, &pp);
+        pack_s += pp.time_s;
+        pack_lo += pp.time_lo_s;
+        pack_hi += pp.time_hi_s;
+        pack_bytes += pp.pack_bytes;
+        pack_ws += pp.pack_ws_bytes;
+      }
+      c.status = st;
+      if (st == IMD_STATUS_SUCCESS) {
+        c.k4_config = pr.k4_config, c.dispatch = pr.dispatch;
+        c.contract_s = pr.time_s, c.pack_s = pack_s;
+        c.time_s = pr.time_s + pack_s / req->reuse;
+        c.tflops_eq = c.time_s > 0 ? pr.flops_eq / c.time_s * 1e-12 : 0;
+        c.eps_s = 0, c.eps_fraction = 0;  // v1.15 (§6c.1): no eps path
+        c.workspace_bytes = pr.workspace_bytes;
+        c.plan_device_bytes = pr.plan_device_bytes;
+        c.pack_bytes = pack_bytes, c.pack_ws_bytes = pack_ws;
+        uint64_t total = 0;
+        const bool fits = add_u64(c.workspace_bytes, c.plan_device_bytes, &total) &&
+                          add_u64(total, pack_bytes, &total) && add_u64(total, pack_ws, &total);
+        c.total_bytes = fits ? total : UINT64_MAX;
+        if (!(req->budget_bytes == 0 || c.total_bytes <= req->budget_bytes))
+          c.infeasible |= IMD_PERF_INFEASIBLE_BUDGET;
+        c.kernel_launches = pr.kernel_launches;
+        c.time_lo_s = pr.time_lo_s + pack_lo / req->reuse;
+        c.time_hi_s = pr.time_hi_s + pack_hi / req->reuse;
+        c.clock_mhz = pr.clock_mhz, c.power_w = pr.power_w;
+        // v8 (§6f): the contract's estimates (predict_contract, the request's accuracy)
+        c.err_bound = pr.err_bound, c.err_typical = pr.err_typical;
+        c.err_status = pr.err_status;
+        c.uncalibrated_phases = pr.uncalibrated_phases;  // v16
+        c.hw_tile = pr.hw_tile, c.hw_slab = pr.hw_slab, c.hw_slabs = pr.hw_slabs;
+        if (pr.err_status == IMD_ERR_MISSED) c.infeasible |= IMD_PERF_INFEASIBLE_ACCURACY;
+      } else {
+        c.infeasible = IMD_PERF_INFEASIBLE_STATUS;
+        c.err_bound = c.err_typical = std::numeric_limits<double>::infinity();  // no plan
+      }
+      c.feasible = c.infeasible == 0 ? 1 : 0;
+      return cd;
+    };
+    const auto vec_on = [&](int32_t vec) {
+      return (vec_mask & (vec == IMD_VEC_GENERATE ? IMD_PERF_VEC_GENERATE : IMD_PERF_VEC_RESIDENT)) != 0;
+    };
+    const auto push = [&](Cand cd) {
+      cd.order = static_cast<int64_t>(cands.size());
+      cands.push_back(cd);
+    };
+    for (int32_t ni = 0; emu && ni < req->num_moduli_count; ++ni) {
       const int32_t N = req->num_moduli[ni];
       std::vector<int32_t> gs;
       if (req->residue_group_count == 0)
@@ -1774,8 +2097,7 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
           if (req->residue_groups[i] <= N) gs.push_back(req->residue_groups[i]);
       for (const int32_t g : gs)
         for (const int32_t vec : {IMD_VEC_GENERATE, IMD_VEC_RESIDENT}) {
-          if (!(vec_mask & (vec == IMD_VEC_GENERATE ? IMD_PERF_VEC_GENERATE : IMD_PERF_VEC_RESIDENT)))
-            continue;
+          if (!vec_on(vec)) continue;
           for (const int32_t pm : {IMD_PERF_PACK_NONE, IMD_PERF_PACK_A, IMD_PERF_PACK_B,
                                    IMD_PERF_PACK_AB}) {
             if (!(pack_mask & pm)) continue;
@@ -1783,77 +2105,88 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
                                    : pm == IMD_PERF_PACK_A  ? 1
                                    : pm == IMD_PERF_PACK_B  ? 2
                                                             : 3;
-            imd_options_t o = *base;
+            imd_options_t o = base_opts;
+            o.mode = legacy ? legacy_mode : IMD_EMULATE, o.k_slab = 0;
             o.num_moduli = N, o.residue_group = g, o.vec_mode = vec;
-            Cand cd{};
-            imd_perf_candidate_t& c = cd.c;
-            cd.order = static_cast<int64_t>(cands.size());
-            c.num_moduli = N, c.residue_group = g, c.vec_mode = vec, c.packed = packed;
-            // The packed operands' descriptors: the unpacked plan's orders (§6b.2).
-            imd_pack_desc_t desc[2];
-            std::vector<int32_t> labels[2];
-            imd_status_t st = IMD_STATUS_SUCCESS;
-            for (int x = 0; x < 2 && st == IMD_STATUS_SUCCESS; ++x) {
-              if (!(packed & (1 << x))) continue;
-              const imd_tensor_t* X = x == 0 ? A : B;
-              labels[x].assign(static_cast<size_t>(std::max(X->rank, 1)), 0);
-              std::memset(&desc[x], 0, sizeof desc[x]);
-              desc[x].struct_size = sizeof desc[x];
-              st = pack_desc_for(A, B, C, &o, sel, x, &desc[x], labels[x].data(),
-                                 static_cast<int32_t>(labels[x].size()));
-            }
-            const imd_packing_t packing = {(packed & 1) ? &desc[0] : nullptr,
-                                           (packed & 2) ? &desc[1] : nullptr};
-            imd_perf_t pr;
-            std::memset(&pr, 0, sizeof pr);
-            if (st == IMD_STATUS_SUCCESS)
-              st = predict_contract(A, B, C, &o, packed ? &packing : nullptr, sel, q, cal,
-                                    &pr);
-            double pack_s = 0, pack_lo = 0, pack_hi = 0;
-            uint64_t pack_bytes = 0, pack_ws = 0;
-            for (int x = 0; x < 2 && st == IMD_STATUS_SUCCESS; ++x) {
-              if (!(packed & (1 << x))) continue;
-              imd_perf_t pp;
-              std::memset(&pp, 0, sizeof pp);
-              st = predict_pack(desc[x], sel, q, cal, &pp);
-              pack_s += pp.time_s;
-              pack_lo += pp.time_lo_s;
-              pack_hi += pp.time_hi_s;
-              pack_bytes += pp.pack_bytes;
-              pack_ws += pp.pack_ws_bytes;
-            }
-            c.status = st;
-            if (st == IMD_STATUS_SUCCESS) {
-              c.k4_config = pr.k4_config, c.dispatch = pr.dispatch;
-              c.contract_s = pr.time_s, c.pack_s = pack_s;
-              c.time_s = pr.time_s + pack_s / req->reuse;
-              c.tflops_eq = c.time_s > 0 ? pr.flops_eq / c.time_s * 1e-12 : 0;
-              c.eps_s = 0, c.eps_fraction = 0;  // v1.15 (§6c.1): no eps path
-              c.workspace_bytes = pr.workspace_bytes;
-              c.plan_device_bytes = pr.plan_device_bytes;
-              c.pack_bytes = pack_bytes, c.pack_ws_bytes = pack_ws;
-              uint64_t total = 0;
-              const bool fits = add_u64(c.workspace_bytes, c.plan_device_bytes, &total) &&
-                                add_u64(total, pack_bytes, &total) && add_u64(total, pack_ws, &total);
-              c.total_bytes = fits ? total : UINT64_MAX;
-              if (!(req->budget_bytes == 0 || c.total_bytes <= req->budget_bytes))
-                c.infeasible |= IMD_PERF_INFEASIBLE_BUDGET;
-              c.kernel_launches = pr.kernel_launches;
-              c.time_lo_s = pr.time_lo_s + pack_lo / req->reuse;
-              c.time_hi_s = pr.time_hi_s + pack_hi / req->reuse;
-              c.clock_mhz = pr.clock_mhz, c.power_w = pr.power_w;
-              // v8 (§6f): the contract's estimates (predict_contract, the request's accuracy)
-              c.err_bound = pr.err_bound, c.err_typical = pr.err_typical;
-              c.err_status = pr.err_status;
-              if (pr.err_status == IMD_ERR_MISSED) c.infeasible |= IMD_PERF_INFEASIBLE_ACCURACY;
-            } else {
-              c.infeasible = IMD_PERF_INFEASIBLE_STATUS;
-              c.err_bound = c.err_typical = std::numeric_limits<double>::infinity();  // no plan
-            }
-            c.feasible = c.infeasible == 0 ? 1 : 0;
-            cands.push_back(cd);
+            push(eval(o, packed));
           }
         }
+    }
+    // v16 (§6i.5): DIRECT and HWGEMM ignore N, g and the pack modes (a valid N is kept so the
+    // options validate); one candidate per vec mode (HWGEMM: per vec mode and k_slab).
+    imd_options_t nat = base_opts;
+    if (nat.num_moduli < c::kNMin || nat.num_moduli > c::kNMax) nat.num_moduli = c::kNMin;
+    nat.residue_group = 0;
+    if (modes & IMD_PERF_MODE_DIRECT)
+      for (const int32_t vec : {IMD_VEC_GENERATE, IMD_VEC_RESIDENT}) {
+        if (!vec_on(vec)) continue;
+        imd_options_t o = nat;
+        o.mode = IMD_DIRECT, o.k_slab = 0, o.vec_mode = vec;
+        push(eval(o, 0));
+      }
+    if (modes & IMD_PERF_MODE_HWGEMM) {
+      std::vector<int64_t> slabs;
+      if (v16 && req->k_slab_count > 0) slabs.assign(req->k_slabs, req->k_slabs + req->k_slab_count);
+      else slabs.push_back(0);
+      bool vec_matters = true;  // a fully affine call builds no vectors: one candidate
+      int64_t k_full = 0;
+      {
+        imd_options_t o = nat;
+        o.mode = IMD_HWGEMM, o.k_slab = 0, o.vec_mode = IMD_VEC_GENERATE;
+        Analysis an;
+        ExecPlan e;
+        if (analyze_with(A, B, C, &o, sel, nullptr, &an) == IMD_STATUS_SUCCESS &&
+            plan_data(an, &e) == IMD_STATUS_SUCCESS) {
+          if (e.path == Path::kHwGemm && e.hw.fully_affine()) vec_matters = false;
+          k_full = e.k;
+        }
+      }
+      for (const int32_t vec : {IMD_VEC_GENERATE, IMD_VEC_RESIDENT}) {
+        if (!vec_on(vec)) continue;
+        std::vector<int64_t> seen_L;  // k_slab values that run the same slab length: one
+        const auto add = [&](int64_t ks) -> const Cand* {
+          imd_options_t o = nat;
+          o.mode = IMD_HWGEMM, o.k_slab = ks, o.vec_mode = vec;
+          Cand cd = eval(o, 0);
+          if (cd.c.status == IMD_STATUS_SUCCESS) {
+            for (const int64_t L : seen_L)
+              if (L == cd.c.hw_slab) return nullptr;
+            seen_L.push_back(cd.c.hw_slab);
+          }
+          push(cd);
+          return &cands.back();
+        };
+        for (const int64_t ks : slabs) add(ks);
+        // IMD_PERF_HW_FIT_SLAB: the largest slab whose candidate fits the budget. The footprint
+        // is affine in L (PA / PB by one slab, §6i.3): its slope from L = 16 and 32, the
+        // closed-form L, then checked and stepped by 16 to the largest that fits.
+        if (v16 && (req->hw_flags & IMD_PERF_HW_FIT_SLAB) && req->budget_bytes > 0 && k_full > 32) {
+          imd_options_t o16 = nat, o32 = nat;
+          o16.mode = o32.mode = IMD_HWGEMM, o16.vec_mode = o32.vec_mode = vec;
+          o16.k_slab = 16, o32.k_slab = 32;
+          const Cand a = eval(o16, 0), b2 = eval(o32, 0);
+          if (a.c.status == IMD_STATUS_SUCCESS && b2.c.status == IMD_STATUS_SUCCESS &&
+              b2.c.total_bytes > a.c.total_bytes && a.c.total_bytes <= req->budget_bytes) {
+            const double slope = static_cast<double>(b2.c.total_bytes - a.c.total_bytes) / 16;
+            const double room = static_cast<double>(req->budget_bytes - a.c.total_bytes);
+            int64_t L = 16 + static_cast<int64_t>(std::floor(room / slope / 16)) * 16;
+            L = std::min(L, (k_full + 15) / 16 * 16);
+            // The line is exact up to 256 bytes of alignment per pack (spec/params.py
+            // cert_hw_workspace): step down to a fitting L, then up while L + 16 still fits.
+            const int64_t top = (k_full + 15) / 16 * 16;
+            const auto fits = [&](int64_t len) {
+              imd_options_t o = nat;
+              o.mode = IMD_HWGEMM, o.k_slab = len, o.vec_mode = vec;
+              const Cand t = eval(o, 0);
+              return t.c.status == IMD_STATUS_SUCCESS && t.c.total_bytes <= req->budget_bytes;
+            };
+            for (int it = 0; it < 64 && L > 16 && !fits(L); ++it) L -= 16;
+            for (int it = 0; it < 64 && L + 16 <= top && fits(L + 16); ++it) L += 16;
+            if (fits(L)) add(L);
+          }
+        }
+        if (!vec_matters) break;
+      }
     }
     // The v6 order: feasible by time, then infeasible SUCCESS by time, then the rest in
     // enumeration order.
@@ -1864,7 +2197,9 @@ imd_status_t imd_perf_rank(const imd_tensor_t* A, const imd_tensor_t* B, const i
       if (x.num_moduli != y.num_moduli) return x.num_moduli < y.num_moduli;
       if (x.residue_group != y.residue_group) return x.residue_group < y.residue_group;
       if (x.vec_mode != y.vec_mode) return x.vec_mode < y.vec_mode;
-      return x.packed < y.packed;
+      if (x.packed != y.packed) return x.packed < y.packed;
+      if (x.mode != y.mode) return x.mode < y.mode;  // v16
+      return x.k_slab < y.k_slab;
     };
     std::stable_sort(cands.begin(), cands.end(), [&](const Cand& x, const Cand& y) {
       const int rx = rank_of(x.c), ry = rank_of(y.c);

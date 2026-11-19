@@ -118,9 +118,10 @@ ErrOut err_compute(int N, int32_t rounding, int32_t dispatch, int64_t k, int64_t
   ErrOut o;
   if (dispatch == IMD_DISPATCH_NOOP || dispatch == IMD_DISPATCH_SCALE || k <= 0) {
     // no product: 0
-  } else if (dispatch == IMD_DISPATCH_DIRECT) {
+  } else if (dispatch == IMD_DISPATCH_DIRECT || dispatch == IMD_DISPATCH_HWGEMM) {
     // The native FMA chain (§3.7): gamma_k relative to sum |a b| <= ||a|| ||b||, the final
     // rounding included; no bound (+inf) once k u >= 1/2 (gamma_k >= 1 there anyway).
+    // v1.21 §6i.4: HWGEMM without K-slabs has the same bound (any summation order).
     const double ku = static_cast<double>(k) * kU;
     if (ku >= 0.5) {
       o.unit_bound = o.bound = kInf;
@@ -181,7 +182,7 @@ imd_status_t imd_err_estimate(int32_t num_moduli, int32_t rounding, int32_t disp
   if (!out_valid(out)) return IMD_STATUS_INVALID_VALUE;
   ErrReq q;
   if (num_moduli < c::kNMin || num_moduli > c::kNMax || (rounding != IMD_RN && rounding != IMD_TRUNC) ||
-      dispatch < IMD_DISPATCH_NOOP || dispatch > IMD_DISPATCH_SCALE || k < 0 || outputs < 0 ||
+      dispatch < IMD_DISPATCH_NOOP || dispatch > IMD_DISPATCH_HWGEMM || k < 0 || outputs < 0 ||
       !err_request_valid(request, &q))
     return IMD_STATUS_INVALID_VALUE;
   imd_err_t r;
@@ -211,18 +212,24 @@ imd_status_t imd_err_min_moduli(const imd_tensor_t* A, const imd_tensor_t* B, co
     // not depend on N, g or vec_mode). Not the workspace layout: it depends on N and g, and
     // must not reject a shape that is valid at the N found. The §3.2 RN acceptance is the
     // estimate's own +inf at small N.
-    const imd_options_t& o = *options;
+    imd_options_t o;  // host API 16: through struct_size
+    if (const imd_status_t st = read_options(options, &o); st != IMD_STATUS_SUCCESS) return st;
+    if (o.k_slab < 0 || (o.k_slab != 0 && o.mode != IMD_HWGEMM)) return IMD_STATUS_INVALID_VALUE;
     if ((o.rounding != IMD_RN && o.rounding != IMD_TRUNC) ||
-        (o.mode != IMD_EMULATE && o.mode != IMD_DIRECT) || A == nullptr || B == nullptr ||
+        (o.mode != IMD_EMULATE && o.mode != IMD_DIRECT && o.mode != IMD_HWGEMM) ||
+        A == nullptr || B == nullptr ||
         C == nullptr)
       return IMD_STATUS_INVALID_VALUE;
     Lowered lw;
     if (const imd_status_t st = lower(*A, *B, *C, &lw); st != IMD_STATUS_SUCCESS) return st;
     if (o.mode == IMD_EMULATE && !lw.empty_output() && lw.k >= 2 && !gemm_dims_ok(lw))
       return IMD_STATUS_INVALID_VALUE;
+    if (o.mode == IMD_HWGEMM && !lw.empty_output() && lw.k >= 2 && !hw_dims_ok(lw))
+      return IMD_STATUS_INVALID_VALUE;  // v1.21 §6i.6
     const int32_t dispatch = lw.empty_output()                     ? IMD_DISPATCH_NOOP
                              : lw.k == 0                           ? IMD_DISPATCH_SCALE
                              : (o.mode == IMD_DIRECT || lw.k == 1) ? IMD_DISPATCH_DIRECT
+                             : o.mode == IMD_HWGEMM                ? IMD_DISPATCH_HWGEMM
                                                                    : IMD_DISPATCH_EMULATE;
     const int64_t outputs = lw.b * lw.m * lw.n;
     for (int N = lo; N <= hi; ++N) {
